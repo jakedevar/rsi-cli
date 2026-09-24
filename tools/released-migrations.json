@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "latest_schema_version": 131,
+  "latest_schema_version": 132,
   "migration_file": "crates/rsid/src/store/mod.rs",
   "blocks": {
     "0": "sha256:3e79edf6e3b6718c67bf3de92309ddd9cf97c1768cab75922a24d61405589ca5",
@@ -133,7 +133,8 @@
     "128": "sha256:df96116d8a34bb7b14554c51c41d56d2c441b7da7eb5f73b25d001d94ef3ec78",
     "129": "sha256:a647cd7768138d61a42e3dd6a0dc8ece97b9eabc6fbf8936559d47cf8a6dd8d6",
     "130": "sha256:c06df721b9d791f67a61c594e2417eb671a8f2bb011817bcfc8fa47b78dfb266",
-    "131": "sha256:4232b6caead20f01a3c8e08e5f3400998c3b8df25208355935b7e86297305118"
+    "131": "sha256:4232b6caead20f01a3c8e08e5f3400998c3b8df25208355935b7e86297305118",
+    "132": "sha256:c79a3a2d9fbd5c29aaee6c7f095ffd7de661ac88af7c260f72079b1f37d6c563"
   },
   "protected_sections": {
     "v128-watchdog-restart-catalog": {
@@ -304,6 +305,18 @@
       "path": "crates/rsid/src/store/session_diagnostics.rs",
       "sha256": "sha256:2d0d288d6830169d8c061fac425ba4ffbdfa1419707809139abfb2ad89961706"
     },
+    "v132-session-model-updates-schema": {
+      "path": "crates/rsid/src/store/session_model_updates.rs",
+      "sha256": "sha256:d492810303d62fbd4c1f2d54bcfdbac53ba1ceecb04eb662babaca57c0be7992"
+    },
+    "v132-session-model-updates-migration": {
+      "path": "crates/rsid/src/store/session_model_updates.rs",
+      "sha256": "sha256:84402cc79b203d7e71502ae14eacce7bae69e5435d200c172e58f4e4a9c50f79"
+    },
+    "v132-session-model-updates-catalog": {
+      "path": "crates/rsid/src/store/session_model_updates.rs",
+      "sha256": "sha256:33c096f6bc2c9c796f8f5ec2d14e24a4738d26599bc9bfff78321c8cfd3d0f6b"
+    },
     "v120-source-worktree-batch-migration": {
       "path": "crates/rsid/src/store/source_worktree_v120.rs",
       "sha256": "sha256:2f644559ca929ffbbd8179a737d3c4dd315a79a89b9a52df2698b8a9c76fecea"
@@ -328,13 +341,25 @@
       "path": "crates/rsid/src/store/tests.rs",
       "sha256": "sha256:eca45abbd759475bc3533aa624bd2512f4d8f5443f354635df2413d8eedc3708"
     },
+    "v132-session-model-updates-rewind": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:0453c56d9c06caf4db92ee6d2a40998014936954f92eb949db7be85353eb308d"
+    },
     "v127-session-diagnostics-fixture-assertion": {
       "path": "crates/rsid/src/store/tests.rs",
       "sha256": "sha256:2003bca96a8093c54f5d5fd82d4a0c34ebfef0325f76ec54cddde0a0d3476453"
     },
+    "v132-session-model-updates-fixture-assertion": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:81a18e225a512de83fa8e8089d997280555ee2773707c411d22b6cd2c2bde557"
+    },
     "v127-session-diagnostics-replay-assertion": {
       "path": "crates/rsid/src/store/tests.rs",
       "sha256": "sha256:7b6a8e5004620d1ac1c2ebea16e0d958e12f67a1b1131e3f2440087c03d16250"
+    },
+    "v132-session-model-updates-replay-assertion": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:9228fa1ce4c2cfbd3bae32011c304d54f70ca1f41ad23e40315218589672df88"
     },
     "v129-topology-executor-catalog": {
       "path": "crates/rsid/src/store/topology_v129.rs",

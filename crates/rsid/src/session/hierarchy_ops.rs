@@ -1283,12 +1283,7 @@ mod tests {
         let project_dir = dir.path().join("acme");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project = manager
-            .create_project(
-                "Acme".to_string(),
-                Some(project_dir.clone()),
-                None,
-                None,
-            )
+            .create_project("Acme".to_string(), Some(project_dir.clone()), None, None)
             .await
             .unwrap();
 
@@ -1313,12 +1308,7 @@ mod tests {
         let project_dir = dir.path().join("acme");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project = manager
-            .create_project(
-                "Acme".to_string(),
-                Some(project_dir.clone()),
-                None,
-                None,
-            )
+            .create_project("Acme".to_string(), Some(project_dir.clone()), None, None)
             .await
             .unwrap();
         let group = manager

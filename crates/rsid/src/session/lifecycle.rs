@@ -629,6 +629,16 @@ static CONTINUE_CUSTODY_CONFIG_OBSERVATION_KEYS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
+static CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATION_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
 static CONTINUE_EXECUTION_SCRATCH_FAILURE_KEYS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -655,6 +665,17 @@ fn install_continue_custody_root_mutation_for_test(session_id: Uuid, initial_seq
 #[cfg(test)]
 fn install_continue_custody_config_observation_for_test(session_id: Uuid, initial_sequence: i32) {
     CONTINUE_CUSTODY_CONFIG_OBSERVATION_KEYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(continue_custody_test_key(session_id, initial_sequence));
+}
+
+#[cfg(test)]
+fn install_continue_model_effort_config_observation_for_test(
+    session_id: Uuid,
+    initial_sequence: i32,
+) {
+    CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATION_KEYS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(continue_custody_test_key(session_id, initial_sequence));
@@ -718,21 +739,31 @@ fn observe_continue_custody_config_for_test(
     config: &LaunchConfig,
 ) {
     let key = continue_custody_test_key(session_id, initial_sequence);
-    if !CONTINUE_CUSTODY_CONFIG_OBSERVATION_KEYS
+    if CONTINUE_CUSTODY_CONFIG_OBSERVATION_KEYS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&key)
     {
-        return;
+        let working_dir = config
+            .working_dir
+            .clone()
+            .expect("continue config must carry permit-derived cwd");
+        CONTINUE_CUSTODY_CONFIG_OBSERVATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), (working_dir, config.cargo_target_dir.clone()));
     }
-    let working_dir = config
-        .working_dir
-        .clone()
-        .expect("continue config must carry permit-derived cwd");
-    CONTINUE_CUSTODY_CONFIG_OBSERVATIONS
+
+    if CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATION_KEYS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, (working_dir, config.cargo_target_dir.clone()));
+        .remove(&key)
+    {
+        CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, (config.model.clone(), config.effort.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +777,22 @@ fn take_continue_custody_config_for_test(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&key);
     CONTINUE_CUSTODY_CONFIG_OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key)
+}
+
+#[cfg(test)]
+fn take_continue_model_effort_config_for_test(
+    session_id: Uuid,
+    initial_sequence: i32,
+) -> Option<(Option<String>, Option<String>)> {
+    let key = continue_custody_test_key(session_id, initial_sequence);
+    CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATION_KEYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&key)
@@ -2699,6 +2746,37 @@ impl SessionManager {
                 return Err(error);
             }
         };
+        // A queued operator selection belongs to the invocation that just
+        // ended. Apply it before context-budget refresh and LaunchConfig
+        // construction so the provider receives it on this continuation while
+        // keeping its conversation identifier and history intact.
+        let pending_model_update = {
+            let mut store = self.store.lock().await;
+            match store.session_model_invocation_id(session_id) {
+                Ok(Some(invocation_id)) => store.apply_pending_session_model_update(
+                    session_id,
+                    invocation_id,
+                    initial_sequence,
+                ),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        match pending_model_update {
+            Ok(Some(update)) => {
+                completed_session.session.model = Some(update.model);
+                completed_session.session.effort = update.effort;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.completed
+                    .write()
+                    .await
+                    .insert(session_id, completed_session);
+                return Err(error);
+            }
+        }
+
         let mut fresh_task_source = None;
 
         #[cfg(test)]
@@ -5963,6 +6041,72 @@ mod d00_tests {
             assert!(test.manager.active.read().await.contains_key(&target));
             wait_for_notice_turn(&test, target, "Read the manager inbox.").await;
             crate::session::launch::drop_controller_candidate_test_stream(target);
+        }
+
+        #[tokio::test]
+        async fn queued_model_effort_update_is_used_by_next_continue_launch() {
+            let test = test_manager();
+            let (session_id, _) = insert_completed_continue_fixture(&test, false).await;
+            let invocation_id = Uuid::new_v4();
+            {
+                let mut store = test.manager.store.lock().await;
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO model_invocations (
+                             id, purpose, invocation_kind, foreground, paid_risk,
+                             admission_status, status, provider, model, trigger_source,
+                             session_id, policy_snapshot_json, usage_confidence,
+                             created_at, started_at, completed_at
+                         ) VALUES (
+                             ?1, 'session.launch.fresh', 'model', 'foreground',
+                             'paid_capable', 'admitted', 'completed', 'Claude',
+                             'claude-sonnet-4-5', 'continue-model-effort-fixture',
+                             ?2, '{}', 'unavailable', ?3, ?3, ?3
+                         )",
+                        rusqlite::params![invocation_id.to_string(), session_id.to_string(), now],
+                    )
+                    .expect("insert completed invocation lineage fixture");
+                store
+                    .set_session_model_invocation(session_id, Some(invocation_id))
+                    .expect("bind completed session to its current invocation");
+                let receipt = store
+                    .queue_session_model_update(
+                        session_id,
+                        invocation_id,
+                        "claude-opus-4-1",
+                        Some("high"),
+                        "continue-model-effort-update",
+                    )
+                    .expect("queue model/effort update for next continuation");
+                assert_eq!(receipt.state, "queued");
+            }
+
+            install_continue_model_effort_config_observation_for_test(session_id, 0);
+            crate::session::launch::install_controller_candidate_test_process(session_id);
+            test.manager
+                .continue_session(session_id, "continue with queued model update".to_string())
+                .await
+                .expect("continue session with queued model update");
+
+            assert_eq!(
+                take_continue_model_effort_config_for_test(session_id, 0),
+                Some((
+                    Some("claude-opus-4-1".to_string()),
+                    Some("high".to_string())
+                )),
+                "continuation LaunchConfig must use the queued model and effort"
+            );
+            let store = test.manager.store.lock().await;
+            let continued = store
+                .get_session(session_id)
+                .expect("read session after continuation")
+                .expect("continued session row");
+            assert_eq!(continued.model.as_deref(), Some("claude-opus-4-1"));
+            assert_eq!(continued.effort.as_deref(), Some("high"));
+            drop(store);
+            crate::session::launch::drop_controller_candidate_test_stream(session_id);
         }
 
         #[tokio::test]

@@ -27,6 +27,9 @@ target
 # Project-specific ignores
 caveman/
 thoughts/shared/plans/modal-resize-move-model.md
+.fractal/
+.antigravitycli/
+cache/projects.json
 
 # Serena MCP tool memories
 .serena/

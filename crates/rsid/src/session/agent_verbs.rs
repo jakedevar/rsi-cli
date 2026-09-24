@@ -26,6 +26,8 @@
 //! P0.
 
 use super::SessionManager;
+#[path = "agent_authority.rs"]
+pub(crate) mod agent_authority;
 use super::spawn_coordinator::{SpawnRejectReason, SpawnState};
 use super::types::{CompletedSession, TrackedSession};
 use crate::error::{DaemonError, Result};

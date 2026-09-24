@@ -8,17 +8,17 @@ You are tasked with reviewing an existing implementation plan for technical corr
 
 ## Initial Response
 
-When this command is invoked:
+At invocation:
 
 1. **If a plan path is provided**: Read it FULLY and begin review immediately
 2. **If no plan path provided**:
    ```
    I'll help you review an implementation plan.
 
-   Please provide the path to the plan file, for example:
+   Send the plan path to review, for example:
    `/review_plan thoughts/shared/plans/2026-01-23-feature.md`
 
-   Tip: List recent plans with `ls -lt thoughts/shared/plans/ | head`
+   Tip: Use `rg --files thoughts/shared/plans` to locate recent plans.
    ```
    Wait for user input.
 

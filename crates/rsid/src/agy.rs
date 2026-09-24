@@ -278,6 +278,16 @@ impl AgyClient {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
+        if config
+            .effort
+            .as_deref()
+            .is_some_and(|effort| !matches!(effort, "low" | "medium" | "high"))
+        {
+            return Err(DaemonError::InvalidParam(
+                "Antigravity effort must be low, medium, or high".to_string(),
+            ));
+        }
+
         let invocation_id = execution.invocation_id();
         let mut cmd = Command::new(&self.binary_path);
         cmd.args([
@@ -287,6 +297,12 @@ impl AgyClient {
             "--print-timeout",
             "60m",
         ]);
+        if let Some(model) = &config.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &config.effort {
+            cmd.args(["--effort", effort]);
+        }
         if let Some(resume_id) = &config.resume_session_id {
             cmd.args(["--conversation", resume_id]);
         }
@@ -669,6 +685,52 @@ worker prompt body\n\
             fs::read_to_string(&expected_system_md).unwrap(),
             "assembled worker preamble"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_resume_launch_passes_model_and_effort() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path, _) = install_fake_agy(tmp.path());
+        let client = AgyClient { binary_path };
+
+        let mut config = test_launch_config("next turn");
+        config.model = Some("gemini-3.6-flash-high".to_string());
+        config.effort = Some("high".to_string());
+        config.resume_session_id = Some("conversation-123".to_string());
+
+        let (mut process, _rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::AntigravityCli),
+            )
+            .expect("launch fake agy");
+        let status = process.wait().await.expect("wait fake agy");
+        assert!(status.success(), "fake agy failed: {status}");
+
+        let args = read_nul_args(&args_path);
+        assert_arg_pair(&args, "--conversation", "conversation-123");
+        assert_arg_pair(&args, "--model", "gemini-3.6-flash-high");
+        assert_arg_pair(&args, "--effort", "high");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_launch_rejects_unsupported_effort() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, _, _) = install_fake_agy(tmp.path());
+        let client = AgyClient { binary_path };
+        let mut config = test_launch_config("next turn");
+        config.effort = Some("ultra".to_string());
+
+        assert!(matches!(
+            client.launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::AntigravityCli),
+            ),
+            Err(DaemonError::InvalidParam(message))
+                if message == "Antigravity effort must be low, medium, or high"
+        ));
     }
 
     #[cfg(unix)]

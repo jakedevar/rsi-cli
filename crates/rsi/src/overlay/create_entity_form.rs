@@ -2054,11 +2054,8 @@ mod tests {
         let mut app = test_app();
         let project_id = uuid::Uuid::new_v4();
         let project_dir = PathBuf::from("/tmp/acme");
-        app.projects.push(make_project(
-            project_id,
-            "Acme",
-            Some(project_dir.clone()),
-        ));
+        app.projects
+            .push(make_project(project_id, "Acme", Some(project_dir.clone())));
         app.current_project_id = Some(project_id);
 
         assert_eq!(

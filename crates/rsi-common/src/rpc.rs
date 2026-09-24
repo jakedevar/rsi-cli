@@ -236,6 +236,18 @@ pub struct SwitchSessionModelParams {
     pub new_model: String,
 }
 
+/// Queue an operator-selected model and effort for the next provider turn.
+/// The invocation fence rejects stale UI actions after a session advances.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueSessionModelUpdateParams {
+    pub session_id: Uuid,
+    pub expected_model_invocation_id: Uuid,
+    pub new_model: String,
+    #[serde(default)]
+    pub new_effort: Option<String>,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionParams {
     pub session_id: Uuid,

@@ -20,7 +20,7 @@ You are tasked with conducting fully autonomous research across the codebase. Un
 - DO NOT suggest improvements or changes
 - DO NOT perform root cause analysis
 - DO NOT propose future enhancements
-- DO NOT critique the implementation
+- Describe behavior without judging its quality
 - ONLY describe what exists, where it exists, how it works
 
 ## Input Handling
@@ -154,7 +154,7 @@ decisions_made: [count of autonomous decisions]
 
 [Current patterns, data flow, design decisions found]
 
-## Historical Context (from thoughts/)
+## Prior Work and Decisions
 
 [If thoughts/ directory was searched]
 - `thoughts/path/to/doc.md` - [Key insight]

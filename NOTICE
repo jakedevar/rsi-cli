@@ -44,18 +44,3 @@ Copyright:  Copyright (c) 2024 Alex Garcia
 Location:   crates/rsid/vendor/sqlite-vec/
 License:    MIT or Apache-2.0 at your option; both texts are in that
             directory. rsi uses it under the MIT license.
-
-HumanLayer
-----------
-Source:     https://github.com/humanlayer/humanlayer
-Copyright:  Copyright (c) 2024, humanlayer Authors
-License:    Apache License, Version 2.0 (full text: LICENSES/Apache-2.0.txt)
-
-Two prompts still contain text adapted (and modified) from HumanLayer's
-research_codebase.md and create_plan.md, so they are listed here as the
-Apache License requires. A rewrite in rsi's own words is in progress.
-
-    .claude/commands/research.md and .claude/commands/plan.md, plus the
-    copies generated from them by scripts/sync-agent-commands.sh:
-    .codex/prompts/{research,plan}.md, .gemini/commands/{research,plan}.toml,
-    .agents/skills/{research,plan}/SKILL.md

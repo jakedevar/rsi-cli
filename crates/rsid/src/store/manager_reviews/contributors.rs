@@ -99,9 +99,48 @@ impl Store {
         }
 
         let mut prior = self.conn.prepare(
-            "SELECT reviewer_session_id FROM manager_review_assignments
-             WHERE project_id=?1 AND epic_id=?2 AND work_key=?3
-               AND (?4 IS NULL OR rowid<?4) AND reviewer_session_id IS NOT NULL
+            "SELECT a.reviewer_session_id FROM manager_review_assignments a
+             WHERE a.project_id=?1 AND a.epic_id=?2 AND a.work_key=?3
+               AND (?4 IS NULL OR a.rowid<?4) AND a.reviewer_session_id IS NOT NULL
+               -- A blocked/revoked pre-effect launch cannot have contributed bytes.
+               -- Every missing or conflicting witness keeps the reviewer in the set.
+               AND NOT (a.state IN ('failed','cancelled','superseded')
+                 AND a.reviewer_invocation_id IS NULL
+                 AND a.reviewer_custody_id IS NULL
+                 AND a.reviewer_custody_generation IS NULL
+                 AND EXISTS (SELECT 1 FROM harness_manager_v2_operations o
+                     WHERE o.id=a.action_operation_id AND o.kind='lifecycle_action'
+                       AND o.project_id=a.project_id
+                       AND o.manager_session_id=a.manager_session_id
+                       AND o.scope_version=a.scope_version
+                       AND o.target_session_id=a.reviewer_session_id
+                       AND o.state IN ('blocked','revoked')
+                       AND json_extract(o.outcome_json,'$.operation_id')=o.id
+                       AND json_extract(o.outcome_json,'$.target_session_id')=a.reviewer_session_id
+                       AND json_extract(o.outcome_json,'$.state')=o.state
+                       AND json_type(o.outcome_json,'$.outcome')='text'
+                       AND length(json_extract(o.outcome_json,'$.outcome'))>0
+                       AND json_extract(o.payload_json,'$.request.operation.action')='create_session'
+                       AND EXISTS (SELECT 1 FROM harness_manager_v2_records c
+                           WHERE c.project_id=o.project_id
+                             AND c.manager_session_id=o.manager_session_id
+                             AND c.scope_version=o.scope_version
+                             AND c.kind='lifecycle_context' AND c.record_key=o.id
+                             AND json_extract(c.payload_json,'$.request.operation.action')='create_session')
+                       AND NOT EXISTS (SELECT 1 FROM harness_manager_v2_records e
+                           WHERE e.project_id=o.project_id
+                             AND e.manager_session_id=o.manager_session_id
+                             AND e.scope_version=o.scope_version
+                             AND e.kind='lifecycle_execution' AND e.record_key=o.id))
+                 AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=a.reviewer_session_id)
+                 AND NOT EXISTS (SELECT 1 FROM model_invocations i
+                     WHERE i.session_id=a.reviewer_session_id)
+                 AND NOT EXISTS (SELECT 1 FROM sandbox_custody_roots c
+                     WHERE c.owner_session_id=a.reviewer_session_id
+                        OR c.allocation_id=a.reviewer_session_id)
+                 AND NOT EXISTS (SELECT 1 FROM manager_review_receipts r
+                     WHERE r.assignment_id=a.assignment_id
+                        OR r.reviewer_session_id=a.reviewer_session_id))
              LIMIT ?5",
         )?;
         let reviewers = prior
@@ -578,6 +617,71 @@ mod tests {
         id
     }
 
+    fn prelaunch_assignment(
+        f: &Fixture,
+        reviewer: Uuid,
+        assignment_state: &str,
+        action_state: &str,
+        receipt_state: Option<&str>,
+    ) -> (Uuid, Uuid) {
+        let id = assignment(f, None, false, "2000-01-01T00:00:00.000000000Z");
+        let action = Uuid::new_v4();
+        let outcome = json!({"operation_id":action,"target_session_id":reviewer,
+            "state":receipt_state,"outcome":"manager_v2_lifecycle_unconfirmed"});
+        let payload = json!({"request":{"operation":{"action":"create_session"}}});
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,
+             scope_version,policy_version,idempotency_key,fingerprint,kind,payload_json,state,
+             target_session_id,outcome_json,not_before,created_at,updated_at)
+             VALUES(?1,?2,?3,1,1,?1,'test','lifecycle_action',?4,?5,?6,?7,
+                    '2001-01-01T00:00:00.000000000Z',
+                    '2001-01-01T00:00:00.000000000Z',
+                    '2001-01-01T00:00:00.000000000Z')",
+                params![
+                    action.to_string(),
+                    f.project.to_string(),
+                    f.manager.to_string(),
+                    payload.to_string(),
+                    action_state,
+                    reviewer.to_string(),
+                    outcome.to_string()
+                ],
+            )
+            .unwrap();
+        f.store.conn.execute(
+            "INSERT INTO harness_manager_v2_records(project_id,manager_session_id,scope_version,
+             kind,record_key,row_version,payload_json,created_at,updated_at)
+             VALUES(?1,?2,1,'lifecycle_context',?3,1,?4,?5,?5)",
+            params![f.project.to_string(), f.manager.to_string(), action.to_string(),
+                payload.to_string(), now()],
+        ).unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE manager_review_assignments SET state='allocating',reviewer_session_id=?2,
+                    action_operation_id=?3,row_version=row_version+1,
+                    updated_at='2001-01-01T00:00:00.000000000Z'
+              WHERE assignment_id=?1",
+                params![id.to_string(), reviewer.to_string(), action.to_string()],
+            )
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE manager_review_assignments SET state=?2,
+                    failure_code=CASE WHEN ?2='failed' THEN 'manager_v2_lifecycle_unconfirmed' END,
+                    row_version=row_version+1,
+                    updated_at='2002-01-01T00:00:00.000000000Z',
+                    terminal_at='2002-01-01T00:00:00.000000000Z'
+              WHERE assignment_id=?1",
+                params![id.to_string(), assignment_state],
+            )
+            .unwrap();
+        (id, action)
+    }
+
     fn contributors(f: &Fixture) -> ContributorSet {
         f.store
             .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
@@ -642,6 +746,91 @@ mod tests {
         let f = fixture();
         let reviewer = session(&f, "claude-sonnet-5");
         assignment(&f, Some(reviewer), true, &now());
+        let set = contributors(&f);
+        assert!(set.sessions.contains(&reviewer));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
+    }
+
+    #[test]
+    fn terminal_prelaunch_review_reservations_do_not_block_a_later_family() {
+        for (assignment_state, action_state) in [("failed", "blocked"), ("cancelled", "revoked")] {
+            let f = fixture();
+            let missing = Uuid::new_v4();
+            let (prior, _) = prelaunch_assignment(
+                &f,
+                missing,
+                assignment_state,
+                action_state,
+                Some(action_state),
+            );
+            let set = contributors(&f);
+            assert_eq!(set.sessions, BTreeSet::from([f.author]));
+            assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
+            assert!(check(&f, &set, ReviewModelFamily::OpenAI).is_err());
+            assert_eq!(
+                f.store
+                    .manager_review_assignment(prior)
+                    .unwrap()
+                    .reviewer_session_id,
+                Some(missing)
+            );
+        }
+    }
+
+    #[test]
+    fn missing_reviewer_without_terminal_zero_effect_proof_refuses_traversal() {
+        for (action_state, receipt_state) in [
+            ("running", Some("running")),
+            ("failed", Some("failed")),
+            ("uncertain", Some("uncertain")),
+            ("blocked", None),
+        ] {
+            let f = fixture();
+            prelaunch_assignment(&f, Uuid::new_v4(), "failed", action_state, receipt_state);
+            assert!(
+                f.store
+                    .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("contributors_unbounded")
+            );
+        }
+        let f = fixture();
+        assignment(&f, Some(Uuid::new_v4()), false, &now());
+        assert!(
+            f.store
+                .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("contributors_unbounded")
+        );
+    }
+
+    #[test]
+    fn apparent_prelaunch_failure_with_an_effect_witness_refuses_traversal() {
+        let f = fixture();
+        let (_, action) =
+            prelaunch_assignment(&f, Uuid::new_v4(), "failed", "blocked", Some("blocked"));
+        f.store.conn.execute(
+            "INSERT INTO harness_manager_v2_records(project_id,manager_session_id,scope_version,
+             kind,record_key,row_version,payload_json,created_at,updated_at)
+             VALUES(?1,?2,1,'lifecycle_execution',?3,1,'{\"effect_started\":true}',?4,?4)",
+            params![f.project.to_string(), f.manager.to_string(), action.to_string(), now()],
+        ).unwrap();
+        assert!(
+            f.store
+                .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("contributors_unbounded")
+        );
+    }
+
+    #[test]
+    fn terminal_action_with_a_persisted_reviewer_keeps_its_family() {
+        let f = fixture();
+        let reviewer = session(&f, "claude-sonnet-5");
+        prelaunch_assignment(&f, reviewer, "failed", "blocked", Some("blocked"));
         let set = contributors(&f);
         assert!(set.sessions.contains(&reviewer));
         assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());

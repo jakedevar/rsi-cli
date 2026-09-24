@@ -4,7 +4,7 @@
 //! algorithm (rendered last to overlap other content). Fixed width of 50 chars.
 
 use crate::types::ModelDropdownState;
-use crate::ui::theme;
+use crate::ui::{glyphs, theme};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -68,21 +68,29 @@ pub fn render_model_dropdown(
     frame.render_widget(Clear, popup_area);
 
     let provider_label = provider_label(state.provider);
+    let title_style = Style::default()
+        .fg(theme::overlay_title())
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()))
-        .title(Line::from(vec![Span::styled(
-            format!(
-                " Model [{}{}] ",
-                provider_label,
-                if provider_available { "" } else { " (offline)" }
+        .title(Line::from(vec![
+            Span::styled(" Model [", title_style),
+            Span::styled(
+                glyphs::provider_glyph(state.provider),
+                title_style.fg(glyphs::provider_color(state.provider)),
             ),
-            Style::default()
-                .fg(theme::overlay_title())
-                .add_modifier(Modifier::BOLD),
-        )]))
+            Span::styled(
+                format!(
+                    " {}{}] ",
+                    provider_label,
+                    if provider_available { "" } else { " (offline)" }
+                ),
+                title_style,
+            ),
+        ]))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup_area);
@@ -159,5 +167,73 @@ fn provider_label(provider: rsi_common::types::SessionProvider) -> &'static str 
         SessionProvider::CodexAppServer => "Codex(AS)",
         SessionProvider::Harness => "Harness",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use rsi_common::types::SessionProvider;
+
+    #[test]
+    fn model_dropdown_title_places_colored_glyph_beside_provider_name() {
+        let providers = [
+            SessionProvider::Claude,
+            SessionProvider::Codex,
+            SessionProvider::Pioneer,
+            SessionProvider::OpenRouter,
+            SessionProvider::Bedrock,
+            SessionProvider::Local,
+            SessionProvider::Antigravity,
+            SessionProvider::CodexAppServer,
+            SessionProvider::Harness,
+        ];
+
+        for provider in providers {
+            for available in [true, false] {
+                let state = ModelDropdownState::new(
+                    provider,
+                    vec![("model-id".into(), "Model name".into())],
+                    None,
+                );
+                let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_model_dropdown(
+                            frame,
+                            frame.area(),
+                            Rect::new(0, 0, 50, 1),
+                            &state,
+                            None,
+                            available,
+                        );
+                    })
+                    .unwrap();
+
+                let buffer = terminal.backend().buffer();
+                let title_cells = &buffer.content[60..120];
+                let title = title_cells
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                let offline = if available { "" } else { " (offline)" };
+                assert!(
+                    title.contains(&format!(
+                        "Model [{} {}{}]",
+                        glyphs::provider_glyph(provider),
+                        provider_label(provider),
+                        offline
+                    )),
+                    "provider {provider:?}: {title:?}"
+                );
+                let glyph_cell = title_cells
+                    .iter()
+                    .find(|cell| cell.symbol() == glyphs::provider_glyph(provider))
+                    .unwrap();
+                assert_eq!(glyph_cell.fg, glyphs::provider_color(provider));
+            }
+        }
     }
 }

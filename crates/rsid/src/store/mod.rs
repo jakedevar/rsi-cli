@@ -61,6 +61,7 @@ pub(crate) mod sandbox_custody;
 pub(crate) mod sandbox_reclaim;
 pub mod scheduled_jobs;
 mod session_diagnostics;
+mod session_model_updates;
 mod sessions;
 pub(crate) mod successor_reservations;
 mod summaries;
@@ -108,7 +109,7 @@ use uuid::Uuid;
 /// Released migration DDL, catalog projections, and fingerprints are
 /// immutable. Never repair them in place; add a forward migration. The
 /// repository guard pins each released block and the marked helper regions.
-pub const LATEST_SCHEMA_VERSION: i32 = 131;
+pub const LATEST_SCHEMA_VERSION: i32 = 132;
 
 // RSI-RELEASED-MIGRATION-BEGIN: v112-archive-cleanup-catalog
 pub(crate) const V112_ARCHIVE_CATALOG_OBJECTS: [(&str, &str); 10] = [
@@ -10536,6 +10537,10 @@ impl Store {
         }
         // RSI-RELEASED-MIGRATION-END: v131-sandbox-reclaim-journal-driver
 
+        // V132: persist operator model/effort selections for the next turn.
+        if version < 132 {
+            session_model_updates::apply_v132_migration(self)?;
+        }
         // V120 definitions and the internal cursor key are authenticated on
         // every reopen, before any projection reconciliation can write.
         source_worktree_v120::validate_v120_catalog(&self.conn)?;

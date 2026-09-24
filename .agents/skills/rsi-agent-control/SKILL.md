@@ -249,11 +249,25 @@ does not satisfy the landing gate for `crates/rsid/src/rpc.rs`.
   `fence`, `idempotency_key` and `operation` tagged by `action`: `resume_lead`,
   `pause_lead`, `retry_lead`, `replace_lead`, `create_container`, `update_container`,
   `archive_container`, `delete_container`, `restore_container`, `create_session`,
-  `assign_lead`, `archive_session`, `restore_session`, `update_session`, or
-  `succeed_manager`. Lead actions carry the exact observed lead/generation/event/
-  custody fence; container edits carry their observed update timestamp. Session
-  creation never implies lead assignment. Inspect the operation receipt for its
-  actual execution result; queued or uncertain is not completed.
+  `assign_lead`, `archive_session`, `restore_session`, `update_session`,
+  `operator_call`, or `succeed_manager`. Lead actions carry the exact observed
+  lead/generation/event/custody fence; container edits carry their observed
+  update timestamp. Session creation never implies lead assignment. Inspect the
+  operation receipt for its actual execution result; queued or uncertain is not
+  completed.
+  `operator_call` (K14, #672) needs `OperatorDelegation`, Execute mode, not
+  paused: it invokes one method from the closed, versioned
+  `DELEGABLE_OPERATOR_METHODS` allowlist (`ArchiveSession` logical-only,
+  `GetArchiveCleanupStatus`, `ListSessions`, `UnarchiveSession` logical
+  restore) against a leaf in the manager's own project, never through the
+  tokened RPC dispatcher. Archive/Unarchive additionally carry an
+  `OperatorCallFenceV1` with the target's observed `session_updated_at`. A
+  method outside the allowlist is refused before it reaches any handler; a
+  large disjoint `NEVER_DELEGABLE` set (appointment/scope/policy/grant, human
+  gates, daemon config, launches/spend outside quota, continuation outside
+  manager gates, deletion, daemon-global custody, `ProgramRun`/Closure,
+  generic Issue verbs) stays operator-only regardless of the grant. See
+  `docs/harness-manager.md` "Operator delegation".
   Root `succeed_manager` requires explicit SelfSuccession and a parentless Standard
   current manager. Read the Overview `manager_control` epoch/custody observation,
   supply `expected`, `launch`, and committed `handoff` (source_commit, relative_path,
@@ -300,9 +314,11 @@ operator state inspection and exact decision answers remain operator-only
 `ConfigureHarnessManagerPolicy`, `GetHarnessManagerState`,
 `AnswerHarnessManagerDecision`); they have no native tools or agent schemas. A
 title/prompt never appoints a manager. Scope changes fence old requests/actions.
-Beyond `SessionControl` (scoped halt, continue and mail) and `IssueCoordinate`
-(the seven guarded Issue controls), manager grants do not widen other Agent
-verbs or expose ProgramRun methods.
+Beyond `SessionControl` (scoped halt, continue and mail), `IssueCoordinate`
+(the seven guarded Issue controls) and `OperatorDelegation` (one allowlisted
+method per `operator_call`, never a raw verb), manager grants do not widen
+other Agent verbs or expose ProgramRun methods. Decision answers
+(`AnswerHarnessManagerDecision`) stay operator-only regardless of any grant.
 Status/monitor/execute intent, operator/Epic pauses, creation quotas, concurrency,
 provider/model/effort choices, retry count/delay/deadlines and spend caps are
 persisted. Unfinished authorized work remains an obligation after a provider turn

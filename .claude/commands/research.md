@@ -1,12 +1,15 @@
 ---
-description: Document codebase as-is with thoughts directory for historical context
+description: Trace current rsi behavior and record checked source evidence
 model: opus
 capability_class: architect
 ---
 
 # Research Codebase
 
-You are tasked with conducting comprehensive research across the codebase to answer user questions by spawning parallel sub-agents and synthesizing their findings.
+Map the current implementation for the question given. Use source and tests as
+the primary evidence; use prior notes to explain history. Describe behavior,
+ownership, and connections. Offer diagnoses or proposed changes only when the
+request calls for them.
 
 **Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=research` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
@@ -24,30 +27,18 @@ These lenses inform WHAT to document. Describe the state relative to each lens w
 
 Canonical reference with full expert descriptions: `five-experts.md`
 
-## CRITICAL: YOUR ONLY JOB IS TO DOCUMENT AND EXPLAIN THE CODEBASE AS IT EXISTS TODAY
-- DO NOT suggest improvements or changes unless the user explicitly asks for them
-- DO NOT perform root cause analysis unless the user explicitly asks for them
-- DO NOT propose future enhancements unless the user explicitly asks for them
-- DO NOT critique the implementation or identify problems
-- DO NOT recommend refactoring, optimization, or architectural changes
-- ONLY describe what exists, where it exists, how it works, and how components interact
-- You are creating a technical map/documentation of the existing system
+## Start
 
-## Initial Setup:
-
-When this command is invoked, respond with:
-```
-I'm ready to research the codebase. Please provide your research question or area of interest, and I'll analyze it thoroughly by exploring relevant components and connections.
-```
-
-Then wait for the user's research query.
+If the question names a file, ticket, or document, read its relevant sections
+first. If no question was supplied, ask for the area to investigate and wait.
+Keep the shared preamble's read and return budgets throughout the task.
 
 ## Scope Routing — MANDATORY
 
 After receiving the user's research query (and before spawning sub-agents in Step 3), assess scope. If ANY of the following are true, automatically route to `/team_research`:
 
 - Spans >2 crates or major subsystems (e.g., TUI + daemon + common simultaneously)
-- Likely needs >5 codebase-locator/analyzer sub-agents to cover
+- Likely needs >5 research sub-agents to cover
 - Crosses >3 independent domains (e.g., schema + RPC + UI + persistence)
 - Estimated >30 min of focused investigation
 
@@ -64,133 +55,49 @@ current session and note the degraded execution mode; do not turn missing team
 tooling into a user gate. An explicit user instruction to keep the work solo
 overrides this automatic route.
 
-## Steps to follow after receiving the research query:
+## Workflow
 
-1. **Read any directly mentioned files first:**
-   - If the user mentions specific files (tickets, docs, JSON), read the relevant sections first
-   - **IMPORTANT**: Honor the shared preamble's read budget (see `_shared/worker_preamble.md` §Read budget).
-   - **CRITICAL**: Read these files yourself in the main context before spawning any sub-tasks
-   - This ensures you have full context before decomposing the research
+1. **Read the inputs.** Record the question and inspect named files before
+   delegating. Keep reads within the shared preamble's budget.
+2. **Divide the investigation.** Locate entry points with `rg` or
+   `rg --files`, follow the relevant calls and data, and assign distinct
+   research areas. Inspect tests for observable behavior.
+3. **Trace each area.** If the active harness supports research sub-agents and
+   the scope justifies them, give each a separate domain and a compact evidence
+   request. Built-in `Explore` and `codebase-analyzer` are suitable where
+   available. Check their claims in the main context. Read relevant
+   `thoughts/` files and recent commits after the live paths are known; use
+   them as history, not proof of today's behavior.
+4. **Synthesize.** Recheck file and line references, explain how components
+   interact, and separate observed behavior from unresolved questions. Do not
+   turn a research report into an unsolicited implementation plan.
+5. **Gather document metadata.** Capture the current date with timezone, HEAD,
+   branch, repository name, researcher, and the exact question before writing.
+   Name the file `thoughts/shared/research/YYYY-MM-DD-ENG-XXXX-topic.md`
+   when a ticket number exists; omit the ticket component otherwise.
+6. **Write the research document.** Include YAML frontmatter with `date`,
+   `researcher`, `git_commit`, `branch`, `repository`, `topic`,
+   `tags`, `status`, `last_updated`, and `last_updated_by`. Use these
+   headings and give every finding a concrete source reference:
 
-2. **Analyze and decompose the research question:**
-   - Break down the user's query into composable research areas
-   - Take time to ultrathink about the underlying patterns, connections, and architectural implications the user might be seeking
-   - Identify specific components, patterns, or concepts to investigate
-   - Create a research plan using TodoWrite to track all subtasks
-   - Consider which directories, files, or architectural patterns are relevant
+   ```markdown
+   # Research: [topic]
 
-3. **Spawn parallel sub-agent tasks for comprehensive research:**
-   - Create multiple Task agents to research different aspects concurrently
-   - We now have specialized agents that know how to do specific research tasks:
+   ## Research Question
+   ## Summary
+   ## Detailed Findings
+   ### [Component/Area 1]
+   ### [Component/Area 2]
+   ## Code References
+   ## Architecture Documentation
+   ## Historical Notes
+   ## Related Research
+   ## Open Questions
+   ```
 
-   **For codebase research:**
-   - Use the **codebase-locator** agent to find WHERE files and components live
-   - Use the **codebase-analyzer** agent to understand HOW specific code works (without critiquing it)
-   - Use the **codebase-pattern-finder** agent to find examples of existing patterns (without evaluating them)
-
-   **IMPORTANT**: All agents are documentarians, not critics. They will describe what exists without suggesting improvements or identifying issues.
-
-   **For thoughts directory:**
-   - Use the **thoughts-locator** agent to discover what documents exist about the topic
-   - Use the **thoughts-analyzer** agent to extract key insights from specific documents (only the most relevant ones)
-
-   **For web research (only if user explicitly asks):**
-   - Use the **web-search-researcher** agent for external documentation and resources
-   - IF you use web-research agents, instruct them to return LINKS with their findings, and please INCLUDE those links in your final report
-
-   **For Linear tickets (if relevant):**
-   - Use the **linear-ticket-reader** agent to get full details of a specific ticket
-   - Use the **linear-searcher** agent to find related tickets or historical context
-
-   The key is to use these agents intelligently:
-   - Start with locator agents to find what exists
-   - Then use analyzer agents on the most promising findings to document how they work
-   - Run multiple agents in parallel when they're searching for different things
-   - Each agent knows its job - just tell it what you're looking for
-   - Don't write detailed prompts about HOW to search - the agents already know
-   - Remind agents they are documenting, not evaluating or improving
-
-4. **Wait for all sub-agents to complete and synthesize findings:**
-   - IMPORTANT: Wait for ALL sub-agent tasks to complete before proceeding
-   - Compile all sub-agent results (both codebase and thoughts findings)
-   - Prioritize live codebase findings as primary source of truth
-   - Use thoughts/ findings as supplementary historical context
-   - Connect findings across different components
-   - Include specific file paths and line numbers for reference
-   - Verify all thoughts/ paths are correct (e.g., thoughts/allison/ not thoughts/shared/ for personal files)
-   - Highlight patterns, connections, and architectural decisions
-   - Answer the user's specific questions with concrete evidence
-
-5. **Gather metadata for the research document:**
-   - Filename: `thoughts/shared/research/YYYY-MM-DD-ENG-XXXX-description.md`
-     - Format: `YYYY-MM-DD-ENG-XXXX-description.md` where:
-       - YYYY-MM-DD is today's date
-       - ENG-XXXX is the ticket number (omit if no ticket)
-       - description is a brief kebab-case description of the research topic
-     - Examples:
-       - With ticket: `2025-01-08-ENG-1478-parent-child-tracking.md`
-       - Without ticket: `2025-01-08-authentication-flow.md`
-
-6. **Generate research document:**
-   - Use the metadata gathered in step 4
-   - Structure the document with YAML frontmatter followed by content:
-     ```markdown
-     ---
-     date: [Current date and time with timezone in ISO format]
-     researcher: [Researcher name from thoughts status]
-     git_commit: [Current commit hash]
-     branch: [Current branch name]
-     repository: [Repository name]
-     topic: "[User's Question/Topic]"
-     tags: [research, codebase, relevant-component-names]
-     status: complete
-     last_updated: [Current date in YYYY-MM-DD format]
-     last_updated_by: [Researcher name]
-     ---
-
-     # Research: [User's Question/Topic]
-
-     **Date**: [Current date and time with timezone from step 4]
-     **Researcher**: [Researcher name from thoughts status]
-     **Git Commit**: [Current commit hash from step 4]
-     **Branch**: [Current branch name from step 4]
-     **Repository**: [Repository name]
-
-     ## Research Question
-     [Original user query]
-
-     ## Summary
-     [High-level documentation of what was found, answering the user's question by describing what exists]
-
-     ## Detailed Findings
-
-     ### [Component/Area 1]
-     - Description of what exists ([file.ext:line](link))
-     - How it connects to other components
-     - Current implementation details (without evaluation)
-
-     ### [Component/Area 2]
-     ...
-
-     ## Code References
-     - `path/to/file.py:123` - Description of what's there
-     - `another/file.ts:45-67` - Description of the code block
-
-     ## Architecture Documentation
-     [Current patterns, conventions, and design implementations found in the codebase]
-
-     ## Historical Context (from thoughts/)
-     [Relevant insights from thoughts/ directory with references]
-     - `thoughts/shared/something.md` - Historical decision about X
-     - `thoughts/local/notes.md` - Past exploration of Y
-     Note: Paths exclude "searchable/" even if found there
-
-     ## Related Research
-     [Links to other research documents in thoughts/shared/research/]
-
-     ## Open Questions
-     [Any areas that need further investigation]
-     ```
+   The summary answers the question. Detailed Findings describe the current
+   paths and behavior. Code References list checked `path:line` locations.
+   Open Questions record facts that could not be established.
 
 6b. **Emit JSON companion + validate (RSI-014):**
    After the markdown research document is written at `<doc>.md`, resolve `rsi-research-validate` from the active repository root before constructing a sidecar. Never search or build from an absolute RSI checkout and never assume a `crates/` layout.
@@ -214,61 +121,40 @@ overrides this automatic route.
    11. On exit `1` (I/O) → same fallback as exit 2; surface the I/O error in your final summary to the user. Validator exit failures are never `SKIPPED`.
    The JSON is opaque to daemon pipeline detection (`PIPELINE_PATH_RE` only matches `.md`); no auto-derive double-fire concern.
 
-7. **Add GitHub permalinks (if applicable):**
-   - Check if on main branch or if commit is pushed: `git branch --show-current` and `git status`
-   - If on main/master or pushed, generate GitHub permalinks:
-     - Get repo info: `gh repo view --json owner,name`
-     - Create permalinks: `https://github.com/{owner}/{repo}/blob/{commit}/{file}#L{line}`
-   - Replace local file references with permalinks in the document
+7. **Add GitHub permalinks (if applicable):** Only use a permalink when
+   the cited commit is available on the remote. Otherwise keep local path and
+   line references. Do not substitute a moving branch URL for a commit URL.
+8. **Commit and report.** Commit the markdown and a valid JSON companion
+   together. Summarize the findings, references, and unresolved questions.
+9. **Follow-up research.** Append dated findings to the same document, update
+   `last_updated` and `last_updated_by`, revalidate any companion, and
+   commit the revision. Recheck live code for each new question.
 
-8. **Sync and present findings:**
-   - Present a concise summary of findings to the user
-   - Include key file references for easy navigation
-   - Ask if they have follow-up questions or need clarification
+## Stage contract
 
-9. **Handle follow-up questions:**
-   - If the user has follow-up questions, append to the same research document
-   - Update the frontmatter fields `last_updated` and `last_updated_by` to reflect the update
-   - Add `last_updated_note: "Added follow-up research for [brief description]"` to frontmatter
-   - Add a new section: `## Follow-up Research [timestamp]`
-   - Spawn new sub-agents as needed for additional investigation
-   - Continue updating the document and syncing
+### Inputs
 
-## Important notes:
-- Always use parallel Task agents to maximize efficiency and minimize context usage
-- Always run fresh codebase research - never rely solely on existing research documents
-- The thoughts/ directory provides historical context to supplement live findings
-- Focus on finding concrete file paths and line numbers for developer reference
-- Research documents should be self-contained with all necessary context
-- Each sub-agent prompt should be specific and focused on read-only documentation operations
-- Document cross-component connections and how systems interact
-- Include temporal context (when the research was conducted)
-- Link to GitHub when possible for permanent references
-- Keep the main agent focused on synthesis, not deep file reading
-- Have sub-agents document examples and usage patterns as they exist
-- Explore all of thoughts/ directory, not just research subdirectory
-- **CRITICAL**: You and all sub-agents are documentarians, not evaluators
-- **REMEMBER**: Document what IS, not what SHOULD BE
-- **NO RECOMMENDATIONS**: Only describe the current state of the codebase
+Named question and files, or a bounded code-discovery budget using `rg` and
+`rg --files`. The shared preamble supplies the read budget.
+
+### Process
+
+Trace current code and tests, inspect relevant history, verify references,
+write the markdown, then apply step 6b to its companion.
+
+### Outputs
+
+A committed research markdown file and, when validation succeeds, a v2 JSON
+sidecar with stable `F-001` style finding IDs.
+
+### Verify
+
+Run the selected `rsi-research-validate` when available under step 6b, and
+check that every cited path and line exists in the current checkout.
+
 - **COMMIT AND PUSH — REQUIRED**: Before responding, commit the research document and other task-owned files using explicit paths. Never stage the entire `thoughts/` directory or unrelated edits. Leave the tree clean. Push only if the user explicitly asked; then push the current feature branch as a safe fast-forward, never `main`.
-- **File reading**: Honor the read budget before spawning sub-tasks (see worker preamble §2).
-- **Critical ordering**: Follow the numbered steps exactly
-  - ALWAYS read mentioned files first before spawning sub-tasks (step 1)
-  - ALWAYS wait for all sub-agents to complete before synthesizing (step 4)
-  - ALWAYS gather metadata before writing the document (step 5 before step 6)
-  - NEVER write the research document with placeholder values
-- **Path handling**: The thoughts/searchable/ directory contains hard links for searching
-  - Always document paths by removing ONLY "searchable/" - preserve all other subdirectories
-  - Examples of correct transformations:
-    - `thoughts/searchable/allison/old_stuff/notes.md` → `thoughts/allison/old_stuff/notes.md`
-    - `thoughts/searchable/shared/prs/123.md` → `thoughts/shared/prs/123.md`
-    - `thoughts/searchable/global/shared/templates.md` → `thoughts/global/shared/templates.md`
-  - NEVER change allison/ to shared/ or vice versa - preserve the exact directory structure
-  - This ensures paths are correct for editing and navigation
-- **Frontmatter consistency**:
-  - Always include frontmatter at the beginning of research documents
-  - Keep frontmatter fields consistent across all research documents
-  - Update frontmatter when adding follow-up research
-  - Use snake_case for multi-word field names (e.g., `last_updated`, `git_commit`)
-  - Tags should be relevant to the research topic and components studied
-  - Always write the research document to `thoughts/shared/research/` — the daemon detects this Write and automatically derives the next pipeline step (`/plan`).
+- Preserve the exact directory of every `thoughts/` source you cite;
+  do not rewrite a personal note path into `thoughts/shared/`.
+- When updating a document, keep frontmatter field names in snake_case and
+  record the update date. Never leave placeholder metadata in a committed file.
+- Always write the research document to `thoughts/shared/research/` — the daemon detects this Write and automatically derives the next pipeline step (`/plan`).

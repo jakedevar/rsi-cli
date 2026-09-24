@@ -472,9 +472,9 @@ If master finds the codebase doesn't match the plan during Tier 0 or sequential 
 
 ```
 Issue in Phase [N]: [Title]
-Expected: [what the plan says]
+Planned behavior: [specific plan claim]
 Found: [actual situation]
-Why this matters: [explanation]
+Effect on this phase: [what changes or becomes blocked]
 
 How should I proceed?
 ```

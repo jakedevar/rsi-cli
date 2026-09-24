@@ -4,8 +4,7 @@ A vim-native terminal UI for running many AI coding agents at once (Claude
 Code, Codex, Antigravity, local models, or a direct API harness) from one
 keyboard-driven screen.
 
-> **Status:** early alpha, shared with friends. Expect rough edges and
-> breaking changes.
+> **Status:** alpha. Expect rough edges and breaking changes.
 
 ## What it does
 

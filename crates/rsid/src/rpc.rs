@@ -76,16 +76,17 @@ use rsi_common::rpc::{
     ListRecursiveTaskAttemptsParams, ListRecursiveTaskGraphsParams, ListRecursiveTasksParams,
     ListSessionChildrenParams, ListStaleRecursiveLiveAttemptHeartbeatsParams, ListTagsParams,
     ListTopologiesParams, METHOD_NOT_FOUND, PreviewRecursiveExecutionArtifactParams,
-    ReconcileProgramRunsParams, ReconcileProgramRunsResult, RecursiveCancellationRequestIdParams,
-    RecursiveSchedulerRunIdParams, RecursiveTaskGraphIdParams, RecursiveTaskIdParams,
-    RemoveSessionTagParams, RequestRecursiveGraphCancellationParams,
-    RequestRecursiveSchedulerRunCancellationParams, RequestTopologyRecursiveCancellationParams,
-    ResumeBlockedProgramRunParams, RotateSessionParams, RpcError, RpcErrorData, RpcRequest,
-    RpcResponse, RunRecursiveFakeSchedulerParams, RunRecursiveLiveSchedulerParams,
-    RunRecursiveTopologyNodeFakeSchedulerParams, SetEpicLeadParams, SetSessionParentParams,
-    StartChainedWorkflowParams, StartChainedWorkflowResponse, SubscribeParams,
-    UpdateIndexStatusParams, UpdateIssueStatusParams, UpdateModelControlPolicyParams,
-    UpdateSessionRatingParams, UpdateSessionTagsParams, UpdateTopologyParams,
+    QueueSessionModelUpdateParams, ReconcileProgramRunsParams, ReconcileProgramRunsResult,
+    RecursiveCancellationRequestIdParams, RecursiveSchedulerRunIdParams,
+    RecursiveTaskGraphIdParams, RecursiveTaskIdParams, RemoveSessionTagParams,
+    RequestRecursiveGraphCancellationParams, RequestRecursiveSchedulerRunCancellationParams,
+    RequestTopologyRecursiveCancellationParams, ResumeBlockedProgramRunParams, RotateSessionParams,
+    RpcError, RpcErrorData, RpcRequest, RpcResponse, RunRecursiveFakeSchedulerParams,
+    RunRecursiveLiveSchedulerParams, RunRecursiveTopologyNodeFakeSchedulerParams,
+    SetEpicLeadParams, SetSessionParentParams, StartChainedWorkflowParams,
+    StartChainedWorkflowResponse, SubscribeParams, UpdateIndexStatusParams,
+    UpdateIssueStatusParams, UpdateModelControlPolicyParams, UpdateSessionRatingParams,
+    UpdateSessionTagsParams, UpdateTopologyParams,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -1744,6 +1745,7 @@ impl RpcServer {
                 "SwitchSessionModel has been deprecated. Model is locked at session creation."
                     .to_string(),
             )),
+            "QueueSessionModelUpdate" => self.handle_queue_session_model_update(request).await,
             "GetModelSegments" => self.handle_get_model_segments(request).await,
             // Read-only lifetime usage aggregate (T8) — operator/TUI-only,
             // deliberately NOT added to READ_VERBS (F-010).
@@ -6040,6 +6042,27 @@ impl RpcServer {
             "session_id": params.session_id,
             "rating": params.rating,
         }))
+    }
+
+    async fn handle_queue_session_model_update(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: QueueSessionModelUpdateParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
+        let receipt = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .queue_session_model_update(
+                params.session_id,
+                params.expected_model_invocation_id,
+                &params.new_model,
+                params.new_effort.as_deref(),
+                &params.idempotency_key,
+            )?;
+        Ok(serde_json::to_value(receipt)?)
     }
 
     async fn handle_continue_session(&self, request: &RpcRequest) -> Result<serde_json::Value> {
@@ -14638,6 +14661,88 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn model_update_rpc_is_operator_only() {
+        let fixture = recursive_dag_rpc_fixture();
+        let method = "QueueSessionModelUpdate";
+        assert!(!agent_gate::AGENT_VERBS.contains(&method));
+        assert!(!agent_gate::READ_VERBS.contains(&method));
+
+        let mut request = RpcRequest::new(
+            method,
+            serde_json::json!({
+                "session_id": Uuid::new_v4(),
+                "expected_model_invocation_id": Uuid::new_v4(),
+                "new_model": "claude-opus-4-1",
+                "new_effort": "high",
+                "idempotency_key": "test-switch",
+            }),
+        );
+        request.session_token = Some("operator-only-test-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response");
+        };
+        let error = response
+            .error
+            .expect("attributed caller must be denied the operator-only method");
+        assert_eq!(error.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn operator_can_queue_a_fenced_model_update() {
+        let fixture = recursive_dag_rpc_fixture();
+        let session_id = Uuid::new_v4();
+        let invocation_id = Uuid::new_v4();
+        let mut session = mk_agent_test_session(
+            session_id,
+            rsi_common::types::SessionKind::Standard,
+            None,
+            None,
+        );
+        session.model = Some("claude-sonnet-4-5".to_string());
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .insert_session(&session)
+            .expect("insert switchable session");
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .set_session_model_invocation(session_id, Some(invocation_id))
+            .expect("set invocation fence");
+
+        let response = call_rpc(
+            &fixture.server,
+            "QueueSessionModelUpdate",
+            serde_json::json!({
+                "session_id": session_id,
+                "expected_model_invocation_id": invocation_id,
+                "new_model": "claude-opus-4-1",
+                "new_effort": "high",
+                "idempotency_key": "operator-switch-1",
+            }),
+        )
+        .await;
+        assert!(
+            response.error.is_none(),
+            "unexpected RPC error: {response:?}"
+        );
+        let receipt = response.result.expect("queued update receipt");
+        assert_eq!(receipt["session_id"], session_id.to_string());
+        assert_eq!(
+            receipt["expected_model_invocation_id"],
+            invocation_id.to_string()
+        );
+        assert_eq!(receipt["state"], "queued");
+        assert_eq!(receipt["new_model"], "claude-opus-4-1");
+        assert_eq!(receipt["new_effort"], "high");
     }
 
     /// P-003/D04: the 8 local-issue-tracker operator verbs are deliberately

@@ -35852,7 +35852,7 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 131;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 132;
 
 /// Catalog objects installed by the V131 sandbox reclaim journal migration.
 const V131_SANDBOX_RECLAIM_OBJECTS: [(&str, &str); 16] = [
@@ -35987,9 +35987,30 @@ fn rewind_session_diagnostics_v127_fixture_to_v126(connection: &Connection) {
 }
 // RSI-RELEASED-MIGRATION-END: v127-session-diagnostics-rewind
 
+// RSI-RELEASED-MIGRATION-BEGIN: v132-session-model-updates-rewind
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn rewind_session_model_updates_v132_fixture_to_v131(connection: &Connection) {
+    let version: i32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    if version == 131 {
+        return;
+    }
+    assert_eq!(version, 132, "V132-to-V131 rewind requires V132");
+    connection
+        .execute_batch(
+            "DROP INDEX idx_session_model_updates_one_queued;
+             DROP INDEX idx_session_model_updates_session_created;
+             DROP TABLE session_model_updates;
+             PRAGMA user_version=131;",
+        )
+        .expect("rewind V132 queued session model updates schema");
+}
+// RSI-RELEASED-MIGRATION-END: v132-session-model-updates-rewind
+
 /// Exact teardown of the post-V121 tail down to `target` (121..=head), always
-/// in chain order V131 -> V130 -> V129 -> V128 -> V127 -> V126 -> V125 -> V124 -> V123 -> V122 so each
-/// helper receives the exact
+/// in chain order V132 -> V131 -> V130 -> V129 -> V128 -> V127 -> V126 ->
+/// V125 -> V124 -> V123 -> V122 so each helper receives the exact
 /// source version it requires. The generic fixture validator cannot claim a
 /// V120+ catalog, so tests that need an exact V121..V123 source use this.
 #[allow(clippy::expect_used)]
@@ -36008,6 +36029,9 @@ pub(super) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= 132 && target <= 131 {
+        rewind_session_model_updates_v132_fixture_to_v131(connection);
+    }
     if active >= 131 && target <= 130 {
         rewind_sandbox_reclaim_journal_v131_fixture_to_v130(connection);
     }
@@ -38658,6 +38682,23 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
     }
     // RSI-RELEASED-MIGRATION-END: v127-session-diagnostics-fixture-assertion
 
+    // RSI-RELEASED-MIGRATION-BEGIN: v132-session-model-updates-fixture-assertion
+    for (kind, name) in super::session_model_updates::V132_CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V132 session model update catalog object");
+        assert_eq!(
+            present,
+            target_version >= 132,
+            "fixture V{target_version} has incorrect V132 {kind} `{name}` presence"
+        );
+    }
+    // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-fixture-assertion
+
     let session_columns = table_columns(connection, "sessions");
     let request_columns = table_columns(connection, "agent_spawn_requests");
     if target_version < 112 {
@@ -39346,6 +39387,19 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
         assert_eq!(found, 1, "V127 did not replay: {kind} {name} is missing");
     }
     // RSI-RELEASED-MIGRATION-END: v127-session-diagnostics-replay-assertion
+
+    // RSI-RELEASED-MIGRATION-BEGIN: v132-session-model-updates-replay-assertion
+    for (kind, name) in super::session_model_updates::V132_CATALOG_OBJECTS {
+        let found: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V132 session model update catalog object");
+        assert_eq!(found, 1, "V132 did not replay: {kind} {name} is missing");
+    }
+    // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-replay-assertion
 
     for (kind, name) in super::manager_prepared_actions::CATALOG_OBJECTS {
         let found: bool = connection

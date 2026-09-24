@@ -304,6 +304,56 @@ the consumer contract BEFORE launching a reviewer.
   it for an unattended handover until they close. Until then hand on manually:
   land everything accepted, commit a handoff, give the operator a short launch
   prompt that reads it by ref, and have the successor rebuild the ledger.
+- Project-wide bulk archive/restore (K14, #672) needs `OperatorDelegation` in
+  Execute mode, not paused. Both directions loop `operator_call` `ListSessions`
+  — a project-bound keyset page over `(updated_at, id)`, ≤64 rows/≤12 KiB,
+  follow `next_after` until absent — but the page filter and the per-row skip
+  differ, because `archive_blocker` is an `ArchiveSession`-only signal:
+  - **Bulk archive**: page with `status_in: ["Completed","Failed","Interrupted"]`,
+    skip any row whose page `archive_blocker` is non-null, then `operator_call`
+    `ArchiveSession` on the rest with the row's observed `session_updated_at`
+    as the `OperatorCallFenceV1`.
+  - **Bulk restore**: page with `status_in: ["Archived"]`. Do NOT filter on
+    `archive_blocker` here — `delegated_archive_blocker`'s own first check
+    refuses every `Archived`/`Deleted` row `manager_v2_session_state_changed`
+    (`crates/rsid/src/store/manager_actions.rs:578-580`), so an
+    `archive_blocker`-based skip discards every restore candidate and never
+    calls `UnarchiveSession`. Skip only rows whose `sandbox_cleanup_state ==
+    "Purged"` (a cheap, always-true predictor of
+    `manager_v2_historical_restore_refused`; see
+    `historical_session_restore_blocked_on`,
+    `crates/rsid/src/store/sessions.rs:31-49`), then `operator_call`
+    `UnarchiveSession` on the rest with its `OperatorCallFenceV1`, tolerating
+    a `manager_v2_historical_restore_refused` refusal for a row whose
+    source-worktree settlement history blocks it — that half of the gate is
+    not visible on the page.
+  For both directions: `ArchiveSession`/`UnarchiveSession` rewrite the target's
+  `updated_at`, which can move it past an in-progress cursor, but once its
+  status changes it stops matching that direction's `status_in` filter and
+  cannot reappear on a later page of the SAME walk. Still treat a duplicate id
+  as a no-op: re-`ArchiveSession`-ing an already-Archived row is refused
+  `manager_v2_session_state_changed`, never a second effect. Reach is the
+  whole project, not Group/Epic scope.
+  `ArchiveSession` is logical-only (never a sandbox purge) and also refuses:
+  `manager_v2_retention_pinned`, `manager_v2_session_is_lead`,
+  `manager_v2_human_or_recovery_owner`, `manager_v2_retention_enabled_wake`,
+  `manager_v2_retention_live_review`, `manager_v2_retention_sealed_source`,
+  `manager_v2_retention_recent_activity` (any activity in the last 24h),
+  `manager_v2_retention_live_worktree`, `manager_v2_session_has_descendants`,
+  or `manager_v2_session_not_terminal`. `UnarchiveSession` has none of those
+  retention gates; it refuses only `manager_v2_session_state_changed` (row is
+  not `Archived` at effect time) or `manager_v2_historical_restore_refused`
+  (purged sandbox or unsettled worktree history) — see
+  `crates/rsid/src/store/manager_actions/operator_delegation.rs:97-107`.
+  A stale fence on either is `manager_v2_session_changed`; a target outside the
+  grant's project or a non-leaf is `manager_v2_target_out_of_project` /
+  `manager_v2_leaf_required`. A method outside
+  `ArchiveSession`/`GetArchiveCleanupStatus`/`ListSessions`/`UnarchiveSession`
+  is `manager_v2_operator_method_not_delegable` — this covers every other
+  operator RPC method, not only the `NEVER_DELEGABLE` ones (a plain
+  `GetSession` is refused the same way; it is in neither list). See
+  `docs/harness-manager.md` "Operator delegation" for the full retention
+  table and allowlist.
 
 ## Wakes
 

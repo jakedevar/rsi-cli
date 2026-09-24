@@ -1,0 +1,27 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/stop_notify.js",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {},
+  "mcpServers": {},
+  "permissions": {
+    "allow": [
+      "Edit(/home/jakedevar/rsi/.claude/commands/**)",
+      "Bash(mkdir -p /home/jakedevar/rsi/.claude/commands/_shared)",
+      "Bash(mkdir /home/jakedevar/rsi/.claude/commands/_shared)"
+    ]
+  }
+}

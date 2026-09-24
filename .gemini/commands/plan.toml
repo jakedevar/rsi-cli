@@ -7,7 +7,10 @@ capability_class: architect
 
 # Implementation Plan
 
-You are tasked with creating detailed implementation plans through an interactive, iterative process. You should be skeptical, thorough, and work collaboratively with the user to produce high-quality technical specifications.
+Turn a ticket, specification, or research document into an executable plan for
+the current rsi checkout. Produce a complete first draft with concrete files,
+ordering, and checks. Keep questions for the operator only when missing
+authority or an unresolved product choice changes the requested outcome.
 
 **Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=planning` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
@@ -25,32 +28,13 @@ This application is built for a single user (IQ 150, ADHD, vim devotee). Quality
 
 Canonical reference with full expert descriptions: `five-experts.md`
 
-## Initial Response
+## Start
 
-When this command is invoked:
-
-1. **Check if parameters were provided**:
-   - If a file path or ticket reference was provided as a parameter, skip the default message
-   - Immediately read any provided files (honor the shared preamble's read budget — see `_shared/worker_preamble.md` §Read budget)
-   - **Check for a matching worktree** (see Step 0 below)
-   - Begin the research process
-
-2. **If no parameters provided**, respond with:
-```
-I'll help you create a detailed implementation plan. Let me start by understanding what we're building.
-
-Please provide:
-1. The task/ticket description (or reference to a ticket file)
-2. Any relevant context, constraints, or specific requirements
-3. Links to related research or previous implementations
-
-I'll analyze this information and work with you to create a comprehensive plan.
-
-Tip: You can also invoke this command with a ticket file directly: `/plan thoughts/allison/tickets/eng_1234.md`
-For deeper analysis, try: `/plan think deeply about thoughts/allison/tickets/eng_1234.md`
-```
-
-Then wait for the user's input.
+Read the supplied ticket and linked files before searching or dispatching
+work. If no task is supplied, request one. Keep any RSI-owned sandbox as the
+working tree; do not switch branches or move into another worktree during an
+RSI-managed session. Check the active branch, HEAD, and dirty state before
+planning.
 
 ## Scope Routing — MANDATORY
 
@@ -74,133 +58,43 @@ current session and note the degraded execution mode; do not turn missing team
 tooling into a user gate. An explicit user instruction to keep the work solo
 overrides this automatic route.
 
-## Process Steps
+## Plan workflow
 
-### Step 0: Worktree Detection & Checkout
+1. **Collect source evidence.** Read the stated requirements, the relevant
+   code and tests, and current AGENTS.md rules. Discover unknown paths with
+   bounded `rg`/`rg --files` searches. Use prior `thoughts/` documents to
+   explain decisions, then verify their claims against the current checkout.
+   For each cited research markdown file, derive
+   its sibling `.json`. If it is absent or the markdown says
+   `json_companion_status: invalid`, use the markdown. Otherwise build the
+   repository's `rsi-research-validate` binary if needed and validate the
+   JSON. Read valid `areas`, `findings`, `file_refs`, and blocking
+   `open_questions`; on validation failure, record the error in the trace
+   and use the markdown. Preserve each `findings[].id` as its join key.
+2. **Investigate by domain.** Trace current behavior through source, tests,
+   storage, RPC, and UI as applicable. Delegate independent domains only when
+   the active harness supports it and the scope justifies it; built-in
+   `Explore` and `codebase-analyzer` may locate and explain code paths.
+   Verify returned paths and claims before using them in the plan.
+3. **Resolve design choices.** Compare feasible approaches with the Five-Expert
+   Decision Framework. Put foundation and migrations before dependent code.
+   Reconcile every requirement with the proposed behavior; an unresolved
+   contradiction is a blocker to a ready plan. Record the decision and its
+   evidence.
+4. **Write the plan.** Use
+   `thoughts/shared/plans/YYYY-MM-DD-ENG-XXXX-topic.md` for numbered work,
+   or omit the ticket segment when none exists. Include scope, current state,
+   desired end state, evidence register, design decisions, ordered phases,
+   dependencies, tests, risks, and explicit out-of-scope items. Each phase
+   names exact files, the intended behavior, and a check that proves it.
+5. **Validate and commit.** Check cited paths, phase ordering, contract
+   sections, provenance coverage, and success criteria. Run
+   `rsi-contract-validate` or `rsi-manifest-validate` when the plan's
+   workflow provides those artifacts. Commit the plan and task-owned files
+   using explicit paths, then report its location and material assumptions.
 
-When a file path parameter is provided, check if a git worktree exists that matches the filename stem (without extension):
+## Provenance and evidence
 
-1. **Extract the name from the file path**:
-   - Given a path like `thoughts/shared/plans/2026-02-10-archived-session-browser.md`
-   - Extract the stem: `2026-02-10-archived-session-browser`
-
-2. **Check for a matching worktree**:
-   - Run `git worktree list` and look for a worktree whose path or branch name contains the extracted stem
-   - Match against worktree paths in these known locations:
-     - `.worktrees/<stem>/`
-     - `~/rsi-<stem>/`
-     - `~/wt/<stem>/`
-     - `~/<stem>/`
-   - Also match against the branch name in the worktree list output
-
-3. **If a matching worktree is found**:
-   - Print: `Found matching worktree: <worktree_path> (branch: <branch_name>)`
-   - `cd` into the worktree directory so all subsequent work happens there
-   - The plan file should still be accessible via its relative path (e.g., `thoughts/shared/plans/...`) since thoughts are synced between main repo and worktrees
-   - Continue with the rest of the planning process from within the worktree
-
-4. **If no matching worktree is found**:
-   - Continue normally in the current directory
-   - No message needed — proceed silently
-
-### Step 1: Context Gathering & Initial Analysis
-
-1. **Read all mentioned files immediately**:
-   - Ticket files (e.g., `thoughts/allison/tickets/eng_1234.md`)
-   - Research documents
-   - Related implementation plans
-   - Any JSON/data files mentioned
-   - **IMPORTANT**: Honor the read budget (see worker preamble §2).
-   - **CRITICAL**: DO NOT spawn sub-tasks before reading the relevant portions of these files yourself in the main context
-
-1a. **JSON sidecar probe (RSI-014):** For each research document path mentioned in the inputs, prefer the typed JSON sidecar over markdown grep:
-   1. Compute `<doc>.json = <doc>.md` with `.md` replaced by `.json`.
-   2. If `<doc>.json` does NOT exist, OR the markdown frontmatter contains `json_companion_status: invalid` → skip the validator and proceed via the markdown read above. No warning.
-   3. Otherwise, ensure `target/debug/rsi-research-validate` exists (run `cargo build -p rsi-common --bin rsi-research-validate --quiet` if missing), then run `target/debug/rsi-research-validate <doc>.json`.
-   4. On exit `0`: read and parse the JSON. Use it deterministically:
-      - `findings[]` → seed your in-memory plan-research working set with these typed summaries. **Retain each `findings[].id`** (`F-001`, …): every plan phase/item that traces to a finding declares it under `satisfies:` (see the phase template and §Cross-stage linkage below).
-      - `areas[]` → seed your domain decomposition.
-      - `open_questions[]` where `blocks_planning: true` → resolve before finalizing the plan; do NOT punt them.
-      - `file_refs[]` → preferred file:line targets for sub-agent dispatch.
-   5. On exit `2` or `1`: log one line on stderr `JSON sidecar invalid: <reason>; falling back to markdown` and continue with the markdown path. The fallback is silent for the user — only the trace records it.
-   This step is read-only — no files written, no commits, no daemon-visible side effects.
-
-2. **Spawn initial research tasks to gather context**:
-   Before asking the user any questions, use specialized agents to research in parallel:
-
-   - Use the **codebase-locator** agent to find all files related to the ticket/task
-   - Use the **codebase-analyzer** agent to understand how the current implementation works
-   - If relevant, use the **thoughts-locator** agent to find any existing thoughts documents about this feature
-   - If a Linear ticket is mentioned, use the **linear-ticket-reader** agent to get full details
-
-   These agents will:
-   - Find relevant source files, configs, and tests
-   - Identify the specific directories to focus on (e.g., TUI work lives under `crates/rsi`, daemon work under `crates/rsid`, shared types live in `crates/rsi-common`)
-   - Trace data flow and key functions
-   - Return detailed explanations with file:line references
-
-3. **Read all files identified by research tasks**:
-   - After research tasks complete, read ALL files they identified as relevant
-   - Read them FULLY into the main context
-   - This ensures you have complete understanding before proceeding
-
-4. **Analyze and verify understanding**:
-   - Cross-reference the ticket requirements with actual code
-   - Identify any discrepancies or misunderstandings
-   - Note assumptions that need verification
-   - Determine true scope based on codebase reality
-
-5. **Make autonomous decisions based on research**:
-   - Use your codebase research to resolve all technical questions yourself
-   - Make design decisions based on existing patterns and the Five-Expert Framework
-   - If something is truly ambiguous, choose the option that best fits existing conventions
-   - Do NOT pause to ask the user questions — proceed directly to the next step
-   - Document any significant decisions and their rationale in the plan itself
-
-### Step 2: Research & Discovery
-
-Proceed directly from Step 1 without waiting for user input:
-
-1. **Create a research todo list** using TodoWrite to track exploration tasks
-
-2. **Spawn parallel sub-tasks for comprehensive research**:
-   - Create multiple Task agents to research different aspects concurrently
-   - Use the right agent for each type of research:
-
-   **For deeper investigation:**
-   - **codebase-locator** - To find more specific files (e.g., "find all files that handle [specific component]")
-   - **codebase-analyzer** - To understand implementation details (e.g., "analyze how [system] works")
-   - **codebase-pattern-finder** - To find similar features we can model after
-
-   **For historical context:**
-   - **thoughts-locator** - To find any research, plans, or decisions about this area
-   - **thoughts-analyzer** - To extract key insights from the most relevant documents
-
-   **For related tickets:**
-   - **linear-searcher** - To find similar issues or past implementations
-
-   Each agent knows how to:
-   - Find the right files and code patterns
-   - Identify conventions and patterns to follow
-   - Look for integration points and dependencies
-   - Return specific file:line references
-   - Find tests and examples
-
-3. **Wait for ALL sub-tasks to complete** before proceeding
-
-4. **Select the best approach autonomously**:
-   - Evaluate design options against the Five-Expert Framework
-   - Choose the approach that best fits existing codebase patterns and conventions
-   - Document the decision and reasoning in the plan itself (under a "Design Decisions" section)
-   - Do NOT pause to ask the user — proceed directly to Step 3
-
-### Step 3: Plan Structure Development
-
-Proceed directly from Step 2 without waiting for user input:
-
-1. **Design the plan structure autonomously** based on research findings
-   - Determine the right number of phases based on complexity
-   - Order phases so each builds on the previous (Tech Wizard veto applies)
    - **Cross-stage linkage (MWP/ICM — binding):** every phase/item that traces
      to research declares `satisfies: [F-…]` naming the research `Finding.id`(s)
      it closes (see the phase template). This is the provenance anchor
@@ -209,211 +103,16 @@ Proceed directly from Step 2 without waiting for user input:
      research→plan→impl drift and fails validation. Pure-scaffolding items with
      no research antecedent MAY omit it — note the omission so it reads as
      intentional, not a gap.
-   - **Evidence-tier audit (binding):** tag every load-bearing plan claim with
-     the shared `[observed]`, `[source]`, or `[inferred]` vocabulary and cite
-     the primary artifact/result. Mechanically extract machine-readable facts
-     and prove the current tool surface can express an exact proposed shape.
-     `[inferred]` is forbidden in Acceptance Criteria and Success Criteria. A
-     plan with any load-bearing `[inferred]` claim must execute and reclassify
-     the claim or downgrade readiness; it cannot be labeled `decision-complete`
-     or `implementation-ready`, described as `ready for implementation`, or
-     given any equivalent readiness promise.
-   - Proceed directly to writing the detailed plan
+   - **Evidence-tier audit (binding):** classify each load-bearing claim as
+     `[observed]`, `[source]`, or `[inferred]`. Cite its primary artifact or
+     result. Extract machine-readable facts from source artifacts and check
+     that the current tool surface can express the proposed action exactly.
 
-### Step 4: Detailed Plan Writing
+Use these tags in the Evidence Register and success criteria:
 
-Proceed directly from Step 3:
-
-1. **Write the plan** to `thoughts/shared/plans/YYYY-MM-DD-ENG-XXXX-description.md`
-   - Format: `YYYY-MM-DD-ENG-XXXX-description.md` where:
-     - YYYY-MM-DD is today's date
-     - ENG-XXXX is the ticket number (omit if no ticket)
-     - description is a brief kebab-case description
-   - Examples:
-     - With ticket: `2025-01-08-ENG-1478-parent-child-tracking.md`
-     - Without ticket: `2025-01-08-improve-error-handling.md`
-2. **Use this template structure**:
-
-````markdown
-# [Feature/Task Name] Implementation Plan
-
-## Overview
-
-[Brief description of what we're implementing and why]
-
-## Current State Analysis
-
-[What exists now, what's missing, key constraints discovered]
-
-## Desired End State
-
-[A Specification of the desired end state after this plan is complete, and how to verify it]
-
-## Evidence Register
-
-- [observed] [claim executed/inspected in this pass — primary artifact/result citation]
-- [source] [claim extracted from an authoritative source — exact citation or reproducible extraction]
-- [inferred] [unexecuted reasoning — resolve before readiness or explicitly downgrade the plan]
-
-### Key Discoveries:
-- [Important finding with file:line reference]
-- [Pattern to follow]
-- [Constraint to work within]
-
-## What We're NOT Doing
-
-[Explicitly list out-of-scope items to prevent scope creep]
-
-## Implementation Approach
-
-[High-level strategy and reasoning]
-
-## Phase 1: [Descriptive Name]
-
-### Overview
-[What this phase accomplishes]
-
-satisfies: [F-001, F-014]  <!-- research Finding.id(s) this phase closes; RESEARCH_SCHEMA_VERSION >= 2. Omit only for pure scaffolding with no research antecedent, and say so explicitly. -->
-
-### Changes Required:
-
-#### 1. [Component/File Group]
-**File**: `path/to/file.ext`
-**Changes**: [Summary of changes]
-
-```[language]
-// Specific code to add/modify
-```
-
-### Success Criteria:
-
-<!-- [inferred] is forbidden here. Every criterion must be supported by cited [observed] or [source] evidence. -->
-
-#### Automated Verification:
-- [ ] [source] Migration applies cleanly: `make migrate` — [requirement citation]
-- [ ] [source] Unit tests pass: `make test-component` — [requirement citation]
-- [ ] [observed] Type-check command is available: `npm run typecheck` — [tool result]
-- [ ] [observed] Lint command is available: `make lint` — [tool result]
-- [ ] [source] Integration tests pass: `make test-integration` — [requirement citation]
-
-#### Manual Verification:
-- [ ] [source] Feature works as expected when tested via UI — [requirement citation]
-- [ ] [source] Performance is acceptable under load — [requirement citation]
-- [ ] [source] Edge case handling verified manually — [requirement citation]
-- [ ] [source] No regressions in related features — [requirement citation]
-
-**Implementation Note**: After completing this phase and all automated verification passes, pause here for manual confirmation from the human that the manual testing was successful before proceeding to the next phase.
-
----
-
-## Phase 2: [Descriptive Name]
-
-[Similar structure with both automated and manual success criteria...]
-
----
-
-## Testing Strategy
-
-### Unit Tests:
-- [What to test]
-- [Key edge cases]
-
-### Integration Tests:
-- [End-to-end scenarios]
-
-### Manual Testing Steps:
-1. [Specific step to verify feature]
-2. [Another verification step]
-3. [Edge case to test manually]
-
-## Performance Considerations
-
-[Any performance implications or optimizations needed]
-
-## Migration Notes
-
-[If applicable, how to handle existing data/systems]
-
-## References
-
-- Original ticket: `thoughts/allison/tickets/eng_XXXX.md`
-- Related research: `thoughts/shared/research/[relevant].md`
-- Similar implementation: `[file:line]`
-````
-
-### Step 5: Sync and Review
-
-1. **Present the draft plan location**:
-   ```
-   I've created the initial implementation plan at:
-   `thoughts/shared/plans/YYYY-MM-DD-ENG-XXXX-description.md`
-
-   Please review it and let me know:
-   - Are the phases properly scoped?
-   - Are the success criteria specific enough?
-   - Any technical details that need adjustment?
-   - Missing edge cases or considerations?
-   ```
-
-2. **Iterate based on feedback** - be ready to:
-   - Add missing phases
-   - Adjust technical approach
-   - Clarify success criteria (both automated and manual)
-   - Add/remove scope items
-   - After making changes, ensure the updated plan is saved and committed in git so the `thoughts/` directory stays in sync across worktrees
-
-3. **Continue refining** until the user is satisfied
-
-## Important Guidelines
-
-1. **Be Skeptical**:
-   - Question vague requirements
-   - Identify potential issues early
-   - Ask "why" and "what about"
-   - Don't assume - verify with code
-
-   - **Check the plan against itself before writing it out.** Every constraint
-     must be compatible with every design decision. If a constraint says
-     "preserve X" and a decision replaces or removes X, that is a contradiction
-     to resolve now, not to hand to the implementer. State the resolution
-     explicitly in the plan.
-   - **Never specify that user-visible information becomes absent.** If a
-     design decision removes a name, title, label, or identifier from the
-     screen, say where the user reaches it instead. A plan that silently drops
-     an entity's identity produces an unfindable entity.
-
-2. **Be Autonomous**:
-   - Write the full plan in one shot without pausing for confirmation
-   - Make design decisions based on codebase research and the Five-Expert Framework
-   - Document your reasoning so the user can review and iterate after the fact
-   - The user will use `/iterate_plan` if they want changes
-
-3. **Be Thorough**:
-   - Honor the read budget before planning (see worker preamble §2).
-   - Research actual code patterns using parallel sub-tasks
-   - Include specific file paths and line numbers
-   - Write measurable success criteria with clear automated vs manual distinction
-   - Prefer workspace-aware cargo scripts when possible (e.g., `cargo test -p rsi` instead of manually `cd`-ing into subdirectories)
-
-4. **Be Practical**:
-   - Focus on incremental, testable changes
-   - Consider migration and rollback
-   - Think about edge cases
-   - Include "what we're NOT doing"
-
-5. **Track Progress**:
-   - Use TodoWrite to track planning tasks
-   - Update todos as you complete research
-   - Mark planning tasks complete when done
-
-6. **No Open Questions in Final Plan**:
-   - If you encounter open questions during planning, STOP
-   - Research or ask for clarification immediately
-   - Do NOT write the plan with unresolved questions
-   - The implementation plan must be complete and actionable
-   - Every decision must be made before finalizing the plan
-
-## Success Criteria Guidelines
+- `[observed]`: checked during this planning pass; cite the tool result.
+- `[source]`: read from an authoritative requirement or source path; cite it.
+- `[inferred]`: reasoned but untested; state the check needed to resolve it.
 
 `[inferred]` is forbidden in Acceptance Criteria and Success Criteria. A plan
 with any load-bearing `[inferred]` claim must execute and reclassify the claim
@@ -423,119 +122,90 @@ equivalent readiness promise. Cite the primary artifact/result for `[observed]`
 criteria and the authoritative requirement for `[source]` criteria; a command
 name alone is not evidence.
 
-**Always separate success criteria into two categories:**
+## Plan format
 
-1. **Automated Verification** (can be run by execution agents):
-   - Commands that can be run: `make test`, `npm run lint`, etc.
-   - Specific files that should exist
-   - Code compilation/type checking
-   - Automated test suites
-
-2. **Manual Verification** (requires human testing):
-   - UI/UX functionality
-   - Performance under real conditions
-   - Edge cases that are hard to automate
-   - User acceptance criteria
-
-**Format example:**
 ```markdown
-### Success Criteria:
+# [Task] Implementation Plan
 
-<!-- [inferred] is forbidden here. Every criterion must be supported by cited [observed] or [source] evidence. -->
+## Overview
+## Current State Analysis
+## Desired End State
+## Evidence Register
+- [observed] [claim] — [primary artifact/result]
+- [source] [claim] — [exact source]
+- [inferred] [claim] — [what must be checked]
 
-#### Automated Verification:
-- [ ] [source] Database migration runs successfully: `make migrate` — [requirement citation]
-- [ ] [source] All unit tests pass: `go test ./...` — [requirement citation]
-- [ ] [observed] Lint command is available: `golangci-lint run` — [tool result]
-- [ ] [source] API endpoint returns 200: `curl localhost:8080/api/new-endpoint` — [requirement citation]
+## Design Decisions
+## Scope and Non-Goals
+## Phase 1: [Outcome]
+satisfies: [F-001, F-002]
 
-#### Manual Verification:
-- [ ] [source] New feature appears correctly in the UI — [requirement citation]
-- [ ] [source] Performance is acceptable with 1000+ items — [requirement citation]
-- [ ] [source] Error messages are user-friendly — [requirement citation]
-- [ ] [source] Feature works correctly on mobile devices — [requirement citation]
+### Inputs
+[Named ticket, source files, research IDs, or a bounded discovery budget]
+
+### Process
+[Ordered changes with exact file paths and dependencies]
+
+### Outputs
+[Files and behavior produced by this phase]
+
+### Verify
+[Commands and expected evidence]
+
+### Success Criteria
+#### Automated Verification
+- [ ] [observed] [check] — [tool result]
+#### Manual Verification
+- [ ] [source] [specific action and result] — [requirement]
+
+## Testing Strategy
+## Risks and Recovery
+## References
 ```
 
-## Common Patterns
+Repeat the phase block as needed. A phase with no research antecedent may omit
+`satisfies:` only when the plan says why. Keep verification tied to the
+same finding IDs so `cross_stage_verify_coverage` can establish that every
+research finding assigned to the plan is checked during implementation.
 
-### For Database Changes:
-- Start with schema/migration
-- Add store methods
-- Update business logic
-- Expose via API
-- Update clients
+## Stage contract
 
-### For New Features:
-- Research existing patterns first
-- Start with data model
-- Build backend logic
-- Add API endpoints
-- Implement UI last
+### Inputs
 
-### For Refactoring:
-- Document current behavior
-- Plan incremental changes
-- Maintain backwards compatibility
-- Include migration strategy
+The supplied ticket, specification, or research document; named files or a
+bounded code-discovery budget; current repository instructions and source.
 
-## Sub-task Spawning Best Practices
+### Process
 
-When spawning research sub-tasks:
+Inspect inputs and live code, classify evidence, decide the implementation
+order, write the plan, and check provenance and verification coverage.
 
-1. **Spawn multiple tasks in parallel** for efficiency
-2. **Each task should be focused** on a specific area
-3. **Provide detailed instructions** including:
-   - Exactly what to search for
-   - Which directories to focus on
-   - What information to extract
-   - Expected output format
-4. **Be EXTREMELY specific about directories**:
-   - Reference concrete crates when noting directories (e.g., `crates/rsi/` for the TUI, `crates/rsid/` for the daemon)
-   - If it mentions "daemon", specify `hld/` directory
-   - Never use generic terms like "UI" when you mean "WUI"
-   - Include the full path context in your prompts
-5. **Specify read-only tools** to use
-6. **Request specific file:line references** in responses
-7. **Wait for all tasks to complete** before synthesizing
-8. **Verify sub-task results**:
-   - If a sub-task returns unexpected results, spawn follow-up tasks
-   - Cross-check findings against the actual codebase
-   - Don't accept results that seem incorrect
+### Outputs
 
-Example of spawning multiple tasks:
-```python
-# Spawn these tasks concurrently:
-tasks = [
-    Task("Research database schema", db_research_prompt),
-    Task("Find API patterns", api_research_prompt),
-    Task("Investigate UI components", ui_research_prompt),
-    Task("Check test patterns", test_research_prompt)
-]
-```
+A committed plan under `thoughts/shared/plans/` with phase-local
+`satisfies:` links where research findings apply.
 
-## Example Interaction Flow
+### Verify
 
-```
-User: /plan thoughts/allison/tickets/eng_1478.md
-Assistant: [Reads ticket file fully]
-[Spawns parallel research agents]
-[Makes design decisions autonomously based on Five-Expert Framework]
-[Writes complete plan to thoughts/shared/plans/]
-[Commits and pushes]
+Each acceptance item is measurable and backed by `[observed]` or `[source]`
+evidence. Confirm every promised command exists on the current tool surface
+and every load-bearing citation identifies a primary artifact.
 
-I've created the implementation plan at:
-`thoughts/shared/plans/2025-01-08-ENG-1478-parent-child-tracking.md`
+## Final check
 
-[Summary of plan contents and key design decisions made]
-
-Use `/iterate_plan` if you want to adjust anything.
-```
-
-## Commit and Push — MANDATORY
-
-Before responding, commit the plan document and other task-owned files using explicit paths. Never stage the entire `thoughts/` directory or unrelated edits. Leave the tree clean. Push only if the user explicitly asked; then push the current feature branch as a safe fast-forward, never `main`.
-
-## Final Response Format
-
-When you complete the plan and are ready to respond to the user, ensure you have written the plan file to `thoughts/shared/plans/` — the daemon detects this Write and automatically derives the next pipeline step (`/implement`).
+- State the positive user-visible end state. When changing a displayed name,
+  title, label, or identifier, specify where the user will see it after the
+  change. Do not encode data loss as a success criterion.
+- Separate automated checks from manual checks. A human gate must have a
+  concrete reason; routine implementation choices should be resolved in the
+  plan.
+- Keep source and plan in agreement. If new evidence changes a design choice,
+  revise and commit the plan before implementation proceeds.
+- **COMMIT AND PUSH — REQUIRED**: Before responding, commit the plan and other
+  task-owned files using explicit paths. Never stage the entire `thoughts/`
+  directory or unrelated edits. Leave the tree clean. Push only if the user
+  explicitly asked; then push the current feature branch as a safe
+  fast-forward, never `main`.
+- The plan path under `thoughts/shared/plans/` is the daemon's pipeline input
+  for `/implement`; include it in the final report.
 '''

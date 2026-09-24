@@ -11,7 +11,7 @@ You are tasked with helping users transform project ideas into comprehensive, ac
 
 ## Initial Response
 
-When this command is invoked, respond with:
+At invocation, send this opening response:
 ```
 I'll help you create a project specification. Let's start by understanding your vision.
 
@@ -23,7 +23,7 @@ Please share:
 I'll research options, ask clarifying questions, and help you build a complete spec.
 ```
 
-Then wait for the user's input.
+Wait for the project details before starting the spec.
 
 ## Process Steps
 
