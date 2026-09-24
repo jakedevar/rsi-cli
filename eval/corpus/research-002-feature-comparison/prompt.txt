@@ -1,0 +1,8 @@
+Produce a concise research document comparing two approaches for
+persisting user preferences in a Rust CLI tool: (a) a JSON file under the
+user's home directory, and (b) a SQLite database with a key-value table.
+Compare the two approaches across four dimensions: durability under
+crash, schema evolution under future change, query power, and zero-config
+operational simplicity. Conclude with a one-sentence recommendation for
+each of two distinct scenarios — a single-user developer tool, and a
+multi-user shared workstation.

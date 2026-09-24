@@ -1,0 +1,149 @@
+---
+description: Prime and drive the Termwright TUI E2E harness via master_orchestrate spawn-child program mode
+---
+
+# Termwright TUI E2E — campaign driver
+
+Single entry point for building the Termwright PTY end-to-end test harness for the
+`rsi` TUI. Invoke this to load the full campaign context and carry the plan to a
+green, opt-in PTY smoke suite — slice by slice, through `/master_orchestrate`
+program mode, spawning each worker with a real `<docregblock>/spawn_child …
+</docregblock>` directive.
+
+This command exists to defeat the stateless-AI effect: every fact the campaign
+needs already lives on disk. This tells you which facts, in what order, under what
+rules — so any session or any model can pick the work up cold and continue without
+re-deriving the plan. Read the three canonical artifacts before acting.
+
+## Preconditions (the loop stalls SILENTLY if any is false)
+
+`/spawn_child` is not a prompt — it is a daemon-intercepted directive. The rsid
+monitor catches it and the spawn coordinator turns it into a durable child. That
+only happens when all of these hold:
+
+1. **Daemon-managed session.** You run under `rsid`, not a bare provider CLI.
+   No daemon → no monitor → the directive is inert.
+2. **You are the Epic lead, and a leaf kind.** This session must be the Epic's
+   `lead_session_id` and a leaf kind (`Feature` recommended). Otherwise the
+   coordinator rejects with `NotLead` (not the lead) or `EmitterNotLeaf` (you are
+   a Group/Epic). — `crates/rsid/src/session/spawn_coordinator.rs:57-74`
+3. **Child kind ∈ Epic's legal children:** `Story | Task | Bug | Feature |
+   Refactor | Research`. Anything else → `IllegalChildKind`.
+   — `crates/rsi-common/src/types.rs:756`
+4. **`<docregblock>` at column 0.** The detection regex is line-anchored; an
+   indented block is ignored. Never indent the open tag, never wrap it in prose
+   on the same line. — `crates/rsid/src/session/types.rs:34`
+
+If you are not an Epic lead, STOP and tell Jake to create a `Group → Epic` and
+launch a `Feature` lead session, then re-invoke this command there.
+
+## The canonical artifacts (read first, in order)
+
+1. **SLICE PLAN** (the work, reviewed — 0 critical):
+   `thoughts/shared/plans/2026-06-18-termwright-tui-e2e-master-orchestration.md`
+   — goals, non-goals, env contract, data fixture (exact `create_container`
+   signature), first-scenario contract, artifact policy, phase plan, validation matrix.
+2. **PROGRAM LEDGER** (the spine):
+   `thoughts/shared/orchestration/2026-06-18-termwright-e2e-program-ledger.md`
+   — per-slice status; read before every slice, update the row after every slice.
+3. **KICKOFF** (the exact spawn-child templates):
+   `thoughts/shared/orchestration/2026-06-18-termwright-e2e-kickoff.md`
+   — the verbatim TW-HARNESS directive and the review-worker follow-up shape.
+
+The plan doubles as the **domain gate pack**: its Non-Goals, Validation Matrix,
+and Acceptance Criteria are binding.
+
+## The mechanism (do not substitute it)
+
+You spawn every worker by emitting this, `<docregblock>` at the start of a line:
+
+```
+<docregblock>
+/spawn_child kind=<Feature|Task|Research> tags=e2e
+QUERY:
+<full worker prompt body — multiline — ending right before the close tag>
+</docregblock>
+```
+
+Do NOT use the Task tool, do NOT implement slices yourself, do NOT fall back to a
+non-RSI worker mechanism. Exercising `/master_orchestrate` + `/spawn_child` IS the
+point. After each emission, STOP and wait for the child's `PIPELINE HANDOFF — …`
+return; keep only {stage, status, doc_path, commit, findings_count, blocker} and
+re-read artifacts from disk.
+
+## The slice queue (ledger order, WIP = 1, serial)
+
+`TW-HARNESS → TW-STAGE10 → TW-HARDEN → TW-LEAF-PLAN`
+
+- **TW-HARNESS** (`kind=Feature`, Plan Phase 1) — the whole opt-in PTY smoke:
+  `crates/rsi` dev-deps, `crates/rsi/tests/e2e_tui.rs`, provider stubs + isolated
+  `rsid` lifecycle + readiness probe, `CreateContainer` Group→Epic seeding, the
+  `Root → Group → Epic → Group` scenario, failure artifacts, thin `scripts/e2e.sh`.
+- **TW-STAGE10** (`kind=Task`, Plan Phase 2) — add Stage-10 TUI-E2E
+  trigger/skip/report rules to `.claude/commands/master_orchestrate.md`. Docs only.
+- **TW-HARDEN** (`kind=Feature`, Plan Phase 3) — transition timing, an
+  induced-failure test that proves assertions fail red, optional `make e2e-tui`.
+- **TW-LEAF-PLAN** (`kind=Research`, Plan Phase 4) — PLAN-ONLY design doc for the
+  Story/leaf fixture path. No code.
+
+Workstreams A/B/C of the plan all edit `e2e_tui.rs`, so they cannot parallelize —
+they collapse into the single TW-HARNESS slice. Do not split them across children.
+
+## How to drive it
+
+Preflight, then run the slice conveyor in program mode:
+
+    /master_orchestrate thoughts/shared/plans/2026-06-18-termwright-tui-e2e-master-orchestration.md
+    mode: program
+    ledger: thoughts/shared/orchestration/2026-06-18-termwright-e2e-program-ledger.md
+    domain_gate_pack: thoughts/shared/plans/2026-06-18-termwright-tui-e2e-master-orchestration.md
+    stop_after_slice: true
+    allow_parallel: false
+
+For each slice: emit the implementation `/spawn_child` (TW-HARNESS template lives
+in the kickoff doc) → self-check against the plan → emit a review `/spawn_child`
+(`PIPELINE STAGE: review`, `ROLE: orchestrate-review`) → bounded fixes if findings
+→ re-review unless Jake waives → run the plan's Validation Matrix → documentation
+if any user-facing/keybinding/RPC/config surface changed → update the ledger row →
+compact slice report. Then stop before the next slice.
+
+## Rules the conveyor must honor
+
+- **WIP = 1.** One slice in flight. The next is forbidden while `crates/`/`scripts/`
+  are dirty. (Untracked `thoughts/` plan + ledger docs are user-owned; park them in
+  preflight — they do not conflict with the `rsi` / `docs-plans` code domains.)
+- **Ratchet.** Every code slice closes with its pinning test green AND
+  `cargo test --workspace` green. No green = not done. Never commit red.
+- **Opt-in forever.** The E2E target stays gated behind `RSI_E2E=1` and must never
+  join default `cargo test`. The skip-run (no `RSI_E2E`) must pass WITHOUT starting `rsid`.
+- **No production schema migration.** Phase 1 introduces none (plan Non-Goals).
+- **Provider safety.** Phase 1 seeds only `Group`/`Epic` via `CreateContainer`;
+  no leaf seeding, no real provider launch. Stub providers + `env_remove("LOCAL_LLM_BASE_URL")`.
+- **Format discipline.** Never touch the 6 format-drift files; never run unscoped
+  `cargo fmt` — format only files the slice changed.
+- **Leaf coverage is plan-only** (TW-LEAF-PLAN) until the fixture path is reviewed.
+
+## Gates
+
+No schema / live-execution / security gate exists in this campaign — Phase 1 is
+opt-in test infrastructure. The only hard gate is the **ratchet** (green per
+slice). In an interactive run, stop for Jake after TW-HARNESS lands green. In an
+autonomous run, self-verify green before advancing; only truly stop if something
+is physically unavailable (e.g. PTY/Termwright cannot build in the environment),
+then mark the slice `partial`/`blocked` with a specific reason — never close on
+"tests probably pass".
+
+## Done = green opt-in PTY smoke
+
+TW-HARNESS green and opt-in (`RSI_E2E=1 cargo test -p rsi --test e2e_tui` passes,
+skip-run does not start `rsid`, `cargo test --workspace` green, `git diff --check`
+clean), TW-STAGE10 folded into `master_orchestrate.md`, and TW-HARDEN/TW-LEAF-PLAN
+landed or explicitly deferred in the ledger. A wrong expected string must turn the
+test red, and failure output must include an artifact path.
+
+## Failure reporting
+
+If your first `/spawn_child` produces no child within a reasonable wait, STOP and
+report which precondition you suspect: `NotLead`, `EmitterNotLeaf`, a non-anchored
+directive, an illegal `kind`, or a non-daemon-managed session. Do not silently
+retry or fall back to direct implementation.

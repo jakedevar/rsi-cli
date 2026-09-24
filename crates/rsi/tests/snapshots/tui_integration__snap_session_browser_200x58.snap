@@ -1,0 +1,62 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: text
+---
+ ● 8
+ All projects / Sessions                                                                                                                                                                    22 sessions
+                                                                                                                   │
+               #   ∞  S  !  FUNCTION                                        ◔     ⇄ AGE    MODEL                ▮  │  01  ? waiting                                    All projects › Root
+               ! NEEDS YOU  2  ──────────────                                                                      │  ────────────────────────────────────────────────────────────────────
+             ▌        ?  !  Review harness snapshots                              3  now ⋈ opus-4-6             ▆──│  Review harness snapshots
+                      ×  !  Investigate render edge                              13  now ✻ opus-4-1                │  ! needs you
+                                                                                                                   │
+               ● IN FLIGHT  8  ──────────────                                                                      │  → Choose the bounded relay policy?
+                      ●     Implement event seam                                  8  now ✻ sonnet-5                │
+                      ●     Browser session 05                                    8   5d ✻ sonnet-5                │  ? reply required
+                      ●     Browser session 06                                    8   6d ✻ sonnet-5                │
+                      ●     Browser session 07                                    8   7d ✻ sonnet-5                │  Policy requires your response.
+                      ●     Browser session 08                                    8   8d ✻ sonnet-5                │
+                      ●     Browser session 09                                    8   9d ✻ sonnet-5                │  ▎ Pin session list rendering with TestBackend
+                      ●     Browser session 10                                    8  10d ✻ sonnet-5                │
+                      ◐     Browser session 11                                    8  11d ✻ sonnet-5                │  ⋈ openrouter/anthropic/claude-opus-4-6  ▮▮▮▯ high
+                                                                                                                   │  ⇄ 3   $0.01   ◷ <1m run
+               ✓ RECENT  1  ──────────────                                                                         │  + 01-01 01:58   Δ just now
+                      ✓     Clean fixture state                                   5  now ⌂ oss:20b                 │
+                                                                                                                   │  # 02020202-0202-0202-0202-020202020202
+               · QUIET  11  ──────────────                                                                         │  ⌂ /tmp
+                      ■     Browser session 12                                    8  12d ✻ sonnet-5                │
+                      ✓     Browser session 13                                    8  13d ✻ sonnet-5                │
+                      ✓     Browser session 14                                    8  14d ✻ sonnet-5                │
+                      ✓     Browser session 15                                    8  15d ✻ sonnet-5                │
+                      ✓     Browser session 16                                    8  16d ✻ sonnet-5                │
+                      ✓     Browser session 17                                    8  17d ✻ sonnet-5                │
+                      ✓     Browser session 18                                    8  18d ✻ sonnet-5                │
+                      ✓     Browser session 19                                    8  19d ✻ sonnet-5                │
+                      ✓     Browser session 20                                    8  20d ✻ sonnet-5                │
+                      ✓     Browser session 21                                    8  21d ✻ sonnet-5                │
+                      ✓     Browser session 22                                    8  22d ✻ sonnet-5                │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+                                                                                                                   │
+               ────────────────────────────────────────────────────────────────────────────────────────────────    │
+                                                                                                                   │
+               22/22                                                                                               │
+                                                                                                                   │
+                                                                                                                   │

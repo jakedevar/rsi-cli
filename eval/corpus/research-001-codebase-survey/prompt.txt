@@ -1,0 +1,8 @@
+Produce a concise research document surveying the major architectural
+components typically found in a Rust workspace organized as three crates:
+a TUI client, a background daemon, and a shared types crate. For each
+crate, list the kinds of modules typically expected — for example, the
+event loop, RPC dispatch, session lifecycle, type definitions, persistence
+layer, and provider abstractions — and indicate which crate would
+typically own each. Format the output with a one-paragraph executive
+summary at the top followed by one section header per crate.

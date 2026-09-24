@@ -1,0 +1,19 @@
+[package]
+name = "rsi-signal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI tool for rsi-managed sessions to signal the daemon"
+
+[[bin]]
+name = "rsi-signal"
+path = "src/main.rs"
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+serde_json = "1"
+
+[lints]
+workspace = true

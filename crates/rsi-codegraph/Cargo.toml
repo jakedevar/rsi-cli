@@ -1,0 +1,25 @@
+[package]
+name = "rsi-codegraph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic structural codegraph storage and exact queries"
+
+[dependencies]
+blake3.workspace = true
+chrono.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-md.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

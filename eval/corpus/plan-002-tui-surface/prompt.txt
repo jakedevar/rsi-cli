@@ -1,0 +1,9 @@
+Produce a step-by-step plan for adding a new `?` keyboard-driven overlay
+to a terminal UI that displays the active keybindings for the current
+mode. The plan must cover: (1) defining the overlay component and its
+data source, (2) wiring the `?` key into the input dispatch path,
+(3) rendering the overlay over the existing content as a modal layer
+with a backdrop, (4) Escape-to-dismiss behavior, (5) test strategy for
+both the input dispatch and the rendering. Output the result as a
+numbered list of five to eight items. Do not write implementation code
+— produce only the plan.

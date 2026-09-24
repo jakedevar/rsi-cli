@@ -1,0 +1,7 @@
+{
+  "kind": "Standard",
+  "expected_completion_status": "Completed",
+  "expected_test_passed": null,
+  "expected_clippy_passed": null,
+  "expected_partial": true
+}

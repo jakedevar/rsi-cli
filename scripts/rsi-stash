@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'HELP'
+Usage: rsi-stash save [message]
+       rsi-stash list
+       rsi-stash restore <sha>
+       rsi-stash drop <sha>
+
+Store uncommitted tracked and untracked work under a ref namespace owned by
+this linked worktree. Restore, list, and drop accept only exact owned SHAs.
+Stop other writers in this worktree before save or restore and keep them stopped
+until the command finishes.
+HELP
+}
+
+fail() { printf 'rsi-stash: %s\n' "$1" >&2; exit 1; }
+temp_dirs=()
+transaction_active=0
+transaction_backup=
+scratch_worktree=
+root=
+index_path=
+cleanup() {
+    local status=$?
+    local dir preserve_backup=0
+    trap - EXIT
+    if (( transaction_active )); then
+        preserve_backup=1
+        mkdir -p "$transaction_backup/displaced"
+        cp "$index_path" "$transaction_backup/displaced/index" || :
+        if rollback_paths; then
+            printf 'rsi-stash: working tree and index restored after failure; recovery snapshot: %s\n' "$transaction_backup" >&2
+        else
+            printf 'rsi-stash: rollback failed; recovery snapshot: %s\n' "$transaction_backup" >&2
+        fi
+    fi
+    if [[ -n $scratch_worktree ]]; then git worktree remove --force "$scratch_worktree" >/dev/null 2>&1 || :; fi
+    for dir in "${temp_dirs[@]}"; do
+        if (( preserve_backup )) && [[ $dir == "$transaction_backup" ]]; then continue; fi
+        rm -rf -- "$dir"
+    done
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+require_repo() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "not inside a Git worktree"
+    root=$(git rev-parse --show-toplevel)
+    cd "$root"
+    index_path=$(git rev-parse --git-path index)
+}
+
+worktree_namespace() {
+    local branch path hash
+    branch=$(git branch --show-current)
+    path=$(git rev-parse --show-toplevel)
+    hash=$(printf '%s' "$path" | openssl dgst -sha256 | awk '{print substr($NF, 1, 12)}')
+    branch=${branch//[^A-Za-z0-9._-]/_}
+    [[ -n $branch ]] || branch="_detached"
+    printf 'refs/rsi-stash/%s-%s' "$branch" "$hash"
+}
+
+# Return the three trees in globals. Temporary indexes leave the caller's index intact.
+read_state() {
+    local scratch=$1
+    index_tree=$(git write-tree)
+    cp "$index_path" "$scratch/tracked-index"
+    GIT_INDEX_FILE="$scratch/tracked-index" git add -u
+    worktree_tree=$(GIT_INDEX_FILE="$scratch/tracked-index" git write-tree)
+    GIT_INDEX_FILE="$scratch/untracked-index" git read-tree --empty
+    git ls-files --others --exclude-standard -z >"$scratch/untracked-paths"
+    if [[ -s "$scratch/untracked-paths" ]]; then
+        GIT_INDEX_FILE="$scratch/untracked-index" git add \
+            --pathspec-from-file="$scratch/untracked-paths" --pathspec-file-nul
+    fi
+    untracked_tree=$(GIT_INDEX_FILE="$scratch/untracked-index" git write-tree)
+}
+
+begin_transaction() {
+    local recovery_root path
+    recovery_root="$(git rev-parse --git-common-dir)/rsi-stash-recovery"
+    mkdir -p "$recovery_root"
+    transaction_backup=$(mktemp -d "$recovery_root/backup.XXXXXX")
+    temp_dirs+=("$transaction_backup")
+    mkdir "$transaction_backup/tree" "$transaction_backup/dirs"
+    cp "$operation_paths" "$transaction_backup/paths"
+    while IFS= read -r -d '' path; do
+        if [[ -d "$root/$path" && ! -L "$root/$path" ]]; then
+            mkdir -p "$transaction_backup/dirs/$path"
+        elif [[ -e "$root/$path" || -L "$root/$path" ]]; then
+            mkdir -p "$transaction_backup/tree/$(dirname "$path")"
+            cp -a -- "$root/$path" "$transaction_backup/tree/$path"
+        fi
+    done <"$operation_paths"
+    cp "$index_path" "$transaction_backup/index"
+}
+
+rollback_paths() {
+    local path failed=0 destination original displaced
+    while IFS= read -r -d '' path; do
+        destination="$root/$path"
+        original="$transaction_backup/tree/$path"
+        displaced="$transaction_backup/displaced/$path"
+        if [[ -e $destination || -L $destination ]]; then
+            if [[ ! -d $destination || -L $destination ]]; then
+                mkdir -p "$(dirname "$displaced")" || failed=1
+                cp -a -- "$destination" "$displaced" || failed=1
+            fi
+        fi
+        if [[ -e $original || -L $original ]]; then
+            if [[ -d $destination && ! -L $destination ]]; then
+                rmdir -- "$destination" 2>/dev/null || failed=1
+            fi
+            mkdir -p "$(dirname "$destination")" || failed=1
+            cp -a --remove-destination -- "$original" "$destination" || failed=1
+        elif [[ -d "$transaction_backup/dirs/$path" ]]; then
+            if [[ -e $destination || -L $destination ]]; then
+                rm -f -- "$destination" || failed=1
+            fi
+            mkdir -p "$destination" || failed=1
+        elif [[ -d $destination && ! -L $destination ]]; then
+            rmdir -- "$destination" 2>/dev/null || :
+        elif [[ -e $destination || -L $destination ]]; then
+            rm -f -- "$destination" || failed=1
+        fi
+    done <"$transaction_backup/paths"
+    cp "$transaction_backup/index" "$index_path" || failed=1
+    (( failed == 0 ))
+}
+
+restore_paths() {
+    local stash=$1
+    {
+        git diff --no-renames --name-only -z "$stash^1" "$stash"
+        git diff --no-renames --name-only -z "$stash^1" "$stash^2"
+        if git rev-parse -q --verify "$stash^3^{commit}" >/dev/null; then
+            git ls-tree -r --name-only -z "$stash^3"
+        fi
+    } | sort -zu >"$operation_paths"
+}
+
+# Mirror only paths Git may change. The scratch worktree already has HEAD.
+mirror_paths() {
+    local destination_root=$1 path destination
+    while IFS= read -r -d '' path; do
+        destination="$destination_root/$path"
+        if [[ -d "$root/$path" && ! -L "$root/$path" ]]; then
+            if [[ (-e $destination || -L $destination) && (! -d $destination || -L $destination) ]]; then
+                rm -f -- "$destination"
+            fi
+            mkdir -p "$destination"
+        elif [[ -e "$root/$path" || -L "$root/$path" ]]; then
+            if [[ -d $destination && ! -L $destination ]]; then
+                rmdir -- "$destination" || fail "preflight path is a nonempty directory: $path"
+            fi
+            mkdir -p "$(dirname "$destination")"
+            cp -a --remove-destination -- "$root/$path" "$destination"
+        elif [[ -e $destination || -L $destination ]]; then
+            rm -f -- "$destination"
+        fi
+    done <"$operation_paths"
+}
+
+owned_ref() {
+    local wanted=$1
+    [[ $wanted =~ ^[0-9a-f]{40,64}$ ]] || fail "invalid stash SHA: $wanted"
+    matching_ref=$(git for-each-ref --format='%(refname) %(objectname)' "$namespace/" \
+        | awk -v wanted="$wanted" '$2 == wanted {print $1}')
+    [[ -n $matching_ref ]] || fail "stash is not owned by this worktree: $wanted"
+    [[ $(printf '%s\n' "$matching_ref" | wc -l) -eq 1 ]] || fail "multiple refs pin the same stash"
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+require_repo
+namespace=$(worktree_namespace)
+command=$1
+shift
+
+case $command in
+    save)
+        [[ $# -le 1 ]] || { usage >&2; exit 2; }
+        message=${1:-rsi-stash save}
+        scratch=$(mktemp -d "${TMPDIR:-/tmp}/rsi-stash-state.XXXXXX")
+        temp_dirs+=("$scratch")
+        read_state "$scratch"
+        head=$(git rev-parse HEAD)
+        empty_tree=$(git hash-object -t tree /dev/null)
+        head_tree=$(git rev-parse HEAD^{tree})
+        [[ $index_tree != "$head_tree" || $worktree_tree != "$head_tree" || $untracked_tree != "$empty_tree" ]] \
+            || fail "there is no uncommitted work to save"
+        index_commit=$(printf 'index on %s\n' "$message" | git commit-tree "$index_tree" -p "$head")
+        parents=(-p "$head" -p "$index_commit")
+        if [[ $untracked_tree != "$empty_tree" ]]; then
+            untracked_commit=$(printf 'untracked files on %s\n' "$message" | git commit-tree "$untracked_tree")
+            parents+=(-p "$untracked_commit")
+        fi
+        sha=$(printf '%s\n' "$message [$namespace]" | git commit-tree "$worktree_tree" "${parents[@]}")
+        timestamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+        git update-ref "$namespace/$timestamp" "$sha" ""
+
+        # Ref first; reject a changed source before any worktree mutation.
+        saved_index_tree=$index_tree saved_worktree_tree=$worktree_tree saved_untracked_tree=$untracked_tree
+        read_state "$scratch"
+        [[ $index_tree == "$saved_index_tree" && $worktree_tree == "$saved_worktree_tree" && $untracked_tree == "$saved_untracked_tree" ]] \
+            || fail "working tree changed during capture; saved SHA $sha is recoverable"
+        operation_paths="$scratch/operation-paths"
+        git diff HEAD --no-renames --name-only -z >"$scratch/tracked-paths"
+        cat "$scratch/tracked-paths" "$scratch/untracked-paths" | sort -zu >"$operation_paths"
+        begin_transaction
+        read_state "$scratch"
+        [[ $index_tree == "$saved_index_tree" && $worktree_tree == "$saved_worktree_tree" && $untracked_tree == "$saved_untracked_tree" ]] \
+            || fail "working tree changed before cleanup; saved SHA $sha is recoverable"
+        transaction_active=1
+        while IFS= read -r -d '' path; do rm -f -- "$root/$path"; done <"$scratch/untracked-paths"
+        if [[ -s "$scratch/tracked-paths" ]]; then
+            git restore --source=HEAD --staged --worktree \
+                --pathspec-from-file="$scratch/tracked-paths" --pathspec-file-nul
+        fi
+        git status --porcelain=v1 -z --untracked-files=all >"$scratch/remaining-status"
+        [[ ! -s "$scratch/remaining-status" ]] || fail "cleanup left changes; saved SHA $sha is recoverable"
+        transaction_active=0
+        printf '%s\n' "$sha"
+        ;;
+    list)
+        [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+        while IFS= read -r ref; do
+            [[ -n $ref ]] || continue
+            sha=$(git rev-parse "$ref")
+            printf '%s\t%s\n' "$sha" "$(git log -1 --format=%s "$sha")"
+        done < <(git for-each-ref --format='%(refname)' "$namespace/")
+        ;;
+    restore)
+        [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+        sha=$1
+        owned_ref "$sha"
+        scratch=$(mktemp -d "$root/.rsi-stash-preflight.XXXXXX")
+        temp_dirs+=("$scratch")
+        operation_paths="$scratch/operation-paths"
+        restore_paths "$sha"
+        scratch_worktree="$scratch/check"
+        git worktree add --detach -q "$scratch_worktree" HEAD
+        mirror_paths "$scratch_worktree"
+        cp "$index_path" "$(git -C "$scratch_worktree" rev-parse --git-path index)"
+        if ! git -C "$scratch_worktree" stash apply --index "$sha" >/dev/null 2>&1; then
+            git worktree remove --force "$scratch_worktree"
+            scratch_worktree=
+            fail "stash conflicts with current worktree or index: $sha"
+        fi
+        git worktree remove --force "$scratch_worktree"
+        scratch_worktree=
+        begin_transaction
+        transaction_active=1
+        git stash apply --index "$sha" >/dev/null
+        transaction_active=0
+        printf '%s\n' "$sha"
+        ;;
+    drop)
+        [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+        sha=$1
+        owned_ref "$sha"
+        git update-ref -d "$matching_ref" "$sha"
+        ;;
+    *) usage >&2; exit 2 ;;
+esac

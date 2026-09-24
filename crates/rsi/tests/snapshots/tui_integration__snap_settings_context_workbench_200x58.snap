@@ -1,0 +1,61 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: text
+---
+ ● 0
+    Settings / Input & Prompts                                                                                                                                                     CONTEXT WORKBENCH
+    ──────────────────────────────── ────────────────────────────────────────────────────────────────────────────────────────────── ────────────────────────────────────────────────────────────────
+      SECTIONS                  21     INPUT & PROMPTS                                                                ITEMS FOCUS     CONTEXT                                              DERIVED
+                                       How typing and submitting behave.
+      APPEARANCE                                                                                                                      SUBMIT ON ENTER
+        Theme & Colors                   SETTING                                    VALUE                  ACTION
+        Screen                         ──────────────────────────────────────────────────────────────────────────────────────────      ENTER RESULT
+      WORKSPACE                        ▌ Submit on Enter                            [ON]                   Enter toggle → OFF          Enter toggle → OFF
+        Session List                     Auto-open question panel                   [OFF]                  toggle
+        Transcript Defaults              Prompt compiler                            [ON]                   toggle
+      ▶ Input & Prompts
+      MODELS                                                                                                                          DESCRIPTION
+        Model Roles                     SELECTED · Submit on Enter                                                                    Plain Enter submits multiline text; Shift+Enter inserts a
+        API Providers                   Plain Enter submits multiline text; Shift+Enter inserts a newline.                            newline.
+        System Prompt                   Enter toggle → OFF
+      SAFETY & SPEND
+        Model Control
+        Budgets                                                                                                                       CONTRACT
+        Usage                                                                                                                         Scope              Input & Prompts
+      AGENT AUTOMATION                                                                                                                Owner              TUI (state.json)
+        Retries & Recovery                                                                                                            Persistence        state.json
+        Stall Detection                                                                                                               Apply              immediately
+        Memory & Dreaming                                                                                                             Restart            not required
+        Orchestration
+        Code Intelligence
+      PROVIDERS & SANDBOXES
+        Provider Isolation
+        Sandbox Storage
+        Claude Hooks
+        Claude Skills
+      INTEGRATIONS
+        Message Bridges
+                                                                                                                                      TERMINAL NOTE
+                                                                                                                                      Toggle OFF when the terminal cannot deliver Shift+Enter as a
+                                                                                                                                      distinct key.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                      ────────────────────────────────────────────────────────────
+                                                                                                                                      Context has no focus or hidden actions.

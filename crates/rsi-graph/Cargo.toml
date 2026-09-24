@@ -1,0 +1,17 @@
+[package]
+name = "rsi-graph"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

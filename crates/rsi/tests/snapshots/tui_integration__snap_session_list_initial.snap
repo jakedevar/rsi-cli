@@ -1,0 +1,14 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: "support::buffer_to_snapshot(&buffer)"
+---
+ ● 1
+ All projects / Sessions                                                                 4 sessions
+  #   ∞  S  !  FUNCTION                                        ◔     ⇄ AGE    MODEL                ▮
+ NEEDS YOU ─────────────────────────────────────────────────────────────────────────────────────────
+▌        ?  !  Review harness snapshots                              3  now ◎ codex-2
+         ×  !  Investigate render edge                              13  now ✻ opus-4-1
+ IN FLIGHT ─────────────────────────────────────────────────────────────────────────────────────────
+         ●     Implement event seam                                  8  now ✻ sonnet-5
+ RECENT ────────────────────────────────────────────────────────────────────────────────────────────
+         ✓     Clean fixture state                                   5  now ⌂ oss:20b

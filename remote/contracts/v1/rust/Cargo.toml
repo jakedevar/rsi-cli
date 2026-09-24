@@ -1,0 +1,21 @@
+[package]
+name = "rsi-remote-contracts-v1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+
+[workspace]
+
+[lib]
+path = "../../../../crates/rsi-common/src/remote_read.rs"
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+uuid = { version = "=1.20.0", default-features = false }
+chrono = { version = "=0.4.43", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "remote-contract-fixtures"
+path = "src/fixtures.rs"

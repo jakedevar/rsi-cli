@@ -1,0 +1,29 @@
+[package]
+name = "flywheel-imessage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "iMessage bridge for RSI — polls chat.db, dispatches to daemon, sends replies via AppleScript"
+
+[[bin]]
+name = "flywheel-imessage"
+path = "src/main.rs"
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+fuzzy-matcher = { workspace = true }
+toml = "0.8"
+
+[lints]
+workspace = true

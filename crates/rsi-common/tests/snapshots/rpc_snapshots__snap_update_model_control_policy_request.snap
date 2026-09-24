@@ -1,0 +1,17 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+assertion_line: 373
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "UpdateModelControlPolicy",
+  "params": {
+    "circuit_updates": [],
+    "interrupt_active": true,
+    "mode": "stop_all",
+    "policies": [],
+    "replace_policies": false
+  }
+}

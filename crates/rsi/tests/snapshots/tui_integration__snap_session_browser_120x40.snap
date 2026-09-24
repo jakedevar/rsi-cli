@@ -1,0 +1,44 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: text
+---
+ ● 8
+ All projects / Sessions                                                                                    22 sessions
+  ▌ 01  ? waiting · reply required
+  ▌ Choose the bounded relay policy?
+
+    #   ∞  S  !  FUNCTION                                                        ◔     ⇄ AGE    MODEL                ▮
+
+    ! NEEDS YOU  2  ──────────────
+  ▌        ?  !  Review harness snapshots                                              3  now ⋈ opus-4-6             ▆
+           ×  !  Investigate render edge                                              13  now ✻ opus-4-1
+
+    ● IN FLIGHT  8  ──────────────
+           ●     Implement event seam                                                  8  now ✻ sonnet-5
+           ●     Browser session 05                                                    8   5d ✻ sonnet-5
+           ●     Browser session 06                                                    8   6d ✻ sonnet-5
+           ●     Browser session 07                                                    8   7d ✻ sonnet-5
+           ●     Browser session 08                                                    8   8d ✻ sonnet-5
+           ●     Browser session 09                                                    8   9d ✻ sonnet-5
+           ●     Browser session 10                                                    8  10d ✻ sonnet-5
+           ◐     Browser session 11                                                    8  11d ✻ sonnet-5
+
+    ✓ RECENT  1  ──────────────
+           ✓     Clean fixture state                                                   5  now ⌂ oss:20b
+
+    · QUIET  11  ──────────────
+           ■     Browser session 12                                                    8  12d ✻ sonnet-5
+           ✓     Browser session 13                                                    8  13d ✻ sonnet-5
+           ✓     Browser session 14                                                    8  14d ✻ sonnet-5
+           ✓     Browser session 15                                                    8  15d ✻ sonnet-5
+           ✓     Browser session 16                                                    8  16d ✻ sonnet-5
+           ✓     Browser session 17                                                    8  17d ✻ sonnet-5
+           ✓     Browser session 18                                                    8  18d ✻ sonnet-5
+           ✓     Browser session 19                                                    8  19d ✻ sonnet-5
+           ✓     Browser session 20                                                    8  20d ✻ sonnet-5
+           ✓     Browser session 21                                                    8  21d ✻ sonnet-5
+           ✓     Browser session 22                                                    8  22d ✻ sonnet-5
+
+
+
+    22/22

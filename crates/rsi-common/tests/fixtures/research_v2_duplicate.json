@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "research_question": "Duplicate provenance identifiers must fail strict v2",
+  "areas": ["validators", "provenance"],
+  "findings": [
+    {"id": "F-001", "summary": "First finding claims F-001", "file_ref": "src/lib.rs:1", "confidence": "high"},
+    {"id": "F-001", "summary": "Second finding reuses F-001", "file_ref": "src/lib.rs:2", "confidence": "high"}
+  ],
+  "file_refs": [
+    {"path": "src/lib.rs", "lines": [1, 2]}
+  ],
+  "open_questions": []
+}

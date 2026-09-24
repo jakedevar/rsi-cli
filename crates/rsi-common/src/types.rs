@@ -1,0 +1,8077 @@
+use crate::provider_capabilities::ResolvedContextBudget;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+// === Newtype ID wrappers (Phase 3.1 — Step A, additive) ===
+//
+// These typed identifiers prevent silent cross-ID mix-ups (e.g., passing a
+// `Project.id` where a `Session.id` is expected). The wire format is
+// preserved via `#[serde(transparent)]` — JSON serialization is identical to
+// the inner type, so old TUI/daemon clients consuming the type-erased shape
+// continue to work.
+//
+// Step A is purely additive: adds the types and `From`/`Display` impls. No
+// existing struct fields are migrated yet — Step B (a separate commit) does
+// the field migration mechanically across the workspace.
+//
+// Deliberately NO `Deref` impl: forcing callers to be explicit when they
+// need the inner `Uuid` is the entire point of the newtype barrier.
+
+/// Typed identifier for a `Session` row. Prevents mix-ups with other Uuid IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct SessionId(pub Uuid);
+
+impl SessionId {
+    /// Construct a fresh random session id.
+    #[must_use]
+    pub fn new() -> Self {
+        SessionId(Uuid::new_v4())
+    }
+}
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<Uuid> for SessionId {
+    fn from(u: Uuid) -> Self {
+        SessionId(u)
+    }
+}
+impl From<SessionId> for Uuid {
+    fn from(id: SessionId) -> Self {
+        id.0
+    }
+}
+
+/// Typed identifier for a `ConversationEvent` DB row. Sentinel `UNSAVED`
+/// represents pre-persistence events; check via `is_saved()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct EventId(pub i64);
+
+impl EventId {
+    /// Sentinel for events not yet written to the database.
+    pub const UNSAVED: EventId = EventId(0);
+    /// Returns true when the id has been assigned by the store (non-zero).
+    #[inline]
+    pub const fn is_saved(self) -> bool {
+        self.0 != 0
+    }
+}
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<i64> for EventId {
+    fn from(n: i64) -> Self {
+        EventId(n)
+    }
+}
+impl From<EventId> for i64 {
+    fn from(id: EventId) -> Self {
+        id.0
+    }
+}
+
+/// Typed identifier for a `Project` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct ProjectId(pub Uuid);
+
+impl ProjectId {
+    #[must_use]
+    pub fn new() -> Self {
+        ProjectId(Uuid::new_v4())
+    }
+}
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<Uuid> for ProjectId {
+    fn from(u: Uuid) -> Self {
+        ProjectId(u)
+    }
+}
+impl From<ProjectId> for Uuid {
+    fn from(id: ProjectId) -> Self {
+        id.0
+    }
+}
+
+/// Typed identifier for a `Workflow` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct WorkflowId(pub Uuid);
+
+impl WorkflowId {
+    #[must_use]
+    pub fn new() -> Self {
+        WorkflowId(Uuid::new_v4())
+    }
+}
+impl std::fmt::Display for WorkflowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<Uuid> for WorkflowId {
+    fn from(u: Uuid) -> Self {
+        WorkflowId(u)
+    }
+}
+impl From<WorkflowId> for Uuid {
+    fn from(id: WorkflowId) -> Self {
+        id.0
+    }
+}
+
+/// Typed identifier for a `SessionLabel` row (column name `group_id` in schema).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct LabelId(pub Uuid);
+
+impl LabelId {
+    #[must_use]
+    pub fn new() -> Self {
+        LabelId(Uuid::new_v4())
+    }
+}
+impl std::fmt::Display for LabelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<Uuid> for LabelId {
+    fn from(u: Uuid) -> Self {
+        LabelId(u)
+    }
+}
+impl From<LabelId> for Uuid {
+    fn from(id: LabelId) -> Self {
+        id.0
+    }
+}
+
+/// Typed identifier for a `ScheduledJob` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct ScheduledJobId(pub Uuid);
+
+impl ScheduledJobId {
+    #[must_use]
+    pub fn new() -> Self {
+        ScheduledJobId(Uuid::new_v4())
+    }
+}
+impl std::fmt::Display for ScheduledJobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<Uuid> for ScheduledJobId {
+    fn from(u: Uuid) -> Self {
+        ScheduledJobId(u)
+    }
+}
+impl From<ScheduledJobId> for Uuid {
+    fn from(id: ScheduledJobId) -> Self {
+        id.0
+    }
+}
+
+/// Project for organizing sessions.
+/// Sessions have optional project_id FK enabling per-project analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub description: Option<String>,
+    /// Hex color for UI display (default: Catppuccin blue #89b4fa)
+    pub color: String,
+    /// Files to inject as project context into session system prompts.
+    /// Paths are relative to project path. Read from disk at session launch.
+    #[serde(default)]
+    pub context_files: Option<Vec<PathBuf>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Project {
+    /// Default Catppuccin blue color for new projects.
+    pub const DEFAULT_COLOR: &'static str = "#89b4fa";
+}
+
+/// Label for organizing related sessions (lightweight convoy/issue tracking).
+/// Sessions link to labels via optional group_id FK (column name preserved for schema compat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLabel {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional project scoping. When set, the label is associated with a project.
+    /// Cross-project labels are allowed (project_id = None).
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    /// Hex color for UI display (default: Catppuccin mauve #cba6f7).
+    pub color: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SessionLabel {
+    /// Default Catppuccin mauve color for new labels.
+    pub const DEFAULT_COLOR: &'static str = "#cba6f7";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingQuestion {
+    pub questions: Vec<QuestionItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionItem {
+    pub question: String,
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    // === Cache line 1: identity + hot render fields (64 bytes) ===
+    pub id: Uuid,
+    pub status: SessionStatus,
+    /// Session kind: Standard or TaskRabbit (one-shot).
+    #[serde(default)]
+    pub session_kind: SessionKind,
+    #[serde(default)]
+    pub provider: SessionProvider,
+    #[serde(default)]
+    pub context_usage_confidence: ContextUsageConfidence,
+    /// Depth in context rotation chain. 0 = original session, 1 = first rotation child, etc.
+    /// Auto-rotation is blocked once this reaches 4; the session is interrupted with a warning.
+    #[serde(default)]
+    pub rotation_depth: u32,
+    /// Current retry attempt (0 = first run, 1 = first retry).
+    /// Only set when max_retries > 0.
+    #[serde(default)]
+    pub retry_attempt: Option<u8>,
+    /// Maximum auto-retry attempts for this session. 0 = no retry.
+    #[serde(default)]
+    pub max_retries: Option<u8>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Timestamp when session was pinned. None = unpinned.
+    #[serde(default)]
+    pub pinned_at: Option<DateTime<Utc>>,
+    /// Timestamp when session was marked as needing manual testing. None = not flagged.
+    #[serde(default)]
+    pub testing_needed_at: Option<DateTime<Utc>>,
+    /// Timestamp when auto-rotation was disabled for this session. None = rotation enabled (default).
+    #[serde(default)]
+    pub rotation_disabled_at: Option<DateTime<Utc>>,
+
+    // === Cache line 2-3: display strings ===
+    pub query: String,
+    /// Haiku-generated or user-set title. Falls back to `query` for display when `None`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Normalized operator-facing pipeline function for a direct Epic child.
+    /// This is display metadata and never an authority claim.
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    /// Immutable ordinal reserved by the owning Epic's durable logical spawn.
+    /// Rotation/successor lineage rows intentionally share this value.
+    #[serde(default)]
+    pub epic_spawn_ordinal: Option<u32>,
+    /// LLM-generated paragraph description of what the session is doing.
+    /// Provides richer context than the short title.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Latest short summary (rolling, updated every ~20 assistant messages).
+    /// Daemon-populated from session_summaries table, not user-editable.
+    #[serde(default)]
+    pub short_summary: Option<String>,
+    pub working_dir: PathBuf,
+    /// Git branch name resolved from working_dir at session launch.
+    /// None if working_dir is not inside a git repository.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+
+    // === Cache line 4: secondary identity ===
+    pub claude_session_id: Option<String>,
+    /// Optional project association for organization/analytics.
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    /// Parent session ID for context rotation chains.
+    /// When a session is rotated, the child session's continued_from points to the parent.
+    #[serde(default)]
+    pub continued_from: Option<Uuid>,
+    /// Hierarchical parent session ID (organizational tree — Group/Epic containers).
+    /// Independent of `continued_from` (which tracks rotation chains).
+    /// `None` = top-level session.
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    /// Lead/orchestrator session for this container. Only meaningful when
+    /// `session_kind` is `Group` or `Epic`. Points at a leaf child whose
+    /// `parent_id == self.id`. `None` = no lead assigned.
+    /// Maintained by daemon: auto-promoted to first launched child;
+    /// re-pointed on rotation; cleared on delete.
+    #[serde(default)]
+    pub lead_session_id: Option<Uuid>,
+    /// Path to handoff document if this session wrote one during context rotation.
+    /// Populated when parent session writes a handoff file detected via Write tool interception.
+    #[serde(default)]
+    pub handoff_filepath: Option<String>,
+    /// User-defined description of the active task. Injected into the system prompt
+    /// on launch, continue, and rotation. Survives context rotation via inheritance.
+    /// Set via `:context <text>` command, cleared with bare `:context`.
+    #[serde(default)]
+    pub active_task: Option<String>,
+    /// Optional label assignment for organizing related sessions.
+    /// Field name `group_id` preserved for schema compatibility.
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
+    /// Fallback single-tag for legacy callsites and the synthetic
+    /// "untagged" pill (per locked decision §3.3, INDEX.md:52). Empty
+    /// string means untagged. Multi-tag rollout uses `tags` (below) and
+    /// the `session_tags` join table (P1.5 populates from DB).
+    #[serde(default)]
+    pub tag: String,
+    /// Multi-tag set for this session. Populated from the `session_tags`
+    /// join table during `restore_sessions` (deferred to P1.5 — this ticket
+    /// leaves it empty). Per §2.1 (INDEX.md:23).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// ID of the scheduled job that spawned this session (if any).
+    #[serde(default)]
+    pub scheduled_job_id: Option<Uuid>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+
+    // === Cache line 5+: cold analytics ===
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub num_turns: Option<u32>,
+    // Token usage from Claude's stream events (for context window tracking)
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_context_budget: Option<ResolvedContextBudget>,
+    // Accumulated totals across all turns (for aggregate analytics)
+    #[serde(default)]
+    pub total_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_cache_read_tokens: Option<u64>,
+    /// Daemon-counted input tokens (query + tool results) — no API dependency.
+    #[serde(default)]
+    pub daemon_input_tokens: Option<u64>,
+    /// Daemon-counted output tokens (assistant text content) — no API dependency.
+    #[serde(default)]
+    pub daemon_output_tokens: Option<u64>,
+    /// Context-window fill percentage (0.0–100.0), DERIVED ON READ by the daemon
+    /// and stamped onto every `Session` it returns over RPC. The daemon is the
+    /// single source of truth: live/active sessions use runtime state, idle ones
+    /// are computed from persisted token fields, both through one shared formula.
+    /// NOT a DB column — never persisted, never written by row mappers; `None`
+    /// before the daemon stamps it. The TUI renders this value and does not
+    /// recompute pct from `context_window`/token fields.
+    #[serde(default)]
+    pub context_fill_pct: Option<f64>,
+    /// Path to pipeline artifact written by this session.
+    /// Set when model writes to thoughts/shared/{research,plans}/.
+    /// Used by TUI to derive the next pipeline step and render action buttons.
+    #[serde(default)]
+    pub pipeline_artifact: Option<String>,
+    /// Per-session topology override. **Deprecated semantics**: previously
+    /// "workflow this session belongs to". As of P1.3 (topology-on-epic),
+    /// this field is `None` for spawned children; topology is derived on
+    /// read via `rsid::session::hierarchy_ops::effective_topology_with_override`
+    /// (or its TUI mirror `App::effective_topology`) walking the
+    /// `parent_id` chain to the owning Epic. A non-`None` value here means
+    /// the user explicitly pinned a topology to this individual session
+    /// (typically via the `r` keybinding on the `gv` overlay). Prefer
+    /// `effective_topology_with_override` over direct reads of this field.
+    #[serde(default)]
+    pub workflow_id: Option<Uuid>,
+    /// Per-session topology override. When `Some`, supersedes the Epic-derived
+    /// topology resolved by `effective_topology_with_override`. `None` (default)
+    /// means the session inherits its Epic ancestor's topology.
+    #[serde(default)]
+    pub workflow_id_override: Option<Uuid>,
+    #[serde(default)]
+    pub pending_question: Option<PendingQuestion>,
+    /// Whether this session is marked for auto-archive on completion.
+    /// Set via `MarkPendingArchive` RPC; daemon auto-archives when session finishes.
+    #[serde(default)]
+    pub pending_archive: bool,
+    /// Effort level used for this session when supported by the provider.
+    /// Values: provider/model-specific levels including "low", "medium", "high",
+    /// "xhigh", "max", and Codex GPT-6 Astra "ultra".
+    #[serde(default)]
+    pub effort: Option<String>,
+
+    // === Issue tracker fields (set for issue-driven sessions) ===
+    /// External issue tracker identifier (e.g., "ENG-42"). Set for issue-driven sessions.
+    #[serde(default)]
+    pub issue_identifier: Option<String>,
+    /// External issue tracker URL for the source issue.
+    #[serde(default)]
+    pub issue_url: Option<String>,
+    /// External issue tracker UUID (for reconciliation queries).
+    #[serde(default)]
+    pub issue_tracker_id: Option<String>,
+
+    // === Rating + harness versioning + outcome telemetry ===
+    //
+    // Nullability contract (Q3 resolution): every field in this block is
+    // `Option<...>` with `#[serde(default)]`. The distinction between `None`
+    // (unmeasured — pre-V38/V41 row, session never ran the relevant probe,
+    // or parser couldn't extract a verdict) and `Some(false)` / `Some(0)`
+    // (measured, outcome was the zero/false value) is load-bearing. Any
+    // downstream analytics code that treats "unmeasured" as zero must do so
+    // explicitly via `.unwrap_or(0)` / `.unwrap_or(false)` — never match
+    // these as implicit-zero. Rows that pre-date the relevant migration
+    // will forever carry `None`, no retroactive backfill runs.
+    //
+    // Hook site: populated at finalize only (`finalize_session` in
+    // `crates/rsid/src/session/lifecycle.rs`). There is no intra-session
+    // update path — analytics see one write per session lifetime.
+    /// User rating of session outcome (1–10 scale). `None` = unrated.
+    #[serde(default)]
+    pub rating: Option<i16>,
+    /// SHA256 hash of resolved worker_preamble + command + FLYWHEEL + memory bundle at launch.
+    /// Enables session reproducibility verification.
+    #[serde(default)]
+    pub harness_version_hash: Option<String>,
+    /// Whether the final `cargo test` invocation in this session passed.
+    /// `None` = session never ran `cargo test`, or the final ToolResult was
+    /// unparseable. `Some(true)` / `Some(false)` = measured verdict from the
+    /// last cargo-test event pair (final-invocation-wins; earlier runs are
+    /// ignored). See `crates/rsid/src/session/outcome.rs` for the full parse
+    /// contract. Downstream must NOT conflate `None` with `Some(false)`.
+    #[serde(default)]
+    pub test_passed: Option<bool>,
+    /// Whether the final `cargo clippy` invocation in this session passed.
+    /// `None` = session never ran `cargo clippy`, or ToolResult was empty.
+    /// `Some(true)` / `Some(false)` = measured verdict. A clippy run with
+    /// any line beginning `error:` is reported as `Some(false)`; warnings
+    /// alone are `Some(true)`. Same None-vs-Some(false) distinction as
+    /// `test_passed` — downstream must pattern-match `Option`.
+    #[serde(default)]
+    pub clippy_passed: Option<bool>,
+    /// Total conversation turns in this session, sourced from the provider's
+    /// stream-json result event (Claude `num_turns` field). `None` = provider
+    /// did not emit a result event (session interrupted before completion).
+    /// This is NOT `events.len()` — the events vec contains every ToolUse /
+    /// ToolResult and drifts badly from the real turn count.
+    #[serde(default)]
+    pub turn_count: Option<u32>,
+    /// Snapshot of `retry_attempt` at finalize, mirrored into a cold column
+    /// so analytics can join on it without reading the hot retry-state path.
+    /// `None` for sessions that pre-date V38 (unmeasured). `Some(0)` for a
+    /// session that finalized on its first attempt. This is NOT a per-message
+    /// / tool-call retry counter — that would require per-turn instrumentation
+    /// out of scope for RSI-002. See resolution Q2 in
+    /// `thoughts/shared/plans/2026-04-24-rsi-002-server-telemetry-correctness.md`.
+    #[serde(default)]
+    pub retry_count: Option<u32>,
+    /// Cumulative time (milliseconds) this session spent with an open
+    /// `AskUserQuestion` (`SessionStatus::WaitingApproval`). `None` for sessions
+    /// that pre-date V41. `Some(0)` for sessions that never entered approval.
+    /// Resets at rotation/retry boundary — children start fresh at `Some(0)`.
+    /// See `thoughts/shared/plans/2026-04-24-rsi-002-server-telemetry-correctness.md`
+    /// resolution Q1.
+    #[serde(default)]
+    pub approval_wait_ms: Option<u64>,
+    /// Wall-clock timestamp the session entered its current `WaitingApproval`
+    /// interval. `Some(t)` while status == WaitingApproval and a question is
+    /// open; `None` otherwise. Derived by the daemon from
+    /// `TrackedSession.approval_wait_start: Option<Instant>` (re-anchored to
+    /// `Utc::now() - elapsed()` on each `ListSessions` / `GetSession`
+    /// projection in `crates/rsid/src/session/queries.rs`).
+    ///
+    /// NOT persisted to SQLite — this is a transient projection refreshed on
+    /// every RPC response. `skip_serializing_if = "Option::is_none"` keeps the
+    /// field absent from the JSON wire when `None`, so the existing RPC
+    /// schema-lock snapshots
+    /// (`crates/rsi-common/tests/snapshots/rpc_snapshots__snap_*_session*.snap`)
+    /// do not see a new `null` key and do not need re-acceptance. Pre-V41
+    /// clients deserialize `None` via `#[serde(default)]`; back-compatible
+    /// with all existing clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_started_at: Option<DateTime<Utc>>,
+    /// Accumulated active-work milliseconds for this session — wall-clock time the
+    /// monitor loop spent Running MINUS AskUserQuestion (approval) wait. Daemon-side
+    /// measurement (provider-agnostic); NOT the provider-reported `duration_ms`.
+    /// Add-only floor, monotonic across restart/continue. `None` = unmeasured
+    /// (pre-V70 row, or a Group/Epic container that never ran). `Some(0)` =
+    /// measured-but-no-work-yet. Rotation/retry children start fresh at `Some(0)`.
+    /// TD1 (see thoughts/shared/plans/2026-07-07-TD1-accumulated-work-time.md).
+    #[serde(default)]
+    pub work_time_ms: Option<u64>,
+
+    // === Sandbox (agent isolation) ===
+    /// Which sandbox variant (if any) this session uses. `None` = canonical working_dir.
+    #[serde(default)]
+    pub sandbox_kind: Option<SandboxKind>,
+    /// Absolute path to the sandbox root (e.g. git worktree checkout). `None` when
+    /// `sandbox_kind` is `None`. Provider subprocess `current_dir` resolves through
+    /// this when `Some`, falling back to `working_dir` otherwise.
+    #[serde(default)]
+    pub sandbox_root: Option<PathBuf>,
+    /// Git branch name for the sandbox (when `sandbox_kind == GitWorktree`).
+    #[serde(default)]
+    pub sandbox_branch: Option<String>,
+    /// Cleanup state of the on-disk sandbox. Drives orphan sweep logic on daemon restart.
+    #[serde(default)]
+    pub sandbox_cleanup_state: Option<SandboxCleanupState>,
+
+    /// Marks this session row as an eval replay. Excluded from production
+    /// analytics and from default `ListSessions` projections. Set by
+    /// `rsi-eval` via `LaunchSessionParams.is_eval=true`. Pre-V44 rows
+    /// carry false (column default); never null. See RSI-006.
+    #[serde(default)]
+    pub is_eval: bool,
+
+    // === Routing enforcement (RSI-010) ===
+    /// Declared capability class for this session (from command frontmatter
+    /// or an explicit `LaunchConfig.capability_class`). The validator hook in
+    /// `crates/rsid/src/session/monitor.rs` compares this against the actual
+    /// model's classified tier on `system/init` and emits a warn on mismatch.
+    /// `None` for free-text / ad-hoc launches with no command binding.
+    #[serde(default)]
+    pub capability_class: Option<CapabilityClass>,
+
+    // === Topology binding (P1.7) ===
+    /// Topology node this session is bound to. `None` = unbound (manual spawn or
+    /// pre-topology session). Identifier matches a node in the topology resolved
+    /// via `effective_topology()`.
+    #[serde(default)]
+    pub topology_node_id: Option<String>,
+    /// Iteration count for this `(epic_id, topology_node_id)` tuple.
+    /// Default 0 = first iteration (or unbound). Hard-capped at
+    /// `MAX_ITERATIONS = 32` at spawn time.
+    #[serde(default)]
+    pub topology_iteration: u32,
+
+    // === Provider handshake (V99, P1-A) ===
+    //
+    // Captured from the provider's `system/init` event. These record what the
+    // installed CLI *told us* it is and what it *told us* it supports, so a
+    // later phase can gate a flag on advertised support instead of assuming it.
+    // No backfill: a historical session's negotiated capability set is not
+    // recoverable, so pre-V99 rows stay `None`/empty forever.
+    /// Provider CLI version string from `system/init` (e.g. `"2.1.259"`).
+    /// `None` = never observed (pre-V99 row, non-Claude provider, or a session
+    /// that failed before its handshake).
+    #[serde(default)]
+    pub provider_cli_version: Option<String>,
+    /// Capability tokens the provider CLI advertised at `system/init`
+    /// (e.g. `["interrupt_receipt_v1", "msg_lifecycle_v1"]`).
+    ///
+    /// A `Vec` rather than an `Option<Vec>` on purpose: "advertised nothing"
+    /// and "not yet observed" are both correctly answered by "this CLI has not
+    /// told us it supports anything", and every consumer is a membership test.
+    #[serde(default)]
+    pub provider_capabilities: Vec<String>,
+
+    // === Richer usage capture (V99, P1-C) ===
+    //
+    // Extracted from the final `result` event's `usage` object. All `Option`
+    // with `#[serde(default)]`: `None` means unmeasured (pre-V99 row, or a
+    // provider that does not report the counter), which is distinct from
+    // `Some(0)`. Do not collapse the two.
+    /// `usage.output_tokens_details.thinking_tokens` — extended-thinking tokens
+    /// billed as output.
+    #[serde(default)]
+    pub thinking_tokens: Option<u64>,
+    /// `usage.service_tier` (e.g. `"standard"`, `"priority"`, `"batch"`).
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`.
+    ///
+    /// Split from the 5m counter deliberately: Claude Code drops from the 1-hour
+    /// prompt-cache TTL to the 5-minute TTL once an account draws on usage
+    /// credits, which materially changes the cost model for long-lived sessions.
+    /// Capturing both is what makes that transition observable rather than an
+    /// unexplained cost increase.
+    #[serde(default)]
+    pub cache_creation_1h_tokens: Option<u64>,
+    /// `usage.cache_creation.ephemeral_5m_input_tokens`. See the 1h counter.
+    #[serde(default)]
+    pub cache_creation_5m_tokens: Option<u64>,
+    /// Number of entries in the `result.permission_denials` array.
+    ///
+    /// A count, not the elements: the array's existence and type are observed
+    /// but its element shape is not (only the empty case has ever been seen),
+    /// and modelling an unobserved shape would be guesswork. Elements are
+    /// deferred to P2-DENIALS pending a probe that produces a real denial.
+    #[serde(default)]
+    pub permission_denial_count: Option<u64>,
+    /// `result.subagent_stats`, stored verbatim as a JSON string.
+    ///
+    /// Opaque on purpose. The shape is observed but has six nested sub-objects
+    /// and a `by_type` map whose keys are unknown, so a column-per-field schema
+    /// would be invented rather than known. Verbatim storage is honest and
+    /// costs one column.
+    #[serde(default)]
+    pub subagent_stats_json: Option<String>,
+    /// `result.queued_turn_count` — turns still queued when the result landed.
+    #[serde(default)]
+    pub queued_turn_count: Option<u64>,
+    /// `result.terminal_reason` (e.g. `"completed"`). Distinct from
+    /// `stop_reason`, which is the model's own stop cause for the last turn.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+}
+
+/// Variants of session sandbox isolation. Additional kinds (bwrap, nspawn, ...)
+/// are reserved for later iterations; `GitWorktree` is the only active variant today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub enum SandboxKind {
+    #[default]
+    None,
+    /// Isolated via `git worktree add` — filesystem-only.
+    GitWorktree,
+    // Reserved for future iterations. Keep variants unused-but-serializable so a
+    // future daemon can read old rows without a breaking rename.
+    // Bubblewrap,
+    // SystemdNspawn,
+}
+
+/// Lifecycle state of a sandbox root on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub enum SandboxCleanupState {
+    /// Worktree/root exists on disk and is associated with a live session.
+    #[default]
+    Live,
+    /// Cleanup attempted; filesystem removal confirmed.
+    Purged,
+    /// Cleanup failed; on-disk state may or may not exist. Orphan sweep retries.
+    Failed,
+}
+
+/// Stable, bounded pre-effect refusal classes for sandbox custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCustodyErrorCodeV1 {
+    TupleIncomplete,
+    HistoricalPurged,
+    HistoricalTransferred,
+    CleanupFailed,
+    RootMissing,
+    RootOutsideBase,
+    RootIdentityMismatch,
+    WorktreeMismatch,
+    OwnershipMissing,
+    OwnershipConflict,
+    CustodyChanged,
+    ReclaimPrepared,
+    RootBusy,
+    SourceRevisionUnavailable,
+    SourceWorktreeDirty,
+    AllocationFailed,
+    PersistenceTransitionFailed,
+}
+
+impl SandboxCustodyErrorCodeV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TupleIncomplete => "tuple_incomplete",
+            Self::HistoricalPurged => "historical_purged",
+            Self::HistoricalTransferred => "historical_transferred",
+            Self::CleanupFailed => "cleanup_failed",
+            Self::RootMissing => "root_missing",
+            Self::RootOutsideBase => "root_outside_base",
+            Self::RootIdentityMismatch => "root_identity_mismatch",
+            Self::WorktreeMismatch => "worktree_mismatch",
+            Self::OwnershipMissing => "ownership_missing",
+            Self::OwnershipConflict => "ownership_conflict",
+            Self::CustodyChanged => "custody_changed",
+            Self::ReclaimPrepared => "reclaim_prepared",
+            Self::RootBusy => "root_busy",
+            Self::SourceRevisionUnavailable => "source_revision_unavailable",
+            Self::SourceWorktreeDirty => "source_worktree_dirty",
+            Self::AllocationFailed => "allocation_failed",
+            Self::PersistenceTransitionFailed => "persistence_transition_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCustodyTransitionV1 {
+    FreshLaunch,
+    AgentSpawnChild,
+    Rotation,
+    Retry,
+    AgentFresh,
+    CodexAppServerReplacement,
+    RecursiveLive,
+    StartupReconciliation,
+    Purge,
+    CleanupFailure,
+    EffectRevalidation,
+    Continue,
+    ResumeWake,
+    HandoffResume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCustodyRecoveryV1 {
+    InspectStatus,
+    CommitSource,
+    RetryAfterReconcile,
+    CreateNewSession,
+    OperatorRepair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxCustodyErrorV1 {
+    pub version: u8,
+    pub code: SandboxCustodyErrorCodeV1,
+    pub session_id: Option<Uuid>,
+    pub transition: SandboxCustodyTransitionV1,
+    pub retryable: bool,
+    pub recovery: SandboxCustodyRecoveryV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecutionStateV1 {
+    OrdinaryUnsandboxed,
+    LiveSandboxed,
+    HistoricalPurged,
+    HistoricalTransferred,
+    HistoricalCleanupFailed,
+    Quarantined,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecutionFreshnessV1 {
+    Verified,
+    Unverified,
+    Invalid,
+}
+
+/// Additive, cached execution projection. `Session.working_dir` remains the
+/// canonical repository directory; `effective_cwd` is present only after a
+/// current custody verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionStatusV1 {
+    pub schema_version: u8,
+    pub projection_version: u8,
+    pub state: SessionExecutionStateV1,
+    pub freshness: SessionExecutionFreshnessV1,
+    pub canonical_repo_dir: PathBuf,
+    pub effective_cwd: Option<PathBuf>,
+    pub sandbox_root: Option<PathBuf>,
+    pub sandbox_branch: Option<String>,
+    pub custody_id: Option<Uuid>,
+    pub owner_session_id: Option<Uuid>,
+    pub owner_generation: Option<u64>,
+    pub source_commit: Option<String>,
+    pub validated_at: Option<DateTime<Utc>>,
+    pub error: Option<SandboxCustodyErrorV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusViewV1 {
+    #[serde(flatten)]
+    pub session: Session,
+    pub execution: SessionExecutionStatusV1,
+}
+
+/// Capability class for routing enforcement (RSI-010).
+///
+/// Declared in `.claude/commands/*.md` frontmatter (`capability_class:`) and
+/// stamped on `Session.capability_class` at launch. The validator hook in
+/// `crates/rsid/src/session/monitor.rs` warns when the actual model's tier
+/// disagrees with the declared class.
+///
+/// - `Architect` — Opus/Sol-class. Multi-file architectural work, nuanced reasoning.
+/// - `Implementer` — Sonnet/Terra-class. Standard implementation / research.
+/// - `LookupFast` — Haiku/Luna-class. Fast lookups, simple validation.
+///
+/// Bridge-scope (RSI-010): absorbed by RSI-017's orchestrator/worker split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityClass {
+    /// Opus/Sol-class — multi-file architectural decisions.
+    Architect,
+    /// Sonnet/Terra-class — standard implementation / research.
+    Implementer,
+    /// Haiku/Luna-class — fast lookups, simple validation.
+    LookupFast,
+}
+
+impl CapabilityClass {
+    /// Classify a model string into its capability tier.
+    ///
+    /// Returns `None` for unrecognized models — the validator interprets `None`
+    /// as "cannot judge" and suppresses the mismatch warning for that model.
+    ///
+    /// Normalization: lowercases, strips a leading `anthropic/` or `openai/`
+    /// provider namespace. Prefix-matches the canonical model-family tokens
+    /// (`claude-opus`, `claude-sonnet`, `claude-haiku`, `claude-3-opus`,
+    /// `claude-3-5-haiku`, etc.) and the OpenAI reasoning
+    /// families (`gpt-4`, `gpt-5`, `o1`, `o3`). Current Codex Sol/Terra/Luna
+    /// suffixes are classified before the generic GPT-5 fallback. The function
+    /// is allocation-free outside the one lowercase and `O(1)` in practice.
+    pub fn classify(model: &str) -> Option<Self> {
+        // Normalize — classification is case-insensitive and strips a leading
+        // provider namespace (e.g. "anthropic/") that some configs carry.
+        let m = model.to_ascii_lowercase();
+        let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+        let m = m.strip_prefix("openai/").unwrap_or(m);
+
+        // Anthropic Opus family (current + legacy).
+        if m.starts_with("claude-opus") || m.starts_with("claude-3-opus") {
+            return Some(Self::Architect);
+        }
+        // Anthropic Sonnet family.
+        if m.starts_with("claude-sonnet") {
+            return Some(Self::Implementer);
+        }
+        // Anthropic Haiku family (current + 3.5 + 3.0).
+        if m.starts_with("claude-haiku")
+            || m.starts_with("claude-3-5-haiku")
+            || m.starts_with("claude-3-haiku")
+        {
+            return Some(Self::LookupFast);
+        }
+
+        // Current GPT-6 Codex tiers.
+        if m.starts_with("gpt-6-astra") || m.starts_with("gpt-6-sol") {
+            return Some(Self::Architect);
+        }
+        if m.starts_with("gpt-6-luna") {
+            return Some(Self::LookupFast);
+        }
+
+        // Other OpenAI GPT-5 + O-series reasoning maps to Architect-tier.
+        if m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") {
+            return Some(Self::Architect);
+        }
+        // OpenAI GPT-4 / GPT-3 maps to Implementer-tier.
+        if m.starts_with("gpt-4") || m.starts_with("gpt-3") {
+            return Some(Self::Implementer);
+        }
+
+        // Unknown — validator suppresses mismatch warning.
+        None
+    }
+}
+
+/// Per-launch sandbox request carried by `LaunchSessionParams`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxSpec {
+    /// Defaults to `GitWorktree` when spec is present but kind is unset.
+    #[serde(default)]
+    pub kind: Option<SandboxKind>,
+    /// Optional branch name override. Default: `rsi/<session_id_short>`.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub enum SessionProvider {
+    #[default]
+    Claude,
+    Codex,
+    /// Pioneer inference through the Codex CLI custom-provider transport.
+    Pioneer,
+    /// OpenRouter inference through the Codex CLI custom-provider transport.
+    OpenRouter,
+    /// Amazon Bedrock Responses API through the Codex CLI custom-provider transport.
+    Bedrock,
+    /// Local models via Ollama or any local OpenAI-compatible server.
+    Local,
+    /// Google Antigravity CLI (`agy`) — subprocess-based, plain-text `--print` output.
+    #[serde(alias = "Gemini")]
+    Antigravity,
+    /// Codex via app-server bidirectional JSON-RPC protocol.
+    /// Uses `codex app-server` for structured approval flows and multi-turn continuation.
+    CodexAppServer,
+    /// Direct API harness — owns the conversation loop, tools, and compaction.
+    /// Model string determines which backend API to call (Anthropic, OpenAI, compatible).
+    Harness,
+}
+
+/// Categorizes sessions by their creation intent.
+///
+/// Leaf kinds (Standard, TaskRabbit, Bug, Story, Task, Feature, Refactor, Research)
+/// are spawnable: the daemon launches a provider subprocess for them.
+///
+/// Container kinds (Group, Epic) are organizational nodes only;
+/// they cannot be spawned as processes and only hold child sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub enum SessionKind {
+    #[default]
+    Standard,
+    TaskRabbit,
+    Bug,
+    /// Container kind — top-level organizational node. Children: Standard, Epic.
+    Group,
+    /// Container kind — holds Story/Task/Bug/Feature/Refactor/Research children under a Group.
+    Epic,
+    /// Leaf kind — narrative / planning unit under an Epic.
+    Story,
+    /// Leaf kind — work unit under an Epic.
+    Task,
+    /// Leaf kind — feature work (new capability, additive change).
+    Feature,
+    /// Leaf kind — refactor (no behavior change, structural improvement).
+    Refactor,
+    /// Leaf kind — research / investigation (output is findings, not code).
+    Research,
+}
+
+/// Returns true if the kind is a spawnable leaf (daemon will launch a subprocess).
+#[inline]
+pub fn is_leaf_kind(k: SessionKind) -> bool {
+    matches!(
+        k,
+        SessionKind::Standard
+            | SessionKind::TaskRabbit
+            | SessionKind::Bug
+            | SessionKind::Story
+            | SessionKind::Task
+            | SessionKind::Feature
+            | SessionKind::Refactor
+            | SessionKind::Research
+    )
+}
+
+/// Returns true if the kind is a container (organizational node, non-spawnable).
+#[inline]
+pub fn is_container_kind(k: SessionKind) -> bool {
+    matches!(k, SessionKind::Group | SessionKind::Epic)
+}
+
+/// Returns the legal child-kind set for a given parent.
+///
+/// - `None` (root): [Standard, Group]
+/// - `Some(Group)`: [Standard, Epic]
+/// - `Some(Epic)`:  [Story, Task, Bug, Feature, Refactor, Research]
+/// - any leaf parent: `&[]` (leaves cannot contain children)
+pub fn legal_children(parent: Option<SessionKind>) -> &'static [SessionKind] {
+    match parent {
+        None => &[SessionKind::Standard, SessionKind::Group],
+        Some(SessionKind::Group) => &[SessionKind::Standard, SessionKind::Epic],
+        Some(SessionKind::Epic) => &[
+            SessionKind::Story,
+            SessionKind::Task,
+            SessionKind::Bug,
+            SessionKind::Feature,
+            SessionKind::Refactor,
+            SessionKind::Research,
+        ],
+        Some(SessionKind::Standard)
+        | Some(SessionKind::TaskRabbit)
+        | Some(SessionKind::Bug)
+        | Some(SessionKind::Story)
+        | Some(SessionKind::Task)
+        | Some(SessionKind::Feature)
+        | Some(SessionKind::Refactor)
+        | Some(SessionKind::Research) => &[],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionStatus {
+    Starting,
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Interrupted,
+    Archived,
+    Deleted,
+}
+
+impl SessionStatus {
+    /// Returns true if this status represents a terminal/final state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Archived
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationEvent {
+    // Hot path — accessed on every render/filter
+    pub id: i64,
+    pub session_id: Uuid,
+    pub sequence: i32,
+    pub event_type: EventType,
+    pub role: Option<Role>,
+    pub created_at: DateTime<Utc>,
+    // Display
+    pub content: String,
+    pub tool_name: Option<String>,
+    // Cold — only populated for ToolUse events
+    pub tool_input: Option<Box<serde_json::Value>>,
+    /// Reference to offloaded content (compression). Set when event content has been summarized.
+    #[serde(default)]
+    pub offload_id: Option<String>,
+    /// Provider-assigned tool call id. Set on `ToolUse` events (the block's `id`)
+    /// and on `ToolResult` events (the block's `tool_use_id`), giving offline
+    /// analysis a typed, indexed join key to pair a call with its result.
+    ///
+    /// `None` means unpairable: either the event is not tool-related, the
+    /// provider did not supply an id, or the row predates the V81 migration.
+    /// It is never inferred by adjacency — a guess here would be indistinguishable
+    /// from ground truth downstream.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// Free-form structured observations about this event (duration, exit code,
+    /// token counts, truncation/error flags). Deliberately open-ended so future
+    /// observations do not require another migration on this hot table.
+    #[serde(default)]
+    pub metadata: Option<Box<serde_json::Value>>,
+}
+
+/// Severity stored for a session-attributed daemon diagnostic. Deliberately
+/// narrower than `tracing::Level`; this is not a mirror of daemon logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SessionDiagnosticLevelV1 {
+    Warn,
+    Error,
+}
+
+/// A bounded daemon diagnostic attributed to one session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDiagnosticV1 {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub occurrence_count: i64,
+    pub level: SessionDiagnosticLevelV1,
+    pub message: String,
+    pub fields: Option<serde_json::Value>,
+}
+
+/// Insert contract for a session diagnostic. The Store validates message and
+/// field bounds before persisting this value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewSessionDiagnosticV1 {
+    pub session_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub level: SessionDiagnosticLevelV1,
+    pub message: String,
+    pub fields: Option<serde_json::Value>,
+}
+
+/// A bounded page of session diagnostics. `next_after_id` is present when the
+/// page reached its requested limit; requesting it may produce an empty page
+/// if no further records exist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDiagnosticsPageV1 {
+    pub diagnostics: Vec<SessionDiagnosticV1>,
+    pub next_after_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum EventType {
+    Message,
+    ToolUse,
+    ToolResult,
+    System,
+    /// Extended thinking / reasoning content from Claude.
+    /// Hidden by default in detail view; rendered as a collapsed count bubble.
+    Thinking,
+    /// Event whose content has been offloaded (compressed).
+    /// Original content stored separately; event shows `[[OFFLOAD:id]]` marker + summary.
+    Compressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// Confidence classification for live context usage calculations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ContextUsageConfidence {
+    /// Daemon-counted directly from streamed content — real-time, no API dependency.
+    Counted,
+    /// Usage data contains both prompt and cache tokens for an exact total.
+    Full,
+    /// Usage data is missing cache tokens or other fields — best-effort approximation.
+    Partial,
+    /// API previously reported usage but no update has arrived within the daemon's
+    /// staleness window (default 60s) on a Running session. The daemon keeps the
+    /// last API-reported percentage but marks the reading stale; TUI renders a
+    /// distinct `!` indicator. Runtime-only — never persisted to the DB; on
+    /// rehydrate, the DB value resets to `Missing` (same as today).
+    Stale,
+    /// No usage data reported for the chunk; accumulator is stale until next update.
+    #[default]
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Approval {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub status: ApprovalStatus,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ApprovalStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+/// Lifecycle hook points where the daemon can intercept and mutate behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum HookPoint {
+    BeforeLaunch,
+    AfterLaunch,
+    OnToolUse,
+    BeforeToolDispatch,
+    BeforeCompression,
+    BeforeRotation,
+    BeforeFinalize,
+    BeforeArchive,
+}
+
+/// Permission levels for tool access control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PermissionLevel {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Scope for permission rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PermissionScope {
+    Global,
+    Project,
+}
+
+/// A glob-based tool permission rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub id: i64,
+    pub tool_pattern: String,
+    pub level: PermissionLevel,
+    pub scope: PermissionScope,
+    #[serde(default)]
+    pub scope_id: Option<Uuid>,
+    pub priority: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Metadata for an offloaded (compressed) event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffloadEntry {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub event_sequence: i32,
+    pub original_byte_size: u64,
+    pub content_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Pipeline workflow stage. Strictly forward-only progression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WorkflowStage {
+    /// Research session launched.
+    Research,
+    /// Research artifact detected.
+    ResearchComplete,
+    /// Plan session launched or continued.
+    Planning,
+    /// Plan artifact detected.
+    PlanComplete,
+    /// Implement session launched or continued.
+    Implementing,
+    /// Implement session completed.
+    ImplementComplete,
+    /// Fully done (manual or future automation).
+    Complete,
+}
+
+/// A workflow represents an "idea" — a unit of work progressing through
+/// the research → plan → implement pipeline. Sessions link to workflows via FK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    pub id: Uuid,
+    pub title: String,
+    pub stage: WorkflowStage,
+    /// Path to the latest pipeline artifact (research doc, plan doc, etc.).
+    /// Used by TUI to construct the next pipeline command.
+    pub artifact_path: Option<String>,
+    pub project_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Workflow metadata plus the editor-facing definition payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDocument {
+    pub workflow: Workflow,
+    pub definition: serde_json::Value,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Topology — DB-stored named template for executable workflow DAGs.
+// Peer of `Workflow` (which tracks pipeline-stage progression). Topologies
+// live on Epic containers; sessions resolve their effective topology by
+// walking up `parent_id` until a non-NULL `workflow_id_override` is found
+// (resolved via `effective_topology_with_override` in
+// `crates/rsid/src/session/hierarchy_ops.rs`). Per locked decision §2.2
+// (INDEX.md:24), topologies are DB-stored, editable via the `gv` graph
+// overlay.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A named, DB-stored topology template (executable DAG with optional loop guards).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Topology {
+    pub id: Uuid,
+    pub name: String,
+    pub definition: TopologyDefinition,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Typed (not free-form) topology definition. Round-trips through the
+/// `topologies.definition_json` SQLite column via serde_json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopologyDefinition {
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+    /// Topology-level loop-guard predicate. Per §B1 (INDEX.md:40), any of
+    /// per-node max_iterations / lead-emits-/halt / topology-level until
+    /// can terminate the loop; daemon enforces hard cap MAX_ITERATIONS = 32.
+    #[serde(default)]
+    pub until: Option<UntilCondition>,
+}
+
+/// One node in a topology DAG.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopologyNode {
+    /// Stable string identifier within the topology (referenced by edges).
+    pub id: String,
+    /// Session kind to spawn when this node is scheduled.
+    pub kind: SessionKind,
+    /// Display label for graph overlay rendering.
+    pub label: String,
+    /// IDs of prerequisite nodes that must complete before this node fires.
+    #[serde(default)]
+    pub prereqs: Vec<String>,
+    /// Per-node iteration cap (per §B1). None = no per-node cap; daemon's
+    /// MAX_ITERATIONS = 32 still applies as a hard ceiling.
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    /// What to do when a child session at this node fails.
+    #[serde(default)]
+    pub on_failure: Option<FailurePolicy>,
+    /// Opaque per-node parameter bag. Daemon performs no validation; the
+    /// spawn coordinator and topology executor (Phase 5) own the contract.
+    /// Examples: `audience="myself"`, `model="gpt-5"`,
+    /// `max_revision_iterations=2`. Missing key on a stored topology
+    /// deserializes to an empty map (`#[serde(default)]`).
+    /// Do NOT add `skip_serializing_if` — empty `{}` must serialize as `{}`
+    /// to keep the JSON shape stable for downstream tooling.
+    #[serde(default)]
+    pub params: HashMap<String, serde_json::Value>,
+}
+
+/// One directed edge in a topology DAG.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopologyEdge {
+    pub from: String,
+    pub to: String,
+    /// Marks the edge as part of a loop (re-fires `to` when `from` completes).
+    #[serde(default)]
+    pub loop_edge: bool,
+}
+
+// ─── Deterministic topology steps (#635) ────────────────────────────────────
+//
+// A node's typed kind lives in `TopologyNode.params["step"]` and an edge's
+// routing condition in the *target* node's `params["when"]` map, keyed by the
+// source node id — the same convention as `params["custody"]["from"]`. A node
+// without `step` is a legacy session node; an edge without an entry is
+// `success`. Both are decoded strictly: unknown fields (argv, env, a script
+// path, an effect class) are hard errors, never ignored.
+
+/// `TopologyNode.params` key holding the node's [`TopologyStep`].
+pub const TOPOLOGY_STEP_PARAM: &str = "step";
+/// `TopologyNode.params` key holding `{source_node_id: EdgeWhen}`.
+pub const TOPOLOGY_WHEN_PARAM: &str = "when";
+/// Node parameters that would let an author choose what a command node runs
+/// or how its effects are classified. Refused on every node (plan §3 rule 8).
+pub const TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS: &[&str] =
+    &["argv", "env", "script", "script_path", "effect_class"];
+
+/// The typed kind of one topology node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TopologyStep {
+    /// An ordinary agent session. Succeeds only on a validated
+    /// `PIPELINE HANDOFF` with `status: complete` and a clean tree.
+    Session {
+        /// HEAD must differ from the fork commit.
+        #[serde(default)]
+        expects_commit: bool,
+        /// Render upstream nodes' full last message into this node's prompt.
+        #[serde(default)]
+        pass_content: bool,
+    },
+    /// One closed, daemon-owned catalog operation.
+    Command { op: CatalogOp },
+    /// A pure boolean over upstream typed outputs.
+    Gate { condition: GateCondition },
+}
+
+impl TopologyStep {
+    /// Stored `topology_node_attempts.node_kind` value.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Session { .. } => "session",
+            Self::Command { .. } => "command",
+            Self::Gate { .. } => "gate",
+        }
+    }
+}
+
+/// Maximum length of a catalog test filter.
+pub const CATALOG_FILTER_MAX_LEN: usize = 128;
+/// Maximum number of crates one `rolling_baseline` names.
+pub const CATALOG_MAX_CRATES: usize = 8;
+/// Crates `rolling_baseline` covers when none are named.
+pub const ROLLING_BASELINE_DEFAULT_CRATES: &[&str] = &["rsi-common", "rsid", "rsi"];
+
+/// The closed command catalog (plan §3.2). The daemon builds argv and env
+/// and derives the effect class; an author supplies only these typed params.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "name", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CatalogOp {
+    CargoTestFocused {
+        #[serde(rename = "crate")]
+        krate: String,
+        #[serde(default)]
+        filter: Option<String>,
+        #[serde(default)]
+        lib_only: bool,
+    },
+    CargoClippyCrate {
+        #[serde(rename = "crate")]
+        krate: String,
+    },
+    CargoCheckCrate {
+        #[serde(rename = "crate")]
+        krate: String,
+    },
+    RollingBaseline {
+        #[serde(default)]
+        crates: Option<Vec<String>>,
+    },
+}
+
+impl CatalogOp {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::CargoTestFocused { .. } => "cargo_test_focused",
+            Self::CargoClippyCrate { .. } => "cargo_clippy_crate",
+            Self::CargoCheckCrate { .. } => "cargo_check_crate",
+            Self::RollingBaseline { .. } => "rolling_baseline",
+        }
+    }
+
+    /// Every crate the op names (the default set for a bare baseline).
+    pub fn crates(&self) -> Vec<&str> {
+        match self {
+            Self::CargoTestFocused { krate, .. }
+            | Self::CargoClippyCrate { krate }
+            | Self::CargoCheckCrate { krate } => vec![krate.as_str()],
+            Self::RollingBaseline {
+                crates: Some(crates),
+            } => crates.iter().map(String::as_str).collect(),
+            Self::RollingBaseline { crates: None } => ROLLING_BASELINE_DEFAULT_CRATES.to_vec(),
+        }
+    }
+
+    /// Syntactic parameter validation. Workspace membership is checked
+    /// against the execution repository at execute time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first invalid parameter.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::RollingBaseline {
+            crates: Some(crates),
+        } = self
+        {
+            if crates.is_empty() || crates.len() > CATALOG_MAX_CRATES {
+                return Err(format!(
+                    "rolling_baseline crates must name 1..={CATALOG_MAX_CRATES} crates"
+                ));
+            }
+            let unique: std::collections::HashSet<&String> = crates.iter().collect();
+            if unique.len() != crates.len() {
+                return Err("rolling_baseline crates must be unique".into());
+            }
+        }
+        for krate in self.crates() {
+            let valid = !krate.is_empty()
+                && krate.len() <= 64
+                && krate
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                && !krate.starts_with('-');
+            if !valid {
+                return Err(format!("invalid crate name {krate:?}"));
+            }
+        }
+        if let Self::CargoTestFocused {
+            filter: Some(filter),
+            ..
+        } = self
+        {
+            let valid = !filter.is_empty()
+                && filter.len() <= CATALOG_FILTER_MAX_LEN
+                && filter
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':');
+            if !valid {
+                return Err(format!(
+                    "test filter must match [A-Za-z0-9_:]{{1,{CATALOG_FILTER_MAX_LEN}}}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Maximum nesting depth of a gate condition.
+pub const GATE_MAX_DEPTH: usize = 16;
+/// Maximum operands of one `and`/`or`, and values of one `in`.
+pub const GATE_MAX_OPERANDS: usize = 32;
+
+/// A closed boolean AST over upstream typed outputs (plan §3). Every `path`
+/// is `nodes.<ancestor_id>.<field>[.<field>…]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GateCondition {
+    Eq {
+        path: String,
+        value: serde_json::Value,
+    },
+    Ne {
+        path: String,
+        value: serde_json::Value,
+    },
+    In {
+        path: String,
+        values: Vec<serde_json::Value>,
+    },
+    Exists {
+        path: String,
+    },
+    Lt {
+        path: String,
+        value: f64,
+    },
+    Le {
+        path: String,
+        value: f64,
+    },
+    Gt {
+        path: String,
+        value: f64,
+    },
+    Ge {
+        path: String,
+        value: f64,
+    },
+    And {
+        args: Vec<Self>,
+    },
+    Or {
+        args: Vec<Self>,
+    },
+    Not {
+        arg: Box<Self>,
+    },
+}
+
+impl GateCondition {
+    /// Every path the condition reads, in AST order.
+    #[must_use]
+    pub fn paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        self.collect_paths(&mut paths);
+        paths
+    }
+
+    fn collect_paths<'a>(&'a self, paths: &mut Vec<&'a str>) {
+        match self {
+            Self::Eq { path, .. }
+            | Self::Ne { path, .. }
+            | Self::In { path, .. }
+            | Self::Exists { path }
+            | Self::Lt { path, .. }
+            | Self::Le { path, .. }
+            | Self::Gt { path, .. }
+            | Self::Ge { path, .. } => paths.push(path),
+            Self::And { args } | Self::Or { args } => {
+                for arg in args {
+                    arg.collect_paths(paths);
+                }
+            }
+            Self::Not { arg } => arg.collect_paths(paths),
+        }
+    }
+
+    /// Shape validation: bounded depth and operands, well-formed paths.
+    /// Returns the referenced node ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first malformed element.
+    pub fn validate(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        self.validate_depth(1)?;
+        let mut nodes = std::collections::BTreeSet::new();
+        for path in self.paths() {
+            nodes.insert(gate_path_node(path)?.to_owned());
+        }
+        Ok(nodes)
+    }
+
+    fn validate_depth(&self, depth: usize) -> Result<(), String> {
+        if depth > GATE_MAX_DEPTH {
+            return Err(format!("gate condition deeper than {GATE_MAX_DEPTH}"));
+        }
+        match self {
+            Self::And { args } | Self::Or { args } => {
+                if args.is_empty() || args.len() > GATE_MAX_OPERANDS {
+                    return Err(format!("and/or take 1..={GATE_MAX_OPERANDS} operands"));
+                }
+                args.iter()
+                    .try_for_each(|arg| arg.validate_depth(depth + 1))
+            }
+            Self::Not { arg } => arg.validate_depth(depth + 1),
+            Self::In { values, .. } if values.is_empty() || values.len() > GATE_MAX_OPERANDS => {
+                Err(format!("in takes 1..={GATE_MAX_OPERANDS} values"))
+            }
+            Self::Lt { value, .. }
+            | Self::Le { value, .. }
+            | Self::Gt { value, .. }
+            | Self::Ge { value, .. }
+                if !value.is_finite() =>
+            {
+                Err("ordering comparisons need a finite number".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Split `nodes.<id>.<field>…` and return `<id>`.
+///
+/// # Errors
+///
+/// Returns a description when the path is not of that form.
+pub fn gate_path_node(path: &str) -> Result<&str, String> {
+    let mut segments = path.split('.');
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment.len() <= 64
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let (Some("nodes"), Some(node), Some(field)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(format!("gate path {path:?} must be nodes.<id>.<field>"));
+    };
+    if !valid_segment(node) || !valid_segment(field) || !segments.all(valid_segment) {
+        return Err(format!("gate path {path:?} has an invalid segment"));
+    }
+    Ok(node)
+}
+
+/// When an edge is taken (plan §3). An untaken edge never feeds its
+/// target; a node whose incoming edges are all untaken is `skipped`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeWhen {
+    #[default]
+    Success,
+    Failure,
+    Completed,
+    GateTrue,
+    GateFalse,
+    VerdictAccepted,
+    VerdictChangesRequested,
+}
+
+impl TopologyNode {
+    /// The node's typed step; `None` is a legacy session node.
+    ///
+    /// # Errors
+    ///
+    /// Returns the strict decode error (unknown kind or field).
+    pub fn step(&self) -> Result<Option<TopologyStep>, String> {
+        self.params
+            .get(TOPOLOGY_STEP_PARAM)
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("node {}: invalid step: {error}", self.id))
+            })
+            .transpose()
+    }
+
+    /// Routing conditions of this node's incoming edges, keyed by source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the strict decode error.
+    pub fn incoming_when(&self) -> Result<std::collections::BTreeMap<String, EdgeWhen>, String> {
+        self.params.get(TOPOLOGY_WHEN_PARAM).map_or_else(
+            || Ok(std::collections::BTreeMap::new()),
+            |value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("node {}: invalid when: {error}", self.id))
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod topology_step_tests {
+    use super::*;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn node(params: serde_json::Value) -> TopologyNode {
+        serde_json::from_value(serde_json::json!({
+            "id": "n", "kind": "Task", "label": "n", "params": params
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_node_has_no_step_and_success_edges() {
+        let legacy: TopologyEdge =
+            serde_json::from_value(serde_json::json!({"from": "a", "to": "b"})).unwrap();
+        assert!(!legacy.loop_edge);
+        assert_eq!(node(serde_json::json!({})).step(), Ok(None));
+        assert!(
+            node(serde_json::json!({}))
+                .incoming_when()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(EdgeWhen::default(), EdgeWhen::Success);
+    }
+
+    #[test]
+    fn steps_decode_strictly() {
+        let command = node(serde_json::json!({"step": {"kind": "command",
+            "op": {"name": "cargo_test_focused", "crate": "rsid", "filter": "t2_", "lib_only": true}}}));
+        let Some(TopologyStep::Command { op }) = command.step().unwrap() else {
+            panic!("command step");
+        };
+        assert_eq!(op.name(), "cargo_test_focused");
+        assert_eq!(op.validate(), Ok(()));
+        for bad in [
+            serde_json::json!({"kind": "command", "op": {"name": "cargo_check_crate", "crate": "rsid", "argv": ["sh"]}}),
+            serde_json::json!({"kind": "command", "op": {"name": "cargo_check_crate", "crate": "rsid"}, "effect_class": "check"}),
+            serde_json::json!({"kind": "command", "op": {"name": "shell", "crate": "rsid"}}),
+            serde_json::json!({"kind": "review", "of": "node:a"}),
+            serde_json::json!({"kind": "session", "env": {"X": "1"}}),
+        ] {
+            assert!(
+                node(serde_json::json!({"step": bad.clone()}))
+                    .step()
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let bad_filter = CatalogOp::CargoTestFocused {
+            krate: "rsid".into(),
+            filter: Some("a b".into()),
+            lib_only: false,
+        };
+        assert!(bad_filter.validate().is_err());
+        let when = node(serde_json::json!({"when": {"g": "gate_false"}}));
+        assert_eq!(when.incoming_when().unwrap()["g"], EdgeWhen::GateFalse);
+    }
+
+    #[test]
+    fn gate_condition_is_bounded_and_names_its_nodes() {
+        let condition: GateCondition = serde_json::from_value(serde_json::json!({
+            "op": "or", "args": [
+                {"op": "ge", "path": "nodes.check.exit_code", "value": 1},
+                {"op": "not", "arg": {"op": "exists", "path": "nodes.a.handoff.doc_path"}}
+            ]
+        }))
+        .unwrap();
+        let nodes = condition.validate().unwrap();
+        assert_eq!(nodes.into_iter().collect::<Vec<_>>(), ["a", "check"]);
+        let unbounded: GateCondition =
+            serde_json::from_value(serde_json::json!({"op": "and", "args": []})).unwrap();
+        assert!(unbounded.validate().is_err());
+        assert!(gate_path_node("result.exit_code").is_err());
+        assert!(
+            serde_json::from_value::<GateCondition>(
+                serde_json::json!({"op": "regex", "path": "nodes.a.b"})
+            )
+            .is_err()
+        );
+    }
+}
+
+/// Failure-handling policy for a topology node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    Halt,
+    Retry,
+    Skip,
+}
+
+/// Topology-level loop-termination predicate. Tagged-enum encoding produces
+/// JSON like `{"type": "max_iterations", "value": 32}` for graph-overlay
+/// editing convenience.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum UntilCondition {
+    /// Lead session emitted `/halt` directive.
+    LeadHalt,
+    /// Reached the specified iteration count.
+    MaxIterations(u32),
+    /// Future: arbitrary predicate string (parser TBD in scheduler phase).
+    Predicate(String),
+}
+
+/// Severity level for executable workflow validation diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowValidationSeverity {
+    Error,
+    Warning,
+}
+
+impl WorkflowValidationSeverity {
+    pub fn is_blocking(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
+/// Stable subject pointer for a workflow validation diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowValidationSubject {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_index: Option<usize>,
+}
+
+impl WorkflowValidationSubject {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            node_id: None,
+            edge_index: None,
+        }
+    }
+
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = Some(node_id.into());
+        self
+    }
+
+    pub fn with_edge_index(mut self, edge_index: usize) -> Self {
+        self.edge_index = Some(edge_index);
+        self
+    }
+}
+
+/// Structured validation diagnostic shared across TUI preflight and daemon enforcement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowValidationDiagnostic {
+    pub code: String,
+    pub severity: WorkflowValidationSeverity,
+    pub subject: WorkflowValidationSubject,
+    pub message: String,
+}
+
+impl WorkflowValidationDiagnostic {
+    pub fn is_blocking(&self) -> bool {
+        self.severity.is_blocking()
+    }
+}
+
+/// Validation report for executable workflow checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowValidationReport {
+    pub executable: bool,
+    #[serde(default)]
+    pub diagnostics: Vec<WorkflowValidationDiagnostic>,
+}
+
+impl Default for WorkflowValidationReport {
+    fn default() -> Self {
+        Self {
+            executable: true,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl WorkflowValidationReport {
+    pub fn push(&mut self, diagnostic: WorkflowValidationDiagnostic) {
+        if diagnostic.is_blocking() {
+            self.executable = false;
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(WorkflowValidationDiagnostic::is_blocking)
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diag| diag.is_blocking())
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diag| matches!(diag.severity, WorkflowValidationSeverity::Warning))
+            .count()
+    }
+}
+
+/// Lifecycle status for a workflow execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowExecutionStatus {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Interrupted,
+    /// Durable topology execution stopped on preserved work; resumable only
+    /// through `ResolveTopologyAttempt` (#634, plan §3.4).
+    Blocked,
+}
+
+/// Per-node execution state emitted during workflow execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowNodeExecutionState {
+    Running,
+    Succeeded,
+    Failed,
+    /// Durable topology node on an untaken path (#635, plan §3).
+    Skipped,
+}
+
+/// Typed graph execution update pushed from the daemon to the TUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphExecutionUpdate {
+    pub execution_id: Uuid,
+    pub workflow_id: Uuid,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    pub sequence: u64,
+    pub status: WorkflowExecutionStatus,
+    #[serde(default)]
+    pub node_state: Option<WorkflowNodeExecutionState>,
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub output_preview: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Durable execution snapshot used for reconnect and reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowExecutionSnapshot {
+    pub execution_id: Uuid,
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub status: WorkflowExecutionStatus,
+    pub accepted_at: DateTime<Utc>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub last_sequence: u64,
+    #[serde(default)]
+    pub updates: Vec<GraphExecutionUpdate>,
+    /// Durable execution CAS version (`ResolveTopologyAttempt.expected_row_version`).
+    /// `None` for in-memory dry-run executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_version: Option<i64>,
+    /// The attempt holding a `blocked` execution, when blocked on preserved work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_attempt_id: Option<Uuid>,
+    /// Typed blocked reason (for example `preserved_work`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// One iteration of a `master_improve` convergence loop.
+///
+/// Persisted in the V46 `chain_iterations` table. The driver writes one row
+/// per iteration; the row reaches a terminal state when `halt_reason` is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainIteration {
+    pub chain_id: Uuid,
+    pub iteration_index: u32,
+    pub parent_execution_id: Option<Uuid>,
+    pub child_execution_id: Uuid,
+    pub halt_reason: Option<HaltReason>,
+    pub goal_text: String,
+    pub refined_goal_text: Option<String>,
+    pub token_count: Option<u64>,
+    pub pre_failure_count: Option<u32>,
+    pub post_failure_count: Option<u32>,
+    pub cap: u32,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// Terminal halt reason for a `master_improve` chain iteration.
+///
+/// Written by the chain driver when an iteration concludes. Once set, the
+/// iteration row is immutable.
+///
+/// Adjacently-tagged enum: serializes as `{"kind": "<variant>", "data": <payload>}`
+/// (sibling precedent: `ContractError` in `agent_contract.rs:115-129` uses
+/// internally-tagged because all its variants are unit/struct; `HaltReason`'s
+/// tuple variants `JudgeBlocked(String)` and `Error(String)` require the
+/// adjacent-tagged form).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HaltReason {
+    /// Judge returned `DONE`. Chain converged.
+    Done,
+    /// Iteration cap reached.
+    Cap,
+    /// `cargo test --workspace` post-iteration count exceeded pre-iteration count.
+    Regression { pre: u32, post: u32 },
+    /// `~/.rsi/STOP` file present at budget pre-flight or driver pre-respawn.
+    StopFile,
+    /// Judge returned `CONTINUE: HALT_JUDGE_BLOCKED <reason>`.
+    JudgeBlocked(String),
+    /// Judge returned a malformed final message.
+    JudgeMalformed,
+    /// Workflow execution failed, daemon restarted mid-chain, or other unrecoverable.
+    Error(String),
+}
+
+/// Result of looking up a workflow execution snapshot after retention is applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowExecutionLookup {
+    Found {
+        execution: WorkflowExecutionSnapshot,
+    },
+    Expired {
+        execution_id: Uuid,
+        expired_at: DateTime<Utc>,
+    },
+    NotFound {
+        execution_id: Uuid,
+    },
+}
+
+/// Per-turn telemetry data for analytics.
+/// Captures token usage, timing, and tool invocations for each model turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnMetric {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub turn_number: i32,
+    pub input_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub stop_reason: Option<String>,
+    pub tools_used: Option<Vec<String>>,
+    pub tool_count: u32,
+    pub created_at: DateTime<Utc>,
+    /// Model that produced this turn (for per-turn attribution after model switching).
+    #[serde(default)]
+    pub model: Option<String>,
+    // === Richer usage capture (V99, P1-C) ===
+    //
+    // Per-turn attribution of the same signals the session-level columns carry.
+    // These are `NOT NULL DEFAULT 0` counters rather than `Option`: a turn row
+    // is only ever written from a usage payload we just parsed, so "absent"
+    // means the provider reported no such tokens, which is genuinely zero.
+    /// Extended-thinking tokens billed as output for this turn.
+    #[serde(default)]
+    pub thinking_tokens: u64,
+    /// Prompt-cache tokens written at the 1-hour TTL for this turn.
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    /// Prompt-cache tokens written at the 5-minute TTL for this turn.
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    /// Service tier that served this turn, when the provider reported one.
+    #[serde(default)]
+    pub service_tier: Option<String>,
+}
+
+/// Model segment within a session — tracks which model produced which events.
+/// Segments are defined by sequence ranges: [from_sequence, to_sequence].
+/// An active segment has to_sequence = None.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSegment {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub model_id: String,
+    pub from_sequence: i32,
+    pub to_sequence: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Lifetime usage aggregate for the Settings -> Stats category (T8).
+///
+/// Read-only cross-session rollup computed on page-open by `GetUsageStats`
+/// (`store/usage.rs::usage_stats`); no schema change, no daemon writes.
+/// Every field is `#[serde(default)]` so a version-skewed daemon/TUI pair
+/// (older daemon response missing a field a newer TUI expects) still
+/// deserializes safely.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageStats {
+    #[serde(default)]
+    pub lifetime_chats: u64,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_cache_creation_tokens: u64,
+    #[serde(default)]
+    pub total_cache_read_tokens: u64,
+    /// Accumulated "work time", NEVER "compute time" (TD1 N-3 carry-forward —
+    /// includes idle-but-Running app-server wait time).
+    #[serde(default)]
+    pub total_work_time_ms: u64,
+    #[serde(default)]
+    pub per_model: Vec<ModelUsage>,
+    #[serde(default)]
+    pub timeline: Vec<UsageBucket>,
+}
+
+/// Per-model slice of `UsageStats.per_model` (GROUP BY `sessions.model`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub chats: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub work_time_ms: u64,
+}
+
+/// Per-day slice of `UsageStats.timeline` (GROUP BY `date(sessions.created_at)`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageBucket {
+    /// `YYYY-MM-DD`, derived from `sessions.created_at` (RFC3339).
+    #[serde(default)]
+    pub day: String,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+/// A completed ESP Square game record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspGame {
+    pub id: Uuid,
+    pub played_at: DateTime<Utc>,
+    pub score: u8,
+    pub rounds_played: u8,
+    pub total_rounds: u8,
+    pub p_value: f64,
+    /// JSON array of per-round details: [{"pick": N, "target": N, "hit": bool}, ...]
+    pub round_details: String,
+}
+
+/// A compact card of the most important facts about an entity.
+/// Injected into session context pipelines for instant grounding.
+///
+/// Two entity types:
+/// - "project" (entity_id = project UUID) — tech stack, conventions, current focus
+/// - "user" (entity_id = "self") — working style, preferences, tool patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityCard {
+    pub id: Uuid,
+    /// "project" or "user"
+    pub entity_type: String,
+    /// project_id (as UUID string) or "self" for user card
+    pub entity_id: String,
+    /// Ordered list of factual statements (max 40).
+    pub facts: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EntityCard {
+    /// Maximum number of facts per card.
+    pub const MAX_FACTS: usize = 40;
+}
+
+/// Kind of session summary (short = rolling every 20 msgs, long = rolling every 60 msgs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SummaryKind {
+    Short,
+    Long,
+}
+
+/// A rolling session summary generated by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub kind: SummaryKind,
+    /// The summary text content.
+    pub content: String,
+    /// The event sequence number this summary covers through (inclusive).
+    /// Used to determine which events are "new" since the last summary.
+    pub covers_through_sequence: i32,
+    /// Approximate token count of the summary content.
+    pub token_count: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Tier level of an extracted observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ObservationLevel {
+    /// Facts directly stated in conversation text.
+    Explicit,
+    /// Logical necessities derived from explicit facts (Dreamer).
+    Deductive,
+    /// Patterns across multiple observations (Dreamer).
+    Inductive,
+    /// Conflicting statements detected across observations (Dreamer).
+    Contradiction,
+}
+
+/// Confidence level for inductive observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ObservationConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+/// An atomic factual observation extracted from session conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Observation {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub level: ObservationLevel,
+    pub content: String,
+    /// Parent observation IDs this was derived from (deductive/inductive only).
+    #[serde(default)]
+    pub source_ids: Vec<Uuid>,
+    /// Confidence level for inductive observations.
+    #[serde(default)]
+    pub confidence: Option<ObservationConfidence>,
+    /// Number of times this fact has been independently derived.
+    #[serde(default)]
+    pub times_derived: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Search result for observation queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationSearchResult {
+    pub observation: Observation,
+    pub score: f64,
+}
+
+/// Wake mode for scheduled jobs: spawn fresh, resume the origin session, or
+/// fire when a WATCHED session reaches a notify-worthy state (A8).
+///
+/// `OnTerminal` carries the watched-subject session id; the wake target
+/// (whom to resume) stays in `ScheduledJob.wake_session_id`, bound
+/// server-side to the arming caller — never agent-supplied.
+///
+/// `AgentFresh` is durable daemon-attributed authority provenance. Its
+/// `wake_session_id` remains a required origin link for inherited state, never
+/// proof of authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WakeMode {
+    #[default]
+    Fresh,
+    #[serde(rename = "agent_fresh")]
+    AgentFresh,
+    Resume,
+    #[serde(rename = "on_terminal")]
+    OnTerminal(Uuid),
+}
+
+/// Recurrence interval for scheduled jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
+#[non_exhaustive]
+pub enum Recurrence {
+    Once,
+    EverySeconds(u64),
+    EveryMinutes(u64),
+    EveryHours(u64),
+    EveryDays(u64),
+    EveryWeeks(u64),
+    EveryMonths(u32),
+    EveryYears(u32),
+}
+
+/// Schedule specification: when to first fire and how often to recur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleSpec {
+    pub recurrence: Recurrence,
+    /// The anchor time — first intended fire time. Unspecified H:M:S default to 00:00:00.
+    pub anchor: DateTime<Utc>,
+}
+
+/// A user-configured scheduled job that fires session launches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledJob {
+    pub id: Uuid,
+    pub name: String,
+    /// The prompt/query to launch as a session when the job fires.
+    pub message: String,
+    pub schedule: ScheduleSpec,
+    pub last_fired_at: Option<DateTime<Utc>>,
+    pub next_fire_at: DateTime<Utc>,
+    pub enabled: bool,
+    /// Optional working directory for launched sessions.
+    pub working_dir: Option<PathBuf>,
+    /// Optional provider override for launched sessions.
+    pub provider: Option<SessionProvider>,
+    /// Optional model override for launched sessions.
+    pub model: Option<String>,
+    /// Optional project to associate launched sessions with.
+    pub project_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Wake behavior: `Fresh` (default) spawns a new session; `AgentFresh`
+    /// is a daemon-attributed fresh successor; `Resume` re-invokes the origin.
+    #[serde(default)]
+    pub wake_mode: WakeMode,
+    /// For `Resume` jobs, the RSI session UUID to re-invoke. Agent-scheduled
+    /// `AgentFresh` jobs retain their server-bound origin here so the scheduler
+    /// can inherit narrow origin state before launching; generic Fresh jobs use
+    /// `None` and retain the default behavior. This field is an origin link,
+    /// not the privilege discriminator.
+    #[serde(default)]
+    pub wake_session_id: Option<Uuid>,
+}
+
+/// A persisted compiled prompt record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledPrompt {
+    pub id: Uuid,
+    /// The session this prompt was compiled for (None for Blank/TaskRabbit).
+    pub session_id: Option<Uuid>,
+    pub original_input: String,
+    pub compiled_output: String,
+    /// "complete", "incomplete:<criterion>", or "error:<kind>:<message>".
+    pub contract_status: String,
+    pub layer_semantic: bool,
+    pub layer_syntactic: bool,
+    pub layer_deictic: bool,
+    pub layer_discourse: bool,
+    pub layer_pragmatic: bool,
+    pub accepted: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+// ─── Index status sidecar types (P1.9) ─────────────────────────────────────
+
+/// Status of a single ticket in INDEX.status.json.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexStatusValue {
+    NotStarted,
+    Ready,
+    InProgress,
+    Shipped,
+    Blocked,
+}
+
+/// Per-ticket record stored in the sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexTicketStatus {
+    pub status: IndexStatusValue,
+    #[serde(default)]
+    pub last_shipped_commit: Option<String>,
+    #[serde(default)]
+    pub last_shipped_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_shipped_branch: Option<String>,
+}
+
+/// Full on-disk shape of thoughts/shared/projects/<project>/INDEX.status.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexStatusSidecar {
+    pub schema_version: u32,
+    pub project: String,
+    pub last_updated: DateTime<Utc>,
+    pub tickets: std::collections::BTreeMap<String, IndexTicketStatus>,
+}
+
+// ─── Idea identity kernel (D01 / V75) ───────────────────────────────────────
+
+/// Canonical `sha256:<64 lowercase hex>` digest used for protected-content
+/// references and Idea evidence. The digest carries no source content.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    /// Parse a canonical SHA-256 digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix, length, case, or hex alphabet is not
+    /// canonical.
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let hex = value
+            .strip_prefix("sha256:")
+            .ok_or_else(|| "SHA-256 digest must start with sha256:".to_string())?;
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("SHA-256 digest must contain 64 lowercase hex characters".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn hex(&self) -> &str {
+        &self.0["sha256:".len()..]
+    }
+}
+
+impl std::fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for Sha256Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Canonical immutable content-addressed reference. Inline/data URLs and
+/// unknown algorithms are rejected by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContentAddressedRef(String);
+
+impl ContentAddressedRef {
+    /// Parse a canonical immutable content-addressed reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for inline data, unknown algorithms, or a
+    /// noncanonical digest.
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let hex = value
+            .strip_prefix("cas://sha256/")
+            .ok_or_else(|| "content reference must start with cas://sha256/".to_string())?;
+        Sha256Digest::parse(format!("sha256:{hex}"))?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn for_digest(digest: &Sha256Digest) -> Self {
+        Self(format!("cas://sha256/{}", digest.hex()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn matches_digest(&self, digest: &Sha256Digest) -> bool {
+        self.0 == format!("cas://sha256/{}", digest.hex())
+    }
+}
+
+impl std::fmt::Display for ContentAddressedRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for ContentAddressedRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentAddressedRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated immutable byte span into protected genesis content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenesisSpan {
+    pub start: i64,
+    pub end: i64,
+    pub digest: Sha256Digest,
+}
+
+impl GenesisSpan {
+    /// Construct a validated immutable genesis byte span.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `0 <= start < end`.
+    pub fn new(start: i64, end: i64, digest: Sha256Digest) -> Result<Self, String> {
+        if start < 0 || end <= start {
+            return Err("genesis span must satisfy 0 <= start < end".to_string());
+        }
+        Ok(Self { start, end, digest })
+    }
+}
+
+impl<'de> Deserialize<'de> for GenesisSpan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct GenesisSpanWire {
+            start: i64,
+            end: i64,
+            digest: Sha256Digest,
+        }
+
+        let wire = GenesisSpanWire::deserialize(deserializer)?;
+        Self::new(wire.start, wire.end, wire.digest).map_err(serde::de::Error::custom)
+    }
+}
+
+macro_rules! exact_string_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $value)] $variant),+
+        }
+
+        impl $name {
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+
+            /// Parse the exact persisted value without aliases.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error for unknown or case-changed values.
+            pub fn parse(value: &str) -> Result<Self, String> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    other => Err(format!("invalid {} value: {other}", stringify!($name))),
+                }
+            }
+        }
+    };
+}
+
+exact_string_enum!(IdeaActorKind {
+    Operator => "operator",
+    Session => "session",
+    System => "system",
+});
+exact_string_enum!(CaptureSourceKind {
+    OperatorInput => "operator_input",
+    SessionArtifact => "session_artifact",
+    ImportedArtifact => "imported_artifact",
+    LegacyReference => "legacy_reference",
+});
+exact_string_enum!(IdeaLifecycle {
+    Open => "Open",
+    Parked => "Parked",
+    Completed => "Completed",
+    Abandoned => "Abandoned",
+    Superseded => "Superseded",
+});
+exact_string_enum!(IdeaStage {
+    Captured => "Captured",
+    Shaping => "Shaping",
+    Researching => "Researching",
+    Planned => "Planned",
+    Implementing => "Implementing",
+    Integrating => "Integrating",
+    Verifying => "Verifying",
+    Released => "Released",
+});
+exact_string_enum!(AutonomyPolicy {
+    CaptureOnly => "CaptureOnly",
+    Research => "Research",
+    PlanAndWait => "PlanAndWait",
+    Sandbox => "Sandbox",
+    IntegrateIdeaBranch => "IntegrateIdeaBranch",
+    PromoteProjectTarget => "PromoteProjectTarget",
+    ExternalEffects => "ExternalEffects",
+});
+exact_string_enum!(IdeaRelationshipKind {
+    DependsOn => "depends_on",
+    Supersedes => "supersedes",
+    DerivedFrom => "derived_from",
+});
+exact_string_enum!(LegacyIdeaSourceKind {
+    SessionGroup => "session_group",
+    SessionEpic => "session_epic",
+    SessionLabel => "session_label",
+    SessionChild => "session_child",
+});
+exact_string_enum!(IdeaCompatibilityStatus {
+    Pending => "pending",
+    Mapped => "mapped",
+    Blocked => "blocked",
+    Excluded => "excluded",
+});
+exact_string_enum!(IdeaEventType {
+    Created => "created",
+    DecisionRecorded => "decision_recorded",
+    ProjectionChanged => "projection_changed",
+    LifecycleTransitioned => "lifecycle_transitioned",
+    StageTransitioned => "stage_transitioned",
+    AutonomyChanged => "autonomy_changed",
+    ScopeChanged => "scope_changed",
+    ControllerReserved => "controller_reserved",
+    ControllerAssigned => "controller_assigned",
+    ControllerReleased => "controller_released",
+    QuestionAsked => "question_asked",
+    QuestionAnswered => "question_answered",
+    IssueLinked => "issue_linked",
+    ArtifactSealed => "artifact_sealed",
+    FindingRecorded => "finding_recorded",
+    VerdictRecorded => "verdict_recorded",
+    ProgramTransitioned => "program_transitioned",
+    GateTransitioned => "gate_transitioned",
+    IntegrationRecorded => "integration_recorded",
+    ReleaseRecorded => "release_recorded",
+    RelationshipChanged => "relationship_changed",
+    Split => "split",
+    Superseded => "superseded",
+    Failed => "failed",
+    Abandoned => "abandoned",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capture {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub creator_kind: IdeaActorKind,
+    pub creator_id: String,
+    pub captured_at: DateTime<Utc>,
+    pub source_kind: CaptureSourceKind,
+    pub raw_content_digest: Sha256Digest,
+    pub storage_policy_id: String,
+    pub content_ref: ContentAddressedRef,
+}
+
+impl Capture {
+    /// Validate cross-field Capture invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty identities/policy or a digest/reference
+    /// mismatch.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.creator_id.trim().is_empty() {
+            return Err("capture creator_id must not be empty".to_string());
+        }
+        if self.storage_policy_id.trim().is_empty() {
+            return Err("capture storage_policy_id must not be empty".to_string());
+        }
+        if !self.content_ref.matches_digest(&self.raw_content_digest) {
+            return Err("capture content_ref must match raw_content_digest".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Idea {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub slug: String,
+    #[serde(default)]
+    pub sigil: Option<String>,
+    pub genesis_capture_id: Uuid,
+    #[serde(default)]
+    pub genesis_span_start: Option<i64>,
+    #[serde(default)]
+    pub genesis_span_end: Option<i64>,
+    #[serde(default)]
+    pub genesis_span_digest: Option<Sha256Digest>,
+    pub title: String,
+    pub description: String,
+    pub portfolio_summary: String,
+    pub lifecycle: IdeaLifecycle,
+    pub stage: IdeaStage,
+    pub priority: i64,
+    pub autonomy_policy: AutonomyPolicy,
+    pub integration_target_ref: String,
+    #[serde(default)]
+    pub program_template_policy_id: Option<String>,
+    #[serde(default)]
+    pub current_controller_session_id: Option<Uuid>,
+    pub controller_epoch: i64,
+    pub row_version: i64,
+    pub next_event_sequence: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub terminal_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub superseded_at: Option<DateTime<Utc>>,
+}
+
+impl Idea {
+    /// Return the validated optional genesis span.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when span fields are partial or out of range.
+    pub fn genesis_span(&self) -> Result<Option<GenesisSpan>, String> {
+        match (
+            self.genesis_span_start,
+            self.genesis_span_end,
+            self.genesis_span_digest.clone(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(start), Some(end), Some(digest)) => {
+                GenesisSpan::new(start, end, digest).map(Some)
+            }
+            _ => Err("genesis span fields must be all present or all absent".to_string()),
+        }
+    }
+
+    /// Validate bounded text, counters, policy identifiers, and genesis span.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any persisted Idea invariant is violated.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.slug.trim().is_empty() || self.slug.len() > 128 {
+            return Err("idea slug must contain 1..=128 bytes".to_string());
+        }
+        if self
+            .sigil
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 64)
+        {
+            return Err("idea sigil must contain 1..=64 bytes when present".to_string());
+        }
+        if self.title.trim().is_empty() || self.title.len() > 512 {
+            return Err("idea title must contain 1..=512 bytes".to_string());
+        }
+        if self.description.len() > 65_536 || self.portfolio_summary.len() > 2_048 {
+            return Err("idea description or portfolio summary exceeds its bound".to_string());
+        }
+        if self.integration_target_ref.trim().is_empty() {
+            return Err("idea integration_target_ref must not be empty".to_string());
+        }
+        if self
+            .program_template_policy_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("program_template_policy_id must not be empty".to_string());
+        }
+        if self.controller_epoch < 0 || self.row_version < 0 || self.next_event_sequence <= 0 {
+            return Err("idea counters are out of range".to_string());
+        }
+        self.genesis_span()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaEvent {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub idea_id: Uuid,
+    pub sequence: i64,
+    pub event_type: IdeaEventType,
+    pub actor_kind: IdeaActorKind,
+    pub actor_id: String,
+    #[serde(default)]
+    pub controller_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub controller_epoch: Option<i64>,
+    pub expected_row_version: i64,
+    pub resulting_row_version: i64,
+    pub idempotency_key: String,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub artifact_digests: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl IdeaEvent {
+    /// Validate event sequence/version and identity invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for out-of-range counters or empty actor/idempotency
+    /// identities.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.sequence <= 0
+            || self.expected_row_version < 0
+            || self.resulting_row_version < 0
+            || self.controller_epoch.is_some_and(|epoch| epoch < 0)
+        {
+            return Err("idea event sequence/version values are out of range".to_string());
+        }
+        if self.actor_id.trim().is_empty() || self.idempotency_key.trim().is_empty() {
+            return Err("idea event actor and idempotency key must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaRelationship {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub source_idea_id: Uuid,
+    pub target_idea_id: Uuid,
+    pub kind: IdeaRelationshipKind,
+    pub created_event_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub removed_event_id: Option<Uuid>,
+    #[serde(default)]
+    pub removed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaCollection {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub slug: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaCollectionMembership {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub collection_id: Uuid,
+    pub idea_id: Uuid,
+    pub added_at: DateTime<Utc>,
+    #[serde(default)]
+    pub removed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaCompatibilityMapping {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub legacy_source_kind: LegacyIdeaSourceKind,
+    pub legacy_source_id: Uuid,
+    #[serde(default)]
+    pub idea_id: Option<Uuid>,
+    #[serde(default)]
+    pub collection_id: Option<Uuid>,
+    pub status: IdeaCompatibilityStatus,
+    pub provenance: serde_json::Value,
+    #[serde(default)]
+    pub disposition: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub mapped_at: Option<DateTime<Utc>>,
+}
+
+impl IdeaCompatibilityMapping {
+    /// Validate compatibility target/status consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless mapped rows have exactly one target and a
+    /// mapping timestamp, while other statuses have neither.
+    pub fn validate(&self) -> Result<(), String> {
+        let target_count =
+            i64::from(self.idea_id.is_some()) + i64::from(self.collection_id.is_some());
+        if target_count > 1
+            || (self.status == IdeaCompatibilityStatus::Mapped) != (target_count == 1)
+            || (self.status == IdeaCompatibilityStatus::Mapped) != self.mapped_at.is_some()
+        {
+            return Err("compatibility status, target, and mapped_at are inconsistent".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaWithGenesis {
+    pub idea: Idea,
+    pub genesis: Capture,
+}
+
+/// Version tag persisted in every D02 semantic request envelope.
+pub const IDEA_SEMANTIC_REQUEST_V1: &str = "rsi.idea.semantic-request/v1";
+/// Default number of Idea events returned by a bounded history read.
+pub const IDEA_EVENT_PAGE_DEFAULT_LIMIT: usize = 100;
+/// Hard maximum number of Idea events returned by one history read.
+pub const IDEA_EVENT_PAGE_MAX_LIMIT: usize = 256;
+
+/// Explicit patch value for nullable Idea projection fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdeaOptionalStringV1 {
+    Set { value: String },
+    Clear,
+}
+
+/// Strict creation input. Project, actor, lifecycle, stage, IDs, counters,
+/// timestamps, and controller fields are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIdeaRequestV1 {
+    pub idempotency_key: String,
+    pub genesis_capture_id: Uuid,
+    #[serde(default)]
+    pub genesis_span: Option<GenesisSpan>,
+    pub slug: String,
+    #[serde(default)]
+    pub sigil: Option<String>,
+    pub title: String,
+    pub description: String,
+    pub portfolio_summary: String,
+    pub priority: i64,
+    pub autonomy_policy: AutonomyPolicy,
+    pub integration_target_ref: String,
+    #[serde(default)]
+    pub program_template_policy_id: Option<String>,
+    #[serde(default)]
+    pub derived_from_idea_id: Option<Uuid>,
+    #[serde(default)]
+    pub artifact_digests: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl CreateIdeaRequestV1 {
+    /// Validate and canonicalize a D02 create request without changing text.
+    ///
+    /// Digest vectors are sorted and deduplicated; all caller-authored text
+    /// remains byte-for-byte intact after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid keys, text bounds, spans, or policies.
+    pub fn normalized(&self) -> Result<Self, String> {
+        validate_idea_idempotency_key(&self.idempotency_key)?;
+        validate_idea_text("slug", &self.slug, 1, 128)?;
+        validate_optional_idea_text("sigil", self.sigil.as_deref(), 64)?;
+        validate_idea_text("title", &self.title, 1, 512)?;
+        validate_idea_text("description", &self.description, 0, 65_536)?;
+        validate_idea_text("portfolio_summary", &self.portfolio_summary, 0, 2_048)?;
+        validate_idea_text(
+            "integration_target_ref",
+            &self.integration_target_ref,
+            1,
+            4_096,
+        )?;
+        validate_optional_idea_text(
+            "program_template_policy_id",
+            self.program_template_policy_id.as_deref(),
+            256,
+        )?;
+        if let Some(span) = &self.genesis_span {
+            GenesisSpan::new(span.start, span.end, span.digest.clone())?;
+        }
+        let mut normalized = self.clone();
+        canonicalize_idea_digests(&mut normalized.artifact_digests);
+        canonicalize_idea_digests(&mut normalized.evidence_digests);
+        Ok(normalized)
+    }
+
+    /// Build the persisted semantic envelope from server-bound authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this request or the bound actor is invalid.
+    pub fn semantic_envelope(
+        &self,
+        project_id: Uuid,
+        idea_id: Uuid,
+        actor_id: &str,
+    ) -> Result<IdeaSemanticRequestV1, String> {
+        let normalized = self.normalized()?;
+        validate_idea_actor_id(actor_id)?;
+        let envelope = IdeaSemanticRequestV1 {
+            domain: IDEA_SEMANTIC_REQUEST_V1.to_string(),
+            project_id,
+            idea_id,
+            expected_row_version: 0,
+            actor_kind: IdeaActorKind::Operator,
+            actor_id: actor_id.to_string(),
+            operation: IdeaSemanticOperationV1::Create(IdeaCreateSemanticV1 {
+                genesis_capture_id: normalized.genesis_capture_id,
+                genesis_span: normalized.genesis_span,
+                slug: normalized.slug,
+                sigil: normalized.sigil,
+                title: normalized.title,
+                description: normalized.description,
+                portfolio_summary: normalized.portfolio_summary,
+                priority: normalized.priority,
+                autonomy_policy: normalized.autonomy_policy,
+                integration_target_ref: normalized.integration_target_ref,
+                program_template_policy_id: normalized.program_template_policy_id,
+                derived_from_idea_id: normalized.derived_from_idea_id,
+            }),
+            artifact_digests: normalized.artifact_digests,
+            evidence_digests: normalized.evidence_digests,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+}
+
+/// Closed D02 semantic action catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdeaMutationActionV1 {
+    ChangeProjection {
+        #[serde(default)]
+        sigil: Option<IdeaOptionalStringV1>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        portfolio_summary: Option<String>,
+        #[serde(default)]
+        priority: Option<i64>,
+    },
+    ChangeScope {
+        #[serde(default)]
+        integration_target_ref: Option<String>,
+        #[serde(default)]
+        program_template_policy_id: Option<IdeaOptionalStringV1>,
+    },
+    ChangeAutonomy {
+        autonomy_policy: AutonomyPolicy,
+    },
+    Park {
+        reason: String,
+    },
+    Reopen {
+        reason: String,
+    },
+    Abandon {
+        reason: String,
+    },
+    TransitionStage {
+        stage: IdeaStage,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    AddRelationship {
+        relationship_kind: IdeaRelationshipKind,
+        target_idea_id: Uuid,
+    },
+    RemoveRelationship {
+        relationship_kind: IdeaRelationshipKind,
+        target_idea_id: Uuid,
+    },
+    AcceptSupersession {
+        replacement_idea_ids: Vec<Uuid>,
+    },
+}
+
+impl IdeaMutationActionV1 {
+    /// Return the one event type derived from this action.
+    #[must_use]
+    pub const fn event_type(&self) -> IdeaEventType {
+        match self {
+            Self::ChangeProjection { .. } => IdeaEventType::ProjectionChanged,
+            Self::ChangeScope { .. } => IdeaEventType::ScopeChanged,
+            Self::ChangeAutonomy { .. } => IdeaEventType::AutonomyChanged,
+            Self::Park { .. } | Self::Reopen { .. } => IdeaEventType::LifecycleTransitioned,
+            Self::Abandon { .. } => IdeaEventType::Abandoned,
+            Self::TransitionStage { .. } => IdeaEventType::StageTransitioned,
+            Self::AddRelationship { .. } | Self::RemoveRelationship { .. } => {
+                IdeaEventType::RelationshipChanged
+            }
+            Self::AcceptSupersession { .. } => IdeaEventType::Superseded,
+        }
+    }
+
+    fn normalized(&self) -> Result<Self, String> {
+        let mut normalized = self.clone();
+        match &mut normalized {
+            Self::ChangeProjection {
+                sigil,
+                title,
+                description,
+                portfolio_summary,
+                priority,
+            } => {
+                if sigil.is_none()
+                    && title.is_none()
+                    && description.is_none()
+                    && portfolio_summary.is_none()
+                    && priority.is_none()
+                {
+                    return Err("projection change must contain at least one field".to_string());
+                }
+                if let Some(IdeaOptionalStringV1::Set { value }) = sigil {
+                    validate_idea_text("sigil", value, 1, 64)?;
+                }
+                if let Some(value) = title {
+                    validate_idea_text("title", value, 1, 512)?;
+                }
+                if let Some(value) = description {
+                    validate_idea_text("description", value, 0, 65_536)?;
+                }
+                if let Some(value) = portfolio_summary {
+                    validate_idea_text("portfolio_summary", value, 0, 2_048)?;
+                }
+            }
+            Self::ChangeScope {
+                integration_target_ref,
+                program_template_policy_id,
+            } => {
+                if integration_target_ref.is_none() && program_template_policy_id.is_none() {
+                    return Err("scope change must contain at least one field".to_string());
+                }
+                if let Some(value) = integration_target_ref {
+                    validate_idea_text("integration_target_ref", value, 1, 4_096)?;
+                }
+                if let Some(IdeaOptionalStringV1::Set { value }) = program_template_policy_id {
+                    validate_idea_text("program_template_policy_id", value, 1, 256)?;
+                }
+            }
+            Self::Park { reason } | Self::Reopen { reason } | Self::Abandon { reason } => {
+                validate_idea_reason(reason)?;
+            }
+            Self::TransitionStage { reason, .. } => {
+                if let Some(reason) = reason {
+                    validate_idea_reason(reason)?;
+                }
+            }
+            Self::AddRelationship {
+                relationship_kind, ..
+            }
+            | Self::RemoveRelationship {
+                relationship_kind, ..
+            } => {
+                if *relationship_kind == IdeaRelationshipKind::Supersedes {
+                    return Err(
+                        "supersedes is accepted only through accept_supersession".to_string()
+                    );
+                }
+            }
+            Self::AcceptSupersession {
+                replacement_idea_ids,
+            } => {
+                replacement_idea_ids.sort_unstable();
+                replacement_idea_ids.dedup();
+                if replacement_idea_ids.is_empty() {
+                    return Err("accept_supersession requires at least one replacement".to_string());
+                }
+            }
+            Self::ChangeAutonomy { .. } => {}
+        }
+        Ok(normalized)
+    }
+}
+
+/// Strict later-mutation input. Scope and actor attribution are handle-bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutateIdeaRequestV1 {
+    pub expected_row_version: i64,
+    pub idempotency_key: String,
+    pub action: IdeaMutationActionV1,
+    #[serde(default)]
+    pub artifact_digests: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl MutateIdeaRequestV1 {
+    /// Validate and canonicalize a D02 mutation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid versions, keys, action payloads, or
+    /// digest vectors.
+    pub fn normalized(&self) -> Result<Self, String> {
+        if self.expected_row_version < 1 {
+            return Err("expected_row_version must be positive after creation".to_string());
+        }
+        validate_idea_idempotency_key(&self.idempotency_key)?;
+        let mut normalized = self.clone();
+        normalized.action = normalized.action.normalized()?;
+        canonicalize_idea_digests(&mut normalized.artifact_digests);
+        canonicalize_idea_digests(&mut normalized.evidence_digests);
+        Ok(normalized)
+    }
+
+    /// Build the persisted semantic envelope from server-bound authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this request or the bound actor is invalid.
+    pub fn semantic_envelope(
+        &self,
+        project_id: Uuid,
+        idea_id: Uuid,
+        actor_id: &str,
+    ) -> Result<IdeaSemanticRequestV1, String> {
+        let normalized = self.normalized()?;
+        validate_idea_actor_id(actor_id)?;
+        let envelope = IdeaSemanticRequestV1 {
+            domain: IDEA_SEMANTIC_REQUEST_V1.to_string(),
+            project_id,
+            idea_id,
+            expected_row_version: normalized.expected_row_version,
+            actor_kind: IdeaActorKind::Operator,
+            actor_id: actor_id.to_string(),
+            operation: IdeaSemanticOperationV1::Mutate {
+                action: normalized.action,
+            },
+            artifact_digests: normalized.artifact_digests,
+            evidence_digests: normalized.evidence_digests,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+}
+
+/// Creation payload embedded in the canonical semantic envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaCreateSemanticV1 {
+    pub genesis_capture_id: Uuid,
+    #[serde(default)]
+    pub genesis_span: Option<GenesisSpan>,
+    pub slug: String,
+    #[serde(default)]
+    pub sigil: Option<String>,
+    pub title: String,
+    pub description: String,
+    pub portfolio_summary: String,
+    pub priority: i64,
+    pub autonomy_policy: AutonomyPolicy,
+    pub integration_target_ref: String,
+    #[serde(default)]
+    pub program_template_policy_id: Option<String>,
+    #[serde(default)]
+    pub derived_from_idea_id: Option<Uuid>,
+}
+
+/// Versioned operation inside the canonical semantic envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdeaSemanticOperationV1 {
+    Create(IdeaCreateSemanticV1),
+    Mutate {
+        action: IdeaMutationActionV1,
+    },
+    LinkIssue {
+        issue_id: Uuid,
+        #[serde(default)]
+        source_event_id: Option<Uuid>,
+        #[serde(default)]
+        source_finding_ref: Option<IssueSourceFindingRef>,
+    },
+}
+
+/// Canonical comparison unit for exact durable replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaSemanticRequestV1 {
+    pub domain: String,
+    pub project_id: Uuid,
+    pub idea_id: Uuid,
+    pub expected_row_version: i64,
+    pub actor_kind: IdeaActorKind,
+    pub actor_id: String,
+    pub operation: IdeaSemanticOperationV1,
+    pub artifact_digests: Vec<Sha256Digest>,
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl IdeaSemanticRequestV1 {
+    /// Validate a decoded V1 semantic envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown version, non-operator attribution,
+    /// noncanonical vectors, or invalid operation payload.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.domain != IDEA_SEMANTIC_REQUEST_V1 {
+            return Err("unknown Idea semantic request version".to_string());
+        }
+        if self.actor_kind != IdeaActorKind::Operator {
+            return Err("D02 semantic requests require an operator actor".to_string());
+        }
+        validate_idea_actor_id(&self.actor_id)?;
+        if !idea_digests_are_canonical(&self.artifact_digests)
+            || !idea_digests_are_canonical(&self.evidence_digests)
+        {
+            return Err("Idea semantic digest vectors are not sorted and unique".to_string());
+        }
+        match &self.operation {
+            IdeaSemanticOperationV1::Create(create) => {
+                if self.expected_row_version != 0 {
+                    return Err("create semantic request must expect row version zero".to_string());
+                }
+                let request = CreateIdeaRequestV1 {
+                    idempotency_key: "semantic-validation".to_string(),
+                    genesis_capture_id: create.genesis_capture_id,
+                    genesis_span: create.genesis_span.clone(),
+                    slug: create.slug.clone(),
+                    sigil: create.sigil.clone(),
+                    title: create.title.clone(),
+                    description: create.description.clone(),
+                    portfolio_summary: create.portfolio_summary.clone(),
+                    priority: create.priority,
+                    autonomy_policy: create.autonomy_policy,
+                    integration_target_ref: create.integration_target_ref.clone(),
+                    program_template_policy_id: create.program_template_policy_id.clone(),
+                    derived_from_idea_id: create.derived_from_idea_id,
+                    artifact_digests: self.artifact_digests.clone(),
+                    evidence_digests: self.evidence_digests.clone(),
+                };
+                request.normalized()?;
+            }
+            IdeaSemanticOperationV1::Mutate { action } => {
+                if self.expected_row_version < 1 {
+                    return Err(
+                        "mutation semantic request must expect a positive row version".to_string(),
+                    );
+                }
+                action.normalized()?;
+            }
+            IdeaSemanticOperationV1::LinkIssue {
+                issue_id,
+                source_finding_ref,
+                ..
+            } => {
+                if self.expected_row_version < 1 {
+                    return Err(
+                        "link_issue semantic request must expect a positive row version"
+                            .to_string(),
+                    );
+                }
+                if issue_id.is_nil() {
+                    return Err(
+                        "link_issue semantic request requires a non-nil issue id".to_string()
+                    );
+                }
+                if !self.artifact_digests.is_empty() {
+                    return Err("link_issue semantic request has no artifact digests".to_string());
+                }
+                let expected_evidence = source_finding_ref
+                    .as_ref()
+                    .map(|finding| vec![finding.artifact_digest()])
+                    .unwrap_or_default();
+                if self.evidence_digests != expected_evidence {
+                    return Err("link_issue semantic request evidence digest does not match finding provenance".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Return deterministic compact JSON with recursively sorted object keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the envelope is invalid or cannot be serialized.
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        let mut output = String::new();
+        write_canonical_json(&value, &mut output)?;
+        Ok(output)
+    }
+
+    /// Return the event type fixed by the semantic operation.
+    #[must_use]
+    pub const fn event_type(&self) -> IdeaEventType {
+        match &self.operation {
+            IdeaSemanticOperationV1::Create(_) => IdeaEventType::Created,
+            IdeaSemanticOperationV1::Mutate { action } => action.event_type(),
+            IdeaSemanticOperationV1::LinkIssue { .. } => IdeaEventType::IssueLinked,
+        }
+    }
+}
+
+impl IdeaEvent {
+    /// Decode and enforce the stronger D02 semantic-event contract.
+    ///
+    /// D01 structural fixtures remain readable through [`IdeaEvent::validate`],
+    /// while every D02 writer and replay path must use this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the envelope, event type, actor, scope, versions,
+    /// controller fields, key, or digest columns disagree.
+    pub fn semantic_request_v1(&self) -> Result<IdeaSemanticRequestV1, String> {
+        self.validate()?;
+        validate_idea_idempotency_key(&self.idempotency_key)?;
+        if self.resulting_row_version != self.expected_row_version + 1 {
+            return Err("D02 event row versions must advance by exactly one".to_string());
+        }
+        if self.actor_kind != IdeaActorKind::Operator
+            || self.controller_session_id.is_some()
+            || self.controller_epoch.is_some()
+        {
+            return Err("D02 events require operator attribution without controller fields".into());
+        }
+        if !idea_digests_are_canonical(&self.artifact_digests)
+            || !idea_digests_are_canonical(&self.evidence_digests)
+        {
+            return Err("D02 event digest vectors are not sorted and unique".to_string());
+        }
+        let request: IdeaSemanticRequestV1 =
+            serde_json::from_value(self.payload.clone()).map_err(|error| error.to_string())?;
+        request.validate()?;
+        if request.project_id != self.project_id
+            || request.idea_id != self.idea_id
+            || request.expected_row_version != self.expected_row_version
+            || request.actor_kind != self.actor_kind
+            || request.actor_id != self.actor_id
+            || request.artifact_digests != self.artifact_digests
+            || request.evidence_digests != self.evidence_digests
+            || request.event_type() != self.event_type
+        {
+            return Err("D02 event columns disagree with the semantic envelope".to_string());
+        }
+        if matches!(request.operation, IdeaSemanticOperationV1::Create(_))
+            && (self.sequence != 1
+                || self.expected_row_version != 0
+                || self.resulting_row_version != 1)
+        {
+            return Err("D02 creation event must be sequence 1 and version 0 -> 1".to_string());
+        }
+        Ok(request)
+    }
+}
+
+/// Typed committed result for create, mutation, and exact replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaMutationResultV1 {
+    pub idea: Idea,
+    pub event: IdeaEvent,
+    pub relationships: Vec<IdeaRelationship>,
+    pub deduplicated: bool,
+}
+
+/// Version tag persisted in every D03 controller-control event.
+pub const IDEA_CONTROLLER_CONTROL_V1: &str = "rsi.idea.controller-control/v1";
+/// Version tag persisted in every D03 controller-authorized mutation event.
+pub const IDEA_CONTROLLER_MUTATION_V1: &str = "rsi.idea.controller-mutation/v1";
+/// Fixed D03 launch-reservation lifetime. This is deliberately not caller-configurable.
+pub const IDEA_CONTROLLER_RESERVATION_LEASE_SECONDS: i64 = 300;
+/// Stable restart-reconciliation page size.
+pub const IDEA_CONTROLLER_RECONCILIATION_BATCH_SIZE: usize = 64;
+
+exact_string_enum!(ControllerReleaseReasonV1 {
+    LaunchAdmissionFailed => "LaunchAdmissionFailed",
+    TokenMintFailed => "TokenMintFailed",
+    ProviderSpawnFailed => "ProviderSpawnFailed",
+    ProviderHandshakeFailed => "ProviderHandshakeFailed",
+    DurableRowFailed => "DurableRowFailed",
+    ConfirmationFailed => "ConfirmationFailed",
+    Cancelled => "Cancelled",
+    Expired => "Expired",
+    StaleAssignmentBase => "StaleAssignmentBase",
+    RestartRecovery => "RestartRecovery",
+    OperatorRelease => "OperatorRelease",
+    ControllerSelfRelease => "ControllerSelfRelease",
+});
+
+exact_string_enum!(ControllerConfirmationKindV1 {
+    InstalledProvider => "InstalledProvider",
+    CodexAppServerInitialized => "CodexAppServerInitialized",
+});
+
+/// Strict caller input for a controller reservation. Scope, actor, observed
+/// epoch, reservation identity, candidate identity, and timestamps are bound
+/// or generated inside the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReserveIdeaControllerRequestV1 {
+    pub expected_row_version: i64,
+    pub transfer_intent_key: String,
+}
+
+impl ReserveIdeaControllerRequestV1 {
+    /// Validate the caller-owned portion of a reserve request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-positive row version or invalid intent key.
+    pub fn normalized(&self) -> Result<Self, String> {
+        if self.expected_row_version < 1 {
+            return Err("expected_row_version must be positive".to_string());
+        }
+        validate_idea_idempotency_key(&self.transfer_intent_key)?;
+        Ok(self.clone())
+    }
+}
+
+/// Strict caller input for releasing the reservation derived from one
+/// transfer intent. The reservation UUID and candidate UUID are never accepted
+/// from a caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseIdeaControllerReservationRequestV1 {
+    pub transfer_intent_key: String,
+    pub reason: ControllerReleaseReasonV1,
+}
+
+impl ReleaseIdeaControllerReservationRequestV1 {
+    /// Validate the caller-owned portion of a reservation release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid transfer intent key.
+    pub fn normalized(&self) -> Result<Self, String> {
+        validate_idea_idempotency_key(&self.transfer_intent_key)?;
+        Ok(self.clone())
+    }
+}
+
+/// Strict caller input for releasing the currently assigned controller.
+/// Assigned session and epoch are read from the bound handle and projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAssignedIdeaControllerRequestV1 {
+    pub expected_row_version: i64,
+    pub release_intent_key: String,
+    pub reason: ControllerReleaseReasonV1,
+}
+
+impl ReleaseAssignedIdeaControllerRequestV1 {
+    /// Validate the caller-owned portion of an assigned release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-positive row version or invalid intent key.
+    pub fn normalized(&self) -> Result<Self, String> {
+        if self.expected_row_version < 1 {
+            return Err("expected_row_version must be positive".to_string());
+        }
+        validate_idea_idempotency_key(&self.release_intent_key)?;
+        Ok(self.clone())
+    }
+}
+
+/// Complete durable snapshot of one unresolved controller reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerReservationV1 {
+    pub reservation_id: Uuid,
+    pub candidate_session_id: Uuid,
+    #[serde(default)]
+    pub base_controller_session_id: Option<Uuid>,
+    pub base_controller_epoch: i64,
+    pub base_row_version: i64,
+    pub proposed_epoch: i64,
+    pub reserved_event_id: Uuid,
+    pub reserved_sequence: i64,
+    pub reserved_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub transfer_intent_key: String,
+}
+
+impl IdeaControllerReservationV1 {
+    /// Validate deterministic identity, version, epoch, and lease invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reservation cannot be authoritative D03 data.
+    pub fn validate(&self, idea_id: Uuid) -> Result<(), String> {
+        validate_idea_idempotency_key(&self.transfer_intent_key)?;
+        if self.reservation_id != idea_controller_reservation_id(idea_id, &self.transfer_intent_key)
+            || self.candidate_session_id
+                != idea_controller_candidate_session_id(self.reservation_id)
+            || self.reserved_event_id
+                != idea_controller_event_id(
+                    idea_id,
+                    &idea_controller_reserve_stage_key(self.reservation_id),
+                )
+        {
+            return Err("controller reservation deterministic identity mismatch".to_string());
+        }
+        if self.base_controller_epoch < 0
+            || self.base_row_version < 1
+            || self.base_row_version.checked_add(1).is_none()
+            || self.reserved_sequence < 2
+            || self.proposed_epoch
+                != self
+                    .base_controller_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "controller reservation proposed epoch overflow".to_string())?
+        {
+            return Err("controller reservation counter invariant failed".to_string());
+        }
+        let expected_expiry = self
+            .reserved_at
+            .checked_add_signed(chrono::Duration::seconds(
+                IDEA_CONTROLLER_RESERVATION_LEASE_SECONDS,
+            ))
+            .ok_or_else(|| "controller reservation expiry overflow".to_string())?;
+        if self.expires_at != expected_expiry {
+            return Err("controller reservation expiry is not exactly five minutes".to_string());
+        }
+        Ok(())
+    }
+
+    /// True only before the exact persisted absolute expiry.
+    #[must_use]
+    pub fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+        now < self.expires_at
+    }
+}
+
+/// Provider-neutral fact emitted only after model admission, provider
+/// installation/handshake, durable row verification, prospective A6
+/// verification, and reservation verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerLaunchConfirmationV1 {
+    pub candidate_session_id: Uuid,
+    pub project_id: Uuid,
+    pub provider: SessionProvider,
+    pub admission_invocation_id: Uuid,
+    pub confirmation_kind: ControllerConfirmationKindV1,
+    pub durable_session_id: Uuid,
+    pub durable_project_id: Uuid,
+    pub durable_provider: SessionProvider,
+    pub a6_bound_session_id: Uuid,
+    pub confirmed_at: DateTime<Utc>,
+}
+
+impl IdeaControllerLaunchConfirmationV1 {
+    /// Validate duplicated provider-neutral confirmation facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless all durable and A6 identities match.
+    pub fn validate(
+        &self,
+        reservation: &IdeaControllerReservationV1,
+        project_id: Uuid,
+    ) -> Result<(), String> {
+        if self.candidate_session_id != reservation.candidate_session_id
+            || self.project_id != project_id
+            || self.durable_project_id != project_id
+            || self.provider != self.durable_provider
+            || self.admission_invocation_id.is_nil()
+            || self.confirmed_at < reservation.reserved_at
+            || self.confirmed_at >= reservation.expires_at
+            || matches!(
+                (self.provider, self.confirmation_kind),
+                (
+                    SessionProvider::CodexAppServer,
+                    ControllerConfirmationKindV1::InstalledProvider
+                ) | (
+                    SessionProvider::Claude
+                        | SessionProvider::Codex
+                        | SessionProvider::Pioneer
+                        | SessionProvider::OpenRouter
+                        | SessionProvider::Bedrock
+                        | SessionProvider::Local
+                        | SessionProvider::Antigravity
+                        | SessionProvider::Harness,
+                    ControllerConfirmationKindV1::CodexAppServerInitialized
+                )
+            )
+        {
+            return Err("controller launch confirmation facts disagree".to_string());
+        }
+        if self.durable_session_id != reservation.candidate_session_id
+            || self.a6_bound_session_id != reservation.candidate_session_id
+        {
+            return Err("controller launch confirmation identities disagree".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Canonical semantic controller-control operation. Every privileged identity
+/// in this enum is constructed by a daemon-bound handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdeaControllerControlOperationV1 {
+    Reserve {
+        transfer_intent_key: String,
+        expected_row_version: i64,
+        observed_controller_epoch: i64,
+        #[serde(default)]
+        base_controller_session_id: Option<Uuid>,
+        base_controller_epoch: i64,
+        base_row_version: i64,
+        reservation_id: Uuid,
+        candidate_session_id: Uuid,
+        proposed_epoch: i64,
+        lease_seconds: i64,
+    },
+    Assign {
+        reservation: IdeaControllerReservationV1,
+        confirmation: IdeaControllerLaunchConfirmationV1,
+    },
+    ReleaseReservation {
+        reservation: IdeaControllerReservationV1,
+        expected_row_version: i64,
+        reason: ControllerReleaseReasonV1,
+    },
+    ReleaseAssigned {
+        release_intent_key: String,
+        expected_row_version: i64,
+        observed_controller_epoch: i64,
+        controller_session_id: Uuid,
+        controller_epoch: i64,
+        reason: ControllerReleaseReasonV1,
+    },
+}
+
+impl IdeaControllerControlOperationV1 {
+    /// Event kind fixed by this controller operation.
+    #[must_use]
+    pub const fn event_type(&self) -> IdeaEventType {
+        match self {
+            Self::Reserve { .. } => IdeaEventType::ControllerReserved,
+            Self::Assign { .. } => IdeaEventType::ControllerAssigned,
+            Self::ReleaseReservation { .. } | Self::ReleaseAssigned { .. } => {
+                IdeaEventType::ControllerReleased
+            }
+        }
+    }
+
+    /// Expected Idea row version fixed by the semantic request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reservation base cannot advance.
+    pub fn expected_row_version(&self) -> Result<i64, String> {
+        match self {
+            Self::Reserve {
+                base_row_version, ..
+            } => Ok(*base_row_version),
+            Self::ReleaseReservation {
+                expected_row_version,
+                ..
+            }
+            | Self::ReleaseAssigned {
+                expected_row_version,
+                ..
+            } => Ok(*expected_row_version),
+            Self::Assign { reservation, .. } => reservation
+                .base_row_version
+                .checked_add(1)
+                .ok_or_else(|| "controller assignment row version overflow".to_string()),
+        }
+    }
+
+    /// Subject epoch duplicated into the event column.
+    #[must_use]
+    pub const fn controller_epoch(&self) -> i64 {
+        match self {
+            Self::Reserve { proposed_epoch, .. } => *proposed_epoch,
+            Self::Assign { reservation, .. } | Self::ReleaseReservation { reservation, .. } => {
+                reservation.proposed_epoch
+            }
+            Self::ReleaseAssigned {
+                controller_epoch, ..
+            } => *controller_epoch,
+        }
+    }
+
+    /// Subject session duplicated into the event column when the referenced
+    /// Session row must already exist. Reservation rows keep this column NULL
+    /// because the deterministic candidate may not have a Session row yet.
+    #[must_use]
+    pub const fn controller_session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Assign { reservation, .. } => Some(reservation.candidate_session_id),
+            Self::ReleaseAssigned {
+                controller_session_id,
+                ..
+            } => Some(*controller_session_id),
+            Self::Reserve { .. } | Self::ReleaseReservation { .. } => None,
+        }
+    }
+}
+
+/// Canonical exact-versus-changed comparison unit for D03 controller control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerControlRequestV1 {
+    pub domain: String,
+    pub project_id: Uuid,
+    pub idea_id: Uuid,
+    pub actor_kind: IdeaActorKind,
+    pub actor_id: String,
+    pub operation: IdeaControllerControlOperationV1,
+}
+
+impl IdeaControllerControlRequestV1 {
+    /// Validate the strict D03 controller-control envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid scope, attribution, counters, identities,
+    /// lease constants, confirmations, or release policy.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.domain != IDEA_CONTROLLER_CONTROL_V1
+            || self.project_id.is_nil()
+            || self.idea_id.is_nil()
+        {
+            return Err("unknown or unscoped controller-control request".to_string());
+        }
+        validate_controller_actor(self.actor_kind, &self.actor_id)?;
+        match &self.operation {
+            IdeaControllerControlOperationV1::Reserve { .. } => self.validate_reserve(),
+            IdeaControllerControlOperationV1::Assign { .. } => self.validate_assignment(),
+            IdeaControllerControlOperationV1::ReleaseReservation { .. } => {
+                self.validate_reservation_release()
+            }
+            IdeaControllerControlOperationV1::ReleaseAssigned { .. } => {
+                self.validate_assigned_release()
+            }
+        }
+    }
+
+    fn validate_reserve(&self) -> Result<(), String> {
+        let IdeaControllerControlOperationV1::Reserve {
+            transfer_intent_key,
+            expected_row_version,
+            observed_controller_epoch,
+            base_controller_epoch,
+            base_row_version,
+            reservation_id,
+            candidate_session_id,
+            proposed_epoch,
+            lease_seconds,
+            ..
+        } = &self.operation
+        else {
+            return Err("controller reserve operation mismatch".to_string());
+        };
+        validate_idea_idempotency_key(transfer_intent_key)?;
+        if !matches!(
+            self.actor_kind,
+            IdeaActorKind::Operator | IdeaActorKind::System
+        ) || *expected_row_version < 1
+            || *observed_controller_epoch < 0
+            || *base_controller_epoch != *observed_controller_epoch
+            || !matches!(
+                expected_row_version.checked_add(1),
+                Some(after_expiry_release)
+                    if *base_row_version == *expected_row_version
+                        || *base_row_version == after_expiry_release
+            )
+            || *lease_seconds != IDEA_CONTROLLER_RESERVATION_LEASE_SECONDS
+            || *reservation_id != idea_controller_reservation_id(self.idea_id, transfer_intent_key)
+            || *candidate_session_id != idea_controller_candidate_session_id(*reservation_id)
+            || *proposed_epoch
+                != base_controller_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "controller reserve epoch overflow".to_string())?
+        {
+            return Err("invalid controller reserve semantics".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_assignment(&self) -> Result<(), String> {
+        let IdeaControllerControlOperationV1::Assign {
+            reservation,
+            confirmation,
+        } = &self.operation
+        else {
+            return Err("controller assignment operation mismatch".to_string());
+        };
+        if self.actor_kind != IdeaActorKind::System {
+            return Err("controller assignment requires system attribution".to_string());
+        }
+        reservation.validate(self.idea_id)?;
+        confirmation.validate(reservation, self.project_id)
+    }
+
+    fn validate_reservation_release(&self) -> Result<(), String> {
+        let IdeaControllerControlOperationV1::ReleaseReservation {
+            reservation,
+            expected_row_version,
+            reason,
+        } = &self.operation
+        else {
+            return Err("controller reservation release operation mismatch".to_string());
+        };
+        if !matches!(
+            self.actor_kind,
+            IdeaActorKind::Operator | IdeaActorKind::System
+        ) {
+            return Err("reservation release requires operator or system attribution".to_string());
+        }
+        reservation.validate(self.idea_id)?;
+        let reserved_row_version = reservation
+            .base_row_version
+            .checked_add(1)
+            .ok_or_else(|| "controller reservation row version overflow".to_string())?;
+        if *expected_row_version < reserved_row_version {
+            return Err("reservation release row version predates reservation".to_string());
+        }
+        if matches!(
+            reason,
+            ControllerReleaseReasonV1::OperatorRelease
+                | ControllerReleaseReasonV1::ControllerSelfRelease
+        ) {
+            return Err("invalid reservation release reason".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_assigned_release(&self) -> Result<(), String> {
+        let IdeaControllerControlOperationV1::ReleaseAssigned {
+            release_intent_key,
+            expected_row_version,
+            observed_controller_epoch,
+            controller_session_id,
+            controller_epoch,
+            reason,
+        } = &self.operation
+        else {
+            return Err("assigned controller release operation mismatch".to_string());
+        };
+        validate_idea_idempotency_key(release_intent_key)?;
+        let actor_reason_is_valid = matches!(
+            (self.actor_kind, reason),
+            (
+                IdeaActorKind::Operator | IdeaActorKind::System,
+                ControllerReleaseReasonV1::OperatorRelease
+            ) | (
+                IdeaActorKind::Session,
+                ControllerReleaseReasonV1::ControllerSelfRelease
+            )
+        );
+        if *expected_row_version < 1
+            || *controller_epoch < 0
+            || *observed_controller_epoch != *controller_epoch
+            || controller_session_id.is_nil()
+            || !actor_reason_is_valid
+            || (self.actor_kind == IdeaActorKind::Session
+                && self.actor_id != controller_session_id.to_string())
+        {
+            return Err("invalid assigned-controller release semantics".to_string());
+        }
+        Ok(())
+    }
+
+    /// Deterministic canonical JSON used for durable semantic equality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or JSON serialization fails.
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_value(self)
+    }
+}
+
+/// Generated committed outcome persisted beside the exact semantic request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerControlOutcomeV1 {
+    pub idea: Idea,
+    pub event_id: Uuid,
+    pub sequence: i64,
+    pub resulting_row_version: i64,
+    pub occurred_at: DateTime<Utc>,
+    #[serde(default)]
+    pub reservation: Option<IdeaControllerReservationV1>,
+}
+
+/// Complete strict controller event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerEventPayloadV1 {
+    pub request: IdeaControllerControlRequestV1,
+    pub outcome: IdeaControllerControlOutcomeV1,
+}
+
+impl IdeaControllerEventPayloadV1 {
+    /// Validate duplicated event outcome and projection data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request and committed outcome disagree.
+    pub fn validate(&self) -> Result<(), String> {
+        self.request.validate()?;
+        self.outcome.idea.validate()?;
+        let expected = self.request.operation.expected_row_version()?;
+        if self.outcome.idea.id != self.request.idea_id
+            || self.outcome.idea.project_id != self.request.project_id
+            || self.outcome.sequence <= 0
+            || self.outcome.resulting_row_version
+                != expected
+                    .checked_add(1)
+                    .ok_or_else(|| "controller event resulting row version overflow".to_string())?
+            || self.outcome.idea.row_version != self.outcome.resulting_row_version
+            || self.outcome.idea.next_event_sequence
+                != self
+                    .outcome
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "controller event sequence overflow".to_string())?
+            || self.outcome.idea.updated_at != self.outcome.occurred_at
+        {
+            return Err("controller event outcome disagrees with request".to_string());
+        }
+        match (&self.request.operation, &self.outcome.reservation) {
+            (
+                IdeaControllerControlOperationV1::Reserve {
+                    reservation_id,
+                    candidate_session_id,
+                    ..
+                },
+                Some(outcome_reservation),
+            ) => {
+                outcome_reservation.validate(self.request.idea_id)?;
+                if outcome_reservation.reservation_id != *reservation_id
+                    || outcome_reservation.candidate_session_id != *candidate_session_id
+                {
+                    return Err("reserve outcome contains a different reservation".to_string());
+                }
+            }
+            (
+                IdeaControllerControlOperationV1::Assign { reservation, .. }
+                | IdeaControllerControlOperationV1::ReleaseReservation { reservation, .. },
+                Some(outcome_reservation),
+            ) => {
+                outcome_reservation.validate(self.request.idea_id)?;
+                if outcome_reservation != reservation {
+                    return Err("terminal outcome contains a different reservation".to_string());
+                }
+            }
+            (IdeaControllerControlOperationV1::ReleaseAssigned { .. }, None) => {}
+            _ => return Err("controller event reservation outcome mismatch".to_string()),
+        }
+        Ok(())
+    }
+
+    /// Deterministic canonical JSON used as `payload_json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or JSON serialization fails.
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_value(self)
+    }
+}
+
+/// Closed controller-authorized subset of the D02 mutation catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdeaControllerMutationActionV1 {
+    ChangeProjection {
+        #[serde(default)]
+        sigil: Option<IdeaOptionalStringV1>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        portfolio_summary: Option<String>,
+        #[serde(default)]
+        priority: Option<i64>,
+    },
+    TransitionStage {
+        stage: IdeaStage,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+impl IdeaControllerMutationActionV1 {
+    /// Convert into the shared D02 projection action after applying the exact
+    /// D03 allowlist and the existing D02 validation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected allowed action is malformed.
+    pub fn normalized_idea_action(&self) -> Result<IdeaMutationActionV1, String> {
+        let action = match self {
+            Self::ChangeProjection {
+                sigil,
+                title,
+                description,
+                portfolio_summary,
+                priority,
+            } => IdeaMutationActionV1::ChangeProjection {
+                sigil: sigil.clone(),
+                title: title.clone(),
+                description: description.clone(),
+                portfolio_summary: portfolio_summary.clone(),
+                priority: *priority,
+            },
+            Self::TransitionStage { stage, reason } => IdeaMutationActionV1::TransitionStage {
+                stage: *stage,
+                reason: reason.clone(),
+            },
+        };
+        action.normalized()
+    }
+
+    /// Event kind fixed by the allowed action.
+    #[must_use]
+    pub const fn event_type(&self) -> IdeaEventType {
+        match self {
+            Self::ChangeProjection { .. } => IdeaEventType::ProjectionChanged,
+            Self::TransitionStage { .. } => IdeaEventType::StageTransitioned,
+        }
+    }
+}
+
+/// Strict controller mutation input. All authority identity is handle-bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutateIdeaAsControllerRequestV1 {
+    pub expected_row_version: i64,
+    pub idempotency_key: String,
+    pub action: IdeaControllerMutationActionV1,
+    #[serde(default)]
+    pub artifact_digests: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl MutateIdeaAsControllerRequestV1 {
+    /// Validate and canonicalize the controller-owned portion of a mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid counters, keys, actions, or digests.
+    pub fn normalized(&self) -> Result<Self, String> {
+        if self.expected_row_version < 1 {
+            return Err("expected_row_version must be positive".to_string());
+        }
+        validate_idea_idempotency_key(&self.idempotency_key)?;
+        self.action.normalized_idea_action()?;
+        let mut normalized = self.clone();
+        canonicalize_idea_digests(&mut normalized.artifact_digests);
+        canonicalize_idea_digests(&mut normalized.evidence_digests);
+        Ok(normalized)
+    }
+}
+
+/// Canonical exact-versus-changed comparison unit for controller mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerMutationRequestV1 {
+    pub domain: String,
+    pub project_id: Uuid,
+    pub idea_id: Uuid,
+    pub controller_session_id: Uuid,
+    pub controller_epoch: i64,
+    pub expected_row_version: i64,
+    pub idempotency_key: String,
+    pub action: IdeaControllerMutationActionV1,
+    pub artifact_digests: Vec<Sha256Digest>,
+    pub evidence_digests: Vec<Sha256Digest>,
+}
+
+impl IdeaControllerMutationRequestV1 {
+    /// Build a canonical mutation envelope from server-bound authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the strict input or bound identity is invalid.
+    pub fn from_bound(
+        project_id: Uuid,
+        idea_id: Uuid,
+        controller_session_id: Uuid,
+        controller_epoch: i64,
+        request: &MutateIdeaAsControllerRequestV1,
+    ) -> Result<Self, String> {
+        let request = request.normalized()?;
+        let envelope = Self {
+            domain: IDEA_CONTROLLER_MUTATION_V1.to_string(),
+            project_id,
+            idea_id,
+            controller_session_id,
+            controller_epoch,
+            expected_row_version: request.expected_row_version,
+            idempotency_key: request.idempotency_key,
+            action: request.action,
+            artifact_digests: request.artifact_digests,
+            evidence_digests: request.evidence_digests,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Validate strict controller identity, CAS, action, and digest invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the envelope is noncanonical.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.domain != IDEA_CONTROLLER_MUTATION_V1
+            || self.project_id.is_nil()
+            || self.idea_id.is_nil()
+            || self.controller_session_id.is_nil()
+            || self.controller_epoch < 0
+            || self.expected_row_version < 1
+        {
+            return Err("invalid controller mutation scope or counters".to_string());
+        }
+        validate_idea_idempotency_key(&self.idempotency_key)?;
+        self.action.normalized_idea_action()?;
+        if !idea_digests_are_canonical(&self.artifact_digests)
+            || !idea_digests_are_canonical(&self.evidence_digests)
+        {
+            return Err("controller mutation digest vectors are not sorted and unique".to_string());
+        }
+        Ok(())
+    }
+
+    /// Deterministic canonical JSON for exact replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or JSON serialization fails.
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_value(self)
+    }
+}
+
+/// Generated committed controller-mutation outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerMutationOutcomeV1 {
+    pub idea: Idea,
+    pub event_id: Uuid,
+    pub sequence: i64,
+    pub resulting_row_version: i64,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Complete strict controller-mutation event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaControllerMutationPayloadV1 {
+    pub request: IdeaControllerMutationRequestV1,
+    pub outcome: IdeaControllerMutationOutcomeV1,
+}
+
+impl IdeaControllerMutationPayloadV1 {
+    /// Validate duplicated event outcome and controller scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request and outcome disagree.
+    pub fn validate(&self) -> Result<(), String> {
+        self.request.validate()?;
+        self.outcome.idea.validate()?;
+        if self.outcome.idea.id != self.request.idea_id
+            || self.outcome.idea.project_id != self.request.project_id
+            || self.outcome.idea.current_controller_session_id
+                != Some(self.request.controller_session_id)
+            || self.outcome.idea.controller_epoch != self.request.controller_epoch
+            || self.outcome.resulting_row_version
+                != self
+                    .request
+                    .expected_row_version
+                    .checked_add(1)
+                    .ok_or_else(|| "controller mutation row version overflow".to_string())?
+            || self.outcome.idea.row_version != self.outcome.resulting_row_version
+            || self.outcome.idea.next_event_sequence
+                != self
+                    .outcome
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "controller mutation sequence overflow".to_string())?
+            || self.outcome.idea.updated_at != self.outcome.occurred_at
+        {
+            return Err("controller mutation outcome disagrees with request".to_string());
+        }
+        Ok(())
+    }
+
+    /// Deterministic canonical JSON used as `payload_json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or JSON serialization fails.
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_value(self)
+    }
+}
+
+/// Typed committed result for controller control and exact replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaControllerControlResultV1 {
+    pub idea: Idea,
+    pub event: IdeaEvent,
+    #[serde(default)]
+    pub reservation: Option<IdeaControllerReservationV1>,
+    pub deduplicated: bool,
+}
+
+/// Typed committed result for a controller-authorized mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaControllerMutationResultV1 {
+    pub idea: Idea,
+    pub event: IdeaEvent,
+    pub deduplicated: bool,
+}
+
+impl IdeaEvent {
+    /// Strictly decode and cross-check a D03 controller-control event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any duplicated row or payload field disagrees.
+    pub fn controller_control_payload_v1(&self) -> Result<IdeaControllerEventPayloadV1, String> {
+        self.validate()?;
+        let payload: IdeaControllerEventPayloadV1 =
+            serde_json::from_value(self.payload.clone()).map_err(|error| error.to_string())?;
+        payload.validate()?;
+        let operation = &payload.request.operation;
+        if self.project_id != payload.request.project_id
+            || self.idea_id != payload.request.idea_id
+            || self.event_type != operation.event_type()
+            || self.actor_kind != payload.request.actor_kind
+            || self.actor_id != payload.request.actor_id
+            || self.controller_session_id != operation.controller_session_id()
+            || self.controller_epoch != Some(operation.controller_epoch())
+            || self.expected_row_version != operation.expected_row_version()?
+            || self.resulting_row_version != payload.outcome.resulting_row_version
+            || self.id != payload.outcome.event_id
+            || self.sequence != payload.outcome.sequence
+            || self.occurred_at != payload.outcome.occurred_at
+            || !self.artifact_digests.is_empty()
+            || !self.evidence_digests.is_empty()
+        {
+            return Err("controller-control event columns disagree with payload".to_string());
+        }
+        Ok(payload)
+    }
+
+    /// Strictly decode and cross-check a D03 controller-mutation event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any duplicated row or payload field disagrees.
+    pub fn controller_mutation_payload_v1(
+        &self,
+    ) -> Result<IdeaControllerMutationPayloadV1, String> {
+        self.validate()?;
+        let payload: IdeaControllerMutationPayloadV1 =
+            serde_json::from_value(self.payload.clone()).map_err(|error| error.to_string())?;
+        payload.validate()?;
+        let request = &payload.request;
+        if self.project_id != request.project_id
+            || self.idea_id != request.idea_id
+            || self.event_type != request.action.event_type()
+            || self.actor_kind != IdeaActorKind::Session
+            || self.actor_id != request.controller_session_id.to_string()
+            || self.controller_session_id != Some(request.controller_session_id)
+            || self.controller_epoch != Some(request.controller_epoch)
+            || self.expected_row_version != request.expected_row_version
+            || self.resulting_row_version != payload.outcome.resulting_row_version
+            || self.id != payload.outcome.event_id
+            || self.sequence != payload.outcome.sequence
+            || self.occurred_at != payload.outcome.occurred_at
+            || self.idempotency_key != request.idempotency_key
+            || self.artifact_digests != request.artifact_digests
+            || self.evidence_digests != request.evidence_digests
+        {
+            return Err("controller-mutation event columns disagree with payload".to_string());
+        }
+        Ok(payload)
+    }
+}
+
+/// Deterministically derive a reservation identity from one Idea and transfer
+/// intent.
+#[must_use]
+pub fn idea_controller_reservation_id(idea_id: Uuid, transfer_intent_key: &str) -> Uuid {
+    Uuid::new_v5(
+        &idea_id,
+        format!("rsi.idea.controller-reservation/v1/{transfer_intent_key}").as_bytes(),
+    )
+}
+
+/// Deterministically derive the candidate session identity from a reservation.
+#[must_use]
+pub fn idea_controller_candidate_session_id(reservation_id: Uuid) -> Uuid {
+    Uuid::new_v5(&reservation_id, b"rsi.session.controller-candidate/v1")
+}
+
+/// Deterministically derive one Idea event identity from a stage key.
+#[must_use]
+pub fn idea_controller_event_id(idea_id: Uuid, stage_key: &str) -> Uuid {
+    Uuid::new_v5(
+        &idea_id,
+        format!("rsi.idea.event/v1/{stage_key}").as_bytes(),
+    )
+}
+
+/// Durable reserve-stage key.
+#[must_use]
+pub fn idea_controller_reserve_stage_key(reservation_id: Uuid) -> String {
+    format!("controller-reserve:v1:{reservation_id}")
+}
+
+/// Durable assignment-stage key.
+#[must_use]
+pub fn idea_controller_assign_stage_key(reservation_id: Uuid) -> String {
+    format!("controller-assign:v1:{reservation_id}")
+}
+
+/// Durable reservation-release-stage key.
+#[must_use]
+pub fn idea_controller_reservation_release_stage_key(reservation_id: Uuid) -> String {
+    format!("controller-release-reservation:v1:{reservation_id}")
+}
+
+/// Durable assigned-release-stage key derived from the Idea and release intent.
+#[must_use]
+pub fn idea_controller_assigned_release_stage_key(
+    idea_id: Uuid,
+    release_intent_key: &str,
+) -> String {
+    let operation_id = Uuid::new_v5(
+        &idea_id,
+        format!("rsi.idea.controller-assigned-release/v1/{release_intent_key}").as_bytes(),
+    );
+    format!("controller-release-assigned:v1:{operation_id}")
+}
+
+/// Strict bounded history request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaEventPageRequestV1 {
+    #[serde(default)]
+    pub after_sequence: i64,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl IdeaEventPageRequestV1 {
+    /// Validate the cursor and return its effective limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for negative cursors, zero limits, or limits above
+    /// [`IDEA_EVENT_PAGE_MAX_LIMIT`].
+    pub fn validated_limit(self) -> Result<usize, String> {
+        if self.after_sequence < 0 {
+            return Err("after_sequence must be non-negative".to_string());
+        }
+        let limit = self.limit.unwrap_or(IDEA_EVENT_PAGE_DEFAULT_LIMIT);
+        if !(1..=IDEA_EVENT_PAGE_MAX_LIMIT).contains(&limit) {
+            return Err(format!(
+                "Idea event page limit must be 1..={IDEA_EVENT_PAGE_MAX_LIMIT}"
+            ));
+        }
+        Ok(limit)
+    }
+}
+
+/// Stable ascending bounded history page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdeaEventPageV1 {
+    pub events: Vec<IdeaEvent>,
+    #[serde(default)]
+    pub next_after_sequence: Option<i64>,
+}
+
+/// Exhaustive fail-closed transition rejection used by D02.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdeaTransitionViolation {
+    NoSemanticChange,
+    InvalidLifecycleTransition,
+    InvalidStageTransition,
+    PrerequisiteUnavailable,
+    TerminalLifecycle,
+    LifecyclePaused,
+}
+
+/// Evaluate one of all 25 lifecycle pairs under the D02 prerequisite model.
+///
+/// `reason_present` is required for park, reopen, and abandonment.
+/// `accepted_supersession` can be true only for the typed supersession action.
+///
+/// # Errors
+///
+/// Returns the fail-closed reason when the transition cannot commit in D02.
+pub fn evaluate_idea_lifecycle_transition(
+    from: IdeaLifecycle,
+    to: IdeaLifecycle,
+    reason_present: bool,
+    accepted_supersession: bool,
+) -> Result<(), IdeaTransitionViolation> {
+    use IdeaLifecycle::{Abandoned, Completed, Open, Parked, Superseded};
+    if from == to {
+        return Err(IdeaTransitionViolation::NoSemanticChange);
+    }
+    if matches!(from, Completed | Abandoned | Superseded) {
+        return Err(IdeaTransitionViolation::TerminalLifecycle);
+    }
+    match (from, to) {
+        (Open, Parked) | (Parked, Open) | (Open | Parked, Abandoned) if reason_present => Ok(()),
+        (Open | Parked, Completed) => Err(IdeaTransitionViolation::PrerequisiteUnavailable),
+        (Open | Parked, Superseded) if accepted_supersession => Ok(()),
+        _ => Err(IdeaTransitionViolation::InvalidLifecycleTransition),
+    }
+}
+
+/// Evaluate one of all 64 stage pairs under the D02 prerequisite model.
+///
+/// # Errors
+///
+/// Returns the fail-closed reason when the transition cannot commit in D02.
+pub fn evaluate_idea_stage_transition(
+    lifecycle: IdeaLifecycle,
+    from: IdeaStage,
+    to: IdeaStage,
+    reason_present: bool,
+) -> Result<(), IdeaTransitionViolation> {
+    if from == to {
+        return Err(IdeaTransitionViolation::NoSemanticChange);
+    }
+    if matches!(
+        lifecycle,
+        IdeaLifecycle::Completed | IdeaLifecycle::Abandoned | IdeaLifecycle::Superseded
+    ) {
+        return Err(IdeaTransitionViolation::TerminalLifecycle);
+    }
+    if lifecycle == IdeaLifecycle::Parked {
+        return Err(IdeaTransitionViolation::LifecyclePaused);
+    }
+    let from_rank = idea_stage_rank(from);
+    let to_rank = idea_stage_rank(to);
+    if from == IdeaStage::Captured && to == IdeaStage::Shaping {
+        return Ok(());
+    }
+    if to_rank > from_rank {
+        return Err(IdeaTransitionViolation::PrerequisiteUnavailable);
+    }
+    if to_rank < from_rank && reason_present {
+        return Ok(());
+    }
+    Err(IdeaTransitionViolation::InvalidStageTransition)
+}
+
+const fn idea_stage_rank(stage: IdeaStage) -> u8 {
+    match stage {
+        IdeaStage::Captured => 0,
+        IdeaStage::Shaping => 1,
+        IdeaStage::Researching => 2,
+        IdeaStage::Planned => 3,
+        IdeaStage::Implementing => 4,
+        IdeaStage::Integrating => 5,
+        IdeaStage::Verifying => 6,
+        IdeaStage::Released => 7,
+    }
+}
+
+fn validate_idea_idempotency_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() || key.len() > 128 || key.contains('\0') {
+        return Err("idempotency key must contain 1..=128 bytes and no NUL".to_string());
+    }
+    Ok(())
+}
+
+/// Validate an operator identity before it is bound to a D02 handle.
+///
+/// # Errors
+///
+/// Returns an error for empty, oversized, or NUL-containing values.
+pub fn validate_idea_actor_id(actor_id: &str) -> Result<(), String> {
+    if actor_id.trim().is_empty() || actor_id.len() > 256 || actor_id.contains('\0') {
+        return Err("operator actor_id must contain 1..=256 bytes and no NUL".to_string());
+    }
+    Ok(())
+}
+
+fn validate_controller_actor(kind: IdeaActorKind, actor_id: &str) -> Result<(), String> {
+    validate_idea_actor_id(actor_id)?;
+    if kind == IdeaActorKind::Session
+        && Uuid::parse_str(actor_id)
+            .ok()
+            .is_none_or(|session_id| session_id.is_nil() || session_id.to_string() != actor_id)
+    {
+        return Err("controller session actor must be a lowercase canonical UUID".to_string());
+    }
+    Ok(())
+}
+
+fn validate_idea_reason(reason: &str) -> Result<(), String> {
+    validate_idea_text("reason", reason, 1, 4_096)
+}
+
+fn validate_optional_idea_text(
+    label: &str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_idea_text(label, value, 1, maximum)?;
+    }
+    Ok(())
+}
+
+fn validate_idea_text(
+    label: &str,
+    value: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), String> {
+    if value.len() < minimum
+        || value.len() > maximum
+        || (minimum > 0 && value.trim().is_empty())
+        || value.contains('\0')
+    {
+        return Err(format!(
+            "{label} must contain {minimum}..={maximum} bytes and no NUL"
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_idea_digests(digests: &mut Vec<Sha256Digest>) {
+    digests.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    digests.dedup_by(|left, right| left.as_str() == right.as_str());
+}
+
+fn idea_digests_are_canonical(digests: &[Sha256Digest]) -> bool {
+    digests
+        .windows(2)
+        .all(|pair| pair[0].as_str() < pair[1].as_str())
+}
+
+fn canonical_json_value(value: &impl Serialize) -> Result<String, String> {
+    let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    let mut output = String::new();
+    write_canonical_json(&value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).map_err(|error| error.to_string())?);
+        }
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).map_err(|error| error.to_string())?);
+                output.push(':');
+                write_canonical_json(&values[key], output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+// ─── Local issue tracker types (C1 / V72) ───────────────────────────────────
+
+/// Status of a locally tracked issue.
+///
+/// DB strings are exactly the serde variant names
+/// (`'Open' | 'InProgress' | 'Closed' | 'Cancelled'`). There is no `Blocked`
+/// variant: blocked is DERIVED from `issue_deps` edges (a beads-style
+/// computed property), never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssueStatus {
+    Open,
+    InProgress,
+    Closed,
+    Cancelled,
+}
+
+impl IssueStatus {
+    /// Exact DB / serde string for this status.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueStatus::Open => "Open",
+            IssueStatus::InProgress => "InProgress",
+            IssueStatus::Closed => "Closed",
+            IssueStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Parse the exact DB / serde string; unknown strings are an error
+    /// (validation lives in Rust — the `issues` table carries no CHECK).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "Open" => Ok(IssueStatus::Open),
+            "InProgress" => Ok(IssueStatus::InProgress),
+            "Closed" => Ok(IssueStatus::Closed),
+            "Cancelled" => Ok(IssueStatus::Cancelled),
+            other => Err(format!("Invalid issue status: {other}")),
+        }
+    }
+
+    /// Terminal statuses (`Closed`/`Cancelled`) do not block dependents in
+    /// the ready-work query and carry a `closed_at` timestamp.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, IssueStatus::Closed | IssueStatus::Cancelled)
+    }
+}
+
+/// A stable finding identity coupled to its artifact's SHA-256 digest.
+///
+/// This deliberately remains a string newtype: D04 introduces neither a
+/// durable Finding table nor a new authority surface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IssueSourceFindingRef(String);
+
+impl IssueSourceFindingRef {
+    const PREFIX: &'static str = "finding:v1:sha256:";
+
+    /// Parse the canonical D04 finding provenance grammar without trimming or
+    /// case normalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is not the exact canonical grammar.
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let bytes = value.as_bytes();
+        if !(84..=211).contains(&bytes.len()) || !bytes.is_ascii() {
+            return Err("finding reference must contain 84..=211 ASCII bytes".to_string());
+        }
+        let Some(rest) = value.strip_prefix(Self::PREFIX) else {
+            return Err("finding reference must start with finding:v1:sha256:".to_string());
+        };
+        let Some((hex, stable_id)) = rest.split_once(':') else {
+            return Err("finding reference must contain a digest and stable id".to_string());
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("finding reference digest must contain 64 lowercase hex characters".into());
+        }
+        if stable_id.is_empty()
+            || stable_id.len() > 128
+            || !stable_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(
+                "finding reference stable id must contain 1..=128 [A-Za-z0-9._-] bytes".into(),
+            );
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a value bypasses `parse`, which the private
+    /// representation prevents.
+    pub fn artifact_digest(&self) -> Sha256Digest {
+        Sha256Digest::parse(format!(
+            "sha256:{}",
+            &self.0[Self::PREFIX.len()..Self::PREFIX.len() + 64]
+        ))
+        .unwrap_or_else(|_| {
+            unreachable!("IssueSourceFindingRef parser guarantees canonical digest")
+        })
+    }
+
+    #[must_use]
+    pub fn stable_id(&self) -> &str {
+        &self.0[Self::PREFIX.len() + 65..]
+    }
+}
+
+impl std::fmt::Display for IssueSourceFindingRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for IssueSourceFindingRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for IssueSourceFindingRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for IssueSourceFindingRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A locally tracked issue (V77 `issues` table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Issue {
+    /// Lowercase canonical UUID, generated store-side.
+    pub id: Uuid,
+    /// Immutable owning project. All automation derives scope from this value.
+    pub project_id: Uuid,
+    /// Monotonic human-facing number, allocated inside the create transaction.
+    pub display_number: i64,
+    pub title: String,
+    /// Description body; empty string when unset, never null.
+    pub body: String,
+    pub status: IssueStatus,
+    /// 1=urgent .. 4=low; None=unset.
+    #[serde(default)]
+    pub priority: Option<u8>,
+    /// Plain text tags; persisted as a JSON string array column.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Session that created the issue; None = operator-created.
+    #[serde(default)]
+    pub created_by_session_id: Option<Uuid>,
+    /// Free-form assignee string; claim/dispatch semantics live elsewhere.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// The optional Idea this obligation was linked to exactly once.
+    #[serde(default)]
+    pub idea_id: Option<Uuid>,
+    /// Optional antecedent event within the linked Idea.
+    #[serde(default)]
+    pub source_event_id: Option<Uuid>,
+    /// Optional digest-bound finding provenance.
+    #[serde(default)]
+    pub source_finding_ref: Option<IssueSourceFindingRef>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Set when status transitions into `Closed`/`Cancelled`; cleared on reopen.
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
+    /// Optimistic concurrency version. V97 starts every imported row at one.
+    #[serde(default = "default_issue_row_version")]
+    pub row_version: i64,
+    /// Logical archive marker. Archived rows remain readable for audit/restore
+    /// but are excluded from readiness and local dispatch selection.
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+const fn default_issue_row_version() -> i64 {
+    1
+}
+
+/// Fields supplied when creating a new issue. Everything else
+/// (id, display_number, status=Open, timestamps) is allocated store-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewIssue {
+    pub project_id: Uuid,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub created_by_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub idea_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_event_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_finding_ref: Option<IssueSourceFindingRef>,
+}
+
+/// All-Option patch for `update_issue`; bumps `updated_at` on apply.
+///
+/// Clear-vs-skip encoding (C1 micro-decision): nullable columns (`priority`,
+/// `assignee`) use a double `Option` — `None` = leave unchanged,
+/// `Some(None)` = clear to NULL, `Some(Some(v))` = set. Non-nullable fields
+/// (`title`, `body`, `labels`) use a single `Option` where `None` = leave
+/// unchanged. Caveat for the C3 RPC surface: plain serde cannot express
+/// `Some(None)` from JSON (`null` deserializes to outer `None`); C3 should
+/// add a `double_option`-style adapter if wire-level clearing is needed.
+///
+/// Status changes go through `update_issue_status` (which owns the
+/// `closed_at` bookkeeping), not this patch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IssueUpdate {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub priority: Option<Option<u8>>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    #[serde(default)]
+    pub assignee: Option<Option<String>>,
+}
+
+/// A dependency edge (V72 `issue_deps` table).
+///
+/// Read as "`issue_id` depends on `depends_on_id`" /
+/// "`depends_on_id` blocks `issue_id`".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueDep {
+    pub project_id: Uuid,
+    pub issue_id: Uuid,
+    pub depends_on_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Archive visibility for bounded V97 Issue pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssueArchiveFilterV1 {
+    /// The default agent view: only active, unarchived Issues.
+    #[default]
+    Active,
+    /// Only logically archived Issues.
+    Archived,
+    /// Both active and archived Issues.
+    All,
+}
+
+/// Immutable Issue-event operation kinds stored in V97.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueEventOperationV1 {
+    BaselineImported,
+    Created,
+    ContentUpdated,
+    StatusUpdated,
+    Archived,
+    Restored,
+    IdeaLinked,
+    LegacyCreateAdopted,
+}
+
+/// Canonical audit-domain marker for every V97 Issue semantic request.
+pub const ISSUE_SEMANTIC_REQUEST_DOMAIN_V1: &str = "rsi.issue.request/v1";
+
+/// Explicit content patch recorded in Issue audit events. Nullable values use
+/// separate clear flags so omission, set, and clear remain distinct in JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueContentPatchV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub clear_priority: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub clear_assignee: bool,
+}
+
+impl IssueContentPatchV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.priority.is_some() && self.clear_priority {
+            return Err("priority cannot be set and cleared together".to_string());
+        }
+        if self.assignee.is_some() && self.clear_assignee {
+            return Err("assignee cannot be set and cleared together".to_string());
+        }
+        if self == &Self::default() {
+            return Err("Issue content update must change at least one field".to_string());
+        }
+        if let Some(title) = &self.title {
+            if title.trim().is_empty() || title.len() > 512 || title.as_bytes().contains(&0) {
+                return Err("Issue title must be nonblank, NUL-free, and at most 512 bytes".into());
+            }
+        }
+        if let Some(body) = &self.body
+            && (body.len() > 65_536 || body.as_bytes().contains(&0))
+        {
+            return Err("Issue body must be NUL-free and at most 65536 bytes".into());
+        }
+        if let Some(labels) = &self.labels {
+            if labels.len() > 64 {
+                return Err("Issue labels must contain at most 64 entries".into());
+            }
+            if labels.iter().any(|label| {
+                label.trim().is_empty() || label.len() > 128 || label.as_bytes().contains(&0)
+            }) {
+                return Err(
+                    "Issue labels must be nonblank, NUL-free, and at most 128 bytes".into(),
+                );
+            }
+        }
+        if let Some(priority) = self.priority
+            && !(1..=4).contains(&priority)
+        {
+            return Err("Issue priority must be 1..=4".into());
+        }
+        if let Some(assignee) = &self.assignee
+            && (assignee.trim().is_empty()
+                || assignee.len() > 256
+                || assignee.as_bytes().contains(&0))
+        {
+            return Err("Issue assignee must be nonblank, NUL-free, and at most 256 bytes".into());
+        }
+        Ok(())
+    }
+}
+
+/// Complete create semantics shared by ordinary, operator, and system Issue
+/// writers. Actor identity remains event metadata; creator attribution is part
+/// of the projection semantics and therefore belongs in the fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueCreateSemanticV1 {
+    pub project_id: Uuid,
+    pub issue_id: Uuid,
+    pub title: String,
+    pub body: String,
+    pub priority: Option<u8>,
+    pub labels: Vec<String>,
+    pub created_by_session_id: Option<Uuid>,
+    pub assignee: Option<String>,
+}
+
+/// Closed operation payload for a canonical V97 Issue semantic request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IssueSemanticOperationV1 {
+    BaselineImported {
+        issue_id: Uuid,
+        project_id: Uuid,
+    },
+    Created {
+        create: IssueCreateSemanticV1,
+    },
+    ContentUpdated {
+        issue_id: Uuid,
+        expected_row_version: i64,
+        patch: IssueContentPatchV1,
+    },
+    StatusUpdated {
+        issue_id: Uuid,
+        expected_row_version: i64,
+        status: IssueStatus,
+    },
+    Archived {
+        issue_id: Uuid,
+        expected_row_version: i64,
+    },
+    Restored {
+        issue_id: Uuid,
+        expected_row_version: i64,
+    },
+    IdeaLinked {
+        issue_id: Uuid,
+        expected_row_version: i64,
+        idea_id: Uuid,
+        source_event_id: Option<Uuid>,
+        source_finding_ref: Option<IssueSourceFindingRef>,
+    },
+}
+
+impl IssueSemanticOperationV1 {
+    #[must_use]
+    pub const fn event_operation(&self) -> IssueEventOperationV1 {
+        match self {
+            Self::BaselineImported { .. } => IssueEventOperationV1::BaselineImported,
+            Self::Created { .. } => IssueEventOperationV1::Created,
+            Self::ContentUpdated { .. } => IssueEventOperationV1::ContentUpdated,
+            Self::StatusUpdated { .. } => IssueEventOperationV1::StatusUpdated,
+            Self::Archived { .. } => IssueEventOperationV1::Archived,
+            Self::Restored { .. } => IssueEventOperationV1::Restored,
+            Self::IdeaLinked { .. } => IssueEventOperationV1::IdeaLinked,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let validate_id = |label: &str, id: Uuid| {
+            if id.is_nil() {
+                Err(format!("{label} must not be nil"))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Self::BaselineImported {
+                issue_id,
+                project_id,
+            } => {
+                validate_id("issue_id", *issue_id)?;
+                validate_id("project_id", *project_id)
+            }
+            Self::Created { create } => {
+                validate_id("issue_id", create.issue_id)?;
+                validate_id("project_id", create.project_id)?;
+                if create.title.trim().is_empty()
+                    || create.title.len() > 512
+                    || create.title.contains('\0')
+                    || create.body.len() > 65_536
+                    || create.body.contains('\0')
+                    || create
+                        .priority
+                        .is_some_and(|priority| !(1..=4).contains(&priority))
+                    || create.labels.len() > 64
+                    || create.labels.iter().any(|label| {
+                        label.trim().is_empty() || label.len() > 128 || label.contains('\0')
+                    })
+                    || create.assignee.as_ref().is_some_and(|assignee| {
+                        assignee.trim().is_empty()
+                            || assignee.len() > 256
+                            || assignee.contains('\0')
+                    })
+                {
+                    return Err("invalid Issue create semantics".to_string());
+                }
+                if create.created_by_session_id.is_some_and(|id| id.is_nil()) {
+                    return Err("created_by_session_id must not be nil".to_string());
+                }
+                Ok(())
+            }
+            Self::ContentUpdated {
+                issue_id,
+                expected_row_version,
+                patch,
+            } => {
+                validate_id("issue_id", *issue_id)?;
+                if *expected_row_version < 1 {
+                    return Err("expected_row_version must be positive".to_string());
+                }
+                patch.validate()
+            }
+            Self::StatusUpdated {
+                issue_id,
+                expected_row_version,
+                ..
+            }
+            | Self::Archived {
+                issue_id,
+                expected_row_version,
+            }
+            | Self::Restored {
+                issue_id,
+                expected_row_version,
+            } => {
+                validate_id("issue_id", *issue_id)?;
+                if *expected_row_version < 1 {
+                    return Err("expected_row_version must be positive".to_string());
+                }
+                Ok(())
+            }
+            Self::IdeaLinked {
+                issue_id,
+                expected_row_version,
+                idea_id,
+                source_event_id,
+                ..
+            } => {
+                validate_id("issue_id", *issue_id)?;
+                validate_id("idea_id", *idea_id)?;
+                if *expected_row_version < 1 {
+                    return Err("expected_row_version must be positive".to_string());
+                }
+                if source_event_id.is_some_and(|id| id.is_nil()) {
+                    return Err("source_event_id must not be nil".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Versioned, canonical Issue semantic request used by every event writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueSemanticRequestV1 {
+    pub domain: String,
+    #[serde(flatten)]
+    pub operation: IssueSemanticOperationV1,
+}
+
+impl IssueSemanticRequestV1 {
+    #[must_use]
+    pub fn new(operation: IssueSemanticOperationV1) -> Self {
+        Self {
+            domain: ISSUE_SEMANTIC_REQUEST_DOMAIN_V1.to_string(),
+            operation,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.domain != ISSUE_SEMANTIC_REQUEST_DOMAIN_V1 {
+            return Err("invalid Issue semantic request domain".to_string());
+        }
+        self.operation.validate()
+    }
+
+    pub fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_value(self)
+    }
+
+    pub fn fingerprint(&self) -> Result<String, String> {
+        Ok(crate::program_runs::program_run_fingerprint(
+            ISSUE_SEMANTIC_REQUEST_DOMAIN_V1,
+            self.canonical_json()?.as_bytes(),
+        ))
+    }
+}
+
+/// Stable outcome used by the shared exhaustive agent status matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStatusTransitionErrorV1 {
+    NoSemanticChange,
+    InvalidTransition,
+}
+
+pub fn validate_agent_issue_status_transition(
+    current: IssueStatus,
+    target: IssueStatus,
+) -> Result<(), IssueStatusTransitionErrorV1> {
+    if current == target {
+        return Err(IssueStatusTransitionErrorV1::NoSemanticChange);
+    }
+    match (current, target) {
+        (
+            IssueStatus::Open,
+            IssueStatus::InProgress | IssueStatus::Closed | IssueStatus::Cancelled,
+        )
+        | (
+            IssueStatus::InProgress,
+            IssueStatus::Open | IssueStatus::Closed | IssueStatus::Cancelled,
+        )
+        | (IssueStatus::Closed | IssueStatus::Cancelled, IssueStatus::Open) => Ok(()),
+        _ => Err(IssueStatusTransitionErrorV1::InvalidTransition),
+    }
+}
+
+impl IssueEventOperationV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BaselineImported => "baseline_imported",
+            Self::Created => "created",
+            Self::ContentUpdated => "content_updated",
+            Self::StatusUpdated => "status_updated",
+            Self::Archived => "archived",
+            Self::Restored => "restored",
+            Self::IdeaLinked => "idea_linked",
+            Self::LegacyCreateAdopted => "legacy_create_adopted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "baseline_imported" => Ok(Self::BaselineImported),
+            "created" => Ok(Self::Created),
+            "content_updated" => Ok(Self::ContentUpdated),
+            "status_updated" => Ok(Self::StatusUpdated),
+            "archived" => Ok(Self::Archived),
+            "restored" => Ok(Self::Restored),
+            "idea_linked" => Ok(Self::IdeaLinked),
+            "legacy_create_adopted" => Ok(Self::LegacyCreateAdopted),
+            _ => Err("invalid Issue event operation".to_string()),
+        }
+    }
+}
+
+/// Provenance kind for an immutable V97 Issue event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueActorKindV1 {
+    Operator,
+    Session,
+    System,
+    /// The current appointed harness manager acting through its V2
+    /// `IssueCoordinate` grant. It carries its session id and request key but
+    /// never an owning Epic.
+    Manager,
+}
+
+impl IssueActorKindV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Session => "session",
+            Self::System => "system",
+            Self::Manager => "manager",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "operator" => Ok(Self::Operator),
+            "session" => Ok(Self::Session),
+            "system" => Ok(Self::System),
+            "manager" => Ok(Self::Manager),
+            _ => Err("invalid Issue event actor kind".to_string()),
+        }
+    }
+}
+
+/// Stable keyset cursor for Issue pages. The cursor is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueListCursorV1 {
+    pub display_number: i64,
+    pub issue_id: Uuid,
+}
+
+/// Bounded project-scoped Issue page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuePageV1 {
+    pub issues: Vec<Issue>,
+    #[serde(default)]
+    pub next_cursor: Option<IssueListCursorV1>,
+}
+
+/// Compact related-Issue projection returned by the guarded agent lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIssueDependencyRefV1 {
+    pub id: Uuid,
+    pub display_number: i64,
+    pub status: IssueStatus,
+}
+
+/// Flat, additive `AgentGetIssue` response. Flattening preserves the existing
+/// Issue response fields while adding bounded dependency graph projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGetIssueResultV1 {
+    #[serde(flatten)]
+    pub issue: Issue,
+    pub blocked_by: Vec<AgentIssueDependencyRefV1>,
+    pub blocked_by_truncated: bool,
+    pub blocks: Vec<AgentIssueDependencyRefV1>,
+    pub blocks_truncated: bool,
+}
+
+/// Bounded immutable Issue-history page request. Scope is injected by Store
+/// authority; callers can name only the Issue and sequence cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueEventPageRequestV1 {
+    pub issue_id: Uuid,
+    #[serde(default)]
+    pub after_sequence: i64,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+impl IssueEventPageRequestV1 {
+    pub fn validated_limit(&self) -> Result<u32, String> {
+        if self.issue_id.is_nil() {
+            return Err("issue_id must not be nil".to_string());
+        }
+        if self.after_sequence < 0 {
+            return Err("after_sequence must be nonnegative".to_string());
+        }
+        let limit = self.limit.unwrap_or(64);
+        if !(1..=256).contains(&limit) {
+            return Err("Issue event page limit must be 1..=256".to_string());
+        }
+        Ok(limit)
+    }
+}
+
+/// One append-only V97 Issue event. `request` is the decoded canonical
+/// semantic request and `issue` is the immutable resulting projection snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueEventV1 {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub issue_id: Uuid,
+    pub sequence: i64,
+    pub operation: IssueEventOperationV1,
+    pub actor_kind: IssueActorKindV1,
+    #[serde(default)]
+    pub actor_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub owning_epic_id: Option<Uuid>,
+    #[serde(default)]
+    pub actor_label: Option<String>,
+    pub expected_row_version: i64,
+    pub resulting_row_version: i64,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    pub request_fingerprint: String,
+    pub occurred_at: DateTime<Utc>,
+    pub request: IssueSemanticRequestV1,
+    pub issue: Issue,
+}
+
+/// Bounded ascending Issue-history page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueEventPageV1 {
+    pub events: Vec<IssueEventV1>,
+    #[serde(default)]
+    pub next_after_sequence: Option<i64>,
+}
+
+/// Filter for `list_issues`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IssueFilter {
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub idea_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_event_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_finding_ref: Option<IssueSourceFindingRef>,
+    #[serde(default)]
+    pub status: Option<IssueStatus>,
+    #[serde(default)]
+    pub created_by_session_id: Option<Uuid>,
+    /// `None` preserves legacy operator behavior and returns all rows.
+    #[serde(default)]
+    pub archive: Option<IssueArchiveFilterV1>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_deserialize_without_metadata() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z"
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert!(session.cost_usd.is_none());
+        assert!(session.duration_ms.is_none());
+        assert!(session.num_turns.is_none());
+        assert!(session.model.is_none());
+        assert!(session.input_tokens.is_none());
+        assert!(session.output_tokens.is_none());
+        assert!(session.context_window.is_none());
+        assert!(session.resolved_context_budget.is_none());
+        assert!(session.total_input_tokens.is_none());
+        assert!(session.total_output_tokens.is_none());
+        assert!(session.total_cache_creation_tokens.is_none());
+        assert!(session.total_cache_read_tokens.is_none());
+        assert!(session.stop_reason.is_none());
+        assert!(session.project_id.is_none());
+        assert!(session.pinned_at.is_none());
+        assert!(session.work_time_ms.is_none());
+        assert!(session.agent_role.is_none());
+        assert!(session.epic_spawn_ordinal.is_none());
+    }
+
+    #[test]
+    fn test_session_deserialize_with_metadata() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Completed",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z",
+            "cost_usd": 0.0123,
+            "duration_ms": 5000,
+            "num_turns": 3,
+            "model": "claude-sonnet-5",
+            "input_tokens": 34728,
+            "output_tokens": 512,
+            "context_window": 200000,
+            "total_input_tokens": 45000,
+            "total_output_tokens": 2500,
+            "total_cache_creation_tokens": 10000,
+            "total_cache_read_tokens": 30000,
+            "stop_reason": "end_turn",
+            "work_time_ms": 42000
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(session.cost_usd, Some(0.0123));
+        assert_eq!(session.duration_ms, Some(5000));
+        assert_eq!(session.num_turns, Some(3));
+        assert_eq!(session.model, Some("claude-sonnet-5".to_string()));
+        assert_eq!(session.input_tokens, Some(34728));
+        assert_eq!(session.output_tokens, Some(512));
+        assert_eq!(session.context_window, Some(200000));
+        assert!(session.resolved_context_budget.is_none());
+        assert_eq!(session.total_input_tokens, Some(45000));
+        assert_eq!(session.total_output_tokens, Some(2500));
+        assert_eq!(session.total_cache_creation_tokens, Some(10000));
+        assert_eq!(session.total_cache_read_tokens, Some(30000));
+        assert_eq!(session.work_time_ms, Some(42000));
+        assert_eq!(session.stop_reason, Some("end_turn".to_string()));
+    }
+
+    #[test]
+    fn test_session_provider_antigravity_serde_aliases() {
+        let antigravity: SessionProvider = serde_json::from_str("\"Antigravity\"").unwrap();
+        let gemini: SessionProvider = serde_json::from_str("\"Gemini\"").unwrap();
+
+        assert_eq!(antigravity, SessionProvider::Antigravity);
+        assert_eq!(gemini, SessionProvider::Antigravity);
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Antigravity).unwrap(),
+            "\"Antigravity\""
+        );
+    }
+
+    #[test]
+    fn test_session_provider_pioneer_serde_roundtrip() {
+        let provider = SessionProvider::Pioneer;
+        let Ok(json) = serde_json::to_string(&provider) else {
+            panic!("Pioneer provider must serialize");
+        };
+        let Ok(decoded) = serde_json::from_str::<SessionProvider>(&json) else {
+            panic!("Pioneer provider must deserialize");
+        };
+
+        assert_eq!(json, "\"Pioneer\"");
+        assert_eq!(decoded, provider);
+    }
+
+    #[test]
+    fn legal_children_hierarchy_v1_matrix_is_exact() {
+        use SessionKind::*;
+
+        assert_eq!(legal_children(None), &[Standard, Group][..]);
+        assert_eq!(legal_children(Some(Group)), &[Standard, Epic][..]);
+        assert_eq!(
+            legal_children(Some(Epic)),
+            &[Story, Task, Bug, Feature, Refactor, Research][..]
+        );
+
+        for leaf_kind in [
+            Standard, TaskRabbit, Bug, Story, Task, Feature, Refactor, Research,
+        ] {
+            assert!(
+                legal_children(Some(leaf_kind)).is_empty(),
+                "{leaf_kind:?} should not accept children"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_round_trip_serde() {
+        let project_id = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap();
+        let session = Session {
+            context_fill_pct: None,
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            provider: SessionProvider::Claude,
+            claude_session_id: Some("abc123".to_string()),
+            query: "hello".to_string(),
+            title: None,
+            agent_role: Some("Reviewer".to_string()),
+            epic_spawn_ordinal: Some(7),
+            description: None,
+            short_summary: None,
+            working_dir: std::path::PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            status: SessionStatus::Completed,
+            project_id: Some(project_id),
+            pinned_at: None,
+            testing_needed_at: None,
+            rotation_disabled_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            cost_usd: Some(0.05),
+            duration_ms: Some(12345),
+            num_turns: Some(7),
+            model: Some("sonnet".to_string()),
+            input_tokens: Some(50000),
+            output_tokens: Some(1200),
+            context_window: Some(200000),
+            resolved_context_budget: Some(ResolvedContextBudget {
+                active_tokens: 200000,
+                capacity: crate::provider_capabilities::ContextCapacity {
+                    advertised_max_tokens: Some(1_050_000),
+                    provider_default_tokens: Some(272_000),
+                    provider_max_tokens: Some(872_000),
+                    effective_percent: Some(95),
+                    ..Default::default()
+                },
+                evidence: crate::provider_capabilities::CapabilityEvidence {
+                    source: crate::provider_capabilities::CapabilitySource::ProviderCatalog,
+                    source_version: Some("codex-cli 0.155.1".to_string()),
+                    source_digest: Some(format!("sha256:{}", "a".repeat(64))),
+                    observed_at: Some("2026-09-02T12:34:56.123456789Z".parse().unwrap()),
+                    confidence: crate::provider_capabilities::CapabilityConfidence::Verified,
+                },
+            }),
+            total_input_tokens: Some(45000),
+            session_kind: SessionKind::Standard,
+            total_output_tokens: Some(2500),
+            total_cache_creation_tokens: Some(10000),
+            total_cache_read_tokens: Some(30000),
+            stop_reason: Some("end_turn".to_string()),
+            continued_from: None,
+            context_usage_confidence: ContextUsageConfidence::Missing,
+            daemon_input_tokens: None,
+            daemon_output_tokens: None,
+            handoff_filepath: None,
+            active_task: None,
+            group_id: None,
+            tag: String::new(),
+            tags: Vec::new(),
+            pipeline_artifact: None,
+            workflow_id: None,
+            workflow_id_override: None,
+            pending_question: None,
+            pending_archive: false,
+            rotation_depth: 0,
+            retry_attempt: None,
+            max_retries: None,
+            effort: None,
+            issue_identifier: None,
+            issue_url: None,
+            issue_tracker_id: None,
+            scheduled_job_id: None,
+            rating: None,
+            harness_version_hash: None,
+            test_passed: None,
+            clippy_passed: None,
+            turn_count: None,
+            retry_count: None,
+            approval_wait_ms: None,
+            approval_started_at: None,
+            work_time_ms: Some(9876),
+            sandbox_kind: None,
+            sandbox_root: None,
+            sandbox_branch: None,
+            sandbox_cleanup_state: None,
+            parent_id: None,
+            lead_session_id: None,
+            is_eval: false,
+            capability_class: None,
+            topology_node_id: None,
+            topology_iteration: 0,
+            provider_cli_version: None,
+            provider_capabilities: Vec::new(),
+            thinking_tokens: None,
+            service_tier: None,
+            cache_creation_1h_tokens: None,
+            cache_creation_5m_tokens: None,
+            permission_denial_count: None,
+            subagent_stats_json: None,
+            queued_turn_count: None,
+            terminal_reason: None,
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        let deserialized: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.work_time_ms, Some(9876));
+        assert_eq!(deserialized.cost_usd, Some(0.05));
+        assert_eq!(deserialized.duration_ms, Some(12345));
+        assert_eq!(deserialized.num_turns, Some(7));
+        assert_eq!(deserialized.model, Some("sonnet".to_string()));
+        assert_eq!(deserialized.input_tokens, Some(50000));
+        assert_eq!(deserialized.output_tokens, Some(1200));
+        assert_eq!(deserialized.context_window, Some(200000));
+        assert_eq!(
+            deserialized.resolved_context_budget,
+            session.resolved_context_budget
+        );
+        assert_eq!(deserialized.project_id, Some(project_id));
+        assert_eq!(deserialized.total_input_tokens, Some(45000));
+        assert_eq!(deserialized.total_output_tokens, Some(2500));
+        assert_eq!(deserialized.total_cache_creation_tokens, Some(10000));
+        assert_eq!(deserialized.total_cache_read_tokens, Some(30000));
+        assert_eq!(deserialized.stop_reason, Some("end_turn".to_string()));
+        assert_eq!(deserialized.agent_role.as_deref(), Some("Reviewer"));
+        assert_eq!(deserialized.epic_spawn_ordinal, Some(7));
+    }
+
+    #[test]
+    fn test_turn_metric_serde_round_trip() {
+        let metric = TurnMetric {
+            id: 42,
+            session_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            turn_number: 3,
+            input_tokens: 15000,
+            cache_creation_tokens: 5000,
+            cache_read_tokens: 8000,
+            output_tokens: 1200,
+            stop_reason: Some("end_turn".to_string()),
+            tools_used: Some(vec!["Read".to_string(), "Edit".to_string()]),
+            tool_count: 2,
+            created_at: chrono::Utc::now(),
+            model: Some("claude-sonnet-5".to_string()),
+            thinking_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            service_tier: None,
+        };
+        let json = serde_json::to_value(&metric).unwrap();
+        let deserialized: TurnMetric = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.id, 42);
+        assert_eq!(deserialized.turn_number, 3);
+        assert_eq!(deserialized.input_tokens, 15000);
+        assert_eq!(deserialized.cache_creation_tokens, 5000);
+        assert_eq!(deserialized.cache_read_tokens, 8000);
+        assert_eq!(deserialized.output_tokens, 1200);
+        assert_eq!(deserialized.stop_reason, Some("end_turn".to_string()));
+        assert_eq!(
+            deserialized.tools_used,
+            Some(vec!["Read".to_string(), "Edit".to_string()])
+        );
+        assert_eq!(deserialized.tool_count, 2);
+    }
+
+    /// T8 — `GetUsageStats` wire types round-trip (F-008). Covers `UsageStats`
+    /// plus its `per_model`/`timeline` nested vectors.
+    #[test]
+    fn test_usage_stats_serde_round_trip() {
+        let stats = UsageStats {
+            lifetime_chats: 42,
+            total_cost_usd: 12.345,
+            total_input_tokens: 100_000,
+            total_output_tokens: 20_000,
+            total_cache_creation_tokens: 3_000,
+            total_cache_read_tokens: 4_000,
+            total_work_time_ms: 3_600_000,
+            per_model: vec![ModelUsage {
+                model: "claude-sonnet-5".to_string(),
+                chats: 30,
+                cost_usd: 10.0,
+                input_tokens: 80_000,
+                output_tokens: 15_000,
+                cache_creation_tokens: 2_000,
+                cache_read_tokens: 3_000,
+                work_time_ms: 2_400_000,
+            }],
+            timeline: vec![UsageBucket {
+                day: "2026-07-08".to_string(),
+                cost_usd: 1.5,
+                input_tokens: 500,
+                output_tokens: 100,
+                cache_creation_tokens: 10,
+                cache_read_tokens: 20,
+            }],
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        let deserialized: UsageStats = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.lifetime_chats, 42);
+        assert_eq!(deserialized.total_cost_usd, 12.345);
+        assert_eq!(deserialized.total_input_tokens, 100_000);
+        assert_eq!(deserialized.total_work_time_ms, 3_600_000);
+        assert_eq!(deserialized.per_model.len(), 1);
+        assert_eq!(deserialized.per_model[0].model, "claude-sonnet-5");
+        assert_eq!(deserialized.timeline.len(), 1);
+        assert_eq!(deserialized.timeline[0].day, "2026-07-08");
+
+        // Additive-field safety (F-008): every field is `#[serde(default)]`,
+        // so an empty JSON object still deserializes (version-skew guard).
+        let empty: UsageStats = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.lifetime_chats, 0);
+        assert!(empty.per_model.is_empty());
+        assert!(empty.timeline.is_empty());
+    }
+
+    #[test]
+    fn test_project_serde_round_trip() {
+        let project = Project {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            name: "rsi".to_string(),
+            path: Some(std::path::PathBuf::from("/home/user/rsi")),
+            description: Some("Claude session manager".to_string()),
+            color: Project::DEFAULT_COLOR.to_string(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&project).unwrap();
+        let deserialized: Project = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.name, "rsi");
+        assert_eq!(
+            deserialized.path,
+            Some(std::path::PathBuf::from("/home/user/rsi"))
+        );
+        assert_eq!(
+            deserialized.description,
+            Some("Claude session manager".to_string())
+        );
+        assert_eq!(deserialized.color, Project::DEFAULT_COLOR);
+    }
+
+    #[test]
+    fn test_workflow_stage_serde_round_trip() {
+        let stages = vec![
+            WorkflowStage::Research,
+            WorkflowStage::ResearchComplete,
+            WorkflowStage::Planning,
+            WorkflowStage::PlanComplete,
+            WorkflowStage::Implementing,
+            WorkflowStage::ImplementComplete,
+            WorkflowStage::Complete,
+        ];
+        for stage in stages {
+            let json = serde_json::to_value(&stage).unwrap();
+            let deserialized: WorkflowStage = serde_json::from_value(json).unwrap();
+            assert_eq!(deserialized, stage);
+        }
+    }
+
+    #[test]
+    fn test_workflow_serde_round_trip() {
+        let workflow = Workflow {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            title: "research codebase for feature X".to_string(),
+            stage: WorkflowStage::ResearchComplete,
+            artifact_path: Some("thoughts/shared/research/2026-03-08-feature-x.md".to_string()),
+            project_id: Some(Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&workflow).unwrap();
+        let deserialized: Workflow = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.id, workflow.id);
+        assert_eq!(deserialized.title, "research codebase for feature X");
+        assert_eq!(deserialized.stage, WorkflowStage::ResearchComplete);
+        assert_eq!(
+            deserialized.artifact_path,
+            Some("thoughts/shared/research/2026-03-08-feature-x.md".to_string())
+        );
+        assert_eq!(deserialized.project_id, workflow.project_id);
+    }
+
+    #[test]
+    fn test_workflow_document_round_trip() {
+        let workflow = Workflow {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            title: "graph-editor".to_string(),
+            stage: WorkflowStage::Planning,
+            artifact_path: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let document = WorkflowDocument {
+            workflow: workflow.clone(),
+            definition: serde_json::json!({
+                "version": "1.0",
+                "name": "graph-editor",
+                "nodes": [],
+                "edges": [],
+                "metadata": {},
+            }),
+        };
+
+        let json = serde_json::to_value(&document).unwrap();
+        let deserialized: WorkflowDocument = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.workflow.id, workflow.id);
+        assert_eq!(deserialized.definition["name"], "graph-editor");
+    }
+
+    #[test]
+    fn test_workflow_execution_snapshot_round_trip() {
+        let execution_id = Uuid::new_v4();
+        let workflow_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let snapshot = WorkflowExecutionSnapshot {
+            execution_id,
+            workflow_id,
+            workflow_name: "graph-run".to_string(),
+            status: WorkflowExecutionStatus::Running,
+            accepted_at: now,
+            started_at: Some(now),
+            finished_at: None,
+            dry_run: true,
+            input: Some(serde_json::json!({ "seed": 1 })),
+            output: None,
+            error: None,
+            last_sequence: 2,
+            row_version: None,
+            blocked_attempt_id: None,
+            blocked_reason: None,
+            updates: vec![GraphExecutionUpdate {
+                execution_id,
+                workflow_id,
+                node_id: Some("plan".to_string()),
+                sequence: 2,
+                status: WorkflowExecutionStatus::Running,
+                node_state: Some(WorkflowNodeExecutionState::Running),
+                finished: false,
+                error: None,
+                output_preview: None,
+                updated_at: now,
+            }],
+        };
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let deserialized: WorkflowExecutionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.execution_id, execution_id);
+        assert_eq!(deserialized.workflow_id, workflow_id);
+        assert_eq!(deserialized.updates.len(), 1);
+        assert_eq!(
+            deserialized.updates[0].node_state,
+            Some(WorkflowNodeExecutionState::Running)
+        );
+    }
+
+    #[test]
+    fn test_workflow_validation_report_round_trip() {
+        let report = WorkflowValidationReport {
+            executable: false,
+            diagnostics: vec![
+                WorkflowValidationDiagnostic {
+                    code: "workflow.edge.cycle".to_string(),
+                    severity: WorkflowValidationSeverity::Error,
+                    subject: WorkflowValidationSubject::new("/edges"),
+                    message: "workflow contains a cycle in executable edges".to_string(),
+                },
+                WorkflowValidationDiagnostic {
+                    code: "workflow.version.unknown".to_string(),
+                    severity: WorkflowValidationSeverity::Warning,
+                    subject: WorkflowValidationSubject::new("/version"),
+                    message: "unknown workflow version '2.0'".to_string(),
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&report).unwrap();
+        let deserialized: WorkflowValidationReport = serde_json::from_value(json).unwrap();
+        assert!(!deserialized.executable);
+        assert_eq!(deserialized.error_count(), 1);
+        assert_eq!(deserialized.warning_count(), 1);
+    }
+
+    #[test]
+    fn test_workflow_execution_lookup_round_trip() {
+        let execution_id = Uuid::new_v4();
+        let workflow_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let lookup = WorkflowExecutionLookup::Found {
+            execution: WorkflowExecutionSnapshot {
+                execution_id,
+                workflow_id,
+                workflow_name: "graph-run".to_string(),
+                status: WorkflowExecutionStatus::Succeeded,
+                accepted_at: now,
+                started_at: Some(now),
+                finished_at: Some(now),
+                dry_run: false,
+                input: None,
+                output: Some(serde_json::json!({ "ok": true })),
+                error: None,
+                last_sequence: 3,
+                row_version: None,
+                blocked_attempt_id: None,
+                blocked_reason: None,
+                updates: Vec::new(),
+            },
+        };
+
+        let json = serde_json::to_value(&lookup).unwrap();
+        let deserialized: WorkflowExecutionLookup = serde_json::from_value(json).unwrap();
+        match deserialized {
+            WorkflowExecutionLookup::Found { execution } => {
+                assert_eq!(execution.execution_id, execution_id);
+                assert_eq!(execution.workflow_id, workflow_id);
+            }
+            _ => panic!("expected found lookup"),
+        }
+    }
+
+    #[test]
+    fn test_session_retry_fields_default() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z"
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert!(session.retry_attempt.is_none());
+        assert!(session.max_retries.is_none());
+    }
+
+    #[test]
+    fn test_session_retry_fields_present() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Failed",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z",
+            "retry_attempt": 2,
+            "max_retries": 3
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(session.retry_attempt, Some(2));
+        assert_eq!(session.max_retries, Some(3));
+    }
+
+    #[test]
+    fn test_session_with_workflow_id_round_trip() {
+        let wf_id = Uuid::parse_str("770e8400-e29b-41d4-a716-446655440002").unwrap();
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z",
+            "workflow_id": wf_id.to_string()
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(session.workflow_id, Some(wf_id));
+    }
+
+    #[test]
+    fn test_topology_definition_roundtrip() {
+        let original = TopologyDefinition {
+            nodes: vec![
+                TopologyNode {
+                    id: "research".to_string(),
+                    kind: SessionKind::Research,
+                    label: "Research phase".to_string(),
+                    prereqs: vec![],
+                    max_iterations: Some(5),
+                    on_failure: None,
+                    params: HashMap::new(),
+                },
+                TopologyNode {
+                    id: "implement".to_string(),
+                    kind: SessionKind::Task,
+                    label: "Implementation".to_string(),
+                    prereqs: vec!["research".to_string()],
+                    max_iterations: None,
+                    on_failure: Some(FailurePolicy::Retry),
+                    params: HashMap::new(),
+                },
+            ],
+            edges: vec![TopologyEdge {
+                from: "research".to_string(),
+                to: "implement".to_string(),
+                loop_edge: true,
+            }],
+            until: Some(UntilCondition::LeadHalt),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize TopologyDefinition");
+        let decoded: TopologyDefinition =
+            serde_json::from_str(&json).expect("deserialize TopologyDefinition");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_project_deserialize_without_optional_fields() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "test",
+            "path": null,
+            "description": null,
+            "color": "#a6e3a1",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z"
+        });
+        let project: Project = serde_json::from_value(json).unwrap();
+        assert_eq!(project.name, "test");
+        assert!(project.path.is_none());
+        assert!(project.description.is_none());
+        assert_eq!(project.color, "#a6e3a1");
+    }
+
+    #[test]
+    fn test_session_label_serde_round_trip() {
+        let label = SessionLabel {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            name: "auth-refactor".to_string(),
+            description: Some("Refactoring authentication layer".to_string()),
+            project_id: Some(Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap()),
+            color: SessionLabel::DEFAULT_COLOR.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&label).unwrap();
+        let deserialized: SessionLabel = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.name, "auth-refactor");
+        assert_eq!(
+            deserialized.description,
+            Some("Refactoring authentication layer".to_string())
+        );
+        assert_eq!(deserialized.color, SessionLabel::DEFAULT_COLOR);
+        assert!(deserialized.project_id.is_some());
+    }
+
+    #[test]
+    fn test_session_with_group_id_round_trip() {
+        let gid = Uuid::parse_str("880e8400-e29b-41d4-a716-446655440003").unwrap();
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "test",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z",
+            "group_id": gid.to_string()
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(session.group_id, Some(gid));
+    }
+
+    #[test]
+    fn test_entity_card_serde_roundtrip() {
+        let card = EntityCard {
+            id: Uuid::new_v4(),
+            entity_type: "project".to_string(),
+            entity_id: Uuid::new_v4().to_string(),
+            facts: vec![
+                "Uses Rust with ratatui".to_string(),
+                "Vim-first TUI application".to_string(),
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        let deser: EntityCard = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.id, card.id);
+        assert_eq!(deser.entity_type, "project");
+        assert_eq!(deser.facts.len(), 2);
+        assert_eq!(deser.facts[0], "Uses Rust with ratatui");
+    }
+
+    #[test]
+    fn test_entity_card_user_card_roundtrip() {
+        let card = EntityCard {
+            id: Uuid::new_v4(),
+            entity_type: "user".to_string(),
+            entity_id: "self".to_string(),
+            facts: vec!["Prefers vim keybindings".to_string()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&card).unwrap();
+        let deser: EntityCard = serde_json::from_value(json).unwrap();
+        assert_eq!(deser.entity_type, "user");
+        assert_eq!(deser.entity_id, "self");
+    }
+
+    #[test]
+    fn test_entity_card_empty_facts() {
+        let card = EntityCard {
+            id: Uuid::new_v4(),
+            entity_type: "project".to_string(),
+            entity_id: "some-id".to_string(),
+            facts: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        let deser: EntityCard = serde_json::from_str(&json).unwrap();
+        assert!(deser.facts.is_empty());
+    }
+
+    #[test]
+    fn test_observation_level_serde_roundtrip() {
+        for level in [
+            ObservationLevel::Explicit,
+            ObservationLevel::Deductive,
+            ObservationLevel::Inductive,
+            ObservationLevel::Contradiction,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let deser: ObservationLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser, level);
+        }
+    }
+
+    #[test]
+    fn test_observation_confidence_serde_roundtrip() {
+        for conf in [
+            ObservationConfidence::Low,
+            ObservationConfidence::Medium,
+            ObservationConfidence::High,
+        ] {
+            let json = serde_json::to_string(&conf).unwrap();
+            let deser: ObservationConfidence = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser, conf);
+        }
+    }
+
+    #[test]
+    fn test_observation_serde_roundtrip_full() {
+        let obs = Observation {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            level: ObservationLevel::Explicit,
+            content: "User refactored the overlay system".to_string(),
+            source_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            confidence: Some(ObservationConfidence::High),
+            times_derived: 3,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        let deser: Observation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.id, obs.id);
+        assert_eq!(deser.session_id, obs.session_id);
+        assert_eq!(deser.project_id, obs.project_id);
+        assert_eq!(deser.level, obs.level);
+        assert_eq!(deser.content, obs.content);
+        assert_eq!(deser.source_ids.len(), 2);
+        assert_eq!(deser.confidence, Some(ObservationConfidence::High));
+        assert_eq!(deser.times_derived, 3);
+    }
+
+    #[test]
+    fn test_observation_serde_roundtrip_none_optionals() {
+        let obs = Observation {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            project_id: None,
+            level: ObservationLevel::Explicit,
+            content: "Simple fact".to_string(),
+            source_ids: vec![],
+            confidence: None,
+            times_derived: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        let deser: Observation = serde_json::from_str(&json).unwrap();
+        assert!(deser.project_id.is_none());
+        assert!(deser.source_ids.is_empty());
+        assert!(deser.confidence.is_none());
+        assert_eq!(deser.times_derived, 1);
+    }
+
+    #[test]
+    fn test_observation_search_result_serde_roundtrip() {
+        let result = ObservationSearchResult {
+            observation: Observation {
+                id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                project_id: None,
+                level: ObservationLevel::Explicit,
+                content: "Test observation".to_string(),
+                source_ids: vec![],
+                confidence: None,
+                times_derived: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            score: 0.85,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: ObservationSearchResult = serde_json::from_str(&json).unwrap();
+        assert!((deser.score - 0.85).abs() < f64::EPSILON);
+        assert_eq!(deser.observation.content, "Test observation");
+    }
+
+    #[test]
+    fn test_session_provider_codex_app_server_serde_roundtrip() {
+        let provider = SessionProvider::CodexAppServer;
+        let json = serde_json::to_string(&provider).unwrap();
+        let deser: SessionProvider = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, SessionProvider::CodexAppServer);
+        assert_eq!(json, "\"CodexAppServer\"");
+    }
+
+    /// Round-trips a fully-populated set of sandbox fields through JSON serde
+    /// to catch silent drops by `#[serde(default)]` attributes on Session.
+    #[test]
+    fn session_serde_sandbox_roundtrip() {
+        let session = Session {
+            context_fill_pct: None,
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            provider: SessionProvider::Claude,
+            claude_session_id: None,
+            query: "sandbox round-trip".to_string(),
+            title: None,
+            agent_role: None,
+            epic_spawn_ordinal: None,
+            description: None,
+            short_summary: None,
+            working_dir: std::path::PathBuf::from("/tmp/canonical"),
+            git_branch: None,
+            status: SessionStatus::Running,
+            project_id: None,
+            pinned_at: None,
+            testing_needed_at: None,
+            rotation_disabled_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            cost_usd: None,
+            duration_ms: None,
+            num_turns: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            context_window: None,
+            resolved_context_budget: None,
+            total_input_tokens: None,
+            session_kind: SessionKind::Standard,
+            total_output_tokens: None,
+            total_cache_creation_tokens: None,
+            total_cache_read_tokens: None,
+            stop_reason: None,
+            continued_from: None,
+            context_usage_confidence: ContextUsageConfidence::Missing,
+            daemon_input_tokens: None,
+            daemon_output_tokens: None,
+            handoff_filepath: None,
+            active_task: None,
+            group_id: None,
+            tag: String::new(),
+            tags: Vec::new(),
+            pipeline_artifact: None,
+            workflow_id: None,
+            workflow_id_override: None,
+            pending_question: None,
+            pending_archive: false,
+            rotation_depth: 0,
+            retry_attempt: None,
+            max_retries: None,
+            effort: None,
+            issue_identifier: None,
+            issue_url: None,
+            issue_tracker_id: None,
+            scheduled_job_id: None,
+            rating: None,
+            harness_version_hash: None,
+            test_passed: None,
+            clippy_passed: None,
+            turn_count: None,
+            retry_count: None,
+            approval_wait_ms: None,
+            approval_started_at: None,
+            work_time_ms: None,
+            sandbox_kind: Some(SandboxKind::GitWorktree),
+            sandbox_root: Some(std::path::PathBuf::from("/home/j/.rsi/sandboxes/abc")),
+            sandbox_branch: Some("rsi/abc123".to_string()),
+            sandbox_cleanup_state: Some(SandboxCleanupState::Live),
+            parent_id: None,
+            lead_session_id: None,
+            is_eval: false,
+            capability_class: None,
+            topology_node_id: None,
+            topology_iteration: 0,
+            provider_cli_version: None,
+            provider_capabilities: Vec::new(),
+            thinking_tokens: None,
+            service_tier: None,
+            cache_creation_1h_tokens: None,
+            cache_creation_5m_tokens: None,
+            permission_denial_count: None,
+            subagent_stats_json: None,
+            queued_turn_count: None,
+            terminal_reason: None,
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        let deser: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(deser.sandbox_kind, Some(SandboxKind::GitWorktree));
+        assert_eq!(
+            deser.sandbox_root,
+            Some(std::path::PathBuf::from("/home/j/.rsi/sandboxes/abc"))
+        );
+        assert_eq!(deser.sandbox_branch, Some("rsi/abc123".to_string()));
+        assert_eq!(deser.sandbox_cleanup_state, Some(SandboxCleanupState::Live));
+    }
+
+    /// Old-client JSON (no sandbox fields at all) deserializes into a Session
+    /// where every sandbox field is `None` — backward-compat for pre-V39 payloads.
+    #[test]
+    fn session_serde_backcompat() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "legacy",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z"
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert!(session.sandbox_kind.is_none());
+        assert!(session.sandbox_root.is_none());
+        assert!(session.sandbox_branch.is_none());
+        assert!(session.sandbox_cleanup_state.is_none());
+        assert!(session.capability_class.is_none());
+    }
+
+    #[test]
+    fn pending_question_serde_roundtrips_multiselect_camel_case() {
+        let question = PendingQuestion {
+            questions: vec![QuestionItem {
+                question: "Which checks should run?".to_string(),
+                header: "Checks".to_string(),
+                options: vec![
+                    QuestionOption {
+                        label: "tests".to_string(),
+                        description: "Run cargo test".to_string(),
+                    },
+                    QuestionOption {
+                        label: "clippy".to_string(),
+                        description: "Run cargo clippy".to_string(),
+                    },
+                ],
+                multi_select: true,
+            }],
+        };
+
+        let json = serde_json::to_value(&question).unwrap();
+        assert_eq!(json["questions"][0]["multiSelect"], true);
+        assert!(json["questions"][0].get("multi_select").is_none());
+
+        let reloaded: PendingQuestion = serde_json::from_value(json).unwrap();
+        assert_eq!(reloaded, question);
+    }
+
+    // ─── RSI-010: CapabilityClass ───────────────────────────────────────────
+
+    #[test]
+    fn capability_class_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&CapabilityClass::Architect).unwrap(),
+            "\"architect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CapabilityClass::Implementer).unwrap(),
+            "\"implementer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CapabilityClass::LookupFast).unwrap(),
+            "\"lookup_fast\""
+        );
+        for variant in [
+            CapabilityClass::Architect,
+            CapabilityClass::Implementer,
+            CapabilityClass::LookupFast,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: CapabilityClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn capability_class_classify_opus_is_architect() {
+        assert_eq!(
+            CapabilityClass::classify("claude-opus-4-5"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("claude-3-opus-20240229"),
+            Some(CapabilityClass::Architect)
+        );
+    }
+
+    #[test]
+    fn capability_class_classify_sonnet_is_implementer() {
+        assert_eq!(
+            CapabilityClass::classify("claude-sonnet-5"),
+            Some(CapabilityClass::Implementer)
+        );
+    }
+
+    #[test]
+    fn capability_class_classify_haiku_is_lookup_fast() {
+        assert_eq!(
+            CapabilityClass::classify("claude-haiku-4-5"),
+            Some(CapabilityClass::LookupFast)
+        );
+        assert_eq!(
+            CapabilityClass::classify("claude-3-5-haiku-20241022"),
+            Some(CapabilityClass::LookupFast)
+        );
+    }
+
+    #[test]
+    fn capability_class_classify_openai() {
+        assert_eq!(
+            CapabilityClass::classify("gpt-6-astra"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("gpt-6-sol"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("gpt-6-luna"),
+            Some(CapabilityClass::LookupFast)
+        );
+        assert_eq!(
+            CapabilityClass::classify("gpt-5"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("o1-preview"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("gpt-4o"),
+            Some(CapabilityClass::Implementer)
+        );
+    }
+
+    #[test]
+    fn capability_class_classify_unknown_is_none() {
+        assert_eq!(CapabilityClass::classify("llama-3-70b"), None);
+        assert_eq!(CapabilityClass::classify(""), None);
+    }
+
+    #[test]
+    fn capability_class_classify_case_insensitive_and_namespaced() {
+        assert_eq!(
+            CapabilityClass::classify("Claude-Opus-4-5"),
+            Some(CapabilityClass::Architect)
+        );
+        assert_eq!(
+            CapabilityClass::classify("anthropic/claude-haiku-4-5"),
+            Some(CapabilityClass::LookupFast)
+        );
+    }
+
+    /// V46-era JSON (no topology fields) deserializes with default values for
+    /// the new P1.7 fields: `topology_node_id = None`, `topology_iteration = 0`.
+    #[test]
+    fn session_serde_topology_backcompat_defaults() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440001",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "legacy",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z"
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            session.topology_node_id, None,
+            "V46-era JSON must default topology_node_id to None"
+        );
+        assert_eq!(
+            session.topology_iteration, 0,
+            "V46-era JSON must default topology_iteration to 0"
+        );
+    }
+
+    /// Session with topology binding round-trips cleanly through JSON.
+    #[test]
+    fn session_serde_topology_roundtrip() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440002",
+            "provider": "Claude",
+            "claude_session_id": null,
+            "query": "bound session",
+            "working_dir": "/tmp",
+            "status": "Running",
+            "created_at": "2026-01-31T00:00:00Z",
+            "updated_at": "2026-01-31T00:00:00Z",
+            "topology_node_id": "plan_v1",
+            "topology_iteration": 3
+        });
+        let session: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            session.topology_node_id,
+            Some("plan_v1".to_string()),
+            "topology_node_id must round-trip"
+        );
+        assert_eq!(
+            session.topology_iteration, 3,
+            "topology_iteration must round-trip"
+        );
+
+        // Serialize back and re-read.
+        let reserialized = serde_json::to_value(&session).unwrap();
+        let reloaded: Session = serde_json::from_value(reserialized).unwrap();
+        assert_eq!(reloaded.topology_node_id, Some("plan_v1".to_string()));
+        assert_eq!(reloaded.topology_iteration, 3);
+    }
+
+    // ─── Index status sidecar tests (P1.9) ───────────────────────────────────
+
+    #[test]
+    fn test_index_status_serde_round_trip() {
+        use std::collections::BTreeMap;
+        let now = chrono::Utc::now();
+        let mut tickets = BTreeMap::new();
+        tickets.insert(
+            "P1.1".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::Shipped,
+                last_shipped_commit: Some("abc123".to_string()),
+                last_shipped_at: Some(now),
+                last_shipped_branch: Some("main".to_string()),
+            },
+        );
+        tickets.insert(
+            "P1.2".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::Ready,
+                last_shipped_commit: None,
+                last_shipped_at: None,
+                last_shipped_branch: None,
+            },
+        );
+        tickets.insert(
+            "P1.3".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::InProgress,
+                last_shipped_commit: None,
+                last_shipped_at: None,
+                last_shipped_branch: None,
+            },
+        );
+        let sidecar = IndexStatusSidecar {
+            schema_version: 1,
+            project: "test-project".to_string(),
+            last_updated: now,
+            tickets,
+        };
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let deserialized: IndexStatusSidecar = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, sidecar);
+    }
+
+    #[test]
+    fn test_index_status_value_snake_case() {
+        let serialized = serde_json::to_string(&IndexStatusValue::InProgress).unwrap();
+        assert_eq!(serialized, "\"in_progress\"");
+        let serialized = serde_json::to_string(&IndexStatusValue::NotStarted).unwrap();
+        assert_eq!(serialized, "\"not_started\"");
+        let serialized = serde_json::to_string(&IndexStatusValue::Shipped).unwrap();
+        assert_eq!(serialized, "\"shipped\"");
+    }
+
+    #[test]
+    fn test_btreemap_ticket_order() {
+        use std::collections::BTreeMap;
+        let now = chrono::Utc::now();
+        let mut tickets = BTreeMap::new();
+        // Insert in reverse alphabetical order
+        tickets.insert(
+            "P2.1".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::Ready,
+                last_shipped_commit: None,
+                last_shipped_at: None,
+                last_shipped_branch: None,
+            },
+        );
+        tickets.insert(
+            "P1.9".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::InProgress,
+                last_shipped_commit: None,
+                last_shipped_at: None,
+                last_shipped_branch: None,
+            },
+        );
+        tickets.insert(
+            "P1.1".to_string(),
+            IndexTicketStatus {
+                status: IndexStatusValue::Shipped,
+                last_shipped_commit: None,
+                last_shipped_at: None,
+                last_shipped_branch: None,
+            },
+        );
+        let sidecar = IndexStatusSidecar {
+            schema_version: 1,
+            project: "order-test".to_string(),
+            last_updated: now,
+            tickets,
+        };
+        let json = serde_json::to_string_pretty(&sidecar).unwrap();
+        // Find the positions of P1.1, P1.9, P2.1 in the serialized output.
+        let pos_p11 = json.find("\"P1.1\"").expect("P1.1 in JSON");
+        let pos_p19 = json.find("\"P1.9\"").expect("P1.9 in JSON");
+        let pos_p21 = json.find("\"P2.1\"").expect("P2.1 in JSON");
+        assert!(pos_p11 < pos_p19, "P1.1 should appear before P1.9");
+        assert!(pos_p19 < pos_p21, "P1.9 should appear before P2.1");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn issue_actor_kind_exact_strings_round_trip_including_manager() {
+        for (kind, value) in [
+            (IssueActorKindV1::Operator, "operator"),
+            (IssueActorKindV1::Session, "session"),
+            (IssueActorKindV1::System, "system"),
+            (IssueActorKindV1::Manager, "manager"),
+        ] {
+            assert_eq!(kind.as_str(), value);
+            assert_eq!(IssueActorKindV1::parse(value), Ok(kind));
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(value)
+            );
+            assert_eq!(
+                serde_json::from_value::<IssueActorKindV1>(serde_json::json!(value)).unwrap(),
+                kind
+            );
+        }
+        assert!(IssueActorKindV1::parse("Manager").is_err());
+        assert!(serde_json::from_value::<IssueActorKindV1>(serde_json::json!("lead")).is_err());
+    }
+
+    #[test]
+    fn idea_kernel_exact_enum_strings_round_trip_and_unknowns_fail() {
+        macro_rules! check_enum {
+            ($ty:ty, [$($value:literal),+ $(,)?]) => {
+                $(
+                    let parsed: $ty =
+                        serde_json::from_value(serde_json::json!($value)).unwrap();
+                    assert_eq!(parsed.as_str(), $value);
+                    assert_eq!(serde_json::to_value(parsed).unwrap(), serde_json::json!($value));
+                )+
+                assert!(serde_json::from_value::<$ty>(serde_json::json!("UNKNOWN")).is_err());
+            };
+        }
+
+        check_enum!(IdeaActorKind, ["operator", "session", "system"]);
+        check_enum!(
+            CaptureSourceKind,
+            [
+                "operator_input",
+                "session_artifact",
+                "imported_artifact",
+                "legacy_reference"
+            ]
+        );
+        check_enum!(
+            IdeaLifecycle,
+            ["Open", "Parked", "Completed", "Abandoned", "Superseded"]
+        );
+        check_enum!(
+            IdeaStage,
+            [
+                "Captured",
+                "Shaping",
+                "Researching",
+                "Planned",
+                "Implementing",
+                "Integrating",
+                "Verifying",
+                "Released"
+            ]
+        );
+        check_enum!(
+            AutonomyPolicy,
+            [
+                "CaptureOnly",
+                "Research",
+                "PlanAndWait",
+                "Sandbox",
+                "IntegrateIdeaBranch",
+                "PromoteProjectTarget",
+                "ExternalEffects"
+            ]
+        );
+        check_enum!(
+            IdeaRelationshipKind,
+            ["depends_on", "supersedes", "derived_from"]
+        );
+        check_enum!(
+            LegacyIdeaSourceKind,
+            [
+                "session_group",
+                "session_epic",
+                "session_label",
+                "session_child"
+            ]
+        );
+        check_enum!(
+            IdeaCompatibilityStatus,
+            ["pending", "mapped", "blocked", "excluded"]
+        );
+        check_enum!(
+            IdeaEventType,
+            [
+                "created",
+                "decision_recorded",
+                "projection_changed",
+                "lifecycle_transitioned",
+                "stage_transitioned",
+                "autonomy_changed",
+                "scope_changed",
+                "controller_reserved",
+                "controller_assigned",
+                "controller_released",
+                "question_asked",
+                "question_answered",
+                "issue_linked",
+                "artifact_sealed",
+                "finding_recorded",
+                "verdict_recorded",
+                "program_transitioned",
+                "gate_transitioned",
+                "integration_recorded",
+                "release_recorded",
+                "relationship_changed",
+                "split",
+                "superseded",
+                "failed",
+                "abandoned"
+            ]
+        );
+    }
+
+    #[test]
+    fn idea_kernel_safe_genesis_values_reject_noncanonical_or_inline_data() -> Result<(), String> {
+        let hex = "a".repeat(64);
+        let digest = Sha256Digest::parse(format!("sha256:{hex}"))?;
+        assert!(matches!(
+            ContentAddressedRef::parse(format!("cas://sha256:{hex}")),
+            Err(ref error) if error.contains("cas://sha256/")
+        ));
+        assert!(Sha256Digest::parse(format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(Sha256Digest::parse("sha256:short").is_err());
+        assert!(ContentAddressedRef::parse("data:text/plain,secret").is_err());
+        assert!(ContentAddressedRef::parse("inline://secret").is_err());
+        assert_eq!(
+            ContentAddressedRef::for_digest(&digest).as_str(),
+            format!("cas://sha256/{hex}")
+        );
+        assert!(
+            serde_json::from_value::<GenesisSpan>(serde_json::json!({
+                "start": 3,
+                "end": 3,
+                "digest": digest
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idea_kernel_snapshot_and_event_json_round_trip_without_protected_fields()
+    -> Result<(), String> {
+        let now = Utc::now();
+        let digest = Sha256Digest::parse(format!("sha256:{}", "b".repeat(64)))?;
+        let capture = Capture {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            creator_kind: IdeaActorKind::Operator,
+            creator_id: "operator".to_string(),
+            captured_at: now,
+            source_kind: CaptureSourceKind::OperatorInput,
+            raw_content_digest: digest.clone(),
+            storage_policy_id: "cas-v1".to_string(),
+            content_ref: ContentAddressedRef::for_digest(&digest),
+        };
+        assert!(capture.validate().is_ok());
+        let idea = Idea {
+            id: Uuid::new_v4(),
+            project_id: capture.project_id,
+            slug: "safe-kernel".to_string(),
+            sigil: None,
+            genesis_capture_id: capture.id,
+            genesis_span_start: Some(0),
+            genesis_span_end: Some(4),
+            genesis_span_digest: Some(digest.clone()),
+            title: "Safe kernel".to_string(),
+            description: String::new(),
+            portfolio_summary: "Bounded identity".to_string(),
+            lifecycle: IdeaLifecycle::Open,
+            stage: IdeaStage::Captured,
+            priority: 1,
+            autonomy_policy: AutonomyPolicy::CaptureOnly,
+            integration_target_ref: "refs/heads/main".to_string(),
+            program_template_policy_id: None,
+            current_controller_session_id: None,
+            controller_epoch: 0,
+            row_version: 0,
+            next_event_sequence: 1,
+            created_at: now,
+            updated_at: now,
+            terminal_at: None,
+            superseded_at: None,
+        };
+        assert!(idea.validate().is_ok());
+        let snapshot = IdeaWithGenesis {
+            idea: idea.clone(),
+            genesis: capture,
+        };
+        let value = serde_json::to_value(&snapshot).map_err(|error| error.to_string())?;
+        let encoded = value.to_string();
+        for forbidden in [
+            "raw_content",
+            "provider",
+            "model",
+            "transcript",
+            "token",
+            "sandbox",
+            "context_window",
+        ] {
+            assert!(
+                !encoded.contains(&format!("\"{forbidden}\":")),
+                "leaked field {forbidden}"
+            );
+        }
+        let decoded =
+            serde_json::from_value::<IdeaWithGenesis>(value).map_err(|error| error.to_string())?;
+        assert_eq!(decoded, snapshot);
+
+        let event = IdeaEvent {
+            id: Uuid::new_v4(),
+            project_id: idea.project_id,
+            idea_id: idea.id,
+            sequence: 1,
+            event_type: IdeaEventType::Created,
+            actor_kind: IdeaActorKind::System,
+            actor_id: "d01-fixture".to_string(),
+            controller_session_id: None,
+            controller_epoch: None,
+            expected_row_version: 0,
+            resulting_row_version: 0,
+            idempotency_key: "create:1".to_string(),
+            occurred_at: now,
+            payload: serde_json::json!({"decision": "reference-only"}),
+            artifact_digests: vec![digest.clone()],
+            evidence_digests: vec![digest],
+        };
+        assert!(event.validate().is_ok());
+        let value = serde_json::to_value(&event).map_err(|error| error.to_string())?;
+        let decoded =
+            serde_json::from_value::<IdeaEvent>(value).map_err(|error| error.to_string())?;
+        assert_eq!(decoded, event);
+        Ok(())
+    }
+
+    #[test]
+    fn idea_kernel_optional_span_and_mapping_status_validation_is_strict() -> Result<(), String> {
+        let digest = Sha256Digest::parse(format!("sha256:{}", "c".repeat(64)))?;
+        let mut idea = Idea {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            slug: "span".to_string(),
+            sigil: None,
+            genesis_capture_id: Uuid::new_v4(),
+            genesis_span_start: None,
+            genesis_span_end: None,
+            genesis_span_digest: None,
+            title: "Span".to_string(),
+            description: String::new(),
+            portfolio_summary: String::new(),
+            lifecycle: IdeaLifecycle::Open,
+            stage: IdeaStage::Captured,
+            priority: 0,
+            autonomy_policy: AutonomyPolicy::CaptureOnly,
+            integration_target_ref: "refs/heads/main".to_string(),
+            program_template_policy_id: None,
+            current_controller_session_id: None,
+            controller_epoch: 0,
+            row_version: 0,
+            next_event_sequence: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_at: None,
+            superseded_at: None,
+        };
+        assert!(idea.validate().is_ok());
+        idea.slug = "é".repeat(64);
+        idea.sigil = Some("é".repeat(32));
+        assert!(idea.validate().is_ok());
+        idea.slug = format!("{}a", "é".repeat(64));
+        assert!(idea.validate().is_err());
+        idea.slug = "span".to_string();
+        idea.sigil = Some(format!("{}a", "é".repeat(32)));
+        assert!(idea.validate().is_err());
+        idea.sigil = Some(" ".to_string());
+        assert!(idea.validate().is_err());
+        idea.sigil = None;
+        idea.genesis_span_start = Some(0);
+        assert!(idea.validate().is_err());
+        idea.genesis_span_end = Some(1);
+        idea.genesis_span_digest = Some(digest);
+        assert!(idea.validate().is_ok());
+
+        let mut mapping = IdeaCompatibilityMapping {
+            id: Uuid::new_v4(),
+            project_id: idea.project_id,
+            legacy_source_kind: LegacyIdeaSourceKind::SessionEpic,
+            legacy_source_id: Uuid::new_v4(),
+            idea_id: None,
+            collection_id: None,
+            status: IdeaCompatibilityStatus::Pending,
+            provenance: serde_json::json!({"source": "fixture"}),
+            disposition: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            mapped_at: None,
+        };
+        assert!(mapping.validate().is_ok());
+        mapping.status = IdeaCompatibilityStatus::Mapped;
+        assert!(mapping.validate().is_err());
+        mapping.idea_id = Some(idea.id);
+        mapping.mapped_at = Some(Utc::now());
+        assert!(mapping.validate().is_ok());
+        Ok(())
+    }
+
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "D02 contract tests construct only literal-valid fixtures"
+    )]
+    mod d02_idea_event_cas_tests {
+        use super::*;
+
+        fn d02_digest(byte: char) -> Sha256Digest {
+            Sha256Digest::parse(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
+        }
+
+        fn d02_create_request() -> CreateIdeaRequestV1 {
+            CreateIdeaRequestV1 {
+                idempotency_key: "create-one".to_string(),
+                genesis_capture_id: Uuid::new_v4(),
+                genesis_span: Some(GenesisSpan::new(0, 8, d02_digest('a')).unwrap()),
+                slug: "event-cas".to_string(),
+                sigil: Some("EC".to_string()),
+                title: "Event CAS".to_string(),
+                description: "strict request".to_string(),
+                portfolio_summary: "projection plus history".to_string(),
+                priority: 7,
+                autonomy_policy: AutonomyPolicy::CaptureOnly,
+                integration_target_ref: "refs/heads/ideas/event-cas".to_string(),
+                program_template_policy_id: Some("default-v1".to_string()),
+                derived_from_idea_id: None,
+                artifact_digests: vec![d02_digest('c'), d02_digest('a'), d02_digest('c')],
+                evidence_digests: vec![d02_digest('b'), d02_digest('a')],
+            }
+        }
+
+        #[test]
+        fn idea_event_cas_lifecycle_and_stage_tables_are_exhaustive() {
+            let lifecycles = [
+                IdeaLifecycle::Open,
+                IdeaLifecycle::Parked,
+                IdeaLifecycle::Completed,
+                IdeaLifecycle::Abandoned,
+                IdeaLifecycle::Superseded,
+            ];
+            for from in lifecycles {
+                for to in lifecycles {
+                    let actual = evaluate_idea_lifecycle_transition(from, to, true, true);
+                    let expected = if from == to {
+                        Err(IdeaTransitionViolation::NoSemanticChange)
+                    } else if matches!(
+                        from,
+                        IdeaLifecycle::Completed
+                            | IdeaLifecycle::Abandoned
+                            | IdeaLifecycle::Superseded
+                    ) {
+                        Err(IdeaTransitionViolation::TerminalLifecycle)
+                    } else {
+                        match to {
+                            IdeaLifecycle::Open if from == IdeaLifecycle::Parked => Ok(()),
+                            IdeaLifecycle::Parked if from == IdeaLifecycle::Open => Ok(()),
+                            IdeaLifecycle::Abandoned | IdeaLifecycle::Superseded => Ok(()),
+                            IdeaLifecycle::Completed => {
+                                Err(IdeaTransitionViolation::PrerequisiteUnavailable)
+                            }
+                            _ => Err(IdeaTransitionViolation::InvalidLifecycleTransition),
+                        }
+                    };
+                    assert_eq!(actual, expected, "lifecycle {from:?} -> {to:?}");
+                }
+            }
+            assert_eq!(
+                evaluate_idea_lifecycle_transition(
+                    IdeaLifecycle::Open,
+                    IdeaLifecycle::Parked,
+                    false,
+                    false
+                ),
+                Err(IdeaTransitionViolation::InvalidLifecycleTransition)
+            );
+            assert_eq!(
+                evaluate_idea_lifecycle_transition(
+                    IdeaLifecycle::Open,
+                    IdeaLifecycle::Superseded,
+                    false,
+                    false
+                ),
+                Err(IdeaTransitionViolation::InvalidLifecycleTransition)
+            );
+
+            let stages = [
+                IdeaStage::Captured,
+                IdeaStage::Shaping,
+                IdeaStage::Researching,
+                IdeaStage::Planned,
+                IdeaStage::Implementing,
+                IdeaStage::Integrating,
+                IdeaStage::Verifying,
+                IdeaStage::Released,
+            ];
+            for (from_index, from) in stages.into_iter().enumerate() {
+                for (to_index, to) in stages.into_iter().enumerate() {
+                    let actual =
+                        evaluate_idea_stage_transition(IdeaLifecycle::Open, from, to, true);
+                    let expected = if from_index == to_index {
+                        Err(IdeaTransitionViolation::NoSemanticChange)
+                    } else if from == IdeaStage::Captured && to == IdeaStage::Shaping {
+                        Ok(())
+                    } else if to_index > from_index {
+                        Err(IdeaTransitionViolation::PrerequisiteUnavailable)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(actual, expected, "stage {from:?} -> {to:?}");
+                    if from != to {
+                        assert_eq!(
+                            evaluate_idea_stage_transition(IdeaLifecycle::Parked, from, to, true),
+                            Err(IdeaTransitionViolation::LifecyclePaused)
+                        );
+                        assert_eq!(
+                            evaluate_idea_stage_transition(
+                                IdeaLifecycle::Abandoned,
+                                from,
+                                to,
+                                true
+                            ),
+                            Err(IdeaTransitionViolation::TerminalLifecycle)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                evaluate_idea_stage_transition(
+                    IdeaLifecycle::Open,
+                    IdeaStage::Researching,
+                    IdeaStage::Captured,
+                    false
+                ),
+                Err(IdeaTransitionViolation::InvalidStageTransition)
+            );
+        }
+
+        #[test]
+        fn idea_event_cas_envelope_is_canonical_and_request_shape_is_closed() {
+            let project_id = Uuid::new_v4();
+            let idea_id = Uuid::new_v4();
+            let request = d02_create_request();
+            let envelope = request
+                .semantic_envelope(project_id, idea_id, "operator")
+                .unwrap();
+            assert_eq!(
+                envelope.artifact_digests,
+                vec![d02_digest('a'), d02_digest('c')]
+            );
+            let canonical = envelope.canonical_json().unwrap();
+            let decoded: IdeaSemanticRequestV1 = serde_json::from_str(&canonical).unwrap();
+            assert_eq!(decoded, envelope);
+            assert_eq!(decoded.canonical_json().unwrap(), canonical);
+
+            let mut value = serde_json::to_value(&request).unwrap();
+            for forbidden in [
+                "project_id",
+                "idea_id",
+                "actor_kind",
+                "actor_id",
+                "session_id",
+                "controller_session_id",
+                "controller_epoch",
+                "event_id",
+                "event_type",
+                "occurred_at",
+                "resulting_row_version",
+                "fingerprint",
+                "deduplicated",
+            ] {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(forbidden.to_string(), serde_json::json!("spoof"));
+                assert!(
+                    serde_json::from_value::<CreateIdeaRequestV1>(value.clone()).is_err(),
+                    "request admitted reserved field {forbidden}"
+                );
+                value.as_object_mut().unwrap().remove(forbidden);
+            }
+            assert!(
+                serde_json::from_value::<CreateIdeaRequestV1>(serde_json::json!({
+                    "idempotency_key": "x",
+                    "genesis_capture_id": Uuid::new_v4(),
+                    "slug": "x",
+                    "title": "x",
+                    "description": "",
+                    "portfolio_summary": "",
+                    "priority": 0,
+                    "autonomy_policy": "CaptureOnly",
+                    "integration_target_ref": "refs/heads/main",
+                    "raw_content": "protected"
+                }))
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn idea_event_cas_semantic_event_requires_exact_columns_and_version_chain() {
+            let project_id = Uuid::new_v4();
+            let idea_id = Uuid::new_v4();
+            let request = d02_create_request();
+            let envelope = request
+                .semantic_envelope(project_id, idea_id, "operator")
+                .unwrap();
+            let canonical = envelope.canonical_json().unwrap();
+            let now = Utc::now();
+            let mut event = IdeaEvent {
+                id: Uuid::new_v4(),
+                project_id,
+                idea_id,
+                sequence: 1,
+                event_type: IdeaEventType::Created,
+                actor_kind: IdeaActorKind::Operator,
+                actor_id: "operator".to_string(),
+                controller_session_id: None,
+                controller_epoch: None,
+                expected_row_version: 0,
+                resulting_row_version: 1,
+                idempotency_key: request.idempotency_key,
+                occurred_at: now,
+                payload: serde_json::from_str(&canonical).unwrap(),
+                artifact_digests: envelope.artifact_digests.clone(),
+                evidence_digests: envelope.evidence_digests.clone(),
+            };
+            assert_eq!(event.semantic_request_v1().unwrap(), envelope);
+            event.event_type = IdeaEventType::ProjectionChanged;
+            assert!(event.semantic_request_v1().is_err());
+            event.event_type = IdeaEventType::Created;
+            event.resulting_row_version = 0;
+            assert!(event.semantic_request_v1().is_err());
+            event.resulting_row_version = 1;
+            event.actor_kind = IdeaActorKind::Session;
+            assert!(event.semantic_request_v1().is_err());
+            event.actor_kind = IdeaActorKind::Operator;
+            event.controller_epoch = Some(0);
+            assert!(event.semantic_request_v1().is_err());
+            event.controller_epoch = None;
+            event.artifact_digests.reverse();
+            assert!(event.semantic_request_v1().is_err());
+        }
+
+        #[test]
+        fn idea_event_cas_action_catalog_maps_exact_event_types_and_bounds_pages() {
+            let target = Uuid::new_v4();
+            let actions = [
+                (
+                    IdeaMutationActionV1::ChangeProjection {
+                        sigil: None,
+                        title: Some("next".to_string()),
+                        description: None,
+                        portfolio_summary: None,
+                        priority: None,
+                    },
+                    IdeaEventType::ProjectionChanged,
+                ),
+                (
+                    IdeaMutationActionV1::ChangeScope {
+                        integration_target_ref: Some("refs/heads/next".to_string()),
+                        program_template_policy_id: None,
+                    },
+                    IdeaEventType::ScopeChanged,
+                ),
+                (
+                    IdeaMutationActionV1::ChangeAutonomy {
+                        autonomy_policy: AutonomyPolicy::Research,
+                    },
+                    IdeaEventType::AutonomyChanged,
+                ),
+                (
+                    IdeaMutationActionV1::Park {
+                        reason: "pause".to_string(),
+                    },
+                    IdeaEventType::LifecycleTransitioned,
+                ),
+                (
+                    IdeaMutationActionV1::Reopen {
+                        reason: "resume".to_string(),
+                    },
+                    IdeaEventType::LifecycleTransitioned,
+                ),
+                (
+                    IdeaMutationActionV1::Abandon {
+                        reason: "stop".to_string(),
+                    },
+                    IdeaEventType::Abandoned,
+                ),
+                (
+                    IdeaMutationActionV1::TransitionStage {
+                        stage: IdeaStage::Shaping,
+                        reason: None,
+                    },
+                    IdeaEventType::StageTransitioned,
+                ),
+                (
+                    IdeaMutationActionV1::AddRelationship {
+                        relationship_kind: IdeaRelationshipKind::DependsOn,
+                        target_idea_id: target,
+                    },
+                    IdeaEventType::RelationshipChanged,
+                ),
+                (
+                    IdeaMutationActionV1::RemoveRelationship {
+                        relationship_kind: IdeaRelationshipKind::DerivedFrom,
+                        target_idea_id: target,
+                    },
+                    IdeaEventType::RelationshipChanged,
+                ),
+                (
+                    IdeaMutationActionV1::AcceptSupersession {
+                        replacement_idea_ids: vec![target],
+                    },
+                    IdeaEventType::Superseded,
+                ),
+            ];
+            for (action, event_type) in actions {
+                assert_eq!(action.event_type(), event_type);
+            }
+            assert_eq!(
+                IdeaEventPageRequestV1 {
+                    after_sequence: 0,
+                    limit: None
+                }
+                .validated_limit()
+                .unwrap(),
+                100
+            );
+            for request in [
+                IdeaEventPageRequestV1 {
+                    after_sequence: -1,
+                    limit: Some(1),
+                },
+                IdeaEventPageRequestV1 {
+                    after_sequence: 0,
+                    limit: Some(0),
+                },
+                IdeaEventPageRequestV1 {
+                    after_sequence: 0,
+                    limit: Some(257),
+                },
+            ] {
+                assert!(request.validated_limit().is_err());
+            }
+        }
+
+        #[test]
+        fn idea_event_cas_rejects_invalid_requests_and_normalizes_targets() {
+            let project_id = Uuid::new_v4();
+            let idea_id = Uuid::new_v4();
+            for key in ["", " ", "nul\0key"] {
+                let mut request = d02_create_request();
+                request.idempotency_key = key.to_string();
+                assert!(request.normalized().is_err());
+            }
+            let mut oversized_key = d02_create_request();
+            oversized_key.idempotency_key = "x".repeat(129);
+            assert!(oversized_key.normalized().is_err());
+            assert!(Sha256Digest::parse(format!("sha256:{}", "A".repeat(64))).is_err());
+
+            let first = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+            let second = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+            let mutation = MutateIdeaRequestV1 {
+                expected_row_version: 1,
+                idempotency_key: "supersede".to_string(),
+                action: IdeaMutationActionV1::AcceptSupersession {
+                    replacement_idea_ids: vec![second, first, second],
+                },
+                artifact_digests: vec![d02_digest('b'), d02_digest('a'), d02_digest('b')],
+                evidence_digests: Vec::new(),
+            };
+            let normalized = mutation.normalized().unwrap();
+            assert_eq!(
+                normalized.artifact_digests,
+                vec![d02_digest('a'), d02_digest('b')]
+            );
+            assert_eq!(
+                normalized.action,
+                IdeaMutationActionV1::AcceptSupersession {
+                    replacement_idea_ids: vec![first, second]
+                }
+            );
+            let envelope = normalized
+                .semantic_envelope(project_id, idea_id, "operator")
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<IdeaSemanticRequestV1>(&envelope.canonical_json().unwrap())
+                    .unwrap(),
+                envelope
+            );
+
+            for invalid_action in [
+                IdeaMutationActionV1::ChangeProjection {
+                    sigil: None,
+                    title: None,
+                    description: None,
+                    portfolio_summary: None,
+                    priority: None,
+                },
+                IdeaMutationActionV1::AcceptSupersession {
+                    replacement_idea_ids: Vec::new(),
+                },
+                IdeaMutationActionV1::AddRelationship {
+                    relationship_kind: IdeaRelationshipKind::Supersedes,
+                    target_idea_id: first,
+                },
+            ] {
+                assert!(
+                    MutateIdeaRequestV1 {
+                        expected_row_version: 1,
+                        idempotency_key: "invalid-action".to_string(),
+                        action: invalid_action,
+                        artifact_digests: Vec::new(),
+                        evidence_digests: Vec::new(),
+                    }
+                    .normalized()
+                    .is_err()
+                );
+            }
+
+            let mut value = serde_json::to_value(&mutation).unwrap();
+            for forbidden in [
+                "project_id",
+                "idea_id",
+                "actor_kind",
+                "actor_id",
+                "session_id",
+                "controller_session_id",
+                "controller_epoch",
+                "event_id",
+                "event_type",
+                "occurred_at",
+                "resulting_row_version",
+                "fingerprint",
+                "deduplicated",
+            ] {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(forbidden.to_string(), serde_json::json!("spoof"));
+                assert!(
+                    serde_json::from_value::<MutateIdeaRequestV1>(value.clone()).is_err(),
+                    "mutation admitted reserved field {forbidden}"
+                );
+                value.as_object_mut().unwrap().remove(forbidden);
+            }
+            assert!(
+                serde_json::from_value::<MutateIdeaRequestV1>(serde_json::json!({
+                    "expected_row_version": 1,
+                    "idempotency_key": "split",
+                    "action": {"kind": "split", "children": []}
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn controller_control_ids_and_canonical_request_are_deterministic() -> Result<(), String> {
+        let project_id = Uuid::parse_str("10000000-0000-0000-0000-000000000001")
+            .map_err(|error| error.to_string())?;
+        let idea_id = Uuid::parse_str("20000000-0000-0000-0000-000000000002")
+            .map_err(|error| error.to_string())?;
+        let reservation_id = idea_controller_reservation_id(idea_id, "rotation:source:1");
+        let candidate_session_id = idea_controller_candidate_session_id(reservation_id);
+        assert_eq!(
+            reservation_id,
+            idea_controller_reservation_id(idea_id, "rotation:source:1")
+        );
+        assert_eq!(
+            candidate_session_id,
+            idea_controller_candidate_session_id(reservation_id)
+        );
+        assert_ne!(
+            reservation_id,
+            idea_controller_reservation_id(idea_id, "rotation:source:2")
+        );
+
+        let request = IdeaControllerControlRequestV1 {
+            domain: IDEA_CONTROLLER_CONTROL_V1.to_string(),
+            project_id,
+            idea_id,
+            actor_kind: IdeaActorKind::System,
+            actor_id: "rsid:controller-transfer".to_string(),
+            operation: IdeaControllerControlOperationV1::Reserve {
+                transfer_intent_key: "rotation:source:1".to_string(),
+                expected_row_version: 7,
+                observed_controller_epoch: 3,
+                base_controller_session_id: None,
+                base_controller_epoch: 3,
+                base_row_version: 7,
+                reservation_id,
+                candidate_session_id,
+                proposed_epoch: 4,
+                lease_seconds: IDEA_CONTROLLER_RESERVATION_LEASE_SECONDS,
+            },
+        };
+        let canonical = request.canonical_json()?;
+        assert_eq!(
+            serde_json::from_str::<IdeaControllerControlRequestV1>(&canonical)
+                .map_err(|error| error.to_string())?,
+            request
+        );
+        assert_eq!(request.canonical_json()?, canonical);
+        Ok(())
+    }
+
+    #[test]
+    fn controller_control_inputs_reject_identity_spoofing_and_unknown_fields() -> Result<(), String>
+    {
+        let reserve = ReserveIdeaControllerRequestV1 {
+            expected_row_version: 1,
+            transfer_intent_key: "fresh:one".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_value::<ReserveIdeaControllerRequestV1>(
+                serde_json::to_value(&reserve).map_err(|error| error.to_string())?
+            )
+            .map_err(|error| error.to_string())?,
+            reserve
+        );
+        for forbidden in [
+            "project_id",
+            "idea_id",
+            "reservation_id",
+            "candidate_session_id",
+            "controller_epoch",
+            "actor_id",
+            "expires_at",
+        ] {
+            let mut value = serde_json::to_value(&reserve).map_err(|error| error.to_string())?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| "reserve fixture must serialize as an object".to_string())?
+                .insert(forbidden.to_string(), serde_json::json!("spoof"));
+            assert!(
+                serde_json::from_value::<ReserveIdeaControllerRequestV1>(value).is_err(),
+                "reserve input admitted privileged field {forbidden}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<ControllerReleaseReasonV1>(serde_json::json!("Unclassified"))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn controller_mutation_is_a_closed_two_action_domain() -> Result<(), String> {
+        let projection: IdeaControllerMutationActionV1 =
+            serde_json::from_value(serde_json::json!({
+                "kind": "change_projection",
+                "title": "controller-owned projection"
+            }))
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            projection,
+            IdeaControllerMutationActionV1::ChangeProjection { .. }
+        ));
+        let transition: IdeaControllerMutationActionV1 =
+            serde_json::from_value(serde_json::json!({
+                "kind": "transition_stage",
+                "stage": "Shaping"
+            }))
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            transition,
+            IdeaControllerMutationActionV1::TransitionStage { .. }
+        ));
+        for forbidden_kind in [
+            "transition_lifecycle",
+            "add_relationship",
+            "remove_relationship",
+            "accept_supersession",
+            "release_assigned",
+        ] {
+            assert!(
+                serde_json::from_value::<IdeaControllerMutationActionV1>(serde_json::json!({
+                    "kind": forbidden_kind,
+                    "reason": "spoof"
+                }))
+                .is_err(),
+                "controller mutation admitted {forbidden_kind}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn d04_source_finding_ref_canonical_grammar_and_serde() -> Result<(), String> {
+        let value = format!("finding:v1:sha256:{}:F-D04-001", "a".repeat(64));
+        let reference = IssueSourceFindingRef::parse(value.clone())?;
+        assert_eq!(reference.as_str(), value);
+        assert_eq!(reference.stable_id(), "F-D04-001");
+        assert_eq!(
+            reference.artifact_digest().as_str(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            serde_json::to_string(&reference).map_err(|error| error.to_string())?,
+            format!("\"{value}\"")
+        );
+        assert!(IssueSourceFindingRef::parse(value.replace("F-D04-001", "bad space")).is_err());
+        assert!(IssueSourceFindingRef::parse(value.replacen('a', "A", 1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn issue_status_transition_matrix_is_exhaustive() {
+        use IssueStatus::{Cancelled, Closed, InProgress, Open};
+        let statuses = [Open, InProgress, Closed, Cancelled];
+        let expected = [
+            [false, true, true, true],
+            [true, false, true, true],
+            [true, false, false, false],
+            [true, false, false, false],
+        ];
+        for (source_index, source) in statuses.into_iter().enumerate() {
+            for (target_index, target) in statuses.into_iter().enumerate() {
+                let result = validate_agent_issue_status_transition(source, target);
+                assert_eq!(
+                    result.is_ok(),
+                    expected[source_index][target_index],
+                    "unexpected Issue transition decision for {source:?}->{target:?}"
+                );
+                if source == target {
+                    assert_eq!(result, Err(IssueStatusTransitionErrorV1::NoSemanticChange));
+                } else if !expected[source_index][target_index] {
+                    assert_eq!(result, Err(IssueStatusTransitionErrorV1::InvalidTransition));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_semantic_request_is_typed_canonical_and_fingerprint_stable() -> Result<(), String> {
+        let issue_id = Uuid::new_v4();
+        let request = IssueSemanticRequestV1::new(IssueSemanticOperationV1::ContentUpdated {
+            issue_id,
+            expected_row_version: 7,
+            patch: IssueContentPatchV1 {
+                body: Some("complete semantic body".to_string()),
+                clear_priority: true,
+                ..IssueContentPatchV1::default()
+            },
+        });
+        let canonical = request.canonical_json()?;
+        assert_eq!(request.fingerprint()?, request.fingerprint()?);
+        let decoded: IssueSemanticRequestV1 =
+            serde_json::from_str(&canonical).map_err(|error| error.to_string())?;
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.canonical_json()?, canonical);
+        assert_eq!(
+            request.operation.event_operation(),
+            IssueEventOperationV1::ContentUpdated
+        );
+
+        let reordered = serde_json::json!({
+            "patch": {"clear_priority":true,"body":"complete semantic body"},
+            "expected_row_version": 7,
+            "issue_id": issue_id,
+            "operation": "content_updated",
+            "domain": ISSUE_SEMANTIC_REQUEST_DOMAIN_V1,
+        });
+        let reordered: IssueSemanticRequestV1 =
+            serde_json::from_value(reordered).map_err(|error| error.to_string())?;
+        assert_eq!(reordered.canonical_json()?, canonical);
+
+        for malformed in [
+            serde_json::json!({
+                "domain": "rsi.issue.request/v2", "operation": "archived",
+                "issue_id": issue_id, "expected_row_version": 1
+            }),
+            serde_json::json!({
+                "domain": ISSUE_SEMANTIC_REQUEST_DOMAIN_V1, "operation": "archived",
+                "issue_id": Uuid::nil(), "expected_row_version": 1
+            }),
+            serde_json::json!({
+                "domain": ISSUE_SEMANTIC_REQUEST_DOMAIN_V1, "operation": "archived",
+                "issue_id": issue_id, "expected_row_version": 0
+            }),
+            serde_json::json!({
+                "domain": ISSUE_SEMANTIC_REQUEST_DOMAIN_V1, "operation": "archived",
+                "issue_id": issue_id, "expected_row_version": 1, "actor_session_id": Uuid::new_v4()
+            }),
+        ] {
+            let parsed = serde_json::from_value::<IssueSemanticRequestV1>(malformed);
+            assert!(parsed.is_err() || parsed.unwrap().validate().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_custody_v1_wire_is_closed_and_versioned() {
+        let error = SandboxCustodyErrorV1 {
+            version: 1,
+            code: SandboxCustodyErrorCodeV1::OwnershipConflict,
+            session_id: Some(Uuid::nil()),
+            transition: SandboxCustodyTransitionV1::Rotation,
+            retryable: false,
+            recovery: SandboxCustodyRecoveryV1::InspectStatus,
+        };
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], "ownership_conflict");
+        let reclaim = SandboxCustodyErrorCodeV1::ReclaimPrepared;
+        assert_eq!(reclaim.as_str(), "reclaim_prepared");
+        assert_eq!(
+            serde_json::from_str::<SandboxCustodyErrorCodeV1>("\"reclaim_prepared\"").unwrap(),
+            reclaim
+        );
+        assert!(
+            serde_json::from_value::<SandboxCustodyErrorCodeV1>(serde_json::json!(
+                "unbounded_error"
+            ))
+            .is_err()
+        );
+    }
+}
+
+/// V99 (P1-A / P1-C): the new `Session` / `TurnMetric` fields must be
+/// backward-compatible on the wire. Every one carries `#[serde(default)]`, so
+/// a payload serialized before this change — by an older daemon or an older
+/// TUI in a version-skewed pair — must still deserialize.
+#[cfg(test)]
+mod v99_field_serde_tests {
+    use super::*;
+
+    /// A pre-V99 `Session` payload has none of the new keys. It must decode
+    /// without error, with the new fields at their defaults.
+    #[test]
+    fn pre_v99_session_payload_still_deserializes() {
+        let payload = serde_json::json!({
+            "id": "0f3a1c2e-4b5d-4e6f-8091-a2b3c4d5e6f7",
+            "status": "Running",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "query": "hello",
+            "working_dir": "/tmp/test",
+            "claude_session_id": serde_json::Value::Null,
+        });
+
+        let session: Session =
+            serde_json::from_value(payload).expect("a pre-V99 payload must still decode");
+
+        assert_eq!(session.provider_cli_version, None);
+        assert!(session.provider_capabilities.is_empty());
+        assert_eq!(session.thinking_tokens, None);
+        assert_eq!(session.service_tier, None);
+        assert_eq!(session.cache_creation_1h_tokens, None);
+        assert_eq!(session.cache_creation_5m_tokens, None);
+        assert_eq!(session.permission_denial_count, None);
+        assert_eq!(session.subagent_stats_json, None);
+        assert_eq!(session.queued_turn_count, None);
+        assert_eq!(session.terminal_reason, None);
+        // And the pre-existing fields still mean what they meant.
+        assert_eq!(session.query, "hello");
+        assert_eq!(session.status, SessionStatus::Running);
+    }
+
+    /// A payload WITH the new keys round-trips their values intact.
+    #[test]
+    fn v99_session_fields_round_trip_when_present() {
+        let mut session: Session = serde_json::from_value(serde_json::json!({
+            "id": "0f3a1c2e-4b5d-4e6f-8091-a2b3c4d5e6f7",
+            "status": "Completed",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "query": "hello",
+            "working_dir": "/tmp/test",
+            "claude_session_id": serde_json::Value::Null,
+        }))
+        .expect("base payload decodes");
+
+        session.provider_cli_version = Some("2.1.259".to_string());
+        session.provider_capabilities = vec![
+            "interrupt_receipt_v1".to_string(),
+            "msg_lifecycle_v1".to_string(),
+        ];
+        session.thinking_tokens = Some(640);
+        session.service_tier = Some("standard".to_string());
+        session.cache_creation_1h_tokens = Some(7411);
+        session.cache_creation_5m_tokens = Some(0);
+        session.permission_denial_count = Some(2);
+        session.subagent_stats_json = Some(r#"{"spawned":0}"#.to_string());
+        session.queued_turn_count = Some(3);
+        session.terminal_reason = Some("completed".to_string());
+
+        let encoded = serde_json::to_value(&session).expect("session serializes");
+        let decoded: Session = serde_json::from_value(encoded).expect("session round-trips");
+
+        assert_eq!(decoded.provider_cli_version.as_deref(), Some("2.1.259"));
+        assert_eq!(
+            decoded.provider_capabilities,
+            vec![
+                "interrupt_receipt_v1".to_string(),
+                "msg_lifecycle_v1".to_string()
+            ]
+        );
+        assert_eq!(decoded.thinking_tokens, Some(640));
+        assert_eq!(decoded.service_tier.as_deref(), Some("standard"));
+        assert_eq!(decoded.cache_creation_1h_tokens, Some(7411));
+        assert_eq!(decoded.cache_creation_5m_tokens, Some(0));
+        assert_eq!(decoded.permission_denial_count, Some(2));
+        assert_eq!(
+            decoded.subagent_stats_json.as_deref(),
+            Some(r#"{"spawned":0}"#)
+        );
+        assert_eq!(decoded.queued_turn_count, Some(3));
+        assert_eq!(decoded.terminal_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn pre_v99_turn_metric_payload_still_deserializes() {
+        let payload = serde_json::json!({
+            "id": 1,
+            "session_id": "0f3a1c2e-4b5d-4e6f-8091-a2b3c4d5e6f7",
+            "turn_number": 1,
+            "input_tokens": 100,
+            "cache_creation_tokens": 200,
+            "cache_read_tokens": 300,
+            "output_tokens": 50,
+            "stop_reason": serde_json::Value::Null,
+            "tools_used": serde_json::Value::Null,
+            "tool_count": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+        });
+
+        let metric: TurnMetric =
+            serde_json::from_value(payload).expect("a pre-V99 payload must still decode");
+
+        assert_eq!(metric.thinking_tokens, 0);
+        assert_eq!(metric.cache_creation_1h_tokens, 0);
+        assert_eq!(metric.cache_creation_5m_tokens, 0);
+        assert_eq!(metric.service_tier, None);
+        // Pre-existing counters unchanged.
+        assert_eq!(metric.input_tokens, 100);
+        assert_eq!(metric.cache_creation_tokens, 200);
+        assert_eq!(metric.output_tokens, 50);
+    }
+
+    #[test]
+    fn v99_turn_metric_fields_round_trip_when_present() {
+        let payload = serde_json::json!({
+            "id": 1,
+            "session_id": "0f3a1c2e-4b5d-4e6f-8091-a2b3c4d5e6f7",
+            "turn_number": 1,
+            "input_tokens": 100,
+            "cache_creation_tokens": 200,
+            "cache_read_tokens": 300,
+            "output_tokens": 50,
+            "stop_reason": serde_json::Value::Null,
+            "tools_used": serde_json::Value::Null,
+            "tool_count": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "thinking_tokens": 640,
+            "cache_creation_1h_tokens": 7411,
+            "cache_creation_5m_tokens": 0,
+            "service_tier": "standard",
+        });
+
+        let metric: TurnMetric = serde_json::from_value(payload).expect("payload decodes");
+        assert_eq!(metric.thinking_tokens, 640);
+        assert_eq!(metric.cache_creation_1h_tokens, 7411);
+        assert_eq!(metric.cache_creation_5m_tokens, 0);
+        assert_eq!(metric.service_tier.as_deref(), Some("standard"));
+    }
+}
+
+/// V99 (P1-B): `HealthStatusResponse.rate_limits` is additive and defaulted,
+/// so a version-skewed daemon that does not send it still decodes.
+#[cfg(test)]
+mod v99_rate_limit_rpc_tests {
+    use crate::rpc::{HealthStatusResponse, ProviderRateLimitSnapshot, ProviderRateLimitWindow};
+    use crate::types::SessionProvider;
+
+    #[test]
+    fn health_status_without_rate_limits_decodes_to_an_empty_list() {
+        let payload = serde_json::json!({
+            "persistence_queue_depth": 0,
+            "persistence_queue_capacity": 1024,
+            "last_command_duration_ms": 0,
+            "project_cache_size": 0,
+        });
+        let response: HealthStatusResponse =
+            serde_json::from_value(payload).expect("older daemon payload must decode");
+        assert!(
+            response.rate_limits.is_empty(),
+            "an absent field means no observation, not an error"
+        );
+    }
+
+    #[test]
+    fn peak_window_picks_the_most_consumed_window() {
+        // The status bar has room for one window; it must be the one that
+        // throttles first.
+        let snapshot = ProviderRateLimitSnapshot {
+            provider: SessionProvider::Claude,
+            status: None,
+            rate_limit_type: None,
+            overage_status: None,
+            is_using_overage: false,
+            observed_at: chrono::Utc::now(),
+            windows: vec![
+                ProviderRateLimitWindow {
+                    window_key: "seven_day".to_string(),
+                    utilization: 0.05,
+                    resets_at_epoch: None,
+                },
+                ProviderRateLimitWindow {
+                    window_key: "five_hour".to_string(),
+                    utilization: 0.82,
+                    resets_at_epoch: None,
+                },
+            ],
+        };
+        let peak = snapshot.peak_window().expect("a peak exists");
+        assert_eq!(peak.window_key, "five_hour");
+        assert_eq!(peak.utilization, 0.82);
+    }
+
+    #[test]
+    fn peak_window_of_an_empty_snapshot_is_none() {
+        let snapshot = ProviderRateLimitSnapshot {
+            provider: SessionProvider::Claude,
+            status: None,
+            rate_limit_type: None,
+            overage_status: None,
+            is_using_overage: false,
+            observed_at: chrono::Utc::now(),
+            windows: Vec::new(),
+        };
+        assert!(snapshot.peak_window().is_none());
+    }
+}

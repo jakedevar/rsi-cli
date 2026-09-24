@@ -1,0 +1,28 @@
+# Sessions to KEEP (exclude from archive batch).
+# Source: thoughts/shared/plans/2026-05-11-session-archive-and-branch-cleanup.md §2
+# 21 UUIDs total = 19 needs-continuation (B1-B19) + 1 ready-to-merge root + 1 active rotation
+
+# 19 needs-continuation rows from the evening audit (B1-B19)
+4486ffdf-7761-4aad-949b-19cdf5655847
+315d40c4-6ec7-4de8-be6a-6b0198e9dc27
+118b8c6c-beba-4dc3-a9b1-0719dc845499
+697d565f-91e3-4191-bd34-0c9d2a3db859
+62849e13-ba19-4de5-812f-adc48a9933c6
+4f329123-e2e5-4e39-aa50-9b37f3bc1542
+de57c219-316d-4a29-8638-402c949a4791
+843e7858-0e75-4b51-9f7f-baaa49204ec9
+c0218f60-8df6-480c-9dea-98efa26924dd
+45eb236f-d4ab-4149-9221-2f6c3c7cd1e3
+60359490-0c8b-4101-9b4e-dd6362a126e8
+de9b35f9-06ef-4e73-93d4-2561e27d5218
+61053963-8453-4655-8198-a753b77bf257
+bb5787d5-1384-461c-a49c-645d98e80bcc
+339a9e4c-65d9-4f7b-875f-d3f44f286067
+9c3534a3-6f1a-4679-9ea2-c579adb58d90
+8d4cc849-ae59-45be-9617-493248569e55
+e605a5d7-0f0c-45fa-9d38-08ba95ece22c
+5c036e9c-0e13-498b-82a5-b552138137e3
+# 1 ready-to-merge conversation root still alive (A1, owner of PR #10 work — now closed in favor of #17)
+c9f9b093-4e55-44c9-b3dd-60340e16c8a3
+# Active rotation/Running rows
+2b827d12-8243-4699-938b-bc1fa7684f7c

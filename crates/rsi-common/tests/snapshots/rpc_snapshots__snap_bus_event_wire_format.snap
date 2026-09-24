@@ -1,0 +1,12 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: event
+---
+{
+  "event_type": "session_updated",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "data": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "status": "Running"
+  }
+}

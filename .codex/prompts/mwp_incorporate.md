@@ -1,0 +1,220 @@
+---
+description: Prime and drive the MWP/ICM incorporation campaign via master_orchestrate program mode (freeze-gated, merge-safe slices)
+---
+
+# MWP / ICM Incorporation — campaign driver
+
+You are the master orchestrator for incorporating the Model Workspace Protocol
+(MWP) / Interpretable Context Methodology disciplines into RSI. You drive the work
+slice by slice through `/master_orchestrate` (program mode), merge-safe by
+construction, respecting the locked v1 freeze. You are the COORDINATOR, not the
+implementer: spawn Opus workers for every research/plan/implement/review/verify/
+document stage. If this harness cannot spawn workers, compile the exact downstream
+prompt, hand it to Jake, and stop — never pretend a worker ran.
+
+This command exists to defeat the stateless-AI effect: every fact this campaign
+needs already lives on disk. Read the canonical artifacts before acting, and TRUST
+CODE OVER TICKET METADATA — several tickets say `status: ready` while their
+deliverables have already partly landed.
+
+## The thesis (do not violate it)
+
+MWP says "for sequential, human-reviewed workflows, don't build a framework — use
+the filesystem." RSI *is* the framework — which the paper itself says is correct for
+concurrent/complex coding. So the task is NOT "replace RSI with folders." It is:
+absorb MWP's disciplines as constraints INSIDE RSI's framework. The research found
+RSI is effectively a superset of MWP and the disciplines map almost 1:1 onto the
+existing RSI-001…026 roadmap. You are sharpening shipped/ready work in a deliberate
+order — not inventing a new architecture, and not reimplementing what already landed.
+
+## Current state & freeze posture (READ BEFORE SCHEDULING ANYTHING)
+
+As of this campaign's authoring:
+
+- The v1 stabilization slices have ALL LANDED — `thoughts/shared/orchestration/2026-06-18-v1-stabilization-program-ledger.md` is `status: complete`.
+- There is NO `v1*` git tag yet (`git tag -l 'v1*'` is empty).
+- Freeze rule 1 (`thoughts/shared/project/2026-06-12-v1-stable-scope.md:14`) is STILL IN FORCE: "Feature freeze until v1.0 tag."
+- Therefore the true state is POST-MERGE, PRE-TAG/SOAK — not "burn-down active," and not "freeze lifted."
+
+Freeze posture for THIS campaign (default):
+
+- Gate 0 (planning + the shipped-delta audit below) is DOCS-ONLY and may run NOW.
+- NO implementation slice (Tier 0 remainder included) starts until EITHER the `v1.0`
+  tag exists, OR Jake explicitly edits/waives freeze rule 1 for the freeze-safe
+  meta-tooling in writing. Absent that, park all implementation until the tag.
+- Tier 2/3 is post-v1 regardless of any Tier-0/1 waiver.
+
+Do not treat "meta-tooling is freeze-safe" as self-authorization. The freeze rule is
+literal; only Jake lifts it.
+
+## Canonical artifacts (read first, in this order)
+
+1. RESEARCH (source of truth, but Tier-0 status is STALE — see audit):
+   `thoughts/shared/research/2026-06-18-mwp-icm-incorporation-feasibility.md` (+ `.json`).
+   The D1–D7 feasibility matrix, freeze split, cross-domain connections, Tier 0–3
+   sequencing. NOTE: its "ready" annotations predate the code that has since landed.
+2. FREEZE (LOCKED): `thoughts/shared/project/2026-06-12-v1-stable-scope.md` +
+   `2026-06-12-v1-triage.md`. v1 ledger (complete):
+   `thoughts/shared/orchestration/2026-06-18-v1-stabilization-program-ledger.md`.
+3. TICKETS: `thoughts/shared/tickets/rsi-harness/` RSI-014, RSI-021, RSI-012, RSI-025
+   (Tier-0, `ready` but partly landed); RSI-007/008/006/009 (post-v1/blocked).
+4. D1 FOUNDATION: `thoughts/shared/projects/verification-pipeline/INDEX.md`.
+5. CONVEYOR: `.claude/commands/master_orchestrate.md` — the slice lifecycle you run.
+6. STARTER ARTIFACTS (pre-generated skeletons — extend, don't recreate):
+   `thoughts/shared/plans/2026-06-29-mwp-icm-slice-plan.md` and
+   `thoughts/shared/orchestration/2026-06-29-mwp-program-ledger.md`.
+
+## Gate 0 — shipped-delta audit + plan + ledger (DOCS-ONLY; conflict domain: docs-plans)
+
+**Step A — SHIPPED-DELTA AUDIT** (mandatory; reconcile ticket metadata against code):
+For each Tier-0 ticket, diff what the ticket describes against what is ALREADY IN
+CODE, and record the genuine remaining delta only:
+
+- RSI-021: `crates/rsi-common/src/agent_contract.rs` ALREADY EXISTS. Do NOT recreate
+  it or "add" the contract. Audit what enforcement is wired vs missing.
+- RSI-012 / preamble: `.claude/commands/_shared/worker_preamble.md` is ALREADY
+  `version: 6` with the write-ordering rule and the `rsi-contract-validate` handoff.
+  Do NOT "bump v3→v4." Audit which per-kind templates still lack the contract block.
+- RSI-014: `crates/rsi-common/src/research_schema/` ships at `RESEARCH_SCHEMA_VERSION=1`.
+  Audit what structured-output surface remains.
+- RSI-025: audit whether the stale-sidecar CI hygiene is wired.
+
+Output a "Tier-0 remainder" list. If a ticket is effectively done in code, mark it
+CLOSE-ON-AUDIT and drop its slice.
+
+**Step B — RESOLVE THE THREE BLOCKER QUESTIONS, AND MUTATE SCOPE FROM THE ANSWERS**
+(not merely record them). Known answers to start from (verify, then propagate):
+
+- `compiled_prompts` is DB-BACKED (`crates/rsid/src/store/mod.rs:~722`), NOT git.
+  ⇒ D4/S11 reversibility requires DB-level prompt versioning + rollback; git alone is
+  insufficient. Rewrite S11's manifest accordingly.
+- `rsi-graph::CacheKey` is PERSISTED in `crates/rsid/src/store/graph_cache.rs` (3
+  columns). ⇒ D6/S10 is a schema-migration slice; expand its manifest (below).
+- `retry_attempt` "corrective burn" vs routine-retry classification: CONFIRM where (if
+  anywhere) this distinction is made; it gates D4 signal quality. If absent, S11 must
+  add the classification as a sub-step.
+
+**Step C — WRITE THE ARTIFACTS** (extend the pre-generated skeletons):
+
+- SLICE PLAN: `thoughts/shared/plans/2026-06-29-mwp-icm-slice-plan.md` — for every
+  slice: goal, non-goals, conflict domain, file manifest (creates vs modifies,
+  INCLUDING storage/migration/test files), freeze status, dependencies, pinning test,
+  done-means.
+- PROGRAM LEDGER: `thoughts/shared/orchestration/2026-06-29-mwp-program-ledger.md`
+  (already modeled on `2026-06-13-v1-program-ledger.md`).
+
+Then STOP for Jake's go + freeze decision. Do not implement.
+
+## The merge-safe slice map (spine — drive in order, WIP = 1)
+
+Conflict-domain serialization is the whole game. Slices sharing a file are STRICTLY
+SERIAL. Parallel is forbidden unless Jake authorizes AND file sets are disjoint AND
+domains differ AND no dangerous gate is owned AND the ledger records both. Because
+"scope is sacred" (below) is enforced, Gate 0 MUST expand every manifest to include
+the storage/migration/test files a slice truly needs BEFORE implementation — an
+incomplete manifest makes a worker correctly halt.
+
+**TIER 0 — freeze-safe REMAINDER only** (post-audit; most may CLOSE-ON-AUDIT):
+
+- S1 · RSI-014 structured-research remainder · `rsi-common/research_schema` · foundation for D5
+- S2 · RSI-021 contract-enforcement remainder · `rsi-common/agent_contract.rs` (EXISTS) + wiring
+- S3 · RSI-012 per-kind template remainder · `.claude/commands/_shared` (preamble is v6)
+- S4 · RSI-025 stale-sidecar remainder · CI hygiene (docs-plans)
+- [verification-pipeline V1.2 rollout = D1 foundation — coordinate, don't duplicate]
+
+**TIER 1 — MWP sharpening on the foundation** (freeze-safe meta-tooling):
+
+- S5 · D5 Provenance IDs · add `id: Option<String>` to `Finding` AND bump
+  `RESEARCH_SCHEMA_VERSION` 1→2 as a STRICT SUPERSET (`rules.rs` already specifies this
+  path: new fields `Option<T>`, v1 docs stay valid — no forced backfill). Manifest:
+  `research_schema/schema.rs` + `research_schema/rules.rs` + validator tests. THE JOIN
+  KEY — do first; unblocks S6 and S11. Serial after S1.
+- S6 · D1 Cross-stage linkage · add `satisfies:`/`covers:` to `VerificationItem`
+  (`verification_manifest.rs`) + a cross-stage VERIFY pass in `agent_contract.rs` + give
+  `validate_plan` a machine schema. Consumes S5 IDs. Serial after S5.
+- S7 · D3 Stage-contract block · Inputs/Process/Outputs/Verify section in the per-kind
+  preambles still missing it + a `scan_sections` validator (`handoff_schema/body.rs`).
+  MUST allow declared static inputs + a code-discovery budget (grep-found inputs — do
+  not over-constrain). Serial after S6 (shares `agent_contract.rs`).
+- S8 · D7a Token instrumentation · promote the per-block debug log in
+  `crates/rsid/src/session/context_pipeline.rs` to per-layer (L0–L4) telemetry.
+  BORDERLINE-FREEZE + Jake-gated. The PLAN MUST FIRST DEFINE THE TELEMETRY CONTRACT:
+  the sink (structured tracing event vs a store table vs a `turn_metrics` extension vs
+  an RPC field), which store/RPC/log schema changes are in scope, and the pinning test
+  (assert per-layer token counts emitted for a known assembly). No implementation until
+  that contract is in the plan. File-disjoint from S1–S7 ⇒ parallel only with explicit
+  authorization.
+
+```text
+==================  FREEZE / TAG GATE — HARD STOP  ==================
+Everything above is parked until the `v1.0` tag or an explicit Jake freeze waiver.
+Everything below requires the `v1.0` tag unconditionally (post-v1 product/daemon;
+meta-harness TND#17). Verify the tag, then stop and ask Jake before Tier 2.
+====================================================================
+```
+
+**TIER 2 — post-v1 product/daemon** (gated):
+
+- S9 · D2 Reference/working split · labeled L3/L4 sections at
+  `crates/rsid/src/session/launch.rs:~407` + fold preamble `version:` into `harness_hash`
+  inputs + A/B via RSI-008. Measure before keeping (open empirical question — do not
+  break freeze for an unmeasured prompt change).
+- S10 · D6 Content-staleness · extend `CacheKey` with artifact-content hashes AND its
+  persistence. MANIFEST (schema-migration gate): `crates/rsi-graph/src/cache.rs` +
+  `crates/rsid/src/store/graph_cache.rs` + a store migration with `user_version` bump +
+  persistence tests + review of RPC cache-hit/miss behavior +
+  `recursive_dag/scheduler_core.rs` staleness check. Hash-based first, semantic later.
+- S11 · D4 Edit-source loop — MVP, PROPOSE-ONLY · capture correction signals (human
+  edits, validator rejections, manifest failures) → recurring-pattern aggregation →
+  extend `dreamer/deduction.rs` to PROPOSE a preamble/contract diff. Reversibility:
+  because `compiled_prompts` is DB-backed, add DB prompt versioning + rollback (git alone
+  is insufficient). Human-gated, NEVER auto-apply. (security-boundary — self-mutation.)
+  Depends on RSI-003/005/006 + the `retry_attempt` "corrective burn" classification from
+  Gate 0.
+
+**TIER 3 — strategic/exploratory** (post-v1):
+
+- S12 · D7b glass-box workspace-view · S13 · D7c MWP-mode lane (justify before build)
+- S14 · D4 full loop (still human-gated, never auto-apply).
+
+## How to drive each slice (once unfrozen/tagged)
+
+```text
+/master_orchestrate thoughts/shared/plans/2026-06-29-mwp-icm-slice-plan.md
+mode: program
+ledger: thoughts/shared/orchestration/2026-06-29-mwp-program-ledger.md
+domain_gate_pack: thoughts/shared/project/2026-06-12-v1-stable-scope.md
+stop_after_slice: true
+allow_parallel: false
+```
+
+## Rules the conveyor must honor (non-negotiable)
+
+- **Freeze first.** No implementation before the `v1.0` tag or an explicit Jake waiver
+  of freeze rule 1. Gate 0 is the only docs-only exception.
+- **WIP = 1.** One slice in flight; next slice forbidden while the repo is dirty.
+- **Branch/worktree per slice** (`rsi/mwp-<slice-id>`); merge to main ONLY after
+  `cargo test --workspace` + `cargo clippy --workspace` green AND the pinning test
+  exists. Rebase downstream slices onto new main before they start.
+- **Ratchet.** Every slice closes with the test that pins it. No pinning test = not done.
+- **Scope is sacred, manifests are complete.** The manifest is the merge contract. A
+  worker needing a file outside its manifest STOPS and escalates. Gate 0 is responsible
+  for making manifests complete (incl. storage/migration/tests) so this never triggers
+  on a foreseeable file.
+- **Trust code over ticket status.** Never reimplement a landed deliverable; close-on-audit.
+- **Schema/migration slices (S5/S6/S10)** require a version/`user_version` bump + a
+  back-compat plan (strict-superset for research schema; migration + persistence tests
+  for `graph_cache`). Existing docs/rows must stay valid.
+- **D4 (S11/S14) is propose-only forever** in this campaign. Auto-apply is forbidden.
+- **Documentation is a required obligation** (`master_orchestrate`
+  §Implementation, Verification, And Documentation); implementation owner updates
+  due docs in same source revision.
+- **Workers are Opus**; every worker applies the Seven-Expert lenses from CLAUDE.md.
+
+## Done = the seven disciplines absorbed, freeze honored
+
+Gate 0 audit done and Tier-0 remainder truthfully scoped (landed work closed, not
+redone); Tier 0/1 landed as freeze-safe meta-tooling — each with a pinning test — only
+after the tag or an explicit waiver; Tier 2/3 sequenced behind the `v1.0` tag with D4
+propose-only. Never imply the next slice is auto-authorized: state the blocker if not
+ready; if ready, state the next allowed work and wait for Jake.

@@ -1,0 +1,12 @@
+Implement a Rust function `migration_version(filename: &str) -> Option<u32>`
+that extracts the integer version from migration filenames matching the
+pattern `V<N>__<name>.sql` (for example, `V12__add_users.sql` returns
+`Some(12)` and `V3__init.sql` returns `Some(3)`). Return `None` for any
+malformed input — missing `V` prefix, missing double-underscore separator,
+or non-numeric version. Initialize a cargo library project if one does not
+exist (`cargo init --lib`), place the function in `src/lib.rs` with a
+`#[cfg(test)]` module covering single-digit and multi-digit happy-path
+cases plus malformed cases (missing prefix, no double-underscore,
+non-numeric version), run `cargo test` to confirm the tests pass, run
+`cargo clippy --workspace -- -D warnings` to confirm cleanliness, and
+report the function signature in a one-sentence summary.

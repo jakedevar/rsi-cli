@@ -1,0 +1,103 @@
+[package]
+name = "rsid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rsid"
+path = "src/main.rs"
+
+[[bin]]
+name = "rsi-rolling-land"
+path = "src/bin/rsi-rolling-land.rs"
+
+[[bin]]
+name = "rsi-recursive-dag-smoke-fixture"
+path = "src/bin/rsi-recursive-dag-smoke-fixture.rs"
+required-features = ["dev-fixtures"]
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+rsi-graph = { path = "../rsi-graph" }
+rsi-codegraph = { path = "../rsi-codegraph" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+dotenvy = { workspace = true }
+thiserror = { workspace = true }
+which = { workspace = true }
+nix = { workspace = true }
+rusqlite = { workspace = true, features = ["load_extension", "functions"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+anyhow = "1"
+async-trait = "0.1"
+regex = { workspace = true }
+reqwest = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tiktoken-rs = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2"
+notify = "7"
+serde_yaml_ng = { workspace = true }
+toml = "0.8"
+minijinja = { workspace = true }
+parking_lot = "0.12"
+lru = "0.16"
+blake3 = "1"
+rand = { workspace = true }
+tempfile = "3"
+similar = "2.7"
+
+# Optional: heap profiling (Phase 0.4) — enabled via `dhat-heap` feature
+dhat = { version = "0.3", optional = true }
+# Optional: tokio-console subscriber (Phase 0.6) — enabled via `tokio-console` feature
+console-subscriber = { version = "0.4", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[build-dependencies]
+blake3 = "1"
+cc = "1"
+
+[dev-dependencies]
+rusqlite = { workspace = true, features = ["backup"] }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+mockito = "1"
+wiremock = "0.6"
+temp-env = { workspace = true, features = ["async_closure"] }
+criterion = { workspace = true }
+
+[features]
+default = []
+test-ollama = []
+dev-fixtures = ["rusqlite/backup"]
+# Heap profiling — gates `tests/dhat_baseline.rs` + `#[global_allocator]` setup.
+dhat-heap = ["dep:dhat"]
+# tokio-console subscriber — gates conditional init in main.rs (RSI_TOKIO_CONSOLE=1).
+tokio-console = ["dep:console-subscriber"]
+
+[[bench]]
+name = "store_worker_flush"
+harness = false
+
+[[bench]]
+name = "restore_sessions"
+harness = false
+
+[lints]
+workspace = true

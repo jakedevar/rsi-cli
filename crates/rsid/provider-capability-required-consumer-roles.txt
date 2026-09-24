@@ -1,0 +1,21 @@
+# Independent C4c acceptance anchor. This file is intentionally not generated
+# from CONSUMER_INVENTORY: removing a validator entry must leave a failing
+# required-role witness until the capability contract is explicitly revised.
+startup-catalog-refresh
+launch
+restoration-reopen
+live-monitor
+memory-flush
+rotation
+context-injection
+harness-full-window-compaction
+persistence
+rpc-session
+bus-publication
+polling
+f3-detail
+detail-header-context
+wide-inspector-detail
+wide-inspector-compact
+session-list-compact-row
+tests

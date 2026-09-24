@@ -1,0 +1,19 @@
+{
+  "provider": "codex-cli 0.153.4",
+  "generation_command": "codex app-server generate-json-schema --out /tmp/ham-v2-provider-schema",
+  "source_sha256": {
+    "CommandExecutionRequestApprovalResponse.json": "6d0767113e22f311381809b6b236b0dde2b99b01992879c26bf7b1ea0e003cb7",
+    "FileChangeRequestApprovalResponse.json": "b95b03ee6be674e25cee2e863cc135a28620e1070addd2f34685aadee27cde08",
+    "RequestId.json": "9c72d59a306d827113020c6d31a14c326d55210d9bd6954f825196a52009f1c7",
+    "ServerRequest.json": "31f580ad468fbd18766eb7adb12744be4e3790e3357b58bd4413c0108c4f65d0",
+    "CommandExecutionRequestApprovalParams.json": "16a71816c2d66e319c2c4aa83dd636dfdc43c61e72b6d5475e421ce08d8e6558",
+    "FileChangeRequestApprovalParams.json": "13848b26814c286ad6425a20d01c1691c86790e1f9e2529399677a8a22fe0d18",
+    "ExecCommandApprovalResponse.json": "80dba6d9f28d19c57960db72340554c193624f014cd496714a0c7aabe1120046",
+    "ApplyPatchApprovalResponse.json": "a5e145b4794ea91da6eb478626fac96bbbd4485c3399fabd1c9972d53d2d9010"
+  },
+  "excerpts": {
+    "ServerRequest-methods.json": "All oneOf method enum values and their params references, in source order.",
+    "ApprovalParams-required.json": "Exact required keys and their property schemas. Optional properties and definitions omitted."
+  },
+  "availableDecisions": "Not declared by the installed 0.153.4 params schemas. If supplied by a backend, constrain replies to its explicit array of offered decisions; do not add a permissive default for malformed or empty arrays."
+}

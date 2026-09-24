@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "git_commit": "167fce48c1cc35ef88065b7e885437d21eb756ce",
+  "captured_at": "2026-04-26T23:41:02Z",
+  "build": {
+    "wall_clock_seconds": 0.102
+  },
+  "coverage": {
+    "workspace_pct": 50.535343723784706,
+    "per_crate": {
+      "flywheel-imessage": 42.752100840336134,
+      "flywheel-signal": 53.14685314685315,
+      "rsi": 34.78834609811633,
+      "rsi-common": 93.23725055432372,
+      "rsi-graph": 91.88907111972566,
+      "rsi-signal": 0,
+      "rsid": 56.53822185292896
+    }
+  },
+  "mutants": {
+    "kill_rate_pct_per_crate": {
+      "rsi-common": 65,
+      "rsi": 24
+    }
+  },
+  "criterion": {
+    "median_ns": {
+      "rpc_decode_ListSessions": 101.24192016690598,
+      "ui_height_event_rendered_height/message_user": 4378.807562466773,
+      "ui_height_event_rendered_height/message_assistant": 46344.0105181277,
+      "ui_height_event_rendered_height/tool_use": 1635.2619836413105,
+      "ui_height_event_rendered_height/tool_result": 3112.7414048991063,
+      "store_worker_flush_insert_events/n_10": 195562.7083333333,
+      "store_worker_flush_insert_events/n_100": 848330.8,
+      "store_worker_flush_insert_events/n_1000": 6521309.8,
+      "rpc_decode_GetConversationsSince": 1451.4604683887624,
+      "ui_height_update_event_heights/n_10": 166065.20710784313,
+      "ui_height_update_event_heights/n_100": 1483590.8719715956,
+      "ui_height_update_event_heights/n_1000": 14914553.625,
+      "ui_content_parse_content/medium": 158.1698590418918,
+      "ui_content_parse_content/large": 5068.5506854256855,
+      "ui_content_parse_content/small": 16.225525374809514,
+      "rpc_decode_LaunchSession": 540.0496523299846,
+      "ui_content_render_markdown_line_medium_doc": 3313.507542205283,
+      "restore_sessions_load_sessions/n_10": 39228.015837104074,
+      "restore_sessions_load_sessions/n_100": 197270.1879843225,
+      "restore_sessions_load_sessions/n_500": 935821.0623781676,
+      "ui_content_parse_inline_markdown/line_0": 258.5763725904703,
+      "ui_content_parse_inline_markdown/line_3": 399.2402723241622,
+      "ui_content_parse_inline_markdown/line_1": 356.18060126333575,
+      "ui_content_parse_inline_markdown/line_2": 490.8528546528173
+    }
+  },
+  "dhat": {
+    "total_heap_bytes": 6565525,
+    "total_blocks": 12241
+  },
+  "noise_floor": {
+    "criterion_pct": 5.0,
+    "dhat_pct": 2.0
+  }
+}

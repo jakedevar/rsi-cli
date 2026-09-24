@@ -1,0 +1,15 @@
+pub mod chunking;
+pub mod embedding;
+pub mod files;
+pub mod flush;
+pub mod llm;
+pub mod manager;
+pub mod math;
+pub mod reindex;
+pub mod search;
+pub mod session_text;
+pub mod store;
+pub mod sync;
+pub mod types;
+pub mod watcher;
+pub mod worker;

@@ -1,0 +1,35 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "LaunchSession",
+  "params": {
+    "configured_context_window": null,
+    "continued_from": null,
+    "effort": null,
+    "group_id": null,
+    "is_eval": null,
+    "max_retries": 0,
+    "model": "claude-sonnet-5",
+    "openai_api_key": null,
+    "openai_base_url": null,
+    "parent_id": null,
+    "project_id": "00000000-0000-0000-0000-000000000002",
+    "provider": "Claude",
+    "query": "implement feature X",
+    "sandbox": null,
+    "session_kind": "Standard",
+    "skip_context_pipeline": null,
+    "system_prompt": null,
+    "tags": [
+      "ci"
+    ],
+    "title": null,
+    "workflow_id": null,
+    "workflow_id_override": null,
+    "working_dir": "/tmp/repo"
+  }
+}

@@ -1,0 +1,10 @@
+Implement a Rust function `parse_event(line: &str) -> Option<(String, u64)>`
+that parses a log-event line in the format `<name>:<timestamp>` (for example,
+`login:1700000000` returns `Some(("login".to_string(), 1700000000))`). Return
+`None` if the line is missing a colon, has an empty name, or has a non-numeric
+timestamp. Initialize a cargo library project if one does not exist
+(`cargo init --lib`), place the function in `src/lib.rs` with a `#[cfg(test)]`
+module covering one happy-path case and three error cases (missing colon,
+empty name, non-numeric timestamp), run `cargo test` to confirm the tests
+pass, run `cargo clippy --workspace -- -D warnings` to confirm cleanliness,
+and report the function signature in a one-sentence summary.

@@ -1,0 +1,6 @@
+There is a small off-by-one bug in a helper function. The function should
+iterate over the entire input slice but currently skips the first element
+because it slices `[1..]` instead of `[..]`. Locate the bug, fix it with a
+minimal one-line change, run `cargo test` to confirm no regressions, and run
+`cargo clippy --workspace -- -D warnings` to confirm cleanliness. Report the
+fix as a one-sentence summary.

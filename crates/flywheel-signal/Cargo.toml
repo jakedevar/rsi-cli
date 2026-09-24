@@ -1,0 +1,28 @@
+[package]
+name = "flywheel-signal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Signal bridge for RSI on Linux — polls signal-cli, dispatches to rsid, sends replies via signal-cli"
+
+[[bin]]
+name = "flywheel-signal"
+path = "src/main.rs"
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+which = { workspace = true }
+toml = "0.8"
+
+[lints]
+workspace = true

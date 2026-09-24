@@ -1,0 +1,50 @@
+{
+  "CommandExecutionRequestApprovalParams.json": {
+    "required": [
+      "itemId",
+      "startedAtMs",
+      "threadId",
+      "turnId"
+    ],
+    "properties": {
+      "itemId": {
+        "type": "string"
+      },
+      "startedAtMs": {
+        "description": "Unix timestamp (in milliseconds) when this approval request started.",
+        "format": "int64",
+        "type": "integer"
+      },
+      "threadId": {
+        "type": "string"
+      },
+      "turnId": {
+        "type": "string"
+      }
+    }
+  },
+  "FileChangeRequestApprovalParams.json": {
+    "required": [
+      "itemId",
+      "startedAtMs",
+      "threadId",
+      "turnId"
+    ],
+    "properties": {
+      "itemId": {
+        "type": "string"
+      },
+      "startedAtMs": {
+        "description": "Unix timestamp (in milliseconds) when this approval request started.",
+        "format": "int64",
+        "type": "integer"
+      },
+      "threadId": {
+        "type": "string"
+      },
+      "turnId": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "research_question": "Unique provenance identifiers validate cleanly under strict v2",
+  "areas": ["validators", "provenance"],
+  "findings": [
+    {"id": "F-001", "summary": "First unique finding", "file_ref": "src/lib.rs:1", "confidence": "high"},
+    {"id": "F-002", "summary": "Second unique finding", "file_ref": "src/lib.rs:2", "confidence": "high"}
+  ],
+  "file_refs": [
+    {"path": "src/lib.rs", "lines": [1, 2]}
+  ],
+  "open_questions": []
+}

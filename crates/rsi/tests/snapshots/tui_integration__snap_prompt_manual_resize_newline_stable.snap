@@ -1,0 +1,16 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: "support::buffer_to_snapshot(&after_newline)"
+---
+ ● 0
+ All projects / Sessions ┌────────────────────────────────────────────────┐               1 session
+  #   ∞  S  !  FUNCTION  │ cwd: /tmp/rsi-s-input  [default]               │   MODEL                ▮
+ RECENT ─────────────────│                                                │─────────────────────────
+▌        ✓     query 0   │                                                │ ✻
+                         │ line 1                                         │
+                         │ line 2                                         │
+                         │ line 3                                         │
+                         │                                                │
+                         │                                                │
+                         │  INSERT  Ctrl+Enter: send  Esc: normal         │
+                         └────────────────────────────────────────────────┘

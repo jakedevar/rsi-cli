@@ -1,0 +1,12 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: response
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "missing required field: query"
+  }
+}

@@ -1,0 +1,31 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: response
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "conversations": [
+      {
+        "events": [
+          {
+            "content": "hello",
+            "created_at": "2026-01-01T00:00:00Z",
+            "event_type": "Message",
+            "id": 42,
+            "metadata": null,
+            "offload_id": null,
+            "role": "User",
+            "sequence": 0,
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "tool_input": null,
+            "tool_name": null,
+            "tool_use_id": null
+          }
+        ],
+        "session_id": "00000000-0000-0000-0000-000000000001"
+      }
+    ]
+  }
+}

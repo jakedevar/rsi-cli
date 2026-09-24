@@ -1,0 +1,226 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+assertion_line: 412
+expression: response
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "active_invocations": [
+      {
+        "budget": [
+          {
+            "authorized": true,
+            "effort": "medium",
+            "model_tier": "premium",
+            "policy_status": "configured",
+            "purpose": "session.launch.fresh",
+            "remaining_active": 0,
+            "remaining_calls": 2,
+            "remaining_embedding_inputs": null,
+            "remaining_input_tokens": 15000,
+            "remaining_output_tokens": 5000,
+            "remaining_total_tokens": 20000,
+            "remaining_wall_time_ms": 120000,
+            "scope_id": "00000000-0000-0000-0000-000000000001",
+            "scope_kind": "session",
+            "source": "policy:session/test"
+          }
+        ],
+        "cancellation_reason": null,
+        "denial_reason": null,
+        "lineage_summary": "root",
+        "owner_summary": "session 00000001",
+        "record": {
+          "admission_status": "admitted",
+          "authorization_reason": null,
+          "backend": "Claude",
+          "baseline_usage": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "confidence": "stale",
+            "embedding_input_count": 0,
+            "estimated_cost_usd": null,
+            "input_tokens": 1000,
+            "output_tokens": 300,
+            "reasoning_tokens": 0,
+            "wall_time_ms": 20000
+          },
+          "cancellation_mechanism": null,
+          "cancellation_reason": null,
+          "cancellation_requested_at": null,
+          "completed_at": null,
+          "created_at": "2026-01-01T00:00:00+00:00",
+          "dedup_key": "session.launch",
+          "effort": "medium",
+          "error_class": null,
+          "escalation_reason": null,
+          "escalation_source": null,
+          "foreground": "foreground",
+          "id": "00000000-0000-0000-0000-000000000009",
+          "kind": "session_lifecycle",
+          "model": "claude-sonnet-5",
+          "model_tier": "premium",
+          "owner": {
+            "issue_identifier": null,
+            "issue_tracker_id": null,
+            "operator": "operator",
+            "project_id": "00000000-0000-0000-0000-000000000002",
+            "recursive_attempt_id": null,
+            "recursive_graph_id": null,
+            "recursive_task_id": null,
+            "scheduled_job_id": null,
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "topology_node_id": null,
+            "workflow_id": null
+          },
+          "owner_scopes": [
+            {
+              "kind": "session",
+              "scope_id": "00000000-0000-0000-0000-000000000001"
+            },
+            {
+              "kind": "project",
+              "scope_id": "00000000-0000-0000-0000-000000000002"
+            }
+          ],
+          "paid_risk": "paid_capable",
+          "parent_invocation_id": null,
+          "policy_authorized": true,
+          "policy_snapshot": {
+            "mode": "normal"
+          },
+          "policy_snapshot_error": null,
+          "policy_snapshot_status": "valid",
+          "provider": "Claude",
+          "purpose": "session.launch.fresh",
+          "raw_admission_status": "admitted",
+          "raw_status": "running",
+          "request_fingerprint": "sha256:deadbeef",
+          "retry_of_invocation_id": null,
+          "started_at": "2026-01-01T00:00:00+00:00",
+          "status": "running",
+          "trigger": "launch_session",
+          "usage": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "confidence": "measured",
+            "embedding_input_count": 0,
+            "estimated_cost_usd": 0.42,
+            "input_tokens": 1200,
+            "output_tokens": 400,
+            "reasoning_tokens": 50,
+            "wall_time_ms": 35000
+          }
+        },
+        "scope_summary": "session:00000000-0000-0000-0000-000000000001 | project:00000000-0000-0000-0000-000000000002",
+        "stop_mechanism": "interrupt_session",
+        "stop_target": "00000000-0000-0000-0000-000000000001"
+      }
+    ],
+    "circuit_reason": "interactive work remains budget-governed; paid background work is denied by default",
+    "circuit_state": "closed",
+    "circuits": [],
+    "mode": "normal",
+    "mode_updated_at": "2026-01-01T00:00:00+00:00",
+    "policies": [],
+    "recent_budget_alerts": [],
+    "recent_denials": [],
+    "recent_invocations": [
+      {
+        "budget": [],
+        "cancellation_reason": null,
+        "denial_reason": null,
+        "lineage_summary": "root",
+        "owner_summary": "session 00000001",
+        "record": {
+          "admission_status": "admitted",
+          "authorization_reason": null,
+          "backend": "Claude",
+          "baseline_usage": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "confidence": "stale",
+            "embedding_input_count": 0,
+            "estimated_cost_usd": null,
+            "input_tokens": 1000,
+            "output_tokens": 300,
+            "reasoning_tokens": 0,
+            "wall_time_ms": 20000
+          },
+          "cancellation_mechanism": null,
+          "cancellation_reason": null,
+          "cancellation_requested_at": null,
+          "completed_at": null,
+          "created_at": "2026-01-01T00:00:00+00:00",
+          "dedup_key": "session.launch",
+          "effort": "medium",
+          "error_class": null,
+          "escalation_reason": null,
+          "escalation_source": null,
+          "foreground": "foreground",
+          "id": "00000000-0000-0000-0000-000000000009",
+          "kind": "session_lifecycle",
+          "model": "claude-sonnet-5",
+          "model_tier": "premium",
+          "owner": {
+            "issue_identifier": null,
+            "issue_tracker_id": null,
+            "operator": "operator",
+            "project_id": "00000000-0000-0000-0000-000000000002",
+            "recursive_attempt_id": null,
+            "recursive_graph_id": null,
+            "recursive_task_id": null,
+            "scheduled_job_id": null,
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "topology_node_id": null,
+            "workflow_id": null
+          },
+          "owner_scopes": [
+            {
+              "kind": "session",
+              "scope_id": "00000000-0000-0000-0000-000000000001"
+            },
+            {
+              "kind": "project",
+              "scope_id": "00000000-0000-0000-0000-000000000002"
+            }
+          ],
+          "paid_risk": "paid_capable",
+          "parent_invocation_id": null,
+          "policy_authorized": true,
+          "policy_snapshot": {
+            "mode": "normal"
+          },
+          "policy_snapshot_error": null,
+          "policy_snapshot_status": "valid",
+          "provider": "Claude",
+          "purpose": "session.launch.fresh",
+          "raw_admission_status": "admitted",
+          "raw_status": "running",
+          "request_fingerprint": "sha256:deadbeef",
+          "retry_of_invocation_id": null,
+          "started_at": "2026-01-01T00:00:00+00:00",
+          "status": "running",
+          "trigger": "launch_session",
+          "usage": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "confidence": "measured",
+            "embedding_input_count": 0,
+            "estimated_cost_usd": 0.42,
+            "input_tokens": 1200,
+            "output_tokens": 400,
+            "reasoning_tokens": 50,
+            "wall_time_ms": 35000
+          }
+        },
+        "scope_summary": "session:00000000-0000-0000-0000-000000000001 | project:00000000-0000-0000-0000-000000000002",
+        "stop_mechanism": "interrupt_session",
+        "stop_target": "00000000-0000-0000-0000-000000000001"
+      }
+    ],
+    "restart_required_fields": []
+  }
+}

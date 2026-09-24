@@ -1,0 +1,21 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "GetConversationsSince",
+  "params": {
+    "requests": [
+      {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "since_sequence": 10
+      },
+      {
+        "session_id": "00000000-0000-0000-0000-000000000003",
+        "since_sequence": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>name</key>
+    <string>Flywheel Goth</string>
+    <key>semanticClass</key>
+    <string>theme.dark.fractal-goth</string>
+    <key>uuid</key>
+    <string>4df542b0-bf78-4ff0-8bea-9b486dd55e60</string>
+    <key>author</key>
+    <string>Flywheel</string>
+    <key>colorSpaceName</key>
+    <string>sRGB</string>
+    <key>settings</key>
+    <array>
+      <dict>
+        <key>settings</key>
+        <dict>
+          <key>background</key>
+          <string>#0b0d11</string>
+          <key>foreground</key>
+          <string>#f4f0ff</string>
+          <key>caret</key>
+          <string>#cbb7ff</string>
+          <key>lineHighlight</key>
+          <string>#1a1d27</string>
+          <key>selection</key>
+          <string>#3f3b4e80</string>
+          <key>selectionBorder</key>
+          <string>#6f6b84</string>
+          <key>findHighlight</key>
+          <string>#2f677f</string>
+          <key>gutterForeground</key>
+          <string>#56516a</string>
+          <key>guide</key>
+          <string>#3f3b4e</string>
+          <key>activeGuide</key>
+          <string>#56516a</string>
+          <key>stackGuide</key>
+          <string>#6f6b84</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Comments</string>
+        <key>scope</key>
+        <string>comment, punctuation.definition.comment</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#6f6b84</string>
+          <key>fontStyle</key>
+          <string>italic</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Keywords</string>
+        <key>scope</key>
+        <string>keyword, modifier, storage</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#b58ad7</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Types &amp; Classes</string>
+        <key>scope</key>
+        <string>entity.name.type, support.class, support.type</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#cbb7ff</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Functions &amp; Methods</string>
+        <key>scope</key>
+        <string>entity.name.function, meta.function-call</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#4a7ed8</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Strings</string>
+        <key>scope</key>
+        <string>string, constant.other.symbol</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#6fbf8d</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Numbers</string>
+        <key>scope</key>
+        <string>constant.numeric</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#df8f76</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Constants</string>
+        <key>scope</key>
+        <string>constant.language, constant.character, support.constant</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#d2b45a</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Operators &amp; Delimiters</string>
+        <key>scope</key>
+        <string>punctuation, keyword.operator</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#9e99b7</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Attributes &amp; Annotations</string>
+        <key>scope</key>
+        <string>entity.other.attribute-name, meta.annotation</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#df6aaa</string>
+        </dict>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>Invalid</string>
+        <key>scope</key>
+        <string>invalid, invalid.deprecated</string>
+        <key>settings</key>
+        <dict>
+          <key>foreground</key>
+          <string>#0b0d11</string>
+          <key>background</key>
+          <string>#d9485f</string>
+        </dict>
+      </dict>
+    </array>
+  </dict>
+</plist>

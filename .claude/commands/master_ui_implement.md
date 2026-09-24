@@ -1,0 +1,249 @@
+---
+description: Screenshot-driven UI implementation pipeline with image-parity gates
+model: opus
+capability_class: architect
+---
+
+# Master UI Implement
+
+Screenshot-driven UI implementation orchestrator. Use this when the desired outcome is not just "the feature exists", but "the live UI visually matches these screenshots, mockups, or reference images within terminal/browser/platform limits."
+
+**Use this for:** TUI, GUI, web, game, dashboard, visualization, design-system, or visual-polish work where screenshots/images are the source of truth.
+
+**Do not use this for:** pure backend changes, invisible refactors, migrations, CLI-only behavior, or work where structural tests alone define completion.
+
+---
+
+## Non-Negotiable Contract
+
+The image/reference target is the acceptance source of truth.
+
+Priority order:
+
+1. Explicit user instructions in the current thread
+2. Reference images/mockups/screenshots provided by the user
+3. Current live screenshots or baseline captures
+4. Project/ticket text
+5. Existing tests and docs
+
+If project text says "complete" but screenshots do not match, the work is not complete.
+
+If tests pass but screenshots do not match, the work is not complete.
+
+If the live app cannot be captured or inspected, stop at a visual QA gate and ask Jake for a screenshot or permission to proceed with reduced confidence.
+
+---
+
+## Terminal And Platform Reality
+
+Before promising picture-perfect output, state the platform limits.
+
+For terminal UIs:
+
+- Cell geometry, borders, spacing, stable columns, colors, selected rows, and visual hierarchy are controllable.
+- Exact pixel antialiasing, sub-cell positioning, font rasterization, blur, alpha compositing, and wallpaper blending are not fully controllable by ratatui/crossterm.
+- "Nearly picture-perfect" means matching at the terminal-cell and theme-token level on the same terminal, font, size, and transparency settings.
+
+For browser/native UIs:
+
+- Pixel-level parity is more realistic, but still depends on viewport size, font rendering, device scale factor, OS theme, and asset loading.
+
+Never hide these limits. Use them to define a concrete fidelity target.
+
+---
+
+## Required Inputs
+
+Accept either a ticket/plan path or a free-text goal. Strongly prefer explicit image paths.
+
+If no reference images or screenshots are provided, ask for them unless the task is clearly a UI creation from scratch.
+
+Examples:
+
+```text
+/master_ui_implement thoughts/shared/projects/session-views-redesign/index.md
+target images:
+  /abs/path/full-list.png
+  /abs/path/detail.png
+current screenshots:
+  /abs/path/current-full-list.png
+  /abs/path/current-detail.png
+```
+
+```text
+/master_ui_implement "Make the dashboard match /tmp/target.png. Use /tmp/current.png as baseline."
+```
+
+---
+
+## Phase 0: Spec Lock
+
+Before editing files:
+
+1. Read the ticket/plan if provided.
+2. Open every provided reference image and current screenshot.
+3. Identify the target platform, viewport/window size, theme, terminal/browser, font assumptions, and screenshot dimensions.
+4. Decide whether the image is authoritative or merely inspirational.
+
+If the user did not specify authority, default to:
+
+> The provided images are authoritative for visual intent; code/tests are supporting evidence.
+
+If that default conflicts with project text, surface the conflict before coding.
+
+---
+
+## Phase 1: Visual Delta Ledger
+
+Before editing files, produce a compact visual delta ledger.
+
+Required columns:
+
+- Surface: full page, header, sidebar, list row, detail pane, input bar, deck, footer, modal, etc.
+- Target: what the reference image shows
+- Current: what the live screenshot/app shows
+- Gap: concrete visible mismatch
+- Likely owner: file/component/layout/theme area
+- Status: pending
+
+Do not skip this phase. The ledger is the working contract.
+
+If the target cannot be compared because no baseline screenshot exists, inspect the current code and then ask Jake for a baseline screenshot at the target viewport before claiming final parity.
+
+---
+
+## Phase 2: Feasibility And Foundation Check
+
+Before implementation, identify any foundation constraints that make parity impossible.
+
+Examples:
+
+- max-width or centering caps
+- old layout engines still controlling geometry
+- hardcoded paddings/insets
+- stale theme tokens
+- missing image/assets
+- terminal size assumptions
+- renderer height/cache math
+- unavailable data
+
+If a foundation constraint blocks parity, fix the foundation first. Do not polish around it.
+
+State the recommended route and why. If multiple approaches are viable, list options and clearly recommend one.
+
+---
+
+## Phase 3: Implementation Plan
+
+Write a short implementation plan tied to the delta ledger.
+
+Each item must include:
+
+- visual delta being addressed
+- files/components likely touched
+- acceptance evidence expected
+
+Do not add unrelated visual redesigns. Match the target first.
+
+Preserve keyboard flow and behavior unless the target requires a change. Any keybinding change must update keybinding docs in the same pass.
+
+---
+
+## Phase 4: Implement
+
+Make the code changes required for visual parity.
+
+Rules:
+
+- Prefer existing design-system/theme helpers, but add semantic tokens when needed.
+- Use stable layout constraints: explicit widths, min/max behavior, aspect ratios, row heights, and bottom/top insets.
+- Avoid hidden old layout paths that can reassert themselves in real app usage.
+- Keep data/view-model changes separate from rendering changes when practical.
+- For TUI work, update height/scroll math whenever borders, padding, row heights, or input/deck areas change.
+- For web/native work, verify responsive behavior at the target viewport and at least one narrow viewport unless the user says target-only.
+- Do not mark project/ticket status complete during implementation.
+
+---
+
+## Phase 5: Verification
+
+Run normal engineering verification:
+
+- formatter
+- typecheck/build
+- focused tests for touched behavior
+- broader tests when the blast radius is high
+- lint when practical
+
+But this is not enough.
+
+Structural tests are a floor. Visual parity is the ceiling.
+
+---
+
+## Phase 6: Visual QA Loop
+
+Capture or obtain current screenshots after implementation.
+
+Compare target vs current visually using the Phase 1 delta ledger.
+
+For each delta:
+
+- mark fixed, improved, unchanged, or intentionally impossible
+- note the evidence screenshot path or observation
+- continue iterating while meaningful visual gaps remain and the platform can support the target
+
+If screenshots still differ materially, do not call the project complete. Either keep working or report the remaining deltas as blockers.
+
+If a screenshot cannot be captured by the agent, stop and ask Jake for a screenshot. Do not infer final parity from tests or code.
+
+---
+
+## Phase 7: Completion Gate
+
+Only complete when all are true:
+
+- Reference images were inspected.
+- Current screenshots were inspected after implementation.
+- The visual delta ledger is resolved or has explicit impossible-by-platform notes.
+- Normal verification passed or failures are clearly unrelated and documented.
+- Docs/ticket status updates reflect reality.
+- Any project status changed to `complete` only after the visual gate passed.
+
+If the result is a foundation pass, say so and do not use "complete" language.
+
+---
+
+## Commit Discipline
+
+Do not commit until after the visual QA loop unless Jake explicitly asks for checkpoint commits.
+
+Commit subjects should reflect the truth:
+
+- `Implement UI parity for <surface>` when screenshots match
+- `Add foundation for <surface> visual parity` when useful groundwork landed but visual parity remains
+- Never use `Complete <redesign>` unless the completion gate passed
+
+Before committing:
+
+```bash
+git status --short
+git diff --check
+```
+
+Stage only files touched for this task. Do not stage unrelated dirty worktree changes.
+
+---
+
+## Final Report Format
+
+Return:
+
+1. Visual outcome: matched, near-matched, foundation-only, or blocked
+2. Target images inspected
+3. Current screenshots inspected
+4. Remaining visual deltas, if any
+5. Verification commands and results
+6. Commit SHA, if committed
+
+Be direct. If it is not visually done, say it is not visually done.

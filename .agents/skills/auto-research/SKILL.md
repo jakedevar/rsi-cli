@@ -1,0 +1,239 @@
+---
+name: auto-research
+description: Fully autonomous codebase research without human interaction
+---
+
+# Auto Research (Autonomous Mode)
+
+You are tasked with conducting fully autonomous research across the codebase. Unlike the interactive `/research` command, you will make all decisions independently and produce a complete research document without pausing for human input.
+
+## CRITICAL: AUTONOMOUS OPERATION PRINCIPLES
+
+1. **NO QUESTIONS TO USER** - Make best-guess decisions and document them
+2. **NO PAUSES** - Continue through the entire workflow
+3. **DOCUMENT ALL DECISIONS** - Create an audit trail of choices made
+4. **ONLY STOP ON BLOCKING ERRORS** - Technical failures that prevent progress
+5. **COMPREHENSIVE OUTPUT** - The final document should be self-contained
+
+## YOUR ONLY JOB IS TO DOCUMENT THE CODEBASE AS IT EXISTS
+
+- DO NOT suggest improvements or changes
+- DO NOT perform root cause analysis
+- DO NOT propose future enhancements
+- DO NOT critique the implementation
+- ONLY describe what exists, where it exists, how it works
+
+## Input Handling
+
+When this command is invoked:
+
+1. **If a research topic/question is provided**: Begin research immediately
+2. **If no topic provided**: Research the overall codebase architecture and structure
+
+## Autonomous Research Process
+
+### Step 1: Parse and Expand Research Scope
+
+1. **Read any directly mentioned files FULLY** (no limit/offset)
+2. **Analyze the research question** and decompose into sub-questions
+3. **Identify scope boundaries** - what's in scope vs out of scope
+4. **Document initial understanding**:
+   ```
+   AUTONOMOUS RESEARCH LOG
+   =======================
+   Topic: [Research question/area]
+   Scope: [What we're investigating]
+   Out of Scope: [What we're explicitly NOT investigating]
+   Initial Assumptions: [Any assumptions made about intent]
+   ```
+
+### Step 2: Spawn Parallel Research Sub-Agents
+
+Create a comprehensive research plan and spawn ALL of these agents in parallel:
+
+**Codebase Research Agents:**
+```
+Use Task tool with subagent_type="Explore":
+- Prompt: "Find all files and directories related to [topic]. Return structured list with full paths, organized by purpose (core logic, tests, configs, types, utilities). Do NOT evaluate or critique - only locate and categorize."
+
+Use Task tool with subagent_type="codebase-analyzer":
+- Prompt: "Analyze how [specific component] works. Trace data flow, identify key functions, document interfaces. Include file:line references. Do NOT suggest improvements - only document current behavior."
+
+Use Task tool with subagent_type="Explore":
+- Prompt: "Find examples of [pattern/feature] in the codebase. Show concrete code examples with file:line references. Document variations found. Do NOT recommend one pattern over another."
+```
+
+**Context Research Agents (if thoughts/ directory exists):**
+```
+Use Task tool with subagent_type="Explore":
+- Prompt: "Find all documents in thoughts/ related to [topic]. Categorize by type (research, plans, tickets, notes). Return paths only."
+
+Use Task tool with subagent_type="codebase-analyzer":
+- Prompt: "Extract key insights from [specific thoughts/ documents]. Focus on decisions made, rationale, and historical context. Note any information that may be outdated."
+```
+
+**CRITICAL: Spawn ALL relevant agents in a SINGLE message to maximize parallelism**
+
+### Step 3: Synthesize Findings (No Human Review)
+
+After ALL sub-agents complete:
+
+1. **Compile findings** from all agents
+2. **Resolve conflicts** - when agents report different information:
+   - Prefer live codebase over documentation
+   - Prefer recent files over old files
+   - Document the conflict in the research document
+3. **Identify gaps** - areas that couldn't be researched
+4. **Cross-reference** findings to build complete picture
+
+### Step 4: Generate Metadata
+
+Run: `hack/spec_metadata.sh` (if available) or gather:
+- Current date/time with timezone
+- Git commit hash: `git rev-parse HEAD`
+- Branch name: `git branch --show-current`
+- Repository name
+
+### Step 5: Write Research Document
+
+**Filename**: `thoughts/shared/research/YYYY-MM-DD-[topic-kebab-case].md`
+
+```markdown
+date: [ISO timestamp]
+researcher: autonomous-agent
+git_commit: [commit hash]
+branch: [branch name]
+repository: [repo name]
+topic: "[Research Topic]"
+tags: [research, autonomous, relevant-tags]
+status: complete
+autonomous: true
+decisions_made: [count of autonomous decisions]
+
+# Research: [Topic]
+
+**Date**: [timestamp]
+**Mode**: Autonomous (no human review during research)
+**Git Commit**: [hash]
+**Branch**: [branch]
+
+## Research Question
+
+[Original query or auto-generated scope]
+
+## Autonomous Decisions Made
+
+> These decisions were made automatically without human input:
+
+| Decision Point | Choice Made | Rationale |
+|---------------|-------------|-----------|
+| [What needed deciding] | [What was chosen] | [Why] |
+
+## Summary
+
+[High-level findings answering the research question]
+
+## Detailed Findings
+
+### [Component/Area 1]
+- What it does: [description]
+- Location: [file:line references]
+- How it connects: [relationships to other components]
+- Key interfaces: [APIs, functions, types]
+
+### [Component/Area 2]
+[Same structure...]
+
+## Code References
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `path/to/file.ext` | 123-145 | [What this code does] |
+
+## Architecture Documentation
+
+[Current patterns, data flow, design decisions found]
+
+## Historical Context (from thoughts/)
+
+[If thoughts/ directory was searched]
+- `thoughts/path/to/doc.md` - [Key insight]
+
+## Research Gaps
+
+> Areas that could not be fully researched:
+
+- [Gap 1] - [Why it couldn't be researched]
+- [Gap 2] - [Suggested follow-up]
+
+## Confidence Assessment
+
+| Finding | Confidence | Notes |
+|---------|------------|-------|
+| [Key finding] | High/Medium/Low | [Why this confidence level] |
+
+## Open Questions for Human Review
+
+> These questions arose during research but were not blocking:
+
+1. [Question that a human might want to clarify]
+2. [Another question for optional follow-up]
+```
+
+### Step 6: Add GitHub Permalinks (If Applicable)
+
+1. Check if on main branch or commit is pushed
+2. Get repo info: `gh repo view --json owner,name`
+3. Generate permalinks: `https://github.com/{owner}/{repo}/blob/{commit}/{file}#L{line}`
+4. Replace local references with permalinks
+
+### Step 7: Sync and Report
+
+1. Ensure the research doc is saved and committed so `thoughts/` remains consistent across environments
+2. Output completion summary:
+
+```
+AUTONOMOUS RESEARCH COMPLETE
+============================
+Document: thoughts/shared/research/[filename].md
+Duration: [time taken]
+Sub-agents spawned: [count]
+Decisions made autonomously: [count]
+Confidence: [overall assessment]
+Gaps identified: [count]
+
+The research document is ready for review.
+```
+
+## Decision Heuristics
+
+When you encounter ambiguity, use these heuristics:
+
+| Situation | Decision Rule |
+|-----------|--------------|
+| Unclear scope boundary | Include more rather than less - can be trimmed later |
+| Multiple interpretations of question | Research all interpretations, document each |
+| Conflicting information | Document both, prefer code over docs |
+| Missing files/directories | Note as gap, continue with available info |
+| Agent returns no results | Try broader search, then document as gap |
+| Uncertain relevance | Include with low confidence flag |
+
+## Error Handling
+
+**Recoverable Errors** (continue after logging):
+- Sub-agent returns empty results → Document gap, continue
+- File not found → Note in gaps, continue
+- Git commands fail → Use placeholder, continue
+
+**Blocking Errors** (stop and report):
+- Cannot write to output directory
+- All sub-agents fail
+- Critical tool unavailable
+
+## Important Notes
+
+- **Parallel execution**: Always spawn multiple agents in single message
+- **No partial reads**: Always read files FULLY (no limit/offset)
+- **Path handling**: Remove "searchable/" from thoughts paths
+- **Audit trail**: Document every autonomous decision
+- **Self-contained**: Final document should need no external context

@@ -1,0 +1,13 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+assertion_line: 317
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "GetModelControlStatus",
+  "params": {
+    "recent_limit": 12
+  }
+}

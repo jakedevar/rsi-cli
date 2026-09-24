@@ -1,0 +1,16 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+assertion_line: 345
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "ListModelInvocations",
+  "params": {
+    "active_only": true,
+    "limit": 25,
+    "purpose": "session.launch.fresh",
+    "session_id": "00000000-0000-0000-0000-000000000001"
+  }
+}

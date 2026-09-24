@@ -1,0 +1,19 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "CreateProject",
+  "params": {
+    "color": "#89b4fa",
+    "context_files": null,
+    "created_at": "2026-01-01T00:00:00Z",
+    "description": "Vim TUI",
+    "id": "00000000-0000-0000-0000-000000000002",
+    "name": "rsi",
+    "path": "/tmp/rsi",
+    "updated_at": "2026-01-01T00:00:00Z"
+  }
+}

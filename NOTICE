@@ -1,0 +1,61 @@
+rsi
+Copyright (C) 2026 Jacob deVarennes
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3 only
+(SPDX-License-Identifier: AGPL-3.0-only). The full text is in LICENSE.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+License for more details.
+
+Commercial licenses and other licensing arrangements are available from
+the copyright holder on request.
+
+
+Thanks
+======
+
+rsi stands on other people's ideas. In particular:
+
+- HumanLayer (https://github.com/humanlayer/humanlayer). Its Claude Code
+  agents and commands were rsi's starting point for the research -> plan
+  -> implement workflow.
+
+- Jake Van Clief and David McDermott, "Interpretable Context Methodology:
+  Folder Structure as Agentic Architecture" (the Model Workspace
+  Protocol), arXiv:2603.16021, 2026. It shaped rsi's stage contracts
+  (Inputs / Process / Outputs / Verify).
+
+- Yoonho Lee, Roshen Nair, Qizheng Zhang, Kangwook Lee, Omar Khattab and
+  Chelsea Finn, "Meta-Harness: End-to-End Optimization of Model Harnesses"
+  (Stanford), arXiv:2603.28052, 2026. It shaped how rsi measures and
+  improves its own harness from real execution traces.
+
+
+Third-party material
+====================
+
+sqlite-vec
+----------
+Source:     https://github.com/asg017/sqlite-vec (v0.1.7-alpha.2)
+Copyright:  Copyright (c) 2024 Alex Garcia
+Location:   crates/rsid/vendor/sqlite-vec/
+License:    MIT or Apache-2.0 at your option; both texts are in that
+            directory. rsi uses it under the MIT license.
+
+HumanLayer
+----------
+Source:     https://github.com/humanlayer/humanlayer
+Copyright:  Copyright (c) 2024, humanlayer Authors
+License:    Apache License, Version 2.0 (full text: LICENSES/Apache-2.0.txt)
+
+Two prompts still contain text adapted (and modified) from HumanLayer's
+research_codebase.md and create_plan.md, so they are listed here as the
+Apache License requires. A rewrite in rsi's own words is in progress.
+
+    .claude/commands/research.md and .claude/commands/plan.md, plus the
+    copies generated from them by scripts/sync-agent-commands.sh:
+    .codex/prompts/{research,plan}.md, .gemini/commands/{research,plan}.toml,
+    .agents/skills/{research,plan}/SKILL.md

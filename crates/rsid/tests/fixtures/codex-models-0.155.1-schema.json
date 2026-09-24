@@ -1,0 +1,55 @@
+{
+  "models": [
+    {
+      "additional_speed_tiers": [],
+      "apply_patch_tool_type": "freeform",
+      "availability_nux": null,
+      "base_instructions": "<omitted: schema fixture>",
+      "comp_hash": "schema",
+      "context_window": 1,
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "default_verbosity": "low",
+      "description": "Bounded schema-only record.",
+      "display_name": "Schema Fixture",
+      "effective_context_window_percent": 100,
+      "experimental_supported_tools": [],
+      "include_apps_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "include_skills_usage_instructions": false,
+      "input_modalities": [
+        "text"
+      ],
+      "max_context_window": 1,
+      "model_messages": {},
+      "multi_agent_version": "v1",
+      "node_repl_auto_review_required": false,
+      "node_repl_disabled": true,
+      "priority": 0,
+      "service_tiers": [],
+      "shell_type": "unified_exec",
+      "slug": "schema-fixture",
+      "support_verbosity": false,
+      "supported_in_api": false,
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": null
+        }
+      ],
+      "supports_image_detail_original": false,
+      "supports_search_tool": false,
+      "tool_mode": "code_mode_only",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 1
+      },
+      "upgrade": null,
+      "use_responses_lite": false,
+      "visibility": "hidden",
+      "web_search_tool_type": "text",
+      "multi_agent_reasoning_effort": "xhigh",
+      "supports_experimental_context": true
+    }
+  ]
+}

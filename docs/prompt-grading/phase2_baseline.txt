@@ -1,0 +1,4 @@
+pre-phase2 file total chars: 9638
+pre-phase2 step-2 prompt chars (approx): 1170
+post-phase2 step-2 prompt chars: 129
+reduction: 89%

@@ -1,0 +1,12 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "GetUsageStats",
+  "params": {
+    "project_id": "00000000-0000-0000-0000-000000000002"
+  }
+}

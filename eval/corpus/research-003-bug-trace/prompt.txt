@@ -1,0 +1,10 @@
+Produce a concise research document outlining the systematic steps a
+developer would take to trace the following symptom: a database session
+row appears in `ListSessions` query results but is missing some expected
+fields (for example, the model name or the project_id is null on read
+even though it should have been set on launch). Cover four candidate
+layers in order: (1) persistence — was the column actually written?,
+(2) serialization — is the struct-to-row mapper dropping fields?,
+(3) query — does the SELECT clause omit columns?, (4) display — is the
+renderer hiding fields? For each layer give one concrete diagnostic
+command or code-level check the developer would run.

@@ -1,0 +1,80 @@
+---
+description: Risk and capability router for agent work
+---
+
+# Orchestration Router
+
+Always-on routing policy for spawnable RSI sessions. Choose the smallest
+reliable work unit, least costly capable model, and only independent workers
+that shorten the critical path.
+
+## Risk Route
+
+After execution, classify the next unmet evidence obligation:
+
+1. **Tier-0** — atomic lookup, formatting, or deterministic validation. Current
+   agent; no review child.
+2. **Tier-1** — bounded, well-specified code or document work outside hazardous
+   areas. One primary owner; add investigation or review only for a named gap or
+   risk.
+3. **Tier-2** — schema, auth, custody, concurrency, integration, destructive
+   lifecycle, dangerous external effects, or disputed risk. One primary owner,
+   hazardous gates, and independent exact-revision review.
+
+Use lowest supported tier. Route decisions are actions, not approval questions.
+Ask only for materially new authority, changed outcome/scope, or a destructive,
+production, external-impact, credential, privacy, or substantial-cost gate.
+Explicit operator choice wins within higher-priority constraints.
+
+## Evidence Before Topology
+
+Reuse current evidence. Do not create a worker or phase for research, planning,
+verification, review, documentation, or closure already satisfied at exact
+current source/spec/policy.
+
+Combine investigation and design in one owner when one bounded uncertainty can
+yield facts, decision, affected interfaces, checks, rollback, and open questions.
+Separate them only for independent parallel questions, separate custody, or an
+actual consumer boundary.
+
+Parallelize only disjoint conflict domains, files, artifacts, and effects. Keep
+one mutating owner for schema, security, shared protocol, and live external
+effects. Normalize formatting locally; never spawn a repair worker for it.
+
+Child count, elapsed time, token use, and successor generations have no portable
+default ceiling. Explicit operator, caller, plan, project, backend, and provider
+limits remain binding.
+
+## Review Budget
+
+Review rounds are bounded independently from resource ceilings:
+
+- Tier-0: zero.
+- Tier-1: at most two—initial review when a named risk requires it, plus one
+  delta re-review only if the fix changes that risk.
+- Tier-2: initial review plus one finding-focused delta re-review.
+- Explicit hazardous specialist gate: one additional different specialist,
+  three total.
+
+A renamed attempt or source revision does not reset a logical slice. At limit,
+unresolved blockers still prevent acceptance. Do not repeat the same broad
+review; split or replan materially changed work, preserve finding dispositions,
+or report the actual typed gate. Review count alone is not a human gate.
+
+## Capability Class
+
+| Class | Claude | Codex | Use |
+| --- | --- | --- | --- |
+| `architect` | `opus`, `xhigh` | `gpt-6-astra`, `xhigh` | Ambiguous architecture, cross-system correctness, planning that cannot combine cheaply, independent semantic review |
+| `implementer` | `sonnet`, `high` | `gpt-6-astra`, `high` | Scoped implementation, investigation/design, bounded fixes |
+| `lookup_fast` | `haiku` | `gpt-6-astra`, `low` | Mechanical lookup, format, lint, build, test, smoke |
+
+Set provider-valid `model` and `effort` explicitly when child difficulty or
+provider differs from parent. Never carry model spelling across providers.
+Claude accepts `low|medium|high|xhigh|max`; Codex additionally accepts
+`ultra`; Haiku has no effort. Current provider aliases are daemon-resolved.
+
+Escalate one class only when output gives concrete evidence of capability
+insufficiency. Missing authority, credentials, malformed input, destructive or
+production gates, external state, capacity, and formatting defects are not
+model failures. Explicit caller model/effort overrides remain pinned.

@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "latest_schema_version": 131,
+  "migration_file": "crates/rsid/src/store/mod.rs",
+  "blocks": {
+    "0": "sha256:3e79edf6e3b6718c67bf3de92309ddd9cf97c1768cab75922a24d61405589ca5",
+    "1": "sha256:f5b453219583042b7d0f9fc644e73fb41ae7cab820a26c6caf8d3592d790ccd5",
+    "2": "sha256:f046e88a2feea12843c726e3f4da43d3690696cc8bd88867d7f65ea65925d788",
+    "3": "sha256:2e48e308647f7bd814858b498d79254acca609e3b7368a406ed5578a68266c65",
+    "4": "sha256:a813bcae542615b73bbc0e01ae2cf1a0b743f0ff869a8e7e20cccd6edaf9ca1b",
+    "5": "sha256:5ca9d42da49e9b7469ad6ffe812c30fad410f9b5a3494c646cac3b987f296b3c",
+    "6": "sha256:90d839418c832ab2f7c8091f202b278fa46fa187c80d2841e8f11f5acf620d53",
+    "7": "sha256:a721bd9102d69110029e71c8e71a58ab184a96ca634ee7228597c3598d55cd3e",
+    "8": "sha256:6d0a3b87b473cc2249a6cdb499cb1bd7e982e5399b4e91bc656ec1a2ee02fe1f",
+    "9": "sha256:7e21f72031966f036ed0f2e1cae7c670231d4ea0c80206ed71a3bfe8ba33186d",
+    "10": "sha256:de7c8fcf533fb53d6094f741882b96dca69e2ec0b3c4c4673fa3472ccfe0a6f6",
+    "11": "sha256:341ca53b343e3cadf0ba43c3e66b6b277886e0235dce5005926143d1a6f74c2b",
+    "12": "sha256:b439be586140e396952a1dff39d2c0586a28e0dd645cf0c5378f55db8f8f3a16",
+    "13": "sha256:57add2fcf9cb7aa6e66ec45a5ef8db35127df97854b5eb04c9aedf554d9d7f4b",
+    "14": "sha256:b6dfbb86367c45e8c30d829ddbf2cc0bc571cfbfab5416029adadec9380b645f",
+    "15": "sha256:010d9c244d1daf1397cbee0aa28fae667515d813ee949f350694392a9db65283",
+    "16": "sha256:a7e59441eac316588179b6b081b11dbafd35cc7ef63f96e853360a48cb23e88c",
+    "17": "sha256:9f6289e18d5f59c4cf46434de4da5539ad31a64ebf9a360de18d82b4cce7ba86",
+    "18": "sha256:dfc9dc8a222c888df1f8ba5e20c49efc5d7f86afbfb91fc8ea53ae6a196166d8",
+    "19": "sha256:88293c539cc87c404b0d7c9a5461411a000b7b981178b30f392bc8016e297317",
+    "20": "sha256:5d0bf1f21ac6892e168e1b3ce208a65a2cde5f84afacd3d84e750caf3e3bc256",
+    "21": "sha256:eeb02be79c29397223a5d4ef83febcb779650b0f2016ef9bc55a241b85364295",
+    "22": "sha256:6c92e18a1d5afd5a4950a20fc2a78c53e8daf126dfb1e440a96b7f9242556b58",
+    "23": "sha256:bfa5fe585ebb1939eceaec42c753c97a87ef69dac7b93271419084e95c5a7a23",
+    "24": "sha256:375bbab34e5f2bbef7540ad305bd20a4a5213b9275d37bdad75cf8307c28eed4",
+    "25": "sha256:c78251cef51f2fadb7db1ccf5e2901f014adee19a5cef0541440d58d55ea4fa4",
+    "26": "sha256:e6e45443e7defd48e6f418a9f5162762efe1ebafcf5a6ccbdd1cff9b2880ef22",
+    "27": "sha256:669a63100e560c42e2c64c7ff0f4a0640912fcc09b13f2851671c7e624cc5d32",
+    "28": "sha256:6438390bfa94eb9ebfd650b0e8921d7ac8f2df523ab9195df6d3ec3490213827",
+    "29": "sha256:a12476b4e444ef563a1b0a95593b2c4e6b44ebb7af5d187381ee9ee2a369f428",
+    "30": "sha256:412918e30a61ef7461b50b4fdba0a29f97ca927f12c76b75079653df7d70bd0f",
+    "31": "sha256:2cccbbff53ef29e123d807f53d0b6207eae625c5c3db5b12a65e2b6130065d92",
+    "32": "sha256:db44da7f93191c170178d455ae16a8ecb04158ad85581e0d312a29d5ee4142f9",
+    "33": "sha256:1ca63807b21f7d4683c4f919ef30a3c0a324e082dae86b3a90e5e19bd9b4a560",
+    "34": "sha256:f11a398ce67a89fe7113ce82ec0fdaa749da4b541e76cce4c51680efa0b0b707",
+    "35": "sha256:7379539f4a1823baa6d2bf44bef003278d1ad5538b2a0c4ff23a1caa73371b89",
+    "36": "sha256:832b7f2112029e8b48d3f1d3ce1c6d7f6c77f0c9a080ea5915f6125e2d4d8433",
+    "37": "sha256:17d265feea0c3fde6c27e458d2faa63ee9515dcd22157cd971860a9573a064f3",
+    "38": "sha256:18df1e7154909456cab2f710bb58215f58fe511cecbf384b8f67f0c75a18b7c0",
+    "39": "sha256:c0b838d51df384dff7cb849a5dae6ebf5ab178bf5a9b6bf2e235666b6fe12c3e",
+    "40": "sha256:14830855fda6abdb189954fbeb7304f16a6d844454f751b74a166f0a69a26492",
+    "41": "sha256:c65a3777c8cda652468ce93a3b697c8f80e15ef12c0cd016d24a3845c77b2179",
+    "42": "sha256:1732145f70bfb2c6c4d19f7fa570384925eab131d56dc4cd3bcf39cb985dc407",
+    "43": "sha256:f72cc731be452bc7dc673501b090093fb3840e0a2161698c21b8d98a43c86703",
+    "44": "sha256:90ac1a866d40c3a4fc84d0b1915953bb7820eb0bb7029b6dd60f97328c534c43",
+    "45": "sha256:9aedab48e8fb03639c23dfdbd14cd954fbd5ab94ec3ed53b0ae7bc970906b739",
+    "46": "sha256:8b0e17d09bf5f643111e464d4c35eaf059d4366038a9248da1677312cd449310",
+    "47": "sha256:bad4bbe583b11865bae0c6da7d0cb6c205657d5cd97471869222cfca90ff6acc",
+    "48": "sha256:047dc9fd5f4a3d84be43013ce690307f4f9e40ee67d9418678b6741d99914ccc",
+    "49": "sha256:0d67f866c69841fd4fc9eacfc34dda4204117cf445a4c77efb88e948b9e54c5a",
+    "50": "sha256:cfee8915e0263ff847d5867c68d777c249ba9cc5ebffa5a7a35c7867e25b8b1e",
+    "51": "sha256:fb1fe913c3b9c023d0ed9eaf6c1e9fb6675d54823917303957a8b4cb9d1a3c7b",
+    "52": "sha256:4bcbaeab5671d1b40cfe8f65bd705c960e8c272c2e7a21b90cf1ed9632846ab0",
+    "53": "sha256:c1f377e472dacb34e4b56b12ce487cfa46bdd9dfcf3ef7c041c13d259e8abf4e",
+    "54": "sha256:19749dcaca514879368b9e7dbf7add67404b087ef049c4e2fe0ed919bc143ab9",
+    "55": "sha256:4fc76b1dfb73078ee80e733c79f6eda8f09291d97819afa63be3eafb5f83303d",
+    "56": "sha256:30b5f0e09d5817c3e5c5d5557ea794f21d81068a3510a3e991461ebd7646ed49",
+    "57": "sha256:4bdb4e3f6de22ee276545ef88e27571aa1081c793be2da8e8a61456255f531cd",
+    "58": "sha256:c507ecf18c93f3c6316afccf1856ff23942a1639d4e7eaa0c2c8c49872dc6835",
+    "59": "sha256:d88556386739c042027ee2c5d7ffe98a829a07529d57d9889479d716a426c546",
+    "60": "sha256:227a5ef57cdc67ec10b5279b8f002e7bf70cc914727363a46c812705971826de",
+    "61": "sha256:788723736518b84260d668abcd6ecb78b898e92a1039c04cc3ea409be5ee4824",
+    "62": "sha256:7ca8501301dfeb31794222920f808818f3a7f66d335261b318c07fbbf8240f9f",
+    "63": "sha256:6a07fc321fc3419127cf22833bbc89ebbd7bf04b3f486a50c353ec00e44d4a1f",
+    "64": "sha256:2e89747f0bdbdc124ce4b50429054bbf3eab5f2843223c4724351fd8c72d8351",
+    "65": "sha256:be9e3c2c8d468070dcc2d5834018ecaa89ff0392495ef109c4fcfec1495a79f9",
+    "66": "sha256:134b14ce1c9eb1d61886cb7201de592cbc07692feea0c77d8235acdebc4920c1",
+    "67": "sha256:6d103480f3bd76e078c34708898268c1a1eb478f0bbdacc0a040155d8215f5f7",
+    "68": "sha256:990ec9b20b5da009b67b8aa18d3a87e667bfb4745c0187216d871a7f143a1084",
+    "69": "sha256:052f336a429cc3b396d5ed7d3d06aa84d2542e64b98ff7e5ac129bf5f030c279",
+    "70": "sha256:962133f42b6ed30b2210e380c094620ea11b39d90b177497db5f73f713f94371",
+    "72": "sha256:0edb10ff22d3e2794943072b99ccb40eae6a66011ed8ad33adbff40e32de423f",
+    "73": "sha256:558bb99c025d0061c1ec8d734fe9a18cc5c34f073b6ab6bb027aa81d859afdeb",
+    "74": "sha256:e2ff91ed12fd20f35fca719855dd94be104a228a4b76ebfda7f147f3c2f5b840",
+    "75": "sha256:742b5aff9a9d45ce3e05ff0c99a13765af373fbe3db770f9ccc44bcc62541232",
+    "76": "sha256:130cc7b0f86c513627f69de75dcbde1a513725cbb27977e1bb40ca81459a6d0d",
+    "77": "sha256:e0f5af7995c688326a13dc9baf44bef4578ef15521e78515df5fd53e00d3df0f",
+    "78": "sha256:b596732d6453e22edafd91cf575887d1cacc5bebca1b737cf9d6bb270f5a2dfa",
+    "79": "sha256:1bb32b064d5f1053054819e1e7694c5317e59034ec17390ab234d22cea4c45a7",
+    "80": "sha256:e96fac7b63012f48c117e09aebf28fc33419eab44d6fc82cc01060d22fa73211",
+    "81": "sha256:9159e68bcdc6f3f6fa818f3d9270ce803094148456baf273237bb18863d964af",
+    "82": "sha256:f2e758b75bb622b07a01776bc4d6782e1764d52f7a3449c025beeb21d61d6820",
+    "83": "sha256:e70b3693044abded50f66bdf02778eb844d0db946c210bb03661106d5890a80b",
+    "84": "sha256:9a49267bf26cb00c00f687cc13998f1976c71538e44c0a6fc124c6047bc7a242",
+    "85": "sha256:539890b21b69478eb88de62fcf36e51e3b0364551e0c374de9c6a12106a19f58",
+    "86": "sha256:a09b90b2a0b12ff02bd954a396a5b43ad3d2ae9899de1e0364b861087aefdde3",
+    "87": "sha256:cfec11f5e363938302013020402492be3d23a6cf6866697c3a9c7f38fb99f652",
+    "88": "sha256:8e6f42f9834e7404d2c5388001d556c0da45f70518581612e817e7dafb4b7fbe",
+    "89": "sha256:c949df571d9877c132964d7f4a75a62d5e14a4d571c186824fd695beb1eb2ede",
+    "90": "sha256:af2168f37cb7f5e8112de65e177833bdb2e67513ee35f2b53a88f9161d7f9efd",
+    "91": "sha256:74a54e07663c651f0ecf2a7d8d70099a8a0538fbac075cedc10df60f508c5d2a",
+    "92": "sha256:19ee6972e2f95b736fcd4ef26caa8ae213d1621c82ce08c977564d20cc0507ec",
+    "93": "sha256:9b493d24a43412212e7eae8267bbd0ced11b8c6017ed0d9271024bab4c511277",
+    "94": "sha256:ead872f365fcf86014c97e48ac60cf1c14891d10be91c55798c418d6064d9eb7",
+    "95": "sha256:bd7170b7da926582f4de535e946b153f07212b1bbc90676a01ab2e2c28efda46",
+    "96": "sha256:1aff33a8b4977ce3ed8b26f2b77fe5cb74f7dc321c2671f546115387f9eb37b6",
+    "97": "sha256:f83b856d433e2fcf229b67877219e6d1de25cf7f1ada5c1dbf6cc75de25ddce9",
+    "98": "sha256:24d83db574a757ef2d374f8b58b3efd6b93853944954cd1ab3f6d59457dbb73a",
+    "99": "sha256:2d072e3250e7c971f7eae2e2b43b9bcbe975ff20a91f43f68cadb8b09810b596",
+    "100": "sha256:0f26f73493c79611fcdd4c219c956371dd6580f6092c6a15d32e3ab823ede16d",
+    "101": "sha256:b27b6feadffadd224a41fe26ea0be9cbf68dd7383f151a976f0ecad837bc969e",
+    "102": "sha256:5f588b2bbeba42760b25bf22a4a440af1b060f4f247c716d1154ab8d4ec92080",
+    "103": "sha256:c1259501952614d914632269614f31af4924faf6a836e76ba53b840489a004cc",
+    "104": "sha256:a391089ed51cfb76624d7ae623c0ec9c26587460a42e41141874b4d19a7841a7",
+    "105": "sha256:8786a6565b1573f048cdb52604f7425ece4de8038ae2a57ccb243c59c94983ce",
+    "106": "sha256:975fe299cc7acdb53e132ae8ffb1cc11443dec2001f4e459bb751c38d1f74ad5",
+    "107": "sha256:1de53496774c801a124a3d491fc7c9c27d5c5d544bba9e9d4e853845ec4cb243",
+    "108": "sha256:b33cfdcc3fe16a5264f3c60371f8fefd010f8ba7ab2a49d94b0a5d446b724852",
+    "109": "sha256:742cb030e35725bacb21c89277d047923105228322786bd2cececa2d5f117a8d",
+    "110": "sha256:c3fc4bfce8092f5895b9852d7bb960ce2c306052589fc02492949f084af7402f",
+    "111": "sha256:81e6be762fb7db0a079656918b627d1fa07dca8e471d294072ac7441741e8213",
+    "112": "sha256:c7e01644c8918803cf11f22e877290ac7fd7d4e324afcbe5247bc09b41a35273",
+    "113": "sha256:bd71389f44829e782ad8a2c0f81ddf80bbf521119a1b505190d0bbb031adedc3",
+    "114": "sha256:96257ace886998eb2eacdccba06c95d8baa03fcf5fe9d5c31c5945fea055a6aa",
+    "115": "sha256:30309101f84f62c9fcc1b0f0fcf42a8a56c2038d19879118eeff1a9cd9877785",
+    "116": "sha256:ed3e21c76412dff4195ec9b72e618859b0c8ba16656cbe62cfb050621b6257de",
+    "117": "sha256:97da04fab428c2f6040d0d79961afaaafc61ad97efbae595265f005a30150fb4",
+    "118": "sha256:48d1d1ece7905ba0f27cde634c44ad0e544d204e6459440f80c79c2a6058cf6e",
+    "119": "sha256:19c21f45a1388c805038dec488b17ffc40cab42dd3568c12913436b4848cd893",
+    "120": "sha256:55c68215ab24d8deef715c9fd59b738acdf90495ed88a144f4fe475a0fb24a94",
+    "121": "sha256:75d9e290400ce249b68bfeca7b7d4693abfc1f44196912ac5b9cb5e3f8f76167",
+    "122": "sha256:2bfefe35a493c527f713d6e73971056f8242b3309cbacb28188dfbb6420f421b",
+    "123": "sha256:8b6d64a54ff7b3611469b2d67cedbc8142477ce6cfd9464afb373ed9cd44f8aa",
+    "124": "sha256:11a00306fb74208dff535149849c82606f1a883b82820f5a15f69c67e7523dfc",
+    "125": "sha256:11dcc81d40d65f1b8fe051fb3e745adcd4adff13cef1d720c90930517c1b600f",
+    "126": "sha256:50e1ca31031cc6cef6129845d4b0d275c7fc9cea355ca1487428ffb101cbc199",
+    "127": "sha256:4dbbbc4c9356fb38fbd12706785a5d8fd5366c680a97b3c7d88973ac9a8edc6b",
+    "128": "sha256:df96116d8a34bb7b14554c51c41d56d2c441b7da7eb5f73b25d001d94ef3ec78",
+    "129": "sha256:a647cd7768138d61a42e3dd6a0dc8ece97b9eabc6fbf8936559d47cf8a6dd8d6",
+    "130": "sha256:c06df721b9d791f67a61c594e2417eb671a8f2bb011817bcfc8fa47b78dfb266",
+    "131": "sha256:4232b6caead20f01a3c8e08e5f3400998c3b8df25208355935b7e86297305118"
+  },
+  "protected_sections": {
+    "v128-watchdog-restart-catalog": {
+      "path": "crates/rsid/src/daemon_restart_persistence.rs",
+      "sha256": "sha256:50030bd93f4efd338aa2da2265744599088222da3d416308fe94343b8afb0e05"
+    },
+    "v128-watchdog-restart-migration": {
+      "path": "crates/rsid/src/daemon_restart_persistence.rs",
+      "sha256": "sha256:456566954b3d061d8018af0b061a602c03e01004c5efae346f07785938611937"
+    },
+    "v130-agent-child-relaunch-intents": {
+      "path": "crates/rsid/src/store/agent_child_relaunch_intents.rs",
+      "sha256": "sha256:6f83c9ba3ad2a79a602637a7204a828fa08756e43ede1dccdcd31c35ef9d7142"
+    },
+    "v94-v95-settlement-fingerprints": {
+      "path": "crates/rsid/src/store/cohort_settlement.rs",
+      "sha256": "sha256:58551463539a4e7b46cd547e173ff3f620c2e753fa42cfcc885cb5161aa8c39e"
+    },
+    "v94-settlement-projections-and-bridge": {
+      "path": "crates/rsid/src/store/cohort_settlement.rs",
+      "sha256": "sha256:f4ee9c4a239a99e870fb8fa63779c08debd6114a6cef122dc56b11d8d6e8ef3e"
+    },
+    "v95-settlement-migration": {
+      "path": "crates/rsid/src/store/cohort_settlement.rs",
+      "sha256": "sha256:c07d04e26ac082ad8456d57e3975180e7925ea1810508f3a8197352f4a2e86e8"
+    },
+    "manager-v2-live-bookkeeping-index-migration": {
+      "path": "crates/rsid/src/store/harness_manager_v2.rs",
+      "sha256": "sha256:e8ccf3c69ed8c7d1d7b27e42f6d4fa9f23d45ab15f496805e1f5c3c3d1392615"
+    },
+    "issue-events-manager-actor-catalog": {
+      "path": "crates/rsid/src/store/issue_events_manager_actor.rs",
+      "sha256": "sha256:47b5f356b5bf6e9e02ac9fb6a582d6cc5a38b1a492052d2c8bec72c674f2460d"
+    },
+    "issue-events-manager-actor-migration": {
+      "path": "crates/rsid/src/store/issue_events_manager_actor.rs",
+      "sha256": "sha256:e60968d8e2a4d1ba4b1eb15a1b6480954cdc6c166c73d8504b75c135a80c48fc"
+    },
+    "v122-manager-work-facts-migration": {
+      "path": "crates/rsid/src/store/manager_ledger/facts.rs",
+      "sha256": "sha256:881e6cb27cf22505fca60d9d8e932de74589d9cc98d076d18c72674f7e372528"
+    },
+    "v115-prepared-actions-catalog": {
+      "path": "crates/rsid/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:1ccdd4aa838ca6f3f12270a4684a90b0f28028a910828448d654ce207b109792"
+    },
+    "v115-prepared-actions-driver": {
+      "path": "crates/rsid/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:36c1567053a2f55e2a53d691b4be7986302e48babd61a744c77c4258be90f8f5"
+    },
+    "v116-prepared-actions-caller-catalog": {
+      "path": "crates/rsid/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:65a7dfd67c62943f21c7abfa894e6f9f63dce5f3c9f54a72a5e8647de4b28417"
+    },
+    "v116-prepared-actions-caller-driver": {
+      "path": "crates/rsid/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:75ae66d7410d76e0e8b7061710c86cbd0a2ac70024c9a2cfd0a77afa12e39448"
+    },
+    "v118-full-catalog-fingerprint": {
+      "path": "crates/rsid/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:b5a1c16bbdaa9471da6611e423f4b837322863d89d1707d06fa9a356979194bf"
+    },
+    "v121-manager-review-catalog": {
+      "path": "crates/rsid/src/store/manager_review_v121.rs",
+      "sha256": "sha256:d7bb69aaec7b83ecf0f6b1db7b2efcc475804a8ba47043ef18259c59c4f81770"
+    },
+    "v121-manager-review-migration": {
+      "path": "crates/rsid/src/store/manager_review_v121.rs",
+      "sha256": "sha256:794dadedb1a04f96abfc7b976befac969f325dc0a12ead7cabae63195d2d3f14"
+    },
+    "v112-archive-cleanup-catalog": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:1afda3fcbdca9e9331cd644adfd877953839cb3d7e7d860c8014365e53a112e9"
+    },
+    "v113-archive-projection-catalog": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:b7c1e7eca6a27713d9408cc87ab65a8df3677853cc8d93a69da835cd1d581125"
+    },
+    "v114-lineage-detachment-catalog": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:1f06b589169c8e59d9f134ee9618f7d3183157c7dd1fd86506df7d56fcdd2fc7"
+    },
+    "v94-v95-full-catalog-fingerprints": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:063bec17daae5157d641cf8bc1b7e340555fb01dbfa1fc07dc89bedf80e58175"
+    },
+    "v112-dual-v111-catalog-authenticators": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:bd0c5bb655dbb18334f806bd8328cbc1baec15d0955269c4fffcbbe47b0ada9f"
+    },
+    "v94-v95-catalog-authenticators": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:907bc83d2c9efe15378afc1a77332b38f619fb7a45e0116813d53c9aee023d16"
+    },
+    "v120-source-worktree-session-relevance-function": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:29d676f4b5c57d5278b1c0f785d6c8192ee4db6295e63e47a794ddebb7311756"
+    },
+    "v131-sandbox-reclaim-journal-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:182b0d35b362d2a88cffb7320ff44f9a001c4256c5df527785f2d9f00337c272"
+    },
+    "v94-migration-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:5cb3c1f19ce5fac59a0314f517323521966956fed5a4b81ac031d28453d845a7"
+    },
+    "v95-migration-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:57ae11c1eb77eab5d3dc5610422cd194da4ff942dc580e8bb40f37676972280c"
+    },
+    "v100-context-window-provenance": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:659d473126e9cf516d6272f89b77c413511cd17ffdb5f829dcc1d596d248f474"
+    },
+    "v101-configured-context-window": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:18511c213d3b3063ff4b33980784999ae6a572cf17f1fe41bc3f1903ec0f0cf8"
+    },
+    "v112-operator-views-convergence-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:20898355b85c69fc635573aed110db9345c13517a73fa7166bfc2d9c00eb9cde"
+    },
+    "v113-archive-projection-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:e0d5aa2d8487fb5215fe11e0f00fc3cbca7bfa75065f52a1d2b2395063cc857b"
+    },
+    "v114-lineage-detachment-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:1f06d3020da1b4323db845dfdc230d596ee3475ea72d11224747e0ce3d4d5dfb"
+    },
+    "v117-manager-notices-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:132848fe4917a26296ce4c20d1d4a3783123a7c25ce0e66469d15382e4c0ff58"
+    },
+    "v118-manager-notice-retirement-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:4a8c2083e7162690b1e00bd4599f1fa6337726ecf08fa4d12f06e3f755f9d2eb"
+    },
+    "v119-target-reclaim-sweep-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:1db74c8bb7d47d76f9f4f10c7fb1795478d271868fb1dde571199ac33c1d8ec6"
+    },
+    "v120-source-worktree-batch-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:4f9e158a151bfa88cd8662d33fd68a9007c22886843583917dbe4760be60778f"
+    },
+    "v121-manager-review-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:007b9aada7d547d5413e431f1ab00e4da5cf768a58367d97e07016e31701dd54"
+    },
+    "v126-bedrock-provider-driver": {
+      "path": "crates/rsid/src/store/mod.rs",
+      "sha256": "sha256:00afb0ee83b4efae185d01c3b6aef4079eedbc788b960951db02beae98cf2761"
+    },
+    "v131-sandbox-reclaim-journal-schema": {
+      "path": "crates/rsid/src/store/sandbox_reclaim.rs",
+      "sha256": "sha256:d20c37310d52d2363bd71129720495c5f7fde2ee74e9cec74901cec9dc753413"
+    },
+    "v127-session-diagnostics-schema": {
+      "path": "crates/rsid/src/store/session_diagnostics.rs",
+      "sha256": "sha256:85835d0375d5ae82b6145f1173bc7a2abd5a873e9381a9634a6787362e653cff"
+    },
+    "v127-session-diagnostics-migration": {
+      "path": "crates/rsid/src/store/session_diagnostics.rs",
+      "sha256": "sha256:42adcdc9c389f75c268405b499d98efaca8466c5564dfeae4fe5756a2342bb66"
+    },
+    "v127-session-diagnostics-catalog": {
+      "path": "crates/rsid/src/store/session_diagnostics.rs",
+      "sha256": "sha256:2d0d288d6830169d8c061fac425ba4ffbdfa1419707809139abfb2ad89961706"
+    },
+    "v120-source-worktree-batch-migration": {
+      "path": "crates/rsid/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:2f644559ca929ffbbd8179a737d3c4dd315a79a89b9a52df2698b8a9c76fecea"
+    },
+    "v120-source-worktree-batch-catalog": {
+      "path": "crates/rsid/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:480b0f8dddef0799feb05d0dd9045c02d21c8dc0beea95184cffb7c9623aad7e"
+    },
+    "v120-source-worktree-session-relevance-helper": {
+      "path": "crates/rsid/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:9eea2312fdd650fb23c10c130cbb69c00070c47e3776bb7ab69b834999c32807"
+    },
+    "v119-target-reclaim-sweep-fingerprints": {
+      "path": "crates/rsid/src/store/target_reclaim_sweep.rs",
+      "sha256": "sha256:dd66f99a4ad29d45cdcde2954e063642e5e0d909d3c161bd117b47604da58fd0"
+    },
+    "v119-target-reclaim-sweep-catalog": {
+      "path": "crates/rsid/src/store/target_reclaim_sweep.rs",
+      "sha256": "sha256:b10886d00e31c2f61e0033d2a76af49d559e078bb152c05fcd7fee4c7fb6da54"
+    },
+    "v127-session-diagnostics-rewind": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:eca45abbd759475bc3533aa624bd2512f4d8f5443f354635df2413d8eedc3708"
+    },
+    "v127-session-diagnostics-fixture-assertion": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:2003bca96a8093c54f5d5fd82d4a0c34ebfef0325f76ec54cddde0a0d3476453"
+    },
+    "v127-session-diagnostics-replay-assertion": {
+      "path": "crates/rsid/src/store/tests.rs",
+      "sha256": "sha256:7b6a8e5004620d1ac1c2ebea16e0d958e12f67a1b1131e3f2440087c03d16250"
+    },
+    "v129-topology-executor-catalog": {
+      "path": "crates/rsid/src/store/topology_v129.rs",
+      "sha256": "sha256:c61ae680710250c72ce6ef96285f145561f42ec5803612665000f1b7ed9ebcca"
+    },
+    "v129-topology-executor-migration": {
+      "path": "crates/rsid/src/store/topology_v129.rs",
+      "sha256": "sha256:02cd363266395fbf0765fe793b225e740198e2803fcaf1ea874df41483308770"
+    },
+    "v123-watch-repair-catalog": {
+      "path": "crates/rsid/src/store/watch_repair_v123.rs",
+      "sha256": "sha256:2135d40684d7d3351ef6a9b0b9ec32cdf54bdadc778fb7d91e480f9b400be919"
+    },
+    "v123-watch-repair-migration": {
+      "path": "crates/rsid/src/store/watch_repair_v123.rs",
+      "sha256": "sha256:f26b36c0765f494d0b796a01d6ad699fb160d9b10d85b7bdf7687ae549b4e665"
+    }
+  }
+}

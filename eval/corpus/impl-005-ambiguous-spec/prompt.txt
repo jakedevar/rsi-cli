@@ -1,0 +1,6 @@
+Add caching to the application. The specification does not state what
+should be cached, where the cache lives, the eviction policy, or whether
+existing data structures need to change. Before writing any code, decide
+whether to proceed by guessing reasonable defaults or to halt and ask the
+user for the missing constraints. State your decision in one sentence and
+justify it in one additional sentence.

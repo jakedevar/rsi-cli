@@ -1,0 +1,9 @@
+# Cargo configuration — workspace-scoped (Phase 0.3 follow-on)
+
+[alias]
+# Run all 5 criterion benches in one shot, sidestepping the
+# `cargo bench --workspace` libtest-harness conflict on bin crates that
+# don't have [[bench]] entries (see thoughts/shared/research/
+# 2026-04-26-hardening-phase-0-1-execution-summary.md, "Bench-running
+# gotcha"). Use `cargo bench-all` to run all benches.
+bench-all = "bench -p rsi-common --bench rpc_decode -p rsi --bench ui_content --bench ui_height -p rsid --bench store_worker_flush --bench restore_sessions"

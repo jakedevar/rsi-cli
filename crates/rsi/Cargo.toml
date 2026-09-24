@@ -1,0 +1,90 @@
+[package]
+name = "rsi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rsi"
+path = "src/main.rs"
+
+[lib]
+name = "rsi"
+path = "src/lib.rs"
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+rsi-graph = { path = "../rsi-graph" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+modalkit = { workspace = true }
+modalkit-ratatui = { workspace = true }
+editor-types = { workspace = true }
+keybindings = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+color-eyre = { workspace = true }
+catppuccin = { workspace = true }
+syntect = { workspace = true }
+syntect-tui = { workspace = true }
+tui-textarea = { workspace = true }
+fuzzy-matcher = { workspace = true }
+ignore = { workspace = true }
+which = { workspace = true }
+pipewire = { workspace = true, optional = true }
+rand = { workspace = true }
+arboard = { workspace = true }
+image = { workspace = true }
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-language.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-yaml.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-md.workspace = true
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+tokio = { workspace = true }
+criterion = { workspace = true }
+insta = { workspace = true }
+termwright = "0.2"
+tempfile = "3"
+
+[[bench]]
+name = "ui_content"
+harness = false
+
+[[bench]]
+name = "ui_height"
+harness = false
+
+[features]
+default = []
+pipewire-audio = ["dep:pipewire"]
+
+[lints]
+workspace = true

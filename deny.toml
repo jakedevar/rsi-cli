@@ -1,0 +1,107 @@
+# cargo-deny configuration — Phase 0.2 (advisory only)
+# All checks are informational; violations do not block CI (continue-on-error: true).
+# Enforcement (convert warn → deny) is deferred to Phase 2.
+
+[graph]
+# Analyse the full dependency graph. Dev-dependencies are included by default.
+all-features = false
+
+# ── Advisories ───────────────────────────────────────────────────────────────
+# Default severity for vulnerabilities / unmaintained crates is "deny" in
+# cargo-deny v0.19+. The CI job carries continue-on-error: true so these
+# failures are advisory-only at the pipeline level.
+[advisories]
+# Suppress specific advisory IDs here as they are triaged.
+ignore = [
+    # RUSTSEC-2025-0141: bincode — crate permanently abandoned after harassment incident; v1.3.3 declared "complete"
+    # TODO(rsi): triage — replace dep / pin / accept risk. See thoughts/shared/research/
+    # 2026-04-26-hardening-phase-0-1-execution-summary.md "Immediate / unblocking" §1.
+    "RUSTSEC-2025-0141",
+
+    # RUSTSEC-2024-0384: instant — crate unmaintained; author recommends switching to web-time
+    # TODO(rsi): triage — replace dep / pin / accept risk. See thoughts/shared/research/
+    # 2026-04-26-hardening-phase-0-1-execution-summary.md "Immediate / unblocking" §1.
+    "RUSTSEC-2024-0384",
+
+    # RUSTSEC-2024-0436: paste — crate archived and no longer maintained by dtolnay; alternatives: pastey, with_builtin_macros
+    # TODO(rsi): triage — replace dep / pin / accept risk. See thoughts/shared/research/
+    # 2026-04-26-hardening-phase-0-1-execution-summary.md "Immediate / unblocking" §1.
+    "RUSTSEC-2024-0436",
+
+    # NOTE: cargo update + lru bump on 2026-04-26 resolved 8 of the original
+    # 13 advisories. Cleared:
+    #   - RUSTSEC-2026-0007 (bytes 1.11.0 → 1.11.1)
+    #   - RUSTSEC-2026-0009 (time 0.3.46 → 0.3.47)
+    #   - RUSTSEC-2026-0097 (rand 0.8.5 → 0.8.6, 0.9.2 → 0.9.4)
+    #   - RUSTSEC-2026-0049/-0098/-0099/-0104 (rustls-webpki 0.103.9 → 0.103.13)
+    #   - RUSTSEC-2026-0002 (lru 0.12.5 → 0.16.4 — Cargo.toml manifest bump)
+    # The 5 remaining ignores below are genuine unmaintained-crate advisories
+    # that need upstream replacement (bincode, instant, paste, serial, yaml-rust).
+    # NOTE: yaml-rust is no longer pulled in by serde_yaml (swapped to serde_yaml_ng)
+    # but syntect v5 still depends on yaml-rust for .sublime-syntax parsing.
+    # Blocked on syntect upstream; tracked separately.
+
+    # RUSTSEC-2017-0008: serial — crate unmaintained since 2017; alternatives: serial2, serialport, tokio-serial
+    # TODO(rsi): triage — replace dep / pin / accept risk. See thoughts/shared/research/
+    # 2026-04-26-hardening-phase-0-1-execution-summary.md "Immediate / unblocking" §1.
+    "RUSTSEC-2017-0008",
+
+    # RUSTSEC-2024-0320: yaml-rust — crate unmaintained; now pulled in by syntect (not serde_yaml).
+    # serde_yaml was already replaced with serde_yaml_ng; syntect is the remaining blocker.
+    # TODO(rsi): update syntect or fork-pin when syntect 6.x removes yaml-rust.
+    "RUSTSEC-2024-0320",
+
+]
+
+# ── Licenses ─────────────────────────────────────────────────────────────────
+[licenses]
+# Accepted SPDX license identifiers for third-party dependencies. Keep this
+# list permissive (plus file-level MPL-2.0): a copyleft dependency would stop
+# rsi from also being offered under commercial terms (see NOTICE).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "NCSA",
+]
+# Confidence threshold for license text matching (0.8 is the default).
+confidence-threshold = 0.8
+# rsi's own workspace crates are AGPL-3.0-only (LICENSE, NOTICE). Allow it for
+# them alone so a copyleft third-party crate still fails. Add new workspace
+# crates here.
+exceptions = [
+    { allow = ["AGPL-3.0-only"], crate = "rsid" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-common" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-signal" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-graph" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-eval" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-diag" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-baseline" },
+    { allow = ["AGPL-3.0-only"], crate = "rsi-codegraph" },
+    { allow = ["AGPL-3.0-only"], crate = "flywheel-imessage" },
+    { allow = ["AGPL-3.0-only"], crate = "flywheel-signal" },
+]
+
+# ── Bans ─────────────────────────────────────────────────────────────────────
+[bans]
+# Warn on multiple versions of the same crate — helpful signal, not a blocker.
+multiple-versions = "warn"
+# Wildcard version requirements are suspicious but not banned in Phase 0.
+wildcards = "warn"
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+[sources]
+# Warn on crates from unknown registries or git sources — crates.io is canonical.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

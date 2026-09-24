@@ -1,0 +1,7 @@
+{
+  "kind": "Feature",
+  "expected_completion_status": "Completed",
+  "expected_test_passed": true,
+  "expected_clippy_passed": true,
+  "expected_partial": false
+}

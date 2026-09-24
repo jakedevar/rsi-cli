@@ -1,0 +1,83 @@
+{
+  "id": "00000000-0000-4000-8000-000000000645",
+  "name": "readonly-fanout-audit",
+  "created_at": "2026-09-23T00:00:00Z",
+  "updated_at": "2026-09-23T00:00:00Z",
+  "definition": {
+    "nodes": [
+      {
+        "id": "audit_1",
+        "kind": "Task",
+        "label": "Read-only audit 1",
+        "params": {
+          "instructions": "Audit only the area supplied under `area_1` in the workflow input context. Read source and relevant tests; report concrete findings and file/line evidence. Do not write, edit, or commit anything. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and the findings in its inline summary.",
+          "provider": "openrouter",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "effort": "medium",
+          "custody": {"from": "base"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": false}
+        }
+      },
+      {
+        "id": "audit_2",
+        "kind": "Task",
+        "label": "Read-only audit 2",
+        "params": {
+          "instructions": "Audit only the area supplied under `area_2` in the workflow input context. Read source and relevant tests; report concrete findings and file/line evidence. Do not write, edit, or commit anything. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and the findings in its inline summary.",
+          "provider": "openrouter",
+          "model": "z-ai/glm-5.3-flashx",
+          "effort": "medium",
+          "custody": {"from": "base"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": false}
+        }
+      },
+      {
+        "id": "audit_3",
+        "kind": "Task",
+        "label": "Read-only audit 3",
+        "params": {
+          "instructions": "Audit only the area supplied under `area_3` in the workflow input context. Read source and relevant tests; report concrete findings and file/line evidence. Do not write, edit, or commit anything. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and the findings in its inline summary.",
+          "provider": "openrouter",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "effort": "medium",
+          "custody": {"from": "base"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": false}
+        }
+      },
+      {
+        "id": "audit_4",
+        "kind": "Task",
+        "label": "Read-only audit 4",
+        "params": {
+          "instructions": "Audit only the area supplied under `area_4` in the workflow input context. Read source and relevant tests; report concrete findings and file/line evidence. Do not write, edit, or commit anything. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and the findings in its inline summary.",
+          "provider": "openrouter",
+          "model": "z-ai/glm-5.3-flashx",
+          "effort": "medium",
+          "custody": {"from": "base"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": false}
+        }
+      },
+      {
+        "id": "summary",
+        "kind": "Task",
+        "label": "Audit summary",
+        "prereqs": ["audit_1", "audit_2", "audit_3", "audit_4"],
+        "params": {
+          "instructions": "Synthesize the four read-only audit handoffs in the upstream context. Preserve each area, cite its concrete evidence, deduplicate findings, and distinguish confirmed defects from risks or questions. Do not modify files or commit. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and a concise inline summary.",
+          "provider": "codex",
+          "model": "gpt-6-luna",
+          "effort": "medium",
+          "custody": {"from": "node:audit_1"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": true}
+        }
+      }
+    ],
+    "edges": [
+      {"from": "audit_1", "to": "summary"},
+      {"from": "audit_2", "to": "summary"},
+      {"from": "audit_3", "to": "summary"},
+      {"from": "audit_4", "to": "summary"}
+    ],
+    "until": null
+  }
+}

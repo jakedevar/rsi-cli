@@ -1,0 +1,63 @@
+[package]
+name = "rsi-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = "0.2"
+sha2 = "0.10"
+serde_yaml_ng = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+insta = { workspace = true }
+
+[[bench]]
+name = "rpc_decode"
+harness = false
+
+[[bin]]
+name = "rsi-handoff-validate"
+path = "src/bin/rsi-handoff-validate.rs"
+
+[[bin]]
+name = "rsi-research-validate"
+path = "src/bin/rsi-research-validate.rs"
+
+[[bin]]
+name = "rsi-contract-validate"
+path = "src/bin/rsi-contract-validate.rs"
+
+[[bin]]
+name = "rsi-manifest-validate"
+path = "src/bin/rsi-manifest-validate.rs"
+
+[[bin]]
+name = "rsi-closure-evidence-validate"
+path = "src/bin/rsi-closure-evidence-validate.rs"
+
+[[bin]]
+name = "rsi-rpc"
+path = "src/bin/rsi-rpc.rs"
+
+[[bin]]
+name = "rsi-agent-mcp"
+path = "src/bin/rsi-agent-mcp.rs"
+
+[[bin]]
+name = "rsi-rolling-health-validate"
+path = "src/bin/rsi-rolling-health-validate.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+Produce a step-by-step plan for adding a new boolean column `is_archived`
+(defaulting to `false`) to an existing SQLite `sessions` table via a
+forward-only migration. The plan must cover: (1) the migration SQL with
+idempotent column-addition semantics, (2) updating the Rust struct that
+maps to the row, (3) any queries or serializers that need to read or
+filter the new column, (4) verification steps such as `cargo test` and
+`PRAGMA table_info(sessions)`. Output the result as a numbered list of
+five to eight items. Do not write implementation code — produce only the
+plan.

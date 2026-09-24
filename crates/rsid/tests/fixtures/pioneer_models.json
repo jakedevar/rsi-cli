@@ -1,0 +1,85 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "data-only/model",
+      "display_name": "Compatibility Data Entry"
+    }
+  ],
+  "models": [
+    {
+      "slug": "vendor/low-priority",
+      "display_name": "Low Priority",
+      "visibility": "list",
+      "priority": 30,
+      "supported_in_api": true,
+      "context_window": 131072,
+      "future_metadata": { "preserved": true }
+    },
+    {
+      "slug": "vendor/hidden",
+      "display_name": "Hidden",
+      "visibility": "hide",
+      "priority": 1,
+      "supported_in_api": true
+    },
+    {
+      "slug": "vendor/not-in-api",
+      "display_name": "Not in API",
+      "visibility": "list",
+      "priority": 2,
+      "supported_in_api": false
+    },
+    {
+      "slug": "pioneer/auto",
+      "display_name": "Pioneer Auto Router",
+      "visibility": "list",
+      "priority": 50,
+      "supported_in_api": true
+    },
+    {
+      "slug": "pioneer/auto",
+      "display_name": "Duplicate Auto Router",
+      "visibility": "list",
+      "priority": 60,
+      "supported_in_api": true
+    },
+    {
+      "slug": "vendor/high-priority",
+      "priority": 10
+    },
+    {
+      "slug": "vendor/no-display-name",
+      "visibility": "list",
+      "priority": 20,
+      "supported_in_api": true
+    },
+    {
+      "slug": "vendor/duplicate",
+      "display_name": "Later Duplicate",
+      "visibility": "list",
+      "priority": 40
+    },
+    {
+      "slug": "vendor/duplicate",
+      "display_name": "Preferred Duplicate",
+      "visibility": "list",
+      "priority": 5
+    },
+    {
+      "slug": " invalid/leading-space",
+      "visibility": "list",
+      "priority": 0
+    },
+    {
+      "slug": "invalid model",
+      "visibility": "list",
+      "priority": 0
+    },
+    {
+      "slug": "vendor/unknown-visibility",
+      "visibility": "private",
+      "priority": 0
+    }
+  ]
+}

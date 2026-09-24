@@ -1,0 +1,30 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: "support::buffer_to_snapshot(&resized)"
+---
+ ● 0
+ All projects / Sessions              4 sessions │ Implement event seam
+  #   ∞  S  !  FUNCTION              ◔     ⇄ AGE   ID  ✓  Claude  ·  Sonnet 5  ·  43s  ·  42%≈ ctx
+                                                  ────────────────────────────────────────────────────────────
+  ! NEEDS YOU  2  ──────────────                    No output.
+▌        ?  !  Review harness sn~          3  now
+         ×  !  Investigate rende~         13  now
+
+  ● IN FLIGHT  1  ──────────────
+│        ✓     Implement event s~  42%     8  now
+
+  ✓ RECENT  1  ──────────────
+         ✓     Clean fixture sta~          5  now
+
+
+
+
+  4/4
+
+ 01 ─────────────────────────────────────────────
+ ◎ codex-2
+
+
+                                                  ┌──────────────────────────────────────────────────────────┐
+                                                  │NORMAL ›  Type your message…                              │
+                                                  └──────────────────────────────────────────────────────────┘

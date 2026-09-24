@@ -1,0 +1,2 @@
+# Snapshot files are ephemeral, archive-batch-specific rollback inputs
+snapshot-*.txt

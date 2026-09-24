@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "research_question": "Compose an example of every rule failing at once.",
+  "areas": ["TUI"],
+  "findings": [
+    {
+      "summary": "this summary deliberately exceeds the twenty five word cap by repeating filler words one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+      "file_ref": "no-colon-format-here",
+      "confidence": "medium"
+    }
+  ],
+  "file_refs": [
+    {"path": "src/lib.rs", "lines": [42, 1]}
+  ],
+  "open_questions": [
+    {"summary": "this open question summary is also intentionally over the twenty five word limit by listing many filler items one two three four five six seven eight", "blocks_planning": false}
+  ]
+}

@@ -1,0 +1,13 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+assertion_line: 357
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "CancelModelInvocation",
+  "params": {
+    "invocation_id": "00000000-0000-0000-0000-000000000009"
+  }
+}

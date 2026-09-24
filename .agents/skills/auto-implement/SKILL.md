@@ -1,0 +1,307 @@
+---
+name: auto-implement
+description: Autonomous implementation with guardrails and test verification
+---
+
+# Auto Implement (Autonomous Mode)
+
+You are tasked with implementing an approved technical plan autonomously. Unlike the interactive `/implement` command, you will execute all phases without pausing for human verification, relying on automated tests as your quality gate.
+
+## CRITICAL: AUTONOMOUS OPERATION PRINCIPLES
+
+1. **NO PAUSES FOR HUMAN VERIFICATION** - Automated tests are your quality gate
+2. **STOP ON TEST FAILURES** - If automated tests fail after 3 fix attempts, stop
+3. **DOCUMENT ALL CHANGES** - Create audit trail of what was modified
+4. **SKIP MANUAL VERIFICATION** - Queue for human review at end
+5. **PHASE COMPLETION = TESTS PASS** - Move to next phase only when tests pass
+
+## Input Requirements
+
+**Required**: Path to implementation plan (e.g., `thoughts/shared/plans/YYYY-MM-DD-feature.md`)
+
+If no plan provided: ERROR - cannot implement without plan
+
+## Autonomous Implementation Process
+
+### Step 1: Load and Validate Plan
+
+1. **Read the plan FULLY** (no limit/offset)
+2. **Read all files mentioned in the plan** FULLY
+3. **Check for existing progress** (look for `[x]` checkmarks)
+4. **Validate plan has required sections**:
+   - [ ] Phases defined
+   - [ ] Success criteria per phase
+   - [ ] Automated verification commands
+5. **Log implementation start**:
+   ```
+   AUTONOMOUS IMPLEMENTATION LOG
+   =============================
+   Plan: [plan path]
+   Start Time: [timestamp]
+   Phases to Implement: [count]
+   Resume Point: [Phase N if resuming, else Phase 1]
+   ```
+
+### Step 2: Create Implementation Tracker
+
+Create a todo list to track progress across all phases:
+
+```
+- Phase 1: [Name] - [status]
+- Phase 2: [Name] - [status]
+...
+- Final: Run all tests and generate report
+```
+
+### Step 3: Implement Each Phase
+
+For each phase, follow this process:
+
+#### 3a. Phase Setup
+
+1. **Mark phase as in_progress** in todo list
+2. **Read all files that will be modified** FULLY
+3. **Understand the change context** - don't just blindly apply
+
+#### 3b. Implementation
+
+**For each change in the phase:**
+
+1. **Read the target file** (if it exists)
+2. **Apply the change** using Edit or Write tool
+3. **Verify the change** was applied correctly (read file again if needed)
+
+**Implementation Order:**
+1. Schema/model changes first
+2. Core logic second
+3. API/interface third
+4. Tests fourth (if creating new tests)
+
+#### 3c. Automated Verification
+
+After all changes in phase are complete:
+
+1. **Run each automated verification command** from the plan
+2. **Capture output** for each command
+3. **Evaluate results**:
+
+```
+Phase [N] Verification Results:
+| Check | Command | Result | Output |
+|-------|---------|--------|--------|
+| [Name] | [cmd] | PASS/FAIL | [summary] |
+```
+
+#### 3d. Handle Test Failures
+
+**If any automated check fails:**
+
+1. **Analyze the failure** - read error output carefully
+2. **Identify the fix** - what code change would resolve it
+3. **Apply the fix**
+4. **Re-run the failing check**
+5. **Track attempts**: Max 3 fix attempts per failure
+
+**Fix Attempt Tracking:**
+```
+Fix Attempt [1/3] for: [test name]
+Error: [error message]
+Analysis: [what's wrong]
+Fix Applied: [what was changed]
+Result: [PASS/FAIL]
+```
+
+**If 3 attempts fail:**
+```
+IMPLEMENTATION BLOCKED
+======================
+Phase: [N]
+Check: [which check]
+Attempts: 3/3 exhausted
+Last Error: [error]
+
+Unable to resolve automatically. Human intervention required.
+Partial progress saved. Resume with: /auto_implement [plan path]
+```
+**STOP HERE** - Do not proceed to next phase
+
+#### 3e. Phase Completion
+
+**If all automated checks pass:**
+
+1. **Update plan file** - check off completed items using Edit
+2. **Update todo list** - mark phase complete
+3. **Log completion**:
+   ```
+   Phase [N] COMPLETE
+   ==================
+   Changes Made: [count]
+   Files Modified: [list]
+   Automated Checks: [X/X passed]
+   Manual Checks Deferred: [count]
+   ```
+4. **Proceed to next phase**
+
+### Step 4: Final Verification
+
+After ALL phases complete:
+
+1. **Run comprehensive test suite** (if available):
+   - `make test` or equivalent
+   - `make lint` or equivalent
+   - `make typecheck` or equivalent
+
+2. **Generate change summary**:
+   ```
+   IMPLEMENTATION COMPLETE
+   =======================
+   Plan: [plan path]
+   Duration: [time]
+   Phases Completed: [X/X]
+
+   Files Modified:
+   - [file1] - [summary of changes]
+   - [file2] - [summary of changes]
+
+   Files Created:
+   - [file1] - [purpose]
+
+   Automated Verification:
+   - [X] All phase checks passed
+   - [X] Final test suite passed
+   - [X] Linting passed
+   - [X] Type checking passed
+
+   DEFERRED FOR MANUAL VERIFICATION:
+   - [ ] [Manual check 1 from plan]
+   - [ ] [Manual check 2 from plan]
+   - [ ] [etc.]
+
+   To verify manually, review:
+   1. [Specific thing to test]
+   2. [Another thing to test]
+   ```
+
+### Step 5: Update Plan Status
+
+Edit the plan file to reflect completion:
+
+1. Mark all automated checks as `[x]`
+2. Leave manual checks as `[ ]`
+3. Add completion note at top:
+   ```markdown
+   > **Implementation Status**: Automated implementation complete [timestamp]
+   > Manual verification pending. See deferred checks below.
+   ```
+
+## Failure Recovery Modes
+
+### Recoverable Failures (continue after handling):
+
+| Failure | Recovery |
+|---------|----------|
+| Linting errors | Auto-fix with lint --fix, retry |
+| Type errors | Analyze and fix, retry |
+| Missing import | Add import, retry |
+| Test assertion failure | Debug and fix logic, retry |
+
+### Blocking Failures (stop implementation):
+
+| Failure | Action |
+|---------|--------|
+| 3 fix attempts exhausted | Stop, report, save progress |
+| Cannot understand error | Stop, report for human review |
+| Plan contradicts codebase | Stop, plan may need revision |
+| Critical file missing | Stop, dependency issue |
+
+## Sub-Agent Usage (Minimal)
+
+Use sub-agents sparingly during implementation:
+
+**When to use:**
+- Debugging complex test failure (codebase-analyzer)
+- Finding similar pattern for reference (Explore)
+- Locating an unfamiliar code area (Explore)
+
+**When NOT to use:**
+- Simple code changes - do them directly
+- Reading files - use Read tool directly
+- Running commands - use Bash tool directly
+
+## Progress Persistence
+
+The plan file itself tracks progress via checkboxes:
+- `[ ]` = Not started
+- `[x]` = Completed
+
+## Completion
+
+Implementation work that changes task-owned tracked files is not complete
+until those scoped changes are committed. Do not report completion while the
+work exists only as an uncommitted diff. Stage explicit paths only; if a commit
+is genuinely blocked, preserve the work and report the exact blocker.
+
+If implementation is interrupted:
+1. Progress is saved in plan file
+2. Resume with same command
+3. Will skip completed phases
+
+## Example Implementation Flow
+
+```
+/auto_implement thoughts/shared/plans/2025-01-15-add-user-auth.md
+
+→ Reading plan...
+→ Found 3 phases, starting from Phase 1
+
+Phase 1: Database Schema
+→ Creating migration file...
+→ Modifying user model...
+→ Running: make migrate
+  ✓ Migration successful
+→ Running: make test-db
+  ✓ Database tests pass
+→ Phase 1 COMPLETE
+
+Phase 2: Auth Service
+→ Creating auth_service.ts...
+→ Adding password hashing...
+→ Running: npm run typecheck
+  ✗ Type error in auth_service.ts:45
+  → Fix attempt 1/3: Adding missing type annotation
+→ Running: npm run typecheck
+  ✓ Type check passes
+→ Running: npm run test:auth
+  ✓ Auth tests pass
+→ Phase 2 COMPLETE
+
+Phase 3: API Endpoints
+→ Adding routes...
+→ Creating middleware...
+→ Running: npm run test:api
+  ✗ Test failure: POST /login returns 500
+  → Fix attempt 1/3: Fixing error handler
+→ Running: npm run test:api
+  ✓ API tests pass
+→ Phase 3 COMPLETE
+
+IMPLEMENTATION COMPLETE
+=======================
+All 3 phases implemented successfully.
+12 files modified, 3 files created.
+All automated checks passed.
+
+MANUAL VERIFICATION NEEDED:
+- [ ] Login flow works in browser
+- [ ] Password reset email sends correctly
+- [ ] Session persists across browser restart
+```
+
+## Important Notes
+
+- **Tests are your safety net** - Never skip automated verification
+- **3 strikes rule** - Don't infinite loop on failures
+- **Progress saves automatically** - Plan file checkboxes persist
+- **No manual steps during execution** - All deferred to end
+- **Full file reads always** - Never use limit/offset
+- **Prefer direct implementation** - Sub-agents only for debugging

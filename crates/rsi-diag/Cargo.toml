@@ -1,0 +1,19 @@
+[package]
+name = "rsi-diag"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Read-only diagnostic CLI for rsi/rsid (capability-class mismatch aggregator, RSI-010)"
+
+[[bin]]
+name = "rsi-diag"
+path = "src/main.rs"
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+rusqlite = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

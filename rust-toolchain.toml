@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned to a known-good stable snapshot for reproducible CI builds.
+# Local dev mirrored against system stable as of 2026-04-26 (rustc 1.94.1).
+# Bump only via deliberate review — surprise stable-channel regressions
+# break CI for everyone.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,9 @@
+Implement a Rust function `keybinding_action(key: &str) -> &'static str` that
+maps single-letter direction keys to action names: `"h"` returns `"left"`,
+`"j"` returns `"down"`, `"k"` returns `"up"`, `"l"` returns `"right"`, and
+any other input returns `"noop"`. Initialize a cargo library project if one
+does not exist (`cargo init --lib`), place the function in `src/lib.rs` with
+a `#[cfg(test)]` module covering each of the four direction mappings plus
+the noop fallthrough case, run `cargo test` to confirm the tests pass, run
+`cargo clippy --workspace -- -D warnings` to confirm cleanliness, and report
+the function signature in a one-sentence summary.

@@ -1,0 +1,522 @@
+---
+description: Orchestrate implementation plans using a master-worker agent team
+model: opus
+capability_class: architect
+---
+
+# Team Implement
+
+Master-agent orchestrator for implementing plans from `thoughts/shared/plans/`. The master decomposes the plan into independent phase clusters, dispatches background worker agents in parallel per tier, gates dependent tiers, and presents a unified verification report at the end.
+
+**Worker preamble (binding):** This command's worker sub-agents MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=implementation` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
+
+**Use this over `/implement` when:**
+- The plan has 3+ phases
+- Phases touch clearly different subsystems (TUI vs daemon vs common)
+- You want parallelism to cut wall-clock time
+
+**Use `/implement` instead when:**
+- The plan is small (1-2 tightly coupled phases)
+- Every phase touches shared files (schema, core types)
+- You want interactive human gates between each phase
+
+---
+
+## Seven-Expert Verification Framework
+
+This application is built for a single user (IQ 150, ADHD, vim devotee). Quality over speed. All implementation decisions — by master and workers — must pass through these lenses:
+
+1. **SWE** (Clean architecture): No duplication, correct abstraction boundaries, single responsibility maintained?
+2. **Tech Wizard** (Zero-waste correctness): Building on the right foundation? Will any of this be thrown away when a later phase lands? **HAS VETO POWER over implementation ordering.**
+3. **UI/UX Power User** (Information density): UI-dense enough? Every action keyboard-reachable in 1-2 keystrokes? No confirmations, hand-holding, progressive simplification?
+4. **Systems Performance Engineer** (Runtime efficiency): Zero unnecessary allocations, event-driven over polling, minimal CPU when idle, efficient rendering?
+5. **Reliability Engineer** (Graceful degradation): What happens when this fails? Can the user recover without restarting? No silent failures?
+6. **Scalability Expert** (Capacity planning): What breaks at 10x sessions/events? RPC fan-out bounded? Backpressure protects SQLite and TUI threads?
+7. **Vim Language Designer** (Compositional grammar): Keybindings compose with vim grammar? `i` = insert mode, not "continue session." Verb-noun composability preserved?
+
+**If any expert objects, stop and resolve before proceeding.**
+
+Canonical reference: `five-experts.md` (in repo root)
+
+---
+
+## Step 0: Worktree Setup — MANDATORY FIRST STEP
+
+Before ANY work:
+
+1. Use the `EnterWorktree` tool with the plan name or ticket ID as the worktree name
+2. ALL work — master and workers — happens inside this worktree
+3. The `thoughts/` directory is synced between main and worktrees — plan paths like `thoughts/shared/plans/...` work as-is
+
+Do NOT skip this step. Do NOT work in the main repo.
+
+---
+
+## Step 0.5: Branch Self-Check (RSI-021, defense in depth)
+
+Run: `git rev-parse --abbrev-ref HEAD`
+
+If the result is `main` or `master`: HALT immediately with a `<blocker>` —
+team_implement workers must NOT commit to main. The pre-commit hook
+(`tools/git-hooks/pre-commit`, RSI-021) will reject the commit anyway, but
+this check catches the workflow drift before any work happens, saving cycles.
+
+If the worktree is correctly checked out to a feature branch, proceed to
+Step 1.
+
+---
+
+## Step 1: Plan Ingestion
+
+Read the plan at the provided path per the shared preamble's read budget — Grep-then-Read targeted ranges, full-file reads only for files <400 lines.
+
+Extract and log this manifest:
+
+```
+PLAN MANIFEST
+=============
+Plan: [path]
+Total phases: [N]
+Already complete (all [x]): [phase list or "none"]
+Remaining phases: [list]
+
+Per-phase summary:
+  Phase 1: [title]
+    Files: [list from "Files to modify" section, or "unspecified"]
+    Depends on: [explicit dependencies, or "none stated"]
+    Complexity: [inferred: foundation/standard/trivial]
+
+  Phase 2: ...
+```
+
+If no plan path is provided, ask for one before doing anything else.
+
+---
+
+## Step 1.5: Verification Manifest Setup
+
+Compute the manifest path deterministically before dispatching any phase:
+
+```text
+thoughts/shared/verification/<ticket-id>-<YYYY-MM-DD>.md
+```
+
+If the plan frontmatter has `ticket`, use it as `<ticket-id>`. Otherwise infer
+the ticket from the plan filename. Use today's ISO date for `<YYYY-MM-DD>`.
+
+Create the skeleton only if it does not already exist:
+
+```markdown
+---
+ticket: <ticket-id>
+plan_doc: <PLAN_PATH>
+branch: <current branch>
+generated: <current UTC timestamp>
+phases_sealed: []
+status: pending_verification
+---
+
+# Verification Manifest - <ticket-id>
+```
+
+Do not overwrite an existing manifest. Validate the skeleton with:
+
+```bash
+cargo run -q -p rsi-common --bin rsi-manifest-validate -- <manifest_path>
+```
+
+Thread `MANIFEST_PATH: <manifest_path>` into every worker prompt. Workers may
+not write the manifest directly. The orchestrator owns all manifest writes and
+appends one complete `## Phase N` block only after that phase's worker report
+validates clean.
+
+---
+
+## Step 2: Dependency Graph + Phase Clustering
+
+For each pair of remaining phases (A, B), determine if they are independent:
+
+```
+independent(A, B) = true  iff ALL of:
+  1. No file appears in both A's and B's "Files to modify" lists
+  2. B does not reference types/structs/traits/functions introduced in A
+  3. Neither phase header says "requires Phase X" or "depends on Phase X"
+  4. Neither phase involves schema migrations, new shared type definitions,
+     or crate-level API changes that other phases consume
+```
+
+Group phases into **tiers** — a tier is a set of mutually independent phases:
+
+- **Tier 0** (sequential, master-only): phases that must finish before parallel work can start
+  - Database schema migrations
+  - New shared types in `rsi-common` that other phases consume
+  - Any phase explicitly annotated `foundation:` in the plan
+  - Phases with unspecified file lists (can't safely determine overlap)
+
+- **Tier 1**: all remaining phases with no Tier 0 dependencies (parallel)
+- **Tier 2**: phases that depend only on Tier 1 phases (parallel after Tier 1 completes)
+- **Tier N**: phases that depend on all previous tiers
+
+**If fewer than 2 phases can run in parallel**, note this and proceed sequentially — don't force artificial parallelism on a tightly coupled plan.
+
+### Model Tier Assignment
+
+Assign each phase a model based on its complexity:
+
+| Complexity Signals | Model |
+|---|---|
+| Schema changes, new type systems, multi-crate coordination, architectural decisions, anything touching `rsi-common` | `opus` |
+| Standard feature implementation, new RPC handlers, action dispatch, UI components, daemon session logic | `sonnet` |
+| Documentation updates, config defaults, trivial additions, test file additions with no new logic | `haiku` |
+
+**UI phases always get `sonnet` minimum — never `haiku`.**
+
+### Emit the Dispatch Plan
+
+Before dispatching any work, show the full plan to the user:
+
+```
+Team Dispatch Plan
+==================
+
+Tier 0 — Sequential (master implements):
+  Phase 1 [opus] — Schema migration (foundation, file: store.rs)
+
+Tier 1 — Parallel (3 workers):
+  Phase 2 [sonnet] — RPC handler (files: rpc.rs, session.rs)
+  Phase 3 [sonnet] — TUI action dispatch (files: action_handler/session.rs, modalkit_types.rs)
+  Phase 5 [haiku] — Update config defaults (files: config.rs)
+
+Tier 2 — Parallel (2 workers, after Tier 1):
+  Phase 4 [opus] — Wire daemon <-> TUI event flow (files: bus.rs, poll_controller.rs)
+  Phase 6 [sonnet] — Integration tests (files: tests/)
+
+Sequential final:
+  Phase 7 [sonnet] — End-to-end smoke test (depends on everything)
+
+Parallelism factor: 3x (Tier 1), 2x (Tier 2)
+```
+
+Do not wait for user confirmation — proceed immediately after emitting this.
+
+---
+
+## Step 3: Tier 0 — Sequential Foundation Work
+
+Implement all Tier 0 phases yourself (master agent). Do not delegate these — they create the foundation that workers will build on.
+
+For each Tier 0 phase:
+1. Read all files to be modified **fully**
+2. Implement the changes
+3. Run the phase's automated success criteria checks
+4. Fix any failures before continuing
+5. Commit with: `git add [specific files] && git commit -m "phase [N]: [title]"`
+6. Mark completed items `[x]` in the plan file using Edit
+
+Do NOT use `git add .` or `git add -A` — only stage the files you touched.
+
+After all Tier 0 phases are complete, proceed to worker dispatch.
+
+---
+
+## Step 4: Worker Agent Dispatch
+
+For each tier (starting from Tier 1), spawn one background worker agent per phase using the `Agent` tool with `run_in_background: true`.
+
+**Fire all workers in a tier in a single message** (true parallel launch). Do not wait for one to finish before launching the others in the same tier.
+
+Assign each worker a descriptive `name` so you can track them: e.g., `"worker-phase-2"`, `"worker-phase-3"`.
+
+### Worker Prompt Template
+
+Use this exact prompt structure for each worker, filled in for their specific phase:
+
+```
+You are a focused implementation worker in a master-worker agent team.
+
+PLAN: [PLAN_PATH]
+WORKTREE: [WORKTREE_PATH]
+MANIFEST_PATH: [MANIFEST_PATH]
+YOUR PHASE(S): Phase [N] — "[Phase Title]"
+
+YOUR SCOPE:
+Files you are authorized to modify:
+  - [file1]
+  - [file2]
+  - [etc.]
+
+INSTRUCTIONS:
+0. FIRST ACTION (mandatory before any other work):
+   Run: export CLAUDE_AGENT_ROLE=pipeline-implement
+   The pre-commit hook (tools/git-hooks/pre-commit, RSI-021) reads this
+   variable and rejects commits on main. Without the export, you may
+   silently land implementation on main and bypass the worktree invariant.
+1. Read the plan at [PLAN_PATH] per the shared preamble's read budget — Grep-then-Read targeted ranges, full-file reads only for files <400 lines
+2. Read files in YOUR SCOPE the same way — targeted ranges by default, full read only for small files
+3. Implement ONLY Phase [N] — do not touch files outside your scope above
+4. After implementing, run the success criteria checks for your phase
+5. Fix any failures before reporting (max 3 attempts per check)
+6. Categorize verification items using `## Verification item categorization`
+   from the worker preamble. Do NOT write MANIFEST_PATH directly; emit
+   `VERIFICATION_ITEMS:` in your final report.
+7. Commit your work with specific files only:
+   git add [file1] [file2] && git commit -m "phase [N]: [title]"
+   DO NOT use git add . or git add -A
+8. Do NOT push to remote
+
+FIVE-EXPERT CHECK before committing:
+- SWE: Is the code clean with correct abstractions?
+- Tech Wizard: Am I building on the right foundation?
+- Systems Engineer: No unnecessary allocations or polling?
+- Reliability: All error paths visible?
+
+If the codebase does not match the plan (file missing, type changed, API shifted),
+do NOT guess or improvise. Stop and include the mismatch in your WORKER REPORT.
+
+YOUR FINAL MESSAGE TO THE MASTER MUST CONTAIN ONLY THE WORKER REPORT BLOCK BELOW.
+Nothing before it. Nothing after it. The master reads only your report and accesses
+your actual changes via the shared git worktree.
+
+<return_schema role="implementation">
+  files_modified: list[file_path, max_items=10]   # the ONLY substantive field
+  verification_items: markdown_bucket_block        # required, may contain explicit (none)
+  status: enum[complete, blocked, partial]
+  blocker: str, max_words=15, optional
+</return_schema>
+
+<forbidden_content>
+(Extends the shared preamble's forbidden list — role-specific additions only.)
+- Any field that exceeds its max_words / max_items cap — over-budget returns will be rejected and the worker re-dispatched.
+</forbidden_content>
+
+**Rule:** `files_modified` and `VERIFICATION_ITEMS` are the ONLY substantive
+fields you return. The master reads `git diff` for details. Everything else is
+a status flag.
+
+WORKER REPORT:
+==============
+status: complete | blocked | partial
+Phase: [N]
+files_modified: [per schema above]
+blocker: [per schema above — only if status != complete]
+
+VERIFICATION_ITEMS:
+### Automated
+- [automated checks added/run, or `(none)`]
+
+### Daemon-level
+- [PENDING] [daemon-observable item]
+  check: [concrete command]
+  expected: [expected result]
+
+### TUI manual
+- [ ] [TUI-only item with automation-blocking note, or `(none)`]
+```
+
+---
+
+## Step 5: Worker Monitoring + Tier Advancement
+
+After dispatching a tier's workers, wait for `TaskOutput` notifications as workers complete.
+
+For each completed worker, validate their reply via the contract binary
+(RSI-021):
+
+  cargo run -q -p rsi-common --bin rsi-contract-validate -- --worker-report < reply.txt
+
+If exit != 0, use SendMessage to dispatch a single corrective directive to the
+worker ("Your WORKER REPORT block was malformed: $err. Re-emit with ONLY the
+report block as your final message — nothing before, nothing after.") and wait
+for the second reply. If the second reply also fails, escalate the worker as
+BLOCKED per the schema below.
+
+On exit 0, parse the structured `WorkerReport` JSON the binary emits to stdout
+for {status, phase, files_modified, blocker?}, then apply the rules below:
+
+**If `Status: DONE`:**
+- Verify their files were committed: check `git log --oneline -5`
+- Verify the worker did not mutate `MANIFEST_PATH` directly. If it did, halt
+  with: "worker mutated manifest directly; orchestrator owns atomic phase seal."
+- Extract the worker's `VERIFICATION_ITEMS:` block from the raw report and
+  append one complete `## Phase N - [Title]` block to `MANIFEST_PATH` with all
+  three bucket headings. Update `phases_sealed` in frontmatter in the same edit.
+- Run `cargo run -q -p rsi-common --bin rsi-manifest-validate -- <manifest_path>`.
+  If validation fails, halt before tier advancement.
+- Mark their phase's completed items `[x]` in the plan file using Edit
+- Log: `✓ Phase [N] complete (worker-phase-[N])`
+
+**If `Status: FAILED`:**
+1. Read the failure detail carefully
+2. Attempt to fix the issue yourself (master) — 1 attempt only
+3. If you fix it, commit the fix: `git add [files] && git commit -m "phase [N]: fix [what failed]"`
+4. If you cannot fix it, escalate using the BLOCKED format below
+
+**If `Status: BLOCKED`:**
+
+Stop the current tier and present this to the user:
+
+```
+Worker Blocked — Phase [N]: [Title]
+
+Worker report:
+  blocker: [worker's blocker field]
+
+Options:
+  1. Skip this phase (mark it deferred, continue with other tiers)
+  2. Tell me what to adjust in the plan and I will re-dispatch
+  3. Handle this phase manually and let me know when done
+
+How should I proceed?
+```
+
+Wait for user input before continuing.
+
+**Tier Advancement Rule:**
+Only advance to the next tier after ALL workers in the current tier are resolved (DONE, master-fixed, skipped, or manually handled). Never start a dependent tier while its prerequisites are incomplete.
+
+## Stop condition
+
+If automated checks (build / test / clippy) fail 3 times on the same phase, STOP. Report the failing diff, the last error output, and the attempted fixes. Do not loop — hand control back to the user.
+
+---
+
+## Step 6: Post-Parallel Sequential Work
+
+After all tiers complete, implement any final sequential phases yourself (master):
+- Integration tests that span all subsystems
+- Final wiring phases that depend on all prior work
+- Phases explicitly marked "last", "integration", or "smoke test" in the plan
+
+For each: read fully → implement → run checks → fix → commit → mark `[x]`.
+
+---
+
+## Step 7: Final Verification
+
+After all phases are complete, run the full workspace test suite:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace
+```
+
+Fix any failures before proceeding to the human gate.
+
+Then pause and present the verification summary:
+
+```
+All Phases Complete — Ready for Manual Verification
+
+Team summary:
+  Tier 0 (master, sequential): Phase [N]
+  Tier 1 (parallel, [M] workers): Phases [list]
+  Tier 2 (parallel, [M] workers): Phases [list]
+  Sequential final: Phase [N]
+
+Automated checks: PASS
+  cargo test --workspace: PASS
+  cargo clippy --workspace: PASS
+
+Please perform only the TUI manual verification items from the manifest:
+
+Phase [N]: [Title]
+  - [ ] [manual step 1]
+  - [ ] [manual step 2]
+
+Phase [M]: [Title]
+  - [ ] [manual step 1]
+
+Let me know when manual testing is complete.
+```
+
+Do NOT check off manual testing items until the user confirms.
+
+---
+
+## Step 8: Commit and Push — MANDATORY
+
+After the user confirms manual verification:
+
+1. Mark confirmed TUI manual items checked in `MANIFEST_PATH`, flip manifest
+   status to `verified`, and validate with `rsi-manifest-validate`
+2. Stage and commit all task-owned changes using explicit paths; directly related `thoughts/` files belong in this commit, but never stage the entire `thoughts/` directory or unrelated edits
+3. Create a final summary commit:
+   ```
+   feat: implement [plan title] via team dispatch
+
+   Phases completed: [list]
+   Workers used: [N]
+   Automated checks: all pass
+   ```
+4. Push only if the user explicitly asked; then push the current branch as a safe fast-forward, never `main`
+
+Do NOT merge into main. The branch stays as-is for review.
+
+---
+
+## Resuming a Partial Run
+
+If the plan already has `[x]` checkmarks:
+
+1. Skip any phase where all checkboxes are `[x]` — trust prior work
+2. Reconstruct which tiers have already completed based on the checkmarks
+3. Pick up from the first tier with incomplete phases
+4. Only re-verify prior work if something looks actively broken
+
+---
+
+## Mismatch Handling
+
+If master finds the codebase doesn't match the plan during Tier 0 or sequential phases:
+
+```
+Issue in Phase [N]: [Title]
+Expected: [what the plan says]
+Found: [actual situation]
+Why this matters: [explanation]
+
+How should I proceed?
+```
+
+Stop and wait for guidance before continuing.
+
+---
+
+## Final Response Format
+
+When all phases are complete and pushed:
+
+```
+Branch: [branch-name]
+Worktree: [path]
+
+Team execution summary:
+  Tier 0 (sequential): [phases] — implemented by master
+  Tier 1 ([N] workers in parallel): [phases]
+  Tier 2 ([N] workers in parallel): [phases]
+  Sequential final: [phases]
+
+Files modified: [total count]
+Automated checks: all pass
+Manual verification: confirmed by user
+
+Ready for review and merge.
+```
+
+---
+
+## Pipeline Mode Override
+
+If your invocation prompt includes `PIPELINE MODE: true`, you are being called from a master pipeline agent (`/master_implement`). In this mode:
+
+1. Override the Final Response Format entirely
+2. Your **terminal message MUST contain ONLY the PIPELINE HANDOFF block** that the master defined in your prompt — nothing before it, nothing after it
+3. All reasoning, worker reports, and phase narration belong in your working process — the master reads only the handoff block
+4. **Skip Step 8 (the final git push)** — the master handles the push after Jake confirms manual verification
+5. Include `Manifest path:` in your PIPELINE HANDOFF block. Do not include
+   inline manual verification items; the master reads TUI manual items from the
+   manifest after daemon verification.
+6. The master parses your handoff to gate daemon verification, Jake's TUI-only
+   verification, and the final push
+
+This keeps the master's context clean across all three pipeline stages.

@@ -1,0 +1,63 @@
+{
+  "id": "00000000-0000-4000-8000-000000000629",
+  "name": "rolling-health-baseline",
+  "created_at": "2026-09-23T00:00:00Z",
+  "updated_at": "2026-09-23T00:00:00Z",
+  "definition": {
+    "nodes": [
+      {
+        "id": "baseline",
+        "kind": "Task",
+        "label": "Rolling health baseline",
+        "params": {
+          "custody": {"from": "base"},
+          "step": {
+            "kind": "command",
+            "op": {
+              "name": "rolling_baseline",
+              "crates": ["rsi-common", "rsid", "rsi"]
+            }
+          }
+        }
+      },
+      {
+        "id": "healthy",
+        "kind": "Task",
+        "label": "All catalog checks passed",
+        "prereqs": ["baseline"],
+        "params": {
+          "when": {"baseline": "completed"},
+          "step": {
+            "kind": "gate",
+            "condition": {
+              "op": "eq",
+              "path": "nodes.baseline.exit_code",
+              "value": 0
+            }
+          }
+        }
+      },
+      {
+        "id": "report",
+        "kind": "Task",
+        "label": "Baseline report",
+        "prereqs": ["baseline", "healthy"],
+        "params": {
+          "instructions": "Write a concise health report using the typed catalog report for every crate and the gate result in the upstream context. State pass/fail per crate and name the failing check when present. Return a valid PIPELINE HANDOFF — SMOKE: with doc_path: inline, status: complete, and a short inline summary. Do not edit files or commit.",
+          "provider": "codex",
+          "model": "gpt-6-luna",
+          "effort": "medium",
+          "custody": {"from": "node:baseline"},
+          "when": {"baseline": "completed"},
+          "step": {"kind": "session", "expects_commit": false, "pass_content": false}
+        }
+      }
+    ],
+    "edges": [
+      {"from": "baseline", "to": "healthy"},
+      {"from": "baseline", "to": "report"},
+      {"from": "healthy", "to": "report"}
+    ],
+    "until": null
+  }
+}

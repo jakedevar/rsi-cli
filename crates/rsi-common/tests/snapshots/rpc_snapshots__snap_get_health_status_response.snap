@@ -1,0 +1,53 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: response
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "last_command_duration_ms": 12,
+    "last_poll_event_count": 10,
+    "last_poll_payload_bytes": 4096,
+    "persistence_queue_capacity": 1024,
+    "persistence_queue_depth": 0,
+    "project_cache_hits": 100,
+    "project_cache_misses": 5,
+    "project_cache_size": 5,
+    "provider_antigravity_available": false,
+    "provider_bedrock_available": true,
+    "provider_claude_available": true,
+    "provider_codex_app_server_available": true,
+    "provider_codex_available": true,
+    "provider_harness_available": true,
+    "provider_local_available": false,
+    "provider_openrouter_available": true,
+    "provider_pioneer_available": true,
+    "queue_claimed": 0,
+    "queue_completed": 42,
+    "queue_failed": 0,
+    "queue_pending": 0,
+    "rate_limits": [
+      {
+        "is_using_overage": false,
+        "observed_at": "2026-01-01T00:00:00Z",
+        "overage_status": "rejected",
+        "provider": "Claude",
+        "rate_limit_type": "five_hour",
+        "status": "allowed",
+        "windows": [
+          {
+            "resets_at_epoch": 1788402000,
+            "utilization": 0.27,
+            "window_key": "five_hour"
+          },
+          {
+            "resets_at_epoch": 1788883200,
+            "utilization": 0.05,
+            "window_key": "seven_day"
+          }
+        ]
+      }
+    ]
+  }
+}

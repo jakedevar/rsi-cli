@@ -1,0 +1,19 @@
+#!/bin/sh
+# Refuse direct agent-session publication to protected branches. Git supplies
+# one line per pushed ref on stdin: local ref/OID, then remote ref/OID.
+# Operator shells have no RSI session marker and retain their normal workflow.
+
+if [ -z "${RSI_SESSION_ID:-}" ] && [ -z "${RSI_SESSION_TOKEN:-}" ]; then
+  exit 0
+fi
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  case "$remote_ref" in
+    refs/heads/rolling|refs/heads/main)
+      echo "pre-push: agent sessions may not update $remote_ref; land with rsi-rolling-land after an ACCEPTED review" >&2
+      exit 1
+      ;;
+  esac
+done
+
+exit 0

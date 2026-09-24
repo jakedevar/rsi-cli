@@ -1,0 +1,12 @@
+{
+  "item/commandExecution/requestApproval": "#/definitions/CommandExecutionRequestApprovalParams",
+  "item/fileChange/requestApproval": "#/definitions/FileChangeRequestApprovalParams",
+  "item/tool/requestUserInput": "#/definitions/ToolRequestUserInputParams",
+  "mcpServer/elicitation/request": "#/definitions/McpServerElicitationRequestParams",
+  "item/permissions/requestApproval": "#/definitions/PermissionsRequestApprovalParams",
+  "item/tool/call": "#/definitions/DynamicToolCallParams",
+  "account/chatgptAuthTokens/refresh": "#/definitions/ChatgptAuthTokensRefreshParams",
+  "attestation/generate": "#/definitions/AttestationGenerateParams",
+  "applyPatchApproval": "#/definitions/ApplyPatchApprovalParams",
+  "execCommandApproval": "#/definitions/ExecCommandApprovalParams"
+}

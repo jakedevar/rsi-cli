@@ -1,0 +1,22 @@
+nextest-version = { required = "0.9.137" }
+
+[profile.default]
+retries = 0
+fail-fast = false
+test-threads = 8
+status-level = "fail"
+final-status-level = "fail"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.rsid-fast]
+inherits = "default"
+retries = 0
+fail-fast = false
+test-threads = 8
+
+[profile.ci-full]
+inherits = "default"
+retries = 0
+fail-fast = false
+test-threads = 8
+slow-timeout = { period = "60s", terminate-after = 6 }

@@ -1,0 +1,39 @@
+---
+source: crates/rsi-common/tests/rpc_snapshots.rs
+expression: response
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "lifetime_chats": 42,
+    "per_model": [
+      {
+        "cache_creation_tokens": 2000,
+        "cache_read_tokens": 3000,
+        "chats": 30,
+        "cost_usd": 10.0,
+        "input_tokens": 80000,
+        "model": "claude-sonnet-5",
+        "output_tokens": 15000,
+        "work_time_ms": 2400000
+      }
+    ],
+    "timeline": [
+      {
+        "cache_creation_tokens": 10,
+        "cache_read_tokens": 20,
+        "cost_usd": 1.5,
+        "day": "2026-07-08",
+        "input_tokens": 500,
+        "output_tokens": 100
+      }
+    ],
+    "total_cache_creation_tokens": 3000,
+    "total_cache_read_tokens": 4000,
+    "total_cost_usd": 12.34,
+    "total_input_tokens": 100000,
+    "total_output_tokens": 20000,
+    "total_work_time_ms": 3600000
+  }
+}

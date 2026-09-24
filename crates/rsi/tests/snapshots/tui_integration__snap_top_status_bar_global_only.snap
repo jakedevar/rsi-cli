@@ -1,0 +1,5 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: snapshot
+---
+ ● 1

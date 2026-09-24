@@ -1,0 +1,6 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+assertion_line: 1186
+expression: "format!(\"{snapshot:?}\")"
+---
+""

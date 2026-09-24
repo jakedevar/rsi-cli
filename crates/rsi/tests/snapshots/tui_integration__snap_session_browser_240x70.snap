@@ -1,0 +1,74 @@
+---
+source: crates/rsi/tests/tui_integration.rs
+expression: text
+---
+ ● 8
+ All projects / Sessions                                                                                                                                                                                                            22 sessions
+                                                                                                          │                                                                         │
+      #   ∞  S  !  FUNCTION                                        ◔     ⇄ AGE    MODEL                ▮  │  01  ? waiting                                    All projects › Root   │  LIVE ACTIVITY
+      ! NEEDS YOU  2  ──────────────                                                                      │  ────────────────────────────────────────────────────────────────────   │  ────────────────────────────────────────────────────
+    ▌        ?  !  Review harness snapshots                              3  now ⋈ opus-4-6             ▆──│  Review harness snapshots                                               │
+             ×  !  Investigate render edge                              13  now ✻ opus-4-1                │  ! needs you                                                            │  ⚑ QUEUE
+                                                                                                          │                                                                         │  02 × Investigate render edge                     now
+      ● IN FLIGHT  8  ──────────────                                                                      │  → Choose the bounded relay policy?                                     │
+             ●     Implement event seam                                  8  now ✻ sonnet-5                │                                                                         │  Δ CHANGES
+             ●     Browser session 05                                    8   5d ✻ sonnet-5                │  ? reply required                                                       │  03 ● Implement event seam                        now
+             ●     Browser session 06                                    8   6d ✻ sonnet-5                │                                                                         │  11 ✓ Clean fixture state                         now
+             ●     Browser session 07                                    8   7d ✻ sonnet-5                │  Policy requires your response.                                         │  02 × Investigate render edge                     now
+             ●     Browser session 08                                    8   8d ✻ sonnet-5                │                                                                         │  04 ● Browser session 05                           5d
+             ●     Browser session 09                                    8   9d ✻ sonnet-5                │  ▎ Pin session list rendering with TestBackend                          │  05 ● Browser session 06                           6d
+             ●     Browser session 10                                    8  10d ✻ sonnet-5                │                                                                         │  06 ● Browser session 07                           7d
+             ◐     Browser session 11                                    8  11d ✻ sonnet-5                │  ⋈ openrouter/anthropic/claude-opus-4-6  ▮▮▮▯ high                      │
+                                                                                                          │  ⇄ 3   $0.01   ◷ <1m run                                                │  FLOW
+      ✓ RECENT  1  ──────────────                                                                         │  + 01-01 01:58   Δ just now                                             │  █████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░
+             ✓     Clean fixture state                                   5  now ⌂ oss:20b                 │                                                                         │  ! 2   ● 8   ✓ 1   · 11   × 1
+                                                                                                          │  # 02020202-0202-0202-0202-020202020202                                 │
+      · QUIET  11  ──────────────                                                                         │  ⌂ /tmp                                                                 │  ────────────────────────────────────────────────────
+             ■     Browser session 12                                    8  12d ✻ sonnet-5                │                                                                         │  ● run  ✓ done  × fail  ■ stop  ◐ start  ? wait
+             ✓     Browser session 13                                    8  13d ✻ sonnet-5                │                                                                         │  · arch
+             ✓     Browser session 14                                    8  14d ✻ sonnet-5                │                                                                         │  ! you  • unread  ↺ retry  ⧗ stall  ◆ pin  ↻ rotated
+             ✓     Browser session 15                                    8  15d ✻ sonnet-5                │                                                                         │  ◌ ctx ?
+             ✓     Browser session 16                                    8  16d ✻ sonnet-5                │                                                                         │  ✻ claude  ◎ codex  ◉ codex as  ⋈ openrouter  ⌂ local
+             ✓     Browser session 17                                    8  17d ✻ sonnet-5                │                                                                         │  △ antigravity  ◇ pioneer  ⌘ harness
+             ✓     Browser session 18                                    8  18d ✻ sonnet-5                │                                                                         │  Mg lead  Pl plan  Im build  Db debug  Rv check
+             ✓     Browser session 19                                    8  19d ✻ sonnet-5                │                                                                         │
+             ✓     Browser session 20                                    8  20d ✻ sonnet-5                │                                                                         │
+             ✓     Browser session 21                                    8  21d ✻ sonnet-5                │                                                                         │
+             ✓     Browser session 22                                    8  22d ✻ sonnet-5                │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
+      ────────────────────────────────────────────────────────────────────────────────────────────────    │                                                                         │
+                                                                                                          │                                                                         │
+      22/22                                                                                               │                                                                         │
+                                                                                                          │                                                                         │
+                                                                                                          │                                                                         │
