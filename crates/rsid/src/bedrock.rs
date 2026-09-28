@@ -10,24 +10,61 @@ use tokio::process::Command;
 pub const BEDROCK_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub const BEDROCK_DEFAULT_MODEL: &str = "global.openai.gpt-5.6-sol";
 
+/// Resolve the Bedrock credential through the key vault: vault entry, then
+/// (unless cleared) `AWS_BEARER_TOKEN_BEDROCK` under `vault.env_compat`, then
+/// the per-launch token generator (never persisted).
+///
+/// # Errors
+///
+/// Returns a secret-free message when the slot is cleared, missing or the generator fails.
 pub fn credential() -> Result<String, String> {
-    if let Some(value) = std::env::var(BEDROCK_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(value);
-    }
+    credential_from(&crate::vault::global()).map(|resolved| resolved.secret.expose().to_owned())
+}
 
+/// Vault-resolved Bedrock credential with its source.
+///
+/// # Errors
+///
+/// Returns a secret-free message when the slot is cleared, missing or the generator fails.
+pub fn credential_from(
+    vault: &crate::vault::VaultHandle,
+) -> Result<crate::vault::Resolved, String> {
+    use crate::vault::Slot;
+    match vault.resolve(Slot::Bedrock)? {
+        Some(resolved) => Ok(resolved),
+        None if vault.state(Slot::Bedrock) == rsi_common::provider_credentials::CredentialState::Cleared => {
+            Err("Bedrock API key was cleared from the RSI key vault; set it again with SetProviderCredential".into())
+        }
+        None => Err("Bedrock API key missing; set AWS_BEARER_TOKEN_BEDROCK or install aws-bedrock-token-generator in ~/.rsi/bedrock-token-venv".into()),
+    }
+}
+
+/// Whether the per-launch token-generator venv is installed (cheap).
+#[must_use]
+pub fn token_generator_available() -> bool {
+    token_python().is_file()
+}
+
+/// Run the token-generator venv once. The token is used for one launch and
+/// never written to the vault.
+///
+/// # Errors
+///
+/// Returns a secret-free message when the venv is missing or generation fails.
+pub fn generate_token() -> Result<String, String> {
     let python = token_python();
     if !python.is_file() {
         return Err("Bedrock API key missing; set AWS_BEARER_TOKEN_BEDROCK or install aws-bedrock-token-generator in ~/.rsi/bedrock-token-venv".into());
     }
-    let output = StdCommand::new(python)
-        .args([
-            "-c",
-            "import signal; signal.alarm(10); from aws_bedrock_token_generator import provide_token; import sys; sys.stdout.write(provide_token(region=sys.argv[1]))",
-            &region()?,
-        ])
+    let mut command = StdCommand::new(python);
+    command.args([
+        "-c",
+        "import signal; signal.alarm(10); from aws_bedrock_token_generator import provide_token; import sys; sys.stdout.write(provide_token(region=sys.argv[1]))",
+        &region()?,
+    ]);
+    // The generator needs AWS credentials, not provider API keys.
+    crate::vault::scrub_std_credential_env(&mut command);
+    let output = command
         .output()
         .map_err(|_| "Bedrock token generator could not start".to_string())?;
     if !output.status.success() {
@@ -58,8 +95,10 @@ pub fn region() -> Result<String, String> {
             static CLI_REGION: OnceLock<Option<String>> = OnceLock::new();
             CLI_REGION
                 .get_or_init(|| {
-                    StdCommand::new("aws")
-                        .args(["configure", "get", "region"])
+                    let mut command = StdCommand::new("aws");
+                    command.args(["configure", "get", "region"]);
+                    crate::vault::scrub_std_credential_env(&mut command);
+                    command
                         .output()
                         .ok()
                         .filter(|output| output.status.success())
@@ -84,10 +123,15 @@ fn region_valid(value: &str) -> bool {
 }
 
 pub fn available(codex_available: bool) -> bool {
-    codex_available
-        && region().is_ok()
-        && (std::env::var(BEDROCK_ENV).is_ok_and(|value| !value.trim().is_empty())
-            || token_python().is_file())
+    available_with(&crate::vault::global(), codex_available)
+}
+
+/// Availability = credential resolvable (vault, env compat or generator) AND
+/// (route = harness OR Codex present) AND a region is configured.
+#[must_use]
+pub fn available_with(vault: &crate::vault::VaultHandle, codex_available: bool) -> bool {
+    region().is_ok()
+        && crate::vault::provider_available(vault, crate::vault::Slot::Bedrock, codex_available)
 }
 
 pub struct CodexOverrides {
@@ -153,8 +197,11 @@ pub fn codex_model_catalog(codex_binary: &Path, model: &str) -> Option<PathBuf> 
     if !model_id_valid(model) {
         return None;
     }
-    let output = StdCommand::new(codex_binary)
-        .args(["debug", "models", "--bundled"])
+    let mut command = StdCommand::new(codex_binary);
+    command.args(["debug", "models", "--bundled"]);
+    // The catalog probe needs no provider credential (#694 K1).
+    crate::vault::scrub_std_credential_env(&mut command);
+    let output = command
         .output()
         .ok()
         .filter(|output| output.status.success() && output.stdout.len() <= CATALOG_MAX_BYTES)?;
@@ -265,6 +312,11 @@ pub async fn discover_models() -> Result<Vec<(String, String)>, String> {
             break;
         }
     }
+    // A partial catalog would look authoritative in the picker. Let its
+    // caller use the offline fallback when the bounded page walk is exhausted.
+    if next_token.is_some() {
+        return Err("Bedrock model discovery exceeded pagination limit".into());
+    }
     models.sort();
     models.dedup();
     if models.is_empty() {
@@ -293,7 +345,9 @@ fn parse_profile_page(
             .iter()
             .filter(|entry| entry["status"] == "ACTIVE")
             .filter_map(|entry| entry["inferenceProfileId"].as_str())
-            // Codex requires Responses, and Bedrock model families differ by API.
+            // This provider uses bedrock-runtime Responses. Other active
+            // profiles can require Converse, Messages, or Chat Completions;
+            // GPT OSS requires bedrock-mantle for Responses.
             .filter(|id| id.contains(".openai.gpt-") && !id.contains("gpt-oss"))
             .map(|id| (id.to_string(), id.to_string())),
     );
@@ -307,6 +361,7 @@ fn parse_profile_page(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn overrides_target_runtime_without_secret() {
         let overrides = CodexOverrides::new("us-west-1");
@@ -332,6 +387,7 @@ mod tests {
         assert!(!region_valid("us-west-1/evil"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn catalog_rekeys_bundled_entry_under_bedrock_profile_id() {
         let bundled = br#"{"models": [
@@ -362,6 +418,7 @@ mod tests {
         assert!(!model_id_valid("us/openai.gpt"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn profile_page_keeps_active_gpt_responses_models() {
         let page = br#"{

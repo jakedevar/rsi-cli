@@ -31,8 +31,7 @@ impl AgyProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
+        crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
     /// Wait for the process to exit.
@@ -230,6 +229,8 @@ impl AgyClient {
                 rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
                 rsi_common::identity::process_ownership_namespace(),
             );
+        // openclaw is outside the stamp chokepoint; scrub explicitly (#694).
+        crate::vault::scrub_credential_env(&mut command);
         let mut models = Vec::new();
         if let Ok(out) = capture_bounded(
             command,
@@ -329,6 +330,7 @@ impl AgyClient {
         }
 
         crate::claude::stamp_execution_environment(&mut cmd, config, invocation_id)?;
+        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
 
         // agy never prints its conversation id (GitHub issue
         // google-antigravity/antigravity-cli#7); on exit it writes
@@ -577,14 +579,15 @@ mod tests {
             &binary_path,
             r#"#!/usr/bin/env bash
 set -euo pipefail
-args_out="$(dirname "$0")/agy_args.bin"
-env_out="$(dirname "$0")/agy_gemini_system_md.txt"
+fixture_dir="${0%/*}"
+args_out="$fixture_dir/agy_args.bin"
+env_out="$fixture_dir/agy_gemini_system_md.txt"
 : > "$args_out"
 for arg in "$@"; do
   printf '%s\0' "$arg" >> "$args_out"
 done
 printf '%s' "${GEMINI_SYSTEM_MD:-}" > "$env_out"
-printf '%s|%s|%s|%s|%s' "${CARGO_TARGET_DIR:-}" "${TMPDIR:-}" "${RSI_PROCESS_OWNERSHIP_NAMESPACE:-}" "${RSI_SESSION_ID:-}" "${RSI_MODEL_INVOCATION_ID:-}" > "$(dirname "$0")/agy_exec_env.txt"
+printf '%s|%s|%s|%s|%s' "${CARGO_TARGET_DIR:-}" "${TMPDIR:-}" "${RSI_PROCESS_OWNERSHIP_NAMESPACE:-}" "${RSI_SESSION_ID:-}" "${RSI_MODEL_INVOCATION_ID:-}" > "$fixture_dir/agy_exec_env.txt"
 printf 'agy ok\n'
 "#,
         )
@@ -616,6 +619,7 @@ printf 'agy ok\n'
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_agy_client_availability() {
         // Documents behavior without asserting (Antigravity may or may not be installed)
@@ -623,6 +627,7 @@ printf 'agy ok\n'
         println!("Antigravity CLI available: {}", available);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn test_discover_models_returns_entries() {
         // Verify static list shape without needing the binary
@@ -639,6 +644,7 @@ printf 'agy ok\n'
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn launch_sends_query_arg_and_system_prompt_via_gemini_system_md() {
         let block = "<docregblock>\n\
@@ -688,6 +694,7 @@ worker prompt body\n\
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn antigravity_resume_launch_passes_model_and_effort() {
         let tmp = TempDir::new().expect("tempdir");
@@ -715,6 +722,7 @@ worker prompt body\n\
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn antigravity_launch_rejects_unsupported_effort() {
         let tmp = TempDir::new().expect("tempdir");
@@ -734,6 +742,7 @@ worker prompt body\n\
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn antigravity_launch_stamps_authenticated_execution_environment() {
         use crate::sandbox::execution_scratch::SandboxExecutionScratch;
@@ -810,6 +819,7 @@ worker prompt body\n\
         assert!(!parts[4].is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn coalesces_multiline_output_into_one_event() {
         let out =
@@ -828,6 +838,7 @@ worker prompt body\n\
         assert!(!text.ends_with('\n')); // trailing trimmed
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn coalesces_thinking_only() {
         let out = "I will view the file.\nI will list the dir.\n";
@@ -842,6 +853,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn coalesces_text_only() {
         let out = "Here is the result.\nDone.\n";
@@ -853,6 +865,7 @@ worker prompt body\n\
         assert_eq!(content[0]["text"], "Here is the result.\nDone.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn empty_output_yields_no_event() {
         assert!(assistant_event_from_output("\n\n   \n").is_none());

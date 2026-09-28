@@ -97,7 +97,8 @@ make release-install
 This builds release binaries and links `rsi`, `rsid`, `rsi-rpc`, and
 `rsi-agent-mcp` into `~/.local/bin` (set `RSI_INSTALL_BIN_DIR` to change it).
 Make sure that directory is on your `PATH`. Running it again after an update
-restarts a running `rsid` on the new build.
+restarts a running `rsid` on the new build: in a bounded systemd user scope on
+Linux, or as a separate process on macOS.
 
 API keys and other daemon settings go in `~/.rsi/.env`, which `rsid` reads at
 startup; copy what you need from [`.env.example`](.env.example). CLI providers
@@ -105,23 +106,32 @@ use their own login instead.
 
 ## Run
 
-Start the daemon, then the TUI in another terminal:
+Run the TUI to start `rsid` automatically if it is not already accepting
+connections:
+
+```bash
+rsi
+```
+
+You can also start the daemon yourself before opening the TUI:
 
 ```bash
 rsid
 rsi
 ```
 
-On Linux with systemd, `rsi` alone is enough: if no daemon is running, it
-starts `rsid` in a systemd user scope and logs to `~/.rsi/daemon.log`.
+On Linux, the TUI launches `rsid` in a bounded systemd user scope with a unique
+name for each launch. On macOS, it starts `rsid` as a separate process. Both
+write daemon output to `~/.rsi/daemon.log`. Set
+`RSI_TUI_NO_AUTO_START_DAEMON=1` to disable TUI auto-start.
 
 First steps:
 
 1. `<Space>p` (or `:projects`): create or pick a project for your repository.
-2. `<Space>m` (or `:blank <objective>`): start a session. `<Space>o` or
+2. `<Space>n` (or `:blank <objective>`): start a session. `<Space>o` or
    `:task <objective>` starts a one-shot task.
 3. `Enter` opens a session, `F3` shows exactly what it launched with, `x`
-   stops it, and `<Space>a` archives it.
+   stops it, `<Space>a` archives it, and `<Space>N` (or `:alerts`) opens notifications.
 4. `?` lists the keys available wherever you are.
 
 The [operator manual](docs/agent-harness-operator-manual.md) covers daily use,

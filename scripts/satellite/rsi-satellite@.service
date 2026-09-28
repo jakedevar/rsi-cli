@@ -1,0 +1,20 @@
+[Unit]
+Description=RSI satellite dial-home tunnel (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/rsi/satellites/%i.env
+ExecStartPre=%h/.local/libexec/rsi-satellite/dial-home.sh --prepare %i
+ExecStart=%h/.local/libexec/rsi-satellite/dial-home.sh %i
+ExecStartPost=%h/.local/libexec/rsi-satellite/dial-home.sh --secure %i
+Restart=always
+RestartSec=20s
+TimeoutStopSec=5s
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

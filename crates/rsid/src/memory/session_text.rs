@@ -162,26 +162,31 @@ mod tests {
 
     // --- normalize_session_text tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_session_text_basic() {
         assert_eq!(normalize_session_text("hello  world"), "hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_session_text_newlines() {
         assert_eq!(normalize_session_text("line1\n\nline2"), "line1 line2");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_session_text_tabs() {
         assert_eq!(normalize_session_text("a\t\tb"), "a b");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_session_text_empty() {
         assert_eq!(normalize_session_text(""), "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_session_text_only_whitespace() {
         assert_eq!(normalize_session_text("  \n\n  "), "");
@@ -189,11 +194,13 @@ mod tests {
 
     // --- extract_session_text tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_empty_events() {
         assert!(extract_session_text(&[]).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_no_messages() {
         let events = vec![
@@ -203,6 +210,7 @@ mod tests {
         assert!(extract_session_text(&events).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_single_user_message() {
         let events = vec![make_event(1, EventType::Message, Some(Role::User), "hello")];
@@ -211,6 +219,7 @@ mod tests {
         assert_eq!(map, vec![1]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_single_assistant_message() {
         let events = vec![make_event(
@@ -224,6 +233,7 @@ mod tests {
         assert_eq!(map, vec![3]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_mixed_events() {
         let events = vec![
@@ -239,6 +249,7 @@ mod tests {
         assert_eq!(map, vec![1, 5]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_whitespace_normalization() {
         let events = vec![make_event(
@@ -251,6 +262,7 @@ mod tests {
         assert_eq!(text, "User: hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_empty_content_skipped() {
         let events = vec![
@@ -262,6 +274,7 @@ mod tests {
         assert_eq!(map, vec![2]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_whitespace_only_content() {
         let events = vec![make_event(
@@ -273,6 +286,7 @@ mod tests {
         assert!(extract_session_text(&events).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_line_map_correctness() {
         let events = vec![
@@ -284,6 +298,7 @@ mod tests {
         assert_eq!(map, vec![1, 5, 10]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_preserves_order() {
         let events = vec![
@@ -298,6 +313,7 @@ mod tests {
         assert_eq!(lines[2], "User: third");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_extract_unicode_content() {
         let events = vec![make_event(
@@ -312,6 +328,7 @@ mod tests {
 
     // --- build_session_entry tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_session_entry_basic() {
         let id = Uuid::new_v4();
@@ -326,6 +343,7 @@ mod tests {
         assert_eq!(entry.entry.size, entry.content.len() as i64);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_session_entry_no_messages() {
         let id = Uuid::new_v4();
@@ -333,6 +351,7 @@ mod tests {
         assert!(build_session_entry(id, None, &events).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_session_entry_hash_includes_line_map() {
         let id = Uuid::new_v4();
@@ -352,6 +371,7 @@ mod tests {
         assert_ne!(entry1.entry.hash, entry2.entry.hash);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_session_entry_path_format() {
         let id = Uuid::new_v4();

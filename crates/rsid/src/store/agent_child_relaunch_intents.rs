@@ -467,6 +467,7 @@ mod tests {
         ).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn relaunch_intent_rows_reject_delete_and_settled_update() {
         let (store, caller, tip) = fixture();
@@ -520,6 +521,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_crash_after_intent_before_admission_settles_abandoned() {
         let (store, caller, tip) = fixture();
@@ -540,6 +542,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_second_key_while_intent_open_is_in_progress() {
         let (store, caller, tip) = fixture();
@@ -553,6 +556,7 @@ mod tests {
         assert_eq!(store.open_child_relaunch_intents().unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_crash_after_spawn_before_confirmation_recovers_as_launched() {
         let (store, caller, tip) = fixture();
@@ -598,6 +602,7 @@ mod tests {
         assert_eq!(bound.as_deref(), Some(invocation.to_string().as_str()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_existing_dedup_admission_routes_to_recovery() {
         let (store, caller, tip) = fixture();
@@ -627,6 +632,7 @@ mod tests {
         assert_eq!(status, "failed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_recovery_settlement_fault_rolls_back_binding_and_completion() {
         let (store, caller, tip) = fixture();
@@ -682,6 +688,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn fresh_relaunch_two_keys_each_replay_returns_its_own_receipt() {
         let (store, caller, tip) = fixture();

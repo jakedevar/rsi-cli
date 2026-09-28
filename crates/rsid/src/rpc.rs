@@ -15,7 +15,7 @@ use crate::session::SessionManager;
 use crate::store::agent_coordination::AgentReadClass;
 use chrono::{DateTime, Utc};
 use rsi_common::agent_control_schema::{
-    AgentGetStatusParams, AgentHaltParams, AgentScheduleWakeParams,
+    AgentControlVerbV1, AgentGetStatusParams, AgentHaltParams, AgentScheduleWakeParams,
 };
 use rsi_common::agent_coordination::{
     AgentArchiveChildRequestV1, AgentContinueChildRequestV1, AgentGetProgressParamsV1,
@@ -705,6 +705,12 @@ mod agent_gate {
         "AgentManagerCommitPreparedControl",
         "AgentManagerGetAction",
         "AgentManagerWorkView",
+        "AgentTopologyUpsert",
+        "AgentTopologyList",
+        "AgentTopologyExecute",
+        "AgentTopologyGetExecution",
+        "AgentTopologyInterrupt",
+        "AgentTopologyResolveAttempt",
     ];
 
     /// Enumerated read-only verbs safe for an attributed (agent) caller.
@@ -770,8 +776,21 @@ pub struct GetSessionParams {
 
 /// RPC params for interrupting a session (daemon-local, not in common).
 #[derive(Debug, Deserialize)]
-pub struct InterruptSessionParams {
-    pub session_id: Uuid,
+pub(crate) struct InterruptSessionParams {
+    pub(crate) session_id: Uuid,
+    #[serde(default = "default_hard_pause")]
+    pub(crate) pause_level: crate::store::manager_actions::OperatorPause,
+}
+
+fn default_hard_pause() -> crate::store::manager_actions::OperatorPause {
+    crate::store::manager_actions::OperatorPause::Hard
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetOperatorPauseParams {
+    pub(crate) session_id: Uuid,
+    pub(crate) pause_level: crate::store::manager_actions::OperatorPause,
 }
 
 /// RPC params for getting conversation events (daemon-local, not in common).
@@ -1104,11 +1123,15 @@ pub struct UpdateDaemonConfigParams {
     pub value: serde_json::Value,
 }
 
-const RSID_SCOPE_CONFIG_FIELDS: [&str; 4] = [
+const RSID_SCOPE_CONFIG_FIELDS: [&str; 8] = [
     "rsid_scope_memory_high_mib",
     "rsid_scope_memory_max_mib",
     "rsid_scope_memory_swap_max_mib",
     "rsid_scope_cpu_weight",
+    "worker_scope_memory_high_mib",
+    "worker_scope_memory_max_mib",
+    "worker_scope_memory_swap_max_mib",
+    "worker_scope_cpu_weight",
 ];
 
 fn is_rsid_scope_config_field(field: &str) -> bool {
@@ -1132,6 +1155,10 @@ fn validated_rsid_scope_settings_env(runtime_config: &RuntimeConfig) -> std::io:
     let max = number(RSID_SCOPE_CONFIG_FIELDS[1])?;
     let swap_max = number(RSID_SCOPE_CONFIG_FIELDS[2])?;
     let cpu_weight = number(RSID_SCOPE_CONFIG_FIELDS[3])?;
+    let worker_high = number(RSID_SCOPE_CONFIG_FIELDS[4])?;
+    let worker_max = number(RSID_SCOPE_CONFIG_FIELDS[5])?;
+    let worker_swap_max = number(RSID_SCOPE_CONFIG_FIELDS[6])?;
+    let worker_cpu_weight = number(RSID_SCOPE_CONFIG_FIELDS[7])?;
     let memory_min = crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MIN;
     let memory_max = crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MAX;
     let cpu_min = u64::from(crate::config::RSID_SCOPE_CPU_WEIGHT_MIN);
@@ -1141,6 +1168,11 @@ fn validated_rsid_scope_settings_env(runtime_config: &RuntimeConfig) -> std::io:
         || high >= max
         || swap_max > memory_max
         || !(cpu_min..=cpu_max).contains(&cpu_weight)
+        || !(memory_min..=memory_max).contains(&worker_high)
+        || !(memory_min..=memory_max).contains(&worker_max)
+        || worker_high >= worker_max
+        || worker_swap_max > memory_max
+        || !(cpu_min..=cpu_max).contains(&worker_cpu_weight)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1148,11 +1180,15 @@ fn validated_rsid_scope_settings_env(runtime_config: &RuntimeConfig) -> std::io:
         ));
     }
     Ok(format!(
-        "{}={high}\n{}={max}\n{}={swap_max}\n{}={cpu_weight}\n",
+        "{}={high}\n{}={max}\n{}={swap_max}\n{}={cpu_weight}\n{}={worker_high}\n{}={worker_max}\n{}={worker_swap_max}\n{}={worker_cpu_weight}\n",
         RSID_SCOPE_CONFIG_FIELDS[0],
         RSID_SCOPE_CONFIG_FIELDS[1],
         RSID_SCOPE_CONFIG_FIELDS[2],
         RSID_SCOPE_CONFIG_FIELDS[3],
+        RSID_SCOPE_CONFIG_FIELDS[4],
+        RSID_SCOPE_CONFIG_FIELDS[5],
+        RSID_SCOPE_CONFIG_FIELDS[6],
+        RSID_SCOPE_CONFIG_FIELDS[7],
     ))
 }
 
@@ -1258,6 +1294,8 @@ fn codegraph_rpc_error(error: crate::codegraph::CodegraphServiceError) -> Daemon
 
 pub struct RpcServer {
     session_manager: Arc<SessionManager>,
+    satellite_incarnation_id: Uuid,
+    satellite_snapshots: crate::satellite::SatelliteSessionSnapshots,
     codegraph_handle: Option<crate::codegraph::IndexHandle>,
     memory_manager: Option<Arc<crate::memory::manager::MemoryManager>>,
     dreamer_handle: Option<crate::dreamer::scheduler::DreamerHandle>,
@@ -1289,6 +1327,8 @@ impl RpcServer {
     ) -> Self {
         Self {
             session_manager,
+            satellite_incarnation_id: Uuid::new_v4(),
+            satellite_snapshots: crate::satellite::SatelliteSessionSnapshots::default(),
             codegraph_handle: None,
             memory_manager,
             dreamer_handle: None,
@@ -1532,6 +1572,30 @@ impl RpcServer {
             }
             "AgentManagerGetAction" => self.handle_agent_manager_get_action(request).await,
             "AgentManagerWorkView" => self.handle_agent_manager_work_view(request).await,
+            "AgentTopologyUpsert" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyUpsert)
+                    .await
+            }
+            "AgentTopologyList" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyList)
+                    .await
+            }
+            "AgentTopologyExecute" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyExecute)
+                    .await
+            }
+            "AgentTopologyGetExecution" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyGetExecution)
+                    .await
+            }
+            "AgentTopologyInterrupt" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyInterrupt)
+                    .await
+            }
+            "AgentTopologyResolveAttempt" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyResolveAttempt)
+                    .await
+            }
 
             // Appointment and scope replacement remain operator-only: neither
             // method belongs to AGENT_VERBS or READ_VERBS.
@@ -1550,6 +1614,8 @@ impl RpcServer {
 
             "GetSession" => self.handle_get_session(request).await,
             "ListSessions" => self.handle_list_sessions(request).await,
+            "GetSatelliteIdentity" => self.handle_get_satellite_identity(request).await,
+            "ListSatelliteSessions" => self.handle_list_satellite_sessions(request).await,
             "GetConversation" => self.handle_get_conversation(request).await,
             "GetSessionDiagnostics" => self.handle_get_session_diagnostics(request).await,
             "GetConversationsSince" => self.handle_get_conversations_since(request).await,
@@ -1687,6 +1753,8 @@ impl RpcServer {
                     .await
             }
             "InterruptSession" => self.handle_interrupt_session(request).await,
+            "SetOperatorPause" => self.handle_set_operator_pause(request).await,
+            "GetOperatorPause" => self.handle_get_operator_pause(request).await,
             "ContinueSession" => self.handle_continue_session(request).await,
             "RotateSession" => self.handle_rotate_session(request).await,
             "DeleteSession" => self.handle_delete_session(request).await,
@@ -1900,6 +1968,19 @@ impl RpcServer {
             // Prompt compilation & generic generate
             "CompilePrompt" => self.handle_compile_prompt(request).await,
             "GenerateText" => self.handle_generate_text(request).await,
+            // #694 K1 provider key vault. Operator-only: absent from
+            // AGENT_VERBS/READ_VERBS/native tools/agent CLI catalog, so the
+            // attribution gate above already refuses a tokened caller; the
+            // handler refuses one again and returns secret-free metadata.
+            method if crate::vault::operator::is_operator_method(method) => {
+                crate::vault::operator::handle(
+                    &crate::vault::global(),
+                    method,
+                    request.session_token.is_some(),
+                    &request.params,
+                )
+                .await
+            }
             _ => {
                 return HandleResult::Response(RpcResponse::error(
                     request.id.clone(),
@@ -2441,6 +2522,23 @@ impl RpcServer {
             .await?;
         Ok(serde_json::to_value(result)?)
     }
+    /// Issue #633: the six scoped `AgentTopology*` verbs. The caller is
+    /// token-bound; authority, policy and audit live behind
+    /// `SessionManager::agent_topology_call`, shared with the native tools.
+    async fn handle_agent_topology(
+        &self,
+        request: &RpcRequest,
+        verb: AgentControlVerbV1,
+    ) -> Result<serde_json::Value> {
+        let caller = self
+            .resolve_caller_session_id(request)
+            .await
+            .map_err(|_| crate::session::topology_agent_verbs::unattributed())?;
+        self.session_manager
+            .agent_topology_call(caller, verb, &request.params)
+            .await
+    }
+
     /// Issue #548: read-only projection for a manager-created session. The
     /// caller is token-bound; Epic, manager and scope are daemon-derived.
     async fn handle_agent_manager_work_view(
@@ -2963,6 +3061,76 @@ impl RpcServer {
             self.session_manager.list_sessions().await
         };
         Ok(serde_json::to_value(&sessions)?)
+    }
+
+    async fn handle_get_satellite_identity(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        if !request.params.is_null() && request.params != serde_json::json!({}) {
+            return Err(DaemonError::InvalidParam(
+                "GetSatelliteIdentity takes no parameters".into(),
+            ));
+        }
+        let installation_id = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .satellite_installation_id()?;
+        Ok(serde_json::to_value(crate::satellite::identity(
+            installation_id,
+            self.satellite_incarnation_id,
+        ))?)
+    }
+
+    async fn handle_list_satellite_sessions(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::satellite::{SATELLITE_MAX_CURSOR_BYTES, SatelliteSessionPageRequestV1};
+        let object = request.params.as_object().ok_or_else(|| {
+            DaemonError::InvalidParam("satellite request must be an object".into())
+        })?;
+        if object.len() > 3
+            || object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "wire_version" | "limit" | "cursor"))
+            || serde_json::to_vec(&request.params)?.len()
+                > usize::from(SATELLITE_MAX_CURSOR_BYTES) + 128
+        {
+            return Err(DaemonError::InvalidParam(
+                "malformed or oversized satellite request".into(),
+            ));
+        }
+        let params: SatelliteSessionPageRequestV1 = serde_json::from_value(request.params.clone())
+            .map_err(|error| {
+                DaemonError::InvalidParam(format!("invalid satellite request: {error}"))
+            })?;
+        params
+            .validate(&rsi_common::satellite::SatelliteReadLimitsV1::default())
+            .map_err(|error| DaemonError::InvalidParam(error.to_string()))?;
+        let installation_id = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .satellite_installation_id()?;
+        let sessions = if params.cursor.is_none() {
+            Some(self.session_manager.list_sessions().await)
+        } else {
+            None
+        };
+        let page = self
+            .satellite_snapshots
+            .page(
+                params,
+                sessions,
+                installation_id,
+                self.satellite_incarnation_id,
+            )
+            .await?;
+        Ok(serde_json::to_value(page)?)
     }
 
     async fn handle_get_conversation(&self, request: &RpcRequest) -> Result<serde_json::Value> {
@@ -5633,11 +5801,40 @@ impl RpcServer {
         let params: InterruptSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
 
+        if params.pause_level == crate::store::manager_actions::OperatorPause::None {
+            return Err(DaemonError::InvalidParam(
+                "interrupt_pause_level_required".into(),
+            ));
+        }
         self.session_manager
-            .interrupt_session_operator(params.session_id)
+            .interrupt_session_operator_with_pause(params.session_id, params.pause_level)
             .await?;
 
         Ok(serde_json::Value::Null)
+    }
+
+    async fn handle_set_operator_pause(&self, request: &RpcRequest) -> Result<serde_json::Value> {
+        let params: SetOperatorPauseParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
+        let level = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .set_operator_pause(params.session_id, params.pause_level)?;
+        Ok(serde_json::json!({"session_id": params.session_id, "pause_level": level}))
+    }
+
+    async fn handle_get_operator_pause(&self, request: &RpcRequest) -> Result<serde_json::Value> {
+        let params: GetSessionParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
+        let level = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .get_operator_pause(params.session_id)?;
+        Ok(serde_json::json!({"session_id": params.session_id, "pause_level": level}))
     }
 
     async fn handle_cancel_retry(&self, request: &RpcRequest) -> Result<serde_json::Value> {
@@ -6928,9 +7125,18 @@ impl RpcServer {
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
 
         let topology_id = params.id;
-        self.session_manager
-            .update_topology(params.id, params.name, params.definition)
-            .await?;
+        // #633: `shared` may be sent alone; with no field at all the
+        // existing "nothing to update" refusal still applies.
+        if params.name.is_some() || params.definition.is_some() || params.shared.is_none() {
+            self.session_manager
+                .update_topology(params.id, params.name, params.definition)
+                .await?;
+        }
+        if let Some(shared) = params.shared {
+            self.session_manager
+                .set_topology_shared(topology_id, shared)
+                .await?;
+        }
 
         // Re-bridge into workflows table for gv-picker freshness. Best-effort:
         // a stale workflow row is recoverable on the next ExecuteTopology;
@@ -7190,7 +7396,11 @@ impl RpcServer {
                     };
 
                     if let Some(session_id) = current_record.owner.session_id {
-                        match self.session_manager.interrupt_session(session_id).await {
+                        match self
+                            .session_manager
+                            .interrupt_session_operator(session_id)
+                            .await
+                        {
                             Ok(()) => interrupted_sessions.push(session_id),
                             Err(error) => {
                                 skipped_invocations.push(current_record.id);
@@ -7417,6 +7627,7 @@ impl RpcServer {
         caps.recursive_dag_artifact_preview_inspection = true;
         caps.recursive_dag_live_execution = live_scheduler_control;
         caps.recursive_dag_background_loop = false;
+        caps.satellite_session_read = true;
         caps.gv_render_recursive_origin = self
             .runtime_config
             .gv_render_recursive_origin
@@ -7802,8 +8013,10 @@ impl RpcServer {
             .codegraph_handle
             .clone()
             .ok_or_else(|| DaemonError::Rpc("codegraph index service is unavailable".into()))?;
+        let store = Arc::clone(self.session_manager.store());
         let workspaces = tokio::task::spawn_blocking(move || {
-            crate::codegraph::CodegraphReadService::new(&handle).list_workspaces(params)
+            crate::codegraph::CodegraphReadService::with_store(&handle, store)
+                .list_workspaces(params)
         })
         .await
         .map_err(|_| DaemonError::Rpc("codegraph read task failed".into()))?
@@ -7819,8 +8032,9 @@ impl RpcServer {
             .codegraph_handle
             .clone()
             .ok_or_else(|| DaemonError::Rpc("codegraph index service is unavailable".into()))?;
+        let store = Arc::clone(self.session_manager.store());
         let status = tokio::task::spawn_blocking(move || {
-            let service = crate::codegraph::CodegraphReadService::new(&handle);
+            let service = crate::codegraph::CodegraphReadService::with_store(&handle, store);
             let bound = service.resolve_operator_scope(scope, false)?;
             service.status(&bound)
         })
@@ -7842,8 +8056,9 @@ impl RpcServer {
             .codegraph_handle
             .clone()
             .ok_or_else(|| DaemonError::Rpc("codegraph index service is unavailable".into()))?;
+        let store = Arc::clone(self.session_manager.store());
         let snapshot = tokio::task::spawn_blocking(move || {
-            crate::codegraph::CodegraphReadService::new(&handle)
+            crate::codegraph::CodegraphReadService::with_store(&handle, store)
                 .snapshot_at(params.scope, params.generation)
         })
         .await
@@ -7864,8 +8079,10 @@ impl RpcServer {
             .codegraph_handle
             .clone()
             .ok_or_else(|| DaemonError::Rpc("codegraph index service is unavailable".into()))?;
+        let store = Arc::clone(self.session_manager.store());
         let page = tokio::task::spawn_blocking(move || {
-            crate::codegraph::CodegraphReadService::new(&handle).list_snapshots(params)
+            crate::codegraph::CodegraphReadService::with_store(&handle, store)
+                .list_snapshots(params)
         })
         .await
         .map_err(|_| DaemonError::Rpc("codegraph read task failed".into()))?
@@ -7897,8 +8114,10 @@ impl RpcServer {
             .codegraph_handle
             .clone()
             .ok_or_else(|| DaemonError::Rpc("codegraph index service is unavailable".into()))?;
+        let store = Arc::clone(self.session_manager.store());
         let result = tokio::task::spawn_blocking(move || {
-            crate::codegraph::CodegraphReadService::new(&handle).read_operator(params, true)
+            crate::codegraph::CodegraphReadService::with_store(&handle, store)
+                .read_operator(params, true)
         })
         .await
         .map_err(|_| DaemonError::Rpc("codegraph read task failed".into()))?
@@ -8001,6 +8220,37 @@ impl RpcServer {
             drop(store);
             self.runtime_config
                 .publish_sandbox_build_cache_config(prepared);
+            return Ok(serde_json::json!({ "ok": true, "field": params.field }));
+        }
+
+        if params.field == "completed_transcript_cache_max_bytes" {
+            let cap = params.value.as_u64().ok_or_else(|| {
+                DaemonError::InvalidParam(
+                    "Invalid value for field 'completed_transcript_cache_max_bytes': expected non-negative integer"
+                        .into(),
+                )
+            })?;
+            // Persist before publication. The cache mutex is also the read
+            // admission boundary, so an acknowledged shrink (including zero)
+            // has already evicted excess entries and no queued reader can
+            // re-admit using an older cap.
+            let store = self.session_manager.store().clone();
+            let guard = store.lock().await;
+            crate::store::daemon_settings::persist_runtime_config_value(
+                &guard,
+                &params.field,
+                &params.value,
+            )
+            .map_err(|error| {
+                DaemonError::Store(format!(
+                    "Failed to persist daemon config field '{}': {}",
+                    params.field, error
+                ))
+            })?;
+            drop(guard);
+            self.session_manager
+                .publish_completed_transcript_cache_cap(cap)
+                .await;
             return Ok(serde_json::json!({ "ok": true, "field": params.field }));
         }
 
@@ -9189,6 +9439,190 @@ fn event_matches_session(event: &DaemonEvent, session_id: Uuid) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn satellite_operator_methods_stay_out_of_agent_catalogs() {
+        let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+        for method in ["GetSatelliteIdentity", "ListSatelliteSessions"] {
+            assert!(!agent_gate::AGENT_VERBS.contains(&method));
+            assert!(!agent_gate::READ_VERBS.contains(&method));
+            assert!(!agent_gate::UNSCOPED_READ_VERBS.contains(&method));
+            assert!(!agent_gate::is_allowed_for_attributed_caller(method));
+            assert!(!catalog.iter().any(|entry| entry.method == method));
+        }
+        for source in [
+            include_str!("tool_registry.rs"),
+            include_str!("session/harness/tools/rsi_control.rs"),
+        ] {
+            let catalog = source.to_ascii_lowercase();
+            for forbidden in [
+                "getsatelliteidentity",
+                "listsatellitesessions",
+                "get_satellite_identity",
+                "list_satellite_sessions",
+            ] {
+                assert!(!catalog.contains(forbidden));
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn satellite_rpc_identity_pages_and_refusals() {
+        use rsi_common::satellite::{SatelliteIdentityV1, SatelliteSessionPageV1};
+        let fixture = recursive_dag_rpc_fixture();
+        let identity_response = call_rpc(
+            &fixture.server,
+            "GetSatelliteIdentity",
+            serde_json::json!({}),
+        )
+        .await;
+        let identity: SatelliteIdentityV1 =
+            serde_json::from_value(identity_response.result.unwrap()).unwrap();
+        identity.validate().unwrap();
+        assert!(identity.capabilities.session_read);
+        let replacement = RpcServer::new(
+            Arc::clone(&fixture.manager),
+            None,
+            None,
+            None,
+            Arc::clone(&fixture.runtime_config),
+            Arc::clone(&fixture.server.compile_engine),
+            reqwest::Client::new(),
+            crate::model_control::ModelControlRuntime::default_normal(),
+        );
+        let after_restart: SatelliteIdentityV1 = serde_json::from_value(
+            call_rpc(
+                &replacement,
+                "GetSatelliteIdentity",
+                serde_json::Value::Null,
+            )
+            .await
+            .result
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after_restart.installation_id, identity.installation_id);
+        assert_ne!(
+            after_restart.daemon_incarnation_id,
+            identity.daemon_incarnation_id
+        );
+        let caps = call_rpc(
+            &fixture.server,
+            "GetDaemonCapabilities",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(caps.result.unwrap()["satellite_session_read"], true);
+
+        for _ in 0..3 {
+            let id = Uuid::new_v4();
+            let session = mk_agent_test_session(id, rsi_common::SessionKind::Standard, None, None);
+            fixture.manager.active().write().await.insert(
+                id,
+                crate::session::types::TrackedSession::new_for_test(session),
+            );
+        }
+        let request = serde_json::json!({"wire_version": 1, "limit": 2, "cursor": null});
+        let first: SatelliteSessionPageV1 = serde_json::from_value(
+            call_rpc(&fixture.server, "ListSatelliteSessions", request)
+                .await
+                .result
+                .unwrap(),
+        )
+        .unwrap();
+        first.validate(&identity.capabilities.limits).unwrap();
+        assert_eq!(first.sessions.len(), 2);
+        assert_eq!(first.snapshot_total_sessions, 3);
+        let forged_offset = call_rpc(
+            &fixture.server,
+            "ListSatelliteSessions",
+            serde_json::json!({
+                "wire_version": 1,
+                "limit": 1,
+                "cursor": format!("v1:{}:1", first.snapshot_id.0)
+            }),
+        )
+        .await;
+        assert!(forged_offset.error.is_some());
+        let later_id = Uuid::new_v4();
+        fixture.manager.active().write().await.insert(
+            later_id,
+            crate::session::types::TrackedSession::new_for_test(mk_agent_test_session(
+                later_id,
+                rsi_common::SessionKind::Standard,
+                None,
+                None,
+            )),
+        );
+        let second: SatelliteSessionPageV1 = serde_json::from_value(
+            call_rpc(
+                &fixture.server,
+                "ListSatelliteSessions",
+                serde_json::json!({
+                    "wire_version": 1, "limit": 2, "cursor": first.next_cursor
+                }),
+            )
+            .await
+            .result
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.snapshot_offset, 2);
+        assert_eq!(second.sessions.len(), 1);
+        assert!(second.next_cursor.is_none());
+        for params in [
+            serde_json::json!({"wire_version": 0, "limit": 1, "cursor": null}),
+            serde_json::json!({"wire_version": 1, "limit": 101, "cursor": null}),
+            serde_json::json!({"wire_version": 1, "limit": 1, "cursor": "v1:bad:1"}),
+            serde_json::json!({"wire_version": 1, "limit": 1, "cursor": "x".repeat(513)}),
+            serde_json::json!({"wire_version": 1, "limit": 1, "unexpected": true}),
+        ] {
+            assert!(
+                call_rpc(&fixture.server, "ListSatelliteSessions", params)
+                    .await
+                    .error
+                    .is_some()
+            );
+        }
+        for method in ["GetSatelliteIdentity", "ListSatelliteSessions"] {
+            let mut attributed = RpcRequest::new(method, serde_json::Value::Null);
+            attributed.session_token = Some("test-token".into());
+            let HandleResult::Response(response) =
+                fixture.server.handle_request_inner(&attributed).await
+            else {
+                panic!("response");
+            };
+            assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
+        }
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server_stream) = UnixStream::pair().unwrap();
+        let connection = fixture.server.handle_connection(server_stream);
+        let client_round_trip = async move {
+            let (reader, mut writer) = client.into_split();
+            let request = RpcRequest::new("GetSatelliteIdentity", serde_json::Value::Null);
+            writer
+                .write_all(serde_json::to_string(&request).unwrap().as_bytes())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            let mut line = String::new();
+            tokio::io::BufReader::new(reader)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            drop(writer);
+            let response: RpcResponse = serde_json::from_str(&line).unwrap();
+            let identity: SatelliteIdentityV1 =
+                serde_json::from_value(response.result.unwrap()).unwrap();
+            identity.validate().unwrap();
+        };
+        let (served, ()) = tokio::join!(connection, client_round_trip);
+        served.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn agent_schema_catalog_matches_the_independent_authorization_allowlist() {
         let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1()
@@ -9199,10 +9633,11 @@ mod tests {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(catalog.len(), 30);
+        assert_eq!(catalog.len(), 36);
         assert_eq!(catalog, authorization);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn codegraph_operator_reads_stay_outside_attributed_agent_surface() {
         let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
@@ -9228,6 +9663,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn agent_get_progress_is_the_only_new_attributed_coordination_read() {
         assert!(agent_gate::is_allowed_for_attributed_caller(
@@ -9252,6 +9688,7 @@ mod tests {
     /// P2-03: the send verb is reachable for an attributed caller and stays
     /// unreachable for a caller with no token, exactly like every other
     /// `Agent*` verb.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn agent_gate_attributed_send_message_is_allowed() {
         assert!(agent_gate::is_allowed_for_attributed_caller(
@@ -9271,6 +9708,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn d05_program_run_operator_surface_is_strict_redacted_and_attributed_denied() {
         const METHODS: [&str; 8] = [
@@ -9429,6 +9867,13 @@ mod tests {
             None,
             None,
         );
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .insert_session(&session)
+            .expect("persist active model invocation owner");
         fixture.manager.active().write().await.insert(
             session_id,
             crate::session::types::TrackedSession::new_for_test(session),
@@ -10604,6 +11049,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_get_session_params_parsing() {
         let json = serde_json::json!({
@@ -10616,6 +11062,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_interrupt_session_params_parsing() {
         let json = serde_json::json!({
@@ -10626,8 +11073,55 @@ mod tests {
             params.session_id.to_string(),
             "550e8400-e29b-41d4-a716-446655440000"
         );
+        assert_eq!(
+            params.pause_level,
+            crate::store::manager_actions::OperatorPause::Hard
+        );
+        let soft: InterruptSessionParams = serde_json::from_value(serde_json::json!({
+            "session_id": params.session_id, "pause_level": "soft"
+        }))
+        .unwrap();
+        assert_eq!(
+            soft.pause_level,
+            crate::store::manager_actions::OperatorPause::Soft
+        );
+        for method in ["SetOperatorPause", "GetOperatorPause"] {
+            assert!(!agent_gate::AGENT_VERBS.contains(&method));
+            assert!(!agent_gate::READ_VERBS.contains(&method));
+        }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn operator_pause_rpc_round_trips_downgrade_and_clear() {
+        let fixture = recursive_dag_rpc_fixture();
+        let session_id = Uuid::new_v4();
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .insert_session(&make_recursive_dag_test_session(session_id))
+            .unwrap();
+        for pause_level in ["hard", "soft", "none"] {
+            let set = call_rpc(
+                &fixture.server,
+                "SetOperatorPause",
+                serde_json::json!({"session_id":session_id,"pause_level":pause_level}),
+            )
+            .await;
+            assert_eq!(set.result.unwrap()["pause_level"], pause_level);
+            let get = call_rpc(
+                &fixture.server,
+                "GetOperatorPause",
+                serde_json::json!({"session_id":session_id}),
+            )
+            .await;
+            assert_eq!(get.result.unwrap()["pause_level"], pause_level);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_get_conversation_params_parsing() {
         let json = serde_json::json!({
@@ -10641,6 +11135,7 @@ mod tests {
         assert!(params.since_sequence.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_get_conversation_params_with_since_sequence() {
         let json = serde_json::json!({
@@ -10655,6 +11150,7 @@ mod tests {
         assert_eq!(params.since_sequence, Some(42));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_continue_session_rpc_dispatch() {
         let json = serde_json::json!({
@@ -10669,6 +11165,7 @@ mod tests {
         assert_eq!(params.query, "fix the remaining issues");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_delete_session_params_parsing() {
         let json = serde_json::json!({
@@ -10681,6 +11178,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_launch_session_params_mapping() {
         let params = LaunchSessionParams {
@@ -10762,6 +11260,7 @@ mod tests {
         assert_eq!(config.configured_context_window, Some(400_000));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_get_turn_metrics_params_parsing() {
         // GetTurnMetrics reuses GetConversationParams (same shape)
@@ -10775,6 +11274,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_list_sessions_params_default() {
         // Empty params should parse with None project_id
@@ -10783,6 +11283,7 @@ mod tests {
         assert!(params.project_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_list_sessions_params_with_project() {
         let json = serde_json::json!({
@@ -10795,6 +11296,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn recursive_dag_rpc_params_parse_read_only_inspection() {
         let graph_id = "550e8400-e29b-41d4-a716-446655440000";
@@ -10834,6 +11336,7 @@ mod tests {
         assert!(topology_status_params.include_dynamic_children);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_read_only_inspection_dispatches() {
         use crate::bus::EventBus;
@@ -11057,6 +11560,7 @@ mod tests {
         assert_eq!(missing_task_response.error.unwrap().code, INVALID_PARAMS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_topology_status_rpc_dispatches_read_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11174,6 +11678,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_fake_scheduler_rpc_runs_existing_unique_link_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11272,6 +11777,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_fake_scheduler_rpc_repeated_runs_reacquire_graph_lease() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11323,6 +11829,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_fake_scheduler_rpc_rejects_bad_resolution_and_missing_steps() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11492,6 +11999,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_fake_scheduler_rpc_control_disabled_rejects_without_mutation() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11555,6 +12063,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_cancellation_rpc_requests_graph_and_run_without_side_effects() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11721,6 +12230,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_cancellation_rpc_rejects_disabled_and_bad_params_without_mutation()
      {
@@ -11831,6 +12341,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_recovery_rpc_rejects_disabled_and_bad_params_without_mutation()
     {
@@ -11942,6 +12453,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_topology_recovery_rpc_store_failure_returns_internal_error() {
         let fixture = recursive_dag_rpc_fixture();
@@ -11990,6 +12502,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn recursive_dag_topology_status_does_not_rewire_execute_topology_source() {
         let source = include_str!("rpc.rs");
@@ -12013,6 +12526,7 @@ mod tests {
         assert!(!execute_topology_source.contains("get_topology_recursive_status"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_rpc_gate_disabled_is_non_mutating() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12052,6 +12566,7 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn handle_get_recursive_graph_as_workflow_returns_bridged_def() {
         use rsi_graph::format::WorkflowDefinition;
@@ -12094,6 +12609,7 @@ mod tests {
         assert_eq!(wf.edges.len(), detail.edges.len());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn handle_get_recursive_graph_as_workflow_rejects_when_gate_disabled() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12118,6 +12634,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn handle_edit_recursive_node_instructions_happy_path_and_rejections() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12208,6 +12725,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn handle_edit_recursive_node_settings_happy_path_and_rejections() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12264,6 +12782,7 @@ mod tests {
         assert_eq!(node.verification_strategy, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_commit_live_attempt_output_rpc_gate_disabled_is_non_mutating() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12317,6 +12836,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_commit_live_attempt_output_rpc_requires_completed_session() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12348,6 +12868,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_commit_live_attempt_output_rpc_terminalizes_valid_completed_session_without_launching()
      {
@@ -12439,6 +12960,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_commit_live_attempt_output_rpc_records_invalid_json_validation_failure()
     {
@@ -12493,6 +13015,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_rpc_enabled_runs_terminal_ordinary_graph_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -12540,6 +13063,7 @@ mod tests {
         assert_eq!(after.session_count, before.session_count);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_first_live_dogfood_smoke_launches_captures_and_terminalizes_once() {
         use wiremock::matchers::{method, path};
@@ -12737,6 +13261,7 @@ mod tests {
         assert!(!caps.recursive_dag_live_execution);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_second_live_dogfood_two_task_graph_runs_one_at_a_time() {
         use wiremock::matchers::{method, path};
@@ -13082,6 +13607,7 @@ mod tests {
         assert!(!caps.recursive_dag_live_execution);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_rpc_rejects_topology_linked_graph_without_mutation() {
         let fixture = recursive_dag_rpc_fixture();
@@ -13113,6 +13639,7 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_slice_keeps_fake_scheduler_fake_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -13138,6 +13665,7 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_capabilities_reflect_control_gates() {
         for (recovery, scheduler, cancellation) in [
@@ -13301,6 +13829,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_call_to_unlisted_method_is_denied() {
         // (b) attributed raw LaunchSession/SetEpicLead rejected.
@@ -13325,6 +13854,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn manager_rpc_appointment_is_operator_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -13359,6 +13889,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn manager_rpc_v2_operator_policy_board_and_exact_answer_flow() {
         use rsi_common::harness_manager_v2::*;
@@ -13498,6 +14029,7 @@ mod tests {
         assert!(stale.error.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_access() {
         use crate::session::harness::tools::rsi_control::{
@@ -13820,6 +14352,7 @@ mod tests {
     /// Issue #548: `AgentManagerWorkView` serves a manager-created worker its
     /// Epic's granted ownership through the token-bound RPC path and refuses a
     /// lead-spawned sibling with a typed code and no data.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
@@ -14007,6 +14540,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
@@ -14192,6 +14726,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn manager_rpc_requires_transport_identity_and_redacts_invalid_params() {
@@ -14307,6 +14842,76 @@ mod tests {
         }
     }
 
+    /// #694 K1: the key-vault methods are operator-only. Each is absent from
+    /// every agent-facing catalog (leaked-authority check) and a tokened
+    /// request is refused before dispatch.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn provider_credential_methods_are_operator_only_and_attributed_denied() {
+        let fixture = recursive_dag_rpc_fixture();
+        let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+        for method in rsi_common::provider_credentials::OPERATOR_METHODS {
+            assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+            assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+            assert!(
+                !agent_gate::is_allowed_for_attributed_caller(method),
+                "{method}"
+            );
+            for descriptor in catalog {
+                assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+                if let Some(tool) = descriptor.native_tool {
+                    assert!(
+                        !tool.name().to_ascii_lowercase().contains("credential"),
+                        "native tool {} exposes the key vault",
+                        tool.name()
+                    );
+                }
+            }
+            let mut request = RpcRequest::new(
+                method,
+                serde_json::json!({"slot": "openrouter", "secret": "sk-test-rpc-tokened"}),
+            );
+            request.session_token = Some("some-token".to_string());
+            let HandleResult::Response(response) =
+                fixture.server.handle_request_inner(&request).await
+            else {
+                panic!("expected response for {method}");
+            };
+            assert!(response.result.is_none(), "{method}");
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("attributed call to {method} must be denied"));
+            assert_eq!(error.code, INVALID_PARAMS, "method: {method}");
+            assert!(
+                error
+                    .message
+                    .contains("not available to session-attributed callers"),
+                "{method}: {}",
+                error.message
+            );
+            assert!(!error.message.contains("sk-test-rpc-tokened"));
+        }
+
+        // Operator (tokenless) dispatch reaches the vault and returns
+        // secret-free metadata for every slot.
+        let request = RpcRequest::new(
+            rsi_common::provider_credentials::METHOD_LIST,
+            serde_json::Value::Null,
+        );
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response");
+        };
+        let list: rsi_common::provider_credentials::ListProviderCredentialsResult =
+            serde_json::from_value(response.result.expect("operator list succeeds")).unwrap();
+        assert_eq!(
+            list.credentials.len(),
+            rsi_common::provider_credentials::ProviderCredentialSlot::ALL.len()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn source_worktree_settlement_surface_is_strict_and_attributed_denied() {
         let fixture = recursive_dag_rpc_fixture();
@@ -14353,6 +14958,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
     async fn agent_archive_child_rpc_is_strict_token_bound_and_preserves_refusal() {
@@ -14465,6 +15071,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn archive_session_rpc_reaches_private_cleanup_and_replays_one_projection() {
         use crate::sandbox::SandboxAllocator;
@@ -14510,6 +15117,11 @@ mod tests {
                 None,
             )
             .expect("allocate RPC archive worktree");
+        #[cfg(target_os = "linux")]
+        let _proc = crate::session::scoped_archive_cleanup_test_proc(
+            session_id,
+            &fixture._dir.path().join("sandboxes"),
+        );
         let branch = allocation.branch.clone().expect("archive branch");
         let common_dir = std::fs::canonicalize(git(
             &repository,
@@ -14548,6 +15160,13 @@ mod tests {
             .restore_sessions()
             .await
             .expect("hydrate completed RPC candidate");
+
+        // Keep the RPC cleanup proof independent of unrelated host processes.
+        // The cleanup runs on a blocking thread, so install the fixture for its
+        // exact session and sandbox instead of a caller-thread-only proc hook.
+        let _holder_proc = fixture
+            .manager
+            .install_archive_cleanup_test_holder_proc(session_id);
 
         let response = call_rpc(
             &fixture.server,
@@ -14591,6 +15210,7 @@ mod tests {
         assert_eq!(projection_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn archive_cleanup_surface_is_strict_operator_only_and_undiscoverable_to_agents() {
         let fixture = recursive_dag_rpc_fixture();
@@ -14663,6 +15283,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn model_update_rpc_is_operator_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -14691,6 +15312,7 @@ mod tests {
         assert_eq!(error.code, INVALID_PARAMS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn operator_can_queue_a_fenced_model_update() {
         let fixture = recursive_dag_rpc_fixture();
@@ -14750,6 +15372,7 @@ mod tests {
     /// for free by the pre-dispatch default-deny gate. This never reaches
     /// an issue-store call (the gate runs before dispatch), so the fixture
     /// needs no seeded issue data.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_call_to_issue_verbs_is_denied() {
         let fixture = recursive_dag_rpc_fixture();
@@ -14785,6 +15408,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         use rsi_common::types::{Project, SessionKind};
@@ -14980,6 +15604,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_issue_rpc_all_seven_decoders_emit_only_bounded_validation_hints() {
         use rsi_common::rpc::{
@@ -15095,6 +15720,7 @@ mod tests {
         assert_eq!(envelope.validation, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn agent_issue_rpc_harness_and_codex_error_envelopes_are_identical_and_redacted() {
         use rsi_common::rpc::AgentIssueErrorCodeV1;
@@ -15196,6 +15822,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn closure_k1_rpc_surface_is_operator_only_and_k2_k3_remain_unrouted() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15247,6 +15874,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_call_to_model_control_verbs_is_denied() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15284,6 +15912,7 @@ mod tests {
     /// Both verbs are operator-only for free via the pre-dispatch default-deny
     /// gate; this asserts that rather than merely intending it. The gate runs
     /// before dispatch, so no daemon-config state needs seeding.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_call_to_daemon_config_verbs_is_denied() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15315,9 +15944,211 @@ mod tests {
         }
     }
 
-    /// #634: preserved-work resolution is operator-only in T2. It is absent
-    /// from the agent and read catalogs and a tokened caller is denied before
-    /// dispatch, so no execution state needs seeding.
+    /// #633 T4-A7 (RPC plane): the six scoped topology verbs are attributed
+    /// writes (never read-allowlisted), dispatch through the token-bound
+    /// service with the redacted `{code, next_action}` envelope, and the
+    /// operator topology family stays operator-only.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays_operator_only()
+    {
+        let fixture = recursive_dag_rpc_fixture();
+        let worker = Uuid::new_v4();
+        fixture
+            .manager
+            .register_agent_token("topology-worker-token".into(), worker)
+            .await;
+        let id = Uuid::new_v4();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for (method, params) in [
+            (
+                "AgentTopologyUpsert",
+                serde_json::json!({
+                    "name":"t4-rpc","scope":"epic","validate_only":true,"idempotency_key":"u",
+                    "definition":{"nodes":[],"edges":[]}
+                }),
+            ),
+            ("AgentTopologyList", serde_json::json!({})),
+            (
+                "AgentTopologyExecute",
+                serde_json::json!({
+                    "topology_id":id,"expected_digest":digest,"epic_id":id,"idempotency_key":"e"
+                }),
+            ),
+            (
+                "AgentTopologyGetExecution",
+                serde_json::json!({"execution_id":id}),
+            ),
+            (
+                "AgentTopologyInterrupt",
+                serde_json::json!({"execution_id":id,"expected_row_version":1,"idempotency_key":"i"}),
+            ),
+            (
+                "AgentTopologyResolveAttempt",
+                serde_json::json!({
+                    "execution_id":id,"attempt_id":id,"action":"inspect",
+                    "expected_row_version":1,"idempotency_key":"r"
+                }),
+            ),
+        ] {
+            assert!(agent_gate::AGENT_VERBS.contains(&method));
+            assert!(!agent_gate::READ_VERBS.contains(&method));
+            for token in [
+                None,
+                Some("unknown-topology-token"),
+                Some("topology-worker-token"),
+            ] {
+                let mut request = RpcRequest::new(method, params.clone());
+                request.session_token = token.map(str::to_owned);
+                let HandleResult::Response(response) =
+                    fixture.server.handle_request_inner(&request).await
+                else {
+                    panic!("expected response for {method}");
+                };
+                let error = response
+                    .error
+                    .unwrap_or_else(|| panic!("{method} with {token:?} must be refused"));
+                assert_eq!(error.code, INVALID_PARAMS, "{method}");
+                let data = error.data.expect("redacted envelope");
+                assert_eq!(data["code"], "authority_denied", "{method} {token:?}");
+                assert!(data["next_action"].as_str().is_some_and(|n| !n.is_empty()));
+            }
+            let mut spoofed = params.clone();
+            spoofed["caller_session_id"] = serde_json::json!(worker);
+            let mut request = RpcRequest::new(method, spoofed);
+            request.session_token = Some("topology-worker-token".into());
+            let HandleResult::Response(response) =
+                fixture.server.handle_request_inner(&request).await
+            else {
+                panic!("expected response for {method}");
+            };
+            let data = response
+                .error
+                .and_then(|error| error.data)
+                .expect("refused");
+            assert_eq!(data["code"], "invalid_params", "{method}");
+        }
+        // A current Epic lead reaches the same guarded service through the
+        // RPC verb and the registration-bound native tool.
+        let (epic, lead) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let store = fixture.manager.store().lock().await;
+            let dir = std::env::temp_dir();
+            let mut row = crate::session::agent_verbs::tests::test_session(epic, dir.clone());
+            row.session_kind = rsi_common::types::SessionKind::Epic;
+            row.lead_session_id = Some(lead);
+            row.project_id = Some(issue_rpc_project_id());
+            store.insert_session(&row).unwrap();
+            let mut row = crate::session::agent_verbs::tests::test_session(lead, dir);
+            row.session_kind = rsi_common::types::SessionKind::Task;
+            row.parent_id = Some(epic);
+            row.project_id = Some(issue_rpc_project_id());
+            store.insert_session(&row).unwrap();
+        }
+        fixture
+            .manager
+            .register_agent_token("topology-lead-token".into(), lead)
+            .await;
+        let mut request = RpcRequest::new(
+            "AgentTopologyUpsert",
+            serde_json::json!({
+                "name":"t4-rpc-lead","scope":"epic","validate_only":true,"idempotency_key":"u",
+                "definition":{"nodes":[],"edges":[]}
+            }),
+        );
+        request.session_token = Some("topology-lead-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected upsert response");
+        };
+        let validated = response.result.expect("lead validates in its own Epic");
+        assert!(
+            validated["definition_digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+        let mut request = RpcRequest::new(
+            "AgentTopologyList",
+            serde_json::json!({"include_executions": true}),
+        );
+        request.session_token = Some("topology-lead-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected list response");
+        };
+        let listed = response.result.expect("lead lists its scope");
+        assert!(listed["topologies"].is_array());
+        let _ = fixture
+            .manager
+            .topology_agent_self
+            .set(Arc::downgrade(&fixture.manager));
+        let native = crate::session::harness::tools::rsi_control::execute_topology_tool(
+            &fixture.manager.agent_control(),
+            lead,
+            AgentControlVerbV1::TopologyList,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("native tool reaches the same service");
+        assert_eq!(native["topologies"], listed["topologies"]);
+
+        // The operator-only `UpdateTopology {shared}` switch publishes an
+        // operator topology to agent callers without raw SQL.
+        let created = call_rpc(
+            &fixture.server,
+            "CreateTopology",
+            serde_json::json!({
+                "name":"t4-operator-shared",
+                "definition":{"nodes":[{"id":"a","kind":"Task","label":"A"}],"edges":[]}
+            }),
+        )
+        .await;
+        let operator_id = created.result.expect("operator creates")["id"].clone();
+        let shared = call_rpc(
+            &fixture.server,
+            "UpdateTopology",
+            serde_json::json!({"id": operator_id, "shared": true}),
+        )
+        .await;
+        assert_eq!(shared.result.expect("operator shares")["ok"], true);
+        let visible = crate::session::harness::tools::rsi_control::execute_topology_tool(
+            &fixture.manager.agent_control(),
+            lead,
+            AgentControlVerbV1::TopologyList,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("lead lists after sharing");
+        let entry = visible["topologies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|topology| topology["topology_id"] == operator_id)
+            .expect("shared operator topology is visible to the lead");
+        assert_eq!(entry["name"], "t4-operator-shared");
+        assert_eq!(entry["shared"], true);
+
+        for method in [
+            "CreateTopology",
+            "UpdateTopology",
+            "ListTopologies",
+            "ExecuteTopology",
+            "GetWorkflowExecution",
+            "InterruptWorkflowExecution",
+            "ResolveTopologyAttempt",
+        ] {
+            assert!(!agent_gate::AGENT_VERBS.contains(&method));
+            assert!(!agent_gate::READ_VERBS.contains(&method));
+            assert!(!agent_gate::is_allowed_for_attributed_caller(method));
+        }
+    }
+
+    /// #634: the operator `ResolveTopologyAttempt` method is operator-only.
+    /// It is absent from the agent and read catalogs and a tokened caller is
+    /// denied before dispatch, so no execution state needs seeding. Agents
+    /// resolve through the scoped `AgentTopologyResolveAttempt` (#633).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn resolve_topology_attempt_is_operator_only() {
         let method = "ResolveTopologyAttempt";
@@ -15352,11 +16183,17 @@ mod tests {
                 .iter()
                 .any(|descriptor| descriptor.method == "AgentSpawnChild")
         );
+        // #633 (T4) adds the scoped agent verb; the operator method itself
+        // stays out of the agent CLI catalog.
         assert!(
             cli_catalog
                 .iter()
-                .all(|descriptor| !descriptor.method.contains("Topology")),
-            "the agent CLI catalog must not advertise topology resolution"
+                .any(|descriptor| descriptor.method == "AgentTopologyResolveAttempt"),
+            "the agent CLI catalog advertises the scoped resolution verb"
+        );
+        assert_eq!(
+            rsi_common::agent_control_schema::AgentControlVerbV1::from_method_name(method),
+            None
         );
         let fixture = recursive_dag_rpc_fixture();
         let mut request = RpcRequest::new(
@@ -15390,6 +16227,7 @@ mod tests {
         assert_eq!(error.message, "not_found");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(
         clippy::await_holding_lock,
@@ -15529,6 +16367,7 @@ mod tests {
 
     /// Issue #35, the static half of the same boundary: the ceiling must stay
     /// off every agent-reachable catalog, not just be denied at dispatch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn operator_daemon_config_is_absent_from_every_agent_surface() {
         for field in RSID_SCOPE_CONFIG_FIELDS {
@@ -15636,6 +16475,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn get_model_control_status_rpc_roundtrip_reports_active_invocation() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15668,6 +16508,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn cancel_model_invocation_rpc_interrupts_active_session() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15706,6 +16547,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn cancel_model_invocation_rpc_uses_runtime_handle_for_sessionless_work() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -15766,6 +16608,7 @@ mod tests {
         assert!(fired.load(Ordering::SeqCst));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_model_control_policy_stop_all_cancels_active_invocations() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15797,6 +16640,10 @@ mod tests {
         assert!(report.requested_invocations.contains(&invocation_id));
 
         let store = fixture.manager.store().lock().await;
+        assert_eq!(
+            store.get_operator_pause(session_id).unwrap(),
+            crate::store::manager_actions::OperatorPause::Hard,
+        );
         let record = store
             .load_model_invocation_record(invocation_id)
             .expect("load")
@@ -15807,6 +16654,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_model_control_policy_stop_all_batches_past_4096_without_tail_loss() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15902,6 +16750,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_model_control_policy_can_replace_policies_and_trip_provider_circuit() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15953,6 +16802,7 @@ mod tests {
         assert_eq!(report.circuits[0].scope_id.as_deref(), Some("codex"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_call_to_allowlisted_method_is_allowed() {
         let fixture = recursive_dag_rpc_fixture();
@@ -15971,6 +16821,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_get_progress_defaults_to_cohort_and_rejects_malformed_or_identity_params() {
         use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -16100,6 +16951,7 @@ mod tests {
     /// an authorized child, refuses an untokened call at the gate, and refuses
     /// every malformed or caller-field-smuggling params shape BEFORE any
     /// payload is persisted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
         let fixture = recursive_dag_rpc_fixture();
@@ -16254,6 +17106,7 @@ mod tests {
         assert!(data["next_action"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_unattributed_launch_session_is_unaffected() {
         // (c) unattributed TUI LaunchSession unaffected by the gate — it may
@@ -16277,6 +17130,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_gate_attributed_subscribe_is_denied() {
         // (c) unattributed Subscribe unaffected; attributed Subscribe is
@@ -16297,6 +17151,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_spawn_child_lead_guard_epic_lead_succeeds_non_lead_rejected() {
         // (a) Epic-lead token spawns child via AgentSpawnChild; non-lead rejected.
@@ -16389,6 +17244,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
         use rsi_common::types::SessionKind;
@@ -16579,12 +17435,18 @@ mod tests {
 
     async fn call_serialized_rpc_over_unix_socket(
         server: std::sync::Arc<RpcServer>,
-        root: &std::path::Path,
+        _root: &std::path::Path,
         request: &RpcRequest,
     ) -> RpcResponse {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let socket_path = root.join(format!("rpc-{}.sock", Uuid::new_v4()));
+        let socket_root = tempfile::Builder::new()
+            .prefix("r")
+            .tempdir_in("/tmp")
+            .expect("isolated RPC socket root");
+        let socket_path = socket_root
+            .path()
+            .join(format!("rpc-{}.sock", Uuid::new_v4()));
         let listener = tokio::net::UnixListener::bind(&socket_path)
             .expect("bind isolated in-process daemon Unix socket");
         let connection = tokio::spawn(async move {
@@ -16625,6 +17487,7 @@ mod tests {
     /// socket and SQLite file live under one temporary root; reconstructing the
     /// manager/server proves replay and the next allocation use durable V99
     /// role/ordinal/counter state rather than process-local coordination.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_identity_in_process_rpc_server_unix_socket_restart_fixture() {
         use rsi_common::types::SessionKind;
@@ -16908,6 +17771,7 @@ mod tests {
     /// Full isolated V95 smoke. The shell wrapper supplies an empty fixture
     /// root and the freshly built CLI path; every call below is a real
     /// `rsi-rpc` subprocess crossing one temporary Unix socket.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture() {
         use rsi_common::types::{Project, SessionKind};
@@ -17530,10 +18394,25 @@ mod tests {
             )
             .expect("settle disposable halt target");
 
+        // The predecessor can be terminal after a daemon restart. Use a live
+        // Epic child to test the candidate's message authority in every phase.
+        let message_target_id = Uuid::new_v4();
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .insert_session(&mk_agent_test_session(
+                message_target_id,
+                rsi_common::types::SessionKind::Task,
+                Some(epic_id),
+                None,
+            ))
+            .expect("insert live message target");
         let mut candidate_send = RpcRequest::new(
             "AgentSendMessage",
             serde_json::json!({
-                "target_session_id": predecessor_id,
+                "target_session_id": message_target_id,
                 "message": format!("candidate authority at {phase}"),
                 "idempotency_key": format!("baton-candidate-message-{phase}")
             }),
@@ -17642,6 +18521,7 @@ mod tests {
 
     /// This is intentionally an in-process `RpcServer` Unix-socket daemon
     /// fixture, not a subprocess-rsid or paid-provider end-to-end test.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixture() {
         use crate::session::harness::tools::HarnessTool;
@@ -18015,6 +18895,7 @@ mod tests {
         backend.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_for_others() {
         // Review finding #2: AgentSpawnChild parents new children under the
@@ -18169,6 +19050,7 @@ mod tests {
         assert!(error.message.contains("agent_verb_scope_denied"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_get_status_and_halt_use_resolved_caller_session_when_unspecified() {
         use rsi_common::types::SessionKind;
@@ -18208,6 +19090,7 @@ mod tests {
         assert_eq!(session.id, caller_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_get_status_null_params_self_targets_but_malformed_params_error() {
         // Review finding #1: `Value::Null` (no `--params` flag at all) is
@@ -18290,6 +19173,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_verb_without_session_token_is_rejected() {
         let fixture = recursive_dag_rpc_fixture();
@@ -18306,6 +19190,7 @@ mod tests {
         assert_eq!(error.code, INVALID_PARAMS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_verb_with_superseded_token_is_rejected() {
         // A6 re-mint semantics: a re-mint (continue/rotation establishment)
@@ -18372,6 +19257,7 @@ mod tests {
 
     // ── Phase 2: AgentScheduleWake pinning tests ──
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_schedule_wake_binds_wake_session_id_from_token_ignoring_params() {
         use rsi_common::types::SessionKind;
@@ -18431,6 +19317,7 @@ mod tests {
         assert_eq!(jobs[0].wake_mode, rsi_common::types::WakeMode::Resume);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_schedule_wake_fresh_persists_bound_origin() {
         use rsi_common::types::SessionKind;
@@ -18487,6 +19374,7 @@ mod tests {
         assert_eq!(jobs[0].wake_session_id, Some(caller_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_schedule_wake_omitted_or_unknown_mode_rejects_without_insert() {
         use rsi_common::types::SessionKind;
@@ -18541,6 +19429,7 @@ mod tests {
         assert!(jobs.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn create_scheduled_job_fresh_remains_generic() {
         use rsi_common::types::{Recurrence, ScheduleSpec};
@@ -18577,6 +19466,7 @@ mod tests {
         assert_eq!(jobs[0].wake_session_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_schedule_wake_rpc_and_harness_tool_produce_equivalent_jobs() {
         use crate::session::harness::tools::HarnessTool;
@@ -18659,6 +19549,7 @@ mod tests {
         assert_eq!(rpc_job.wake_session_id, Some(caller_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn program_guard_rpc_and_native_paths_share_one_caller_bound_row() {
         use crate::session::harness::tools::HarnessTool;
@@ -18725,6 +19616,7 @@ mod tests {
         assert!(is_program_guard_sentinel(&jobs[0], caller_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn closed_guard_program_guard_identity_rejects_two_step_mutation_rearm_and_trigger() {
@@ -19015,6 +19907,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_scheduled_job_enforces_terminal_watch_cap_and_preserves_idempotence() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19102,6 +19995,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn toggle_scheduled_job_enforces_terminal_watch_cap_and_preserves_disable() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19151,6 +20045,7 @@ mod tests {
         assert_eq!(response.result.unwrap()["enabled"], true);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn operator_update_and_toggle_race_never_exceeds_terminal_watch_cap() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19237,6 +20132,7 @@ mod tests {
 
     /// T-12: watched-subject authz scope, self-watch rejection, natural-key
     /// dedup, and the params surface still carrying no steerable wake target.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -19400,6 +20296,7 @@ mod tests {
     }
 
     /// T-12 (cap leg): the 65th enabled watch for one master is rejected.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -19482,6 +20379,7 @@ mod tests {
     /// persists an enabled, immediately-eligible watch row even with the
     /// scheduler disabled (`None` handle — the fixture's shape): the arm
     /// inserts, warns, and the watch activates when the scheduler runs.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -19537,6 +20435,7 @@ mod tests {
         assert!(job.next_fire_at <= chrono::Utc::now() + chrono::Duration::seconds(61));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_typed_inspector_rpc_routes_are_not_registered_slice_1() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19581,6 +20480,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_lookup_is_graph_guarded() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19661,6 +20561,7 @@ mod tests {
         assert!(data.details.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_summary_pagination_is_bounded_and_scoped() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19790,6 +20691,7 @@ mod tests {
         assert_eq!(data.resource_id, Some(unknown_graph_id.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_preview_is_graph_guarded_and_inline_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19870,6 +20772,7 @@ mod tests {
         assert_eq!(data.resource_id, Some(unknown_graph_id.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_preview_blocks_external_and_unsupported_sources() {
         let fixture = recursive_dag_rpc_fixture();
@@ -19957,6 +20860,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_preview_truncates_by_bytes_and_lines() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20051,6 +20955,7 @@ mod tests {
         assert_eq!(data.resource_id, Some(artifact_id.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_readbacks_tolerate_malformed_metadata() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20144,6 +21049,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_has_no_live_executor_entrypoint() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20226,6 +21132,7 @@ mod tests {
             .expect("live attempt state snapshot")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_artifact_inspector_readbacks_are_read_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20299,6 +21206,7 @@ mod tests {
         assert_eq!(live_state_after, live_state_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_live_status_and_validation_readbacks_are_read_only() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20586,6 +21494,7 @@ mod tests {
         assert_eq!(state_after, state_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_live_readbacks_reject_malformed_and_unknown_ids() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20706,6 +21615,7 @@ mod tests {
         assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_live_attempt_without_validation_returns_empty_readbacks() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20756,6 +21666,7 @@ mod tests {
         assert!(readback.latest_validation.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_linked_session_missing_warns_without_failing() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20825,6 +21736,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_live_attempt_graph_filter_handles_mixed_attempts() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20906,6 +21818,7 @@ mod tests {
         assert_eq!(attempts[0].summary.id, second.live_attempt_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_readback_scheduler_runs_and_events() {
         let fixture = recursive_dag_rpc_fixture();
@@ -20965,6 +21878,7 @@ mod tests {
         assert!(detail.report_artifact.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_readback_recovery_status_and_deferred_graphs() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21042,6 +21956,7 @@ mod tests {
         assert_eq!(deferred[0].graph_id, Some(RecursiveTaskGraphId(graph_2)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_malformed_and_unknown_params_are_clear() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21128,6 +22043,7 @@ mod tests {
         assert!(error.message.contains("max_graphs must be positive"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_control_rejects_when_disabled_before_mutation() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21200,6 +22116,7 @@ mod tests {
         assert!(recovery.latest_pass.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_control_aliases_are_gated_like_canonical() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21280,6 +22197,7 @@ mod tests {
         assert!(cancellations.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_control_enabled_fake_scheduler_and_recovery() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21376,6 +22294,7 @@ mod tests {
         assert!(!caps.recursive_dag_background_loop);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_continue_recovery_respects_supplied_budget() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21436,6 +22355,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recursive_dag_rpc_cancellation_controls_create_durable_requests() {
         let fixture = recursive_dag_rpc_fixture();
@@ -21538,6 +22458,7 @@ mod tests {
         assert_eq!(request.run_id, Some(run.id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_create_project_params() {
         let json = serde_json::json!({
@@ -21554,6 +22475,7 @@ mod tests {
         assert_eq!(params.color.unwrap(), "#a6e3a1");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_create_project_params_minimal() {
         // Only name is required
@@ -21567,6 +22489,7 @@ mod tests {
         assert!(params.color.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_update_project_params() {
         let json = serde_json::json!({
@@ -21582,6 +22505,7 @@ mod tests {
         assert!(params.path.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_project_id_params() {
         let json = serde_json::json!({
@@ -21594,6 +22518,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_search_params_full() {
         let json = serde_json::json!({
@@ -21612,6 +22537,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_search_params_minimal() {
         let json = serde_json::json!({ "query": "test" });
@@ -21622,6 +22548,7 @@ mod tests {
         assert!(params.project_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_index_params_default() {
         let json = serde_json::json!({});
@@ -21629,6 +22556,7 @@ mod tests {
         assert!(!params.force);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_index_params_force() {
         let json = serde_json::json!({ "force": true });
@@ -21636,6 +22564,7 @@ mod tests {
         assert!(params.force);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_read_params_full() {
         let json = serde_json::json!({
@@ -21649,6 +22578,7 @@ mod tests {
         assert_eq!(params.lines, Some(20));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_memory_read_params_minimal() {
         let json = serde_json::json!({ "path": "MEMORY.md" });
@@ -21669,6 +22599,7 @@ mod tests {
     // require a live SessionManager + DB, exercised by Phase 4 integration
     // tests.
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_create_container_params_roundtrip() {
         let pid = uuid::Uuid::new_v4();
@@ -21687,6 +22618,7 @@ mod tests {
         assert_eq!(params.tags, vec!["infra".to_string()]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_set_session_parent_params_roundtrip() {
         let sid = uuid::Uuid::new_v4();
@@ -21705,6 +22637,7 @@ mod tests {
         assert!(params.new_parent_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_list_session_children_params_roundtrip_root() {
         // No parent_id → top-level listing.
@@ -21720,6 +22653,7 @@ mod tests {
         assert_eq!(params.parent_id, Some(pid));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_containment_root_accepts_standard_and_group() {
         use crate::session::hierarchy::validate_containment;
@@ -21735,6 +22669,7 @@ mod tests {
         assert!(validate_containment(None, SessionKind::TaskRabbit).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_containment_group_accepts_standard_epic_only() {
         use crate::session::hierarchy::validate_containment;
@@ -21747,6 +22682,7 @@ mod tests {
         assert!(validate_containment(Some(SessionKind::Group), SessionKind::Bug).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_containment_epic_accepts_story_task_bug() {
         use crate::session::hierarchy::validate_containment;
@@ -21759,6 +22695,7 @@ mod tests {
         assert!(validate_containment(Some(SessionKind::Epic), SessionKind::Epic).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_containment_leaf_kinds_reject_all_children() {
         use crate::session::hierarchy::validate_containment;
@@ -21788,6 +22725,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_cycle_self_rejected() {
         use crate::session::hierarchy::detect_cycle;
@@ -21795,6 +22733,7 @@ mod tests {
         assert!(detect_cycle(a, a, |_| None).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_cycle_two_hop_rejected() {
         use crate::session::hierarchy::detect_cycle;
@@ -21806,6 +22745,7 @@ mod tests {
         assert!(detect_cycle(a, b, |id| parents.get(&id).copied()).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_cycle_three_hop_rejected() {
         use crate::session::hierarchy::detect_cycle;
@@ -21818,6 +22758,7 @@ mod tests {
         assert!(detect_cycle(a, c, |id| parents.get(&id).copied()).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_cycle_unrelated_branch_accepted() {
         use crate::session::hierarchy::detect_cycle;
@@ -21829,6 +22770,7 @@ mod tests {
         assert!(detect_cycle(a, c, |id| parents.get(&id).copied()).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rpc_delete_container_cascade_recognizes_container_kinds() {
         use rsi_common::is_container_kind;
@@ -21853,6 +22795,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Verify that only Epic-kind containers are eligible to hold a lead pointer.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_rejects_non_container() {
         use rsi_common::types::SessionKind;
@@ -21872,6 +22815,7 @@ mod tests {
 
     /// Verify that `is_leaf_kind` correctly classifies session kinds for lead
     /// candidate validation in `handle_set_epic_lead`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_rejects_non_child_kind() {
         use rsi_common::types::SessionKind;
@@ -21891,6 +22835,7 @@ mod tests {
     }
 
     /// Archived and Deleted statuses must be rejected as lead candidates.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_rejects_archived_or_deleted_lead() {
         use rsi_common::types::SessionStatus;
@@ -21917,6 +22862,7 @@ mod tests {
     }
 
     /// `SetEpicLeadParams` serde: None clears the pointer.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_clears_with_none_serde() {
         use rsi_common::rpc::SetEpicLeadParams;
@@ -21931,6 +22877,7 @@ mod tests {
     }
 
     /// `SetEpicLeadParams` serde: omitting the field also clears (default = None).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_clears_with_omitted_field() {
         use rsi_common::rpc::SetEpicLeadParams;
@@ -21941,6 +22888,7 @@ mod tests {
     }
 
     /// `LaunchSessionParams` parent_id round-trips through serde correctly.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_launch_session_validates_parent_containment_serde() {
         use rsi_common::rpc::LaunchSessionParams;
@@ -21958,6 +22906,7 @@ mod tests {
     }
 
     /// Epic → Story containment is legal; Epic → Standard is not.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_launch_session_containment_matrix_epic() {
         use crate::session::hierarchy::validate_containment;
@@ -21974,6 +22923,7 @@ mod tests {
 
     /// Rotation: `find_epics_by_lead` / `set_lead_session` store methods exist
     /// and their signatures are as expected by the rotation hook in rotation.rs.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rotation_transfers_lead_to_successor_store_api() {
         // This test verifies the store API exists by referencing its path. The
@@ -21992,6 +22942,7 @@ mod tests {
 
     /// Delete hook: `clear_lead_session_if_matches` store API is reachable from
     /// the delete path (compile-time check).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_delete_session_clears_lead_pointers_store_api() {
         let _clear: fn(&crate::store::Store, uuid::Uuid) -> crate::error::Result<()> =
@@ -22000,6 +22951,7 @@ mod tests {
 
     /// Verify the parent_id membership check in `handle_set_epic_lead`.
     /// A session whose `parent_id != Some(epic_id)` must be rejected.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn handle_set_epic_lead_rejects_non_child() {
         // Simulate the check: lead.parent_id must equal Some(epic_id).
@@ -22042,6 +22994,7 @@ mod tests {
     /// `RuntimeConfig::to_json` (what `handle_get_daemon_config` returns)
     /// reflects the new value. This is the closest we get to a true RPC
     /// round-trip without standing up the full Unix socket harness.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn update_daemon_config_params_round_trip_codex_sandbox_mode() {
         // Parse a wire-format payload identical to what an RPC client sends.
@@ -22070,6 +23023,7 @@ mod tests {
 
     /// SECURITY: the isolation policy is validated on write, and its value
     /// lands in the `GetDaemonConfig` payload the TUI reads back.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn update_daemon_config_round_trips_claude_config_isolation() {
         let rc = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
@@ -22110,6 +23064,7 @@ mod tests {
     }
 
     /// The setting must survive a daemon restart, i.e. be a persisted field.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn claude_config_isolation_is_a_persisted_daemon_setting() {
         assert!(
@@ -22120,6 +23075,7 @@ mod tests {
     /// RSI-022: invalid `codex_sandbox_mode` values must round-trip into the
     /// same `Err` branch that `handle_update_daemon_config` returns as
     /// `InvalidParam`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn update_daemon_config_rejects_invalid_codex_sandbox_mode() {
         let config = crate::config::Config::from_env();
@@ -22133,6 +23089,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_rsid_scope_persists_and_atomically_refreshes_snapshot() {
         let mut fixture = recursive_dag_rpc_fixture();
@@ -22144,12 +23101,36 @@ mod tests {
             .join("rsid-scope.env");
         fixture.server.rsid_scope_settings_path = snapshot.clone();
 
+        // Host-derived worker limits can start above or below this fixture's
+        // target. Change the bound that makes the other update valid first.
+        let worker_memory_updates = if fixture
+            .runtime_config
+            .worker_scope_memory_high_mib
+            .load(Ordering::Relaxed)
+            >= 12_288
+        {
+            [
+                ("worker_scope_memory_high_mib", 7168),
+                ("worker_scope_memory_max_mib", 12_288),
+            ]
+        } else {
+            [
+                ("worker_scope_memory_max_mib", 12_288),
+                ("worker_scope_memory_high_mib", 7168),
+            ]
+        };
         for (field, value) in [
             ("rsid_scope_memory_high_mib", 7168_u64),
             ("rsid_scope_memory_max_mib", 12_288),
             ("rsid_scope_memory_swap_max_mib", 256),
             ("rsid_scope_cpu_weight", 35),
-        ] {
+        ]
+        .into_iter()
+        .chain(worker_memory_updates)
+        .chain([
+            ("worker_scope_memory_swap_max_mib", 256),
+            ("worker_scope_cpu_weight", 35),
+        ]) {
             let response = call_rpc(
                 &fixture.server,
                 "UpdateDaemonConfig",
@@ -22173,11 +23154,19 @@ mod tests {
         assert_eq!(config["rsid_scope_memory_max_mib"], 12_288);
         assert_eq!(config["rsid_scope_memory_swap_max_mib"], 256);
         assert_eq!(config["rsid_scope_cpu_weight"], 35);
+        assert_eq!(config["worker_scope_memory_high_mib"], 7168);
+        assert_eq!(config["worker_scope_memory_max_mib"], 12_288);
+        assert_eq!(config["worker_scope_memory_swap_max_mib"], 256);
+        assert_eq!(config["worker_scope_cpu_weight"], 35);
         let expected = concat!(
             "rsid_scope_memory_high_mib=7168\n",
             "rsid_scope_memory_max_mib=12288\n",
             "rsid_scope_memory_swap_max_mib=256\n",
             "rsid_scope_cpu_weight=35\n",
+            "worker_scope_memory_high_mib=7168\n",
+            "worker_scope_memory_max_mib=12288\n",
+            "worker_scope_memory_swap_max_mib=256\n",
+            "worker_scope_cpu_weight=35\n",
         );
         assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), expected);
         #[cfg(unix)]
@@ -22200,8 +23189,20 @@ mod tests {
         .await;
         assert_eq!(invalid.error.unwrap().code, INVALID_PARAMS);
         assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), expected);
+        let invalid_worker = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({
+                "field": "worker_scope_memory_high_mib",
+                "value": 12_288,
+            }),
+        )
+        .await;
+        assert_eq!(invalid_worker.error.unwrap().code, INVALID_PARAMS);
+        assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), expected);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_rsid_scope_snapshot_failure_rolls_back_setting() {
         let mut fixture = recursive_dag_rpc_fixture();
@@ -22239,6 +23240,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codegraph_capabilities_report_actual_service_and_closed_request_shape() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22272,6 +23274,7 @@ mod tests {
         assert!(invalid.error.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codegraph_snapshot_rpc_pages_ready_history_and_checks_scope() {
         use crate::codegraph::{IndexRuntime, RegisteredWorkspace};
@@ -22289,6 +23292,13 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .insert_project(&project)
+            .unwrap();
         let workspace = RegisteredWorkspace::primary(project.id, root.path()).unwrap();
         let db = fixture
             ._dir
@@ -22448,6 +23458,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codegraph_daemon_config_rpc_round_trip_controls_shared_indexer_and_persists() {
         use crate::codegraph::{IndexPhase, IndexRuntime, RegisteredWorkspace};
@@ -22563,6 +23574,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codegraph_daemon_config_durable_failure_does_not_enable_indexing() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22618,6 +23630,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codegraph_disable_rpc_waits_for_publication_boundary() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22655,6 +23668,7 @@ mod tests {
         assert_eq!(current.result.unwrap()[field], false);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_target_cache_durable_failure_does_not_publish() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22716,6 +23730,73 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn completed_transcript_cap_rpc_persists_before_live_publication() {
+        let fixture = recursive_dag_rpc_fixture();
+        let field = "completed_transcript_cache_max_bytes";
+        let initial = fixture.runtime_config.to_json()[field].as_u64().unwrap();
+        let invalid = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": field, "value": -1}),
+        )
+        .await;
+        assert!(invalid.error.is_some());
+        assert_eq!(fixture.runtime_config.to_json()[field], initial);
+
+        {
+            let store = fixture.manager.store().lock().await;
+            store
+                .set_daemon_setting(field, &initial.to_string())
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER reject_transcript_cap BEFORE UPDATE ON daemon_settings
+                 WHEN NEW.key='completed_transcript_cache_max_bytes'
+                 BEGIN SELECT RAISE(FAIL, 'injected transcript cap failure'); END;",
+                )
+                .unwrap();
+        }
+        let update = serde_json::json!({"field": field, "value": 0});
+        let refused = call_rpc(&fixture.server, "UpdateDaemonConfig", update.clone()).await;
+        assert!(
+            refused
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("injected transcript cap failure"))
+        );
+        assert_eq!(fixture.runtime_config.to_json()[field], initial);
+        {
+            let store = fixture.manager.store().lock().await;
+            assert_eq!(
+                store.get_daemon_setting(field).unwrap(),
+                Some(initial.to_string())
+            );
+            store
+                .conn
+                .execute_batch("DROP TRIGGER reject_transcript_cap;")
+                .unwrap();
+        }
+
+        let accepted = call_rpc(&fixture.server, "UpdateDaemonConfig", update).await;
+        assert!(accepted.error.is_none());
+        let current = call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null).await;
+        assert_eq!(current.result.unwrap()[field], 0);
+        assert_eq!(
+            fixture
+                .manager
+                .store()
+                .lock()
+                .await
+                .get_daemon_setting(field)
+                .unwrap(),
+            Some("0".into())
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_target_cache_first_high_seeds_restartable_pair() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22752,6 +23833,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_target_cache_first_low_seeds_restartable_pair() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22788,6 +23870,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_target_cache_concurrent_watermarks_persist_published_pair() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22836,6 +23919,7 @@ mod tests {
         assert_eq!(restarted.sandbox_build_cache_reclaim_snapshot(), live);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_daemon_config_target_cache_pair_fault_rolls_back_before_publication() {
         let fixture = recursive_dag_rpc_fixture();
@@ -22886,6 +23970,7 @@ mod tests {
     // ─── P1.6: launch_session tag validation tests ────────────────────────
 
     /// AC4f: empty tags vector → InvalidParam at the params boundary.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn launch_session_empty_tags_rejected() {
         // Validate that LaunchSessionParams with empty tags deserializes but
@@ -22908,6 +23993,7 @@ mod tests {
     }
 
     /// AC4g: malformed tag in LaunchSessionParams → error contains tag_malformed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn launch_session_malformed_tag_rejected() {
         let json = serde_json::json!({
@@ -22925,6 +24011,7 @@ mod tests {
     }
 
     /// AC4h: workflow_id_override threads from params into LaunchConfig.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn launch_session_workflow_id_override_threaded() {
         let override_id = uuid::Uuid::new_v4();
@@ -23016,6 +24103,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn get_idea_rpc_operator_round_trip_is_bounded_and_safe() -> anyhow::Result<()> {
         let fixture = recursive_dag_rpc_fixture();
@@ -23061,6 +24149,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn get_idea_rpc_missing_malformed_and_attributed_calls_fail_closed() -> anyhow::Result<()>
     {
@@ -23132,6 +24221,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn create_issue_rpc_roundtrip_allocates_display_number_and_open_status() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23157,6 +24247,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn get_issue_rpc_known_and_unknown() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23192,6 +24283,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn list_issues_rpc_status_filter() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23231,6 +24323,7 @@ mod tests {
         assert!(!issues.iter().any(|i| i.id == to_close_issue.id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn list_issues_rpc_malformed_status_errors_instead_of_listing_all() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23267,6 +24360,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn update_issue_status_rpc_open_to_closed_sets_closed_at_and_unknown_id_errors() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23304,6 +24398,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn add_issue_dep_rpc_success_self_dep_cycle_and_duplicate() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23364,6 +24459,7 @@ mod tests {
         assert_eq!(duplicate.result.unwrap(), serde_json::json!({ "ok": true }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn remove_issue_dep_rpc_true_then_false() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23413,6 +24509,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn list_ready_issues_rpc_respects_blockers_and_limit() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23470,6 +24567,7 @@ mod tests {
         assert_eq!(limited_issues.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn list_ready_issues_rpc_malformed_limit_errors_instead_of_becoming_unbounded() {
         let fixture = recursive_dag_rpc_fixture();
@@ -23513,6 +24611,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn issue_workspace_rpc_operator_surface_round_trips_visible_identity_and_end_states() {
         tokio::spawn(async move {
@@ -23862,6 +24961,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn issue_workspace_rpc_rejects_present_null_and_all_methods_remain_operator_only() {
         const METHODS: [&str; 11] = [
@@ -24165,6 +25265,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_refuses_worker_reading_another_epic_or_project_for_every_verb() {
         let f = read_scope_fixture().await;
@@ -24206,6 +25307,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn session_diagnostics_read_is_bounded_and_pages_by_stable_id() {
         let f = read_scope_fixture().await;
@@ -24252,6 +25354,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_admits_self_lineage_child_and_nested_descendant() {
         let f = read_scope_fixture().await;
@@ -24289,6 +25392,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_admits_epic_lead_over_every_session_of_its_epic() {
         let f = read_scope_fixture().await;
@@ -24314,6 +25418,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_worker_reads_own_containers_metadata_but_not_sibling_content() {
         let f = read_scope_fixture().await;
@@ -24376,6 +25481,7 @@ mod tests {
         assert_read_scope_denied(&sibling_row, "sibling metadata");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_admits_current_manager_only_inside_its_scope() {
         let f = read_scope_fixture().await;
@@ -24419,6 +25525,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_leaves_unattributed_reads_unchanged() {
         let f = read_scope_fixture().await;
@@ -24492,6 +25599,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_nested_worker_reads_owning_epic_and_group_but_not_intermediate_parent()
      {
@@ -24534,6 +25642,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_parent_cycle_denies_on_caller_and_target_side() {
         use rsi_common::types::SessionKind;
@@ -24579,6 +25688,7 @@ mod tests {
         assert_read_admitted(&clean, "clean successor");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_continued_from_cycle_denies_on_caller_and_target_side() {
         use rsi_common::types::SessionKind;
@@ -24625,6 +25735,7 @@ mod tests {
         assert_read_admitted(&clean, "clean child");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_read_scope_depth_overflow_denies_on_caller_and_target_side() {
         use rsi_common::types::SessionKind;

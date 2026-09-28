@@ -609,7 +609,7 @@ impl Store {
             ),
             ArchiveCleanupPhaseV1::Refused => (
                 true,
-                "Stop competing maintenance, resolve the reported condition, then retry archive.".into(),
+                "Resolve the reported condition, then retry this archive attempt. The session does not need to restart.".into(),
             ),
             ArchiveCleanupPhaseV1::RecoveryRequired => (
                 false,
@@ -1255,6 +1255,7 @@ impl Store {
                 "archive cleanup final Session fence drifted".into(),
             ));
         }
+        Store::cancel_queued_recovery_for_archive_on(&tx, run.session_id)?;
         Store::resolve_c5_autofile_pending_tx(&tx, run.session_id)?;
         tx.execute(
             "UPDATE sessions SET lead_session_id=NULL,updated_at=?1
@@ -1714,6 +1715,7 @@ fn next_event_sequence(tx: &Transaction<'_>, run_id: Uuid) -> Result<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn archive_phase_edges_are_closed_and_forward_only() {
         assert!(legal_transition(
@@ -1734,6 +1736,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn topology_digest_binds_identity_without_exposing_title_authority() {
         let session_id = Uuid::new_v4();

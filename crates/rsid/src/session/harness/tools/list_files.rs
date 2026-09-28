@@ -1,4 +1,6 @@
-use crate::session::harness::tools::{HarnessTool, is_system_blocked};
+use crate::session::harness::tools::{
+    HarnessTool, ToolExecutionMode, is_system_blocked, truncation::truncate_text,
+};
 use crate::session::harness::types::ToolResult;
 use regex::Regex;
 use std::path::Path;
@@ -11,6 +13,10 @@ pub struct ListFilesTool;
 impl HarnessTool for ListFilesTool {
     fn name(&self) -> &str {
         "list_files"
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::ParallelSafe
     }
 
     fn description(&self) -> &str {
@@ -146,17 +152,11 @@ impl HarnessTool for ListFilesTool {
 
         paths.sort();
 
-        // Truncate output if it's too large to prevent context window explosion
-        let mut output = paths.join("\n");
-        let max_len = 100_000;
-        if output.len() > max_len {
-            output.truncate(max_len);
-            output.push_str("\n... [output truncated due to length]");
-        }
-
-        if output.is_empty() {
-            output = "(no matching files found)".to_string();
-        }
+        let output = if paths.is_empty() {
+            "(no matching files found)".to_string()
+        } else {
+            truncate_text(&paths.join("\n"), 100_000, false).content
+        };
 
         ToolResult {
             success: true,
@@ -172,6 +172,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_list_files_basic() {
         let temp = TempDir::new().unwrap();
@@ -191,6 +192,7 @@ mod tests {
         assert!(result.output.contains("src/main.rs"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_list_files_pattern() {
         let temp = TempDir::new().unwrap();

@@ -22,7 +22,7 @@ Generated from the rsi registries: the action registry, key tables, overlay help
 
 ## 1. Getting started
 
-rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start the daemon, then the TUI. Press `?` for help on the focused view, `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.
+rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start `rsi`; on Linux and macOS it starts `rsid` if no daemon is accepting connections and the daemon binary is available. Press `?` for help on the focused view, `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.
 
 ### Discovery
 
@@ -228,8 +228,11 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | Keys | Command | Action | What it does |
 | --- | --- | --- | --- |
 | `yy` |  | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
-| `x` | `:kill` `:ki` | Interrupt running session | Interrupts the selected running session. |
-| `X` `<Space>c` | `:continue [arg]` `:cont [arg]` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
+| `x` | `:kill` `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
+| `X` |  | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `<Space>hs` | `:pause soft` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
+| `<Space>hc` | `:pause clear` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `<Space>c` | `:continue [arg]` `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` |  | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | `:archive` `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `U` |  | Unarchive selected session | Restores the selected archived session to the Main zone. |
@@ -238,8 +241,8 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | `R` | `:rotate` `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
 |  | `:model [arg]` `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `<Space>o` | `:task [arg]` `:ta [arg]` | Launch task session | Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly. |
-| `<Space>m` | `:blank [arg]` `:bl [arg]` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
-| `<Space>S` | `:stopall` `:stop-all` | Emergency stop all | Emergency stop: denies new paid work and cancels live model invocations. |
+| `Ctrl-N` `<Space>N` | `:blank [arg]` `:bl [arg]` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
+| `<Space>X` | `:stopall` `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 |  | `:group` `:groups` | Choose group label | Opens the group label picker for the selected session. |
 |  | `:context [arg]` `:ctx [arg]` | Set active task context | Sets or clears the active task context for new launches. |
 |  | `:rate [arg]` `:r [arg]` | Rate selected session | Rates the selected session 1-10: `:rate <n>`, or opens the rating overlay (digits 1-9, 0 = 10). |
@@ -247,8 +250,7 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | `Ctrl-M` |  | Model dropdown | Opens or closes the model dropdown for the next launch (plain `M` stays free for text surfaces). |
 | `<Space>r` |  | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` |  | Cancel pending retry | Cancels the selected session's pending automatic retry. |
-| `<Space>x` |  | Run docregblock tags | Launches a session for every docregblock tag in the selected session's output. |
-| `<Space>X` |  | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
+| `<Space>x` |  | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 
 ### Window
 
@@ -305,7 +307,7 @@ rsi ships 14 built-in themes, in picker order. `T` opens the picker with a live 
 | 11 | Diamond |
 | 12 | Ruby |
 | 13 | Saphire |
-| 14 | D. is for Devil |
+| 14 | D. is for Daemon |
 
 ### Theme & Colors
 
@@ -334,9 +336,13 @@ Every settings row by group and section: what it does, what kind of value it is,
 | Settings: `l` `Right` |  | Enter selected category | Moves focus from the category rail into the selected category's items. |
 | Settings: `Space` |  | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
 | Settings: `a` |  | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
-| Settings: `d` |  | Delete item | Deletes the selected item from a settings list. |
+| Settings: `d` |  | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | Settings: `e` |  | Enable or disable skill | Enables or disables the selected Claude skill. |
 | Settings: `R` |  | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
+| Settings: `s` |  | Set provider key | Opens the masked Set form for the selected provider key slot. |
+| Settings: `r` |  | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
+| Settings: `c` |  | Check provider key | Checks the selected provider key slot with its provider. |
+| Settings: `i` |  | Import provider keys | Imports available provider keys from the process environment into vault slots. |
 | Settings: `/` |  | Search settings | Opens an incremental settings query; Enter jumps to the first match at or after the cursor. |
 | Settings: `n` |  | Next settings match | Jumps to the next settings row matching the active query, wrapping with a notice. |
 | Settings: `N` |  | Previous settings match | Jumps to the previous settings row matching the active query, wrapping with a notice. |
@@ -359,14 +365,16 @@ The built-in theme, per-role overrides and legacy colors.
 
 #### Screen
 
-Text-area background and animation styles.
+Text-area background, animation styles and detail column placement.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Text area background | Paints the configured background color behind text-entry surfaces. | toggle | TUI (state.json) | immediately |
 | Background color | Sets the hex color used when the text area background is on. | edit | TUI (state.json) | immediately |
-| Formulation animation | Sets how long the in-progress message grow animation runs. | choice | TUI (state.json) | immediately |
+| Formulation animation | Reveals each new live message with a top-to-bottom wipe. Off by default. | toggle | TUI (state.json) | immediately |
+| Formulation speed | Sets how long the formulation reveal runs when the animation is on. | choice | TUI (state.json) | immediately |
 | Activity indicator | Chooses the working-indicator style: Semantic, Rainbow Classic or Rainbow Compact. | choice | TUI (state.json) | immediately |
+| Detail column | Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned. | choice | TUI (state.json) | immediately |
 
 ### WORKSPACE — What do I see in the list and a new transcript?
 
@@ -379,6 +387,8 @@ What the session navigator and cards show.
 | Navigator preset | Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it. | choice | TUI (state.json) | immediately |
 | Navigator optional columns | Turns individual optional navigator columns on or off. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. Required columns cannot be hidden. | list | TUI (state.json) | immediately |
 | Card fields | Chooses which facts render on session-list cards. Card fields: Context bar, Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date. | list | TUI (state.json) | immediately |
+| Automatic session archive | Archives delivered or issue-filed terminal sessions after an idle window. | toggle | daemon field `session_retention_enabled` | immediately |
+| Archive idle hours | Idle hours before an eligible terminal session is archived. | choice | daemon field `session_retention_window_hours` | immediately |
 
 #### Transcript Defaults
 
@@ -460,6 +470,14 @@ Usage telemetry and stop/cancel actions.
 | Usage and telemetry | Read-only daemon usage and model-control telemetry. | read-only | daemon (usage statistics) | immediately |
 | Stop-all and cancel | Destructive actions from the stats view: emergency stop-all and cancel a live invocation. **Destructive.** | action | daemon (model control) | immediately |
 
+#### Provider Keys
+
+Manage provider credentials stored in the key vault.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Provider credential slots | Twenty-three masked vault slots; s sets, r rotates, c checks, d clears after confirmation, and i imports from environment. | list | daemon (key vault) | immediately |
+
 ### AGENT AUTOMATION — What does the daemon do on its own when agents fail?
 
 #### Retries & Recovery
@@ -474,6 +492,9 @@ What the daemon does when a session fails.
 | Retry on stall | Runs the stall-retry handler that relaunches stalled sessions. | toggle | daemon field `retry_on_stall` | after daemon restart |
 | Reconciliation loop | Runs the background loop that reconciles session liveness and consistency. | toggle | daemon field `reconciliation_enabled` | after daemon restart |
 | Context rotation | Rotates a session into a fresh context near its limit, carrying a handoff forward. | toggle | daemon field `context_rotation_enabled` | new launches now · resumed sessions after restart |
+| Context rotation threshold (global) | Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%. | choice | daemon field `context_rotation_global_pct` | immediately |
+| Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | immediately |
+| Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | immediately |
 
 #### Stall Detection
 
@@ -495,7 +516,7 @@ Memory extraction and consolidation.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Memory system | Enables the daemon memory subsystem (observation extraction and search). | toggle | daemon field `memory_enabled` | after daemon restart |
+| Memory system | OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync. | toggle | daemon field `memory_enabled` | after daemon restart |
 | Dream consolidation | Enables periodic memory consolidation (dreaming). | toggle | daemon field `dream_enabled` | immediately |
 | Observation threshold | Number of new observations that triggers a consolidation cycle. | edit | daemon field `dream_observation_threshold` | after daemon restart |
 | Dream cooldown | Minimum seconds between consolidation cycles. | edit | daemon field `dream_cooldown_secs` | after daemon restart |
@@ -519,6 +540,16 @@ Background queue and recursive DAG controls.
 | Graph overlay: info dashboard | Shows the info dashboard panel in the graph overlay (:dag). | toggle | daemon field `gv_info_dashboard` | immediately |
 | Durable topology executor | Kill switch for the durable topology executor (#634); off, no durable execution advances or recovers and live topology runs use the legacy in-memory runner. | toggle | daemon field `topology_executor_enabled` | immediately |
 | Topology build nodes | Most topology build nodes the durable executor runs at once (1-16; the page cycles 1-4). | choice | daemon field `topology_max_concurrent_build_nodes` | immediately |
+| Topology bulk fan-out on OpenRouter (0 off) | Minimum leaf count for OpenRouter topology bulk fan-out; 0 disables it. | choice | daemon field `topology_bulk_fanout_min_openrouter` | immediately |
+| Completed transcript cache (bytes) | Daemon RAM limit for completed transcript reads; 0 disables retention. | choice | daemon field `completed_transcript_cache_max_bytes` | immediately |
+| rsid MemoryHigh (MiB) | Systemd memory pressure threshold for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_high_mib` | after daemon restart |
+| rsid MemoryMax (MiB) | Hard systemd memory ceiling for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_max_mib` | after daemon restart |
+| rsid MemorySwapMax (MiB) | Swap ceiling for the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_swap_max_mib` | after daemon restart |
+| rsid CPUWeight | Relative CPU weight of the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_cpu_weight` | after daemon restart |
+| Worker slice MemoryHigh (MiB) | Aggregate worker MemoryHigh, initially 55% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_high_mib` | after daemon restart |
+| Worker slice MemoryMax (MiB) | Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_max_mib` | after daemon restart |
+| Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
+| Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
 
 #### Code Intelligence
 
@@ -538,6 +569,10 @@ How provider processes are sandboxed and isolated.
 | --- | --- | --- | --- | --- |
 | Codex sandbox | Sandbox policy for new Codex processes: read-only, workspace-write or danger-full-access. | choice | daemon field `codex_sandbox_mode` | next spawn |
 | Claude project config isolation | Isolation of Claude project config for new Claude processes: off, settings or strict. | choice | daemon field `claude_config_isolation` | next spawn |
+| Vault: legacy env fallback | Allow provider keys from legacy environment variables when no vault credential exists. | toggle | daemon field `vault.env_compat` | immediately |
+| Vault: check TTL | Cache provider key check results for this many seconds. | choice | daemon field `vault.check_ttl_secs` | immediately |
+| OpenRouter engine | Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route <model> [codex_cli\|harness\|default]. | choice | daemon field `api_route.openrouter` | next spawn |
+| API route fallback | Allow a failed Harness preflight to launch OpenRouter through Codex CLI. | toggle | daemon field `api_route.fallback` | next spawn |
 
 #### Sandbox Storage
 
@@ -552,6 +587,11 @@ Sandbox disk use, cache reclamation and settlement.
 | Cache pressure high | Disk-use percent that arms reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_high_watermark_pct` | immediately |
 | Cache pressure low | Disk-use percent that clears reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_low_watermark_pct` | immediately |
 | Cache reclaim pass limit | Maximum caches deleted in one reclaim pass. | edit | daemon field `sandbox_build_cache_reclaim_max_candidates` | immediately |
+| Agent build jobs | Cargo jobs per build in a sandboxed session. | edit | daemon field `agent_build_jobs` | next spawn |
+| Agent line tables | Use line-tables-only debuginfo for sandbox builds. | toggle | daemon field `agent_build_line_tables_only` | next spawn |
+| Worker sccache | Use sccache and disable incremental builds for fresh workers. | toggle | daemon field `agent_build_sccache_enabled` | next spawn |
+| sccache cap (GiB) | Machine local sccache disk cap for new worker processes. | edit | daemon field `agent_build_sccache_cache_gib` | next spawn |
+| Machine build slots | Maximum concurrent compiler processes across agent sandboxes. | edit | daemon field `agent_build_slots` | next spawn |
 | Preview cache reclaim | Runs a dry-run reclaim pass and reports what it would free. | action | daemon (sandbox storage) | immediately |
 | Reclaim sandbox caches now | Runs a real reclaim pass now and reports the result. **Destructive.** | action | daemon (sandbox storage) | immediately |
 | Source-worktree settlement | Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. **Destructive.** | action | daemon (source-worktree settlement) | immediately |
@@ -609,8 +649,10 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:manager decisions` |  | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `:manager inbox` |  | Open manager inbox | Opens the harness manager inbox of lead requests and replies. |
 | `:manager inspect` |  | Open manager inspect | Opens the harness manager inspect view (workers, work, requests, topology and events). |
-| `:kill` | `:ki` | Interrupt running session | Interrupts the selected running session. |
-| `:continue [arg]` | `:cont [arg]` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
+| `:kill` | `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
+| `:pause soft` |  | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
+| `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `:continue [arg]` | `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `:archive` | `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `:rotate` | `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
@@ -627,7 +669,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:project-edit [arg]` |  | Edit project | Edits the named or current project. |
 | `:project-delete <arg>` |  | Delete project | Deletes the named project; the name argument is required. |
 | `:set` | `:settings` | Open settings | Opens the settings pane. |
-| `:stopall` | `:stop-all` | Emergency stop all | Emergency stop: denies new paid work and cancels live model invocations. |
+| `:stopall` | `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `:hooks` |  | Open hook settings | Opens settings at the Claude hooks list. |
 | `:skills` |  | Open skill settings | Opens settings at the Claude skills list. |
 | `:group` | `:groups` | Choose group label | Opens the group label picker for the selected session. |
@@ -681,9 +723,11 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>gb` | Open manager board | Opens the harness manager work board. |
 | `<Space>gd` | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `yy` | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
-| `x` | Interrupt running session | Interrupts the selected running session. |
-| `X` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
-| `<Space>c` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
+| `x` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
+| `X` | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
+| `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `U` | Unarchive selected session | Restores the selected archived session to the Main zone. |
@@ -698,9 +742,10 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `ZZ` | Quit | Quits rsi (the daemon and its sessions keep running). |
 | `<Space>p` | Choose project | Opens the project picker. |
 | `<Space>o` | Launch task session | Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly. |
-| `<Space>m` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
+| `Ctrl-N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
+| `<Space>N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `<Space>,` | Open settings | Opens the settings pane. |
-| `<Space>S` | Emergency stop all | Emergency stop: denies new paid work and cancels live model invocations. |
+| `<Space>X` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `<Space>v` | Open graph review | Opens the visual workflow graph review editor. |
 | `gL` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
 | `<Space>q` | Close pane | Closes the focused pane. |
@@ -750,8 +795,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>C` | Change session project | Moves the selected session to another project. |
 | `<Space>r` | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` | Cancel pending retry | Cancels the selected session's pending automatic retry. |
-| `<Space>x` | Run docregblock tags | Launches a session for every docregblock tag in the selected session's output. |
-| `<Space>X` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
+| `<Space>x` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 | `<Space>T` | Open in new tab | Opens the selected session in a new tab. |
 | `<Space>gg` | Git panel (lazygit) | Suspends the TUI and runs lazygit in the session's working directory. |
 | `<Space>e` | File explorer | Toggles the left-anchored file explorer drawer. |
@@ -790,6 +834,7 @@ Reserved sequences: prefixes wait for the next key; no-ops keep retired chords f
 | `gf` | prefix | prefix of gf1..gf9 (Vim's gf would open a file path) |
 | `<Space>gr` | no-op | retired; the label picker is `:group` |
 | `<Space>R` | no-op | retired; the rating overlay is `:rate` |
+| `<Space>S` | no-op | retired emergency-stop chord; use <Space>X |
 | `gm` | no-op | retired merge-queue chord |
 | `g?` | no-op | retired; the dialectic overlay is `:ask` |
 | `gX` | no-op | retired modal launcher; the command moved under <Space>g |
@@ -823,9 +868,13 @@ Keys of the settings pane (category rail and items).
 | `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. |
 | `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
-| `d` | Delete item | Deletes the selected item from a settings list. |
+| `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
+| `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
+| `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
+| `c` | Check provider key | Checks the selected provider key slot with its provider. |
+| `i` | Import provider keys | Imports available provider keys from the process environment into vault slots. |
 | `/` | Search settings | Opens an incremental settings query; Enter jumps to the first match at or after the cursor. |
 | `n` | Next settings match | Jumps to the next settings row matching the active query, wrapping with a notice. |
 | `N` | Previous settings match | Jumps to the previous settings row matching the active query, wrapping with a notice. |
@@ -958,6 +1007,8 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-0` | launch prompt or input modal open | reset the overlay's size and position |
 | `Ctrl-Shift-Right` | normal mode, no overlay | widen the session-list sidebar |
 | `Ctrl-Shift-Left` | normal mode, no overlay | narrow the session-list sidebar |
+| `Ctrl-Left` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column left (snaps to Left Aligned at the edge) |
+| `Ctrl-Right` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column right (unsnaps Left Aligned) |
 | `Ctrl-Left` | normal mode, no overlay, not inserting | focus the pane to the left (zones: gs / gt / gj / ga) |
 | `Ctrl-Right` | normal mode, no overlay, not inserting | focus the pane to the right (zones: gs / gt / gj / ga) |
 | `Shift-Down` | normal mode, no overlay, not inserting | select the next transcript event |
@@ -1033,7 +1084,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Apply sort order |
 | `Esc / q` | Close without changing |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Notifications
@@ -1047,7 +1098,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Open source session |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Recent Completions
@@ -1060,7 +1111,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `i` | Return to input bar in insert mode |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Trash
@@ -1073,7 +1124,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `D` | Purge session permanently |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 ### Overlays: Working inside a session
@@ -1127,7 +1178,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `G` | Edit labels |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Rate Session
@@ -1139,7 +1190,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Save rating |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### AI Command
@@ -1240,7 +1291,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Open file in viewer |
 | `Esc` | Close telescope |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Prompt Preview
@@ -1253,7 +1304,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Open selected session |
 | `p / Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 ### Overlays: Hierarchy, projects and cards
@@ -1324,7 +1375,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Ctrl-D` | Delete highlighted project |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Label Picker
@@ -1340,7 +1391,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Ctrl-D` | Delete highlighted label |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Parent Picker
@@ -1353,7 +1404,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Set parent |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Project Form
@@ -1391,7 +1442,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Esc` | Cancel fact edit (editing) |
 | `Esc / q` | Save and close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 ### Overlays: Orchestration and the manager
@@ -1498,7 +1549,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `r` | Refresh receipt |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Terminal
@@ -1532,7 +1583,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `c` | Camera follows selection |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Graph Review / Empty
@@ -1545,7 +1596,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `c` | Camera follows selection |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Graph Review / Node Detail
@@ -1567,7 +1618,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Esc` | Back out of detail |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Graph Review / Edit Field
@@ -1607,7 +1658,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `!` | Reveal control details |
 | `Esc / q` | Close inspector, then browser |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Diagnostics
@@ -1616,7 +1667,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | --- | --- |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Memory Search
@@ -1649,7 +1700,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Enter` | Apply theme |
 | `Esc / q` | Revert preview and close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Color Customizer
@@ -1663,7 +1714,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Delete` | Reset field to default |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Text Area Background
@@ -1675,7 +1726,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Delete` | Clear override |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 ### Overlays: Settings reference
@@ -1690,6 +1741,14 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `i / a / o` | Enter insert mode (normal mode) |
 | `Esc` | Return to normal mode (insert mode) |
 | `h j k l, w b` | Move cursor (normal mode) |
+
+#### Provider Key Form
+
+| Keys | Action |
+| --- | --- |
+| `Type / Backspace` | Edit masked credential |
+| `Enter` | Save credential |
+| `Esc` | Cancel and scrub |
 
 #### Message Bridge Form
 
@@ -1719,7 +1778,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `r` | Reload settings from disk |
 | `c / Esc` | Cancel save |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 #### Budget Policy Form
@@ -1741,7 +1800,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `g / Home, G / End` | Jump to top / bottom |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
 ### Screens without an overlay catalog

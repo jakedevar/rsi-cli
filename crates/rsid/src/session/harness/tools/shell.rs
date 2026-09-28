@@ -4,10 +4,10 @@
 //! - 1 MB output cap
 //! - Environment scrubbed: only safe vars carried through
 
-use super::HarnessTool;
+use super::{HarnessTool, truncation::truncate_text};
 use crate::process_control::{
     CaptureError, CaptureLimits, SESSION_TOOL_MAX_STREAM_BYTES, SESSION_TOOL_TIMEOUT,
-    bounded_lossy_concat, capture_bounded,
+    capture_bounded,
 };
 use crate::sandbox::execution_scratch::SandboxExecutionScratch;
 use crate::session::harness::types::ToolResult;
@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT_BYTES: usize = SESSION_TOOL_MAX_STREAM_BYTES;
-const OUTPUT_TRUNCATED_MARKER: &str = "\n\n[output truncated at 1 MB]";
 
 fn command_timeout(args: &serde_json::Value, default: Duration) -> Duration {
     args.get("timeout_secs")
@@ -26,8 +25,9 @@ fn command_timeout(args: &serde_json::Value, default: Duration) -> Duration {
         .unwrap_or(default.min(SESSION_TOOL_TIMEOUT))
 }
 
-/// Environment variables safe to pass to shell commands.
-const SAFE_ENV_VARS: &[&str] = &[
+/// Environment variables safe to pass to shell commands. Shared with the
+/// Local provider's bash tool (`openai.rs`).
+pub const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -40,6 +40,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "VISUAL",
     "TMPDIR",
     "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "SSH_AUTH_SOCK",
@@ -111,7 +112,31 @@ impl ShellTool {
             }
         }
 
-        let mut cmd = tokio::process::Command::new("bash");
+        let limits = match crate::process_scope::WorkerScopeLimits::from_launcher_snapshot() {
+            Ok(limits) => limits,
+            Err(error) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(error.to_string()),
+                };
+            }
+        };
+        let scoped = crate::process_scope::ScopedWorkerCommand::new(
+            std::ffi::OsStr::new("bash"),
+            self.invocation_id.unwrap_or_else(uuid::Uuid::new_v4),
+            limits,
+        );
+        let mut cmd = match scoped {
+            Ok(scoped) => scoped.into_command(),
+            Err(error) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(error.to_string()),
+                };
+            }
+        };
         cmd.args(["-c", command])
             .current_dir(working_dir)
             .env_clear();
@@ -141,25 +166,26 @@ impl ShellTool {
             }
             cmd.env(rsi_common::identity::ENV_CARGO_TARGET_DIR, scratch.target());
             cmd.env(rsi_common::identity::ENV_TMPDIR, scratch.temp());
+            scratch.stamp_build_env(&mut cmd);
         }
 
         let mut limits = CaptureLimits::session_tool();
         limits.execution_timeout = timeout;
         match capture_bounded(cmd, limits, cancel).await {
             Ok(output) => {
-                let mut parts: Vec<&[u8]> = vec![&output.stdout];
+                let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
                 if !output.stderr.is_empty() {
                     if !output.stdout.is_empty() {
-                        parts.push(b"\n--- stderr ---\n");
+                        combined.push_str("\n--- stderr ---\n");
                     }
-                    parts.push(&output.stderr);
+                    combined.push_str(&String::from_utf8_lossy(&output.stderr));
                 }
-                let combined = bounded_lossy_concat(
-                    &parts,
+                let combined = truncate_text(
+                    &combined,
                     MAX_OUTPUT_BYTES,
                     output.stdout_truncated || output.stderr_truncated,
-                    OUTPUT_TRUNCATED_MARKER,
-                );
+                )
+                .content;
                 ToolResult {
                     success: output.status.success(),
                     output: combined,
@@ -223,6 +249,7 @@ impl HarnessTool for ShellTool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_echo() {
         let tool = ShellTool::default();
@@ -236,6 +263,7 @@ mod tests {
         assert_eq!(result.output.trim(), "hello");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_exit_nonzero() {
         let tool = ShellTool::default();
@@ -247,6 +275,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("Exit code: 1"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_timeout() {
         let tool = ShellTool {
@@ -266,6 +295,7 @@ mod tests {
         assert!(msg.contains("timed out"), "unexpected msg: {msg}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_strips_markdown_fence() {
         let tool = ShellTool::default();
@@ -279,6 +309,7 @@ mod tests {
         assert_eq!(result.output.trim(), "stripped");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_env_scrubbing() {
         // RSI_TEST_SECRET should not be visible to the subprocess
@@ -298,6 +329,7 @@ mod tests {
         unsafe { std::env::remove_var("RSI_TEST_SECRET") };
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn bound_shell_preserves_its_exact_ownership_stamps() {
         let session_id = uuid::Uuid::new_v4();
@@ -329,6 +361,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn bound_shell_stamps_descriptor_target_and_tmpdir_after_env_clear() {
         let base = std::env::var_os("CARGO_TARGET_DIR")

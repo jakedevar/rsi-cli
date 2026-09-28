@@ -1645,6 +1645,7 @@ mod tests {
     /// idempotency key is a second baton, not a retry, and is refused; the
     /// exact key still replays its own receipt, and a `failed` reservation
     /// releases the predecessor so ordinary rotation stays available.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_reserve_admits_one_continuation_per_predecessor() {
         let world = world_at(None);
@@ -1747,6 +1748,7 @@ mod tests {
         assert_eq!(retry.reservation_id, retry_ids.reservation_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_reserve_replay_conflict_and_no_auth_writes() {
         let world = world_at(None);
@@ -1829,6 +1831,7 @@ mod tests {
         assert_eq!(count, 1, "authorization failure wrote a reservation");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_v92_ledger_rejects_noncanonical_values_and_invalid_state_shapes() {
         let world = world_at(None);
@@ -1959,6 +1962,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_v92_ledger_rejects_disconnected_aggregate_and_transition_rows() {
         let timestamp = "2099-08-23T12:34:56.123456789Z";
@@ -2143,6 +2147,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_claim_waits_for_settlement_and_is_exactly_once() {
         let world = world_at(None);
@@ -2204,6 +2209,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_reservation_preserves_rotation_override_before_provider_effect() {
         let world = world_at(None);
@@ -2258,6 +2264,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_pre_effect_boundary_requires_exact_reservation_and_invocation() {
         let world = world_at(None);
@@ -2393,6 +2400,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_pre_effect_custody_failure_rolls_back_candidate_aggregate() {
         let world = world_at(None);
@@ -2463,6 +2471,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_provider_and_commit_fences_refuse_missing_custody() {
         let world = world_at(None);
@@ -2528,6 +2537,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_settlement_and_reconcilable_reads_are_fenced() {
         let world = world_at(None);
@@ -2587,6 +2597,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_authority_commit_is_atomic_and_generation_fenced() {
         let mut world = world_at(None);
@@ -2634,6 +2645,7 @@ mod tests {
         assert_eq!(transitions, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_authority_commit_rejects_aba_and_settles_stale() {
         let mut world = world_at(None);
@@ -2699,6 +2711,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_authority_failpoints_roll_back_every_atomic_member() {
         for fault in [
@@ -2757,6 +2770,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_identical_concurrent_reserves_converge() {
         let directory = tempfile::tempdir().unwrap();
@@ -2809,6 +2823,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn successor_changed_fingerprint_concurrent_reserves_converge_to_one_conflicts() {
         let directory = tempfile::tempdir().unwrap();

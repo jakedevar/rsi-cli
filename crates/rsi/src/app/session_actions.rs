@@ -948,7 +948,7 @@ impl App {
         self.recalculate_filtered_order();
         self.reconcile_all_session_list_selections(false);
 
-        self.revert_detail_panes_for(session_id);
+        self.forget_removed_session(session_id);
         self.notify_success(format!("Deleted: {}", query_preview));
     }
 
@@ -1015,7 +1015,7 @@ impl App {
                         .map(|value| value.as_str())
                         .unwrap_or("preflight");
                     self.notify_error(format!(
-                        "Archive retained ({phase}/{}; retryable={}): {}",
+                        "Archive attempt retained ({phase}/{}; archive attempt retryable={}): {}",
                         cleanup.safe_code.as_str(),
                         cleanup.retryable,
                         cleanup.next_action
@@ -1036,7 +1036,7 @@ impl App {
         self.recalculate_filtered_order();
         self.reconcile_all_session_list_selections(false);
 
-        self.revert_detail_panes_for(session_id);
+        self.forget_removed_session(session_id);
         if let Some(receipt) = archive_result.receipt {
             let run = receipt.run_id.to_string();
             let oid = receipt.source_oid.as_str();
@@ -1318,11 +1318,64 @@ impl App {
     }
 
     /// Interrupt the session in the focused pane.
-    pub async fn interrupt_focused_session(&mut self) {
-        if let Some(session_id) = self.selected_session_id()
-            && let Err(e) = self.client.interrupt_session(session_id).await
+    pub async fn interrupt_focused_session(&mut self, hard: bool) {
+        if let Some(session_id) = self.selected_session_id() {
+            match self
+                .client
+                .interrupt_session_with_pause(session_id, hard)
+                .await
+            {
+                Ok(()) => {
+                    self.operator_pauses.insert(
+                        session_id,
+                        if hard {
+                            crate::client::OperatorPauseLevel::Hard
+                        } else {
+                            crate::client::OperatorPauseLevel::Soft
+                        },
+                    );
+                    self.needs_redraw = true;
+                }
+                Err(e) => self.notify_error(format!("Interrupt failed: {e}")),
+            }
+        }
+    }
+
+    /// Change the focused session's operator pause marker through the
+    /// operator-only RPC, then immediately update its visible row.
+    pub async fn set_focused_operator_pause(&mut self, level: crate::client::OperatorPauseLevel) {
+        let Some(session_id) = self.selected_session_id() else {
+            self.notify("No session selected");
+            return;
+        };
+        let current = match self.client.get_operator_pause(session_id).await {
+            Ok(current) => current,
+            Err(error) => {
+                self.notify_error(format!("Pause read failed: {error}"));
+                return;
+            }
+        };
+        if current == crate::client::OperatorPauseLevel::None {
+            self.notify("Selected session has no operator pause marker");
+            return;
+        }
+        if level == crate::client::OperatorPauseLevel::Soft
+            && current != crate::client::OperatorPauseLevel::Hard
         {
-            self.notify_error(format!("Interrupt failed: {}", e));
+            self.notify("Selected session is already SOFT paused");
+            return;
+        }
+        match self.client.set_operator_pause(session_id, level).await {
+            Ok(updated) => {
+                self.operator_pauses.insert(session_id, updated);
+                self.needs_redraw = true;
+                self.notify(match updated {
+                    crate::client::OperatorPauseLevel::None => "Operator pause cleared",
+                    crate::client::OperatorPauseLevel::Soft => "Operator pause downgraded to SOFT",
+                    crate::client::OperatorPauseLevel::Hard => "Operator pause is HARD",
+                });
+            }
+            Err(error) => self.notify_error(format!("Pause change failed: {error}")),
         }
     }
 }

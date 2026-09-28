@@ -385,6 +385,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_client_creation() {
         let client = DreamerLlmClient::new(
@@ -400,6 +401,7 @@ mod tests {
         assert_eq!(client.api_key.as_deref(), Some("test-key"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_complete_with_context_uses_backend() {
         let backend = TestDreamCompletionBackend::with_response(Ok("response".to_string()));

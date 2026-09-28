@@ -363,6 +363,7 @@ pub(crate) mod tests {
                         epic_id: self.epics[index],
                         message: format!("Readiness request {key}"),
                         idempotency_key: key.into(),
+                        informational: false,
                     },
                 )
                 .unwrap()
@@ -400,6 +401,7 @@ pub(crate) mod tests {
         (serde_json::to_value(job).unwrap(), generation, signature)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_watch_capture_is_bounded_and_uses_binding_instead_of_name() {
         let store = Store::open_in_memory().unwrap();
@@ -465,6 +467,7 @@ pub(crate) mod tests {
         assert!(!capture.is_manager_watch(ordinary.id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_watch_competing_settlement_and_operator_edit_invalidate_capture() {
         let store = Store::open_in_memory().unwrap();
@@ -523,6 +526,7 @@ pub(crate) mod tests {
         assert_eq!(notice_state(&store, primary.id), disabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn notice_free_legacy_manager_watch_stays_armed_for_provider_confirmation() {
         let store = Store::open_in_memory().unwrap();
@@ -558,6 +562,7 @@ pub(crate) mod tests {
         assert_eq!(store.manager_watch_delivery_state(legacy.id).unwrap(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn delivered_notice_stays_armed_until_exact_inbox_retrieval_settles_it() {
         let store = Store::open_in_memory().unwrap();
@@ -606,6 +611,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn delivery_marks_only_the_exact_rendered_notice_tranche() {
         let store = Store::open_in_memory().unwrap();

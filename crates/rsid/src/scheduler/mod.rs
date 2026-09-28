@@ -435,6 +435,56 @@ async fn fire_job_inner(
                     Err(e) if continuation_fence_retryable(&e) => {
                         settle_retryable_resume_refusal(store, bus, job, target, &e).await;
                     }
+                    Err(e)
+                        if matches!(
+                            e,
+                            DaemonError::CodexResumeTornTail
+                                | DaemonError::CodexResumeToolHistory(_)
+                        ) =>
+                    {
+                        // A provider thread with invalid persisted history will
+                        // refuse every scheduled resume. Retire this exact row
+                        // once, including recurring jobs, and expose recovery.
+                        let retired = {
+                            let guard = store.lock().await;
+                            match guard.get_scheduled_job(&job.id) {
+                                Ok(Some(current)) if current.enabled => guard
+                                    .settle_watch_fire_with_retry(
+                                        &WatchFireCapture::default(),
+                                        job.id,
+                                        Some(&Utc::now()),
+                                        None,
+                                        false,
+                                        true,
+                                    ),
+                                Ok(_) => Ok(false),
+                                Err(error) => Err(error),
+                            }
+                        };
+                        match retired {
+                            Ok(true) => {
+                                let class = crate::model_control::classify_error_class(&e);
+                                let notice_result = {
+                                    let guard = store.lock().await;
+                                    guard.record_manager_transcript_refusal_notice(target, &class)
+                                };
+                                if let Err(error) = notice_result {
+                                    tracing::error!(job_id=%job.id, %error, "failed to record manager transcript recovery notice");
+                                }
+                                bus.publish(DaemonEvent::SystemMessage {
+                                    level: "error".into(),
+                                    message: format!(
+                                        "Scheduled resume job '{}' stopped: Codex transcript cannot be resumed ({e}). Recover from a fresh conversation boundary within the active retry policy.",
+                                        job.name,
+                                    ),
+                                });
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::error!(job_id=%job.id, %error, "failed to retire invalid transcript resume");
+                            }
+                        }
+                    }
                     Err(e) => {
                         if crate::error::is_retryable_custody_wake_error(&e) {
                             defer_retryable_custody_wake(store, job, &WatchFireCapture::default())
@@ -1359,6 +1409,7 @@ mod tests {
         job
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn root_busy_resume_keeps_oneshot_armed_and_respects_disarm() {
         let directory = tempfile::tempdir().unwrap();
@@ -1453,6 +1504,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn due_jobs_refresh_heartbeat_between_slow_dispatches() {
         let (store, bus) = fixture();
@@ -1490,6 +1542,36 @@ mod tests {
             .expect("job row present")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn invalid_codex_rollout_retires_recurring_resume_with_one_notice() {
+        let (store, bus) = fixture();
+        let target = Uuid::new_v4();
+        let mut job = mk_watch_job(Uuid::new_v4(), target, true);
+        job.wake_mode = WakeMode::Resume;
+        job.message = "resume".into();
+        job.schedule.recurrence = Recurrence::EverySeconds(60);
+        store.lock().await.insert_scheduled_job(&job).unwrap();
+        let launcher = MockLauncher::new(vec![]);
+        launcher
+            .resume_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(DaemonError::CodexResumeTornTail));
+        let dyn_launcher: Arc<dyn SessionLauncher> = launcher.clone();
+        let mut events = bus.subscribe();
+
+        fire_job(&store, &bus, &dyn_launcher, &job).await;
+        let retired = job_row(&store, &job.id).await;
+        assert!(!retired.enabled);
+        assert!(retired.last_fired_at.is_some());
+        let notices = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event.as_ref(), DaemonEvent::SystemMessage { message, .. } if message.contains("fresh conversation boundary")))
+            .count();
+        assert_eq!(notices, 1);
+        assert_eq!(launcher.resume_calls.lock().unwrap().as_slice(), &[target]);
+    }
+
     fn retryable_custody_error(code: rsi_common::types::SandboxCustodyErrorCodeV1) -> DaemonError {
         crate::error::sandbox_custody_error(rsi_common::types::SandboxCustodyErrorV1 {
             version: 1,
@@ -1501,6 +1583,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn transient_custody_gates_preserve_one_shot_resume_and_terminal_watch() {
         for code in [
@@ -1609,6 +1692,7 @@ mod tests {
         (observed, outcome_tx, task)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn manager_watch_stale_confirmation_preserves_new_request_after_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -1681,6 +1765,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn stale_child_confirmation_preserves_continued_watch() {
         let (store, bus) = fixture();
@@ -1711,6 +1796,7 @@ mod tests {
         assert_eq!(row.last_fired_at, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn stale_child_delivery_preserves_new_completion_and_its_next_delivery() {
         let (store, bus) = fixture();
@@ -1764,6 +1850,7 @@ mod tests {
         assert!(job_row(&store, &sibling.id).await.last_fired_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn busy_competing_attempt_does_not_erase_accepted_delivery_witness() {
         let (store, bus) = fixture();
@@ -1798,6 +1885,7 @@ mod tests {
         assert!(row.next_fire_at > competing.next_fire_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn stale_child_abandonment_preserves_continued_watch() {
         let (store, bus) = fixture();
@@ -1826,6 +1914,7 @@ mod tests {
         assert_eq!(row.last_fired_at, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn manager_watch_stale_dispatch_abandon_retry_and_error_preserve_new_request() {
         let (store, bus) = fixture();
@@ -1866,6 +1955,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn manager_watch_retry_and_error_preserve_the_actual_delivery_witness() {
         let (store, bus) = fixture();
@@ -1895,6 +1985,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn manager_watch_coalescing_stamps_only_observed_unchanged_notices_after_reopen() {
         use rsi_common::harness_manager::AgentManagerReplyRequestV1;
@@ -1928,6 +2019,7 @@ mod tests {
                             request_id: requests[index].message_id,
                             message: format!("New reply for feature {index}"),
                             idempotency_key: format!("reply-{index}"),
+                            still_running: false,
                         },
                     )
                     .unwrap();
@@ -2049,6 +2141,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_startup_catchup_never_dispatches_before_due_and_settles_after_due() {
         let (store, bus, job, controller) = capacity_fixture(false);
@@ -2072,6 +2165,7 @@ mod tests {
         assert_ne!(controller, Uuid::nil());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_failure_before_admission_keeps_one_wake_enabled() {
         let (store, bus, job, _) = capacity_fixture(true);
@@ -2091,6 +2185,7 @@ mod tests {
         assert!(launcher.scheduled_fresh_calls.lock().unwrap().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_duplicate_admission_disables_exact_due_slot_without_second_provider() {
         let (store, bus, job, controller) = capacity_fixture(true);
@@ -2108,6 +2203,7 @@ mod tests {
         assert!(launcher.scheduled_fresh_calls.lock().unwrap().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_malformed_recognized_rows_never_fall_through_to_fresh_or_agent_fresh() {
         for mutation in 0..10 {
@@ -2236,6 +2332,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_stale_snapshot_cannot_disable_a_rearmed_due_slot() {
         let (store, bus, mut snapshot, _) = capacity_fixture(true);
@@ -2248,6 +2345,7 @@ mod tests {
         assert!(launcher.scheduled_fresh_calls.lock().unwrap().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn capacity_closed_incident_is_disabled_without_any_launch() {
         let (store, bus, snapshot, controller) = capacity_fixture(true);
@@ -2276,6 +2374,7 @@ mod tests {
         assert!(!job_row(&store, &snapshot.id).await.enabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn scheduled_fresh_inherits_disabled_origin() {
         let (store, bus) = fixture();
@@ -2316,6 +2415,7 @@ mod tests {
     /// is still LIVE must NOT spawn. The job's working_dir is that live
     /// session's sandbox worktree, so a launch here means two uncoordinated
     /// agent processes in one tree. Covers every live status.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn agent_fresh_declines_to_spawn_a_twin_into_a_live_target() {
         for status in [
@@ -2384,6 +2484,7 @@ mod tests {
     /// against a target that has since gone terminal is the intended feature
     /// ("wake a fresh agent after I've finished") and must still launch, with
     /// its dedicated admission purpose intact. Covers every terminal status.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn agent_fresh_still_launches_when_target_is_terminal() {
         for status in [
@@ -2422,6 +2523,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn scheduled_fresh_preserves_enabled_default_and_rejects_missing_origin() {
         let (store, bus) = fixture();
@@ -2480,6 +2582,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn one_shot_agent_fresh_selects_dedicated_purpose_while_generic_and_legacy_stay_scheduled()
      {
@@ -2528,6 +2631,7 @@ mod tests {
     /// T-2: a due `OnTerminal` row fires via the plain due-poll with NO bus
     /// event anywhere in the loop — the DB-state shape of the two
     /// `SessionStatusChanged`-bypassing terminal flips (F-003/F-004).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bypass_flip_fires_via_tick_without_bus_event() {
         let (store, bus) = fixture();
@@ -2560,6 +2664,7 @@ mod tests {
     /// T-3: a rejected delivery (busy master) keeps the recurring row armed
     /// with `next_fire_at` advanced; a later dispatch stamps it and keeps it
     /// armed pending confirmation (D3 requeue-until-idle).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn busy_master_rejection_keeps_watch_armed() {
         let (store, bus) = fixture();
@@ -2614,6 +2719,7 @@ mod tests {
     }
 
     /// Issue #12: only a proven-consumed delivery retires the watch row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn confirmed_delivery_retires_the_watch_row() {
         let (store, bus) = fixture();
@@ -2647,6 +2753,7 @@ mod tests {
     /// and returns `Confirmed`. Eager disable was what destroyed the
     /// notification when the dispatched turn produced nothing, so the dedup had
     /// to move somewhere that can tell those two cases apart.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn two_terminal_children_one_master_single_delivery_stamps_both() {
         let (store, bus) = fixture();
@@ -2706,6 +2813,7 @@ mod tests {
     /// `enabled` with the row's CURRENT DB value — a row disabled in the DB
     /// between snapshot and advance stays disabled, never re-enabled from
     /// the stale struct.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn advance_after_attempt_never_reenables_db_disabled_row() {
         let (store, _bus) = fixture();
@@ -2733,6 +2841,7 @@ mod tests {
 
     /// T-7: an armed watch row fires via a freshly spawned scheduler's
     /// startup catch-up (restart survival — F-008/F-013).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn armed_watch_fires_after_scheduler_restart() {
         let (store, bus) = fixture();
@@ -2778,6 +2887,7 @@ mod tests {
     /// across `Abandon`, launcher error, and `NotReady` the mock's `launch` is
     /// never called; Abandon disables, error keeps the row armed (advanced).
     /// A disabled row (post-coalesced-delivery trigger race) no-ops entirely.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn on_terminal_job_never_falls_through_to_fresh_launch() {
         let (store, bus) = fixture();
@@ -2822,6 +2932,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn closed_guard_malformed_program_guard_never_executes_by_id_or_due_path() {
         use crate::session::harness::tools::schedule_wake::{

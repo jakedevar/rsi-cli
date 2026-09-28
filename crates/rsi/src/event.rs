@@ -152,6 +152,13 @@ fn global_guard_holds(app: &crate::app::App, guard: crate::key_tables::GlobalGua
             unobstructed() && app.focused_pane_is_session_list()
         }
         GlobalGuard::UnobstructedOtherPane => unobstructed() && !app.focused_pane_is_session_list(),
+        GlobalGuard::UnobstructedSessionDetail => {
+            unobstructed()
+                && matches!(
+                    app.focused_pane(),
+                    Some(crate::types::Pane::SessionDetail { .. })
+                )
+        }
         GlobalGuard::UnobstructedOtherPaneNoStaleIssueEditor => {
             unobstructed()
                 && !app.focused_pane_is_session_list()
@@ -218,6 +225,11 @@ async fn run_global_effect(app: &mut crate::app::App, effect: crate::key_tables:
         }
         GlobalEffect::ShrinkSidebar => {
             crate::action_handler::dispatch_lc_action(app, LcAction::ShrinkSidebar).await;
+        }
+        GlobalEffect::NudgeDetailColumn(direction) => {
+            app.settings.nudge_detail_column(direction);
+            // The column moves without changing width; clear stale cells.
+            app.pane_switch_clear = true;
         }
         GlobalEffect::NextEvent => {
             crate::action_handler::dispatch_lc_action(app, LcAction::NextEvent).await;
@@ -1262,6 +1274,7 @@ pub async fn run_event_loop(
             }
         }
 
+        app.poll_worker_pressure_refresh().await;
         app.poll_manager_roster_refresh().await;
 
         if let Some(mode) = app.pending_manual.take() {
@@ -2494,15 +2507,8 @@ mod tests {
             .await
             .expect("connect test daemon client");
         app.poll.connected = true;
-        let continue_key = KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE);
-        let context = ActionContext::from_app(&app);
-        assert!(
-            matches!(
-                crate::action_registry::request_for_key(&context, continue_key),
-                ActionAvailability::Available(request) if request.id == ActionId::ContinueSession
-            ),
-            "continue context: {context:?}"
-        );
+        let continue_leader = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        let continue_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
 
         let rpc = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept quick continue");
@@ -2532,6 +2538,7 @@ mod tests {
             request
         });
 
+        step_once(&mut app, continue_leader).await;
         step_once(&mut app, continue_key).await;
         let request = rpc.await.expect("quick continue daemon task");
         std::fs::remove_file(&socket_path).expect("remove test daemon socket");
@@ -2795,6 +2802,59 @@ mod tests {
         assert_eq!(session_card_index_at(&zone, 1), Some(0));
         assert_eq!(session_card_index_at(&zone, 2), None);
         assert_eq!(session_card_index_at(&zone, 3), Some(1));
+    }
+
+    #[tokio::test]
+    async fn ctrl_arrows_in_session_detail_move_the_transcript_column() {
+        use crate::settings::DetailColumnAlignment;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, session_id) = crate::app::app_test_helpers::with_session_detail();
+        let focused = app.active_tab().focused_pane;
+        *app.active_tab_mut()
+            .layout
+            .find_pane_mut(focused)
+            .expect("focused pane") = crate::types::Pane::SessionDetail { session_id };
+        app.settings.detail_column_alignment = DetailColumnAlignment::Center;
+        let ctrl_left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+        let ctrl_right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
+
+        for _ in 0..5 {
+            step_once(&mut app, ctrl_left).await;
+        }
+        assert_eq!(
+            app.settings.detail_column_alignment,
+            DetailColumnAlignment::Left,
+            "reaching the left edge snaps to Left Aligned"
+        );
+
+        step_once(&mut app, ctrl_right).await;
+        assert_eq!(
+            app.settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(
+            app.settings.detail_column_position_pct,
+            crate::settings::DETAIL_COLUMN_NUDGE_STEP_PCT,
+            "Ctrl+Right out of Left Aligned nudges toward center"
+        );
+
+        // Inserting in the input bar keeps Ctrl+Left for the editor.
+        app.sessions
+            .get_mut(&session_id)
+            .expect("fixture session")
+            .input_bar
+            .surface
+            .mode = crate::types::PopupMode::Insert;
+        step_once(&mut app, ctrl_left).await;
+        assert_eq!(
+            app.settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(
+            app.settings.detail_column_position_pct,
+            crate::settings::DETAIL_COLUMN_NUDGE_STEP_PCT
+        );
     }
 
     /// Regression pin for the Ctrl+Left / Ctrl+Right zone-cycle removal.
@@ -3170,7 +3230,11 @@ mod tests {
                     let mut app = with_session_list(3);
                     config_ready(&mut app);
                     step_once(&mut app, press(KeyCode::Char(' '))).await;
-                    step_once(&mut app, press(KeyCode::Char('m'))).await;
+                    step_once(&mut app, press(KeyCode::Char('N'))).await;
+                    assert!(matches!(
+                        app.focused_input_overlay(),
+                        Some(OverlayState::Prompt { .. })
+                    ));
                     if name == "prompt_config_pending" {
                         app.poll.authoritative_config_ready = false;
                     }
@@ -3359,6 +3423,14 @@ mod tests {
                     app.modal_geometries.clear();
                     let before = observe(&app);
                     step_once(&mut app, chord(chord_name)).await;
+                    if matches!(*fixture_name, "prompt_overlay" | "prompt_config_pending")
+                        && chord_name == "Ctrl-H"
+                    {
+                        assert!(matches!(
+                            app.focused_input_overlay(),
+                            Some(OverlayState::Prompt { .. })
+                        ));
+                    }
                     let after = observe(&app);
                     rows.push((
                         fixture_name.to_string(),

@@ -353,6 +353,7 @@ async fn inspect_with_queued_scope_edit(
     result
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_overview_returns_one_authorized_snapshot_before_queued_scope_edit() {
     for operator in [false, true] {
@@ -372,6 +373,7 @@ async fn manager_overview_returns_one_authorized_snapshot_before_queued_scope_ed
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_decisions_return_one_authorized_snapshot_before_queued_scope_edit() {
     for operator in [false, true] {
@@ -382,6 +384,7 @@ async fn manager_decisions_return_one_authorized_snapshot_before_queued_scope_ed
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_work_rechecks_scope_after_external_observation_boundary() {
     for operator in [false, true] {
@@ -433,6 +436,7 @@ async fn rotate_mail_lead(f: &Fixture) -> Uuid {
     successor.id
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn rotated_request_consumers_track_current_reader_and_durable_execution_evidence() {
     use rsi_common::harness_manager::*;
@@ -470,6 +474,7 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
                         epic_id: f.epic,
                         message: format!("Track {key} through rotation"),
                         idempotency_key: key.into(),
+                        informational: false,
                     },
                 )
                 .await
@@ -500,6 +505,7 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
             &format!("request-{id}-{version}"),
         )
     };
+    let mut reply_receipt_message_id = None;
     for (version, state) in [
         (0, ManagerRequestStateV2::Accepted),
         (1, ManagerRequestStateV2::Running),
@@ -599,17 +605,25 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
                         .to_string()
                         .contains("execution_evidence_required")
                 );
-                f.handle
+                let reply_receipt = f
+                    .handle
                     .agent_manager_reply(
                         caller,
                         AgentManagerReplyRequestV1 {
                             request_id: id,
                             message: "Report delivered; product still unaccepted".into(),
                             idempotency_key: "report-reply".into(),
+                            still_running: false,
                         },
                     )
                     .await
                     .unwrap();
+                reply_receipt_message_id = Some(reply_receipt.message_id);
+                assert!(matches!(
+                    f.handle.agent_manager_update(caller, update).await,
+                    Err(error) if error.to_string().contains("manager_v2_request_transition")
+                ));
+                continue;
             }
             let receipt = f
                 .handle
@@ -660,6 +674,11 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
                 row["execution"]["execution_evidence"]["source_commit"],
                 f.source_head
             );
+        } else {
+            assert_eq!(
+                row["reply_message_id"],
+                reply_receipt_message_id.unwrap().to_string()
+            );
         }
     }
     let work = f
@@ -678,6 +697,7 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
     assert_eq!(work.rows[0]["integrated"], false);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn inherited_request_denies_reassignment_retired_ambiguous_and_revoked_receipts() {
     use rsi_common::harness_manager::*;
@@ -691,6 +711,7 @@ async fn inherited_request_denies_reassignment_retired_ambiguous_and_revoked_rec
                     epic_id: f.epic,
                     message: "Unfinished inherited request".into(),
                     idempotency_key: "request".into(),
+                    informational: false,
                 },
             )
             .await
@@ -922,6 +943,7 @@ async fn request_db_review(f: &Fixture, idempotency_key: &str) -> Uuid {
     Uuid::parse_str(&receipt.key).unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn request_review_uses_live_head_after_sandbox_advances_past_allocation() {
     let f = fixture().await;
@@ -1030,6 +1052,7 @@ async fn activate_db_review_assignment(f: &Fixture, assignment_id: Uuid) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_native_review_accepts_only_the_bound_exact_source_receipt() {
     let f = fixture().await;
@@ -1134,6 +1157,83 @@ async fn db_native_review_accepts_only_the_bound_exact_source_receipt() {
                 .manager_v2_accepted_source(&config, &work, &f.source_head)
                 .unwrap()
                 .is_some()
+        );
+        // The manager-created author's read uses the same accepted receipt
+        // as Inspect, even though no legacy Work acceptance was written.
+        let operation = store
+            .manager_v2_save_receipt(
+                &config,
+                Some(f.manager),
+                1,
+                "action",
+                "create-source-work-view",
+                &json!({"created":f.source}),
+                &json!({"id":f.source}),
+            )
+            .unwrap();
+        let policy = store
+            .get_harness_manager_policy(config.project_id)
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_entities(session_id,operation_id,project_id,manager_session_id,scope_version,policy_version,kind,created_at) VALUES(?1,?2,?3,?4,?5,?6,'session',?7)",
+                params![
+                    f.source.to_string(),
+                    operation.to_string(),
+                    config.project_id.to_string(),
+                    f.manager.to_string(),
+                    config.row_version,
+                    policy.row_version,
+                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        let inspected = store
+            .manager_v2_inspect(
+                f.manager,
+                &AgentManagerInspectRequestV2 {
+                    section: ManagerInspectSectionV2::Work,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let inspected = inspected
+            .rows
+            .iter()
+            .find(|row| row["key"] == "product")
+            .unwrap();
+        let viewed = store
+            .manager_work_view(
+                f.source,
+                &rsi_common::harness_manager::AgentManagerWorkViewRequestV1::default(),
+            )
+            .unwrap();
+        let viewed = viewed
+            .works
+            .iter()
+            .find(|row| row.work_key == "product")
+            .unwrap();
+        assert!(viewed.accepted);
+        assert_eq!(json!(viewed.source_accepted), inspected["source_accepted"]);
+        assert_eq!(
+            json!(viewed.source_acceptance_recorded),
+            inspected["source_acceptance_recorded"]
+        );
+        assert_eq!(json!(viewed.evidence_state), inspected["evidence_state"]);
+        let current = viewed.current_review.as_ref().unwrap();
+        assert_eq!(
+            json!(current.state),
+            inspected["review"]["current"]["state"]
+        );
+        assert_eq!(
+            json!(current.verdict),
+            inspected["review"]["current"]["verdict"]
+        );
+        assert_eq!(
+            json!(current.blocking_finding_count),
+            inspected["review"]["current"]["blocking_finding_count"]
         );
         assert!(
             store
@@ -1260,6 +1360,7 @@ async fn db_native_review_accepts_only_the_bound_exact_source_receipt() {
     assert!(rows[0]["integration_evidence_policy_digest"].is_null());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_reviewed_fast_forwarded_source_integrates_after_same_file_evolution() {
     let f = fixture_with_merged_source(true).await;
@@ -1337,6 +1438,7 @@ async fn db_reviewed_fast_forwarded_source_integrates_after_same_file_evolution(
     assert_eq!(work.rows[0]["integrated"], true);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_reviewed_landing_records_its_exact_target_after_later_remote_landings() {
     for later_landings in 1..=2 {
@@ -1427,6 +1529,7 @@ async fn db_reviewed_landing_records_its_exact_target_after_later_remote_landing
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn archived_db_reviewed_source_integrates_from_exact_remote_repository() {
     let f = fixture().await;
@@ -1649,6 +1752,7 @@ async fn archived_db_reviewed_source_integrates_from_exact_remote_repository() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn completed_db_review_receipt_survives_manager_seat_rotation() {
     let f = fixture().await;
@@ -1728,6 +1832,7 @@ async fn completed_db_review_receipt_survives_manager_seat_rotation() {
     assert_eq!(acceptance.source_commit, f.source_head);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_seat_rotation_preserves_the_durable_review_assignment_budget() {
     let f = fixture().await;
@@ -1856,6 +1961,7 @@ async fn manager_seat_rotation_preserves_the_durable_review_assignment_budget() 
 
 /// #599 test 6: an infra retry re-reviews the sealed commit object after
 /// dirty-tree edits, notes commits, and later code commits.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn infra_retry_tolerates_dirty_tree_and_post_seal_code_commit() {
     let f = fixture().await;
@@ -1958,6 +2064,7 @@ async fn infra_retry_tolerates_dirty_tree_and_post_seal_code_commit() {
     assert!(Uuid::parse_str(&retry).is_ok());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn infra_retry_reserves_when_untracked_status_exceeds_bounded_output() {
     let f = fixture().await;
@@ -2022,6 +2129,7 @@ async fn infra_retry_reserves_when_untracked_status_exceeds_bounded_output() {
     assert_eq!(next_sha, f.source_head);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn rotated_manager_supersedes_active_review_and_old_reviewer_loses_authority() {
     let f = fixture().await;
@@ -2104,6 +2212,7 @@ async fn rotated_manager_supersedes_active_review_and_old_reviewer_loses_authori
     assert!(error.to_string().contains("manager_review_scope_changed"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_review_restart_failpoints_preserve_one_assignment_receipt_and_effect() {
     use crate::store::manager_reviews::{ManagerReviewFault, manager_review_fail_next};
@@ -2305,6 +2414,7 @@ async fn db_review_restart_failpoints_preserve_one_assignment_receipt_and_effect
     assert_eq!((assignments, receipts, effects), (1, 1, 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_review_enrollment_blocks_legacy_override_and_retains_superseded_history() {
     let f = fixture().await;
@@ -2430,6 +2540,7 @@ async fn db_review_enrollment_blocks_legacy_override_and_retains_superseded_hist
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[test]
 fn review_manifest_path_accepts_canonical_closure_paths_and_preserves_legacy_paths() {
     assert_eq!(
@@ -2512,6 +2623,7 @@ async fn evidence(f: &Fixture, head: &str, integration: bool) -> ManagerEvidence
         closure_evidence_id: None,
     }
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn ordinary_work_accepts_only_correlated_independent_committed_evidence() {
     let f = fixture().await;
@@ -2593,6 +2705,7 @@ async fn ordinary_work_accepts_only_correlated_independent_committed_evidence() 
         .unwrap_err();
     assert!(error.to_string().contains("ancestry_mismatch"));
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn read_only_git_rejects_changed_branch_dirty_source_and_wrong_inventory() {
     let f = fixture().await;
@@ -2606,6 +2719,7 @@ async fn read_only_git_rejects_changed_branch_dirty_source_and_wrong_inventory()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn independent_acceptance_and_combined_evidence_record_real_integration() {
     let f = fixture().await;
@@ -2685,17 +2799,39 @@ async fn independent_acceptance_and_combined_evidence_record_real_integration() 
         },
         "integrate",
     );
+    let mut notice_events = f.handle.event_bus.subscribe();
     let first = f
         .handle
-        .agent_manager_update(f.manager, request.clone())
+        .agent_manager_update(f.source, request.clone())
         .await
         .unwrap();
     let replay = f
         .handle
-        .agent_manager_update(f.manager, request.clone())
+        .agent_manager_update(f.source, request.clone())
         .await
         .unwrap();
     assert_eq!(first.event_sequence, replay.event_sequence);
+    let event_job = match notice_events.try_recv().unwrap().as_ref() {
+        crate::bus::DaemonEvent::ManagerNoticeQueued { job_id } => *job_id,
+        event => panic!("expected manager notice, got {event:?}"),
+    };
+    assert!(
+        notice_events.try_recv().is_err(),
+        "replay queued another wake"
+    );
+    let notice_job = f
+        .handle
+        .store
+        .lock()
+        .await
+        .get_scheduled_job(&event_job)
+        .unwrap()
+        .unwrap();
+    assert!(
+        notice_job
+            .message
+            .contains("ledger_change subject=work:product version=6")
+    );
     let query = AgentManagerInspectRequestV2 {
         section: ManagerInspectSectionV2::Work,
         ..Default::default()
@@ -2782,10 +2918,18 @@ async fn independent_acceptance_and_combined_evidence_record_real_integration() 
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released_code() {
     let f = fixture().await;
     let root = f.dir.path().join("repo");
+    let remote = f.dir.path().join("origin.git");
+    std::fs::create_dir(&remote).unwrap();
+    command(&remote, &["init", "--bare"]);
+    command(
+        &root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let inventory_bytes = std::fs::read(repo.join("tools/released-migrations.json")).unwrap();
     let inventory: Value = serde_json::from_slice(&inventory_bytes).unwrap();
@@ -2807,10 +2951,27 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     }
     command(&root, &["commit", "-m", "canonical migration catalog"]);
     let baseline = command(&root, &["rev-parse", "HEAD"]);
+    command(&root, &["push", "origin", "rolling:refs/heads/rolling"]);
+    std::fs::write(root.join("local-only.txt"), "local rolling advanced\n").unwrap();
+    command(&root, &["add", "local-only.txt"]);
+    command(&root, &["commit", "-m", "local rolling advanced"]);
+    let local_head = command(&root, &["rev-parse", "HEAD"]);
     let digest = format!("sha256:{:x}", Sha256::digest(&inventory_bytes));
     git::migration(&f.source_root, &baseline, &digest)
         .await
         .unwrap();
+    assert_eq!(git::remote_head(&f.source_root).await.unwrap(), baseline);
+    assert_eq!(
+        command(&root, &["rev-parse", "refs/heads/rolling"]),
+        local_head
+    );
+    assert!(
+        git::migration(&f.source_root, &local_head, &digest)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("manager_v2_stale_migration_baseline")
+    );
     let path = "crates/rsid/src/store/mod.rs";
     let old = std::fs::read_to_string(root.join(path)).unwrap();
     std::fs::write(
@@ -2820,6 +2981,7 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     .unwrap();
     command(&root, &["commit", "-am", "invalid released edit"]);
     let changed = command(&root, &["rev-parse", "HEAD"]);
+    command(&root, &["push", "origin", "rolling:refs/heads/rolling"]);
     assert!(
         git::migration(&f.source_root, &changed, &digest)
             .await
@@ -2833,6 +2995,7 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     std::fs::write(root.join("tools/released-migrations.json"), &incomplete).unwrap();
     command(&root, &["commit", "-am", "invalid missing pin"]);
     let changed = command(&root, &["rev-parse", "HEAD"]);
+    command(&root, &["push", "origin", "rolling:refs/heads/rolling"]);
     let digest = format!("sha256:{:x}", Sha256::digest(&incomplete));
     assert!(
         git::migration(&f.source_root, &changed, &digest)
@@ -2843,6 +3006,7 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn a_source_moved_out_of_scope_has_unknown_freshness_without_foreign_observation() {
     let f = fixture().await;
@@ -2900,6 +3064,7 @@ async fn a_source_moved_out_of_scope_has_unknown_freshness_without_foreign_obser
     assert_eq!(result.rows[0]["source_commit"], f.source_head);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn evidence_reads_ignore_local_commit_replacement_refs() {
     let f = fixture().await;
@@ -2915,6 +3080,7 @@ async fn evidence_reads_ignore_local_commit_replacement_refs() {
     assert_eq!(String::from_utf8(observed).unwrap().trim(), original);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 #[allow(
     clippy::unwrap_used,
@@ -3047,6 +3213,7 @@ async fn accepted_work_survives_seat_move_and_successor_integrates_it() {
 /// P-005: a DB-native review receipt accepted under seat A still admits the
 /// exact source after a seat move, and seat B integrates it. Allocating a NEW
 /// assignment stays seat-fenced; completed review facts are work-keyed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 #[allow(
     clippy::unwrap_used,
@@ -3306,6 +3473,7 @@ fn seed_creations(store: &Store, f: &Fixture, count: usize, review_linked: bool)
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn db_review_allocation_does_not_consume_the_lifetime_creation_budget() {
     let f = fixture().await;
@@ -3339,6 +3507,7 @@ fn review_link_count(store: &Store, operation: Uuid) -> i64 {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn forged_review_allocation_key_stays_charged_and_genuine_retry_links_once_uncharged() {
     use crate::store::manager_reviews::{ManagerReviewFault, manager_review_fail_next};
@@ -3456,6 +3625,7 @@ async fn forged_review_allocation_key_stays_charged_and_genuine_retry_links_once
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn review_submission_records_manager_notice_and_wakes_idle_manager() {
     let f = fixture().await;
@@ -3535,6 +3705,7 @@ async fn review_submission_records_manager_notice_and_wakes_idle_manager() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn review_receipt_missing_records_manager_notice_and_wakes_idle_manager() {
     let f = fixture().await;
@@ -3590,6 +3761,7 @@ async fn review_receipt_missing_records_manager_notice_and_wakes_idle_manager() 
     assert!(message.contains(&format!("subject=review:{assignment_id} version=failed")));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn review_failure_without_resolvable_lead_still_settles_the_assignment() {
     let f = fixture().await;

@@ -1117,6 +1117,21 @@ async fn test_ctrl_e_uses_prompt_override_when_default_model_lacks_effort() {
 }
 
 #[tokio::test]
+async fn bedrock_prompt_cycles_profile_effort() {
+    let mut app = test_app();
+    app.selected_provider = rsi_common::types::SessionProvider::Bedrock;
+    app.selected_model = Some("global.openai.gpt-5.6-sol".to_string());
+    app.selected_effort = None;
+    prompt::open_blank_popup(&mut app);
+
+    handle_overlay_key(&mut app, key(KeyCode::Esc)).await;
+    handle_overlay_key(&mut app, ctrl_key(KeyCode::Char('e'))).await;
+    assert_eq!(app.selected_effort.as_deref(), Some("low"));
+    handle_overlay_key(&mut app, ctrl_key(KeyCode::Char('e'))).await;
+    assert_eq!(app.selected_effort.as_deref(), Some("medium"));
+}
+
+#[tokio::test]
 async fn test_normal_mode_esc_does_not_close() {
     let mut app = test_app();
     prompt::open_blank_popup(&mut app);

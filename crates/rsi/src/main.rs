@@ -5,7 +5,41 @@ use std::process::Command;
 
 const ENV_TUI_NO_AUTO_START_DAEMON: &str = "RSI_TUI_NO_AUTO_START_DAEMON";
 const RSID_SCOPE_SETTINGS_FILE: &str = "rsid-scope.env";
-const RSID_SCOPE_UNIT: &str = "rsid.scope";
+const RSID_SCOPE_PREFIX: &str = "rsid-tui";
+#[cfg(target_os = "linux")]
+const WORKER_SLICE: &str = "rsi-workers.slice";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerScopeSettings {
+    memory_high_mib: u64,
+    memory_max_mib: u64,
+    memory_swap_max_mib: u64,
+    cpu_weight: u32,
+}
+
+impl WorkerScopeSettings {
+    fn defaults() -> Self {
+        let (memory_high_mib, memory_max_mib) = rsi_common::worker_memory::default_limits_mib();
+        Self {
+            memory_high_mib,
+            memory_max_mib,
+            memory_swap_max_mib: 0,
+            cpu_weight: 20,
+        }
+    }
+
+    fn validate(self) -> color_eyre::Result<()> {
+        if !(256..=1_048_576).contains(&self.memory_high_mib)
+            || !(256..=1_048_576).contains(&self.memory_max_mib)
+            || self.memory_high_mib >= self.memory_max_mib
+            || self.memory_swap_max_mib > 1_048_576
+            || !(1..=10_000).contains(&self.cpu_weight)
+        {
+            return Err(color_eyre::eyre::eyre!("invalid worker slice limits"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RsidScopeSettings {
@@ -13,6 +47,7 @@ struct RsidScopeSettings {
     memory_max_mib: u64,
     memory_swap_max_mib: u64,
     cpu_weight: u32,
+    worker: WorkerScopeSettings,
 }
 
 impl RsidScopeSettings {
@@ -22,13 +57,21 @@ impl RsidScopeSettings {
             memory_max_mib: 8 * 1024,
             memory_swap_max_mib: 0,
             cpu_weight: 20,
+            worker: WorkerScopeSettings::defaults(),
         }
     }
 
     fn to_env(self) -> String {
         format!(
-            "rsid_scope_memory_high_mib={}\nrsid_scope_memory_max_mib={}\nrsid_scope_memory_swap_max_mib={}\nrsid_scope_cpu_weight={}\n",
-            self.memory_high_mib, self.memory_max_mib, self.memory_swap_max_mib, self.cpu_weight
+            "rsid_scope_memory_high_mib={}\nrsid_scope_memory_max_mib={}\nrsid_scope_memory_swap_max_mib={}\nrsid_scope_cpu_weight={}\nworker_scope_memory_high_mib={}\nworker_scope_memory_max_mib={}\nworker_scope_memory_swap_max_mib={}\nworker_scope_cpu_weight={}\n",
+            self.memory_high_mib,
+            self.memory_max_mib,
+            self.memory_swap_max_mib,
+            self.cpu_weight,
+            self.worker.memory_high_mib,
+            self.worker.memory_max_mib,
+            self.worker.memory_swap_max_mib,
+            self.worker.cpu_weight
         )
     }
 
@@ -37,6 +80,10 @@ impl RsidScopeSettings {
         let mut memory_max_mib = None;
         let mut memory_swap_max_mib = None;
         let mut cpu_weight = None;
+        let mut worker_high = None;
+        let mut worker_max = None;
+        let mut worker_swap = None;
+        let mut worker_cpu = None;
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -53,6 +100,20 @@ impl RsidScopeSettings {
                 "rsid_scope_memory_high_mib" => &mut memory_high_mib,
                 "rsid_scope_memory_max_mib" => &mut memory_max_mib,
                 "rsid_scope_memory_swap_max_mib" => &mut memory_swap_max_mib,
+                "worker_scope_memory_high_mib" => &mut worker_high,
+                "worker_scope_memory_max_mib" => &mut worker_max,
+                "worker_scope_memory_swap_max_mib" => &mut worker_swap,
+                "worker_scope_cpu_weight" => {
+                    let weight = u32::try_from(value).map_err(|_| {
+                        color_eyre::eyre::eyre!("worker_scope_cpu_weight exceeds u32::MAX")
+                    })?;
+                    if worker_cpu.replace(weight).is_some() {
+                        return Err(color_eyre::eyre::eyre!(
+                            "duplicate worker scope setting {key}"
+                        ));
+                    }
+                    continue;
+                }
                 "rsid_scope_cpu_weight" => {
                     let cpu_weight_value = u32::try_from(value).map_err(|_| {
                         color_eyre::eyre::eyre!("rsid_scope_cpu_weight exceeds u32::MAX")
@@ -77,6 +138,27 @@ impl RsidScopeSettings {
             }
         }
 
+        let worker = if [worker_high, worker_max, worker_swap]
+            .iter()
+            .all(Option::is_none)
+            && worker_cpu.is_none()
+        {
+            WorkerScopeSettings::defaults()
+        } else {
+            WorkerScopeSettings {
+                memory_high_mib: worker_high.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("missing worker_scope_memory_high_mib")
+                })?,
+                memory_max_mib: worker_max.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("missing worker_scope_memory_max_mib")
+                })?,
+                memory_swap_max_mib: worker_swap.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("missing worker_scope_memory_swap_max_mib")
+                })?,
+                cpu_weight: worker_cpu
+                    .ok_or_else(|| color_eyre::eyre::eyre!("missing worker_scope_cpu_weight"))?,
+            }
+        };
         let settings = Self {
             memory_high_mib: memory_high_mib
                 .ok_or_else(|| color_eyre::eyre::eyre!("missing rsid_scope_memory_high_mib"))?,
@@ -86,6 +168,7 @@ impl RsidScopeSettings {
                 .ok_or_else(|| color_eyre::eyre::eyre!("missing rsid_scope_memory_swap_max_mib"))?,
             cpu_weight: cpu_weight
                 .ok_or_else(|| color_eyre::eyre::eyre!("missing rsid_scope_cpu_weight"))?,
+            worker,
         };
         settings.validate()?;
         Ok(settings)
@@ -112,15 +195,16 @@ impl RsidScopeSettings {
                 "rsid CPUWeight must be between 1 and 10000"
             ));
         }
+        self.worker.validate()?;
         Ok(())
     }
 
-    fn systemd_run_args(self, daemon_cmd: &Path) -> Vec<String> {
+    fn systemd_run_args(self, daemon_cmd: &Path, unit: &str) -> Vec<String> {
         vec![
             "--user".to_string(),
             "--scope".to_string(),
             "--collect".to_string(),
-            format!("--unit={RSID_SCOPE_UNIT}"),
+            format!("--unit={unit}"),
             "--slice=user.slice".to_string(),
             format!("--property=MemoryHigh={}M", self.memory_high_mib),
             format!("--property=MemoryMax={}M", self.memory_max_mib),
@@ -250,99 +334,230 @@ impl Drop for TerminalGuard {
 fn try_auto_start_daemon(log_dir: &Path) -> color_eyre::Result<()> {
     let socket_path = DaemonClient::default_socket_path();
 
-    // Check if daemon is already running by testing socket connectivity
-    if socket_path.exists() {
-        // Socket exists — try connecting to verify daemon is alive
-        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            tracing::info!("daemon already running at {:?}", socket_path);
-            return Ok(());
-        } else {
-            // Stale socket file — daemon will clean it up on start
-            tracing::info!("stale socket found, daemon will clean up on start");
-        }
-    }
-
-    tracing::info!("daemon not detected, attempting auto-start...");
-
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
 
-        let scope = read_or_initialize_rsid_scope_settings()?;
-        let daemon_cmd = resolve_daemon_command();
+        if managed_rsid_service_enabled() {
+            return start_managed_rsid_service(&socket_path);
+        }
+
+        // A previous rsid.scope may remain loaded after the daemon exits.
+        // A fresh name also prevents concurrent TUI launches from colliding.
+        let unit = format!("{RSID_SCOPE_PREFIX}-{}.scope", uuid::Uuid::new_v4());
         let daemon_log_path = log_dir.join("daemon.log");
-        let daemon_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&daemon_log_path)?;
-        let child = Command::new("systemd-run")
-            .args(scope.systemd_run_args(&daemon_cmd))
-            .stdin(std::process::Stdio::null())
-            .stdout(daemon_log.try_clone()?)
-            .stderr(daemon_log)
-            .process_group(0)
-            .spawn()
-            .map_err(|error| {
-                color_eyre::eyre::eyre!(
-                    "failed to invoke systemd-run for rsid scope: {error}; see {}",
-                    daemon_log_path.display()
-                )
-            })?;
-        drop(child);
-        if let Err(error) =
-            wait_for_daemon_socket(&socket_path).and_then(|()| verify_rsid_scope(scope))
-        {
+        let mut launched_scope = None;
+        let result = ensure_daemon_socket(&socket_path, || {
+            let scope = read_or_initialize_rsid_scope_settings()?;
+            provision_worker_slice(scope.worker)?;
+            let daemon_cmd = resolve_daemon_command();
+            let daemon_log = open_daemon_log(&daemon_log_path)?;
+            let child = Command::new("systemd-run")
+                .args(scope.systemd_run_args(&daemon_cmd, &unit))
+                .stdin(std::process::Stdio::null())
+                .stdout(daemon_log.try_clone()?)
+                .stderr(daemon_log)
+                .process_group(0)
+                .spawn()
+                .map_err(|error| {
+                    color_eyre::eyre::eyre!(
+                        "failed to invoke systemd-run for {unit}: {error}; see {}",
+                        daemon_log_path.display()
+                    )
+                })?;
+            launched_scope = Some(scope);
+            Ok(child)
+        });
+        let started = match result {
+            Ok(DaemonStart::Existing | DaemonStart::PeerStarted) => false,
+            Ok(DaemonStart::Launched(child)) => {
+                reap_launcher(child);
+                true
+            }
+            Err(error) => {
+                if launched_scope.is_some() {
+                    let _ = Command::new("systemctl")
+                        .args(["--user", "stop", &unit])
+                        .status();
+                }
+                return Err(error);
+            }
+        };
+        if !started {
+            return Ok(());
+        }
+        let scope = launched_scope.expect("started scope has settings");
+        if let Err(error) = verify_rsid_scope(scope, &unit) {
             let _ = Command::new("systemctl")
-                .args(["--user", "stop", RSID_SCOPE_UNIT])
+                .args(["--user", "stop", &unit])
                 .status();
             return Err(error);
         }
         tracing::info!(
-            daemon = %daemon_cmd.display(),
-            unit = RSID_SCOPE_UNIT,
+            unit = %unit,
             "daemon started in its bounded systemd user scope; logs at {:?}",
             daemon_log_path
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = log_dir;
-        return Err(color_eyre::eyre::eyre!(
-            "rsid auto-start requires Linux systemd user scopes"
-        ));
+        use std::os::unix::process::CommandExt;
+
+        let daemon_log_path = log_dir.join("daemon.log");
+        let start = ensure_daemon_socket(&socket_path, || {
+            let daemon_log = open_daemon_log(&daemon_log_path)?;
+            Command::new(resolve_daemon_command())
+                .stdin(std::process::Stdio::null())
+                .stdout(daemon_log.try_clone()?)
+                .stderr(daemon_log)
+                .process_group(0)
+                .spawn()
+                .map_err(|error| {
+                    color_eyre::eyre::eyre!(
+                        "failed to start rsid: {error}; see {}",
+                        daemon_log_path.display()
+                    )
+                })
+        })?;
+        if let DaemonStart::Launched(child) = start {
+            reap_launcher(child);
+        }
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
+fn managed_rsid_service_enabled() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-enabled", "rsid.service"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && matches!(
+                    output.stdout.as_slice(),
+                    b"enabled\n" | b"enabled-runtime\n"
+                )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn start_managed_rsid_service(socket_path: &Path) -> color_eyre::Result<()> {
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        if managed_rsid_service_active() {
+            return Ok(());
+        }
+        return Err(color_eyre::eyre::eyre!(
+            "rsid.service is enabled, but another daemon owns its socket; stop the legacy daemon before starting the service"
+        ));
+    }
+    let status = Command::new("systemctl")
+        .args(["--user", "start", "rsid.service"])
+        .status()?;
+    if !status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "cannot start rsid.service ({status}); inspect systemctl --user status rsid.service"
+        ));
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(90) {
+        if std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+            && managed_rsid_service_active()
+        {
+            tracing::info!("connected to managed rsid.service");
+            return Ok(());
+        }
+        if Command::new("systemctl")
+            .args(["--user", "is-failed", "--quiet", "rsid.service"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "rsid.service failed before its socket became available"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err(color_eyre::eyre::eyre!(
+        "rsid.service did not provide {} within 90 seconds",
+        socket_path.display()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn managed_rsid_service_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "rsid.service"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+enum DaemonStart {
+    Existing,
+    PeerStarted,
+    Launched(std::process::Child),
+}
+
+/// Reap the daemon or systemd-run launcher without blocking the TUI. A
+/// successful launcher can outlive the TUI event loop by many hours.
+fn reap_launcher(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        if let Err(error) = child.wait() {
+            tracing::warn!("cannot reap rsid launcher: {error}");
+        }
+    });
+}
+
+/// A failed connect, including a stale socket file, must attempt a launch;
+/// rsid owns stale-socket cleanup.
+fn ensure_daemon_socket(
+    socket_path: &Path,
+    start: impl FnOnce() -> color_eyre::Result<std::process::Child>,
+) -> color_eyre::Result<DaemonStart> {
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        tracing::info!("daemon already running at {:?}", socket_path);
+        return Ok(DaemonStart::Existing);
+    }
+    tracing::info!(
+        "daemon not detected, attempting auto-start at {:?}",
+        socket_path
+    );
+    let mut child = start()?;
+    match wait_for_daemon_socket(socket_path, &mut child) {
+        Ok(true) => Ok(DaemonStart::Launched(child)),
+        Ok(false) => Ok(DaemonStart::PeerStarted),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read_or_initialize_rsid_scope_settings() -> color_eyre::Result<RsidScopeSettings> {
     let path = rsi_common::identity::data_path(RSID_SCOPE_SETTINGS_FILE, "rsid-scope");
+    read_or_initialize_rsid_scope_settings_at(&path)
+}
+
+#[cfg(target_os = "linux")]
+fn read_or_initialize_rsid_scope_settings_at(path: &Path) -> color_eyre::Result<RsidScopeSettings> {
     match std::fs::read_to_string(&path) {
         Ok(contents) => RsidScopeSettings::parse(&contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let defaults = RsidScopeSettings::defaults();
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(defaults.to_env().as_bytes())?;
-                    file.sync_all()?;
-                    Ok(defaults)
-                }
-                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let contents = std::fs::read_to_string(&path)?;
-                    RsidScopeSettings::parse(&contents)
-                }
-                Err(create_error) => Err(create_error.into()),
-            }
+            publish_default_rsid_scope_settings(path, || {})?;
+            RsidScopeSettings::parse(&std::fs::read_to_string(path)?)
         }
         Err(error) => Err(color_eyre::eyre::eyre!(
             "cannot read rsid scope settings at {}: {error}",
@@ -352,25 +567,68 @@ fn read_or_initialize_rsid_scope_settings() -> color_eyre::Result<RsidScopeSetti
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_daemon_socket(socket_path: &Path) -> color_eyre::Result<()> {
+fn publish_default_rsid_scope_settings(
+    path: &Path,
+    before_publish: impl FnOnce(),
+) -> color_eyre::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let temp_path =
+        path.with_file_name(format!(".rsid-scope-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        file.write_all(RsidScopeSettings::defaults().to_env().as_bytes())?;
+        file.sync_all()?;
+        before_publish();
+        // hard_link creates the destination atomically and never replaces an
+        // operator-updated file or another launcher's completed snapshot.
+        match std::fs::hard_link(&temp_path, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(&temp_path);
+    result.map_err(Into::into)
+}
+
+fn wait_for_daemon_socket(
+    socket_path: &Path,
+    child: &mut std::process::Child,
+) -> color_eyre::Result<bool> {
+    let mut exited = None;
     for _ in 0..100 {
         if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-            return Ok(());
+            return Ok(exited.is_none() && child.try_wait()?.is_none());
+        }
+        if exited.is_none() {
+            exited = child.try_wait()?;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    if let Some(status) = exited {
+        return Err(color_eyre::eyre::eyre!(
+            "rsid launcher exited before its socket was available ({status}); see daemon.log"
+        ));
+    }
     Err(color_eyre::eyre::eyre!(
-        "rsid did not become available in systemd scope {RSID_SCOPE_UNIT}"
+        "rsid did not become available at {} within 5 seconds; see daemon.log",
+        socket_path.display()
     ))
 }
 
 #[cfg(target_os = "linux")]
-fn verify_rsid_scope(settings: RsidScopeSettings) -> color_eyre::Result<()> {
+fn verify_rsid_scope(settings: RsidScopeSettings, unit: &str) -> color_eyre::Result<()> {
     let output = Command::new("systemctl")
         .args([
             "--user",
             "show",
-            RSID_SCOPE_UNIT,
+            unit,
             "--property=ActiveState",
             "--property=ControlGroup",
             "--property=MemoryHigh",
@@ -382,14 +640,18 @@ fn verify_rsid_scope(settings: RsidScopeSettings) -> color_eyre::Result<()> {
         .map_err(|error| color_eyre::eyre::eyre!("cannot inspect rsid systemd scope: {error}"))?;
     if !output.status.success() {
         return Err(color_eyre::eyre::eyre!(
-            "cannot inspect effective limits for systemd scope {RSID_SCOPE_UNIT}"
+            "cannot inspect effective limits for systemd scope {unit}"
         ));
     }
-    verify_rsid_scope_properties(settings, &String::from_utf8_lossy(&output.stdout))
+    verify_rsid_scope_properties(settings, unit, &String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(target_os = "linux")]
-fn verify_rsid_scope_properties(settings: RsidScopeSettings, text: &str) -> color_eyre::Result<()> {
+fn verify_rsid_scope_properties(
+    settings: RsidScopeSettings,
+    unit: &str,
+    text: &str,
+) -> color_eyre::Result<()> {
     let properties: std::collections::HashMap<&str, &str> = text
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -400,7 +662,7 @@ fn verify_rsid_scope_properties(settings: RsidScopeSettings, text: &str) -> colo
     let expected_memory_swap_max = settings.memory_swap_max_mib * 1024 * 1024;
     let matches = properties.get("ActiveState") == Some(&"active")
         && control_group.starts_with("/user.slice/")
-        && control_group.ends_with("/rsid.scope")
+        && control_group.ends_with(&format!("/{unit}"))
         && properties
             .get("MemoryHigh")
             .and_then(|value| value.parse::<u64>().ok())
@@ -419,10 +681,158 @@ fn verify_rsid_scope_properties(settings: RsidScopeSettings, text: &str) -> colo
             == Some(settings.cpu_weight);
     if !matches {
         return Err(color_eyre::eyre::eyre!(
-            "systemd scope {RSID_SCOPE_UNIT} is active without the configured effective limits or user-slice placement"
+            "systemd scope {unit} is active without the configured effective limits or user-slice placement"
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn worker_slice_properties() -> color_eyre::Result<String> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            WORKER_SLICE,
+            "--property=ActiveState",
+            "--property=ControlGroup",
+            "--property=MemoryHigh",
+            "--property=MemoryMax",
+            "--property=MemorySwapMax",
+            "--property=CPUWeight",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(color_eyre::eyre::eyre!("cannot inspect {WORKER_SLICE}"));
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_worker_slice_properties(
+    settings: WorkerScopeSettings,
+    text: &str,
+) -> color_eyre::Result<()> {
+    let properties: std::collections::HashMap<&str, &str> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let group = properties.get("ControlGroup").copied().unwrap_or_default();
+    let mib = 1024 * 1024;
+    let matches = properties.get("ActiveState") == Some(&"active")
+        && group.starts_with("/user.slice/")
+        && group.ends_with("/rsi-workers.slice")
+        && properties
+            .get("MemoryHigh")
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(settings.memory_high_mib * mib)
+        && properties
+            .get("MemoryMax")
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(settings.memory_max_mib * mib)
+        && properties
+            .get("MemorySwapMax")
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(settings.memory_swap_max_mib * mib)
+        && properties
+            .get("CPUWeight")
+            .and_then(|v| v.parse::<u32>().ok())
+            == Some(settings.cpu_weight);
+    if !matches {
+        return Err(color_eyre::eyre::eyre!(
+            "{WORKER_SLICE} is missing or has different aggregate limits; restart when existing workers have settled"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn worker_slice_cgroup_path(properties: &str) -> Option<std::path::PathBuf> {
+    let group = properties
+        .lines()
+        .find_map(|line| line.strip_prefix("ControlGroup="))?;
+    let suffix = group.strip_prefix("/user.slice/user-")?;
+    let (uid, rest) = suffix.split_once(".slice/user@")?;
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if rest != format!("{uid}.service/rsi.slice/rsi-workers.slice") {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_counter(text: &str, name: &str) -> Option<u64> {
+    let mut values = text.lines().filter_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == name).then_some(value)
+    });
+    let value = values.next()?.parse().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn worker_slice_counters_are_empty(events: &str, stat: &str) -> bool {
+    // populated includes descendant processes; nr_descendants also catches
+    // active worker scopes which currently contain no process.
+    cgroup_counter(events, "populated") == Some(0)
+        && cgroup_counter(stat, "nr_descendants") == Some(0)
+}
+
+#[cfg(target_os = "linux")]
+fn worker_slice_is_empty(properties: &str) -> bool {
+    let Some(path) = worker_slice_cgroup_path(properties) else {
+        return false;
+    };
+    let Ok(events) = std::fs::read_to_string(path.join("cgroup.events")) else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(path.join("cgroup.stat")) else {
+        return false;
+    };
+    worker_slice_counters_are_empty(&events, &stat)
+}
+
+#[cfg(target_os = "linux")]
+fn provision_worker_slice(settings: WorkerScopeSettings) -> color_eyre::Result<()> {
+    let before = worker_slice_properties()?;
+    if before.lines().any(|line| line == "ActiveState=active") {
+        if verify_worker_slice_properties(settings, &before).is_ok() {
+            return Ok(());
+        }
+        // The daemon must boot to reap owned orphans if any worker scope
+        // remains. Admission stays closed while the parent limits differ.
+        if !worker_slice_is_empty(&before) {
+            tracing::warn!(
+                "active {WORKER_SLICE} differs from settings and may contain workers; daemon starts for recovery, worker admission remains closed"
+            );
+            return Ok(());
+        }
+        tracing::info!("reconciling empty {WORKER_SLICE} with configured limits");
+    }
+    let status = Command::new("systemctl")
+        .args([
+            "--user",
+            "set-property",
+            "--runtime",
+            WORKER_SLICE,
+            &format!("MemoryHigh={}M", settings.memory_high_mib),
+            &format!("MemoryMax={}M", settings.memory_max_mib),
+            &format!("MemorySwapMax={}M", settings.memory_swap_max_mib),
+            &format!("CPUWeight={}", settings.cpu_weight),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(color_eyre::eyre::eyre!("cannot configure {WORKER_SLICE}"));
+    }
+    let status = Command::new("systemctl")
+        .args(["--user", "start", WORKER_SLICE])
+        .status()?;
+    if !status.success() {
+        return Err(color_eyre::eyre::eyre!("cannot start {WORKER_SLICE}"));
+    }
+    verify_worker_slice_properties(settings, &worker_slice_properties()?)
 }
 
 fn should_auto_start_daemon() -> bool {
@@ -503,10 +913,12 @@ fn rotate_log_file(current_path: &Path, log_dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RsidScopeSettings, prefer_sibling_daemon, resolve_daemon_command_with,
-        should_auto_start_daemon_with, sibling_daemon_binary,
+        DaemonStart, RsidScopeSettings, WorkerScopeSettings, ensure_daemon_socket,
+        prefer_sibling_daemon, resolve_daemon_command_with, should_auto_start_daemon_with,
+        sibling_daemon_binary, verify_worker_slice_properties,
     };
     use std::path::{Path, PathBuf};
+    use std::process::{Child, Command};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -526,6 +938,154 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent dirs");
         }
         std::fs::write(path, b"").expect("write file");
+    }
+
+    #[test]
+    #[ignore = "fixture entry point for isolated daemon auto-start tests"]
+    fn daemon_socket_fixture() {
+        let socket = PathBuf::from(std::env::var("RSI_TEST_AUTO_START_SOCKET").unwrap());
+        if socket.exists() {
+            std::fs::remove_file(&socket).unwrap();
+        }
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        for stream in listener.incoming() {
+            drop(stream.unwrap());
+        }
+    }
+
+    fn launch_daemon_fixture(socket: &Path) -> color_eyre::Result<Child> {
+        Ok(Command::new(std::env::current_exe()?)
+            .args(["--ignored", "--exact", "tests::daemon_socket_fixture"])
+            .env("RSI_TEST_AUTO_START_SOCKET", socket)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?)
+    }
+
+    #[test]
+    fn daemon_auto_start_handles_first_launch_live_socket_and_stale_relaunch() {
+        // Unix socket paths are short (108 bytes on Linux); the sandbox TMPDIR
+        // can already consume most of that limit.
+        let dir = PathBuf::from(format!(
+            "/tmp/rsi-auto-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let DaemonStart::Launched(mut first) =
+            ensure_daemon_socket(&socket, || launch_daemon_fixture(&socket)).unwrap()
+        else {
+            panic!("first launch starts daemon");
+        };
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+
+        let already_running = ensure_daemon_socket(&socket, || {
+            panic!("live socket must not launch a second daemon")
+        })
+        .unwrap();
+        assert!(matches!(already_running, DaemonStart::Existing));
+
+        first.kill().unwrap();
+        first.wait().unwrap();
+        assert!(socket.exists(), "the killed daemon leaves a stale socket");
+        let DaemonStart::Launched(mut second) =
+            ensure_daemon_socket(&socket, || launch_daemon_fixture(&socket)).unwrap()
+        else {
+            panic!("stale socket triggers relaunch");
+        };
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        second.kill().unwrap();
+        second.wait().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_auto_start_accepts_peer_after_own_launcher_loses_race() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = PathBuf::from(format!(
+            "/tmp/rsi-peer-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let peer_socket = socket.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let peer_barrier = Arc::clone(&barrier);
+        let peer = std::thread::spawn(move || {
+            ensure_daemon_socket(&peer_socket, || {
+                peer_barrier.wait();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                launch_daemon_fixture(&peer_socket)
+            })
+            .unwrap()
+        });
+        let outcome = ensure_daemon_socket(&socket, || {
+            barrier.wait();
+            Ok(Command::new("sh").args(["-c", "exit 7"]).spawn()?)
+        })
+        .unwrap();
+        assert!(matches!(outcome, DaemonStart::PeerStarted));
+        let DaemonStart::Launched(mut winner) = peer.join().unwrap() else {
+            panic!("peer starts the daemon");
+        };
+        winner.kill().unwrap();
+        winner.wait().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_auto_start_reports_launcher_failure_without_a_peer() {
+        let dir = PathBuf::from(format!(
+            "/tmp/rsi-fail-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let error = ensure_daemon_socket(&dir.join("daemon.sock"), || {
+            Ok(Command::new("sh").args(["-c", "exit 7"]).spawn()?)
+        })
+        .err()
+        .expect("missing peer must report launch failure");
+        assert!(error.to_string().contains("exit status: 7"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_first_launch_never_exposes_partial_scope_settings() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = temp_dir("scope-first-launch");
+        let path = dir.join("rsid-scope.env");
+        let written = Arc::new(Barrier::new(2));
+        let published = Arc::new(Barrier::new(2));
+        let worker_path = path.clone();
+        let worker_written = Arc::clone(&written);
+        let worker_published = Arc::clone(&published);
+        let writer = std::thread::spawn(move || {
+            super::publish_default_rsid_scope_settings(&worker_path, || {
+                worker_written.wait();
+                worker_published.wait();
+            })
+            .unwrap();
+        });
+        written.wait();
+        assert!(
+            !path.exists(),
+            "unpublished snapshot is invisible to readers"
+        );
+        let settings = super::read_or_initialize_rsid_scope_settings_at(&path).unwrap();
+        assert_eq!(settings, RsidScopeSettings::defaults());
+        published.wait();
+        writer.join().unwrap();
+        assert_eq!(
+            RsidScopeSettings::parse(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            settings
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -634,6 +1194,26 @@ mod tests {
         assert_eq!(settings.memory_max_mib, 8192);
         assert_eq!(settings.memory_swap_max_mib, 0);
         assert_eq!(settings.cpu_weight, 20);
+        assert_eq!(settings.worker, WorkerScopeSettings::defaults());
+        let explicit = settings
+            .to_env()
+            .replace(
+                &format!(
+                    "worker_scope_memory_high_mib={}",
+                    settings.worker.memory_high_mib
+                ),
+                "worker_scope_memory_high_mib=512",
+            )
+            .replace(
+                &format!(
+                    "worker_scope_memory_max_mib={}",
+                    settings.worker.memory_max_mib
+                ),
+                "worker_scope_memory_max_mib=1024",
+            );
+        let updated = RsidScopeSettings::parse(&explicit).unwrap();
+        assert_eq!(updated.worker.memory_high_mib, 512);
+        assert_eq!(updated.worker.memory_max_mib, 1024);
     }
 
     #[test]
@@ -646,6 +1226,10 @@ mod tests {
 
         let malformed = "rsid_scope_memory_high_mib=6144\nrsid_scope_memory_max_mib=8192\nrsid_scope_memory_swap_max_mib=0\nrsid_scope_cpu_weight=10001\n";
         assert!(RsidScopeSettings::parse(malformed).is_err());
+        assert!(
+            RsidScopeSettings::parse(&format!("{malformed}worker_scope_memory_high_mib=6144\n"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -654,14 +1238,14 @@ mod tests {
             "rsid_scope_memory_high_mib=6144\nrsid_scope_memory_max_mib=8192\nrsid_scope_memory_swap_max_mib=0\nrsid_scope_cpu_weight=20\n",
         )
         .unwrap();
-        let args = settings.systemd_run_args(Path::new("/opt/rsi/rsid"));
+        let args = settings.systemd_run_args(Path::new("/opt/rsi/rsid"), "rsid-tui-123.scope");
         assert_eq!(
             args,
             [
                 "--user",
                 "--scope",
                 "--collect",
-                "--unit=rsid.scope",
+                "--unit=rsid-tui-123.scope",
                 "--slice=user.slice",
                 "--property=MemoryHigh=6144M",
                 "--property=MemoryMax=8192M",
@@ -677,19 +1261,73 @@ mod tests {
     #[test]
     fn rsid_scope_verification_rejects_missing_or_ineffective_limits() {
         let settings = RsidScopeSettings::defaults();
+        let unit = "rsid-tui-123.scope";
         let valid = format!(
-            "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/rsid.scope\nMemoryHigh={}\nMemoryMax={}\nMemorySwapMax={}\nCPUWeight={}\n",
+            "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/{unit}\nMemoryHigh={}\nMemoryMax={}\nMemorySwapMax={}\nCPUWeight={}\n",
             settings.memory_high_mib * 1024 * 1024,
             settings.memory_max_mib * 1024 * 1024,
             settings.memory_swap_max_mib * 1024 * 1024,
             settings.cpu_weight
         );
-        assert!(super::verify_rsid_scope_properties(settings, &valid).is_ok());
+        assert!(super::verify_rsid_scope_properties(settings, unit, &valid).is_ok());
 
         let unbounded = valid.replace("MemoryMax=8589934592", "MemoryMax=infinity");
-        assert!(super::verify_rsid_scope_properties(settings, &unbounded).is_err());
+        assert!(super::verify_rsid_scope_properties(settings, unit, &unbounded).is_err());
 
         let wrong_slice = valid.replace("/user.slice/", "/app.slice/");
-        assert!(super::verify_rsid_scope_properties(settings, &wrong_slice).is_err());
+        assert!(super::verify_rsid_scope_properties(settings, unit, &wrong_slice).is_err());
+
+        let wrong_unit = valid.replace(unit, "rsid.scope");
+        assert!(super::verify_rsid_scope_properties(settings, unit, &wrong_unit).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_slice_verification_requires_finite_exact_parent() {
+        let settings = WorkerScopeSettings::defaults();
+        let valid = "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/user@1000.service/rsi-workers.slice\nMemoryHigh=6442450944\nMemoryMax=8589934592\nMemorySwapMax=0\nCPUWeight=20\n";
+        assert!(verify_worker_slice_properties(settings, valid).is_ok());
+        assert!(
+            verify_worker_slice_properties(
+                settings,
+                &valid.replace("MemoryMax=8589934592", "MemoryMax=infinity")
+            )
+            .is_err()
+        );
+        assert!(
+            verify_worker_slice_properties(
+                settings,
+                &valid.replace("ActiveState=active", "ActiveState=inactive")
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_slice_reconciles_only_without_processes_or_child_scopes() {
+        let properties = "ControlGroup=/user.slice/user-1000.slice/user@1000.service/rsi.slice/rsi-workers.slice\n";
+        assert!(super::worker_slice_cgroup_path(properties).is_some());
+        assert!(
+            super::worker_slice_cgroup_path(&properties.replace("user@1000", "user@1001"))
+                .is_none()
+        );
+        assert!(super::worker_slice_counters_are_empty(
+            "populated 0\nfrozen 0\n",
+            "nr_descendants 0\nnr_dying_descendants 0\n"
+        ));
+        assert!(!super::worker_slice_counters_are_empty(
+            "populated 1\n",
+            "nr_descendants 0\n"
+        ));
+        assert!(!super::worker_slice_counters_are_empty(
+            "populated 0\n",
+            "nr_descendants 1\n"
+        ));
+        assert!(!super::worker_slice_counters_are_empty("populated 0\n", ""));
+        assert!(!super::worker_slice_counters_are_empty(
+            "populated 0\npopulated 0\n",
+            "nr_descendants 0\n"
+        ));
     }
 }

@@ -29,6 +29,7 @@ pub mod project_form;
 pub mod project_picker;
 pub mod prompt;
 pub mod prompt_preview;
+pub mod provider_credential_form;
 pub mod provider_form;
 pub mod question_modal;
 pub mod rating;
@@ -101,6 +102,7 @@ pub use project_form::PROJECT_COLORS;
 pub use project_picker::open_project_picker;
 pub use prompt::{open_blank_popup, open_continue_popup, open_taskrabbit_popup, open_typed_prompt};
 pub use prompt_preview::open_prompt_preview;
+pub use provider_credential_form::open_provider_credential_form;
 pub use provider_form::open_provider_form;
 pub use question_modal::open_question_modal;
 pub use rating::open_rating_overlay;
@@ -126,6 +128,11 @@ fn text_overlay_is_in_normal_mode(overlay: &OverlayState) -> bool {
     }
 }
 
+fn is_uppercase_n_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('N')
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+}
+
 const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
     matches!(
         overlay,
@@ -133,6 +140,7 @@ const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
             | OverlayState::MessageBridgeForm { .. }
             | OverlayState::HookForm { .. }
             | OverlayState::BudgetPolicyForm { .. }
+            | OverlayState::ProviderCredentialForm { .. }
             | OverlayState::MemorySearch { .. }
             | OverlayState::RenameSession { .. }
             | OverlayState::LabelForm { .. }
@@ -188,25 +196,23 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // Non-text overlays (GraphReview, ThemePicker, SortPicker, etc.):
-        // honour Space+o / Space+m to dismiss the overlay and open a session modal.
+        // Honour Space+o / Space+N to dismiss the overlay and open a session modal.
         if app.overlay_leader_pending {
             app.overlay_leader_pending = false;
-            if key.modifiers.is_empty() {
-                match key.code {
-                    KeyCode::Char('o') => {
-                        prompt::open_taskrabbit_popup(app);
-                        return true;
-                    }
-                    KeyCode::Char('m') => {
-                        prompt::open_blank_popup(app);
-                        return true;
-                    }
-                    KeyCode::Char(';') => {
-                        command_palette::open_command_palette(app);
-                        return true;
-                    }
-                    _ => {}
+            match key.code {
+                KeyCode::Char('o') if key.modifiers.is_empty() => {
+                    prompt::open_taskrabbit_popup(app);
+                    return true;
                 }
+                KeyCode::Char('N') if is_uppercase_n_key(key) => {
+                    prompt::open_blank_popup(app);
+                    return true;
+                }
+                KeyCode::Char(';') if key.modifiers.is_empty() => {
+                    command_palette::open_command_palette(app);
+                    return true;
+                }
+                _ => {}
             }
             return false;
         }
@@ -223,7 +229,7 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
             prompt::open_taskrabbit_popup(app);
             return true;
         }
-        if key.modifiers.is_empty() && key.code == KeyCode::Char('m') {
+        if is_uppercase_n_key(key) {
             prompt::open_blank_popup(app);
             return true;
         }
@@ -245,7 +251,7 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-/// Handle Space+o / Space+m leader sequence for input overlay stack.
+/// Handle Space+o / Space+N leader sequence for input overlay stack.
 fn handle_input_overlay_leader(app: &mut App, key: KeyEvent) -> bool {
     let focused = match app.focused_input_overlay() {
         Some(o) => o,
@@ -262,7 +268,7 @@ fn handle_input_overlay_leader(app: &mut App, key: KeyEvent) -> bool {
             prompt::open_taskrabbit_popup(app);
             return true;
         }
-        if key.modifiers.is_empty() && key.code == KeyCode::Char('m') {
+        if is_uppercase_n_key(key) {
             prompt::open_blank_popup(app);
             return true;
         }
@@ -289,6 +295,27 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     if matches!(app.overlay, OverlayState::KeybindingsHelp { .. }) {
+        // Help handles its own search text, but its scroll view advertises the
+        // shared overlay leader. Close help after opening an input prompt so
+        // the prompt receives the following keystrokes.
+        let search_active = matches!(
+            app.overlay,
+            OverlayState::KeybindingsHelp {
+                search_active: true,
+                ..
+            }
+        );
+        if !search_active {
+            let input_count = app.input_overlays.len();
+            if handle_text_overlay_prompt_leader(app, key) {
+                if app.input_overlays.len() > input_count {
+                    keybindings_help::close_keybindings_help(app);
+                }
+                return true;
+            }
+        } else {
+            app.overlay_leader_pending = false;
+        }
         keybindings_help::handle_keybindings_help_key(app, key);
         return true;
     }
@@ -431,6 +458,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         }
         OverlayState::BudgetPolicyForm { .. } => {
             budget_policy_form::handle_budget_policy_form_key(app, key);
+            return true;
+        }
+        OverlayState::ProviderCredentialForm { .. } => {
+            provider_credential_form::handle_provider_credential_form_key(app, key);
             return true;
         }
         OverlayState::HookConflictPrompt { .. } => {
@@ -884,18 +915,15 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
         && key.modifiers == KeyModifiers::CONTROL
     {
         if let OverlayState::Prompt {
-            surface,
             purpose,
             model_dropdown,
             ..
         } = &mut app.overlay
         {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-            {
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) {
                 model_dropdown.toggle();
                 if model_dropdown.open {
                     app.needs_model_refresh = true;
@@ -919,16 +947,11 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
             } => (model_override.clone(), *provider_override),
             _ => (None, None),
         };
-        if let OverlayState::Prompt {
-            surface, purpose, ..
-        } = &app.overlay
-        {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-            {
+        if let OverlayState::Prompt { purpose, .. } = &app.overlay {
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) {
                 cycle_effort(
                     app,
                     effort_model_override.as_deref(),
@@ -944,18 +967,15 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL {
         let sandbox_caps = app.poll.sandbox_supported;
         if let OverlayState::Prompt {
-            surface,
             purpose,
             sandbox_enabled,
             ..
         } = &mut app.overlay
         {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-                && sandbox_caps
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) && sandbox_caps
             {
                 *sandbox_enabled = !*sandbox_enabled;
                 app.mark_dirty();
@@ -1330,18 +1350,15 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
         && key.modifiers == KeyModifiers::CONTROL
     {
         if let Some(OverlayState::Prompt {
-            surface,
             purpose,
             model_dropdown,
             ..
         }) = app.input_overlays.get_mut(idx)
         {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-            {
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) {
                 model_dropdown.toggle();
                 if model_dropdown.open {
                     app.needs_model_refresh = true;
@@ -1365,16 +1382,11 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
             }) => (model_override.clone(), *provider_override),
             _ => (None, None),
         };
-        if let Some(OverlayState::Prompt {
-            surface, purpose, ..
-        }) = app.input_overlays.get(idx)
-        {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-            {
+        if let Some(OverlayState::Prompt { purpose, .. }) = app.input_overlays.get(idx) {
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) {
                 cycle_effort(
                     app,
                     effort_model_override.as_deref(),
@@ -1390,18 +1402,15 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
     if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL {
         let sandbox_caps = app.poll.sandbox_supported;
         if let Some(OverlayState::Prompt {
-            surface,
             purpose,
             sandbox_enabled,
             ..
         }) = app.input_overlays.get_mut(idx)
         {
-            if surface.mode == PopupMode::Normal
-                && matches!(
-                    purpose,
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-                )
-                && sandbox_caps
+            if matches!(
+                purpose,
+                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
+            ) && sandbox_caps
             {
                 *sandbox_enabled = !*sandbox_enabled;
                 app.mark_dirty();
@@ -1949,6 +1958,14 @@ fn paste_text_into_overlay(app: &mut App, text: &str) {
             }
             handled = true;
         }
+        OverlayState::ProviderCredentialForm { secret, .. } => {
+            // Pasting a copied API key is the common real workflow here;
+            // masking is purely a rendering-time concern (see
+            // `ui::overlay::provider_credential_form`), so the underlying
+            // buffer accepts pasted text like every other plain-text field.
+            secret.push_str(&normalized);
+            handled = true;
+        }
         OverlayState::MemorySearch { query, .. } => {
             query.push_str(&normalized);
             handled = true;
@@ -2057,6 +2074,7 @@ fn paste_image_into_overlay(app: &mut App, reference: &str) {
         | OverlayState::MessageBridgeForm { .. }
         | OverlayState::HookForm { .. }
         | OverlayState::BudgetPolicyForm { .. }
+        | OverlayState::ProviderCredentialForm { .. }
         | OverlayState::MemorySearch { .. }
         | OverlayState::RenameSession { .. }
         | OverlayState::LabelForm { .. }
@@ -2174,6 +2192,91 @@ mod text_entry_leader_tests {
 
     fn app() -> App {
         App::new(DaemonClient::new(PathBuf::from("/tmp/test.sock")))
+    }
+
+    fn key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn shift_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT)
+    }
+
+    #[tokio::test]
+    async fn space_shift_n_opens_blank_from_keybindings_help() {
+        let mut app = app();
+        keybindings_help::open_keybindings_help(&mut app);
+
+        assert!(handle_overlay_key(&mut app, key(' ')).await);
+        assert!(handle_overlay_key(&mut app, shift_key('N')).await);
+        assert!(matches!(app.overlay, OverlayState::None));
+        assert!(matches!(
+            app.focused_input_overlay(),
+            Some(OverlayState::Prompt {
+                purpose: crate::types::PromptPurpose::Blank,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn help_search_accepts_space_n_as_filter_text() {
+        let mut app = app();
+        keybindings_help::open_keybindings_help(&mut app);
+        assert!(handle_overlay_key(&mut app, key('/')).await);
+        assert!(handle_overlay_key(&mut app, key(' ')).await);
+        assert!(handle_overlay_key(&mut app, key('n')).await);
+
+        assert!(matches!(
+            app.overlay,
+            OverlayState::KeybindingsHelp {
+                search_active: true,
+                ref filter,
+                ..
+            } if filter == " n"
+        ));
+        assert!(app.input_overlays.is_empty());
+    }
+
+    #[test]
+    fn space_shift_n_opens_blank_from_normal_text_overlay() {
+        let mut app = app();
+        prompt::open_blank_popup(&mut app);
+        let mut prompt = app.input_overlays.pop().expect("blank prompt opens");
+        if let OverlayState::Prompt { surface, .. } = &mut prompt {
+            surface.mode = PopupMode::Normal;
+        }
+        app.overlay = prompt;
+
+        assert!(handle_text_overlay_prompt_leader(&mut app, key(' ')));
+        assert!(handle_text_overlay_prompt_leader(&mut app, shift_key('N')));
+        assert!(matches!(
+            app.focused_input_overlay(),
+            Some(OverlayState::Prompt {
+                purpose: crate::types::PromptPurpose::Blank,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn space_shift_n_stacks_blank_on_input_overlays() {
+        let mut app = app();
+        prompt::open_blank_popup(&mut app);
+        if let Some(OverlayState::Prompt { surface, .. }) = app.focused_input_overlay_mut() {
+            surface.mode = PopupMode::Normal;
+        }
+
+        assert!(handle_input_overlay_leader(&mut app, key(' ')));
+        assert!(handle_input_overlay_leader(&mut app, shift_key('N')));
+        assert_eq!(app.input_overlays.len(), 2);
+        assert!(matches!(
+            app.focused_input_overlay(),
+            Some(OverlayState::Prompt {
+                purpose: crate::types::PromptPurpose::Blank,
+                ..
+            })
+        ));
     }
 
     #[test]

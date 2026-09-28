@@ -154,12 +154,7 @@ impl SessionManager {
         working_dir: Option<std::path::PathBuf>,
         parent_id: Option<Uuid>,
     ) -> Result<ExecuteWorkflowResponse> {
-        let validation = rsi_graph::validate_executable_workflow(&workflow);
-        if validation.has_errors() {
-            return Err(DaemonError::InvalidParam(validation_summary(&validation)));
-        }
-        let steps = crate::topology::steps::validate_workflow(&workflow)
-            .map_err(DaemonError::InvalidParam)?;
+        let steps = validate_live_workflow(&workflow)?;
         if !dry_run && steps.has_typed_effects() && !session_manager.topology_executor_enabled() {
             return Err(DaemonError::InvalidParam(
                 "command and gate nodes need the durable topology executor (topology_executor_enabled)"
@@ -171,46 +166,20 @@ impl SessionManager {
             None
         } else {
             let repo = working_dir.clone().unwrap_or(std::env::current_dir()?);
-            if session_manager
-                .store
-                .lock()
-                .await
-                .path_is_inside_live_custody_root(&repo)?
-            {
-                return Err(DaemonError::InvalidParam(
-                    "execution repository is an active sandbox".into(),
-                ));
-            }
             let explicit_base = input
                 .as_ref()
                 .and_then(|value| value.get("base_commit"))
                 .and_then(serde_json::Value::as_str);
-            let (root, commit) =
-                crate::topology::custody::resolve_execution_base(&repo, explicit_base).await?;
-            for node in &workflow.nodes {
-                if let Some(node_dir) = node.working_dir.as_ref() {
-                    let node_root = crate::topology::custody::repository_root(node_dir)?;
-                    if node_root != root || node_dir.canonicalize()? != root {
-                        return Err(DaemonError::InvalidParam(format!(
-                            "node {} working_dir must name the execution repository",
-                            node.id
-                        )));
-                    }
-                }
-            }
-            // Plan §3.2: a catalog crate must be a workspace member.
-            let crates = steps.command_crates();
-            if !crates.is_empty() {
-                let members = crate::topology::catalog::workspace_members(&root).await?;
-                if let Some((node, krate)) =
-                    crates.iter().find(|(_, krate)| !members.contains(*krate))
-                {
-                    return Err(DaemonError::InvalidParam(format!(
-                        "node {node}: crate {krate} is not a workspace member"
-                    )));
-                }
-            }
-            Some((root, commit))
+            Some(
+                resolve_live_custody_base(
+                    &session_manager.store,
+                    &workflow,
+                    &steps,
+                    &repo,
+                    explicit_base,
+                )
+                .await?,
+            )
         };
         let custody_plan = if dry_run {
             None
@@ -236,6 +205,7 @@ impl SessionManager {
                     repo_root: repo_root.clone(),
                     base_commit: base_commit.clone(),
                     input,
+                    requester: None,
                 },
             )
             .await;
@@ -440,7 +410,7 @@ impl SessionManager {
         )
     }
 
-    fn drive_topology_execution(
+    pub(crate) fn drive_topology_execution(
         self: &Arc<Self>,
         executor: crate::topology::executor::Executor<SessionNodeEffects>,
         execution_id: Uuid,
@@ -487,6 +457,8 @@ impl SessionManager {
         max_executions: usize,
         time_budget: std::time::Duration,
     ) {
+        // #633: native agent topology tools reach the executor from here on.
+        let _ = self.topology_agent_self.set(Arc::downgrade(&self));
         let executor = self.topology_executor().await;
         match crate::topology::recovery::recover_after_restart(
             &executor,
@@ -548,6 +520,59 @@ impl SessionManager {
             }
         });
     }
+}
+
+/// Structural validation shared by every live execution path: the graph,
+/// typed steps, edge routing and refused author inputs (#635).
+pub(crate) fn validate_live_workflow(
+    workflow: &WorkflowDefinition,
+) -> Result<crate::topology::steps::WorkflowSteps> {
+    let validation = rsi_graph::validate_executable_workflow(workflow);
+    if validation.has_errors() {
+        return Err(DaemonError::InvalidParam(validation_summary(&validation)));
+    }
+    crate::topology::steps::validate_workflow(workflow).map_err(DaemonError::InvalidParam)
+}
+
+/// The execution repository and its authenticated base commit (plan §4),
+/// with the node working-dir and catalog-crate checks (plan §3.2). Shared by
+/// the operator `ExecuteTopology` path and the agent verbs (#633).
+pub(crate) async fn resolve_live_custody_base(
+    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    workflow: &WorkflowDefinition,
+    steps: &crate::topology::steps::WorkflowSteps,
+    repo: &std::path::Path,
+    explicit_base: Option<&str>,
+) -> Result<(std::path::PathBuf, String)> {
+    if store.lock().await.path_is_inside_live_custody_root(repo)? {
+        return Err(DaemonError::InvalidParam(
+            "execution repository is an active sandbox".into(),
+        ));
+    }
+    let (root, commit) =
+        crate::topology::custody::resolve_execution_base(repo, explicit_base).await?;
+    for node in &workflow.nodes {
+        if let Some(node_dir) = node.working_dir.as_ref() {
+            let node_root = crate::topology::custody::repository_root(node_dir)?;
+            if node_root != root || node_dir.canonicalize()? != root {
+                return Err(DaemonError::InvalidParam(format!(
+                    "node {} working_dir must name the execution repository",
+                    node.id
+                )));
+            }
+        }
+    }
+    // Plan §3.2: a catalog crate must be a workspace member.
+    let crates = steps.command_crates();
+    if !crates.is_empty() {
+        let members = crate::topology::catalog::workspace_members(&root).await?;
+        if let Some((node, krate)) = crates.iter().find(|(_, krate)| !members.contains(*krate)) {
+            return Err(DaemonError::InvalidParam(format!(
+                "node {node}: crate {krate} is not a workspace member"
+            )));
+        }
+    }
+    Ok((root, commit))
 }
 
 fn source_topology_id(workflow: &WorkflowDefinition) -> Option<Uuid> {
@@ -1169,6 +1194,7 @@ fn preview_json_value(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn t1_a3_invalid_node_working_dir_refuses_before_launch() {
         use crate::bus::EventBus;
@@ -1259,6 +1285,7 @@ mod tests {
     /// custody before any durable row: an unresolved fan-in, a non-ancestor
     /// `custody.from` and two back-edges into one node are all refused with
     /// zero execution, attempt, invocation and session rows and no sandbox.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     async fn t2_a11_unresolved_fanin_refused_zero_launch() {
@@ -1406,6 +1433,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn prune_registry_marks_old_completed_execution_as_expired() {
         let execution_id = Uuid::new_v4();
@@ -1423,6 +1451,7 @@ mod tests {
         assert!(registry.expired.contains_key(&execution_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn lookup_execution_distinguishes_expired_from_not_found() {
         let expired_execution_id = Uuid::new_v4();
@@ -1443,6 +1472,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn prune_registry_enforces_completed_execution_limit() {
         let workflow_id = Uuid::new_v4();

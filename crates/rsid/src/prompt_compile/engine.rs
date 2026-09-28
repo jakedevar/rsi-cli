@@ -466,6 +466,7 @@ mod tests {
         RuntimeConfig::from_config(&config)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn cache_hit_roundtrip() {
         let engine = make_engine();
@@ -495,6 +496,7 @@ mod tests {
         assert_eq!(f.contract, OutputContract::Complete);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn cache_evicts_beyond_capacity() {
         let bus = Arc::new(EventBus::new(16));
@@ -536,6 +538,7 @@ mod tests {
         assert!(engine.cache.lock().get(&k2).is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn cache_hit_emits_synthetic_events() {
         let engine = make_engine();

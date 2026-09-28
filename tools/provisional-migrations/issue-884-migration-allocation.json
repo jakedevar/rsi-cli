@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "version": 137,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/mod.rs",
+      "path_template": "crates/rsid/src/store/mod.rs",
+      "source_blob": "sha256:2fb6b81e6f84784411d6cf1648c04bdd99992f6b16cf1483b914d8adad1528e8",
+      "sites": [
+        {
+          "anchor": "pub const LATEST_SCHEMA_VERSION: i32 = 137;",
+          "replacement": "pub const LATEST_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if version < 137 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "migration_allocation::apply_migration(self, 137)?;",
+          "replacement": "migration_allocation::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:168730644474db1494cd01fad80b59bb042800f94b041fcd31df7dbdfe64d5a4",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 137;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

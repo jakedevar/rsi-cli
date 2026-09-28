@@ -16,6 +16,8 @@ use rsid::bus::EventBus;
 use rsid::config::{Config, RuntimeConfig};
 use rsid::session::chain_driver;
 use rsid::store::Store;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -40,6 +42,19 @@ fn build_manager() -> (Arc<rsid::session::SessionManager>, TempDir, TempDir) {
     )
     .expect("SessionManager::new");
     (Arc::new(manager), db_dir, sandbox_base)
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Test 1: topology_name validation — any value other than "master_improve"
@@ -75,6 +90,28 @@ fn invalid_topology_name_is_invalid_param() {
 #[tokio::test]
 async fn valid_master_improve_params_register_chain() {
     let (manager, _db_dir, _sandbox_base) = build_manager();
+    let repository = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    git(origin.path(), &["init", "--bare", "-q", "-b", "rolling"]);
+    git(repository.path(), &["init", "-q", "-b", "rolling"]);
+    git(
+        repository.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+    );
+    git(
+        repository.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    git(repository.path(), &["push", "-q", "origin", "rolling"]);
     let store = manager.store().clone();
     let workflow_id = Uuid::new_v4();
 
@@ -85,7 +122,7 @@ async fn valid_master_improve_params_register_chain() {
         chain_driver::MASTER_IMPROVE_DEFAULT_CAP,
         workflow_id,
         None,
-        None,
+        Some(repository.path().to_string_lossy().into_owned()),
     )
     .await;
 

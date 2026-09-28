@@ -1774,6 +1774,16 @@ impl CustodyService {
     /// owner from lineage or a canonical fallback from a malformed tuple.
     pub(crate) fn reconcile_startup(store: &mut Store, sandbox_base: &Path) -> Result<()> {
         const STARTUP_GROUP_BATCH: usize = 64;
+        // Every aggregate reader below requires an allocation identity; a
+        // legacy row without one used to abort the whole restore (and with it
+        // restart-intent recovery) on every boot.
+        let repaired = store.repair_missing_custody_allocation_ids()?;
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                "Backfilled missing sandbox custody allocation identities from allocation events"
+            );
+        }
         // No provider has been restored yet. A crash after reservation but
         // before bind leaves a Starting child without custody; settle it
         // before aggregate classification sees its cached root as a rival.
@@ -1818,7 +1828,11 @@ impl CustodyService {
             }
             after = Some(last);
         }
-        Self::log_retained_unowned_diagnostics(store, sandbox_base)?;
+        // Diagnostics only: a failure here must not turn into a failed
+        // restore after every authoritative group reconciled.
+        if let Err(error) = Self::log_retained_unowned_diagnostics(store, sandbox_base) {
+            tracing::warn!(%error, "retained_unowned sandbox custody diagnostics skipped");
+        }
         Ok(())
     }
 
@@ -2782,7 +2796,7 @@ impl CustodyService {
                 "source-worktree settlement journal fences this sandbox execution".into(),
             ));
         }
-        let mut failure = |code| {
+        let failure = |code| {
             if record_failure {
                 match store.record_failed_revalidation_locked(
                     persisted.custody_id,

@@ -438,6 +438,7 @@ mod tests {
 
     // --- l2_normalize tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_unit_vector() {
         let mut v = vec![1.0, 0.0, 0.0];
@@ -447,6 +448,7 @@ mod tests {
         assert!(v[2].abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_unnormalized() {
         let mut v = vec![3.0, 4.0];
@@ -457,6 +459,7 @@ mod tests {
         assert!((v[1] - 0.8).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_zero_vector() {
         let mut v = vec![0.0, 0.0, 0.0];
@@ -464,6 +467,7 @@ mod tests {
         assert_eq!(v, vec![0.0, 0.0, 0.0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_near_zero() {
         let mut v = vec![1e-12, 1e-12];
@@ -472,6 +476,7 @@ mod tests {
         assert!(v[0].abs() < 1e-10);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_nan() {
         let mut v = vec![f32::NAN, 3.0, 4.0];
@@ -482,6 +487,7 @@ mod tests {
         assert!((v[2] - 0.8).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_inf() {
         let mut v = vec![f32::INFINITY, 3.0, 4.0];
@@ -490,6 +496,7 @@ mod tests {
         assert!((v[1] - 0.6).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_single_element() {
         let mut v = vec![5.0];
@@ -497,6 +504,7 @@ mod tests {
         assert!((v[0] - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_negative() {
         let mut v = vec![-3.0, -4.0];
@@ -505,6 +513,7 @@ mod tests {
         assert!((mag - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_empty() {
         let mut v: Vec<f32> = vec![];
@@ -512,6 +521,7 @@ mod tests {
         assert!(v.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_l2_normalize_magnitude_check() {
         let mut v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
@@ -522,22 +532,26 @@ mod tests {
 
     // --- parse_embedding_json tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_parse_embedding_json_valid() {
         let v = parse_embedding_json("[1.0, 2.0, 3.0]").unwrap();
         assert_eq!(v, vec![1.0, 2.0, 3.0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_parse_embedding_json_empty_string() {
         assert!(parse_embedding_json("").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_parse_embedding_json_invalid() {
         assert!(parse_embedding_json("not json").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_parse_embedding_json_empty_array() {
         let v = parse_embedding_json("[]").unwrap();
@@ -546,6 +560,7 @@ mod tests {
 
     // --- EmbeddingProviderResult tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_result_none_provider() {
         let r = EmbeddingProviderResult {
@@ -564,6 +579,7 @@ mod tests {
 
     // --- Factory tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_factory_none_mode() {
         let config = MemoryConfig {
@@ -576,6 +592,7 @@ mod tests {
         assert!(result.unavailable_reason.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_factory_auto_no_services() {
         let config = MemoryConfig {
@@ -590,6 +607,7 @@ mod tests {
         assert!(result.unavailable_reason.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_factory_unknown_provider() {
         let config = MemoryConfig {
@@ -635,6 +653,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn explicit_remote_openai_factory_metadata_is_policy_denied() {
         let config = MemoryConfig {
@@ -655,6 +674,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn remote_ollama_factory_attribution_is_policy_denied() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -704,6 +724,7 @@ mod tests {
 
     // --- MockEmbeddingProvider tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_mock_deterministic() {
         let mock = mock::MockEmbeddingProvider::new(8);
@@ -728,6 +749,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_mock_different_inputs() {
         let mock = mock::MockEmbeddingProvider::new(8);
@@ -752,6 +774,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_mock_fail_next() {
         let mock = mock::MockEmbeddingProvider::new(8);

@@ -170,6 +170,7 @@ fn inspect() -> Value {
         "events",
         "archive",
         "health",
+        "migration_allocations",
     ]);
     section["default"] = json!("overview");
     let mut limit = integer(1, 64);
@@ -585,6 +586,9 @@ fn update() -> Value {
         "dependency",
         "ownership",
         "migration",
+        "migration_seal",
+        "migration_seal_release",
+        "migration_seal_transfer",
         "migration_transfer",
         "migration_release",
         "request_review",
@@ -655,6 +659,46 @@ fn update() -> Value {
                     ("inventory_digest", string()),
                 ],
                 vec!["version", "baseline_commit", "inventory_digest"],
+            ),
+            "migration_seal" => (
+                vec![
+                    (
+                        "source_commit",
+                        json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+                    ),
+                    ("expires_at", json!({"type":"string","format":"date-time"})),
+                ],
+                vec!["source_commit", "expires_at"],
+            ),
+            "migration_seal_release" => (
+                vec![
+                    ("claim_id", uuid()),
+                    (
+                        "source_commit",
+                        json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+                    ),
+                ],
+                vec!["claim_id", "source_commit"],
+            ),
+            "migration_seal_transfer" => (
+                vec![
+                    ("claim_id", uuid()),
+                    (
+                        "source_commit",
+                        json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+                    ),
+                    (
+                        "new_source_commit",
+                        json!({"type":"string","pattern":"^[0-9a-f]{40}$"}),
+                    ),
+                    ("expires_at", json!({"type":"string","format":"date-time"})),
+                ],
+                vec![
+                    "claim_id",
+                    "source_commit",
+                    "new_source_commit",
+                    "expires_at",
+                ],
             ),
             "migration_transfer" | "migration_release" => (
                 vec![("version", integer(0, u32::MAX.into()))],

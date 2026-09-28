@@ -1,4 +1,6 @@
+[features]
+code_mode_host = true
+
 [mcp_servers.rust-analyzer]
-command = "/Users/jacobdevarennes/.cargo/bin/rust-analyzer-mcp"
-cwd = "/Users/jacobdevarennes/rsi"
+command = "rust-analyzer-mcp"
 startup_timeout_sec = 30

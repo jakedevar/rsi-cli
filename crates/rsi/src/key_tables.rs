@@ -237,6 +237,8 @@ pub enum GlobalGuard {
     UnobstructedSessionList,
     /// `Unobstructed` with any pane other than the session list focused.
     UnobstructedOtherPane,
+    /// `Unobstructed` with a session detail pane focused.
+    UnobstructedSessionDetail,
     /// `UnobstructedOtherPane`, except an Issues editor showing a stale-version
     /// conflict (which keeps Ctrl-L for its own reload).
     UnobstructedOtherPaneNoStaleIssueEditor,
@@ -254,6 +256,9 @@ impl GuardLabel for GlobalGuard {
             Self::Unobstructed => "normal mode, no overlay, not inserting",
             Self::UnobstructedSessionList => "session list focused (normal mode, no overlay)",
             Self::UnobstructedOtherPane => "other pane focused (normal mode, no overlay)",
+            Self::UnobstructedSessionDetail => {
+                "session detail focused (normal mode, no overlay, not inserting)"
+            }
             Self::UnobstructedOtherPaneNoStaleIssueEditor => {
                 "other pane focused (normal mode, no overlay; not a stale Issues editor)"
             }
@@ -282,6 +287,8 @@ pub enum GlobalEffect {
     ResetOverlayGeometry,
     GrowSidebar,
     ShrinkSidebar,
+    /// Move the session-detail transcript column left (-1) or right (+1).
+    NudgeDetailColumn(i8),
     NextEvent,
     PrevEvent,
 }
@@ -435,6 +442,18 @@ pub static GLOBAL_KEY_INTERCEPTS: &[KeyEntry<GlobalGuard, GlobalEffect>] = &[
         guard: GlobalGuard::NormalNoOverlay,
         effect: GlobalEffect::ShrinkSidebar,
         label: "narrow the session-list sidebar",
+    },
+    KeyEntry {
+        chord: code(KeyCode::Left, ModMatch::Exact(CTRL), "Ctrl-Left"),
+        guard: GlobalGuard::UnobstructedSessionDetail,
+        effect: GlobalEffect::NudgeDetailColumn(-1),
+        label: "move the transcript column left (snaps to Left Aligned at the edge)",
+    },
+    KeyEntry {
+        chord: code(KeyCode::Right, ModMatch::Exact(CTRL), "Ctrl-Right"),
+        guard: GlobalGuard::UnobstructedSessionDetail,
+        effect: GlobalEffect::NudgeDetailColumn(1),
+        label: "move the transcript column right (unsnaps Left Aligned)",
     },
     KeyEntry {
         chord: code(KeyCode::Left, ModMatch::Exact(CTRL), "Ctrl-Left"),

@@ -104,16 +104,17 @@ fn manager(config: &HarnessManagerConfigV1) -> Uuid {
     config.current_session_id.unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_recovery_fail_closed_by_default() {
-    let variants: [(ManagerPolicyV2, bool, &str); 5] = [
-        (ManagerPolicyV2::default(), true, SEAT_DISABLED_REASON),
+    let variants: [(ManagerPolicyV2, bool, &str); 4] = [
+        (ManagerPolicyV2::default(), false, SEAT_DISABLED_REASON),
         (
             ManagerPolicyV2 {
                 mode: ManagerOperatingModeV2::Status,
                 ..execute(2, 5)
             },
-            true,
+            false,
             "manager_seat_recovery_requires_execute",
         ),
         (
@@ -121,7 +122,7 @@ fn seat_recovery_fail_closed_by_default() {
                 mode: ManagerOperatingModeV2::Monitor,
                 ..execute(2, 5)
             },
-            true,
+            false,
             "manager_seat_recovery_requires_execute",
         ),
         (
@@ -129,10 +130,9 @@ fn seat_recovery_fail_closed_by_default() {
                 paused: true,
                 ..execute(2, 5)
             },
-            true,
+            false,
             "manager_v2_policy_paused",
         ),
-        (execute(2, 5), false, "manager_v2_retry_disabled"),
     ];
     for (policy, retry, reason) in variants {
         let store = Store::open_in_memory().unwrap();
@@ -161,6 +161,7 @@ fn seat_recovery_fail_closed_by_default() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_recovery_backoff_and_budget_exhaust_typed() {
     assert_eq!(seat_backoff(10, 1), Duration::seconds(10));
@@ -171,7 +172,7 @@ fn seat_recovery_backoff_and_budget_exhaust_typed() {
     let tip = manager(&config);
     fail(&store, tip);
     let t0 = Utc::now();
-    let first = pass(&store, config.project_id, true, t0);
+    let first = pass(&store, config.project_id, false, t0);
     assert_eq!(first.claim, None);
     let (level, message) = first.notice.unwrap();
     assert_eq!(level, "error");
@@ -180,10 +181,10 @@ fn seat_recovery_backoff_and_budget_exhaust_typed() {
     assert_eq!(scheduled.state, ManagerSeatConditionV1::Recovering);
     assert_eq!(scheduled.not_before, Some(t0 + Duration::seconds(10)));
     assert_eq!(
-        pass(&store, config.project_id, true, t0 + Duration::seconds(9)).claim,
+        pass(&store, config.project_id, false, t0 + Duration::seconds(9)).claim,
         None
     );
-    let claim = pass(&store, config.project_id, true, t0 + Duration::seconds(10))
+    let claim = pass(&store, config.project_id, false, t0 + Duration::seconds(10))
         .claim
         .unwrap();
     assert_eq!(
@@ -234,6 +235,7 @@ fn seat_recovery_backoff_and_budget_exhaust_typed() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_aborted_streaming_resume_is_transient_and_retried() {
     let store = Store::open_in_memory().unwrap();
@@ -262,6 +264,7 @@ fn seat_aborted_streaming_resume_is_transient_and_retried() {
     assert_eq!((claim.tip_session_id, claim.attempt), (tip, 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_recovery_respects_human_gate_and_spend_hold() {
     let store = Store::open_in_memory().unwrap();
@@ -291,6 +294,7 @@ fn seat_recovery_respects_human_gate_and_spend_hold() {
     assert_eq!(attempts(&store, config.project_id), Vec::new());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_recovery_restart_marks_running_claim_uncertain() {
     let store = Store::open_in_memory().unwrap();
@@ -340,6 +344,7 @@ fn seat_recovery_restart_marks_running_claim_uncertain() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_state_clears_only_on_provider_output() {
     let store = Store::open_in_memory().unwrap();
@@ -365,6 +370,7 @@ fn seat_state_clears_only_on_provider_output() {
     assert_eq!(state.reason, "provider_output_observed");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_inbox_and_reply_receipt_show_manager_seat_down() {
     let store = Store::open_in_memory().unwrap();
@@ -377,6 +383,7 @@ fn lead_inbox_and_reply_receipt_show_manager_seat_down() {
                 epic_id: config.epic_ids[0],
                 message: "Report status".into(),
                 idempotency_key: "seat-request".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -396,6 +403,7 @@ fn lead_inbox_and_reply_receipt_show_manager_seat_down() {
                 request_id: request.message_id,
                 message: "Done; evidence in the handoff".into(),
                 idempotency_key: "seat-reply".into(),
+                still_running: false,
             },
         )
         .unwrap();
@@ -405,6 +413,7 @@ fn lead_inbox_and_reply_receipt_show_manager_seat_down() {
     assert_eq!(seat.reason, SEAT_DISABLED_REASON);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn new_tip_resets_seat_budget() {
     let store = Store::open_in_memory().unwrap();
@@ -448,6 +457,7 @@ fn new_tip_resets_seat_budget() {
     assert_eq!((claim.tip_session_id, claim.attempt), (next.id, 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_classifier_is_live_only_on_output_after_evidence() {
     let now = Utc::now();
@@ -485,6 +495,7 @@ fn seat_classifier_is_live_only_on_output_after_evidence() {
 /// Round 2 (blocked_claim_stalls): a claim refused because the tip was busy
 /// is charged, so the next Failed turn claims a fresh `seat:<tip>:<n+1>` key
 /// and the budget still exhausts deterministically.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_busy_refusal_is_charged_and_later_failed_turn_claims_fresh_key() {
     let store = Store::open_in_memory().unwrap();
@@ -533,6 +544,7 @@ fn seat_busy_refusal_is_charged_and_later_failed_turn_claims_fresh_key() {
 /// Round 2 (appserver_new_row): a tip K13's shared predicate marks
 /// non-resumable is never claimed; the seat records a typed unavailable
 /// outcome with an operator/manager retry-or-replace next action.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_codex_appserver_tip_records_recovery_unavailable() {
     let store = Store::open_in_memory().unwrap();

@@ -3135,6 +3135,7 @@ mod tests {
             .join("\n")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_cursor_rejects_tamper_cross_repository_and_oversize() {
         let store = Store::open_in_memory().expect("open V120 store");
@@ -3167,6 +3168,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_cursor_authenticates_before_decode_and_rejects_noncanonical_claims_and_fences() {
         let store = Store::open_in_memory().expect("open V120 cursor store");
@@ -3264,6 +3266,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_snapshot_page_uses_repository_keyset_index() {
         let directory = tempfile::tempdir().expect("create V120 test directory");
@@ -3295,6 +3298,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_snapshot_pages_513_roots_with_finite_upper_and_late_page_evidence() {
         let directory = tempfile::tempdir().expect("create V120 snapshot fixture");
@@ -3400,6 +3404,7 @@ mod tests {
         assert_eq!(evidence.scheduled_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_snapshot_capture_excludes_concurrent_lower_keys_consistently() {
         let directory = tempfile::tempdir().expect("create concurrent snapshot fixture");
@@ -3489,6 +3494,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_explain_uses_targeted_prefix_exact_cwd_and_ref_indexes() {
         let store = Store::open_in_memory().expect("open V120 EXPLAIN store");
@@ -3554,6 +3560,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_session_health_projection_is_guarded_and_tracks_source_evidence() {
         let directory = tempfile::tempdir().expect("create Session health fixture");
@@ -3650,6 +3657,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_candidate_is_exact_and_participant_overflow_retains_event_chain() {
         let directory = tempfile::tempdir().expect("create V120 candidate fixture");
@@ -3857,6 +3865,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_targeted_dependencies_cover_paths_aliases_links_and_health() {
         let directory = tempfile::tempdir().expect("create V120 dependency fixture");
@@ -4170,6 +4179,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_fresh_path_health_rejects_inward_repoints_and_missing_projection() {
         let directory = tempfile::tempdir().expect("create inward-repoint fixture");
@@ -4396,6 +4406,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn source_worktree_fresh_path_health_pages_and_refuses_each_class_over_ceiling() {
         let directory = tempfile::tempdir().expect("create dependency-health bound fixture");
@@ -4516,6 +4527,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_projection_refresh_fault_rolls_back_every_transactional_writer() {
         let directory = tempfile::tempdir().expect("create V120 writer fixture");
@@ -4649,6 +4661,7 @@ mod tests {
         assert_eq!(after_recovery, before_recovery);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_startup_reconcile_prioritizes_enabled_jobs_over_disabled_history() {
         let store = Store::open_in_memory().expect("open V120 reconcile fixture");
@@ -4698,6 +4711,7 @@ mod tests {
         assert_eq!(disabled_unverified, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_migration_failpoints_rollback_exact_v119_and_allow_fresh_cycles() {
         let store = Store::open_in_memory().expect("open V120 migration fixture");
@@ -4808,6 +4822,7 @@ mod tests {
         assert_eq!(cycles, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v120_disk_reopen_preserves_secret_and_cursor_and_refuses_catalog_poison() {
         let directory = tempfile::tempdir().expect("create disk-backed V120 fixture");

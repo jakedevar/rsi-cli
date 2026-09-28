@@ -180,11 +180,11 @@ pub fn render_keybindings_help(
             HelpView::Contextual => format!(" Context Help — {} ", origin.title()),
             HelpView::All => format!(
                 " All Commands ({}) ",
-                crate::action_registry::ACTION_DESCRIPTORS.len()
+                crate::action_registry::all_commands_descriptor_count()
             ),
         })
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::focused_border()))
+        .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::semantic_color(
             crate::ui::theme_roles::ThemeRole::ElevatedSurface,
         )));
@@ -250,9 +250,12 @@ mod tests {
             .count();
         assert_eq!(
             descriptor_rows,
-            crate::action_registry::ACTION_DESCRIPTORS.len()
+            crate::action_registry::all_commands_descriptor_count()
         );
-        for descriptor in crate::action_registry::ACTION_DESCRIPTORS {
+        for descriptor in crate::action_registry::ACTION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.id != crate::action_registry::ActionId::OpenRecentFile)
+        {
             assert!(
                 text.contains(descriptor.label),
                 "missing {:?}",

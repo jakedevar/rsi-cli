@@ -669,6 +669,7 @@ mod p2_07_gate_permit_spine {
     // It is kept because it pins the durable consequence, not because it is
     // independent evidence.
     // ---------------------------------------------------------------------
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn request_wins_and_terminal_wins_use_the_same_open_gate_cas() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7238,6 +7239,7 @@ mod p2_07_gate_permit_spine {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_decodes_supported_static_writer_spellings() {
         let fixture = r###"
@@ -7333,6 +7335,7 @@ mod p2_07_gate_permit_spine {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_rejects_dynamic_protected_write_construction() {
         let fixture = r#"
@@ -7392,6 +7395,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_rejects_opaque_suffixes_after_safe_statement_prefixes() {
         let fixture = r#"
@@ -7431,6 +7435,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_requires_an_exact_static_gate_state_rhs() {
         let fixture = r#"
@@ -7484,6 +7489,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_expands_invoked_item_macros_but_ignores_inert_definitions() {
         let fixture = r#"
@@ -7523,6 +7529,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_visits_trait_defaults_but_not_declaration_only_methods() {
         let fixture = r#"
@@ -7549,6 +7556,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_expands_invoked_nonempty_local_macros_in_all_positions() {
         let fixture = r#"
@@ -7626,6 +7634,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_tracks_rusqlite_function_aliases_batch_and_raw_ffi() {
         let fixture = r#"
@@ -7692,6 +7701,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_requires_rusqlite_provenance_for_same_named_apis() {
         let fixture = r#"
@@ -7736,6 +7746,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_resolves_qualified_collisions_independently_of_module_order() {
         fn fixture(first: &str, second: &str) -> String {
@@ -7788,6 +7799,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_counts_replace_and_insert_or_replace_as_permit_writers() {
         let fixture = r#"
@@ -7823,6 +7835,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_tracks_or_invalidates_mutated_sql_bindings() {
         let fixture = r#"
@@ -7869,6 +7882,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_ignores_inert_comments_strings_and_the_structural_test_module() {
         let fixture = r###"
@@ -7903,6 +7917,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_discovers_crate_sources_deterministically_and_structurally() {
         let root = tempfile::tempdir().expect("create scanner source root");
@@ -7991,6 +8006,7 @@ mod p2_07_gate_permit_spine {
         assert!(utf8_error.contains("UTF-8 decode"), "{utf8_error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_preserves_source_graph_reachability_cfg_and_logical_scope() {
         let root = tempfile::tempdir().expect("create scanner graph root");
@@ -8072,6 +8088,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_enumerates_production_cfg_attr_path_routes() {
         let root = tempfile::tempdir().expect("create cfg_attr source tree");
@@ -8147,6 +8164,7 @@ mod p2_07_gate_permit_spine {
         assert!(!scan.sources.contains(&"test-only.inc".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_expands_executable_include_with_lexical_state() {
         let root = tempfile::tempdir().expect("create executable include source tree");
@@ -8208,6 +8226,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_enforces_crate_wide_executable_include_source_ceiling() {
         let root = tempfile::tempdir().expect("create source-ceiling tree");
@@ -8245,6 +8264,7 @@ mod p2_07_gate_permit_spine {
         assert_eq!(scan.executable_include_bytes, expected_bytes);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_latches_crate_wide_executable_include_byte_ceiling() {
         let root = tempfile::tempdir().expect("create byte-ceiling tree");
@@ -8310,6 +8330,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_latches_checked_add_overflow_before_later_reads() {
         let root = tempfile::tempdir().expect("create overflow-latch tree");
@@ -8341,6 +8362,7 @@ mod p2_07_gate_permit_spine {
         assert_eq!(context.bytes, usize::MAX);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_preserves_terminal_byte_latch_across_all_visitor_families() {
         let root = tempfile::tempdir().expect("create visitor-latch tree");
@@ -8397,6 +8419,7 @@ mod p2_07_gate_permit_spine {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_deduplicates_cached_includes_without_losing_caller_context() {
         let root = tempfile::tempdir().expect("create include-cache tree");
@@ -8453,6 +8476,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_shares_include_budget_with_nested_and_macro_created_visitors() {
         let root = tempfile::tempdir().expect("create visitor-family tree");
@@ -8506,6 +8530,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_keeps_cached_include_cycles_depth_and_failures_fail_closed() {
         let root = tempfile::tempdir().expect("create include-failure tree");
@@ -8561,6 +8586,7 @@ mod p2_07_gate_permit_spine {
         assert!(scan.report.writers.is_empty(), "{scan:#?}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_normalizes_raw_typed_and_wrapped_callable_aliases() {
         macro_rules! compiled_scanner_fixture {
@@ -8634,6 +8660,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_resolves_relative_imports_from_logical_module_scope() {
         let root = tempfile::tempdir().expect("create relative-import source tree");
@@ -8692,6 +8719,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_rejects_source_nesting_before_recursive_cfg_walk() {
         let ignored_braces = "{".repeat(MAX_SOURCE_DEPTH + 32);
@@ -8732,6 +8760,7 @@ mod p2_07_gate_permit_spine {
         assert!(error.contains("token nesting exceeds"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_isolates_distinct_crate_root_catalogs() {
         let root = tempfile::tempdir().expect("create multi-root source tree");
@@ -8773,6 +8802,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_unions_absolute_path_edges_and_rejects_escape_or_symlink_targets() {
         let root = tempfile::tempdir().expect("create absolute-path source tree");
@@ -8840,6 +8870,7 @@ mod p2_07_gate_permit_spine {
         assert!(error.contains("source symlink"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_tracks_alias_returns_wrappers_callable_assignments_and_method_mutation() {
         let fixture = r#"
@@ -8908,6 +8939,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_expands_indirect_macros_and_scans_executable_constants() {
         let fixture = r#"
@@ -8958,6 +8990,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_preserves_whole_sql_alternatives_and_rejects_protected_overflow() {
         for count in [65usize, 513] {
@@ -9032,6 +9065,7 @@ mod p2_07_gate_permit_spine {
     /// when its own terminal segment equals the query's, so the two must agree
     /// on every query — including the ones that resolve through a shorter
     /// suffix, land on an overloaded key, or find nothing at all.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_symbol_map_terminal_index_matches_linear_suffix_sweep() {
         fn linear_sweep<'a>(
@@ -9132,6 +9166,7 @@ mod p2_07_gate_permit_spine {
     /// Mutation sensitivity for the `SymbolMap` resolution memo: a frozen table
     /// must answer a repeated query exactly as the uncached walk does, on both
     /// the recording probe and every later hit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_symbol_map_memo_agrees_with_uncached_resolution() {
         let mut map = SymbolMap::<&'static str>::default();
@@ -9196,6 +9231,7 @@ mod p2_07_gate_permit_spine {
     /// Mutation sensitivity for the helper-resolution memo, exercised through a
     /// catalog with import aliases, a scope-shadowed name and an overloaded
     /// method so the memo cannot pass by only ever seeing misses.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_helper_memo_agrees_with_uncached_resolution() {
         let fixture = r###"
@@ -9279,6 +9315,7 @@ mod p2_07_gate_permit_spine {
     /// directly: a full capture map and one restricted to
     /// `format_capture_names` must interpolate identically, and the restriction
     /// must actually be dropping entries.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_format_capture_names_match_interpolation() {
         let full: std::collections::HashMap<String, SqlValue> = [
@@ -9345,6 +9382,7 @@ mod p2_07_gate_permit_spine {
     /// have exactly one production writer, owned by their approved Store
     /// methods. The permit half is load-bearing: its counter bump is the
     /// admission fence and no trigger can repair an uncoupled second insert.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn exactly_one_production_writer_of_gate_closing_and_effect_permits() {
         let crate_scan = scan_crate_production_writers(
@@ -9396,6 +9434,7 @@ mod p2_07_gate_permit_spine {
     // database object anywhere re-encodes it. The closing half is pure
     // primary-key matching, equally trigger-free.
     // ---------------------------------------------------------------------
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn wrong_or_missing_provider_turn_cannot_admit_request_or_close_gate() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -9480,6 +9519,7 @@ mod p2_07_gate_permit_spine {
     // permit inserts, the request reaches `handler_started`, and a new
     // external effect starts after the terminal already won.
     // ---------------------------------------------------------------------
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn started_tool_joins_before_terminal_release() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -9643,6 +9683,7 @@ mod p2_07_gate_permit_spine {
     // second call becomes an `Err`, so the assertion fails — but the refusal
     // itself is constraint-assisted rather than purely Store-owned.
     // ---------------------------------------------------------------------
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn restart_joins_old_boot_task_without_replaying_effect() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -9716,6 +9757,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_malformed_key_repair_rejects_invalid_requested_keys_before_query() {
         let store = Store::open_in_memory().expect("open empty V81 store");
@@ -9795,6 +9837,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_malformed_key_repair_rejects_schema_bypassed_durable_keys() {
         let (attempt_store, attempt_world, generation, attempt_row) = schema_bypassed_gate_key_row(
@@ -9882,6 +9925,7 @@ mod p2_07_gate_permit_spine {
         assert!(oversized_error.contains("raw UTF-8 byte length 513"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_malformed_key_repair_rejects_bad_uuids_and_decoder_key_mismatches() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -9986,6 +10030,7 @@ mod p2_07_gate_permit_spine {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_exact_gate_read_preserves_state_counters_and_full_key_isolation() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -10125,6 +10170,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_exact_gate_read_rejects_malformed_durable_facts() {
         let malformed_state_store = Store::open_in_memory().expect("open V81 store");
@@ -10233,6 +10279,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_release_verdict_releases_empty_and_fully_resolved_invocations() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -10297,6 +10344,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_release_verdict_reports_exact_gate_only_permit_only_and_mixed_counts() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -10496,6 +10544,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_release_verdict_isolates_delivery_model_invocations() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -10551,6 +10600,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_malformed_key_repair_point_query_searches_complete_primary_key_under_skew() {
         let store = Store::open_in_memory().expect("open live V81 schema");
@@ -10603,6 +10653,7 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn p2_07_u3_release_count_queries_search_the_v81_indexes() {
         let store = Store::open_in_memory().expect("open live V81 schema");
@@ -10635,6 +10686,7 @@ mod p2_07_gate_permit_spine {
 /// This drives the real `Store::claim_agent_message_exact` against a store
 /// migrated through the production `Store::open_in_memory` path, on messages
 /// accepted through the real P2-03 acceptance transaction.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn claim_requires_session_status_invocation_and_generation_cas() {
     // ---- a stale STATUS loses, and writes nothing ------------------------
@@ -10911,6 +10963,7 @@ fn claim_requires_session_status_invocation_and_generation_cas() {
 
 /// C-P2-19: an existing ENABLED watch on the same natural key deduplicates
 /// rather than accumulating a second row, and the claim still commits.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn claim_watch_arm_deduplicates_on_the_exact_owner_and_tip_natural_key() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -10970,6 +11023,7 @@ fn claim_watch_arm_deduplicates_on_the_exact_owner_and_tip_natural_key() {
 /// C-P2-19: a DISABLED watch row is history, not an arm. A claim must insert a
 /// fresh enabled row rather than treating a consumed watch as satisfying the
 /// obligation — a disabled row will never fire again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn claim_watch_arm_does_not_accept_disabled_history_as_armed() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11039,6 +11093,7 @@ fn claim_watch_arm_does_not_accept_disabled_history_as_armed() {
 /// A message whose target is a live spawn RESERVATION with no Session row yet
 /// cannot be claimed: there is no tip to deliver to, and the claim must lose
 /// cleanly rather than inventing one.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn claim_against_a_reserved_target_without_a_session_row_loses_cleanly() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11181,6 +11236,7 @@ fn attempt_seal(store: &Store, message_id: Uuid, attempt_number: u32) -> Attempt
 /// aggregate CAS that a crash could strand. The requeued message is then
 /// claimable again as attempt 2, and the pointer stays on the sealed attempt
 /// until that next claim moves it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn no_effect_settlement_and_requeue_are_one_crash_atomic_transaction() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11294,6 +11350,7 @@ fn no_effect_settlement_and_requeue_are_one_crash_atomic_transaction() {
 
 /// C-P2-21: a stale fence writes nothing. Only the exact attempt that was
 /// claimed may record its admission.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn admission_recording_requires_the_exact_attempt_fence() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11349,6 +11406,7 @@ fn admission_recording_requires_the_exact_attempt_fence() {
 
 /// P2-04: an admitted result moves the attempt to `effect_possible` and the
 /// aggregate `claimed → injected`, filling the durable boundary value.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn admitted_effect_possible_moves_the_aggregate_to_injected() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11421,6 +11479,7 @@ fn admitted_effect_possible_moves_the_aggregate_to_injected() {
 
 /// P2-04: `unsupported` seals its own disposition and fails the aggregate. It
 /// must never masquerade as a retryable rejection.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn unsupported_admission_seals_unsupported_and_fails_the_aggregate() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11526,6 +11585,7 @@ fn claimed_fixture_expiring(
 /// at the schema level by
 /// `p202_agent_message_transitions_v81_coherence`. This test pins that the
 /// production WRITER actually produces that shape, which no schema test can.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_claimed_message_expires_only_by_sealing_its_attempt_proved_no_effect() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11617,6 +11677,7 @@ fn a_claimed_message_expires_only_by_sealing_its_attempt_proved_no_effect() {
 
 /// P2-04: a caller may not expire a message whose durable expiry has not
 /// passed. Expiry is a property of the row, not of the dispatcher's opinion.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn expiry_disposition_requires_a_durably_passed_expiry() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11678,6 +11739,7 @@ fn aggregate_state(store: &Store, message_id: Uuid) -> (String, i64, Option<Stri
 /// P2-04: acknowledging an INJECTED attempt inserts the real provider event,
 /// fills the acknowledgement triple against that exact event, seals the attempt,
 /// and CASes the aggregate — all in one transaction.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn acknowledgement_seals_the_attempt_against_the_real_provider_event() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11794,6 +11856,7 @@ fn acknowledgement_seals_the_attempt_against_the_real_provider_event() {
 /// P2-04: acknowledging a still-CLAIMED attempt atomically fills the
 /// admitted/effect-possible evidence, because the provider response IS the
 /// proof the effect happened.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn acknowledging_a_claimed_attempt_fills_admission_evidence_atomically() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11868,6 +11931,7 @@ fn acknowledging_a_claimed_attempt_fills_admission_evidence_atomically() {
 }
 
 /// P2-04: a daemon-created user/injection event is never acknowledgement proof.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_user_injection_event_is_never_acknowledgement_proof() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11915,6 +11979,7 @@ fn a_user_injection_event_is_never_acknowledgement_proof() {
 
 /// P2-04: the acknowledging event must live on the exact delivery Session, and
 /// the Session must still be running the exact invocation the attempt claimed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn acknowledgement_requires_the_exact_delivery_session_and_live_invocation() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -11989,6 +12054,7 @@ fn acknowledgement_requires_the_exact_delivery_session_and_live_invocation() {
 /// P2-04: a proved rejection may also settle PERMANENTLY. The attempt seals
 /// `proved_no_effect_failed` and the aggregate carries its safe error class,
 /// with no requeue and therefore no second external call.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn proved_rejection_can_settle_permanently_failed_without_requeue() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12059,6 +12125,7 @@ fn proved_rejection_can_settle_permanently_failed_without_requeue() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn selected_payload_reaches_a_provider_only_through_the_neutralizing_wrapper() {
     // H21-P2-INT-REV-001 goes live the moment anything renders delivered mail
@@ -12160,6 +12227,7 @@ fn selected_payload_reaches_a_provider_only_through_the_neutralizing_wrapper() {
 /// `DispatchGrantRequest` keeps its payload private and exposes exactly one
 /// rendering method, so there is no accessor a delivery author could reach for
 /// instead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn dispatcher_grant_request_cannot_emit_an_unneutralized_payload() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12257,6 +12325,7 @@ fn expected_fifo_order(store: &Store) -> Vec<Uuid> {
     ids
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn dispatch_selection_is_fifo_bounded_and_resumable_by_keyset() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12354,6 +12423,7 @@ fn dispatch_selection_is_fifo_bounded_and_resumable_by_keyset() {
 /// the *identity's* contract before the claim path consumes it: non-nil,
 /// stable, per-incarnation, and — the load-bearing part — a witness genuinely
 /// SEPARATE from the ProgramRun kernel's boot id despite sharing its shape.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn the_delivery_boot_identity_is_non_nil_stable_and_not_the_program_run_witness() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12429,6 +12499,7 @@ fn the_delivery_boot_identity_is_non_nil_stable_and_not_the_program_run_witness(
 /// hold two `Store`s over one database file. That stronger property is pinned by
 /// [`the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity`] below,
 /// through the production seeder. Both are wanted; only the pair is sufficient.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn separate_stores_do_not_share_a_delivery_boot_identity() {
     let first = Store::open_in_memory().expect("open V81 store");
@@ -12465,6 +12536,7 @@ fn separate_stores_do_not_share_a_delivery_boot_identity() {
 /// The seam under test is the real `SessionManager::new`, and the handle read is
 /// the very `Arc<Mutex<Store>>` the monitor locks at its result boundary
 /// (`monitor.rs:2296`) — not a fresh `Store` that merely resembles it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity() {
     use crate::bus::EventBus;
@@ -12550,6 +12622,7 @@ async fn the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity() {
 /// against hand-built pages; nothing proved the real
 /// `list_dispatchable_agent_messages` keyset walk actually carries the pull to
 /// its tip. This closes that gap end to end.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn boundary_pull_pages_past_the_scan_bound_to_reach_its_tip() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12689,6 +12762,7 @@ fn boundary_pull_pages_past_the_scan_bound_to_reach_its_tip() {
 /// Until this test, invariant 5 was pinned only at `reduce_dispatchable_page`
 /// (mutation M-C). Nothing pinned it at `decide_next_boundary`, which is the
 /// function that owns the page walk.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_page_two_row_cannot_forge_a_new_root_head_at_the_production_boundary() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -12799,6 +12873,7 @@ fn a_page_two_row_cannot_forge_a_new_root_head_at_the_production_boundary() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn dispatch_selection_pins_status_and_generation_as_separate_guards() {
     // This test exists because `delivery_session_generation` is sourced from
@@ -13127,6 +13202,7 @@ fn correlation_row(
 /// 3. **Across restart** — a brand-new plane, reconciled from durable storage
 ///    alone, still finds both attempts sealed, still consumes their capacity,
 ///    and does NOT report them as lost evidence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn global_quarantine_caps_seal_once_across_sessions_and_restart() {
     use crate::app_server_control::{AppServerControlPlane, QuarantineSealReason};
@@ -13272,6 +13348,7 @@ async fn global_quarantine_caps_seal_once_across_sessions_and_restart() {
 
 /// C-P2-15: an in-memory latch lost to a crash must not resurrect as a false
 /// terminal fact, and an attempt still pending at restart seals exactly once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn a_latch_lost_to_a_crash_seals_once_and_never_becomes_provider_death() {
     use crate::app_server_control::AppServerControlPlane;
@@ -13331,6 +13408,7 @@ async fn a_latch_lost_to_a_crash_seals_once_and_never_becomes_provider_death() {
 /// C-P2-15: a durably CORRELATED attempt is strictly stronger than a pre-ack
 /// seal. The forward-only V81 trigger refuses the seal, and the worker must
 /// treat that refusal as authority — not retry it forever, and never loosen it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn a_correlated_attempt_supersedes_a_pending_seal_instead_of_being_overwritten() {
     use crate::app_server_control::{AppServerControlPlane, QuarantineSealReason};
@@ -13424,6 +13502,7 @@ async fn a_correlated_attempt_supersedes_a_pending_seal_instead_of_being_overwri
 /// returns, AND whether the logical root is grantable again afterwards. The
 /// second half is what makes this a statement about production arbitration
 /// rather than about a local `Option`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn the_monitors_hold_decision_retains_a_grant_only_on_a_dispatched_delivery() {
     use crate::session::agent_message_delivery::IdleBoundaryDelivery;
@@ -13757,6 +13836,7 @@ fn issue_46_assert_recovery_pending(eligibility: AgentMessageDispatchEligibility
 ///
 /// The population is deliberately one more than a page, so a worker that
 /// stopped after its first page could not pass by accident.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn reconciliation_drains_a_more_than_one_page_crashed_population_in_one_pass() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -13891,6 +13971,7 @@ fn reconciliation_drains_a_more_than_one_page_crashed_population_in_one_pass() {
 /// **Every assertion is on a DERIVED quantity**, never on the page and error
 /// counts R11 happened to observe. A test that hardcoded either tree's literals
 /// would prove nothing about the code that ships.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_persistently_erroring_crash_population_is_still_walked_to_its_end_by_the_cursor() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -14064,6 +14145,7 @@ fn a_persistently_erroring_crash_population_is_still_walked_to_its_end_by_the_cu
 /// or retries a stranded row. It runs a `claimed` row and a `dispatching` row
 /// side by side in ONE pass, so it also proves the discrimination is per row and
 /// not an all-or-nothing posture.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn reconciliation_strands_a_dispatching_attempt_and_never_requeues_it() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -14150,6 +14232,7 @@ fn reconciliation_strands_a_dispatching_attempt_and_never_requeues_it() {
 /// One page per drain over a 65-row population, so the first pass provably
 /// cannot finish. It must report the truncation rather than exhaustion, and the
 /// second pass must complete the population.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn reconciliation_is_bounded_per_pass_and_still_drains_across_passes() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -14225,6 +14308,7 @@ fn reconciliation_is_bounded_per_pass_and_still_drains_across_passes() {
 
 /// Issue #46 Phase A: every non-deliverable terminal status settles with the
 /// same safe aggregate and immutable NULL-attempt ledger shape.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_all_terminal_statuses_settle_with_exact_null_attempt_evidence() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14297,6 +14381,7 @@ fn issue_46_all_terminal_statuses_settle_with_exact_null_attempt_evidence() {
 
 /// Live delivery states and a legitimate reserved child are not terminal
 /// evidence and must remain queued without making a pass look productive.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_live_and_reserved_targets_remain_queued() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14381,6 +14466,7 @@ fn issue_46_live_and_reserved_targets_remain_queued() {
 }
 
 /// A passed acceptance deadline wins even when the delivery tip is terminal.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_expired_terminal_mail_takes_expiry_not_failure() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14441,6 +14527,7 @@ fn issue_46_expired_terminal_mail_takes_expiry_not_failure() {
 /// A terminal root is only advisory: a live rotated tip remains Ready, and a
 /// successor inserted after selection but before the writer runs is re-resolved
 /// and refuses stale terminal settlement.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_live_rotation_tip_and_stale_terminal_selection_remain_queued() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14505,6 +14592,7 @@ fn issue_46_live_rotation_tip_and_stale_terminal_selection_remain_queued() {
 
 /// Repeated passes and reopening durable storage cannot duplicate the terminal
 /// aggregate transition or manufacture an attempt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_second_pass_and_reopen_replay_are_idempotent() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -14559,6 +14647,7 @@ fn issue_46_second_pass_and_reopen_replay_are_idempotent() {
 
 /// A queued aggregate may retain a historical sealed-requeue pointer. Terminal
 /// settlement preserves that evidence and still writes a NULL-attempt edge.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_terminal_settlement_preserves_historical_attempt_pointer() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14612,6 +14701,7 @@ fn issue_46_terminal_settlement_preserves_historical_attempt_pointer() {
 
 /// Claimed, dispatching, and admitted effect-possible custody are outside this
 /// queued-only writer even when their target Sessions become terminal.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_claimed_dispatching_and_effect_possible_custody_is_untouched() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14677,6 +14767,7 @@ fn issue_46_claimed_dispatching_and_effect_possible_custody_is_untouched() {
 
 /// Healthy rows filling the first keyset page cannot starve expired and
 /// terminal rows on the next page; report counts and exhaustion are exact.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_bounded_scan_reaches_expired_and_terminal_rows_behind_healthy_mail() {
     let store = Store::open_in_memory().expect("open V81 store");
@@ -14745,6 +14836,7 @@ fn issue_46_bounded_scan_reaches_expired_and_terminal_rows_behind_healthy_mail()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_settles_once() {
     for suppress_and_exhaust in [false, true] {
@@ -14872,6 +14964,7 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_retry_admission_follows_the_true_successor_without_premature_failure() {
     let store = Store::open_in_memory().expect("open retry fixture");
@@ -14952,6 +15045,7 @@ fn issue_46_retry_admission_follows_the_true_successor_without_premature_failure
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_open_capacity_owner_holds_across_reopen_and_exact_replay() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -15100,6 +15194,7 @@ fn issue_46_open_capacity_owner_holds_across_reopen_and_exact_replay() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_capacity_scope_and_live_delivery_matrix() {
     {
@@ -15309,6 +15404,7 @@ fn issue_46_capacity_scope_and_live_delivery_matrix() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_writer_rechecks_recovery_ownership_after_selection() {
     {
@@ -15400,6 +15496,7 @@ fn issue_46_writer_rechecks_recovery_ownership_after_selection() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_96_link_lineage_finds_live_and_terminal_true_tips() {
     let store = Store::open_in_memory().expect("open deep-lineage fixture");
@@ -15498,6 +15595,7 @@ fn issue_46_96_link_lineage_finds_live_and_terminal_true_tips() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_lineage_cycle_corruption_fails_closed_in_selection_and_writer() {
     let store = Store::open_in_memory().expect("open cycle fixture");
@@ -15573,6 +15671,7 @@ fn issue_46_lineage_cycle_corruption_fails_closed_in_selection_and_writer() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_recovery_pending_rows_preserve_pagination_and_accounting() {
     let store = Store::open_in_memory().expect("open recovery pagination fixture");
@@ -15667,6 +15766,7 @@ fn issue_46_recovery_pending_rows_preserve_pagination_and_accounting() {
 /// belongs exclusively to `record_agent_message_admission`. A second writer for
 /// that edge would race its `expires_at` precondition, so this asserts the
 /// worker leaves a durably-expired CLAIMED message strictly alone.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn reconciliation_expires_only_queued_messages_past_their_acceptance_deadline() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -15785,6 +15885,7 @@ fn reconciliation_expires_only_queued_messages_past_their_acceptance_deadline() 
 /// In both cases the pass must return normally, count the failure, refuse to
 /// claim it reconciled anything, and leave every row exactly as it found it —
 /// so the next tick can still recover them.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_failing_reconciliation_pass_is_reported_and_never_fails_the_daemon() {
     // ---- 1. the page read itself fails -----------------------------------
@@ -15890,6 +15991,7 @@ fn a_failing_reconciliation_pass_is_reported_and_never_fails_the_daemon() {
 /// rather than `sleep` on purpose: a sleeping test task would let the paused
 /// clock auto-advance and fire tick 2 early, which would silently destroy
 /// property 2.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(start_paused = true)]
 async fn the_reconciliation_tick_loop_runs_at_start_waits_its_interval_and_continues() {
     use crate::bus::EventBus;
@@ -16006,6 +16108,7 @@ async fn the_reconciliation_tick_loop_runs_at_start_waits_its_interval_and_conti
 /// still advances by at least one row per pass at the most hostile budget
 /// expressible. A worker that checked the clock BEFORE its first unit of work
 /// would do nothing, forever, and would report that as a normal truncated pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn reconciliation_stops_on_its_wall_clock_budget_and_still_advances_every_pass() {
     let store = Store::open_in_memory().expect("open V82 store");
@@ -16105,6 +16208,7 @@ fn reconciliation_stops_on_its_wall_clock_budget_and_still_advances_every_pass()
 /// `ingress_test_fence` — which stays in use by a sibling test in the old
 /// module — is redeclared here rather than exported. The assertions, the
 /// fixture shape, and the production function under test are unchanged.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn app_server_full_evidence_queue_cannot_block_response_or_terminal_latch() {
     use crate::app_server_control::{
@@ -16349,6 +16453,7 @@ async fn app_server_full_evidence_queue_cannot_block_response_or_terminal_latch(
 /// cases below are the ones that do not: a terminal name that strictly
 /// CONTAINS the frozen token, a `method` that exists only under `params`, and
 /// a `method` key whose value is not a string at all.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn structural_scanner_ignores_terminal_substrings_and_nested_keys() {
     use crate::app_server_control::{
@@ -16487,6 +16592,7 @@ fn structural_scanner_ignores_terminal_substrings_and_nested_keys() {
 /// to be exactly `SessionKind::Epic`. Step 3 below pins that divergence, so a
 /// future refactor that "unified" the two checks onto the wider one would fail
 /// here rather than silently widen who may inject mail.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn non_epic_parent_with_lead_pointer_does_not_grant_authority() {
     use crate::error::DaemonError;

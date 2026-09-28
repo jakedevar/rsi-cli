@@ -4,7 +4,7 @@
 //! The seat is the lineage tip resolved by `current_manager_session_on`. A
 //! `Failed` tip with no live process is down. Recovery reuses the operator's
 //! persisted V2 policy (Execute, not paused, `max_recovery_attempts > 0`,
-//! runtime retries enabled, no spend hold, no human gate, resource admission)
+//! no spend hold, no human gate, resource admission)
 //! and never creates authority: the executor resumes the SAME session row and
 //! sandbox. It never launches Fresh/AgentFresh, never succeeds the seat and
 //! never creates a session. Each attempt is one `seat_recovery` operation row
@@ -257,7 +257,6 @@ impl Store {
         config: &HarnessManagerConfigV1,
         grant: Option<&HarnessManagerPolicyConfigV2>,
         tip: &Session,
-        retry_enabled: bool,
     ) -> Result<std::result::Result<(), String>> {
         let Some(grant) = grant else {
             return Ok(Err(SEAT_NO_POLICY_REASON.into()));
@@ -271,8 +270,6 @@ impl Store {
             Some("manager_seat_recovery_requires_execute".into())
         } else if policy.paused {
             Some("manager_v2_policy_paused".into())
-        } else if !retry_enabled {
-            Some("manager_v2_retry_disabled".into())
         } else if !crate::session::lifecycle::manager_lead_provider_resumable(tip) {
             // Never claim a tip whose continuation would allocate a new row.
             Some(SEAT_UNAVAILABLE_REASON.into())
@@ -315,7 +312,7 @@ impl Store {
         &self,
         project: Uuid,
         tip_active: impl FnOnce(Uuid) -> bool,
-        retry_enabled: bool,
+        _retry_enabled: bool,
         boot_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<ManagerSeatPassV1> {
@@ -343,7 +340,7 @@ impl Store {
         let last_output = self.last_provider_output_at(tip)?;
         let tip_failed = session.status == SessionStatus::Failed && !active;
         let bounds = if tip_failed {
-            self.manager_seat_bounds(&config, grant.as_ref(), &session, retry_enabled)?
+            self.manager_seat_bounds(&config, grant.as_ref(), &session)?
         } else {
             Ok(())
         };
@@ -541,7 +538,7 @@ impl Store {
     pub(crate) fn manager_seat_effect_gate(
         &self,
         claim: &ManagerSeatClaimV1,
-        retry_enabled: bool,
+        _retry_enabled: bool,
     ) -> Result<()> {
         let owned: Option<(String, i64)> = self
             .conn
@@ -572,7 +569,7 @@ impl Store {
         // Bounds first, so a pause, revocation or human question is reported
         // by its own typed reason even when it also changed the tip status.
         let grant = self.get_harness_manager_policy(claim.project_id)?;
-        self.manager_seat_bounds(&config, grant.as_ref(), &session, retry_enabled)?
+        self.manager_seat_bounds(&config, grant.as_ref(), &session)?
             .map_err(|code| refused(&code))?;
         if session.status != SessionStatus::Failed {
             return Err(refused("manager_seat_tip_not_failed"));

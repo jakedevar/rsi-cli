@@ -187,6 +187,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Mutex, mpsc};
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_hard_trim() {
         let mut history = vec![
@@ -205,6 +206,7 @@ mod tests {
         assert_eq!(history.capacity(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_force_compact() {
         let mut history = vec![
@@ -222,6 +224,29 @@ mod tests {
         assert_eq!(history[0].content, "system");
         assert!(history[1].content.contains("truncated"));
         assert_eq!(history[5].content, "msg6");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn force_compact_preserves_error_flag_in_retained_history() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg1"),
+            ChatMessage::user("msg2"),
+            ChatMessage::tool_error_result("call-1", "failed"),
+            ChatMessage::user("msg4"),
+            ChatMessage::user("msg5"),
+            ChatMessage::user("msg6"),
+        ];
+
+        force_compact(&mut history);
+
+        let retained_error = history
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .expect("recent tool error remains in compacted history");
+        assert!(retained_error.is_error);
     }
 
     struct FakeProvider {
@@ -304,6 +329,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn auto_compact_denial_performs_zero_provider_calls() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));

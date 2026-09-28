@@ -114,11 +114,7 @@ pub(super) fn render_prompt_preview(
     // Hint bar at the bottom
     let hint_y = inner.y + inner.height - 1;
     let hint_area = Rect::new(inner.x, hint_y, inner.width, 1);
-    let hint_text = if button_count > 0 {
-        "j/k: navigate  p/Esc: close  Enter: open  Space+x: execute  Ctrl+d/u: scroll"
-    } else {
-        "j/k: navigate  p/Esc: close  Enter: open  Ctrl+d/u: scroll"
-    };
+    let hint_text = "j/k: navigate  p/Esc: close  Enter: open  Ctrl+d/u: scroll";
     let hint = Line::from(vec![Span::styled(
         hint_text,
         Style::default().fg(theme::overlay_hint()),

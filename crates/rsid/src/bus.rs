@@ -502,6 +502,7 @@ mod tests {
     };
     use rsi_common::types::SessionStatus;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_event_bus_no_subscribers() {
         let bus = EventBus::new(10);
@@ -514,6 +515,7 @@ mod tests {
         assert_eq!(bus.subscriber_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_event_bus_subscribe_receive() {
         let bus = EventBus::new(10);
@@ -539,6 +541,7 @@ mod tests {
         assert_eq!(bus.subscriber_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn archive_projection_delivery_guard_is_bounded_to_the_acknowledgement_lifecycle() {
         let bus = EventBus::new(10);
@@ -576,6 +579,7 @@ mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_daemon_event_to_bus_event() {
         let event = DaemonEvent::SessionStatusChanged {
@@ -587,6 +591,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_status_changed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_graph_execution_event_type() {
         let event = DaemonEvent::GraphExecution {
@@ -607,6 +612,7 @@ mod tests {
         assert_eq!(bus_event.event_type, GRAPH_EXECUTION_EVENT);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_memory_index_updated_event_type() {
         let event = DaemonEvent::MemoryIndexUpdated {
@@ -617,6 +623,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "memory_index_updated");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_memory_index_updated_serde_roundtrip() {
         let event = DaemonEvent::MemoryIndexUpdated {
@@ -637,6 +644,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_memory_index_updated_publish_subscribe() {
         let bus = EventBus::new(10);
@@ -662,6 +670,7 @@ mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_retrying_event_type() {
         let event = DaemonEvent::SessionRetrying {
@@ -675,6 +684,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_retrying");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_retrying_serde_roundtrip() {
         let event = DaemonEvent::SessionRetrying {
@@ -701,6 +711,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn context_usage_bus_keeps_scalars_and_adds_resolved_budget() {
         let budget = ResolvedContextBudget {
@@ -782,6 +793,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_system_message_event() {
         let event = DaemonEvent::SystemMessage {
@@ -792,6 +804,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "system_message");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_stalled_event_type() {
         let event = DaemonEvent::SessionStalled {
@@ -803,6 +816,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_stalled");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_stalled_serde_roundtrip() {
         let event = DaemonEvent::SessionStalled {
@@ -823,6 +837,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_sandbox_orphan_cleaned_event_type() {
         let event = DaemonEvent::SandboxOrphanCleaned {
@@ -833,6 +848,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "sandbox_orphan_cleaned");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_sandbox_orphan_cleaned_serde_roundtrip() {
         let root = std::path::PathBuf::from("/tmp/rsi-sandbox/deadbeef");
@@ -854,6 +870,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_classified_event_type() {
         let event = DaemonEvent::SessionClassified {
@@ -867,6 +884,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_classified");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_classified_serde_roundtrip() {
         let event = DaemonEvent::SessionClassified {
@@ -895,6 +913,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_classified_bus_data_includes_verdict_payload() {
         let id = Uuid::new_v4();
@@ -917,6 +936,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_reconciled_event_type() {
         let event = DaemonEvent::SessionReconciled {
@@ -929,6 +949,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_reconciled");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_reconciled_serde_roundtrip() {
         let event = DaemonEvent::SessionReconciled {
@@ -953,6 +974,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_session_question_raised_event() {
         use rsi_common::types::PendingQuestion;

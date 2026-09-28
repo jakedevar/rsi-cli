@@ -28,7 +28,7 @@ use rsi_common::archive_cleanup::ArchiveSessionResultV1;
 use rsi_common::model_control::{InvocationOwner, ModelUsageConfidence};
 use rsi_common::types::{
     ContextUsageConfidence, ConversationEvent, EventType, ReserveIdeaControllerRequestV1, Role,
-    Session, SessionKind, SessionProvider, SessionStatus, WorkflowStage,
+    SandboxKind, Session, SessionKind, SessionProvider, SessionStatus, WorkflowStage,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -83,6 +83,7 @@ enum ContinuationIntent {
     Operator,
     ExistingAuthority,
     AgentChild(FreshRelaunchIntent),
+    Restart(Uuid),
     Capacity(CapacityDeliveryContext),
     ManagerNotice {
         job_ids: Vec<Uuid>,
@@ -262,6 +263,82 @@ fn manager_notice_scope_revoked() -> DaemonError {
 /// when the original run never captured one. This is the continuation path's
 /// single resumability predicate: `Local` reconstructs context from history
 /// under a synthetic id; every other provider needs its captured id.
+/// Claude Code keys its project directory by the cwd with every
+/// non-alphanumeric byte replaced by `-`.
+fn claude_project_dir_name(cwd: &std::path::Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
+/// Copy (never move) a Claude conversation transcript and its sidecar
+/// directory from the project directory of `old_cwd` to that of `new_cwd`.
+/// A missing source transcript is not an error: there is nothing to carry.
+fn copy_claude_transcript(
+    old_cwd: &std::path::Path,
+    new_cwd: &std::path::Path,
+    provider_session_id: &str,
+) -> Result<()> {
+    if provider_session_id.is_empty()
+        || !provider_session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(DaemonError::InvalidParam(
+            "claude provider session id is not a transcript file name".into(),
+        ));
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    let projects = home.join(".claude").join("projects");
+    copy_claude_transcript_in(&projects, old_cwd, new_cwd, provider_session_id)
+}
+
+fn copy_claude_transcript_in(
+    projects: &std::path::Path,
+    old_cwd: &std::path::Path,
+    new_cwd: &std::path::Path,
+    provider_session_id: &str,
+) -> Result<()> {
+    let old_dir = projects.join(claude_project_dir_name(old_cwd));
+    let new_dir = projects.join(claude_project_dir_name(new_cwd));
+    let transcript = format!("{provider_session_id}.jsonl");
+    let source = old_dir.join(&transcript);
+    if !source.is_file() {
+        tracing::warn!(
+            source = %source.display(),
+            "no Claude transcript to carry into replacement sandbox"
+        );
+        return Ok(());
+    }
+    let io =
+        |error: std::io::Error| DaemonError::Process(format!("copy Claude transcript: {error}"));
+    std::fs::create_dir_all(&new_dir).map_err(io)?;
+    std::fs::copy(&source, new_dir.join(&transcript)).map_err(io)?;
+    let sidecar = old_dir.join(provider_session_id);
+    if sidecar.is_dir() {
+        copy_dir_recursive(&sidecar, &new_dir.join(provider_session_id)).map_err(io)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resumable_provider_session_id(session: &Session) -> Option<String> {
     match session.provider {
         SessionProvider::Local => Some(
@@ -272,6 +349,43 @@ pub(crate) fn resumable_provider_session_id(session: &Session) -> Option<String>
         ),
         _ => session.claude_session_id.clone(),
     }
+}
+
+/// The old Codex CLI thread repeatedly replays a websocket-closed turn on
+/// explicit Continue. Rotate only after terminal failure evidence; ordinary
+/// reconnect notices are nonterminal and remain owned by the live provider.
+pub(super) fn codex_websocket_rotation_needed(session: &Session) -> bool {
+    session.provider == SessionProvider::Codex
+        && session.status == SessionStatus::Failed
+        && session.stop_reason.as_deref().is_some_and(|reason| {
+            reason.contains("websocket closed by server before response.completed")
+        })
+}
+
+fn codex_websocket_recovery_context(session_id: Uuid, events: &[ConversationEvent]) -> String {
+    let mut recent_messages = events
+        .iter()
+        .rev()
+        .filter(|event| {
+            event.event_type == EventType::Message
+                && matches!(event.role, Some(Role::User | Role::Assistant))
+        })
+        .take(4)
+        .map(|event| {
+            let role = if event.role == Some(Role::User) {
+                "User"
+            } else {
+                "Assistant"
+            };
+            let excerpt: String = event.content.chars().take(2048).collect();
+            format!("{role}: {excerpt}")
+        })
+        .collect::<Vec<_>>();
+    recent_messages.reverse();
+    format!(
+        "## Codex transport recovery\nThe previous Codex provider thread for RSI session {session_id} ended when the websocket closed before response.completed. This is a fresh provider thread in the same RSI session. The previous turn outcome may be uncertain: inspect the workspace and durable task state before repeating an action. Continue the user's request using the recent conversation below and the current repository state.\n\n{}",
+        recent_messages.join("\n\n")
+    )
 }
 
 /// The single manager resumability predicate. `resume_lead` admission,
@@ -837,7 +951,40 @@ fn owner_from_session(session: &Session) -> InvocationOwner {
 }
 
 fn cleanup_policy_denied(reason: CleanupBlockedReason) -> DaemonError {
-    DaemonError::PolicyDenied(format!("sandbox cleanup blocked: {}", reason.as_str()))
+    let detail = match reason {
+        CleanupBlockedReason::MissingIndependentlyVerifiedProof => {
+            "this session owns a retained sandbox. Archive and delete are blocked while its source work is retained; open Settings > Daemon Features > Source worktree settlement to run its zero-write audit"
+        }
+        CleanupBlockedReason::SharedLiveOwnership => {
+            "the sandbox root is still claimed by another live session"
+        }
+        CleanupBlockedReason::OwnershipReadFailure => "sandbox ownership could not be read",
+        CleanupBlockedReason::ConcurrentDrift => {
+            "sandbox ownership changed while the action was being checked"
+        }
+        CleanupBlockedReason::InconsistentSandboxColumns => {
+            "sandbox metadata is incomplete or inconsistent"
+        }
+        CleanupBlockedReason::RowReadFailure => "session sandbox metadata could not be read",
+        CleanupBlockedReason::LaunchAbortWithoutOwner => {
+            "sandbox launch stopped before ownership was durably recorded"
+        }
+        CleanupBlockedReason::PathOnlyAttribution => "sandbox path has no typed durable owner",
+        CleanupBlockedReason::UnreadableWorktree => {
+            "sandbox ownership or worktree data could not be read"
+        }
+        #[cfg(test)]
+        _ => reason.as_str(),
+    };
+    let stable_reason = if matches!(
+        reason,
+        CleanupBlockedReason::MissingIndependentlyVerifiedProof
+    ) {
+        String::new()
+    } else {
+        format!(" ({})", reason.as_str())
+    };
+    DaemonError::PolicyDenied(format!("sandbox cleanup blocked: {detail}{stable_reason}"))
 }
 
 fn effective_provider_replacement_config(source: &Session, query: String) -> LaunchConfig {
@@ -1181,6 +1328,7 @@ impl SessionManager {
                             role,
                             content: event.content.clone(),
                             tool_call_id: None,
+                            is_error: false,
                             tool_calls: Vec::new(),
                         });
                     }
@@ -1190,6 +1338,12 @@ impl SessionManager {
                         role: MessageRole::Tool,
                         content: event.content.clone(),
                         tool_call_id: event.tool_name.clone(),
+                        is_error: event
+                            .metadata
+                            .as_deref()
+                            .and_then(|metadata| metadata.get("is_error"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         tool_calls: Vec::new(),
                     });
                 }
@@ -1473,6 +1627,36 @@ impl SessionManager {
                     );
                 }
             }
+            if let (Some(SandboxKind::GitWorktree), Some(root)) = (
+                session_clone.sandbox_kind,
+                session_clone.sandbox_root.clone(),
+            ) {
+                // The provider has exited. Capture tracked and untracked work
+                // before terminal watches can wake the owner. Git's bounded
+                // probe disables fsmonitor and leaves every byte in place.
+                let dirty = match tokio::task::spawn_blocking(move || {
+                    crate::sandbox::git_worktree::observe_clean_head_bounded(&root)
+                })
+                .await
+                {
+                    Ok(Ok((clean, _))) => Some(!clean),
+                    Ok(Err(error)) => {
+                        tracing::warn!(session_id = %sid, %error, "Terminal sandbox status probe failed");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(session_id = %sid, %error, "Terminal sandbox status probe task failed");
+                        None
+                    }
+                };
+                let recorded = store
+                    .lock()
+                    .await
+                    .record_terminal_sandbox_worktree(sid, dirty);
+                if let Err(error) = recorded {
+                    tracing::warn!(session_id = %sid, %error, "Failed to persist terminal sandbox status");
+                }
+            }
             // The provider has stopped. A failed metadata write must never
             // report a successful invocation, but it must release its running
             // admission with a durable failure classification.
@@ -1626,18 +1810,27 @@ impl SessionManager {
                 });
             }
 
-            // Capture data for observation extraction before moving completed_session
-            let obs_data = if memory_handle.is_some()
-                && completed_session.events.len() >= 4
+            // Reserve capacity and check live Memory OFF before cloning the
+            // completed transcript. The prepared submission also rechecks OFF
+            // after the insertion await below, without retaining a send task.
+            let observation_submission = if completed_session.events.len() >= 4
                 && matches!(
                     status,
                     SessionStatus::Completed | SessionStatus::Interrupted
                 ) {
-                Some((
-                    completed_session.session.project_id,
-                    completed_session.session.query.clone(),
-                    completed_session.events.clone(),
-                ))
+                memory_handle.as_ref().and_then(|handle| {
+                    match handle.prepare_observations(
+                        session_id,
+                        completed_session.session.project_id,
+                        || (completed_session.session.query.clone(), completed_session.events.clone()),
+                    ) {
+                        Ok(submission) => submission,
+                        Err(error) => {
+                            tracing::warn!(%error, %session_id, "Observation extraction trigger failed");
+                            None
+                        }
+                    }
+                })
             } else {
                 None
             };
@@ -1664,23 +1857,9 @@ impl SessionManager {
                 }
             }
 
-            // Trigger observation extraction in background (after insert so session is queryable)
-            if let (Some((obs_project_id, obs_query, obs_events)), Some(handle)) =
-                (obs_data, &memory_handle)
-            {
-                let obs_handle = handle.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = obs_handle
-                        .extract_observations(session_id, obs_project_id, obs_query, obs_events)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Observation extraction trigger failed"
-                        );
-                    }
-                });
+            // Submit only after insertion so the session is queryable.
+            if let Some(submission) = observation_submission {
+                submission.submit();
             }
         }
 
@@ -1949,6 +2128,25 @@ impl SessionManager {
         .map(|_| ())
     }
 
+    /// Re-enter the exact graceful-restart owner. The intent ID is used in
+    /// model admission so replay cannot launch a second writer.
+    pub(crate) async fn continue_restart_intent(
+        &self,
+        intent_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<()> {
+        self.continue_session_with_delivery(
+            session_id,
+            rsi_common::daemon_message::wrap(
+                "daemon-restart",
+                "The daemon restarted after interrupting your active turn. Continue the task from its durable state.",
+            ),
+            ContinuationIntent::Restart(intent_id),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// An automated or agent continuation with no job rows (operator manual
     /// trigger, stall nudge, `AgentContinueChild`): fenced, never unfenced.
     pub(crate) async fn continue_fenced(
@@ -2033,6 +2231,84 @@ impl SessionManager {
             .lock()
             .await
             .check_continuation_fence_owner(fence, tip_active)
+    }
+
+    /// Replace a terminal, never-transferred sandbox custody root with a fresh
+    /// worktree for an operator continuation. Returns the rebound persisted
+    /// session, or `None` when the session's custody needs no replacement.
+    ///
+    /// The old root and branch are retained as history (never deleted). The
+    /// new worktree starts at the old branch tip when that ref still exists.
+    /// A Claude transcript is copied into the new root's project directory so
+    /// `--resume` finds the conversation from the new cwd.
+    async fn replace_terminal_sandbox_for_operator_continue(
+        &self,
+        session: &Session,
+    ) -> Result<Option<Session>> {
+        let Some(terminal) = self
+            .store
+            .lock()
+            .await
+            .replaceable_terminal_custody(session.id)?
+        else {
+            return Ok(None);
+        };
+        let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
+        let for_allocation = session.clone();
+        let old_branch = terminal.sandbox_branch.clone();
+        let (allocation, binding) = tokio::task::spawn_blocking(move || {
+            super::queries::fresh_replacement_sandbox_binding(
+                &for_allocation,
+                Some(&old_branch),
+                sandbox_base,
+            )
+        })
+        .await
+        .map_err(|error| DaemonError::Process(error.to_string()))??;
+        if session.provider == SessionProvider::Claude
+            && let Some(provider_session_id) = session.claude_session_id.as_deref()
+            && let Err(error) = copy_claude_transcript(
+                &terminal.sandbox_root,
+                &allocation.root,
+                provider_session_id,
+            )
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                sandbox_root = %allocation.root.display(),
+                %error,
+                "retaining unbound replacement sandbox after transcript copy failure"
+            );
+            return Err(error);
+        }
+        let rebound = self.store.lock().await.replace_terminal_session_custody(
+            session.id,
+            terminal.custody_id,
+            binding,
+        );
+        match rebound {
+            Ok(rebound) => {
+                tracing::info!(
+                    session_id = %session.id,
+                    old_custody_id = %terminal.custody_id,
+                    old_root = %terminal.sandbox_root.display(),
+                    new_root = %allocation.root.display(),
+                    "replaced terminal sandbox custody for operator continuation"
+                );
+                Ok(Some(rebound))
+            }
+            Err(error) => {
+                // Matches unarchive: an unbound UUID root is left for startup
+                // custody reconciliation, never destructively rolled back here.
+                tracing::warn!(
+                    session_id = %session.id,
+                    sandbox_root = %allocation.root.display(),
+                    %error,
+                    "retaining unbound replacement sandbox after rebind rejection"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Operator RPC entry point. Internal/agent continuations must use their
@@ -2306,7 +2582,19 @@ impl SessionManager {
         intent: ContinuationIntent,
         fence: Option<ContinuationFenceV1>,
     ) -> Result<ContinueSessionOutcome> {
+        if self
+            .restart_draining
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DaemonError::PolicyDenied(
+                "daemon restart drain is in progress".into(),
+            ));
+        }
         let operator_intent = matches!(&intent, ContinuationIntent::Operator);
+        let restart_intent_id = match &intent {
+            ContinuationIntent::Restart(id) => Some(*id),
+            _ => None,
+        };
         let manager_seat = match &intent {
             ContinuationIntent::ManagerSeat(claim) => Some(claim.as_ref().clone()),
             _ => None,
@@ -2321,6 +2609,7 @@ impl SessionManager {
         ) = match intent {
             ContinuationIntent::Operator
             | ContinuationIntent::ExistingAuthority
+            | ContinuationIntent::Restart(_)
             | ContinuationIntent::ManagerSeat(_) => (None, None, None, None, None),
             ContinuationIntent::AgentChild(child) => (None, None, None, None, Some(child)),
             ContinuationIntent::ScheduledWake { job_ids } => {
@@ -2419,6 +2708,25 @@ impl SessionManager {
         pause_continuation_seam_for_test(ContinuationPauseSeam::AfterFenceCheck, session_id).await;
         let cwd_admission_guard =
             super::spawn_single_flight::acquire_provider_cwd_admission().await;
+        if self
+            .restart_draining
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DaemonError::PolicyDenied(
+                "daemon restart drain is in progress".into(),
+            ));
+        }
+        if operator_intent
+            && self
+                .store
+                .lock()
+                .await
+                .manager_review_has_live_reviewer(session_id)?
+        {
+            return Err(DaemonError::PolicyDenied(
+                "manager_review_reviewer_continuation_owned".into(),
+            ));
+        }
         if let Some(delivery) = manager_decision.as_ref() {
             self.check_manager_decision_runtime(delivery).await?;
         }
@@ -2439,7 +2747,7 @@ impl SessionManager {
             let session = store
                 .get_session(session_id)?
                 .ok_or_else(|| DaemonError::InvalidParam("manager_v2_lead_unavailable".into()))?;
-            check_manager_resume_target(&session)?;
+            store.manager_resume_available_for_lead(&session)?;
         }
         if let Some(job_ids) = manager_notice_jobs.as_deref() {
             self.check_manager_notice_resume(&spawn_guard, session_id, job_ids)
@@ -2696,10 +3004,39 @@ impl SessionManager {
             .map(|event| event.sequence + 1)
             .unwrap_or(0);
 
-        // Reuse never invents a replacement sandbox or silently downgrades
-        // custody-bearing history to the canonical checkout. Authenticate the
-        // completed session before *any* context/Git work, token mint,
-        // admission, orphan reap, provider dispatch, or active publication.
+        // An operator Continue of a session whose own sandbox custody went
+        // terminal (quarantined/failed/purged) without passing to a successor
+        // gets a replacement sandbox instead of `ownership_missing`. Automated
+        // and agent continuations never invent a sandbox.
+        if operator_intent {
+            match self
+                .replace_terminal_sandbox_for_operator_continue(&completed_session.session)
+                .await
+            {
+                Ok(Some(rebound)) => {
+                    let session = &mut completed_session.session;
+                    session.working_dir = rebound.working_dir;
+                    session.git_branch = rebound.git_branch;
+                    session.sandbox_kind = rebound.sandbox_kind;
+                    session.sandbox_root = rebound.sandbox_root;
+                    session.sandbox_branch = rebound.sandbox_branch;
+                    session.sandbox_cleanup_state = rebound.sandbox_cleanup_state;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.completed
+                        .write()
+                        .await
+                        .insert(session_id, completed_session);
+                    return Err(error);
+                }
+            }
+        }
+
+        // Reuse never silently downgrades custody-bearing history to the
+        // canonical checkout. Authenticate the completed session before *any*
+        // context/Git work, token mint, admission, orphan reap, provider
+        // dispatch, or active publication.
         let custody = match CustodyService::classify(&completed_session.session) {
             Ok(CustodyClassification::OrdinaryUnsandboxed) => {
                 CustodyService::authorize_ordinary(&completed_session.session)
@@ -2726,7 +3063,27 @@ impl SessionManager {
             }
         };
 
+        let rotate_codex_thread = codex_websocket_rotation_needed(&completed_session.session);
         let resumable_id = resumable_provider_session_id(&completed_session.session);
+        if rotate_codex_thread && let Some(thread_id) = resumable_id.as_deref() {
+            if let Err(error) = crate::codex::validate_codex_resume_tool_history(thread_id) {
+                if !matches!(error, DaemonError::CodexResumeTornTail) {
+                    self.completed
+                        .write()
+                        .await
+                        .insert(session_id, completed_session);
+                    return Err(error);
+                }
+                // This path already starts a new provider thread with an
+                // uncertainty warning. A torn final record cannot be replayed,
+                // but does not require changing the provider-owned rollout.
+            }
+        }
+        let resumable_id = if rotate_codex_thread {
+            None
+        } else {
+            resumable_id
+        };
         let fresh_relaunch = agent_child.is_some() && resumable_id.is_none();
         let (provider_session_id, conversation_history) = match resumable_id {
             // API providers reconstruct context from history under the
@@ -2736,7 +3093,7 @@ impl SessionManager {
                     .then(|| Self::events_to_openai_messages(&completed_session.events));
                 (Some(id), history)
             }
-            None if fresh_relaunch => (None, None),
+            None if fresh_relaunch || rotate_codex_thread => (None, None),
             None => {
                 let error = unavailable_resume_error(completed_session.session.provider);
                 self.completed
@@ -2910,11 +3267,32 @@ impl SessionManager {
                 .insert(session_id, completed_session);
             return Err(error);
         }
+        let build_worker = match completed_session.session.parent_id {
+            Some(parent_id) => {
+                let parent = match self.store.lock().await.get_session(parent_id) {
+                    Ok(parent) => parent,
+                    Err(error) => {
+                        drop(context_permit);
+                        self.completed
+                            .write()
+                            .await
+                            .insert(session_id, completed_session);
+                        return Err(error);
+                    }
+                };
+                parent.is_some_and(|parent| {
+                    parent.session_kind != SessionKind::Epic
+                        || parent.lead_session_id != Some(session_id)
+                })
+            }
+            None => false,
+        };
         let execution_scratch =
             match crate::sandbox::execution_scratch::SandboxExecutionScratch::from_context_permit(
                 &context_permit,
             ) {
-                Ok(scratch) => scratch,
+                Ok(scratch) => scratch
+                    .map(|scratch| scratch.with_build_env(&self.runtime_config, build_worker)),
                 Err(error) => {
                     drop(context_permit);
                     self.completed
@@ -3041,6 +3419,16 @@ impl SessionManager {
             system_prompt,
             super::preamble::sandbox_custody_instruction_for_session(&completed_session.session),
         );
+        let system_prompt = if rotate_codex_thread {
+            let recovery_context =
+                codex_websocket_recovery_context(session_id, &completed_session.events);
+            Some(match system_prompt {
+                Some(prompt) => format!("{prompt}\n\n{recovery_context}"),
+                None => recovery_context,
+            })
+        } else {
+            system_prompt
+        };
         let system_prompt = if fresh_relaunch {
             let mut parts =
                 super::launch::fresh_launch_preamble_parts(completed_session.session.session_kind);
@@ -3161,6 +3549,54 @@ impl SessionManager {
                 DaemonError::Process(format!("failed to join resume invocation lookup: {e}"))
             })??
         };
+        // An unreadable live process is not proof that an earlier provider
+        // stopped. Check ordinary resume custody before admitting a new model
+        // invocation: a failed scan then leaves no running admission to block
+        // an exact retry after the process is gone. The spawn guard still
+        // closes the scan-to-spawn window for this session.
+        if capacity_delivery.is_none()
+            && matches!(
+                provider,
+                SessionProvider::Claude
+                    | SessionProvider::Codex
+                    | SessionProvider::Pioneer
+                    | SessionProvider::OpenRouter
+                    | SessionProvider::Bedrock
+                    | SessionProvider::Antigravity
+                    | SessionProvider::CodexAppServer
+                    | SessionProvider::Harness
+            )
+        {
+            let reaped = tokio::task::spawn_blocking(move || {
+                super::reaper::reap_orphans_for_session(session_id)
+            })
+            .await
+            .map_err(|error| {
+                DaemonError::Process(format!(
+                    "runtime orphan reap task failed before admission: {error}"
+                ))
+            })
+            .and_then(|result| result);
+            let reaped = match reaped {
+                Ok(reaped) => reaped,
+                Err(error) => {
+                    self.revoke_agent_token_for_session(session_id).await;
+                    self.completed
+                        .write()
+                        .await
+                        .insert(session_id, completed_session);
+                    return Err(error);
+                }
+            };
+            if reaped > 0 {
+                self.event_bus.publish(DaemonEvent::SystemMessage {
+                    level: "warn".to_string(),
+                    message: format!(
+                        "Reaped {reaped} orphaned provider process(es) for session {session_id} before resume"
+                    ),
+                });
+            }
+        }
         let provider_label = format!("{provider:?}");
         let owner = match capacity_delivery {
             Some(delivery) => InvocationOwner {
@@ -3181,6 +3617,8 @@ impl SessionManager {
                 "agent_child_relaunch".to_string()
             } else if capacity_delivery.is_some() {
                 "scheduled_capacity_resume".to_string()
+            } else if restart_intent_id.is_some() {
+                "daemon_restart".to_string()
             } else {
                 "continue_session".to_string()
             },
@@ -3202,6 +3640,7 @@ impl SessionManager {
                 None => manager_decision
                     .as_ref()
                     .map(|delivery| format!("manager.answer:{}", delivery.key))
+                    .or_else(|| restart_intent_id.map(|id| format!("daemon.restart:{id}")))
                     .or_else(|| {
                         manager_action
                             .as_ref()
@@ -3246,6 +3685,7 @@ impl SessionManager {
             baseline_embedding_input_count: 0,
             baseline_wall_time_ms: completed_session.session.work_time_ms.unwrap_or(0),
         };
+
         let admission_request_for_recovery = admission_request.clone();
         let (admission_permit, recovered_capacity_admission) = if capacity_delivery.is_some() {
             match admit_capacity_invocation(&self.store, admission_request, self.event_bus()).await
@@ -3345,6 +3785,33 @@ impl SessionManager {
             }
         }
 
+        if let Some(intent_id) = restart_intent_id {
+            let binding = self.store.lock().await.bind_restart_continuation(
+                intent_id,
+                admission_permit.invocation_id(),
+                self.program_run_boot_id,
+            );
+            if let Err(error) = binding {
+                let _ = complete_invocation(
+                    &self.store,
+                    &admission_permit,
+                    InvocationCompletion {
+                        error_class: Some("restart_delivery_fence_rejected".into()),
+                        confidence: Some(ModelUsageConfidence::Unavailable),
+                        ..InvocationCompletion::default()
+                    },
+                    self.event_bus(),
+                )
+                .await;
+                self.revoke_agent_token_for_session(session_id).await;
+                self.completed
+                    .write()
+                    .await
+                    .insert(session_id, completed_session);
+                return Err(error);
+            }
+        }
+
         #[cfg(test)]
         if capacity_delivery.is_some() {
             super::launch::pause_controller_candidate_test(
@@ -3375,87 +3842,82 @@ impl SessionManager {
         } else {
             None
         };
-        let launcher = super::provider_spawn::CachedLauncher {
-            mgr: self,
-            harness: super::provider_spawn::HarnessLaunchCtx {
-                conversation_history,
-                project_id: completed_session.session.project_id,
-                initial_admission_permit: admission_permit.clone(),
-                model_call_settlements: model_call_settlements.clone(),
-                resolved_context_budget: completed_session
-                    .session
-                    .resolved_context_budget
-                    .clone()
-                    .expect("continued sessions carry a resolved context budget"),
-            },
-        };
-        // A5 (Change 2): reap any cross-restart orphan of THIS session before
-        // spawning, so a provider that survived a prior teardown can never
-        // coexist with the fresh child (F-006/F-007). Harness itself is
-        // task-based, but its shell-tool subprocesses inherit the same exact
-        // `RSI_SESSION_ID` stamp and therefore require the same exclusion.
-        // Local has no daemon-owned subprocess boundary. The A1 single-flight
-        // guard (acquired at fn entry, still held here) closes the reap->spawn
-        // window; the reap runs strictly before spawn, so the new child does
-        // not yet exist and can never be a scan target. Blocking `/proc` walk
-        // -> `spawn_blocking`.
-        if matches!(
-            provider,
-            SessionProvider::Claude
-                | SessionProvider::Codex
-                | SessionProvider::Pioneer
-                | SessionProvider::OpenRouter
-                | SessionProvider::Bedrock
-                | SessionProvider::Antigravity
-                | SessionProvider::CodexAppServer
-                | SessionProvider::Harness
-        ) {
-            let sid = session_id;
-            let reap_task = if capacity_delivery.is_some() {
-                tokio::task::spawn_blocking(move || {
-                    super::reaper::reap_capacity_orphans_checked(sid)
+        let prebound_codegraph = if provider == SessionProvider::Harness {
+            if let (Some(handle), Some(project_id), Some(root)) = (
+                self.codegraph_handle.clone(),
+                completed_session.session.project_id,
+                config.working_dir.clone(),
+            ) {
+                let store = Arc::clone(&self.store);
+                match tokio::task::spawn_blocking(move || {
+                    crate::codegraph::NativeCodegraphBinding::for_resumed_launch(
+                        &handle, store, project_id, session_id, &root,
+                    )
                 })
                 .await
-                .map_err(|error| {
-                    DaemonError::Process(format!(
-                        "capacity orphan reap task failed before spawn: {error}"
-                    ))
-                })
+                {
+                    Ok(Ok(binding)) => binding,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%session_id, %error, "Codegraph resume admission failed");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(%session_id, %error, "Codegraph resume admission task failed");
+                        None
+                    }
+                }
             } else {
-                tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(sid))
-                    .await
-                    .map_err(|error| {
-                        DaemonError::Process(format!(
-                            "runtime orphan reap task failed before spawn: {error}"
-                        ))
-                    })
-            };
+                None
+            }
+        } else {
+            None
+        };
+        let launcher = super::provider_spawn::ResumedLauncher {
+            base: super::provider_spawn::CachedLauncher {
+                mgr: self,
+                harness: super::provider_spawn::HarnessLaunchCtx {
+                    conversation_history,
+                    project_id: completed_session.session.project_id,
+                    initial_admission_permit: admission_permit.clone(),
+                    model_call_settlements: model_call_settlements.clone(),
+                    resolved_context_budget: completed_session
+                        .session
+                        .resolved_context_budget
+                        .clone()
+                        .expect("continued sessions carry a resolved context budget"),
+                },
+            },
+            codegraph_binding: prebound_codegraph,
+        };
+        // Capacity redelivery retains its admitted invocation across a failed
+        // process check so its durable receipt can recover the exact attempt.
+        // Ordinary resumes already passed this check before admission above.
+        if capacity_delivery.is_some()
+            && matches!(
+                provider,
+                SessionProvider::Claude
+                    | SessionProvider::Codex
+                    | SessionProvider::Pioneer
+                    | SessionProvider::OpenRouter
+                    | SessionProvider::Bedrock
+                    | SessionProvider::Antigravity
+                    | SessionProvider::CodexAppServer
+                    | SessionProvider::Harness
+            )
+        {
+            let sid = session_id;
+            let reap_task = tokio::task::spawn_blocking(move || {
+                super::reaper::reap_capacity_orphans_checked(sid)
+            })
+            .await
+            .map_err(|error| {
+                DaemonError::Process(format!(
+                    "capacity orphan reap task failed before spawn: {error}"
+                ))
+            });
             let reaped = match reap_task.and_then(|result| result) {
                 Ok(reaped) => reaped,
                 Err(error) => {
-                    // Capacity redelivery must retain its admission: its
-                    // recovery path requires the original Admitted/Running
-                    // invocation. Other resumes have no such receipt, so
-                    // release their dedup slot for retry.
-                    if capacity_delivery.is_none()
-                        && let Err(settle_error) = complete_invocation(
-                            &self.store,
-                            &admission_permit,
-                            InvocationCompletion {
-                                error_class: Some("orphan_reap_failed".to_string()),
-                                confidence: Some(ModelUsageConfidence::Unavailable),
-                                ..InvocationCompletion::default()
-                            },
-                            self.event_bus(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %settle_error,
-                            session_id = %session_id,
-                            "Failed to settle resume admission after orphan-reap error"
-                        );
-                    }
                     self.revoke_agent_token_for_session(session_id).await;
                     self.completed
                         .write()
@@ -3610,12 +4072,19 @@ impl SessionManager {
         let (mut process, event_rx) = match launch_result {
             Ok(launch) => launch,
             Err(e) => {
+                let safe_error_class = if matches!(&e, DaemonError::CodexResumeTornTail) {
+                    "codex_resume_rollout_torn_tail"
+                } else if matches!(&e, DaemonError::CodexResumeToolHistory(_)) {
+                    "codex_resume_tool_history_invalid"
+                } else {
+                    "spawn_failed"
+                };
                 if capacity_delivery.is_none() {
                     if let Err(settle_error) = complete_invocation(
                         &self.store,
                         &admission_permit,
                         InvocationCompletion {
-                            error_class: Some("spawn_failed".to_string()),
+                            error_class: Some(safe_error_class.to_string()),
                             confidence: Some(ModelUsageConfidence::Unavailable),
                             ..InvocationCompletion::default()
                         },
@@ -4247,12 +4716,14 @@ impl SessionManager {
     }
 
     async fn archive_one_session(&self, session_id: Uuid) -> Result<()> {
+        let spawn_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
         if self.active.read().await.contains_key(&session_id) {
             return Err(DaemonError::Rpc(
                 "Cannot archive active session".to_string(),
             ));
         }
-        self.clear_lead_pointers_to(session_id).await?;
+        self.clear_lead_pointers_to_held(session_id, &spawn_guard)
+            .await?;
         // This acknowledged Store transition is the durable settlement point;
         // do not evict/cancel the completed retry until it commits.
         let mut completed = self.completed.write().await;
@@ -4545,13 +5016,30 @@ impl SessionManager {
     /// Operator RPC entry point; pause ownership is not inferred from internal
     /// shutdown, stall recovery, graph cancellation, or AgentHalt calls.
     pub async fn interrupt_session_operator(&self, session_id: Uuid) -> Result<()> {
+        self.interrupt_session_operator_with_pause(
+            session_id,
+            crate::store::manager_actions::OperatorPause::Hard,
+        )
+        .await
+    }
+
+    pub(crate) async fn interrupt_session_operator_with_pause(
+        &self,
+        session_id: Uuid,
+        pause: crate::store::manager_actions::OperatorPause,
+    ) -> Result<()> {
+        if pause == crate::store::manager_actions::OperatorPause::None {
+            return Err(DaemonError::InvalidParam(
+                "interrupt_pause_level_required".into(),
+            ));
+        }
         // Publish intent before waiting, so an in-flight replacement refuses
         // its final CAS. Then acquire the real spawn guard so a continuation
         // cannot install a process just after an apparently successful pause.
         self.store
             .lock()
             .await
-            .record_manager_operator_pause(session_id, true)?;
+            .set_operator_pause(session_id, pause)?;
         let _guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
         self.interrupt_session(session_id).await
     }
@@ -5042,10 +5530,9 @@ impl SessionManager {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.begin_restart_drain();
         let session_ids: Vec<Uuid> = self.active.read().await.keys().copied().collect();
-        for session_id in session_ids {
-            let _ = self.interrupt_session(session_id).await;
-        }
+        self.interrupt_restart_sessions(session_ids).await?;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
         while !self.active.read().await.is_empty() && start.elapsed() < timeout {
@@ -5099,6 +5586,103 @@ impl SessionManager {
             }
         }
     }
+
+    pub(super) async fn interrupt_restart_sessions(&self, session_ids: Vec<Uuid>) -> Result<()> {
+        for session_id in session_ids {
+            // Persist the exact invocation owner before signaling its process.
+            // A turn completed during the grace window has no eligible row.
+            let recorded = self
+                .store
+                .lock()
+                .await
+                .record_restart_intent(session_id, self.program_run_boot_id)?;
+            if recorded {
+                match self.interrupt_session(session_id).await {
+                    Ok(()) => {
+                        self.store
+                            .lock()
+                            .await
+                            .mark_restart_interrupt_sent(session_id, self.program_run_boot_id)?;
+                    }
+                    Err(DaemonError::SessionNotFound(_)) => {
+                        // The turn finished after the active-map snapshot.
+                        // Its durable intent will settle as not_needed if the
+                        // finalizer committed, or remain restart-owned if it did not.
+                        tracing::debug!(%session_id, "Restart target finished before interrupt");
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Called on SIGTERM/Ctrl+C before the socket's bounded connection drain.
+    pub fn begin_restart_drain(&self) {
+        self.restart_draining
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub async fn reconcile_restart_intents_at_startup(&self) -> Result<()> {
+        // A DB review owns its reviewer continuation. Claim those exact rows
+        // first; the ordinary pass deliberately excludes active assignments.
+        for review_owned in [true, false] {
+            let mut cursor = None;
+            loop {
+                let intent = if review_owned {
+                    self.store.lock().await.next_review_restart_intent(cursor)?
+                } else {
+                    self.store.lock().await.next_restart_intent(cursor)?
+                };
+                let Some(intent) = intent else {
+                    break;
+                };
+                cursor = Some(intent.id);
+                let claimed = if review_owned {
+                    self.store
+                        .lock()
+                        .await
+                        .claim_review_restart_intent(&intent, self.program_run_boot_id)?
+                } else {
+                    self.store
+                        .lock()
+                        .await
+                        .claim_restart_intent(&intent, self.program_run_boot_id)?
+                };
+                if !claimed {
+                    continue;
+                }
+                if resumable_provider_session_id(
+                    &self
+                        .store
+                        .lock()
+                        .await
+                        .get_session(intent.session_id)?
+                        .ok_or(DaemonError::SessionNotFound(intent.session_id))?,
+                )
+                .is_none()
+                {
+                    self.store
+                        .lock()
+                        .await
+                        .fail_restart_intent(intent.id, "not_resumable")?;
+                    continue;
+                }
+                if let Err(error) = self
+                    .continue_restart_intent(intent.id, intent.session_id)
+                    .await
+                {
+                    tracing::warn!(intent_id=%intent.id, session_id=%intent.session_id, %error,
+                        "Graceful restart continuation deferred");
+                    self.store
+                        .lock()
+                        .await
+                        .fail_restart_intent(intent.id, "dispatch_failed")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -5123,6 +5707,66 @@ mod d00_tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
     use tempfile::TempDir;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn failed_codex_websocket_turn_rotates_with_bounded_prior_context() {
+        let directory = TempDir::new().expect("temporary session cwd");
+        let id = Uuid::new_v4();
+        let mut codex = session(id, directory.path());
+        codex.provider = SessionProvider::Codex;
+        codex.status = SessionStatus::Failed;
+        codex.stop_reason = Some(
+            "provider_error:codex:stream disconnected before completion: websocket closed by server before response.completed".into(),
+        );
+        let event = |sequence, event_type, role, content: &str| ConversationEvent {
+            id: 0,
+            session_id: id,
+            sequence,
+            event_type,
+            role,
+            content: content.into(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            offload_id: None,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+        };
+        let events = vec![
+            event(
+                1,
+                EventType::Message,
+                Some(Role::User),
+                "Continue the existing task",
+            ),
+            event(
+                2,
+                EventType::System,
+                None,
+                "**Process Error (codex_event)** websocket closed by server before response.completed",
+            ),
+        ];
+        assert!(codex_websocket_rotation_needed(&codex));
+        let context = codex_websocket_recovery_context(id, &events);
+        assert!(context.contains("Continue the existing task"));
+        assert!(context.contains("previous turn outcome may be uncertain"));
+        assert!(context.contains(&id.to_string()));
+
+        codex.stop_reason = Some("provider_error:codex:invalid model".into());
+        assert!(!codex_websocket_rotation_needed(&codex));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn retained_sandbox_denial_names_operator_audit() {
+        let message =
+            cleanup_policy_denied(CleanupBlockedReason::MissingIndependentlyVerifiedProof)
+                .to_string();
+        assert!(message.contains("retained sandbox"), "{message}");
+        assert!(message.contains("Source worktree settlement"), "{message}");
+        assert!(message.contains("zero-write audit"), "{message}");
+    }
 
     struct TestManager {
         manager: SessionManager,
@@ -5266,6 +5910,226 @@ mod d00_tests {
             queued_turn_count: None,
             terminal_reason: None,
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn operator_continue_replaces_quarantined_custody_with_fresh_sandbox_at_old_tip() {
+        use rsi_common::types::SandboxCustodyErrorCodeV1;
+
+        let test = test_manager();
+        let (session_id, old_root) = insert_completed_continue_fixture(&test, true).await;
+        let old_root = old_root.expect("quarantined fixture root");
+        std::fs::write(old_root.join("carried.txt"), "committed sandbox work\n")
+            .expect("write sandbox work");
+        git(&old_root, &["add", "carried.txt"]);
+        git(&old_root, &["commit", "-q", "-m", "sandbox work"]);
+        let old_tip = git(&old_root, &["rev-parse", "HEAD"]).trim().to_string();
+        let old_custody = {
+            let mut store = test.manager.store.lock().await;
+            let live = store
+                .live_custody_for_session(session_id)
+                .expect("live custody before quarantine");
+            store
+                .record_failed_revalidation(
+                    live.custody_id,
+                    live.generation,
+                    SandboxCustodyErrorCodeV1::SourceRevisionUnavailable,
+                    rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                )
+                .expect("quarantine durable root");
+            live.custody_id
+        };
+
+        install_continue_custody_config_observation_for_test(session_id, 0);
+        super::super::launch::install_controller_candidate_test_process(session_id);
+        test.manager
+            .continue_session_operator(session_id, "resume after quarantine".to_string())
+            .await
+            .expect("operator continue replaces terminal custody");
+
+        let (cwd, target) =
+            take_continue_custody_config_for_test(session_id, 0).expect("provider config built");
+        assert_ne!(
+            cwd, old_root,
+            "continuation must run in the replacement root"
+        );
+        assert_eq!(target, Some(cwd.join("target")));
+        assert_eq!(
+            git(&cwd, &["rev-parse", "HEAD"]).trim(),
+            old_tip,
+            "replacement starts at the old sandbox branch tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("carried.txt")).expect("carried work"),
+            "committed sandbox work\n"
+        );
+        let (live, persisted) = {
+            let store = test.manager.store.lock().await;
+            (
+                store
+                    .live_custody_for_session(session_id)
+                    .expect("replacement custody is live"),
+                store
+                    .get_session(session_id)
+                    .expect("load session")
+                    .expect("session row"),
+            )
+        };
+        assert_ne!(live.custody_id, old_custody);
+        assert_eq!(live.owner_session_id, session_id);
+        assert_eq!(persisted.sandbox_root.as_deref(), Some(cwd.as_path()));
+        assert_eq!(
+            persisted.sandbox_cleanup_state,
+            Some(SandboxCleanupState::Live)
+        );
+        assert!(old_root.exists(), "old root is retained as history");
+        assert!(test.manager.active.read().await.contains_key(&session_id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn operator_continue_of_transferred_predecessor_still_refuses_without_replacement() {
+        let test = test_manager();
+        let (session_id, root) = insert_completed_continue_fixture(&test, true).await;
+        let root = root.expect("transferred fixture root");
+        let predecessor = test
+            .manager
+            .completed
+            .read()
+            .await
+            .get(&session_id)
+            .expect("completed predecessor")
+            .session
+            .clone();
+        let live = test
+            .manager
+            .store
+            .lock()
+            .await
+            .live_custody_for_session(session_id)
+            .expect("predecessor owns live custody before transfer");
+        let successor_id = Uuid::new_v4();
+        let mut successor = session(successor_id, test.repo.path());
+        successor.status = SessionStatus::Starting;
+        successor.continued_from = Some(session_id);
+        successor.sandbox_kind = predecessor.sandbox_kind;
+        successor.sandbox_root = predecessor.sandbox_root.clone();
+        successor.sandbox_branch = predecessor.sandbox_branch.clone();
+        successor.sandbox_cleanup_state = predecessor.sandbox_cleanup_state;
+        successor.git_branch = predecessor.git_branch.clone();
+        {
+            let mut store = test.manager.store.lock().await;
+            store
+                .insert_session(&successor)
+                .expect("reserve custody successor");
+            store
+                .bind_reserved_session_custody(
+                    successor_id,
+                    SessionCustodyBinding::Transfer {
+                        custody_id: live.custody_id,
+                        from_session_id: session_id,
+                        generation: live.generation,
+                        cause: CustodyCause::Rotation,
+                        origin_session_id: Some(session_id),
+                        scheduled_job_id: None,
+                    },
+                )
+                .expect("transfer custody to successor");
+            assert!(
+                store
+                    .replaceable_terminal_custody(session_id)
+                    .expect("query replaceable custody")
+                    .is_none(),
+                "transferred custody is never replaceable by the predecessor"
+            );
+        }
+        let worktrees_before = git(test.repo.path(), &["worktree", "list", "--porcelain"]);
+        install_continue_custody_config_observation_for_test(session_id, 0);
+        let error = test
+            .manager
+            .continue_session_operator(session_id, "stale predecessor".to_string())
+            .await
+            .expect_err("transferred predecessor must refuse");
+        assert!(error.to_string().contains("ownership_missing"), "{error}");
+        assert_eq!(
+            git(test.repo.path(), &["worktree", "list", "--porcelain"]),
+            worktrees_before,
+            "refusal allocates no replacement worktree"
+        );
+        assert!(root.exists());
+        assert!(take_continue_custody_config_for_test(session_id, 0).is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn harness_tool_result_error_metadata_survives_persistence_and_resume() {
+        let dir = TempDir::new().expect("event fixture tempdir");
+        let session_id = Uuid::new_v4();
+        let store = Store::open_in_memory().expect("open event store");
+        store
+            .insert_session(&session(session_id, dir.path()))
+            .expect("insert session");
+
+        let mut sequence = 0;
+        for (tool_use_id, content, is_error) in [
+            ("tool-success", "completed", false),
+            ("tool-failure", "Error: failed", true),
+        ] {
+            let stream = crate::claude::StreamEvent {
+                event_type: "tool_result".into(),
+                data: serde_json::json!({
+                    "session_id": session_id,
+                    "content": content,
+                    "name": "fixture_tool",
+                    "tool_use_id": tool_use_id,
+                    "is_error": is_error,
+                }),
+            };
+            let events =
+                SessionManager::convert_recognized_stream_event(&stream, session_id, &mut sequence)
+                    .expect("tool result stream event is recognized");
+            assert_eq!(events.len(), 1);
+            store
+                .insert_event(&events[0])
+                .expect("persist tool result event");
+        }
+
+        let persisted = store
+            .load_events(session_id)
+            .expect("load persisted events");
+        let history = SessionManager::events_to_harness_messages(&persisted);
+        assert_eq!(history.len(), 2);
+        assert!(!history[0].is_error);
+        assert!(history[1].is_error);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn claude_transcript_copy_carries_jsonl_and_sidecar_into_new_project_dir() {
+        let projects = tempfile::tempdir().expect("projects dir");
+        let old_cwd = std::path::Path::new("/home/u/.rsi/sandboxes/old-root");
+        let new_cwd = std::path::Path::new("/home/u/.rsi/sandboxes/new-root");
+        let old_dir = projects.path().join("-home-u--rsi-sandboxes-old-root");
+        std::fs::create_dir_all(old_dir.join("sid-1").join("subagents")).unwrap();
+        std::fs::write(old_dir.join("sid-1.jsonl"), "{\"turn\":1}\n").unwrap();
+        std::fs::write(old_dir.join("sid-1").join("subagents").join("a.jsonl"), "x").unwrap();
+
+        copy_claude_transcript_in(projects.path(), old_cwd, new_cwd, "sid-1").expect("copy");
+
+        let new_dir = projects.path().join("-home-u--rsi-sandboxes-new-root");
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("sid-1.jsonl")).unwrap(),
+            "{\"turn\":1}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("sid-1").join("subagents").join("a.jsonl"))
+                .unwrap(),
+            "x"
+        );
+        assert!(old_dir.join("sid-1.jsonl").is_file(), "copy never moves");
+        copy_claude_transcript_in(projects.path(), new_cwd, old_cwd, "absent")
+            .expect("missing transcript is not an error");
     }
 
     async fn insert_completed_continue_fixture(
@@ -5516,6 +6380,7 @@ mod d00_tests {
                 .unwrap();
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_rechecks_active_turn_after_waiting_for_spawn_guard() {
             let test = test_manager();
@@ -5563,7 +6428,10 @@ mod d00_tests {
             }
             let before = snapshot(&test, target).await;
             drop(guard);
-            assert_refusal(resume.await, "manager_notice_deferred");
+            assert_refusal(
+                resume.await,
+                &format!("{CONTINUATION_TARGET_BUSY}:{target}"),
+            );
             let active = test.manager.active.read().await;
             let tracked = active.get(&target).unwrap();
             assert_eq!(tracked.spawn_generation, 41);
@@ -5582,6 +6450,7 @@ mod d00_tests {
             assert!(test.manager.completed.read().await.contains_key(&target));
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_preserves_persisted_questions_even_with_stale_completed_cache() {
             let test = test_manager();
@@ -5619,6 +6488,7 @@ mod d00_tests {
             }
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_waiting_approval_in_completed_map_remains_parked() {
             let test = test_manager();
@@ -5651,6 +6521,7 @@ mod d00_tests {
             assert_eq!(completed[&target].session.pending_question, Some(pending));
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_preserves_unresolved_approval_on_completed_session() {
             let test = test_manager();
@@ -5689,6 +6560,7 @@ mod d00_tests {
             );
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_preserves_retry_timer_queue_and_durable_recovery_owner() {
             let test = test_manager();
@@ -5740,6 +6612,7 @@ mod d00_tests {
             .await;
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_preserves_an_existing_one_shot_resume_owner() {
             let test = test_manager();
@@ -5772,6 +6645,7 @@ mod d00_tests {
             );
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_preserves_open_capacity_incident_after_status_changes() {
             let test = test_manager();
@@ -5830,6 +6704,7 @@ mod d00_tests {
             assert_eq!(state, "open");
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_requires_completed_persisted_status() {
             let test = test_manager();
@@ -5849,16 +6724,17 @@ mod d00_tests {
                     .await
                     .update_session_status(target, status)
                     .unwrap();
-                assert_preserved_refusal(
-                    &test,
-                    target,
-                    vec![Uuid::new_v4()],
-                    "manager_notice_deferred",
-                )
-                .await;
+                let refusal = if matches!(status, SessionStatus::Starting | SessionStatus::Running)
+                {
+                    "continuation_tip_unestablished"
+                } else {
+                    "manager_notice_deferred"
+                };
+                assert_preserved_refusal(&test, target, vec![Uuid::new_v4()], refusal).await;
             }
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_rejects_missing_empty_duplicate_and_unbound_jobs() {
             let test = test_manager();
@@ -5884,6 +6760,7 @@ mod d00_tests {
             }
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_rechecks_every_bound_job_after_scope_changes() {
             let test = test_manager();
@@ -5904,6 +6781,7 @@ mod d00_tests {
                 .await;
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_human_program_gate_survives_a_closed_sentinel_and_split_output() {
             let test = test_manager();
@@ -5944,6 +6822,7 @@ mod d00_tests {
             check_manager_notice_program_gate(&store, target).unwrap();
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_registered_recovery_and_output_budget_remain_deferred() {
             let test = test_manager();
@@ -5973,6 +6852,7 @@ mod d00_tests {
                 Err(DaemonError::InvalidParam(message)) if message == "manager_notice_deferred"));
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_appserver_refusal_preserves_the_authorized_principal() {
             let test = test_manager();
@@ -6026,6 +6906,7 @@ mod d00_tests {
             .expect("continued turn must persist the prompt and invocation");
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_authorized_completed_recipient_uses_existing_spawn_funnel() {
             let test = test_manager();
@@ -6043,6 +6924,7 @@ mod d00_tests {
             crate::session::launch::drop_controller_candidate_test_stream(target);
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn queued_model_effort_update_is_used_by_next_continue_launch() {
             let test = test_manager();
@@ -6109,6 +6991,7 @@ mod d00_tests {
             crate::session::launch::drop_controller_candidate_test_stream(session_id);
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
         #[tokio::test]
         async fn manager_notice_intent_preserves_ordinary_waiting_approval_continuation() {
             let test = test_manager();
@@ -6138,6 +7021,7 @@ mod d00_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn archiving_a_non_selected_sandbox_retains_its_live_worktree_and_custody() {
         let test = test_manager();
@@ -6229,6 +7113,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn terminal_metadata_transitions_retain_non_selected_sandboxes() {
         for state in ["clean", "dirty", "unmerged"] {
@@ -6383,6 +7268,7 @@ mod d00_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn terminal_metadata_transitions_ignore_shared_sandbox_cleanup_classification() {
         for (operation, expected_status) in [
@@ -6458,6 +7344,7 @@ mod d00_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn purging_a_sandboxed_session_remains_guarded_by_cleanup_proof() {
         let test = test_manager();
@@ -6472,7 +7359,7 @@ mod d00_tests {
         assert!(
             error
                 .to_string()
-                .contains("sandbox cleanup blocked: missing_independently_verified_proof")
+                .contains("sandbox cleanup blocked: this session owns a retained sandbox")
         );
         assert!(root.exists(), "guarded purge must not remove the worktree");
         let store = test.manager.store.lock().await;
@@ -6490,6 +7377,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn public_archive_routes_an_eligible_sandbox_through_cleanup() {
         let test = test_manager();
@@ -6511,6 +7399,9 @@ mod d00_tests {
             "fixture integrates committed output"
         );
 
+        let _holder_proc = test
+            .manager
+            .install_archive_cleanup_test_holder_proc(session_id);
         let result = test
             .manager
             .archive_session(session_id)
@@ -6548,6 +7439,7 @@ mod d00_tests {
         assert!(row.sandbox_branch.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn archive_restart_unarchive_retains_source_and_allocates_distinct_branch() {
         let test = test_manager();
@@ -6560,6 +7452,9 @@ mod d00_tests {
         let source_oid = git(&original_root, &["rev-parse", "HEAD"])
             .trim()
             .to_string();
+        let _holder_proc = test
+            .manager
+            .install_archive_cleanup_test_holder_proc(session_id);
         let archived = test
             .manager
             .archive_session(session_id)
@@ -6665,6 +7560,7 @@ mod d00_tests {
         super::super::launch::drop_controller_candidate_test_stream(session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn archiving_or_deleting_a_container_cascades_the_session_lifecycle() {
         let test = test_manager();
@@ -6990,6 +7886,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn d03_d05_controller_lifecycle_reconstructs_only_from_live_durable_current_a6_facts()
     -> anyhow::Result<()> {
@@ -7232,6 +8129,7 @@ mod d00_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_continue_real_interrupt_blocks_same_id_reconstruction()
     -> anyhow::Result<()> {
@@ -7376,6 +8274,7 @@ mod d00_tests {
         panic!("persistence worker did not reach expected state");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn failed_final_metadata_write_records_invocation_failure() {
         let test = test_manager();
@@ -7587,6 +8486,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn pending_archive_admission_retains_sandbox_without_cleanup_proof() {
         let test = test_manager();
@@ -7628,6 +8528,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn clearing_pending_archive_remains_available_for_recovery() {
         let test = test_manager();
@@ -7657,6 +8558,7 @@ mod d00_tests {
         assert!(!tracked.session.pending_archive);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn terminal_pending_auto_archive_retains_sandbox_and_commits_archive() {
         let test = test_manager();
@@ -7734,6 +8636,7 @@ mod d00_tests {
         test.manager.event_bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_context_custody_uses_exact_ordinary_and_live_paths() {
         let ordinary = test_manager();
@@ -7794,6 +8697,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_context_revalidation_race_refuses_before_admission_or_dispatch() {
         let test = test_manager();
@@ -7843,6 +8747,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn continue_execution_scratch_failure_restores_exact_completed_session() {
         let test = test_manager();
@@ -7888,6 +8793,7 @@ mod d00_tests {
         super::super::launch::drop_controller_candidate_test_process(session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_preserves_provider_session_id_failure_restoration() {
         let test = test_manager();
@@ -7919,6 +8825,7 @@ mod d00_tests {
         assert!(take_continue_custody_config_for_test(session_id, 0).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_historical_and_malformed_custody_never_falls_back_or_reallocates() {
         use rsi_common::types::SandboxCustodyErrorCodeV1;
@@ -8023,6 +8930,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_reports_startup_invalid_legacy_tuple_before_missing_ownership() {
         use rsi_common::types::SandboxCustodyErrorCodeV1;
@@ -8082,6 +8990,7 @@ mod d00_tests {
         assert!(root.exists(), "refusal must not alter the legacy worktree");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn h1_v83_continue_transferred_predecessor_refuses_without_fallback_or_provider() {
         let test = test_manager();
@@ -8174,6 +9083,7 @@ mod d00_tests {
         assert!(root.exists(), "refusal must preserve successor-owned root");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn h1_v83_continue_source_ratchets_forbid_fallback_reallocation_and_prepermit_dispatch() {
         let source = include_str!("lifecycle.rs");
@@ -8205,6 +9115,7 @@ mod d00_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn explicit_legacy_sandbox_restore_rehydrates_a_purged_tuple() {
         // Low-level compatibility proof only. `continue_session` deliberately

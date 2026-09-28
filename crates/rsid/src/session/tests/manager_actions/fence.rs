@@ -9,6 +9,7 @@ use super::*;
 /// successor never received the lead: the exact target is not the published
 /// tip, so `ManagerRecovery` is refused `continuation_tip_changed` instead of
 /// restarting the superseded incarnation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_resume_of_a_superseded_exact_target_is_refused_tip_changed() {
     let p = pilot().await;
@@ -84,6 +85,7 @@ async fn persisted_event_count(p: &Pilot, session: Uuid, text: &str) -> usize {
 /// manager resumes a retired lead (receipt Succeeded, one new User event),
 /// that event makes the witness stale, and a later scheduled wake to the same
 /// lead is delivered by the ordinary fenced path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_resume_of_a_retired_lead_stales_the_witness_and_permits_a_later_wake() {
     use crate::issue_tracker::poller::SessionLauncher;

@@ -1,0 +1,9 @@
+# Agent routing reference
+
+Route from the next unmet evidence obligation. Tier-0 is a lookup, formatting step, or deterministic check; the current agent handles it without review. Tier-1 is bounded code or document work with one owner; add investigation or review for a named gap. Tier-2 covers schema, auth, custody, concurrency, integration, destructive lifecycle, external effects, or disputed risk; use one mutating owner and independent exact-revision review.
+
+Reuse current evidence. Combine investigation and design when one owner can resolve a bounded uncertainty and name affected interfaces, checks, rollback, and open questions. Separate only for independent questions, separate custody, or a real consumer boundary. Keep shared schema, protocol, security, and live effects under one owner. Resource ceilings come from the operator, project, provider, and daemon policy; do not invent portable child or time limits.
+
+Review budget: Tier-0 has no review. Tier-1 may have one initial risk-driven review and one delta review if the fix changes that risk. Tier-2 has an initial independent review plus one finding-focused delta review. An explicit hazardous specialist gate may add one different specialist (three total). A new source revision does not reset the logical slice's review budget. At the limit, unresolved findings block acceptance; split or replan materially changed work, or report the actual gate. A count limit alone is not a human gate.
+
+Set provider-valid model and effort when child difficulty or provider differs from the parent. Do not carry model spellings across providers. Claude effort accepts `low|medium|high|xhigh|max`; Codex also accepts `ultra`; Haiku has no effort. Current aliases are daemon resolved. Missing authority, credentials, input, external state, capacity, or formatting are not evidence of model failure. Honor explicit model overrides.

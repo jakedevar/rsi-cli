@@ -192,6 +192,7 @@ pub enum AuthStyle {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_chat_message_constructors() {
         let sys = ChatMessage::system("you are helpful");
@@ -212,6 +213,7 @@ mod tests {
         assert_eq!(tool.content, "result data");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_estimated_tokens() {
         let msg = ChatMessage::user("hello world"); // 11 chars -> (11+3)/4 = 3
@@ -221,6 +223,7 @@ mod tests {
         assert_eq!(empty.estimated_tokens(), 0); // (0+3)/4 = 0 (integer division)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_message_role_serde() {
         let json = serde_json::to_string(&MessageRole::System).unwrap();
@@ -230,6 +233,7 @@ mod tests {
         assert_eq!(parsed, MessageRole::Assistant);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_tool_call_serde() {
         let tc = ToolCall {
@@ -243,6 +247,7 @@ mod tests {
         assert_eq!(parsed.name, "read_file");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_provider_quirks_default() {
         let q = ProviderQuirks::default();

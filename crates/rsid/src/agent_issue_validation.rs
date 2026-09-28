@@ -209,6 +209,7 @@ mod tests {
         AgentIssueValidationClassV1 as Class, AgentIssueValidationFieldV1 as Field,
     };
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn list_preserves_null_default_and_other_roots_fail_closed() {
         assert!(decode_list(&Value::Null).is_ok());
@@ -217,6 +218,7 @@ mod tests {
         assert_eq!(error.field, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn agent_issue_validation_ready_field_decodes_and_invalid_values_receive_typed_hints() {
@@ -228,6 +230,7 @@ mod tests {
         assert_eq!(error.field, Some(Field::Ready));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn classifier_never_echoes_unknown_keys_and_uses_stable_precedence() {
         let error =
@@ -242,6 +245,7 @@ mod tests {
         assert_eq!(error.field, Some(Field::IssueId));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn all_seven_request_kinds_accept_current_shapes_and_reject_invalid_roots() {
         type Decode = fn(&Value) -> Result<(), AgentIssueValidationV1>;
@@ -305,6 +309,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn all_required_and_known_invalid_fields_map_to_closed_public_names() {
         let issue_id = uuid::Uuid::new_v4();
@@ -402,6 +407,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn nested_decode_path_collapses_to_allowlisted_top_level_field() {
         let error =
@@ -411,6 +417,7 @@ mod tests {
         assert_eq!(error.field, Some(Field::Cursor));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn classifier_metadata_matches_the_common_catalog_schemas() {
         for kind in [

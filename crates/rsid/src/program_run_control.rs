@@ -764,6 +764,7 @@ impl BoundProgramRunSchedulerAuthority {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn d05_operator_authority_is_construction_bound() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));

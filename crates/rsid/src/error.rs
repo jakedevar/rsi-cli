@@ -39,6 +39,23 @@ pub enum DaemonError {
     #[error("Process error: {0}")]
     Process(String),
 
+    /// A Codex CLI resume would replay an invalid persisted tool conversation.
+    /// The caller must recover from a fresh conversation boundary instead of
+    /// retrying the same thread or guessing the outcome of an interrupted tool.
+    /// Raise it only before a provider process is spawned: manager recovery
+    /// reads its invocation error class as proof that no provider effect
+    /// occurred (`PRE_SPAWN_REFUSAL_ERROR_CLASSES`).
+    #[error("Codex resume tool history invalid: {0}")]
+    CodexResumeToolHistory(String),
+
+    /// The final rollout record was cut off before its newline and is not JSON.
+    /// Replaying this provider thread cannot repair the record.
+    #[error("Codex resume rollout torn tail")]
+    CodexResumeTornTail,
+
+    #[error("OpenRouter Harness route preflight failed: {cause}")]
+    OpenRouterRoutePreflight { cause: &'static str },
+
     /// Startup could not prove and terminate the complete exact-stamped
     /// provider cohort. Continuing would let later best-effort reconciliation
     /// erase the durable candidate set while a provider process remains live.
@@ -273,6 +290,7 @@ mod agent_issue_error_tests {
         AgentIssueValidationFieldV1, AgentIssueValidationV1,
     };
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn normalization_rebuilds_canonical_next_action_and_preserves_typed_evidence() {
         let validation = AgentIssueValidationV1 {
@@ -375,6 +393,7 @@ mod reclaim_prepared_tests {
         SandboxCustodyTransitionV1,
     };
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn v1_reclaim_prepared_rpc_keeps_code_and_adds_bounded_retry_hint() {
         let error = sandbox_custody_error(SandboxCustodyErrorV1 {
@@ -396,6 +415,7 @@ mod reclaim_prepared_tests {
         assert_eq!(data.get("retry_after_ms"), Some(&serde_json::json!(1_000)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn root_busy_is_distinct_from_prepared_and_has_a_bounded_retry_hint() {
         let error = sandbox_custody_error(SandboxCustodyErrorV1 {

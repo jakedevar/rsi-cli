@@ -636,6 +636,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn default_off_blocks_start_and_requests_then_on_reconciles_without_restart() {
         let root = tempfile::tempdir().unwrap();
@@ -696,6 +697,7 @@ mod tests {
         task.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn startup_recovers_interrupted_run_and_retains_ready_head() {
         let root = tempfile::tempdir().unwrap();
@@ -741,6 +743,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn startup_repairs_ready_head_without_v5_accounting() {
         let root = tempfile::tempdir().unwrap();
@@ -790,6 +793,7 @@ mod tests {
         assert!(retained_count > 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_ingress_retains_rescan_on_overflow() {
         let root = tempfile::tempdir().unwrap();
@@ -810,6 +814,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn lost_reordered_and_overflowed_watcher_hints_converge() {
         let root = tempfile::tempdir().unwrap();
@@ -880,6 +885,7 @@ mod tests {
         task.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn queue_coalesces_and_rotates_workspaces() {
         let a = tempfile::tempdir().unwrap();
@@ -896,6 +902,7 @@ mod tests {
         assert_eq!(manager.pending.pop_front(), Some(second.workspace_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn startup_reconciles_two_workspaces_in_one_project_db() {
         let primary_root = tempfile::tempdir().unwrap();

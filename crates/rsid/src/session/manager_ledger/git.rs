@@ -1,5 +1,6 @@
 use super::*;
 use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
+use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::{io::AsyncReadExt, process::Command};
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -262,7 +263,7 @@ async fn content_base_selection(
     base: &str,
     source: &str,
     target: &str,
-) -> Result<(String, bool)> {
+) -> Result<(String, Option<String>)> {
     if source != target {
         let raw = read(root, &["rev-list", "--parents", "-n", "1", target]).await?;
         let history = std::str::from_utf8(&raw)
@@ -280,10 +281,106 @@ async fn content_base_selection(
                 .map_err(|_| refused("manager_v2_accepted_content_unsupported"))?
                 .split_ascii_whitespace()
                 .collect::<Vec<_>>();
-            if bases.len() != 1 || !canonical_sha(bases[0]) {
+            if bases.is_empty() || bases.len() > 2 || !bases.iter().all(|base| canonical_sha(base))
+            {
                 return Err(refused("manager_v2_accepted_content_ambiguous"));
             }
-            return Ok((bases[0].to_owned(), true));
+            if bases.len() == 2 {
+                // Criss-cross history has two incomparable commit bases. Git's
+                // recursive merge builds their shared virtual tree; refuse a
+                // conflicted merge rather than selecting the convenient base.
+                // Only the base on the source's first-parent path can carry
+                // earlier source work. The virtual tree also imports rolling
+                // changes, which must not be attributed to this source.
+                let mut source_side_base = None;
+                for candidate in &bases {
+                    if on_first_parent_path(root, candidate, source).await? {
+                        if source_side_base.replace(*candidate).is_some() {
+                            return Err(refused("manager_v2_accepted_content_ambiguous"));
+                        }
+                    }
+                }
+                let source_side_base = source_side_base
+                    .ok_or_else(|| refused("manager_v2_accepted_content_ambiguous"))?;
+                let rolling_side_base = bases
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate != source_side_base)
+                    .ok_or_else(|| refused("manager_v2_accepted_content_ambiguous"))?;
+                if !ancestor(root, base, source_side_base).await? {
+                    return Err(refused("manager_v2_accepted_content_ambiguous"));
+                }
+                let first_parent = read(
+                    root,
+                    &[
+                        "rev-list",
+                        "--first-parent",
+                        "--parents",
+                        &format!("{base}..{source_side_base}"),
+                    ],
+                )
+                .await?;
+                let mut inspected_commits = 0;
+                for line in std::str::from_utf8(&first_parent)
+                    .map_err(|_| refused("manager_v2_accepted_content_ambiguous"))?
+                    .lines()
+                {
+                    let parents = line.split_ascii_whitespace().collect::<Vec<_>>();
+                    if parents.is_empty() {
+                        continue;
+                    }
+                    inspected_commits += 1;
+                    if inspected_commits > 256
+                        || ancestor(root, parents[0], rolling_side_base).await?
+                    {
+                        // A source fast-forward through already published
+                        // rolling history has no merge commit to mark imported
+                        // prefix paths. That history can include rolling's
+                        // second-parent side branches.
+                        return Err(refused("manager_v2_accepted_content_ambiguous"));
+                    }
+                    match parents.as_slice() {
+                        [_, _] => {}
+                        [_, _, second] if canonical_sha(second) => {
+                            // A source-side worker merge remains attributable
+                            // to the source. A merge that imports the rolling
+                            // side can carry content that rolling later evolves.
+                            let shared =
+                                read(root, &["merge-base", "--all", second, rolling_side_base])
+                                    .await?;
+                            let shared = std::str::from_utf8(&shared)
+                                .map_err(|_| refused("manager_v2_accepted_content_ambiguous"))?;
+                            if shared
+                                .split_ascii_whitespace()
+                                .any(|shared| !canonical_sha(shared))
+                                || shared.trim().is_empty()
+                            {
+                                return Err(refused("manager_v2_accepted_content_ambiguous"));
+                            }
+                            for shared in shared.split_ascii_whitespace() {
+                                if !ancestor(root, shared, base).await? {
+                                    return Err(refused("manager_v2_accepted_content_ambiguous"));
+                                }
+                            }
+                        }
+                        _ => return Err(refused("manager_v2_accepted_content_ambiguous")),
+                    }
+                }
+                let (status, raw) =
+                    run(root, &["merge-tree", "--write-tree", bases[0], bases[1]]).await?;
+                if !status.success() {
+                    return Err(refused("manager_v2_accepted_content_ambiguous"));
+                }
+                let tree = std::str::from_utf8(&raw)
+                    .map_err(|_| refused("manager_v2_accepted_content_ambiguous"))?
+                    .trim();
+                if !canonical_sha(tree) || read(root, &["cat-file", "-t", tree]).await? != b"tree\n"
+                {
+                    return Err(refused("manager_v2_accepted_content_ambiguous"));
+                }
+                return Ok((tree.to_owned(), Some(source_side_base.to_owned())));
+            }
+            return Ok((bases[0].to_owned(), Some(bases[0].to_owned())));
         }
     }
     let source_history = read(
@@ -307,10 +404,10 @@ async fn content_base_selection(
             && ancestor(root, base, parent).await?
             && ancestor(root, parent, target).await?
         {
-            return Ok((parent.to_owned(), false));
+            return Ok((parent.to_owned(), None));
         }
     }
-    Ok((base.to_owned(), false))
+    Ok((base.to_owned(), None))
 }
 
 pub(super) async fn content_base(
@@ -404,24 +501,50 @@ async fn accepted_content_inner(root: &Path, base: &str, source: &str, target: &
     if !ancestor(root, base, source).await? {
         return Err(refused("manager_v2_accepted_base_mismatch"));
     }
-    let (content_base, landing_merge) = content_base_selection(root, base, source, target).await?;
-    if landing_merge
-        && base != content_base
-        && ancestor(root, base, &content_base).await?
-        && on_first_parent_path(root, &content_base, source).await?
-    {
-        // The shared prefix may contain work that crossed into the target's
-        // first-parent history before this landing. Check only the content
-        // novel at that crossing, at the commit where it was published.
-        if let Some((crossing_base, entry)) =
-            shared_prefix_entry(root, base, &content_base, target).await?
+    let (content_base, prefix_base) = content_base_selection(root, base, source, target).await?;
+    if let Some(prefix_base) = prefix_base.filter(|prefix_base| base != prefix_base) {
+        if ancestor(root, base, &prefix_base).await?
+            && on_first_parent_path(root, &prefix_base, source).await?
         {
-            let prefix = changed_paths(root, &crossing_base, &content_base).await?;
-            let paths: Vec<&[u8]> = prefix
-                .split(|byte| *byte == 0)
-                .filter(|path| !path.is_empty())
-                .collect();
-            verify_content_paths(root, &crossing_base, &content_base, &entry, &paths).await?;
+            // The shared prefix may contain work that crossed into the target's
+            // first-parent history before this landing. Check only the content
+            // novel at that crossing, at the commit where it was published.
+            if let Some((crossing_base, entry)) =
+                shared_prefix_entry(root, base, &prefix_base, target).await?
+            {
+                let prefix = changed_paths(root, &crossing_base, &prefix_base).await?;
+                let paths: Vec<&[u8]> = prefix
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                verify_content_paths(root, &crossing_base, &prefix_base, &entry, &paths).await?;
+
+                // Recheck prefix paths changed by this landing. The accepted
+                // source may itself evolve an earlier published path; in that
+                // case its version must survive. Otherwise the landing must
+                // preserve the version already on rolling's first parent.
+                let parent = head(root, &format!("{target}^1")).await?;
+                let landing_changes = changed_paths(root, &parent, target).await?;
+                let landing_paths: HashSet<&[u8]> = landing_changes
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                let changed_prefix_paths: Vec<&[u8]> = paths
+                    .into_iter()
+                    .filter(|path| landing_paths.contains(path))
+                    .collect();
+                let source_changes = changed_paths(root, &prefix_base, source).await?;
+                let source_paths: HashSet<&[u8]> = source_changes
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                let (source_modified, rolling_only): (Vec<_>, Vec<_>) = changed_prefix_paths
+                    .into_iter()
+                    .partition(|path| source_paths.contains(path));
+                verify_content_paths(root, &crossing_base, source, target, &source_modified)
+                    .await?;
+                verify_content_paths(root, &crossing_base, &parent, target, &rolling_only).await?;
+            }
         }
     }
     let changed = changed_paths(root, &content_base, source).await?;
@@ -459,20 +582,25 @@ async fn verify_content_paths(
     target: &str,
     paths: &[&[u8]],
 ) -> Result<()> {
-    // Handoffs and plans travel with the source but do not consume the code
-    // path budget. The total observation still has a 30-second deadline.
-    if paths
-        .iter()
-        .filter(|path| !path.starts_with(b"thoughts/"))
-        .count()
-        > 64
-    {
-        return Err(refused("manager_v2_accepted_content_path_limit"));
-    }
     for raw in paths {
-        let path = std::str::from_utf8(raw)
-            .map_err(|_| refused("manager_v2_accepted_content_unsupported"))?;
-        let before = content_blob(root, base, path).await?;
+        std::str::from_utf8(raw).map_err(|_| refused("manager_v2_accepted_content_unsupported"))?;
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    // Tree equality proves unchanged paths without per-blob Git subprocesses.
+    // Git output and the whole proof still have bounded, fail-closed deadlines.
+    let changed = changed_paths(root, source, target).await?;
+    let divergent: HashSet<&[u8]> = changed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    for raw in paths {
+        if !divergent.contains(raw) {
+            continue;
+        }
+        let path = std::str::from_utf8(raw).expect("candidate paths validated above");
         let after = content_blob(root, source, path).await?;
         let now = content_blob(root, target, path).await?;
         if after == now {
@@ -484,6 +612,7 @@ async fn verify_content_paths(
         let Some(now) = now else {
             return Err(refused("manager_v2_accepted_content_lost"));
         };
+        let before = content_blob(root, base, path).await?;
         let before = before.unwrap_or_default();
         if before.contains(&0) || after.contains(&0) || now.contains(&0) {
             return Err(refused("manager_v2_accepted_content_unsupported"));
@@ -736,7 +865,7 @@ pub(super) async fn blob(root: &Path, commit: &str, path: &str) -> Result<Vec<u8
     read(root, &["cat-file", "blob", &entry]).await
 }
 pub(super) async fn migration(root: &Path, baseline: &str, digest: &str) -> Result<()> {
-    if !canonical_sha(baseline) || head(root, "refs/heads/rolling").await? != baseline {
+    if !canonical_sha(baseline) || remote_head(root).await? != baseline {
         return Err(refused("manager_v2_stale_migration_baseline"));
     }
     let raw = read(
@@ -854,8 +983,48 @@ pub(super) async fn migration(root: &Path, baseline: &str, digest: &str) -> Resu
             return Err(refused("manager_v2_released_source_changed"));
         }
     }
-    if head(root, "refs/heads/rolling").await? != baseline {
+    if remote_head(root).await? != baseline {
         return Err(refused("manager_v2_stale_migration_baseline"));
     }
     Ok(())
+}
+
+/// Observe the local rolling tracking ref and its declared schema head.
+/// A seal records this exact tip; publication rechecks it after fetching.
+pub(super) async fn migration_seal_head(root: &Path) -> Result<(String, u32)> {
+    let tip = head(root, "refs/remotes/origin/rolling").await?;
+    let raw = read(
+        root,
+        &[
+            "cat-file",
+            "blob",
+            &format!("{tip}:tools/released-migrations.json"),
+        ],
+    )
+    .await?;
+    let inventory: Value =
+        serde_json::from_slice(&raw).map_err(|_| refused("manager_v2_invalid_inventory"))?;
+    let version = inventory["latest_schema_version"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n < i32::MAX as u32)
+        .ok_or_else(|| refused("manager_v2_invalid_inventory"))?;
+    let source = read(
+        root,
+        &[
+            "cat-file",
+            "blob",
+            &format!("{tip}:crates/rsid/src/store/mod.rs"),
+        ],
+    )
+    .await?;
+    let declaration = format!("pub const LATEST_SCHEMA_VERSION: i32 = {version};");
+    if !String::from_utf8(source)
+        .map_err(|_| refused("manager_v2_invalid_inventory"))?
+        .lines()
+        .any(|line| line == declaration)
+    {
+        return Err(refused("manager_v2_schema_head_changed"));
+    }
+    Ok((tip, version))
 }

@@ -5033,6 +5033,7 @@ mod tests {
     use crate::store::LATEST_SCHEMA_VERSION;
     use rsi_common::types::SessionStatus;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v94_catalog_is_retained_below_the_current_schema_head() {
         let store = Store::open_in_memory_via_migrations_for_test().expect("blank to schema head");
@@ -5050,6 +5051,7 @@ mod tests {
         tx.rollback().expect("rollback read tx");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v94_journal_rejects_delete_and_phase_regression() {
         let store = Store::open_in_memory().expect("store");
@@ -5071,6 +5073,7 @@ mod tests {
         assert_eq!(trigger_count, 27);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn ordinary_archived_session_still_unarchives_without_a_settlement_receipt() {
         let store = Store::open_in_memory().expect("store");
@@ -5301,6 +5304,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn latest_settlement_run_is_durable_and_repository_scoped() {
         let directory = tempfile::tempdir().expect("latest-run fixture directory");
@@ -5415,6 +5419,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn latest_run_pointer_rejects_delete_regression_bounds_and_bad_association() {
         let directory = tempfile::tempdir().expect("latest-run pointer guards directory");
@@ -5494,6 +5499,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn latest_run_pointer_cannot_oscillate_or_rewrite_immutable_run_order() {
         let directory = tempfile::tempdir().expect("latest-run order guard directory");
@@ -5615,6 +5621,7 @@ mod tests {
         assert_eq!(pointer(), (second.run_id.to_string(), 2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn custody_fence_query_uses_the_partial_repository_index() {
         let directory = tempfile::tempdir().expect("custody fence query-plan directory");
@@ -5648,6 +5655,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn duplicate_custody_ids_in_one_run_are_rejected_before_persistence() {
         let directory = tempfile::tempdir().expect("duplicate custody directory");
@@ -5676,6 +5684,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v95_catalog_trigger_rejects_direct_sql_duplicate_custody_authority() {
         let directory = tempfile::tempdir().expect("direct duplicate custody directory");
@@ -5731,6 +5740,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v95_migration_rejects_authentic_v94_duplicate_custody_authority() {
         let directory = tempfile::tempdir().expect("V94 duplicate custody directory");
@@ -5803,6 +5813,7 @@ mod tests {
         tx.rollback().expect("close V94 authentication transaction");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn fenced_or_settled_root_cannot_advance_pointer_until_a_new_root_exists() {
         use crate::store::sandbox_custody::{NewCustodyRoot, SessionCustodyBinding};
@@ -5920,6 +5931,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn run_backed_cohort_remains_listed_after_its_live_custody_is_gone() {
         let directory = tempfile::tempdir().expect("run-backed cohort fixture directory");
@@ -5942,6 +5954,7 @@ mod tests {
         assert_eq!(summary.terminal_roots, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn live_and_historical_cohort_union_is_strictly_bounded() {
         let directory = tempfile::tempdir().expect("bounded cohort fixture directory");
@@ -5984,6 +5997,7 @@ mod tests {
         assert!(error.to_string().contains("exceeds bounded maximum"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn malformed_historical_receipt_fails_closed_instead_of_returning_live_only() {
         let directory = tempfile::tempdir().expect("malformed cohort fixture directory");
@@ -6122,6 +6136,7 @@ mod tests {
         .expect("construct quarantine marker")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_marker_is_canonical_typed_bounded_and_domain_separated() {
         let directory = tempfile::tempdir().expect("marker directory");
@@ -6169,6 +6184,7 @@ mod tests {
         assert!(zero_root.to_canonical_json().is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_authority_cas_replays_once_and_rejects_tamper_or_phase_drift() {
         let directory = tempfile::tempdir().expect("CAS directory");
@@ -6301,6 +6317,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_authority_cas_rejects_malformed_noncanonical_and_unknown_evidence() {
         let directory = tempfile::tempdir().expect("malformed CAS directory");
@@ -6377,6 +6394,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_marker_survives_all_later_transitions_and_finalization() {
         let directory = tempfile::tempdir().expect("transition directory");
@@ -6450,6 +6468,7 @@ mod tests {
         assert!(receipt.finished_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn refresh_run_projection_covers_all_intent_applying_mixed_and_terminal_states() {
         for (counts, expected) in [
@@ -6506,6 +6525,7 @@ mod tests {
             .expect("insert scheduled q dependency");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_inventory_alias_blocks_scheduled_and_executable_session_paths() {
         let directory = tempfile::tempdir().expect("alias directory");
@@ -6551,6 +6571,7 @@ mod tests {
         assert_eq!(inventory[0].session_path_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_inventory_alias_keeps_custody_only_dependency_blocking() {
         let directory = tempfile::tempdir().expect("custody alias directory");
@@ -6585,6 +6606,7 @@ mod tests {
         assert_eq!(inventory[0].session_path_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_inventory_alias_mismatch_and_bounds_fail_closed() {
         let directory = tempfile::tempdir().expect("invalid alias directory");
@@ -6629,6 +6651,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_inventory_alias_matches_canonical_q_path() {
         let directory = tempfile::tempdir().expect("canonical alias directory");
@@ -6654,6 +6677,7 @@ mod tests {
         assert_eq!(inventory[0].scheduled_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn startup_orphans_match_original_q_or_both_and_q_session_aliases() {
         for (case, original_exists, quarantine_exists) in [
@@ -6696,6 +6720,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn startup_orphans_reject_q_symlink_and_non_directory_collision() {
         for collision in ["symlink", "file"] {
@@ -6730,6 +6755,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn startup_orphans_reject_original_non_directory_collision() {
         let directory = tempfile::tempdir().expect("startup original collision directory");
@@ -6746,6 +6772,7 @@ mod tests {
         assert!(error.to_string().contains("not a directory"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn startup_existing_original_canonicalize_error_fails_closed() {
         let directory = tempfile::tempdir().expect("startup canonicalize error directory");
@@ -6774,6 +6801,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_path_growth_is_bounded() {
         let run_id = Uuid::new_v4();
@@ -6792,6 +6820,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn quarantine_path_rejects_wrong_or_noncanonical_session_leaf() {
         let directory = tempfile::tempdir().expect("path directory");

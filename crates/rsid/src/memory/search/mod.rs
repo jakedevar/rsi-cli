@@ -346,6 +346,7 @@ mod tests {
         store
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_empty_query() {
         let store = setup_test_store(&[]);
@@ -359,6 +360,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_fts_only_mode() {
         let store = setup_test_store(&[(
@@ -384,6 +386,7 @@ mod tests {
         assert!(results[0].snippet.contains("rust"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_hybrid_mode() {
         let store = setup_test_store(&[(
@@ -415,6 +418,7 @@ mod tests {
         assert!(!results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_hybrid_fails_closed_without_embedding_control() {
         let store = setup_test_store(&[]);
@@ -429,6 +433,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_min_score_filter() {
         let store = setup_test_store(&[(
@@ -458,6 +463,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_max_results_limit() {
         let store = setup_test_store(&[
@@ -497,6 +503,7 @@ mod tests {
         assert!(results.len() <= 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_candidate_multiplier() {
         let config = default_config();
@@ -507,6 +514,7 @@ mod tests {
         assert_eq!(candidates, 24); // 6 * 4
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_candidate_multiplier_capped() {
         let mut config = default_config();
@@ -519,6 +527,7 @@ mod tests {
         assert_eq!(candidates, 200); // Capped at 200
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_snippet_truncation() {
         let long_text = "x".repeat(1000);
@@ -569,6 +578,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_conversion_to_search_result() {
         let chunk = ScoredChunk {
@@ -591,6 +601,7 @@ mod tests {
         assert_eq!(result.source, MemorySource::Memory);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_fts_only_extracts_keywords() {
         let store = setup_test_store(&[
@@ -629,6 +640,7 @@ mod tests {
         assert!(results[0].snippet.contains("rust"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_fts_only_fallback_to_raw_query() {
         let store = setup_test_store(&[(
@@ -655,6 +667,7 @@ mod tests {
         let _ = results;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_temporal_decay_applied() {
         let store = setup_test_store(&[(
@@ -684,6 +697,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_mmr_applied() {
         let store = setup_test_store(&[
@@ -733,6 +747,7 @@ mod tests {
         assert!(results.len() <= 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_search_both_decay_and_mmr() {
         let store = setup_test_store(&[

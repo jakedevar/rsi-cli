@@ -148,6 +148,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn client_construction_stores_fields() {
         let client = StallClassifierLlmClient::new(
@@ -162,6 +163,7 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(30));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn admitted_classifier_request_uses_exactly_one_loopback_post() {
         let listener = TcpListener::bind("127.0.0.1:0")

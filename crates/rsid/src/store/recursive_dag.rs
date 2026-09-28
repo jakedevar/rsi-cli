@@ -19034,6 +19034,7 @@ mod tests {
         (graph_id, root_id)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_typed_materialization_schema_exists_at_latest() {
         let (_dir, store) = test_store();
@@ -19058,6 +19059,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_typed_artifact_role_provenance_round_trips() {
         let (_dir, store) = test_store();
@@ -19119,6 +19121,7 @@ mod tests {
         assert_eq!(rows[0], row);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_typed_test_rows_round_trip_with_and_without_name() {
         let (_dir, store) = test_store();
@@ -19202,6 +19205,7 @@ mod tests {
         assert_eq!(without_name.display_label, "cargo test integration");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_typed_diff_rows_round_trip_with_hunks_unavailable() {
         let (_dir, store) = test_store();
@@ -19289,6 +19293,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_report_materialization_uses_uuid_report_id() {
         let (_dir, store) = test_store();
@@ -19324,6 +19329,7 @@ mod tests {
         assert_eq!(by_id, summary);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_report_materialization_covers_failed_and_expired_runs() {
         let (_dir, store) = test_store();
@@ -19383,6 +19389,7 @@ mod tests {
         assert_eq!(expired_summary.report_artifact_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_typed_materialization_tolerates_malformed_metadata() {
         let (_dir, store) = test_store();
@@ -19450,6 +19457,7 @@ mod tests {
         assert_eq!(summary.status, RecursiveTypedTestStatus::Failed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_validation_commit_materializes_typed_rows() {
         let (_dir, store) = test_store();
@@ -20353,6 +20361,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_migration_succeeds() {
         let (_dir, store) = test_store();
@@ -20428,6 +20437,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_persists_linkage_only() {
         let (_dir, store) = test_store();
@@ -20557,6 +20567,7 @@ mod tests {
         assert_eq!(loaded_task_links.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_rolls_back_on_task_link_failure() {
         let (_dir, store) = test_store();
@@ -20593,6 +20604,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_dependency_edges_match_slice() {
         let (_dir, store) = test_store();
@@ -20657,6 +20669,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_reuses_matching_idempotency() {
         let (_dir, store) = test_store();
@@ -20677,6 +20690,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_topology_task_links"), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_rejects_idempotency_conflict() {
         let (_dir, store) = test_store();
@@ -20695,6 +20709,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_task_graphs"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_creation_rejects_owner_collision() {
         let (_dir, store) = test_store();
@@ -20720,6 +20735,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_task_graphs"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_graph_snapshots_survive_topology_edits() {
         let (_dir, store) = test_store();
@@ -20749,6 +20765,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_snapshot_json_round_trips_from_store() {
         let (_dir, store) = test_store();
@@ -20841,6 +20858,7 @@ mod tests {
         assert_eq!(decoded.task_links, response.task_links);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_lists_graphs_with_filters() {
         let (_dir, store) = test_store();
@@ -20928,6 +20946,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_gets_nodes_and_dynamic_counts() {
         let (_dir, store) = test_store();
@@ -21011,6 +21030,7 @@ mod tests {
         assert!(verify.session_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_orders_multiple_graphs_deterministically() {
         let (_dir, store) = test_store();
@@ -21110,6 +21130,7 @@ mod tests {
         assert!(status.nodes.iter().all(|node| node.child_count.is_none()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_precedence_and_readback_states() {
         let (_dir, store) = test_store();
@@ -21256,6 +21277,7 @@ mod tests {
         assert_eq!(run_cancel_status.open_cancellations[0].id, run_cancel.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_graph_scope_is_idempotent_and_visible() {
         let (_dir, store) = test_store();
@@ -21313,6 +21335,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_cancellation_requests"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_status_readback_preserves_parent_scope() {
         let (_dir, store) = test_store();
@@ -21367,6 +21390,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_all_matching_is_partial_and_retryable() {
         let (_dir, store) = test_store();
@@ -21448,6 +21472,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_cancellation_requests"), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_run_scope_marks_run_only() {
         let (_dir, store) = test_store();
@@ -21523,6 +21548,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_cancellation_requests"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_rejects_bad_targets_without_mutation() {
         let (_dir, store) = test_store();
@@ -21591,6 +21617,7 @@ mod tests {
         assert_eq!(table_count(&store, "sessions"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_idempotency_conflict_rejects_without_mutation() {
         let (_dir, store) = test_store();
@@ -21615,6 +21642,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_cancellation_requests"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_cancellation_terminal_single_rejects_cancelled_noops() {
         let (_dir, store) = test_store();
@@ -21646,6 +21674,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_cancellation_requests"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_preserves_mixed_graph_states() {
         let (_dir, store) = test_store();
@@ -21754,6 +21783,7 @@ mod tests {
         assert_eq!(status.open_cancellations[0].id, cancellation.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_readback_is_read_only() {
         let (_dir, store) = test_store();
@@ -21834,6 +21864,7 @@ mod tests {
         assert_eq!(after_audit, before_audit);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_unknown_workflow_execution_id_is_empty() {
         let (_dir, store) = test_store();
@@ -21864,6 +21895,7 @@ mod tests {
         assert!(!status.background_enabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_status_unknown_graph_id_is_clear() {
         let (_dir, store) = test_store();
@@ -21876,6 +21908,7 @@ mod tests {
         assert_error_contains(error, "recursive DAG graph not found");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_fake_scheduler_resolver_requires_unique_fake_link() {
         let (_dir, store) = test_store();
@@ -21989,6 +22022,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_scheduler_runs"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_fake_scheduler_resolver_rejects_non_fake_owner() {
         let (_dir, store) = test_store();
@@ -22024,6 +22058,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_scheduler_runs"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_graph_target_is_idempotent_and_replays() {
         let (_dir, store) = test_store();
@@ -22088,6 +22123,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_recovery_passes"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_safe_active_candidate_reports_recovered_state() {
         let (_dir, store) = test_store();
@@ -22131,6 +22167,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_node_selector_noop_after_completion() {
         let (_dir, store) = test_store();
@@ -22167,6 +22204,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_recovery_passes"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_all_matching_workflow_execution_time_budget_zero() {
         let (_dir, store) = test_store();
@@ -22247,6 +22285,7 @@ mod tests {
         assert_eq!(table_count(&store, "sessions"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_preserves_open_cancellation_readback() {
         let (_dir, store) = test_store();
@@ -22294,6 +22333,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_quarantined_graph_skips_without_repair() {
         let (_dir, store) = test_store();
@@ -22335,6 +22375,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_recovery_passes"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_failed_graph_lifecycle_is_not_pass_failure() {
         let (_dir, store) = test_store();
@@ -22370,6 +22411,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_target_validation_rejects_before_mutation() {
         let (_dir, store) = test_store();
@@ -22455,6 +22497,7 @@ mod tests {
         assert_eq!(table_count(&store, "recursive_recovery_deferred_graphs"), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_topology_recovery_pass_failure_is_persisted() {
         let (_dir, store) = test_store();
@@ -22506,6 +22549,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_success_commits_validation_artifacts_and_state() {
         let (_dir, store) = test_store();
@@ -22633,6 +22677,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_decomposition_commits_children_transactionally() {
         let (_dir, store) = test_store();
@@ -22683,6 +22728,7 @@ mod tests {
         assert_eq!(validation_count(&store, live.summary.id), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_duplicate_decomposition_commit_rejects_safely() {
         let (_dir, store) = test_store();
@@ -22708,6 +22754,7 @@ mod tests {
         assert_eq!(validation_count(&store, live.summary.id), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_invalid_decomposition_rolls_back_children_and_artifacts() {
         let (_dir, store) = test_store();
@@ -22749,6 +22796,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_repair_persists_validation_without_repair_loop() {
         let (_dir, store) = test_store();
@@ -22840,6 +22888,7 @@ mod tests {
         assert_eq!(retry_decision["decision"], "retry_same_live_attempt");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_validation_read_helpers_are_read_only() {
         let (_dir, store) = test_store();
@@ -22959,6 +23008,7 @@ mod tests {
         assert_eq!(counts_after, counts_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_validation_read_helpers_order_multiple_records() {
         let (_dir, store) = test_store();
@@ -23064,6 +23114,7 @@ mod tests {
         assert_eq!(artifacts.diff_artifacts.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_validation_issue_summary_malformed_json_is_clear() {
         let (_dir, store) = test_store();
@@ -23112,6 +23163,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_blocked_maps_to_blocked_state() {
         let (_dir, store) = test_store();
@@ -23142,6 +23194,7 @@ mod tests {
         assert_eq!(result.task.status, RecursiveTaskLifecycleState::Blocked);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_operator_review_maps_to_inspectable_blocked_state() {
         let (_dir, store) = test_store();
@@ -23204,6 +23257,7 @@ mod tests {
         assert_eq!(issues[0]["code"], "unsafe_tool_claim");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_permanent_failure_maps_to_failed_state() {
         let (_dir, store) = test_store();
@@ -23242,6 +23296,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_cancelled_requires_accepted_evidence() {
         let (_dir, store) = test_store();
@@ -23289,6 +23344,7 @@ mod tests {
         assert_eq!(result.task.status, RecursiveTaskLifecycleState::Ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_cancellation_wrong_graph_or_run_rejects_without_mutation() {
         let (_dir, store) = test_store();
@@ -23390,6 +23446,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_inconsistent_ids_reject() {
         let (_dir, store) = test_store();
@@ -23406,6 +23463,7 @@ mod tests {
         assert_eq!(validation_count(&store, live.summary.id), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_stale_validation_digest_rejects() {
         let (_dir, store) = test_store();
@@ -23426,6 +23484,7 @@ mod tests {
         assert_eq!(artifact_count(&store, live.summary.graph_id), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_non_valid_digest_rejects_before_persistence() {
         let (_dir, store) = test_store();
@@ -23446,6 +23505,7 @@ mod tests {
         assert_eq!(artifact_count(&store, live.summary.graph_id), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_duplicate_commit_rejects_safely() {
         let (_dir, store) = test_store();
@@ -23469,6 +23529,7 @@ mod tests {
         assert_eq!(validation_count(&store, live.summary.id), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_commit_after_terminal_live_attempt_rejects_without_writes() {
         let (_dir, store) = test_store();
@@ -23497,6 +23558,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_scheduler_event_is_written_when_provided() {
         let (_dir, store) = test_store();
@@ -23523,6 +23585,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_scheduler_event_failure_rolls_back_state_and_artifacts() {
         let (_dir, store) = test_store();
@@ -23565,6 +23628,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_artifact_failure_rolls_back_partial_writes() {
         let (_dir, store) = test_store();
@@ -23600,6 +23664,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_output_retryable_failure_returns_task_to_retry_state() {
         let (_dir, store) = test_store();
@@ -23630,6 +23695,7 @@ mod tests {
         assert_eq!(result.task.status, RecursiveTaskLifecycleState::Ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_create_graph_root_task_succeeds() {
         let (_dir, store) = test_store();
@@ -23650,6 +23716,7 @@ mod tests {
             .expect("created graph is valid");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_valid_decomposition_batch_commits() {
         let (_dir, store) = test_store();
@@ -23686,6 +23753,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_invalid_decomposition_batch_rolls_back() {
         let (_dir, store) = test_store();
@@ -23710,6 +23778,7 @@ mod tests {
         assert!(detail.injection_batches.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_cycle_insertion_rejects_and_rolls_back() {
         let (_dir, store) = test_store();
@@ -23733,6 +23802,7 @@ mod tests {
         assert!(detail.edges.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_ancestor_descendant_cap_rejects() {
         let (_dir, store) = test_store();
@@ -23769,6 +23839,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_repeated_decomposition_rejects_without_reopen() {
         let (_dir, store) = test_store();
@@ -23789,6 +23860,7 @@ mod tests {
         assert!(error.to_string().contains("explicit reopen required"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_explicit_reopen_permits_second_decomposition() {
         let (_dir, store) = test_store();
@@ -23822,6 +23894,7 @@ mod tests {
         assert_eq!(detail.nodes.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_attempt_start_and_finish_records_correctly() {
         let (_dir, store) = test_store();
@@ -23862,6 +23935,7 @@ mod tests {
         assert_eq!(task.blocked_reason, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_run_store_api_round_trips_transactionally() {
         let (_dir, store) = test_store();
@@ -23933,6 +24007,7 @@ mod tests {
         assert_eq!(runs[0].id, completed.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_scheduler_v65_schema_admits_live_modes_without_reachability() {
         let (_dir, store) = test_store();
@@ -24002,6 +24077,7 @@ mod tests {
         assert!(error.to_string().contains("CHECK"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_scheduler_store_primitives_round_trip() {
         let (_dir, store) = test_store();
@@ -24064,6 +24140,7 @@ mod tests {
         assert_eq!(completed.executor_mode, RecursiveExecutionMode::LiveSession);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_live_attempt_persists_bedrock_provider_at_schema_head() {
         let (_dir, store) = test_store();
@@ -24087,6 +24164,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_live_attempt_persists_pioneer_provider_at_schema_head() {
         let (_dir, store) = test_store();
@@ -24111,6 +24189,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_attempt_create_or_load_is_idempotent_by_recursive_attempt() {
         let (_dir, store) = test_store();
@@ -24168,6 +24247,7 @@ mod tests {
         assert_eq!(session_count(&store), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_attempt_create_or_load_replays_after_terminal_state() {
         let (_dir, store) = test_store();
@@ -24241,6 +24321,7 @@ mod tests {
         assert_eq!(session_count(&store), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_attempt_create_or_load_rejects_conflicting_correlation() {
         let (_dir, store) = test_store();
@@ -24284,6 +24365,7 @@ mod tests {
         assert_error_contains(error, "requires live_session graph execution mode");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_and_fake_scheduler_store_apis_reject_wrong_modes() {
         let (_dir, store) = test_store();
@@ -24336,6 +24418,7 @@ mod tests {
         assert_error_contains(error, "does not match graph");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_scheduler_fake_terminal_apis_reject_live_runs() {
         let (_dir, store) = test_store();
@@ -24406,6 +24489,7 @@ mod tests {
         assert_eq!(completed.executor_mode, RecursiveExecutionMode::Fake);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_correlation_row_round_trips_and_loads_by_keys() {
         let (_dir, store) = test_store();
@@ -24489,6 +24573,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_correlation_attaches_session_and_rejects_duplicate_session() {
         let (_dir, store) = test_store();
@@ -24550,6 +24635,7 @@ mod tests {
         assert_error_contains(error, "already linked");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_correlation_rejects_missing_session_attach() {
         let (_dir, store) = test_store();
@@ -24575,6 +24661,7 @@ mod tests {
         assert_eq!(reloaded.summary.session_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_correlation_rejects_terminal_session_attach() {
         let (_dir, store) = test_store();
@@ -24619,6 +24706,7 @@ mod tests {
         assert!(reloaded.summary.completed_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_correlation_rejects_missing_references() {
         let (_dir, store) = test_store();
@@ -24654,6 +24742,7 @@ mod tests {
         assert_error_contains(error, "recursive scheduler run not found");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_status_round_trips_and_invalid_strings_reject() {
         let (_dir, store) = test_store();
@@ -24759,6 +24848,7 @@ mod tests {
         assert!(error.to_string().contains("CHECK"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_request_round_trips_and_updates_statuses() {
         let (_dir, store) = test_store();
@@ -24869,6 +24959,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_requires_cancellation_request_id() {
         let (_dir, store) = test_store();
@@ -24909,6 +25000,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_active_uniqueness_at_store_level() {
         let (_dir, store) = test_store();
@@ -24971,6 +25063,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_duplicate_after_failed_returns_existing_result() {
         let (_dir, store) = test_store();
@@ -25041,6 +25134,7 @@ mod tests {
         assert_eq!(live.summary.status, RecursiveLiveAttemptStatus::Running);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_rejects_invalid_cancellation_links() {
         let (_dir, store) = test_store();
@@ -25133,6 +25227,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_status_rejects_terminal_reopen_transition() {
         let (_dir, store) = test_store();
@@ -25180,6 +25275,7 @@ mod tests {
         assert!(reloaded.summary.completed_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_heartbeat_acquire_succeeds_for_launching_attempt() {
         let (_dir, store) = test_store();
@@ -25212,6 +25308,7 @@ mod tests {
         assert_eq!(state.session_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_duplicate_heartbeat_start_by_different_owner_rejects() {
         let (_dir, store) = test_store();
@@ -25239,6 +25336,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_heartbeat_update_succeeds_with_correct_token() {
         let (_dir, store) = test_store();
@@ -25262,6 +25360,7 @@ mod tests {
         assert!(renewed.heartbeat_expires_at > renewed.heartbeat_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_wrong_token_heartbeat_does_not_mutate_stale_attempt() {
         let (_dir, store) = test_store();
@@ -25301,6 +25400,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_terminal_attempt_rejects_heartbeat() {
         let (_dir, store) = test_store();
@@ -25340,6 +25440,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_terminal_status_releases_heartbeat_durably() {
         let (_dir, store) = test_store();
@@ -25382,6 +25483,7 @@ mod tests {
         assert_eq!(released.heartbeat_token, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_release_with_wrong_token_rejects_without_clearing() {
         let (_dir, store) = test_store();
@@ -25424,6 +25526,7 @@ mod tests {
         assert_eq!(released.heartbeat_token, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_stale_heartbeats_are_listed_and_fresh_are_not() {
         let (_dir, store) = test_store();
@@ -25450,6 +25553,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_stale_listing_excludes_released_active_attempt() {
         let (_dir, store) = test_store();
@@ -25477,6 +25581,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_stale_listing_excludes_terminal_expired_attempt() {
         let (_dir, store) = test_store();
@@ -25504,6 +25609,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_stale_listing_excludes_incomplete_expired_heartbeat() {
         let (_dir, store) = test_store();
@@ -25530,6 +25636,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_heartbeat_state_survives_store_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25562,6 +25669,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_stale_active_heartbeat_marks_lost() {
         let (_dir, store) = test_store();
@@ -25591,6 +25699,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_missing_session_marks_lost() {
         let (_dir, store) = test_store();
@@ -25623,6 +25732,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_fresh_heartbeat_without_session_marks_lost() {
         let (_dir, store) = test_store();
@@ -25650,6 +25760,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_terminal_completed_session_waits_for_output_validation() {
         let (_dir, store) = test_store();
@@ -25688,6 +25799,7 @@ mod tests {
         assert_eq!(task.status, RecursiveTaskLifecycleState::Pending);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_graph_recovery_preserves_recovery_pending_live_attempt() {
         let (_dir, store) = test_store();
@@ -25717,6 +25829,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_terminal_failed_session_maps_failed() {
         let (_dir, store) = test_store();
@@ -25745,6 +25858,7 @@ mod tests {
         assert_eq!(task.status, RecursiveTaskLifecycleState::Ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_terminal_interrupted_session_maps_interrupted() {
         let (_dir, store) = test_store();
@@ -25774,6 +25888,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_nonterminal_fresh_heartbeat_remains_unchanged() {
         let (_dir, store) = test_store();
@@ -25800,6 +25915,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_fresh_waiting_approval_session_remains_visible() {
         let (_dir, store) = test_store();
@@ -25828,6 +25944,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_launch_incomplete_attempt_marks_lost() {
         let (_dir, store) = test_store();
@@ -25852,6 +25969,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_interrupt_pending_is_deterministic() {
         let (_dir, store) = test_store();
@@ -25897,6 +26015,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_failed_interrupt_record_is_not_replayed_as_pending() {
         let (_dir, store) = test_store();
@@ -25937,6 +26056,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_terminal_attempt_is_idempotent() {
         let (_dir, store) = test_store();
@@ -25972,6 +26092,7 @@ mod tests {
         assert_eq!(after_first.recovered_at, after_second.recovered_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_repeated_lost_attempt_is_idempotent() {
         let (_dir, store) = test_store();
@@ -26004,6 +26125,7 @@ mod tests {
         assert_eq!(after_first.recovery_reason, after_second.recovery_reason);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_malformed_attempt_correlation_is_visible() {
         let (_dir, store) = test_store();
@@ -26065,6 +26187,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_multiple_attempts_are_deterministic() {
         let (_dir, store) = test_store();
@@ -26105,6 +26228,7 @@ mod tests {
         assert_eq!(report.deferred, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_budget_resume_is_deterministic() {
         let (_dir, store) = test_store();
@@ -26153,6 +26277,7 @@ mod tests {
         assert!(final_pass.results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_budget_defers_without_mutating_beyond_budget() {
         let (_dir, store) = test_store();
@@ -26184,6 +26309,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_recovery_source_has_no_launch_interrupt_or_model_calls() {
         let source = include_str!("recursive_dag.rs");
@@ -26215,6 +26341,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_running_heartbeat_requires_session_id() {
         let (_dir, store) = test_store();
@@ -26252,6 +26379,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_interrupt_pending_can_heartbeat_and_interrupted_rejects() {
         let (_dir, store) = test_store();
@@ -26317,6 +26445,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_list_by_graph_includes_mixed_statuses() {
         let (_dir, store) = test_store();
@@ -26427,6 +26556,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_provider_model_validation_rejects_invalid_values() {
         let (_dir, store) = test_store();
@@ -26471,6 +26601,7 @@ mod tests {
         assert!(error.to_string().contains("CHECK"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_schema_does_not_enable_live_scheduler_mode() {
         let (_dir, store) = test_store();
@@ -26495,6 +26626,7 @@ mod tests {
         assert_eq!(session_count(&store), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_migration_reopens_existing_recursive_rows_idempotently() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26570,6 +26702,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_v58_migration_preserves_existing_null_heartbeat_fields() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26633,6 +26766,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_live_v59_migration_tightens_existing_v58_heartbeat_index() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26697,6 +26831,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_lease_rejects_active_run_for_same_graph() {
         let (_dir, store) = test_store();
@@ -26741,6 +26876,7 @@ mod tests {
             .expect("terminal prior run does not hold lease");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_stale_lease_reclaim_allows_new_run() {
         let (_dir, store) = test_store();
@@ -26788,6 +26924,7 @@ mod tests {
         assert_ne!(next.id, run.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_unexpired_lease_reclaim_rejects_new_same_graph_run() {
         let (_dir, store) = test_store();
@@ -26824,6 +26961,7 @@ mod tests {
         assert_error_contains(error, "already has active scheduler run");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_terminal_run_paths_release_graph_lease() {
         let (_dir, store) = test_store();
@@ -26936,6 +27074,7 @@ mod tests {
             .expect("finish replacement run");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_concurrency_cap_rejects_extra_active_run() {
         let (_dir, store) = test_store();
@@ -26995,6 +27134,7 @@ mod tests {
             .expect("terminal run releases global cap");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_concurrency_cap_allows_two_graphs_and_rejects_third() {
         let (_dir, store) = test_store();
@@ -27068,6 +27208,7 @@ mod tests {
             .expect("third graph starts after one active run finishes");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_lease_heartbeat_updates_and_checks_token() {
         let (_dir, store) = test_store();
@@ -27102,6 +27243,7 @@ mod tests {
         assert!(refreshed_expires > refreshed_heartbeat);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_lease_heartbeat_after_terminal_run_rejects() {
         let (_dir, store) = test_store();
@@ -27131,6 +27273,7 @@ mod tests {
         assert_error_contains(error, "is not active");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_wrong_token_heartbeat_cannot_release_expired_run() {
         let (_dir, store) = test_store();
@@ -27176,6 +27319,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_lease_survives_store_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27212,6 +27356,7 @@ mod tests {
         assert!(loaded.lease_expires_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_cancellation_requests_round_trip_and_observe_idempotently() {
         let (_dir, store) = test_store();
@@ -27292,6 +27437,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_cancellation_request_survives_store_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27328,6 +27474,7 @@ mod tests {
         assert_eq!(request.reason, "survive reopen");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_terminal_run_cancellation_is_rejected() {
         let (_dir, store) = test_store();
@@ -27370,6 +27517,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_cancellation_request_schema_rejects_invalid_scope_shapes_and_targets() {
         let (_dir, store) = test_store();
@@ -27480,6 +27628,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_scheduler_run_cancellation_fields_round_trip() {
         let (_dir, store) = test_store();
@@ -27532,6 +27681,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_invalid_attempt_finish_rejects() {
         let (_dir, store) = test_store();
@@ -27566,6 +27716,7 @@ mod tests {
         assert!(attempts[0].finished_at.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_lifecycle_transition_records_event_atomically() {
         let (_dir, store) = test_store();
@@ -27610,6 +27761,7 @@ mod tests {
         assert_eq!(events_after.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_failed_blocked_cancelled_state_writes_are_durable() {
         for (target, reason) in [
@@ -27665,6 +27817,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_basic_graph_task_edge_rows_round_trip() {
         let (store, graph_id, root_id, child_id) = setup_basic_graph();
@@ -27690,6 +27843,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_invalid_persisted_graph_is_rejected() {
         let (_dir, store) = test_store();
@@ -27700,6 +27854,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "graph has no task nodes");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_cycle_rejection() {
         let (store, graph_id, root_id, child_id) = setup_basic_graph();
@@ -27721,6 +27876,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "cycle detected");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_dangling_reference_rejection() {
         let (store, graph_id, root_id, _) = setup_basic_graph();
@@ -27746,6 +27902,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "dangling to_task_id");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_bad_parent_link_rejection() {
         let (_dir, store) = test_store();
@@ -27771,6 +27928,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "parent_task_id does not match");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_duplicate_durable_id_rejection_if_representable() {
         let (store, graph_id, root_id, _) = setup_basic_graph();
@@ -27784,6 +27942,7 @@ mod tests {
         assert!(duplicate.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_attempt_finish_state_validation() {
         let (store, graph_id, root_id, _) = setup_basic_graph();
@@ -27808,6 +27967,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "missing failure_reason");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_invalid_injection_record_rejection() {
         let (store, graph_id, root_id, child_id) = setup_basic_graph();
@@ -27842,6 +28002,7 @@ mod tests {
         assert_integrity_error(&store, graph_id, "repeats child task id");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_valid_terminal_graph_unchanged() {
         let (_dir, store) = test_store();
@@ -27875,6 +28036,7 @@ mod tests {
         assert_eq!(detail.lifecycle_events.len(), events_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_valid_pending_ready_graph_unchanged() {
         let (_dir, store) = test_store();
@@ -27903,6 +28065,7 @@ mod tests {
         assert_eq!(task.status, RecursiveTaskLifecycleState::Ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_malformed_graph_becomes_quarantined() {
         let (_dir, store) = test_store();
@@ -27929,6 +28092,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_startup_recovery_quarantines_malformed_and_recovers_others() {
         let (_dir, store) = test_store();
@@ -28017,6 +28181,7 @@ mod tests {
         attempt_id
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_rejects_zero_graph_budget_without_pass() {
         let (_dir, store) = test_store();
@@ -28034,6 +28199,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_budgeted_recovery_max_graphs_defers_remaining() {
         let (_dir, store) = test_store();
@@ -28084,6 +28250,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_deferred_recovery_graphs_are_listed_visibly() {
         let (_dir, store) = test_store();
@@ -28110,6 +28277,7 @@ mod tests {
         assert_eq!(status.reason.as_deref(), Some("max_graphs"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_budgeted_recovery_counts_safe_active_graph_as_skipped() {
         let (_dir, store) = test_store();
@@ -28136,6 +28304,7 @@ mod tests {
         assert_eq!(status.state, RecursiveGraphRecoveryState::Recovered);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_status_reports_pending_before_pass() {
         let (_dir, store) = test_store();
@@ -28155,6 +28324,7 @@ mod tests {
         assert!(status.last_attempted_at.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_continue_deferred_recovery_recovers_remaining_graphs() {
         let (_dir, store) = test_store();
@@ -28192,6 +28362,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_continue_deferred_recovery_across_multiple_budgeted_passes() {
         let (_dir, store) = test_store();
@@ -28240,6 +28411,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_budgeted_recovery_quarantines_malformed_inside_budget() {
         let (_dir, store) = test_store();
@@ -28264,6 +28436,7 @@ mod tests {
         assert!(malformed.graph.quarantined_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_malformed_graph_beyond_budget_remains_deferred() {
         let (_dir, store) = test_store();
@@ -28294,6 +28467,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_malformed_deferred_graph_quarantines_on_continuation() {
         let (_dir, store) = test_store();
@@ -28332,6 +28506,7 @@ mod tests {
         assert_eq!(status.state, RecursiveGraphRecoveryState::Quarantined);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_budgeted_recovery_is_idempotent_across_passes() {
         let (_dir, store) = test_store();
@@ -28363,6 +28538,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_budgeted_recovery_time_budget_can_defer_before_first_graph() {
         let (_dir, store) = test_store();
@@ -28402,6 +28578,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_active_lease_state_remains_inspectable_after_recovery() {
         let (_dir, store) = test_store();
@@ -28432,6 +28609,7 @@ mod tests {
         assert_eq!(after.lease_expires_at, run.lease_expires_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_deferred_recovery_continuation_preserves_active_lease_and_cancellation() {
         let (_dir, store) = test_store();
@@ -28491,6 +28669,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_repeated_deferred_recovery_continuation_when_empty_is_noop() {
         let (_dir, store) = test_store();
@@ -28517,6 +28696,7 @@ mod tests {
         assert_eq!(pass.errors, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_failed_recovery_pass_is_persisted_and_latest() {
         let (_dir, store) = test_store();
@@ -28550,6 +28730,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_does_not_mutate_already_quarantined_graph() {
         let (_dir, store) = test_store();
@@ -28585,6 +28766,7 @@ mod tests {
         assert_eq!(after.lifecycle_events.len(), events_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_quarantined_graph_rejects_later_mutation_writes() {
         let (_dir, store) = test_store();
@@ -28617,6 +28799,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_running_task_after_restart_becomes_safe() {
         let (_dir, store) = test_store();
@@ -28669,6 +28852,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_unfinished_attempt_is_closed() {
         let (_dir, store) = test_store();
@@ -28712,6 +28896,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_exhausted_interrupted_attempt_fails_task() {
         let (_dir, store) = test_store();
@@ -28758,6 +28943,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_attempt_start_counts_interrupted_attempt_as_retry() {
         let (_dir, store) = test_store();
@@ -28796,6 +28982,7 @@ mod tests {
         assert_eq!(second.retry_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_integrating_and_verifying_tasks_become_safe() {
         for transient in [
@@ -28838,6 +29025,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_blocked_on_children_parent_normalizes() {
         let (_dir, store) = test_store();
@@ -28879,6 +29067,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_cancelled_child_with_succeeded_sibling_blocks_parent() {
         let (_dir, store) = test_store();
@@ -28919,6 +29108,7 @@ mod tests {
         assert_eq!(detail.graph.status, RecursiveGraphStatus::Blocked);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_mixed_succeeded_blocked_cancelled_children_blocks_parent() {
         let (_dir, store) = test_store();
@@ -28961,6 +29151,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_revisits_parents_after_dependency_blocking() {
         let (_dir, store) = test_store();
@@ -29016,6 +29207,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_dependency_failure_chain_blocks_dependents() {
         let (_dir, store) = test_store();
@@ -29058,6 +29250,7 @@ mod tests {
         assert!(c_task.blocked_reason.unwrap().contains(&b.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_dag_recovery_is_idempotent() {
         let (_dir, store) = test_store();
@@ -29136,6 +29329,7 @@ mod tests {
             .expect("read node edit columns")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn edit_recursive_node_instructions_persists() {
         let (_dir, store) = test_store();
@@ -29164,6 +29358,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn edit_recursive_node_settings_persists() {
         let (_dir, store) = test_store();
@@ -29212,6 +29407,7 @@ mod tests {
     /// BLOCKER-1 proof obligation: every LOCKED class is REJECTED with no
     /// partial write — including the binding node-`Ready` + attempt-`Running`
     /// launch-race state (status-only would wrongly accept it).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn edit_recursive_node_rejected_when_locked() {
         // (a) Pure status LOCKED classes (no attempt row needed).
@@ -29332,6 +29528,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn recursive_node_lock_classifies_states() {
         use RecursiveTaskLifecycleState as S;

@@ -147,6 +147,12 @@ impl App {
         }
     }
 
+    pub(crate) fn docreg_operation_is_archiving(&self, session_id: Uuid) -> bool {
+        self.docreg_operation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+    }
+
     fn spawn_docreg_archive(&mut self) -> Result<(), String> {
         let pending = self
             .docreg_operation_pending

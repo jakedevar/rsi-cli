@@ -217,6 +217,9 @@ pub(crate) mod failure {
     pub(crate) const GATE_ERROR: &str = "gate_error";
     /// Every incoming edge of the node was untaken.
     pub(crate) const DEAD_PATH: &str = "dead_path";
+    /// An agent-requested launch refused by live manager policy (#633,
+    /// plan §5.3): no session was created; the execution blocks.
+    pub(crate) const POLICY_REFUSED: &str = "policy_refused";
 
     /// Losses that are not the node's fault: bounded per instance, never
     /// charged against the execution's attempt cap.
@@ -250,6 +253,32 @@ pub(crate) struct ExecutionRow {
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) started_at: Option<DateTime<Utc>>,
     pub(crate) finished_at: Option<DateTime<Utc>>,
+    /// `operator`, `manager`, `epic_lead` or `schedule` (#633).
+    pub(crate) requested_by_kind: String,
+    #[allow(
+        dead_code,
+        reason = "requester audit identity; read by the T4b fleet projection"
+    )]
+    pub(crate) requested_by_session_id: Option<Uuid>,
+    pub(crate) epic_id: Option<Uuid>,
+    #[allow(
+        dead_code,
+        reason = "execution provenance; read by the T4b fleet projection"
+    )]
+    pub(crate) topology_id: Option<Uuid>,
+    #[allow(
+        dead_code,
+        reason = "execution provenance; read by the T4b fleet projection"
+    )]
+    pub(crate) topology_revision: Option<i64>,
+    pub(crate) scope_version: Option<i64>,
+}
+
+impl ExecutionRow {
+    /// Requested through a scoped agent verb (manager or Epic lead).
+    pub(crate) fn agent_requested(&self) -> bool {
+        matches!(self.requested_by_kind.as_str(), "manager" | "epic_lead")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +331,49 @@ pub(crate) struct NewExecution {
     pub(crate) repo_root: PathBuf,
     pub(crate) base_commit: String,
     pub(crate) input: Option<Value>,
+    /// Scoped agent requester (#633); `None` is the operator.
+    pub(crate) requester: Option<ExecutionRequester>,
+}
+
+/// The token-resolved agent that accepted an execution (#633, plan §5).
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionRequester {
+    pub(crate) actor: Actor,
+    pub(crate) epic_id: Uuid,
+    pub(crate) scope_version: Option<i64>,
+    pub(crate) policy_digest: Option<String>,
+    pub(crate) idempotency_key: String,
+    pub(crate) request_fingerprint: String,
+    pub(crate) topology_revision: Option<i64>,
+}
+
+/// Who a durable topology write is attributed to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Actor {
+    /// `operator`, `manager` or `epic_lead`.
+    pub(crate) kind: &'static str,
+    pub(crate) session_id: Option<Uuid>,
+}
+
+impl Actor {
+    pub(crate) const OPERATOR: Self = Self {
+        kind: "operator",
+        session_id: None,
+    };
+
+    pub(crate) const fn manager(session_id: Uuid) -> Self {
+        Self {
+            kind: "manager",
+            session_id: Some(session_id),
+        }
+    }
+
+    pub(crate) const fn epic_lead(session_id: Uuid) -> Self {
+        Self {
+            kind: "epic_lead",
+            session_id: Some(session_id),
+        }
+    }
 }
 
 pub(crate) struct NewAttempt {
@@ -372,6 +444,7 @@ pub(crate) struct EventSpec<'a> {
     pub(crate) output_preview: Option<String>,
     pub(crate) detail: Value,
     pub(crate) actor_kind: &'a str,
+    pub(crate) actor_session_id: Option<Uuid>,
 }
 
 impl<'a> EventSpec<'a> {
@@ -385,7 +458,15 @@ impl<'a> EventSpec<'a> {
             output_preview: None,
             detail: Value::Null,
             actor_kind: "executor",
+            actor_session_id: None,
         }
+    }
+
+    /// Attribute the event to an operator or a token-resolved agent.
+    pub(crate) const fn by(mut self, actor: Actor) -> Self {
+        self.actor_kind = actor.kind;
+        self.actor_session_id = actor.session_id;
+        self
     }
 }
 
@@ -419,7 +500,7 @@ fn append_event(
     let payload = serde_json::json!({ "update": update, "detail": spec.detail });
     conn.execute(
         "INSERT INTO topology_events (execution_id,execution_seq,topology_id,node_id,attempt_id,kind,actor_kind,actor_session_id,payload_json,created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?10,?8,?9)",
         params![
             execution_id.to_string(),
             sequence,
@@ -430,6 +511,7 @@ fn append_event(
             spec.actor_kind,
             payload.to_string(),
             now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            spec.actor_session_id.map(|id| id.to_string()),
         ],
     )?;
     Ok(update)
@@ -444,13 +526,97 @@ fn bump(conn: &Connection, execution_id: Uuid) -> Result<()> {
 }
 
 pub(crate) fn insert_execution(store: &Store, new: &NewExecution) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    let update = insert_in(&tx, new)?;
+    tx.commit()?;
+    Ok(update)
+}
+
+/// Outcome of accepting an agent-requested execution (#633, plan §5.1).
+pub(crate) enum Acceptance {
+    Fresh(GraphExecutionUpdate),
+    /// The same caller already accepted this idempotency key with the same
+    /// request fingerprint; nothing was written.
+    Replay {
+        execution_id: Uuid,
+        accepted_at: DateTime<Utc>,
+        base_commit: String,
+    },
+}
+
+/// A prior acceptance of `(requested_by_session_id, idempotency_key)`.
+pub(crate) struct PriorAcceptance {
+    pub(crate) execution_id: Uuid,
+    pub(crate) fingerprint: Option<String>,
+    pub(crate) accepted_at: DateTime<Utc>,
+    pub(crate) base_commit: String,
+}
+
+pub(crate) fn prior_acceptance(
+    conn: &Connection,
+    requester: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<PriorAcceptance>> {
+    let row: Option<(String, Option<String>, String, String)> = conn
+        .query_row(
+            "SELECT id,request_fingerprint,created_at,base_commit FROM topology_executions \
+             WHERE requested_by_session_id=?1 AND idempotency_key=?2",
+            params![requester.to_string(), idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(id, fingerprint, created_at, base_commit)| {
+        Ok(PriorAcceptance {
+            execution_id: parse_uuid(&id)?,
+            fingerprint,
+            accepted_at: parse_time(&created_at)?,
+            base_commit,
+        })
+    })
+    .transpose()
+}
+
+/// Accept one agent execution atomically with its idempotency check: the
+/// same key and fingerprint replay, a different fingerprint conflicts.
+pub(crate) fn accept_agent_execution(store: &Store, new: &NewExecution) -> Result<Acceptance> {
+    let requester = new
+        .requester
+        .as_ref()
+        .ok_or_else(|| DaemonError::Store("agent execution without requester".into()))?;
+    let caller = requester
+        .actor
+        .session_id
+        .ok_or_else(|| DaemonError::Store("agent execution without caller".into()))?;
+    let tx = immediate(store)?;
+    if let Some(prior) = prior_acceptance(&tx, caller, &requester.idempotency_key)? {
+        if prior.fingerprint.as_deref() != Some(requester.request_fingerprint.as_str()) {
+            return Err(super::resolve::resolution_error(
+                "idempotency_conflict",
+                "retry the original request or use a new idempotency_key",
+                None,
+                None,
+            ));
+        }
+        return Ok(Acceptance::Replay {
+            execution_id: prior.execution_id,
+            accepted_at: prior.accepted_at,
+            base_commit: prior.base_commit,
+        });
+    }
+    let update = insert_in(&tx, new)?;
+    tx.commit()?;
+    Ok(Acceptance::Fresh(update))
+}
+
+fn insert_in(tx: &Connection, new: &NewExecution) -> Result<GraphExecutionUpdate> {
     let definition = serde_json::to_string(&new.definition)?;
     let custody_plan = serde_json::to_string(&new.custody_plan)?;
     let now = now_text();
-    let tx = immediate(store)?;
+    let requester = new.requester.as_ref();
+    let actor = requester.map_or(Actor::OPERATOR, |requester| requester.actor);
     tx.execute(
-        "INSERT INTO topology_executions (id,topology_id,topology_revision,topology_name_snapshot,workflow_id,definition_json,definition_digest,project_id,parent_session_id,requested_by_kind,repo_root,base_ref,base_commit,custody_plan_json,status,input_json,max_node_attempts,created_at,updated_at) \
-         VALUES (?1,(SELECT id FROM topologies WHERE id=?2),NULL,?3,?4,?5,?6,?7,?8,'operator',?9,'refs/remotes/origin/rolling',?10,?11,'accepted',?12,?13,?14,?14)",
+        "INSERT INTO topology_executions (id,topology_id,topology_revision,topology_name_snapshot,workflow_id,definition_json,definition_digest,project_id,parent_session_id,requested_by_kind,repo_root,base_ref,base_commit,custody_plan_json,status,input_json,max_node_attempts,created_at,updated_at,epic_id,requested_by_session_id,scope_version,policy_digest,idempotency_key,request_fingerprint) \
+         VALUES (?1,(SELECT id FROM topologies WHERE id=?2),?15,?3,?4,?5,?6,?7,?8,?16,?9,'refs/remotes/origin/rolling',?10,?11,'accepted',?12,?13,?14,?14,?17,?18,?19,?20,?21,?22)",
         params![
             new.id.to_string(),
             new.topology_id.map(|id| id.to_string()),
@@ -466,17 +632,23 @@ pub(crate) fn insert_execution(store: &Store, new: &NewExecution) -> Result<Grap
             new.input.as_ref().map(Value::to_string),
             i64::from(crate::topology::graph::MAX_NODE_ATTEMPTS_PER_EXECUTION),
             now,
+            requester.and_then(|requester| requester.topology_revision),
+            actor.kind,
+            requester.map(|requester| requester.epic_id.to_string()),
+            actor.session_id.map(|id| id.to_string()),
+            requester.and_then(|requester| requester.scope_version),
+            requester.and_then(|requester| requester.policy_digest.clone()),
+            requester.map(|requester| requester.idempotency_key.clone()),
+            requester.map(|requester| requester.request_fingerprint.clone()),
         ],
     )?;
-    let update = append_event(&tx, new.id, EventSpec::execution("accepted"))?;
-    tx.commit()?;
-    Ok(update)
+    append_event(tx, new.id, EventSpec::execution("accepted").by(actor))
 }
 
-const EXECUTION_COLUMNS: &str = "id,topology_id,workflow_id,topology_name_snapshot,definition_json,custody_plan_json,project_id,parent_session_id,repo_root,base_commit,status,blocked_reason_json,input_json,output_json,error,row_version,max_node_attempts,deadline_at,created_at,started_at,finished_at";
+const EXECUTION_COLUMNS: &str = "id,topology_id,workflow_id,topology_name_snapshot,definition_json,custody_plan_json,project_id,parent_session_id,repo_root,base_commit,status,blocked_reason_json,input_json,output_json,error,row_version,max_node_attempts,deadline_at,created_at,started_at,finished_at,requested_by_kind,requested_by_session_id,epic_id,topology_revision,scope_version";
 
 fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<Option<String>>> {
-    (0..21)
+    (0..26)
         .map(|index| match row.get_ref(index)? {
             rusqlite::types::ValueRef::Null => Ok(None),
             rusqlite::types::ValueRef::Integer(value) => Ok(Some(value.to_string())),
@@ -511,6 +683,15 @@ pub(crate) fn load_execution(store: &Store, id: Uuid) -> Result<Option<Execution
     };
     let optional_uuid = |index: usize| c[index].as_deref().map(parse_uuid).transpose();
     let optional_time = |index: usize| c[index].as_deref().map(parse_time).transpose();
+    let optional_i64 = |index: usize| {
+        c[index]
+            .as_deref()
+            .map(|text| {
+                text.parse::<i64>()
+                    .map_err(|_| DaemonError::Store("invalid topology integer".into()))
+            })
+            .transpose()
+    };
     Ok(Some(ExecutionRow {
         id: parse_uuid(required(&c, 0)?)?,
         workflow_id: parse_uuid(required(&c, 2)?)?,
@@ -536,6 +717,12 @@ pub(crate) fn load_execution(store: &Store, id: Uuid) -> Result<Option<Execution
         created_at: parse_time(required(&c, 18)?)?,
         started_at: optional_time(19)?,
         finished_at: optional_time(20)?,
+        requested_by_kind: required(&c, 21)?.to_owned(),
+        requested_by_session_id: optional_uuid(22)?,
+        epic_id: optional_uuid(23)?,
+        topology_id: optional_uuid(1)?,
+        topology_revision: optional_i64(24)?,
+        scope_version: optional_i64(25)?,
     }))
 }
 
@@ -1171,6 +1358,9 @@ pub(crate) struct ResolutionWrite<'a> {
     pub(crate) fingerprint: &'a str,
     /// Leave `blocked` now; a discard resumes only once its effects finish.
     pub(crate) resume: bool,
+    /// Operator or token-resolved agent (#633); recorded on the attempt and
+    /// the audit event.
+    pub(crate) actor: Actor,
 }
 
 /// Outcome of the CAS/idempotency gate for a resolution action.
@@ -1269,8 +1459,8 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
     let now = now_text();
     let changed = tx.execute(
         "UPDATE topology_node_attempts SET status=?2,resolution=COALESCE(?3,resolution),failure_class=COALESCE(?4,failure_class),\
-            result_commit=COALESCE(?5,result_commit),pin_ref=COALESCE(?6,pin_ref),resolved_by_kind='operator',\
-            resolved_at=?7,updated_at=?7 WHERE id=?1 AND status='blocked'",
+            result_commit=COALESCE(?5,result_commit),pin_ref=COALESCE(?6,pin_ref),resolved_by_kind=?8,\
+            resolved_by_session_id=?9,resolved_at=?7,updated_at=?7 WHERE id=?1 AND status='blocked'",
         params![
             write.attempt.id.to_string(),
             write.attempt_status.as_str(),
@@ -1279,6 +1469,8 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
             write.result_commit,
             write.pin_ref,
             now,
+            write.actor.kind,
+            write.actor.session_id.map(|id| id.to_string()),
         ],
     )?;
     if changed != 1 {
@@ -1319,8 +1511,7 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
             attempt_id: Some(write.attempt.id),
             node_state: Some(write.attempt_status.node_state()),
             detail,
-            actor_kind: "operator",
-            ..EventSpec::execution(write.event_kind)
+            ..EventSpec::execution(write.event_kind).by(write.actor)
         },
     )?];
     if let Some(retry) = &write.retry {
@@ -1332,6 +1523,93 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
     }
     tx.commit()?;
     Ok(Recorded::Fresh(updates))
+}
+
+/// Agent interrupt (#633, plan §5.1): the row-version CAS, the idempotency
+/// key (the per-execution namespace resolutions use) and the `cancelling`
+/// transition commit in one transaction, audited with the actor.
+pub(crate) fn request_agent_interrupt(
+    store: &Store,
+    execution_id: Uuid,
+    expected_row_version: i64,
+    idempotency_key: &str,
+    actor: Actor,
+) -> Result<(Recorded, ExecutionStatus)> {
+    let fingerprint = digest(&format!("interrupt|{execution_id}|{expected_row_version}"));
+    let tx = immediate(store)?;
+    if matches!(
+        gate_in(&tx, execution_id, idempotency_key, &fingerprint)?,
+        ResolutionGate::Replay
+    ) {
+        let status = header(&tx, execution_id)?.status;
+        return Ok((Recorded::Replay, status));
+    }
+    let (actual, current): (i64, String) = tx.query_row(
+        "SELECT row_version,status FROM topology_executions WHERE id=?1",
+        [execution_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if actual != expected_row_version {
+        return Err(super::resolve::resolution_error(
+            "stale_row_version",
+            "refresh the execution and retry with its current row_version",
+            Some(expected_row_version),
+            Some(actual),
+        ));
+    }
+    let current = ExecutionStatus::parse(&current)?;
+    if current.is_final() {
+        return Err(super::resolve::resolution_error(
+            "precondition_failed",
+            "the execution already settled; nothing to interrupt",
+            None,
+            None,
+        ));
+    }
+    let now = now_text();
+    tx.execute(
+        "UPDATE topology_executions SET status='cancelling',blocked_reason_json=NULL,\
+            started_at=COALESCE(started_at,?2),row_version=row_version+1,updated_at=?2 WHERE id=?1",
+        params![execution_id.to_string(), now],
+    )?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            detail: serde_json::json!({
+                "from": current.as_str(),
+                "to": ExecutionStatus::Cancelling.as_str(),
+                "action": "interrupt",
+                "idempotency_key": idempotency_key,
+                "fingerprint": fingerprint,
+            }),
+            ..EventSpec::execution(ExecutionStatus::Cancelling.as_str()).by(actor)
+        },
+    )?;
+    tx.commit()?;
+    Ok((Recorded::Fresh(vec![update]), ExecutionStatus::Cancelling))
+}
+
+/// Durable audit of one refused agent request against an execution the
+/// caller may see (#633, plan §5.3). Not a state change: no row-version bump.
+pub(crate) fn record_agent_refusal(
+    store: &Store,
+    execution_id: Uuid,
+    actor: Actor,
+    verb: &str,
+    code: &str,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            detail: serde_json::json!({ "verb": verb, "code": code }),
+            ..EventSpec::execution("agent_request_refused").by(actor)
+        },
+    )?;
+    tx.commit()?;
+    Ok(update)
 }
 
 /// Outcome of recording one resolution request under its idempotency key.
@@ -1349,6 +1627,7 @@ pub(crate) fn record_inspection(
     attempt: &AttemptRow,
     idempotency_key: &str,
     fingerprint: &str,
+    actor: Actor,
 ) -> Result<Recorded> {
     let tx = immediate(store)?;
     if matches!(
@@ -1368,8 +1647,7 @@ pub(crate) fn record_inspection(
                 "idempotency_key": idempotency_key,
                 "fingerprint": fingerprint,
             }),
-            actor_kind: "operator",
-            ..EventSpec::execution("preserved_work_inspected")
+            ..EventSpec::execution("preserved_work_inspected").by(actor)
         },
     )?;
     tx.commit()?;

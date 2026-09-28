@@ -9,7 +9,7 @@
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag, open, openat2, renameat2};
-use nix::sys::stat::{Mode, SFlag, fstat, fstatat, mkdirat};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, dup, fsync, unlinkat};
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as SkipReason;
 use sha2::{Digest, Sha256};
@@ -2180,6 +2180,7 @@ fn rotate_stage(
     base_dev: u64,
 ) -> Result<(), SkipReason> {
     let pinned = authenticate_stage_from_name(source_fd, entry_name, base_dev)?;
+    let expected = fstat(pinned.as_raw_fd()).map_err(|_| SkipReason::RejectedRecoveryEntry)?;
     authenticate_stage_from_name(source_fd, entry_name, base_dev)?;
     let destination_bucket = source_bucket.wrapping_add(1);
     let destination_name = rotated_stage_name(entry_name, destination_bucket)
@@ -2192,22 +2193,49 @@ fn rotate_stage(
     maybe_fail_rotation_for_test(entry_name, RotationFaultPoint::QueueParentFsync)?;
     fsync(queue_fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
     maybe_fail_rotation_for_test(entry_name, RotationFaultPoint::Rename)?;
-    renameat2(
-        Some(source_fd),
-        entry_name,
-        Some(destination_fd.as_raw_fd()),
-        destination_name.as_str(),
-        RenameFlags::RENAME_NOREPLACE,
-    )
-    .map_err(|error| {
-        if error == Errno::EXDEV {
-            SkipReason::MountOrDeviceCrossing
-        } else if error == Errno::EEXIST {
-            SkipReason::StageConflict
-        } else {
-            SkipReason::StagedDeletionIncomplete
+    let rename_once = || {
+        renameat2(
+            Some(source_fd),
+            entry_name,
+            Some(destination_fd.as_raw_fd()),
+            destination_name.as_str(),
+            RenameFlags::RENAME_NOREPLACE,
+        )
+    };
+    let rename_error = |error| match error {
+        Errno::EXDEV => SkipReason::MountOrDeviceCrossing,
+        Errno::EEXIST => SkipReason::StageConflict,
+        _ => SkipReason::StagedDeletionIncomplete,
+    };
+    match rename_once() {
+        Err(Errno::EACCES) => {
+            // Moving a directory across parents also needs write permission on
+            // the directory itself (its `..` changes). A partial deletion may
+            // have repaired only a deep descendant before exhausting its entry
+            // budget, leaving this authenticated stage root at 0500/0555.
+            // Repair only this authenticated staged inode, never a source
+            // worktree or either bucket. This is constant work per scheduled
+            // stage, with no new tree walk; retain the time/depth fences.
+            let pass = current_pass_state();
+            (|| {
+                restore_staged_owner_write(pinned.as_raw_fd(), &expected, 0, &pass)?;
+                authenticate_stage_from_name(source_fd, entry_name, base_dev)?;
+                pass.checkpoint(0)?;
+                rename_once().map_err(rename_error)
+            })()
+            .inspect_err(|reason| {
+                tracing::warn!(
+                    device = expected.st_dev,
+                    inode = expected.st_ino,
+                    owner = expected.st_uid,
+                    mode = expected.st_mode & 0o7777,
+                    ?reason,
+                    "staged cache rotation owner-write recovery incomplete"
+                );
+            })?;
         }
-    })?;
+        result => result.map_err(rename_error)?,
+    }
     maybe_fail_rotation_for_test(entry_name, RotationFaultPoint::SourceFsync)?;
     fsync(source_fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
     maybe_fail_rotation_for_test(entry_name, RotationFaultPoint::DestinationFsync)?;
@@ -3354,8 +3382,12 @@ fn delete_dir_contents_at_depth(
             !is_dir,
         )?;
         if is_dir {
-            let child = open_nested_dir(fd, OsStr::from_bytes(name.to_bytes()))
-                .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+            let child = open_nested_dir(fd, OsStr::from_bytes(name.to_bytes()))?;
+            let opened =
+                fstat(child.as_raw_fd()).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+            if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+                return Err(SkipReason::TargetIdentityChanged);
+            }
             delete_dir_contents_at_depth(
                 child.as_raw_fd(),
                 base_dev,
@@ -3369,17 +3401,97 @@ fn delete_dir_contents_at_depth(
             )?;
             drop(child);
             maybe_fail_delete_for_test(entry_name)?;
-            unlinkat(Some(fd), name, UnlinkatFlags::RemoveDir)
-                .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+            unlink_staged_entry(fd, name, UnlinkatFlags::RemoveDir, &root, depth, pass)?;
             pass.record_entry_deleted();
         } else {
             maybe_fail_delete_for_test(entry_name)?;
-            unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir)
-                .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+            unlink_staged_entry(fd, name, UnlinkatFlags::NoRemoveDir, &root, depth, pass)?;
             pass.record_entry_deleted();
         }
     }
     Ok(())
+}
+
+/// Only the authenticated staged-content walker calls this helper. An unlink
+/// needs write access to its parent directory, never to the leaf itself. Repair
+/// only that directory, through its retained descriptor, after an actual DAC
+/// denial. Queue/slot parents and original source paths never enter this path.
+fn unlink_staged_entry(
+    fd: RawFd,
+    name: &CStr,
+    flags: UnlinkatFlags,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+) -> Result<(), SkipReason> {
+    match unlinkat(Some(fd), name, flags) {
+        Ok(()) => Ok(()),
+        Err(error) if error == Errno::EACCES || error == Errno::EPERM => {
+            let recovery = (|| {
+                // EPERM (immutable flags, sticky ownership, etc.) is not proof
+                // that adding owner-write can help. Never broaden permissions.
+                if error != Errno::EACCES {
+                    return Err(SkipReason::StagedDeletionIncomplete);
+                }
+                restore_staged_owner_write(fd, expected, depth, pass)?;
+                pass.checkpoint(depth)?;
+                unlinkat(Some(fd), name, flags).map_err(|_| SkipReason::StagedDeletionIncomplete)
+            })();
+            if let Err(reason) = &recovery {
+                // One fixed-size diagnostic at the failing directory, then
+                // unwind this stage. No descendant paths or per-entry retry loop.
+                tracing::warn!(
+                    device = expected.st_dev,
+                    inode = expected.st_ino,
+                    owner = expected.st_uid,
+                    mode = expected.st_mode & 0o7777,
+                    depth,
+                    unlink_errno = error as i32,
+                    ?reason,
+                    "staged cache owner-write recovery incomplete"
+                );
+            }
+            recovery
+        }
+        Err(_) => Err(SkipReason::StagedDeletionIncomplete),
+    }
+}
+
+fn restore_staged_owner_write(
+    fd: RawFd,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+) -> Result<(), SkipReason> {
+    pass.checkpoint(depth)?;
+    let current = fstat(fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    // SAFETY: geteuid has no preconditions. Ownership is never caller-supplied.
+    let mode = staged_owner_write_mode(&current, expected, unsafe { nix::libc::geteuid() })?;
+    fchmod(fd, mode).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    Ok(())
+}
+
+fn staged_owner_write_mode(
+    current: &nix::libc::stat,
+    expected: &nix::libc::stat,
+    owner: nix::libc::uid_t,
+) -> Result<Mode, SkipReason> {
+    if current.st_dev != expected.st_dev || current.st_ino != expected.st_ino {
+        return Err(SkipReason::TargetIdentityChanged);
+    }
+    if !SFlag::from_bits_truncate(current.st_mode).contains(SFlag::S_IFDIR)
+        || current.st_uid != owner
+        || expected.st_uid != owner
+        || current.st_gid != expected.st_gid
+        || current.st_mode != expected.st_mode
+        // This narrow repair covers readable/searchable owner-unwritable
+        // directories (e.g. 0500/0555). Missing read/search, ACL-only denials,
+        // foreign owners and concurrent permission changes remain fail-closed.
+        || current.st_mode & 0o700 != 0o500
+    {
+        return Err(SkipReason::RejectedRecoveryEntry);
+    }
+    Ok(Mode::from_bits_truncate((current.st_mode & 0o7777) | 0o200))
 }
 
 fn charge_deletion_observation(
@@ -3647,6 +3759,7 @@ mod tests {
         (root, pinned, intent)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn registered_stage_durability_seams_are_recoverable_and_delete_fault_retries() {
         for (ordinal, seam) in [
@@ -3690,6 +3803,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn registered_dry_run_raced_absence_never_syncs_parent_namespaces() {
         let temp = tempdir().unwrap();
@@ -3716,6 +3830,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn registered_recovery_preserves_new_source_and_refuses_replaced_payload() {
         let temp = tempdir().unwrap();
@@ -3765,6 +3880,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn legacy_recovery_never_mutates_registered_v3_namespace() {
         let temp = tempdir().unwrap();
@@ -3850,6 +3966,397 @@ mod tests {
         let mut outcomes = recover_staged_targets_with_state(base, false, &pass);
         assert_eq!(outcomes.len(), 1, "unexpected outcomes: {outcomes:?}");
         outcomes.remove(0)
+    }
+
+    fn make_readonly_stage(stage: &Path) {
+        for (path, mode) in [
+            ("one/two/three", 0o555),
+            ("one/two", 0o500),
+            ("one", 0o555),
+            ("", 0o500),
+        ] {
+            std::fs::set_permissions(stage.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_legacy_stage_preview_preserves_modes_and_actual_recovery_removes_nested_cache() {
+        let fixture = staged_depth_fixture();
+        // Production staging publishes this cursor. The raw depth fixture
+        // deliberately does not; dry-run only observes an existing cursor.
+        let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+        let queue = open_beneath_dir(base_fd.as_raw_fd(), OsStr::new(QUEUE_NAME)).unwrap();
+        ensure_recovery_cursor(
+            queue.as_raw_fd(),
+            fixture.dev,
+            stage_bucket_index(&fixture.entry_name),
+        )
+        .unwrap();
+        let cursor_before = recovery_cursor_marker(&fixture.base);
+        make_readonly_stage(&fixture.stage);
+        let preview =
+            recover_staged_targets_with_state(&fixture.base, true, &ReclaimPassState::new());
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].kind, TargetReclaimKind::Inspected);
+        assert_eq!(recovery_cursor_marker(&fixture.base), cursor_before);
+        assert_eq!(
+            std::fs::metadata(&fixture.stage).unwrap().mode() & 0o7777,
+            0o500
+        );
+        assert_eq!(
+            std::fs::metadata(fixture.stage.join("one/two/three"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o555
+        );
+        assert_eq!(
+            std::fs::read(fixture.stage.join("one/two/three/cache")).unwrap(),
+            b"retain"
+        );
+
+        let pass = ReclaimPassState::new();
+        let run = recover_staged_targets_run_with_state(&fixture.base, false, &pass);
+        assert_eq!(run.outcomes.len(), 1);
+        assert_eq!(run.outcomes[0].kind, TargetReclaimKind::RecoveredRemoved);
+        assert_eq!(run.outcomes[0].reason, None);
+        assert_eq!(run.evidence.entries_deleted, 5);
+        assert_eq!(active_stage_paths(&fixture.base).len(), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_registered_recovery_preserves_original_source_and_external_link_targets() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let (root, pinned, intent) = registered_fixture(&base, 71);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        std::fs::set_permissions(outside.join("keep"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::create_dir_all(root.join("target/one/two/three")).unwrap();
+        std::fs::hard_link(
+            outside.join("keep"),
+            root.join("target/one/two/three/hardlink"),
+        )
+        .unwrap();
+        symlink(&outside, root.join("target/one/two/three/symlink")).unwrap();
+        assert_eq!(pinned.stage_registered_target(&intent).reason, None);
+        // The recovery contract begins after staging. A cross-parent rename of
+        // a read-only original target may fail, and grants no chmod authority
+        // over that original source. Make the authenticated detached payload
+        // read-only instead, including its root as well as nested directories.
+        let payload = base
+            .join(QUEUE_NAME)
+            .join(bucket_name(intent.bucket))
+            .join(&intent.slot_name)
+            .join("payload");
+        assert_stage_identity(&payload, intent.expected_device, intent.expected_inode);
+        make_readonly_stage(&payload);
+        assert_eq!(std::fs::metadata(&payload).unwrap().mode() & 0o7777, 0o500);
+        assert_eq!(
+            std::fs::metadata(payload.join("one/two/three"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o555
+        );
+
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target/new-source"), b"retain-source").unwrap();
+        std::fs::set_permissions(root.join("target"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        assert_eq!(
+            delete_registered_target(&base, &intent, false).kind,
+            TargetReclaimKind::RecoveredRemoved
+        );
+        assert_eq!(
+            probe_registered_target(&base, &intent).destination,
+            RegisteredNamespaceState::Absent
+        );
+        assert_eq!(
+            std::fs::read(root.join("target/new-source")).unwrap(),
+            b"retain-source"
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("target")).unwrap().mode() & 0o7777,
+            0o500
+        );
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+        assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o7777, 0o555);
+        assert_eq!(
+            std::fs::metadata(outside.join("keep")).unwrap().mode() & 0o7777,
+            0o444
+        );
+        // Fixture teardown only; production never repairs either retained path.
+        std::fs::set_permissions(root.join("target"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_stage_recovery_resumes_after_bounded_partial_delete() {
+        let fixture = staged_depth_fixture();
+        std::fs::write(fixture.stage.join("one/two/three/second"), b"second").unwrap();
+        make_readonly_stage(&fixture.stage);
+        let limits = ReclaimWorkLimits {
+            filesystem_entries: 5,
+            allocated_bytes: 1,
+            ..roomy_limits()
+        };
+        let pass = ReclaimPassState::for_test(limits);
+        let first = recover_staged_targets_run_with_state(&fixture.base, false, &pass);
+        let pending = first
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.kind == TargetReclaimKind::RecoveredPending)
+            .unwrap();
+        assert_eq!(pending.reason, Some(SkipReason::FilesystemEntryBudget));
+        assert_eq!(first.evidence.entries_deleted, 1);
+        assert!(pending.bytes <= limits.allocated_bytes);
+        let retained = only_active_stage(&fixture.base);
+        assert_stage_identity(&retained, fixture.dev, fixture.ino);
+        assert_eq!(
+            retained.parent().unwrap().file_name().unwrap(),
+            OsStr::new(&bucket_name(
+                stage_bucket_index(&fixture.entry_name).wrapping_add(1)
+            )),
+            "read-only stage root must rotate to the already-reserved next bucket"
+        );
+        assert_eq!(
+            std::fs::read_dir(retained.join("one/two/three"))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let resumed = recover_staged_targets_run_with_state(
+            &fixture.base,
+            false,
+            &ReclaimPassState::for_test(limits),
+        );
+        assert_eq!(resumed.outcomes.len(), 1);
+        assert_eq!(
+            resumed.outcomes[0].kind,
+            TargetReclaimKind::RecoveredRemoved
+        );
+        assert_eq!(resumed.evidence.entries_deleted, 5);
+        assert_eq!(active_stage_paths(&fixture.base).len(), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_stage_rotation_collision_retains_both_authenticated_cache_and_destination() {
+        let fixture = staged_depth_fixture();
+        make_readonly_stage(&fixture.stage);
+        let source_bucket = stage_bucket_index(&fixture.entry_name);
+        let next_bucket = source_bucket.wrapping_add(1);
+        let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+        let queue = open_beneath_dir(base_fd.as_raw_fd(), OsStr::new(QUEUE_NAME)).unwrap();
+        let source =
+            open_beneath_dir(queue.as_raw_fd(), OsStr::new(&bucket_name(source_bucket))).unwrap();
+        let destination = ensure_private_child_directory(
+            queue.as_raw_fd(),
+            &bucket_name(next_bucket),
+            fixture.dev,
+        )
+        .unwrap();
+        let collision = fixture
+            .queue
+            .join(bucket_name(next_bucket))
+            .join(rotated_stage_name(&fixture.entry_name, next_bucket).unwrap());
+        std::fs::create_dir(&collision).unwrap();
+        std::fs::write(collision.join("keep"), b"destination").unwrap();
+        std::fs::set_permissions(&collision, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let collision_identity = std::fs::metadata(&collision).unwrap();
+        assert_eq!(
+            rotate_stage(
+                queue.as_raw_fd(),
+                source.as_raw_fd(),
+                source_bucket,
+                &fixture.entry_name,
+                fixture.dev
+            ),
+            Err(SkipReason::StageConflict)
+        );
+        assert_stage_identity(&fixture.stage, fixture.dev, fixture.ino);
+        assert_eq!(
+            std::fs::read(fixture.stage.join("one/two/three/cache")).unwrap(),
+            b"retain"
+        );
+        assert_stage_identity(
+            &collision,
+            collision_identity.dev(),
+            collision_identity.ino(),
+        );
+        assert_eq!(
+            std::fs::read(collision.join("keep")).unwrap(),
+            b"destination"
+        );
+        assert_eq!(
+            std::fs::metadata(&collision).unwrap().mode() & 0o7777,
+            0o555
+        );
+        drop(destination);
+        // Fixture teardown only, after proving retention on the refused move.
+        for path in ["", "one", "one/two", "one/two/three"] {
+            std::fs::set_permissions(
+                fixture.stage.join(path),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&collision, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_permission_repair_is_descriptor_pinned_and_adds_only_owner_write() {
+        // Exercise fchmod even when QA runs with DAC-bypass privileges: the
+        // production unlink fast path legitimately needs no repair in that case.
+        for (before, after) in [(0o500, 0o700), (0o555, 0o755)] {
+            let fixture = staged_depth_fixture();
+            std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(before))
+                .unwrap();
+            let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+            let relative = fixture.stage.strip_prefix(&fixture.base).unwrap();
+            let pinned = open_beneath_dir(base_fd.as_raw_fd(), relative.as_os_str()).unwrap();
+            let expected = fstat(pinned.as_raw_fd()).unwrap();
+            let retained = fixture.stage.with_file_name("held-for-pin-test");
+            let outside = fixture._temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("keep"), b"outside").unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+            std::fs::rename(&fixture.stage, &retained).unwrap();
+            symlink(&outside, &fixture.stage).unwrap();
+            assert!(open_beneath_dir(base_fd.as_raw_fd(), relative.as_os_str()).is_err());
+            restore_staged_owner_write(pinned.as_raw_fd(), &expected, 0, &ReclaimPassState::new())
+                .unwrap();
+            assert_eq!(fstat(pinned.as_raw_fd()).unwrap().st_mode & 0o7777, after);
+            assert_eq!(std::fs::read_link(&fixture.stage).unwrap(), outside);
+            assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o7777, 0o555);
+            assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+            assert_eq!(
+                std::fs::read(retained.join("one/two/three/cache")).unwrap(),
+                b"retain"
+            );
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_permission_repair_refuses_foreign_owner_identity_and_mode_drift() {
+        let fixture = staged_depth_fixture();
+        std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+        let pinned = open_beneath_dir(
+            base_fd.as_raw_fd(),
+            fixture
+                .stage
+                .strip_prefix(&fixture.base)
+                .unwrap()
+                .as_os_str(),
+        )
+        .unwrap();
+        let expected = fstat(pinned.as_raw_fd()).unwrap();
+        // Synthetic observations avoid chown/root requirements while exercising
+        // the exact policy used immediately before the descriptor-only chmod.
+        let foreign_owner = expected.st_uid.wrapping_add(1);
+        assert_eq!(
+            staged_owner_write_mode(&expected, &expected, foreign_owner),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+        let mut changed = expected;
+        changed.st_ino = changed.st_ino.wrapping_add(1);
+        assert_eq!(
+            staged_owner_write_mode(&changed, &expected, expected.st_uid),
+            Err(SkipReason::TargetIdentityChanged)
+        );
+        assert_eq!(
+            restore_staged_owner_write(pinned.as_raw_fd(), &changed, 0, &ReclaimPassState::new()),
+            Err(SkipReason::TargetIdentityChanged)
+        );
+        changed = expected;
+        changed.st_dev = changed.st_dev.wrapping_add(1);
+        assert_eq!(
+            staged_owner_write_mode(&changed, &expected, expected.st_uid),
+            Err(SkipReason::TargetIdentityChanged)
+        );
+        changed = expected;
+        changed.st_uid = foreign_owner;
+        assert_eq!(
+            restore_staged_owner_write(pinned.as_raw_fd(), &changed, 0, &ReclaimPassState::new()),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+        changed = expected;
+        changed.st_mode = SFlag::S_IFREG.bits() | 0o500;
+        assert_eq!(
+            staged_owner_write_mode(&changed, &changed, expected.st_uid),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+        for mode in [0o400, 0o700, 0o000] {
+            changed = expected;
+            changed.st_mode = (changed.st_mode & !0o7777) | mode;
+            assert_eq!(
+                staged_owner_write_mode(&changed, &changed, expected.st_uid),
+                Err(SkipReason::RejectedRecoveryEntry)
+            );
+        }
+        changed = expected;
+        changed.st_mode |= 0o040;
+        assert_eq!(
+            staged_owner_write_mode(&changed, &expected, expected.st_uid),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+        assert_eq!(fstat(pinned.as_raw_fd()).unwrap().st_mode & 0o7777, 0o500);
+        assert_eq!(
+            std::fs::read(fixture.stage.join("one/two/three/cache")).unwrap(),
+            b"retain"
+        );
+        std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn readonly_permission_repair_respects_duration_and_depth_before_chmod() {
+        let fixture = staged_depth_fixture();
+        std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+        let pinned = open_beneath_dir(
+            base_fd.as_raw_fd(),
+            fixture
+                .stage
+                .strip_prefix(&fixture.base)
+                .unwrap()
+                .as_os_str(),
+        )
+        .unwrap();
+        let expected = fstat(pinned.as_raw_fd()).unwrap();
+        let limits = roomy_limits();
+        let pass = ReclaimPassState::for_test(limits);
+        pass.set_elapsed_for_test(limits.duration + Duration::from_nanos(1));
+        assert_eq!(
+            restore_staged_owner_write(pinned.as_raw_fd(), &expected, 0, &pass),
+            Err(SkipReason::DurationBudget)
+        );
+        pass.set_elapsed_for_test(Duration::ZERO);
+        assert_eq!(
+            restore_staged_owner_write(pinned.as_raw_fd(), &expected, limits.depth + 1, &pass),
+            Err(SkipReason::DepthBudget)
+        );
+        assert_eq!(fstat(pinned.as_raw_fd()).unwrap().st_mode & 0o7777, 0o500);
+        assert_eq!(
+            std::fs::read(fixture.stage.join("one/two/three/cache")).unwrap(),
+            b"retain"
+        );
+        std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn active_stage_paths(base: &Path) -> Vec<PathBuf> {
@@ -3986,6 +4493,7 @@ mod tests {
         (stats.blocks_available() as u64).saturating_mul(stats.fragment_size() as u64)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_sizes_allocated_blocks_without_following_nested_symlinks() {
         let (temp, base, root, id) = fixture();
@@ -4005,6 +4513,7 @@ mod tests {
         assert!(outside.join("sentinel").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_ancestor_swap_deletes_only_pinned_original_target() {
         let (temp, base, root, id) = fixture();
@@ -4039,6 +4548,7 @@ mod tests {
         assert!(!relocated.join("target").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_target_swap_is_refused_without_touching_replacement() {
         let (_temp, base, root, id) = fixture();
@@ -4074,6 +4584,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_partial_delete_reopens_and_converges() {
         let (_temp, base, root, id) = fixture();
@@ -4091,6 +4602,7 @@ mod tests {
         assert!(recover_staged_targets(&base, false).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_final_rmdir_failure_reopens_and_converges() {
         let (_temp, base, root, id) = fixture();
@@ -4107,6 +4619,7 @@ mod tests {
         assert!(recover_staged_targets(&base, false).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_queue_collision_refuses_without_overwrite() {
         let (_temp, base, root, id) = fixture();
@@ -4139,6 +4652,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_rejects_direct_target_symlink_and_identity_drift() {
         let (temp, base, root, id) = fixture();
@@ -4154,6 +4668,7 @@ mod tests {
         assert!(victim.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_rejects_root_escape_and_special_target() {
         let (temp, base, root, id) = fixture();
@@ -4173,6 +4688,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_rejects_unreadable_nested_directory_before_staging() {
         let (_temp, base, root, id) = fixture();
@@ -4189,6 +4705,7 @@ mod tests {
         assert!(!base.join(QUEUE_NAME).exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn stage_name_round_trip_is_strict() {
         let id = Uuid::new_v4();
@@ -4204,6 +4721,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejected_stage_name_round_trip_and_length_are_strict() {
         let id = Uuid::nil();
@@ -4233,6 +4751,7 @@ mod tests {
         assert!(rejected_stage_name(&format!("{active}_suffix")).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_allocated_size_deduplicates_hard_links() {
         let (_temp, base, root, id) = fixture();
@@ -4246,6 +4765,7 @@ mod tests {
         assert!(bytes < allocated.saturating_mul(2).saturating_add(32 * 1024));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_preview_excludes_externally_retained_hard_link_blocks() {
         let (temp, base, root, id) = fixture();
@@ -4282,6 +4802,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn post_sizing_hard_link_drift_is_discarded_before_capacity_estimation() {
         let (temp, base, root, id) = fixture();
@@ -4314,6 +4835,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn pass_ledger_counts_cross_candidate_hard_link_once_when_all_links_delete() {
         let temp = tempdir().unwrap();
@@ -4373,6 +4895,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn newly_created_queue_requires_parent_fsync_before_staging_and_reopens_safely() {
         let (_temp, base, root, id) = fixture();
@@ -4400,6 +4923,7 @@ mod tests {
         assert!(recover_staged_targets(&base, false).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn reclaim_budget_exact_limits_and_limit_plus_one_are_typed() {
         let limits = ReclaimWorkLimits {
@@ -4440,6 +4964,7 @@ mod tests {
         assert_eq!(duration.checkpoint(0), Err(SkipReason::DurationBudget));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn recovery_bucket_cursor_eventually_reaches_later_stage() {
         let temp = tempdir().unwrap();
@@ -4488,6 +5013,7 @@ mod tests {
         assert_ne!(recovery_cursor_marker(&base), first_cursor);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn over_quantum_same_bucket_malformed_prefix_cannot_starve_valid_stage() {
         let temp = tempdir().unwrap();
@@ -4523,6 +5049,7 @@ mod tests {
         assert!(active_stage_paths(&base).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn stage_in_wrong_bucket_is_terminally_rejected_without_identity_loss() {
         let temp = tempdir().unwrap();
@@ -4580,6 +5107,7 @@ mod tests {
         (entry_name, metadata.dev(), metadata.ino())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn over_quantum_legacy_conflict_and_malformed_prefix_cannot_starve_tail() {
         let temp = tempdir().unwrap();
@@ -4627,6 +5155,7 @@ mod tests {
         assert!(rejected.join("cache").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rotation_durability_seams_retain_one_authenticated_stage() {
         for point in [
@@ -4705,6 +5234,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn recovery_run_reports_bounded_deletion_progress() {
         let (_temp, base, root, id) = fixture();
@@ -4731,6 +5261,7 @@ mod tests {
         assert!(run.evidence.cursor_after.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn post_cursor_rename_fsync_uncertainty_never_claims_durable_progress() {
         let (_temp, base, root, id) = fixture();
@@ -4782,6 +5313,7 @@ mod tests {
         only_active_stage(base)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn actual_recovery_same_entry_ceiling_shrinks_and_converges() {
         let limits = ReclaimWorkLimits {
@@ -4826,6 +5358,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn duration_budget_exhaustion_rotates_recovery_stage_with_other_bounds_intact() {
         let temp = tempdir().unwrap();
@@ -4896,6 +5429,7 @@ mod tests {
         assert!(active_stage_paths(&base).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn actual_recovery_unlinks_leaf_larger_than_same_byte_ceiling() {
         let temp = tempdir().unwrap();
@@ -4934,6 +5468,7 @@ mod tests {
         assert!(recover_staged_targets_with_state(&base, false, &fresh_pass).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn overdepth_recovery_is_rejected_once_and_leaves_active_queue() {
         let temp = tempdir().unwrap();
@@ -4974,6 +5509,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_source_name_replacement_never_terminally_reports_wrong_inode() {
         let fixture = staged_depth_fixture();
@@ -5015,6 +5551,7 @@ mod tests {
         assert!(rejected.join("replacement-sentinel").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_legacy_parent_displacement_cannot_redirect_direct_terminal() {
         let fixture = staged_depth_fixture();
@@ -5069,6 +5606,7 @@ mod tests {
         assert!(legacy.join("replacement-sentinel").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_destination_collision_is_pending_and_never_overwrites() {
         let fixture = staged_depth_fixture();
@@ -5090,6 +5628,7 @@ mod tests {
         assert!(collision.join("operator-sentinel").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_namespace_symlink_cross_device_owner_and_mode_are_refused() {
         for case in ["symlink", "cross_device", "owner", "mode"] {
@@ -5154,6 +5693,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_durability_failures_retry_before_move_and_retain_after_move() {
         for phase in ["before", "after"] {
@@ -5205,6 +5745,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_after_auth_before_failure_handling_never_rolls_back_by_name() {
         assert_hostile_direct_terminal_replacement_is_retained(
@@ -5212,11 +5753,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn rejection_final_post_sync_direct_entry_alternation_is_non_terminal_and_retained() {
         assert_hostile_direct_terminal_replacement_is_retained("before_final_direct_proof");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn direct_and_legacy_rejected_names_are_excluded_from_active_recovery() {
         let temp = tempdir().unwrap();
@@ -5269,6 +5812,7 @@ mod tests {
         assert_eq!(std::fs::read(legacy.join("sentinel")).unwrap(), b"legacy");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn filesystem_byte_depth_and_duration_budgets_leave_recoverable_work() {
         let (_temp, base, root, id) = fixture();
@@ -5332,6 +5876,7 @@ mod tests {
         assert!(recover_staged_targets(&base, false).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_refuses_injected_nested_cross_device_before_staging() {
         let (_temp, base, root, id) = fixture();
@@ -5347,6 +5892,7 @@ mod tests {
         assert!(!base.join(QUEUE_NAME).exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_refuses_foreign_device_recovery_and_then_converges() {
         let (_temp, base, root, id) = fixture();
@@ -5380,6 +5926,7 @@ mod tests {
         assert!(active_stage_paths(&base).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_rejects_unsafe_recovery_queue() {
         let (_temp, base, _root, _id) = fixture();
@@ -5394,6 +5941,7 @@ mod tests {
         assert_eq!(outcomes[0].reason, Some(SkipReason::RejectedRecoveryEntry));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn target_reclaim_rejects_staged_inode_mismatch() {
         let (_temp, base, _root, id) = fixture();

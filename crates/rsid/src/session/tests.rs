@@ -47,39 +47,6 @@ fn manager() -> (SessionManager, TempDir) {
     (manager, dir)
 }
 
-#[tokio::test]
-async fn health_keeps_restart_evidence_visible_while_store_is_busy() {
-    let directory = TempDir::new().unwrap();
-    let store = Store::open(&directory.path().join("rsi.db")).unwrap();
-    let observed_at = chrono::Utc::now();
-    let restart = crate::watchdog::RestartRecord {
-        version: 1,
-        id: Uuid::new_v4(),
-        observed_at,
-        last_healthy_at: observed_at - chrono::Duration::seconds(30),
-        failed_probes: vec!["store_probe_timeout".to_owned()],
-    };
-    store.persist_daemon_restart_record(&restart).unwrap();
-    let runtime_config = RuntimeConfig::from_config(&Config::from_env());
-    let manager = SessionManager::new(
-        Arc::new(EventBus::new(16)),
-        store,
-        false,
-        directory.path().join("daemon.sock"),
-        None,
-        Vec::new(),
-        runtime_config,
-        directory.path().join("sandboxes"),
-    )
-    .unwrap();
-
-    let _busy_store = manager.store.lock().await;
-    let health = manager.get_health_status().await;
-    let visible = health.latest_daemon_restart.unwrap();
-    assert_eq!(visible.id, restart.id);
-    assert_eq!(visible.failed_probes, restart.failed_probes);
-}
-
 fn bare_session(id: Uuid) -> Session {
     let now = chrono::Utc::now();
     Session {
@@ -247,6 +214,7 @@ async fn pending_provider_settlement(
     (invocation_id, settlement)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_a_late_provider_settlement_owner() {
     let (manager, _dir) = manager();
@@ -290,6 +258,7 @@ async fn shutdown_waits_for_a_late_provider_settlement_owner() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_retries_producer_timeout_until_the_provider_owner_settles() {
     let (manager, _dir) = manager();
@@ -334,6 +303,73 @@ async fn shutdown_retries_producer_timeout_until_the_provider_owner_settles() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn shutdown_keeps_interrupting_after_a_snapshotted_turn_finishes() {
+    let (manager, _dir) = manager();
+    let stale_id = Uuid::new_v4();
+    let live_id = Uuid::new_v4();
+    for session_id in [stale_id, live_id] {
+        let mut session = bare_session(session_id);
+        session.status = SessionStatus::Running;
+        insert_row(&manager, &session).await;
+        let invocation_id = Uuid::new_v4();
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let store = manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations
+                 (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                  trigger_source,session_id,created_at)
+                 VALUES(?1,'session.launch','session','foreground','paid','admitted','running',
+                        'launch_session',?2,?3)",
+                rusqlite::params![invocation_id.to_string(), session_id.to_string(), at],
+            )
+            .expect("insert running invocation");
+        store
+            .set_session_model_invocation(session_id, Some(invocation_id))
+            .expect("bind running invocation");
+        drop(store);
+        manager
+            .active
+            .write()
+            .await
+            .insert(session_id, TrackedSession::new_for_test(session));
+    }
+
+    // The active-map snapshot still contains stale_id, but its finalizer has
+    // removed it before shutdown signals the process. A later active turn must
+    // still get its own interrupt and durable restart owner.
+    manager.active.write().await.remove(&stale_id);
+    manager
+        .interrupt_restart_sessions(vec![stale_id, live_id])
+        .await
+        .expect("shutdown survives stale snapshot entry");
+
+    assert!(manager.active.read().await[&live_id].interrupt_requested);
+    let store = manager.store.lock().await;
+    let mut stmt = store
+        .conn
+        .prepare(
+            "SELECT session_id,outcome FROM daemon_restart_intents
+             WHERE session_id IN (?1,?2) ORDER BY session_id",
+        )
+        .unwrap();
+    let outcomes: Vec<(String, Option<String>)> = stmt
+        .query_map(
+            rusqlite::params![stale_id.to_string(), live_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.contains(&(stale_id.to_string(), None)));
+    assert!(outcomes.contains(&(live_id.to_string(), Some("shutdown_cancelled".into()))));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_message() {
     let stream = StreamEvent {
@@ -355,6 +391,7 @@ fn test_convert_stream_event_message() {
     assert_eq!(event.sequence, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_use() {
     let stream = StreamEvent {
@@ -376,6 +413,7 @@ fn test_convert_stream_event_tool_use() {
     assert_eq!(event.sequence, 6);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_content_blocks() {
     let stream = StreamEvent {
@@ -397,6 +435,7 @@ fn test_convert_stream_event_content_blocks() {
     assert_eq!(events[0].content, "Line 1\nLine 2");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_content_block_tool_use() {
     // Real Claude Code CLI stream-json format: tool calls arrive as
@@ -430,6 +469,7 @@ fn test_convert_stream_event_content_block_tool_use() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_content_block_parallel_tool_use() {
     // Parallel tool calls: multiple tool_use blocks in one content array,
@@ -459,6 +499,7 @@ fn test_convert_stream_event_content_block_parallel_tool_use() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_thinking_only() {
     let stream = StreamEvent {
@@ -480,6 +521,7 @@ fn test_convert_stream_event_thinking_only() {
     assert_eq!(events[0].content, "Let me reason about this...");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_thinking_and_text() {
     let stream = StreamEvent {
@@ -506,6 +548,7 @@ fn test_convert_stream_event_thinking_and_text() {
     assert_eq!(events[1].sequence, 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_empty_content_skipped() {
     let stream = StreamEvent {
@@ -524,6 +567,7 @@ fn test_convert_stream_event_empty_content_skipped() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_no_content_skipped() {
     let stream = StreamEvent {
@@ -541,6 +585,7 @@ fn test_convert_stream_event_no_content_skipped() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_create_user_event() {
     let session_id = Uuid::new_v4();
@@ -556,6 +601,7 @@ fn test_create_user_event() {
     assert_eq!(event.id, 0); // Placeholder before DB assignment
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_result_returns_empty() {
     let stream = StreamEvent {
@@ -569,6 +615,7 @@ fn test_convert_stream_event_result_returns_empty() {
     assert!(events.is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_pipeline_path_regex() {
     // Research paths
@@ -599,6 +646,7 @@ fn test_pipeline_path_regex() {
     assert_eq!(cap.as_str(), "thoughts/shared/plans/2026-03-04-foo.md");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn test_schedule_memory_sync_enqueues_sync_now() {
     let (tx, mut rx) = mpsc::channel(1);
@@ -645,6 +693,7 @@ fn close_approval_interval(start: &mut Option<std::time::Instant>, total_ms: &mu
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn approval_wait_accumulates_across_multiple_questions() {
     let mut start: Option<std::time::Instant> = None;
@@ -687,6 +736,7 @@ fn approval_wait_accumulates_across_multiple_questions() {
 // GetSession reads ≥10s apart" check, hermetically); (d) monotonic after a
 // `work_time_base_ms` bump (continue semantics — ADD to the reused floor,
 // never reset).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn recompute_work_time_folds_running_minus_approval_wait() {
     let mut tracked = TrackedSession::new_for_test(bare_session(Uuid::new_v4()));
@@ -764,9 +814,10 @@ fn recompute_work_time_folds_running_minus_approval_wait() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_failure_reinserts_completed_session() {
-    let (manager, _dir) = manager();
+    let (mut manager, _dir) = manager();
     let session_id = Uuid::new_v4();
     let mut session = bare_session(session_id);
     session.provider = SessionProvider::Codex;
@@ -786,6 +837,7 @@ async fn continue_failure_reinserts_completed_session() {
             events_hydrated: true,
         },
     );
+    stub_codex_launch_for_missing_working_dir(&mut manager);
 
     let err = manager
         .continue_session(session_id, "continue".to_string())
@@ -796,22 +848,125 @@ async fn continue_failure_reinserts_completed_session() {
         manager.completed.read().await.contains_key(&session_id),
         "failed continue must restore the completed session to memory"
     );
-    assert!(
-        matches!(
-            err,
-            crate::error::DaemonError::CodexBinaryNotFound | crate::error::DaemonError::Io(_)
-        ),
-        "expected a launch-time failure, got {err:?}"
+    assert_missing_working_dir_refusal(&err);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+fn stub_codex_launch_for_missing_working_dir(manager: &mut SessionManager) {
+    manager.codex_client = Some(
+        CodexClient::with_paths_for_test(
+            std::path::PathBuf::from("/usr/bin/true"),
+            std::path::PathBuf::from("/usr/bin/true"),
+            std::sync::Arc::clone(&manager.runtime_config),
+        )
+        .without_resume_history_validation_for_test(),
     );
 }
 
+/// The ONLY accepted refusal: a genuine launch-time filesystem failure caused
+/// by the pinned missing working directory, and nothing else.
+///
+/// The fixtures that call this stub `manager.codex_client` via
+/// `CodexClient::with_paths_for_test` pointing both `binary_path` and
+/// `agent_mcp_path` at an existing no-op binary (`/usr/bin/true`), so `codex`
+/// resolution and the trusted-MCP-sibling check both succeed. The fixture
+/// bypasses rollout validation for its dummy `resume-token`, so the ONLY
+/// remaining precondition standing between `continue_session` and a spawned
+/// process is the missing `working_dir`. An `Ok`, `CodexBinaryNotFound`, or
+/// any other error class means the launch reached (or would have reached)
+/// past the boundary under test.
+fn assert_missing_working_dir_refusal(error: &crate::error::DaemonError) {
+    match error {
+        crate::error::DaemonError::Io(io_error) => {
+            assert_eq!(
+                io_error.kind(),
+                std::io::ErrorKind::NotFound,
+                "expected a NotFound Io refusal from the missing working directory, got {io_error:?}"
+            );
+        }
+        other => panic!(
+            "expected DaemonError::Io(NotFound) from the missing working directory, got {other:?}"
+        ),
+    }
+}
+
+/// The retry leg of `continue_orphan_reap_failure_precedes_admission_for_exact_retry`
+/// must reach its refusal BEFORE any provider work, on every host.
+///
+/// Regression for #563. The fixture previously relied on ambient host state to
+/// produce the second phase's launch refusal: `bare_session` inherits
+/// `working_dir = "/tmp"`, which exists, so the launch was never refused by the
+/// working directory. On a host with `codex` on PATH and the trusted MCP sibling
+/// present, that reached a real provider process -- the assertion then passed
+/// only because a *different* refusal fired first, and would silently start a
+/// live provider if the spawn path succeeded. Measured directly: with the MCP
+/// sibling present, the old fixture's `/tmp` cwd returned `Ok(_)` (real provider
+/// launch) while a missing cwd returned `Io(NotFound)`.
+///
+/// This pins the invariant as an explicit precondition of the fixture rather
+/// than a property of the host, and asserts the refusal is a genuine
+/// launch-time filesystem failure -- never a provider that started.
+///
+/// This also covers the host configuration that produced the original
+/// red/green split: a real `codex` binary IS resolvable on PATH on some
+/// hosts, and the daemon-installed `rsi-agent-mcp` sibling may or may not be
+/// present beside the test binary. Both are neutralized here by stubbing
+/// `manager.codex_client` with `CodexClient::with_paths_for_test` pointing
+/// `binary_path` and `agent_mcp_path` at an existing no-op binary
+/// (`/usr/bin/true`), so the ONLY remaining precondition between
+/// `continue_session` and a real spawn is the missing `working_dir` --
+/// asserted as `DaemonError::Io(NotFound)`, deterministically, on every host.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
-async fn continue_orphan_reap_failure_settles_admission_for_retry() {
-    let (manager, _dir) = manager();
+async fn continue_retry_refusal_is_launch_time_and_not_a_started_provider() {
+    let (mut manager, _dir) = manager();
     let session_id = Uuid::new_v4();
     let mut session = bare_session(session_id);
     session.provider = SessionProvider::Codex;
     session.claude_session_id = Some("resume-token".to_string());
+    session.working_dir = std::path::PathBuf::from("/definitely/missing/rsi-session-dir");
+    insert_row(&manager, &session).await;
+    manager.completed.write().await.insert(
+        session_id,
+        CompletedSession {
+            session,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    stub_codex_launch_for_missing_working_dir(&mut manager);
+
+    let error = match Box::pin(manager.continue_session(session_id, "continue".to_string())).await {
+        Ok(()) => panic!("a missing working directory must refuse the provider launch"),
+        Err(error) => error,
+    };
+
+    assert_missing_working_dir_refusal(&error);
+    assert!(
+        !manager.active.read().await.contains_key(&session_id),
+        "a refused launch must not leave an active provider incarnation"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn continue_orphan_reap_failure_precedes_admission_for_exact_retry() {
+    let (mut manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.provider = SessionProvider::Codex;
+    session.claude_session_id = Some("resume-token".to_string());
+    // Pin the retry's provider-launch refusal to an explicit precondition.
+    // `bare_session` inherits `working_dir = "/tmp"`, which EXISTS, so without
+    // this the second phase below reaches a real `codex` process on any host
+    // where the binary is on PATH and the assertion passes for the wrong
+    // reason (or, worse, a paid provider call escapes). Every sibling
+    // continuation fixture already pins this same missing directory.
+    session.working_dir = std::path::PathBuf::from("/definitely/missing/rsi-session-dir");
     insert_row(&manager, &session).await;
 
     manager.completed.write().await.insert(
@@ -826,12 +981,26 @@ async fn continue_orphan_reap_failure_settles_admission_for_retry() {
             events_hydrated: true,
         },
     );
+    // Neutralize ambient host state (codex on PATH, the daemon-installed
+    // `rsi-agent-mcp` sibling) so the retry leg's refusal is deterministically
+    // the pinned missing working directory and nothing else.
+    stub_codex_launch_for_missing_working_dir(&mut manager);
+    // Keep the process proof independent of other live sessions on this host.
+    // The injected first failure leaves this permit for the exact retry.
+    #[cfg(target_os = "linux")]
+    let _orphan_guard = super::reaper::StartupReaperFixture::new()
+        .scoped_runtime_reap_root(session_id)
+        .expect("scope the retry's process proof to an empty fixture");
     super::reaper::fail_runtime_orphan_reap_for_test(session_id);
 
-    let error = manager
-        .continue_session(session_id, "first continuation".to_string())
-        .await
-        .expect_err("the injected orphan proof failure must refuse provider spawn");
+    let error = match Box::pin(
+        manager.continue_session(session_id, "first continuation".to_string()),
+    )
+    .await
+    {
+        Ok(()) => panic!("the injected orphan proof failure must refuse provider spawn"),
+        Err(error) => error,
+    };
     assert!(
         error
             .to_string()
@@ -839,29 +1008,40 @@ async fn continue_orphan_reap_failure_settles_admission_for_retry() {
         "unexpected continuation failure: {error}"
     );
 
-    let invocation = manager
+    let invocation_count = manager
         .store
         .lock()
         .await
         .conn
         .query_row(
-            "SELECT status, error_class FROM model_invocations
+            "SELECT COUNT(*) FROM model_invocations
              WHERE session_id = ?1 AND purpose = 'session.continue.resume'",
             rusqlite::params![session_id.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| row.get::<_, i64>(0),
         )
-        .expect("load refused resume admission");
-    assert_eq!(invocation.0, "failed");
-    assert_eq!(invocation.1.as_deref(), Some("orphan_reap_failed"));
+        .expect("count admissions after failed process proof");
+    assert_eq!(
+        invocation_count, 0,
+        "failed proof must not charge admission"
+    );
     assert!(
         manager.completed.read().await.contains_key(&session_id),
         "failed pre-spawn proof must restore the completed session"
     );
+    assert!(
+        !manager.active.read().await.contains_key(&session_id),
+        "failed process proof must not establish a provider writer"
+    );
 
-    let _retry_error = manager
-        .continue_session(session_id, "second continuation".to_string())
-        .await
-        .expect_err("the test environment must refuse the provider launch");
+    let retry_error = match Box::pin(
+        manager.continue_session(session_id, "first continuation".to_string()),
+    )
+    .await
+    {
+        Ok(()) => panic!("the missing working directory must refuse the provider launch"),
+        Err(error) => error,
+    };
+    assert_missing_working_dir_refusal(&retry_error);
     let invocation_count = manager
         .store
         .lock()
@@ -874,12 +1054,20 @@ async fn continue_orphan_reap_failure_settles_admission_for_retry() {
             |row| row.get::<_, i64>(0),
         )
         .expect("count resume attempts");
-    assert_eq!(invocation_count, 2, "retry must receive a new admission");
+    assert_eq!(
+        invocation_count, 1,
+        "exact retry must receive one admission"
+    );
+    assert!(
+        !manager.active.read().await.contains_key(&session_id),
+        "launch refusal must not establish a provider writer"
+    );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_recovers_completed_session_missing_from_memory() {
-    let (manager, _dir) = manager();
+    let (mut manager, _dir) = manager();
     let session_id = Uuid::new_v4();
     let mut session = bare_session(session_id);
     session.provider = SessionProvider::Codex;
@@ -904,6 +1092,7 @@ async fn continue_recovers_completed_session_missing_from_memory() {
         !manager.active.read().await.contains_key(&session_id),
         "precondition: session must be absent from the in-memory active map"
     );
+    stub_codex_launch_for_missing_working_dir(&mut manager);
 
     let err = manager
         .continue_session(session_id, "continue".to_string())
@@ -916,14 +1105,7 @@ async fn continue_recovers_completed_session_missing_from_memory() {
          not found just because it's missing from the in-memory completed \
          map, got {err:?}"
     );
-    assert!(
-        matches!(
-            err,
-            crate::error::DaemonError::CodexBinaryNotFound | crate::error::DaemonError::Io(_)
-        ),
-        "expected a launch-time failure once the store fallback resolves the \
-         session, got {err:?}"
-    );
+    assert_missing_working_dir_refusal(&err);
 }
 
 /// `AgentHalt` on a row that is already terminal and has no surviving
@@ -936,6 +1118,7 @@ async fn continue_recovers_completed_session_missing_from_memory() {
 /// missing session, which invites a pointless re-resolve or re-spawn loop.
 /// This mirrors `continue_recovers_completed_session_missing_from_memory`,
 /// where the same class of false `SessionNotFound` was already removed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn halt_of_terminal_session_without_surviving_orphan_reports_success() {
     let (manager, _dir) = manager();
@@ -974,6 +1157,7 @@ async fn halt_of_terminal_session_without_surviving_orphan_reports_success() {
 
 /// The `SessionNotFound` contract is unchanged for ids genuinely absent from
 /// `sessions`: only the false answer for an existing terminal row is removed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn halt_of_absent_session_still_reports_not_found() {
     let (manager, _dir) = manager();
@@ -997,13 +1181,14 @@ async fn halt_of_absent_session_still_reports_not_found() {
 /// state `SessionManager::restore_sessions` now inserts, see
 /// `session::launch::tests::restore_sessions_defers_event_load_and_hydrates_on_conversation_read`)
 /// without hydrating first, a resumed session would silently lose its entire
-/// prior transcript. The launch itself is forced to fail fast (missing Codex
-/// binary / working dir), but hydration runs before that failure, and the
+/// prior transcript. The launch itself is forced to fail at the missing working
+/// directory, but hydration runs before that failure, and the
 /// failure path reinserts the completed session -- so the map's post-failure
 /// state proves whether hydration happened.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_hydrates_restored_placeholder_before_reinserting_on_failure() {
-    let (manager, _dir) = manager();
+    let (mut manager, _dir) = manager();
     let session_id = Uuid::new_v4();
     let mut session = bare_session(session_id);
     session.provider = SessionProvider::Codex;
@@ -1053,18 +1238,13 @@ async fn continue_hydrates_restored_placeholder_before_reinserting_on_failure() 
             events_hydrated: false,
         },
     );
+    stub_codex_launch_for_missing_working_dir(&mut manager);
 
     let err = manager
         .continue_session(session_id, "continue".to_string())
         .await
         .expect_err("continue should still fail at launch in test env");
-    assert!(
-        matches!(
-            err,
-            crate::error::DaemonError::CodexBinaryNotFound | crate::error::DaemonError::Io(_)
-        ),
-        "expected a launch-time failure, got {err:?}"
-    );
+    assert_missing_working_dir_refusal(&err);
 
     let completed = manager.completed.read().await;
     let reinserted = completed
@@ -1086,6 +1266,7 @@ async fn continue_hydrates_restored_placeholder_before_reinserting_on_failure() 
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn remint_revokes_prior_token_and_registers_new() {
     let (manager, _dir) = manager();
@@ -1139,6 +1320,7 @@ async fn remint_revokes_prior_token_and_registers_new() {
     assert_eq!(live_for_sid, 1, "at most one live token per session id");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn d05_agent_token_registry_remint_rebinding_collision_and_revoke_stay_bijective() {
     let first = Uuid::new_v4();
@@ -1186,6 +1368,7 @@ fn d05_agent_token_registry_remint_rebinding_collision_and_revoke_stay_bijective
     assert_eq!(registry.token_for_session(first), None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_registers_working_agent_token() {
     // G1 (A6): continue re-mints before guarded spawn, superseding stale
@@ -1243,6 +1426,7 @@ async fn continue_registers_working_agent_token() {
     drop(registry);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_cancel_exhausts_retry_budget_in_store() {
     let (manager, _dir) = manager();
@@ -1275,6 +1459,7 @@ async fn continue_cancel_exhausts_retry_budget_in_store() {
     assert_eq!(row.max_retries, Some(2));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_interrupts_live_retry_child_before_proceeding() {
     let (manager, _dir) = manager();
@@ -1335,6 +1520,7 @@ async fn continue_interrupts_live_retry_child_before_proceeding() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn cancel_retry_exhausts_retry_budget_in_store() {
     let (manager, _dir) = manager();
@@ -1366,6 +1552,53 @@ async fn cancel_retry_exhausts_retry_budget_in_store() {
     assert_eq!(row.max_retries, Some(2));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn archive_failed_session_cancels_retry_without_spawning() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.status = SessionStatus::Failed;
+    session.retry_attempt = Some(0);
+    session.max_retries = Some(2);
+    insert_row(&manager, &session).await;
+
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+    let mut completed = CompletedSession::for_test(session);
+    completed.retry_cancel = Some(cancel_tx);
+    manager
+        .completed
+        .write()
+        .await
+        .insert(session_id, completed);
+
+    manager.archive_session(session_id).await.expect("archive");
+    let row = manager
+        .store
+        .lock()
+        .await
+        .get_session(session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, SessionStatus::Archived);
+    assert_eq!(row.retry_attempt, Some(2));
+    assert_eq!(row.max_retries, Some(2));
+    assert!(cancel_rx.try_recv().is_ok());
+    assert!(!manager.active.read().await.contains_key(&session_id));
+    assert!(!manager.completed.read().await.contains_key(&session_id));
+    let invocations: i64 = manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row("SELECT count(*) FROM model_invocations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(invocations, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn interrupt_completed_retry_exhausts_retry_budget_in_store() {
     let (manager, _dir) = manager();
@@ -1394,6 +1627,7 @@ async fn interrupt_completed_retry_exhausts_retry_budget_in_store() {
     assert_eq!(row.max_retries, Some(2));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn launch_retry_revalidates_durable_retry_budget() {
     let (manager, _dir) = manager();
@@ -1433,6 +1667,7 @@ async fn launch_retry_revalidates_durable_retry_budget() {
     assert_eq!(restored.max_retries, Some(2));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn stale_finalize_generation_does_not_clobber_active_session() {
     let (manager, _dir) = manager();
@@ -1509,6 +1744,7 @@ async fn stale_finalize_generation_does_not_clobber_active_session() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
     for intent in ["interrupt", "stall"] {
@@ -1563,6 +1799,7 @@ async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn terminal_status_event_is_published_after_completed_map_is_ready() {
     let (manager, _dir) = manager();
@@ -1619,6 +1856,7 @@ async fn terminal_status_event_is_published_after_completed_map_is_ready() {
 /// Tokio's fair `RwLock` grants the already-queued writer first; the finalizer
 /// must then recompute precedence from that durable in-memory intent rather
 /// than persist its stale Completed candidate.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
     use crate::store::daemon_settings::AutofileCause;
@@ -1775,6 +2013,7 @@ impl crate::provider::ProviderSession for RecordingMultiTurnProvider {
 /// M-04 regression: drive the real monitor result boundary, not the predicate
 /// in isolation. Removing the production call to `maybe_start_memory_flush_turn`
 /// makes this test time out before the provider records a turn.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_flush_live_monitor_dispatches_once_from_canonical_budget() {
     use std::sync::atomic::Ordering;
@@ -2176,6 +2415,7 @@ fn assert_no_retry_bus_event(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_result_drain_persists_queued_assistant_before_completion() {
     use std::sync::atomic::Ordering;
@@ -2480,6 +2720,7 @@ async fn terminal_result_drain_persists_queued_assistant_before_completion() {
 /// sender, the monitor does not fabricate normal terminal status. A subsequent
 /// operator interrupt is the explicit recovery action: it waits for the exact
 /// process settlement, releases the receiver, and persists Interrupted.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settled_open_producer_recovers_on_later_interrupt() {
     use std::sync::atomic::Ordering;
@@ -2648,6 +2889,7 @@ fn diagnosed_event_types(records: &UnrecognizedEventLog, session_id: Uuid) -> Ve
 /// were invisible until a manual CLI probe found them. The Codex path warns;
 /// this pins the same signal for every other provider, including the "second
 /// occurrence stays quiet" property that keeps a chatty type off the log.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_event() {
     let records = unrecognized_event_records();
@@ -2736,6 +2978,7 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
 /// that wiring test: a real stream, the real loop, and the real rows.
 ///
 /// Both payloads are the verbatim shapes observed from `claude 2.1.259`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_handshake_and_rate_limit_event_persist_through_the_monitor_loop() {
     let events = vec![
@@ -2948,6 +3191,7 @@ async fn assert_failed_scripted_monitor(
     fixture.manager.event_bus.unsubscribe();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_dead_zero_event_remains_failed() {
     assert_failed_scripted_monitor(
@@ -2958,6 +3202,7 @@ async fn terminal_dead_zero_event_remains_failed() {
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_nonzero_exit_remains_failed() {
     assert_failed_scripted_monitor(
@@ -2973,6 +3218,7 @@ async fn terminal_nonzero_exit_remains_failed() {
 /// terminal failure. The table covers Codex CLI, Local, Harness, and the two
 /// CodexAppServer `turn/completed` terminal shapes through the production
 /// monitor/persistence/drain path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_provider_errors_with_prior_history_fail_after_drain() {
     let terminal_shapes = [
@@ -3143,6 +3389,7 @@ async fn terminal_provider_errors_with_prior_history_fail_after_drain() {
     diagnostic.manager.event_bus.unsubscribe();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::expect_used,
@@ -3443,6 +3690,7 @@ const CODEX_0_156_METADATA_WARNING: &str = "Model metadata for `z-ai/glm-5.3-fla
 /// before `turn.started`. Replays the exact stream shape (warning item, then a
 /// successful turn) for both the config and the model-metadata warning; the
 /// session must complete and the warning must persist as a diagnostic.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_0_156_item_error_warnings_before_turn_started_complete_session() {
     let thread = serde_json::json!({"type": "thread.started", "thread_id": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"});
@@ -3498,6 +3746,7 @@ async fn codex_0_156_item_error_warnings_before_turn_started_complete_session() 
 /// Issue #662: a genuine `turn.failed` after warning items still fails the
 /// session, and the stop reason carries the real Codex error text instead of
 /// `provider_error:unclassified`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_0_156_turn_failed_after_warning_items_fails_with_codex_text() {
     let replay = replay_codex_cli_stream(
@@ -3531,6 +3780,7 @@ async fn codex_0_156_turn_failed_after_warning_items_fails_with_codex_text() {
     }));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn codex_stop_reason_detail_is_single_line_and_bounded() {
     let long = format!("first\tline\r\n{}", "é".repeat(400));
@@ -3542,10 +3792,13 @@ fn codex_stop_reason_detail_is_single_line_and_bounded() {
     assert_eq!(super::monitor::bounded_stop_reason_detail(" \n\t "), None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::expect_used, clippy::significant_drop_tightening)]
 async fn codex_retry_exhaustion_error_waits_for_turn_failed() {
     use std::sync::atomic::Ordering;
+
+    let failure = "stream disconnected before completion: websocket closed by server before response.completed";
 
     let mut fixture =
         start_scripted_monitor_for_provider(SessionProvider::Codex, false, vec![], true, 0).await;
@@ -3562,7 +3815,7 @@ async fn codex_retry_exhaustion_error_waits_for_turn_failed() {
         }),
         serde_json::json!({
             "type": "error",
-            "message": "stream disconnected before completion",
+            "message": failure,
         }),
     ] {
         let event = crate::codex::map_codex_json_to_stream_event(&value, &mut thread_id)
@@ -3582,11 +3835,7 @@ async fn codex_retry_exhaustion_error_waits_for_turn_failed() {
                 .await
                 .load_events(fixture.session_id)
                 .expect("load retry exhaustion diagnostics");
-            if events.iter().any(|event| {
-                event
-                    .content
-                    .contains("stream disconnected before completion")
-            }) {
+            if events.iter().any(|event| event.content.contains(failure)) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -3609,7 +3858,7 @@ async fn codex_retry_exhaustion_error_waits_for_turn_failed() {
     let failed_turn = crate::codex::map_codex_json_to_stream_event(
         &serde_json::json!({
             "type": "turn.failed",
-            "error": {"message": "stream disconnected before completion"},
+            "error": {"message": failure},
         }),
         &mut thread_id,
     )
@@ -3634,12 +3883,14 @@ async fn codex_retry_exhaustion_error_waits_for_turn_failed() {
         .expect("load failed Codex row")
         .expect("failed Codex row");
     assert_eq!(row.status, SessionStatus::Failed);
+    assert!(super::lifecycle::codex_websocket_rotation_needed(&row));
 
     let _ = fixture.scheduler.shutdown().await;
     fixture.watch_task.abort();
     fixture.manager.event_bus.unsubscribe();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_storage_full_interrupts_live_process_before_stream_eof() {
     use std::sync::atomic::Ordering;
@@ -3713,65 +3964,7 @@ async fn codex_storage_full_interrupts_live_process_before_stream_eof() {
     fixture.manager.event_bus.unsubscribe();
 }
 
-#[tokio::test]
-async fn get_session_falls_back_to_store() {
-    let (manager, _dir) = manager();
-    let session_id = Uuid::new_v4();
-    let session = bare_session(session_id);
-    let store = manager.store().clone();
-
-    tokio::task::spawn_blocking(move || {
-        let store = store.blocking_lock();
-        store.insert_session(&session)
-    })
-    .await
-    .unwrap()
-    .expect("insert session");
-
-    let loaded = manager
-        .get_session(session_id)
-        .await
-        .expect("session should load from store fallback");
-    assert_eq!(loaded.id, session_id);
-}
-
-#[tokio::test]
-async fn get_session_stamps_context_fill_pct_for_idle_completed() {
-    // An idle/Completed session that only exists in the store (no live
-    // TrackedSession) must still come back with a daemon-computed
-    // context_fill_pct so the TUI renders a bar without recomputing.
-    let (manager, _dir) = manager();
-    let session_id = Uuid::new_v4();
-    let mut session = bare_session(session_id);
-    session.provider = SessionProvider::Claude;
-    session.model = Some("claude-opus-4-7".to_string()); // 1M window
-    session.total_input_tokens = Some(500_000);
-    let store = manager.store().clone();
-    let to_insert = session.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = store.blocking_lock();
-        store.insert_session(&to_insert)
-    })
-    .await
-    .unwrap()
-    .expect("insert session");
-
-    let loaded = manager.get_session(session_id).await.expect("load");
-    assert_eq!(
-        loaded.context_fill_pct,
-        Some(50.0),
-        "idle Completed session must be stamped with the daemon-computed pct"
-    );
-
-    // And it appears on the list path too.
-    let listed = manager.list_sessions().await;
-    let row = listed
-        .iter()
-        .find(|s| s.id == session_id)
-        .expect("session in list");
-    assert_eq!(row.context_fill_pct, Some(50.0));
-}
-
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn rpc_session_reads_rehydrate_version_fenced_context_capacity() {
     crate::provider_capabilities::provider_capabilities()
@@ -3846,55 +4039,7 @@ async fn rpc_session_reads_rehydrate_version_fenced_context_capacity() {
     }
 }
 
-#[tokio::test]
-async fn archived_and_deleted_lists_stamp_context_fill_pct() {
-    let (manager, _dir) = manager();
-    let archived_id = Uuid::new_v4();
-    let deleted_id = Uuid::new_v4();
-    let mut archived = bare_session(archived_id);
-    archived.status = SessionStatus::Archived;
-    archived.provider = SessionProvider::Claude;
-    archived.model = Some("claude-opus-4-7".to_string());
-    archived.total_input_tokens = Some(500_000);
-
-    let mut deleted = bare_session(deleted_id);
-    deleted.status = SessionStatus::Deleted;
-    deleted.provider = SessionProvider::Claude;
-    deleted.model = Some("claude-opus-4-7".to_string());
-    deleted.total_input_tokens = Some(250_000);
-
-    let store = manager.store().clone();
-    tokio::task::spawn_blocking(move || {
-        let store = store.blocking_lock();
-        store.insert_session(&archived)?;
-        store.insert_session(&deleted)?;
-        Ok::<_, crate::error::DaemonError>(())
-    })
-    .await
-    .unwrap()
-    .expect("insert sessions");
-
-    let archived = manager
-        .list_archived_sessions(None)
-        .await
-        .expect("archived list");
-    let archived_row = archived
-        .iter()
-        .find(|s| s.id == archived_id)
-        .expect("archived session");
-    assert_eq!(archived_row.context_fill_pct, Some(50.0));
-
-    let deleted = manager
-        .list_deleted_sessions(None)
-        .await
-        .expect("deleted list");
-    let deleted_row = deleted
-        .iter()
-        .find(|s| s.id == deleted_id)
-        .expect("deleted session");
-    assert_eq!(deleted_row.context_fill_pct, Some(25.0));
-}
-
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn list_sessions_includes_store_rows_missing_from_memory() {
     let (manager, _dir) = manager();
@@ -3929,6 +4074,7 @@ async fn list_sessions_includes_store_rows_missing_from_memory() {
     assert!(sessions.iter().any(|s| s.id == store_only_id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn list_sessions_omits_hidden_terminal_statuses_from_memory() {
     let (manager, _dir) = manager();
@@ -3986,6 +4132,7 @@ async fn list_sessions_omits_hidden_terminal_statuses_from_memory() {
     assert!(!sessions.iter().any(|s| s.id == archived_id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn list_sessions_by_project_omits_hidden_terminal_statuses_from_memory() {
     let (manager, _dir) = manager();
@@ -4031,6 +4178,7 @@ async fn list_sessions_by_project_omits_hidden_terminal_statuses_from_memory() {
     assert!(!sessions.iter().any(|s| s.id == deleted_id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn approval_wait_idempotent_open_preserves_existing_start() {
     let mut start: Option<std::time::Instant> = None;
@@ -4052,6 +4200,7 @@ fn approval_wait_idempotent_open_preserves_existing_start() {
     assert!(total_ms >= 5);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn approval_wait_closes_open_interval_at_finalize() {
     let mut start: Option<std::time::Instant> = None;
@@ -4069,6 +4218,7 @@ fn approval_wait_closes_open_interval_at_finalize() {
     assert!(total_ms >= 8, "finalize recorded elapsed ms");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn approval_wait_never_opened_returns_zero() {
     let mut start: Option<std::time::Instant> = None;
@@ -4143,6 +4293,7 @@ fn reaper_active_map()
 
 /// A5 Change 1: a provider that never dies on SIGINT is escalated to SIGKILL
 /// after the grace window, and is dead afterward.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn ensure_process_dead_escalates_when_never_dies() {
     let id = Uuid::new_v4();
@@ -4179,6 +4330,7 @@ async fn ensure_process_dead_escalates_when_never_dies() {
 
 /// A5 Change 1: an already-dead handle returns `ExitedGracefully` with no
 /// escalation — the normal, common teardown path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn ensure_process_dead_already_dead_exits_gracefully() {
     let id = Uuid::new_v4();
@@ -4198,6 +4350,7 @@ async fn ensure_process_dead_already_dead_exits_gracefully() {
 /// A5 Change 1 (normal-path preservation): a provider that dies *within* the
 /// grace window returns `ExitedGracefully`, proving NO SIGKILL is sent when the
 /// process exits on its own before the deadline.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn ensure_process_dead_dies_mid_grace_no_sigkill() {
     let id = Uuid::new_v4();
@@ -4219,6 +4372,7 @@ async fn ensure_process_dead_dies_mid_grace_no_sigkill() {
 
 /// A5 Change 1: a session with no process handle (task provider / already
 /// dropped) returns `NoHandle`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn ensure_process_dead_no_handle() {
     let id = Uuid::new_v4();
@@ -4278,6 +4432,7 @@ fn scripted_process_tracked(
     (tracked, controls)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn terminal_settlement_outcomes_are_exhaustive() {
     use super::types::{ProcessSettlementMode, ProcessSettlementOutcome};
@@ -4444,6 +4599,7 @@ async fn terminal_settlement_outcomes_are_exhaustive() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn terminal_settlement_generation_change_never_touches_newer_process() {
     use super::types::{ProcessSettlementMode, ProcessSettlementOutcome};
@@ -4475,6 +4631,7 @@ async fn terminal_settlement_generation_change_never_touches_newer_process() {
 /// running in a blocking section remains observable as live until its own
 /// completion barrier releases, so escalation must retain ownership instead
 /// of reporting success after the abort call returns.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_backed_local_and_harness_escalation_wait_for_observed_death() {
     use super::types::{HarnessProcess, ProcessSettlementMode, ProcessSettlementOutcome};
@@ -4557,6 +4714,7 @@ async fn task_backed_local_and_harness_escalation_wait_for_observed_death() {
 /// rotation deadline or signals its handle. The newer coordinator is set to an
 /// already-expired kill-on-timeout phase to make the formerly-dangerous branch
 /// deterministic.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_monitor_rotation_deadline_neither_interrupts_nor_kills_new_generation() {
     let (manager, _dir) = manager();
@@ -4627,6 +4785,7 @@ async fn stale_monitor_rotation_deadline_neither_interrupts_nor_kills_new_genera
 
 /// A closed producer and an expired rotation deadline must emit one durable timeout
 /// while process settlement remains pending.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::expect_used, clippy::large_futures)]
 async fn expired_rotation_deadline_with_closed_stream_records_one_timed_out_event() {
@@ -4732,6 +4891,7 @@ async fn guarded_fake_spawn(
 /// Two racing resumes for one live session id resolve to exactly one tracked
 /// child: the first spawns, the second blocks on the per-session guard and
 /// adopts. Proves the split-brain dedup (F-004, F-005, F-012).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn dual_resume_spawns_single_child() {
     use std::sync::atomic::Ordering;
@@ -4776,6 +4936,7 @@ async fn dual_resume_spawns_single_child() {
 /// A reconciliation store/liveness pass running during an in-flight guarded
 /// spawn must NOT produce a second child. Locks F-007's "reconcile is not a
 /// spawner" invariant as a regression guard.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn reconcile_during_guarded_spawn_no_double_spawn() {
     use std::sync::atomic::Ordering;
@@ -4846,6 +5007,7 @@ async fn reconcile_during_guarded_spawn_no_double_spawn() {
 /// A finalized/dead tracked child (nulled or completed handle) must NOT be
 /// adopted: a contended caller that finds a non-live entry falls through and
 /// spawns fresh, emitting no dedup event (F-002, F-012, F-003).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn stale_process_is_not_adopted_and_respawns() {
     use std::sync::atomic::Ordering;
@@ -4909,6 +5071,7 @@ async fn stale_process_is_not_adopted_and_respawns() {
 /// under a bounded timeout. With the drop, the re-acquire returns immediately and
 /// is NOT contended. Were the drop missing, the re-acquire would park forever and
 /// the timeout would fire -> a clean failure, not a hung suite.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn guard_released_before_monitor_allows_same_task_reacquire() {
     let (mgr, _dir) = manager();
@@ -5017,6 +5180,7 @@ async fn wait_for_retry_state(
 }
 
 /// T-4 / T-5: the pure predicate decision table (D4/D5 policy).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn watch_fire_decision_table() {
     use super::{WatchDecision, watch_fire_decision};
@@ -5093,6 +5257,7 @@ fn watch_fire_decision_table() {
 
 /// T-1 (session half): an already-terminal-at-arm child plans a delivery on
 /// the FIRST attempt — no waiting on further transitions (arm-time race).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn arm_on_already_terminal_child_fires_immediately() {
@@ -5141,8 +5306,90 @@ async fn arm_on_already_terminal_child_fires_immediately() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn terminal_watch_and_progress_report_preserved_dirty_sandbox() {
+    use std::process::Command;
+
+    let (manager, dir) = manager();
+    let root = dir.path().join("child-worktree");
+    std::fs::create_dir(&root).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("tracked.txt"), b"original\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    std::fs::write(root.join("untracked.txt"), b"preserve these bytes\n").unwrap();
+    assert!(
+        !crate::sandbox::git_worktree::observe_clean_head_bounded(&root)
+            .unwrap()
+            .0,
+        "untracked bytes alone make the sandbox dirty"
+    );
+    std::fs::remove_file(root.join("untracked.txt")).unwrap();
+    std::fs::write(root.join("tracked.txt"), b"modified\n").unwrap();
+    assert!(
+        !crate::sandbox::git_worktree::observe_clean_head_bounded(&root)
+            .unwrap()
+            .0,
+        "tracked modifications alone make the sandbox dirty"
+    );
+    std::fs::write(root.join("untracked.txt"), b"preserve these bytes\n").unwrap();
+    let (clean, _) = crate::sandbox::git_worktree::observe_clean_head_bounded(&root).unwrap();
+    assert!(!clean);
+
+    let child = Uuid::new_v4();
+    let master = Uuid::new_v4();
+    let mut child_row = bare_session(child);
+    child_row.parent_id = Some(master);
+    child_row.sandbox_kind = Some(rsi_common::types::SandboxKind::GitWorktree);
+    child_row.sandbox_root = Some(root.clone());
+    insert_row(&manager, &bare_session(master)).await;
+    insert_row(&manager, &child_row).await;
+    let job = mk_watch_job_for(child, master, "collect child work");
+    {
+        let store = manager.store.lock().await;
+        store
+            .record_terminal_sandbox_worktree(child, Some(!clean))
+            .unwrap();
+        store.insert_scheduled_job(&job).unwrap();
+    }
+    let progress = manager.agent_get_progress(master, &[child]).await.unwrap();
+    assert_eq!(progress.rows[0].sandbox_worktree_dirty, Some(true));
+    let plan = manager.plan_terminal_watch_fire(&job).await.unwrap();
+    let super::WatchFirePlan::Deliver { message, .. } = plan else {
+        panic!("terminal child must notify its owner");
+    };
+    assert!(message.contains("sandbox-worktree-dirty: true"));
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).unwrap(),
+        b"modified\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("untracked.txt")).unwrap(),
+        b"preserve these bytes\n"
+    );
+}
+
 /// T-5 (session half, D4): a live in-memory retry timer suppresses the fire;
 /// without it (post-restart shape) the fire is annotated with eligibility.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn failed_with_live_retry_timer_suppresses_exhausted_or_timerless_fires_annotated() {
@@ -5209,6 +5456,7 @@ async fn failed_with_live_retry_timer_suppresses_exhausted_or_timerless_fires_an
 }
 
 /// D5: a `WaitingApproval` child plans an annotated delivery.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn waiting_approval_fires_watch() {
@@ -5275,6 +5523,7 @@ async fn push_event(
 /// 2. Provider output that PREDATES the attempt must not confirm either, or any
 ///    session with prior history would self-confirm forever.
 /// 3. Provider output dated after the attempt confirms and retires the row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn watch_delivery_confirms_only_on_post_dispatch_provider_output() {
@@ -5339,6 +5588,7 @@ async fn watch_delivery_confirms_only_on_post_dispatch_provider_output() {
 /// Issue #12: an un-consumable notification must fail loudly rather than
 /// re-billing a provider turn forever. Past the give-up window the gate
 /// abandons, which disables the row AND surfaces a `SystemMessage`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn watch_delivery_gives_up_loudly_after_the_bound() {
@@ -5371,6 +5621,7 @@ async fn watch_delivery_gives_up_loudly_after_the_bound() {
 
 /// T-6 (session half): two fire-ready children of one master coalesce into
 /// ONE delivery listing both, with both job ids satisfied.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn two_terminal_children_one_master_single_delivery() {
@@ -5439,6 +5690,7 @@ async fn two_terminal_children_one_master_single_delivery() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn new_child_delivery_coalesces_only_unconsumed_siblings() {
@@ -5485,6 +5737,7 @@ async fn new_child_delivery_coalesces_only_unconsumed_siblings() {
 
 /// T-8: delivery targets the rotation-lineage TIP of the wake target, with
 /// the chase depth-capped.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn fire_targets_rotation_lineage_tip() {
@@ -5528,6 +5781,7 @@ async fn fire_targets_rotation_lineage_tip() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn terminal_watch_follows_rotation_tip() {
@@ -5583,6 +5837,7 @@ async fn terminal_watch_follows_rotation_tip() {
 
 /// §9 Q1 (Jake: INCLUDE): plain `Resume`-mode wakes chase rotation lineage
 /// too — `resume_scheduled` on a rotated-away id acts on the live tip.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn resume_scheduled_targets_rotation_lineage_tip() {
@@ -5645,6 +5900,7 @@ async fn resume_scheduled_targets_rotation_lineage_tip() {
 
 /// T-3 (session half, D3): a busy master defers delivery — the fire outcome
 /// is `NotReady` (requeue), never an error or a consumed wake.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn busy_master_delivery_defers_to_not_ready() {
@@ -5677,6 +5933,7 @@ async fn busy_master_delivery_defers_to_not_ready() {
 /// keeps the watch armed and records durable retry state; at the bound the
 /// watch is abandoned with a typed `continuation_retry_exhausted` naming the
 /// tip, never retried forever.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
 async fn child_watch_fence_refusal_records_retry_and_abandons_typed_at_bound() {
@@ -5741,6 +5998,7 @@ async fn child_watch_fence_refusal_records_retry_and_abandons_typed_at_bound() {
 /// stay durable until the scheduler's retirement commits. A daemon that dies
 /// in between reopens to the same exhausted budget, re-abandons on the next
 /// refusal, and the retirement then clears the state in its own write.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
 async fn child_watch_retry_exhaustion_survives_crash_before_abandon_settlement() {
@@ -5817,6 +6075,7 @@ async fn child_watch_retry_exhaustion_survives_crash_before_abandon_settlement()
 
 /// T-10 (session half): missing watched session or missing wake target maps
 /// to Abandon — never NotReady-forever, never a fresh launch.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn missing_watched_or_master_abandons() {
@@ -5849,6 +6108,7 @@ async fn missing_watched_or_master_abandons() {
 /// `concurrency` handlers at once and (b) let quick retries finish even while a
 /// hung handler is still blocked — the liveness property the old serial loop
 /// lacked.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn bounded_retry_dispatch_caps_concurrency_and_survives_hung_handler() {
     use std::sync::Arc;
@@ -5957,6 +6217,7 @@ async fn finalize_active_session(manager: &SessionManager, session_id: Uuid) {
 ///
 /// `start_paused` means tokio auto-advances virtual time whenever every task is
 /// parked on a timer, so this runs instantly despite the multi-second waits.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn continue_tolerates_teardown_slower_than_the_old_ten_second_deadline() {
     let (manager, _dir) = manager();
@@ -5994,6 +6255,7 @@ async fn continue_tolerates_teardown_slower_than_the_old_ten_second_deadline() {
 /// publishes no terminal status at all, leaving this timeout as the only signal
 /// the caller ever receives. It must stay loud and must not be swallowed by the
 /// wider wait.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn continue_still_times_out_when_no_terminal_status_ever_arrives() {
     let (manager, _dir) = manager();
@@ -6034,6 +6296,7 @@ async fn continue_still_times_out_when_no_terminal_status_ever_arrives() {
 /// outcome with no monitor to publish a terminal status is the interrupt-wait
 /// deadline. Asserting on that error proves the query was not short-circuited
 /// away.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn contended_continue_does_not_silently_drop_the_query() {
     let (manager, _dir) = manager();
@@ -6079,6 +6342,7 @@ async fn contended_continue_does_not_silently_drop_the_query() {
 // never restored when it failed. That is covered where it actually happens, by
 // the `restores_*_on_failed_continue` tests in `crates/rsi`.
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn terminal_capacity_monitor_skips_c5_only_for_committed_owned_or_absent_markers() {
     use crate::session::agent_verbs::{MasterNoIdleOutcome, MasterNoIdleRecoveryDisposition};
@@ -6229,6 +6493,7 @@ async fn due_capacity_resume_manager() -> (
     (manager, directory, controller, recovery, due_job)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn capacity_resume_checked_reaper_failure_keeps_admission_and_authorizes_zero_launches() {
@@ -6274,6 +6539,7 @@ async fn capacity_resume_checked_reaper_failure_keeps_admission_and_authorizes_z
     super::launch::drop_controller_candidate_test_process(controller);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn capacity_resume_provider_spawn_failure_keeps_admission_and_authorizes_zero_launches() {
@@ -6319,6 +6585,7 @@ async fn capacity_resume_provider_spawn_failure_keeps_admission_and_authorizes_z
     super::launch::drop_controller_candidate_test_process(controller);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn capacity_resume_confirmation_failure_kills_unconfirmed_process_and_keeps_due_slot() {
@@ -6365,6 +6632,7 @@ async fn capacity_resume_confirmation_failure_kills_unconfirmed_process_and_keep
     super::launch::drop_controller_candidate_test_stream(controller);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn capacity_resume_crash_after_admission_before_spawn_reopens_to_one_productive_launch() {
@@ -6589,6 +6857,7 @@ async fn capacity_resume_crash_after_admission_before_spawn_reopens_to_one_produ
     scripted.alive.store(false, Ordering::SeqCst);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_result_array_content() {
     // Regression: the Claude Code CLI echoes tool results back as a "user"
@@ -6621,6 +6890,7 @@ fn test_convert_stream_event_tool_result_array_content() {
     assert_eq!(events[0].tool_use_id, Some("toolu_1".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_result_string_content_keeps_id() {
     // The pre-existing string shape still works, and now carries the join key.
@@ -6644,6 +6914,7 @@ fn test_convert_stream_event_tool_result_string_content_keeps_id() {
     assert_eq!(events[0].tool_use_id, Some("toolu_9".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_result_preserves_provider_error_flag() {
     for is_error in [true, false] {
@@ -6691,6 +6962,7 @@ fn test_convert_stream_event_tool_result_preserves_provider_error_flag() {
     assert_eq!(events[0].metadata, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_codex_command_execution_result_error_metadata() {
     for (exit_code, expected_metadata) in [
@@ -6720,6 +6992,7 @@ fn test_codex_command_execution_result_error_metadata() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_result_unparseable_is_loud() {
     // A shape we cannot model must produce a visible System event carrying the
@@ -6750,6 +7023,7 @@ fn test_convert_stream_event_tool_result_unparseable_is_loud() {
     assert_eq!(events[1].tool_use_id, Some("toolu_6".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_result_nontext_blocks_are_loud() {
     // Text blocks are captured AND the non-text block is reported, so nothing
@@ -6784,6 +7058,7 @@ fn test_convert_stream_event_tool_result_nontext_blocks_are_loud() {
     assert_eq!(events[1].tool_use_id, Some("toolu_7".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_tool_use_id_roundtrips() {
     let stream = StreamEvent {
@@ -6804,6 +7079,7 @@ fn test_convert_stream_event_tool_use_id_roundtrips() {
     assert_eq!(events[0].tool_use_id, Some("toolu_abc".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_parallel_tool_use_distinct_ids() {
     let stream = StreamEvent {
@@ -6833,6 +7109,7 @@ fn test_convert_stream_event_parallel_tool_use_distinct_ids() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn test_convert_stream_event_top_level_tool_use_id() {
     // Harness agent-loop synthetic events carry the id at the top level.

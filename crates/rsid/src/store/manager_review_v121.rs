@@ -232,6 +232,7 @@ pub(crate) fn apply_v121_migration(store: &Store) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v121_catalog_is_present_and_authenticated() {
         let store = Store::open_in_memory().expect("open current store");
@@ -242,6 +243,12 @@ mod tests {
                 .unwrap(),
             super::super::LATEST_SCHEMA_VERSION
         );
-        validate_v121_catalog(&store.conn).expect("validate V121 review catalog");
+        super::super::restart_intents::validate_v134_catalog(&store.conn)
+            .expect("validate V134 review catalog at head");
+
+        // V134 replaces the V121 forward trigger, so authenticate the
+        // released fingerprint on the exact predecessor catalog.
+        super::super::tests::rewind_post_v121_tail_to(&store.conn, 133);
+        validate_v121_catalog(&store.conn).expect("validate V121 review catalog at V133");
     }
 }

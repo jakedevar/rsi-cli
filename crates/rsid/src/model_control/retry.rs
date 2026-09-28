@@ -102,6 +102,9 @@ pub(crate) fn classify_session_retry(
     {
         return RetryClassification::Config;
     }
+    if recent.contains("custom tool call output is missing for call id:") {
+        return RetryClassification::Validation;
+    }
     if recent.contains("invalid param")
         || recent.contains("invalid input")
         || recent.contains("bad request")
@@ -160,6 +163,9 @@ pub(crate) fn classify_error_message(message: &str) -> RetryClassification {
     {
         return RetryClassification::Config;
     }
+    if recent.contains("custom tool call output is missing for call id:") {
+        return RetryClassification::Validation;
+    }
     if recent.contains("invalid param")
         || recent.contains("invalid input")
         || recent.contains("bad request")
@@ -214,6 +220,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quota_is_not_retryable() {
         let classification = classify_session_retry(
@@ -227,6 +234,7 @@ mod tests {
         assert!(!classification.retryable());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn rate_limit_is_retryable() {
         let classification = classify_session_retry(
@@ -238,5 +246,24 @@ mod tests {
         );
         assert_eq!(classification, RetryClassification::RateLimited);
         assert!(classification.retryable());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn missing_codex_tool_output_stops_the_retry_loop() {
+        let message = "Custom tool call output is missing for call id: call_interrupted";
+        let classification = classify_session_retry(
+            &MonitorBreakReason::StreamClosed,
+            true,
+            true,
+            Some(1),
+            &[event(message)],
+        );
+        assert_eq!(classification, RetryClassification::Validation);
+        assert!(!classification.retryable());
+        assert_eq!(
+            classify_error_message(message),
+            RetryClassification::Validation
+        );
     }
 }

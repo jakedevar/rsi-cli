@@ -422,6 +422,12 @@ mod tests {
                 "AgentManagerCommitPreparedControl",
                 "AgentManagerGetAction",
                 "AgentManagerWorkView",
+                "AgentTopologyUpsert",
+                "AgentTopologyList",
+                "AgentTopologyExecute",
+                "AgentTopologyGetExecution",
+                "AgentTopologyInterrupt",
+                "AgentTopologyResolveAttempt",
             ]
         );
         let wake_description = agent_control_catalog_v1()

@@ -410,6 +410,7 @@ pub fn load_project_workflow(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_split_front_matter_with_yaml() {
         let content = "---\nprovider: Claude\nmodel: opus\n---\n# Hello\nBody text.";
@@ -418,12 +419,14 @@ mod tests {
         assert_eq!(body, "# Hello\nBody text.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_split_front_matter_no_yaml() {
         let content = "# No front matter\nJust body.";
         assert!(split_front_matter(content).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_split_front_matter_empty_yaml() {
         let content = "---\n---\nBody only.";
@@ -432,12 +435,14 @@ mod tests {
         assert_eq!(body, "Body only.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_split_front_matter_no_closing_fence() {
         let content = "---\nprovider: Claude\nBody without close.";
         assert!(split_front_matter(content).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_split_front_matter_extra_dashes_in_body() {
         let content = "---\nmodel: opus\n---\n# Title\n---\nSection break.";
@@ -446,6 +451,7 @@ mod tests {
         assert!(body.contains("Section break."));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_expand_env_vars_dollar_form() {
         unsafe {
@@ -458,6 +464,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_expand_env_vars_braces_form() {
         unsafe {
@@ -470,18 +477,21 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_expand_env_vars_missing() {
         let result = expand_env_vars("value: $RSI_NONEXISTENT_12345");
         assert_eq!(result, "value: ");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_expand_env_vars_no_vars() {
         let result = expand_env_vars("plain text no vars");
         assert_eq!(result, "plain text no vars");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_expand_env_vars_adjacent() {
         unsafe {
@@ -500,6 +510,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_valid() {
         let content = "---\nprovider: Claude\nmodel: opus\n---\n# Workflow\nDo things.";
@@ -509,6 +520,7 @@ mod tests {
         assert!(body.contains("# Workflow"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_no_front_matter() {
         let content = "# Just a template\nNo settings here.";
@@ -518,6 +530,7 @@ mod tests {
         assert!(body.contains("Just a template"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_all_settings() {
         let content = "---\nprovider: Gemini\nmodel: gemini-2.5-pro\nsession_kind: TaskRabbit\nstall_timeout_secs: 300\nrotation_depth_limit: 2\nrotation_enabled: false\n---\nBody.";
@@ -536,6 +549,7 @@ mod tests {
         assert_eq!(settings.rotation_enabled, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_partial_settings() {
         let content = "---\nmodel: sonnet\n---\nBody.";
@@ -545,6 +559,7 @@ mod tests {
         assert!(settings.session_kind.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_invalid_yaml() {
         let content = "---\n: invalid: yaml: [\n---\nBody.";
@@ -553,6 +568,7 @@ mod tests {
         assert!(result.unwrap_err().contains("YAML parse error"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_rsi_md_unknown_fields_ignored() {
         // Forward compatibility: unknown YAML fields should not cause errors
@@ -561,6 +577,7 @@ mod tests {
         assert_eq!(settings.model, Some("opus".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_render_template_basic() {
         let ctx = TemplateContext {
@@ -584,6 +601,7 @@ mod tests {
         assert_eq!(result, "Working on myproject");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_render_template_all_vars() {
         let ctx = TemplateContext {
@@ -608,6 +626,7 @@ mod tests {
         assert_eq!(result, "proj dev 2 val");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_render_template_empty() {
         let ctx = TemplateContext {
@@ -631,6 +650,7 @@ mod tests {
         assert_eq!(result, "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_render_template_conditional() {
         let ctx = TemplateContext {
@@ -655,6 +675,7 @@ mod tests {
         assert_eq!(result, "use claude");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_fingerprint_equality() {
         let fp1 = FileFingerprint {
@@ -670,6 +691,7 @@ mod tests {
         assert_eq!(fp1, fp2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_fingerprint_inequality_mtime() {
         let fp1 = FileFingerprint {
@@ -685,6 +707,7 @@ mod tests {
         assert_ne!(fp1, fp2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_fingerprint_inequality_size() {
         let fp1 = FileFingerprint {
@@ -700,6 +723,7 @@ mod tests {
         assert_ne!(fp1, fp2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_fingerprint_inequality_hash() {
         let fp1 = FileFingerprint {
@@ -715,6 +739,7 @@ mod tests {
         assert_ne!(fp1, fp2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_compute_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
@@ -725,6 +750,7 @@ mod tests {
         assert!(fp.content_hash > 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_cache_insert_get_remove() {
         let mut cache = ProjectWorkflowCache::new();
@@ -753,6 +779,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_cache_set_error_preserves_workflow() {
         let mut cache = ProjectWorkflowCache::new();
@@ -784,6 +811,7 @@ mod tests {
         assert_eq!(wf.last_error, Some("yaml broke".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_cache_set_error_nonexistent() {
         let mut cache = ProjectWorkflowCache::new();
@@ -792,6 +820,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_load_project_workflow() {
         let dir = tempfile::tempdir().unwrap();
@@ -810,6 +839,7 @@ mod tests {
         assert!(wf.last_error.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_load_project_workflow_no_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -818,6 +848,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_project_settings_serde_defaults() {
         let yaml = "";
@@ -840,6 +871,7 @@ mod tests {
     /// in `session/mod.rs` (using `Arc<tokio::sync::Mutex<_>>` and
     /// `.lock().await`), drives it from within a `tokio::spawn` task, and
     /// asserts it returns without panicking.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_projects_provider_no_blocking_lock_panic() {
         // Stand-in for any data protected by an async mutex.

@@ -109,6 +109,163 @@ async fn update(p: &Pilot, id: Uuid, patch: ManagerSessionPatchV2) -> ManagerAct
     }
 }
 
+/// Model the durable state left by an operator interrupt on a terminal leaf.
+async fn operator_interrupted(p: &Pilot, id: Uuid) {
+    p.manager
+        .store
+        .lock()
+        .await
+        .record_manager_operator_pause(id, true)
+        .unwrap();
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(id, SessionStatus::Interrupted)
+        .unwrap();
+    if let Some(completed) = p.manager.completed.write().await.get_mut(&id) {
+        completed.session.status = SessionStatus::Interrupted;
+    }
+}
+
+async fn manager_continue_authorization(p: &Pilot, target: Uuid) -> Result<()> {
+    let cursor = p
+        .manager
+        .store
+        .lock()
+        .await
+        .agent_continuation_cursor(target)
+        .unwrap();
+    p.manager
+        .agent_control()
+        .authorize_continue_child(
+            p.owner,
+            &rsi_common::agent_coordination::AgentContinueChildRequestV1 {
+                target_session_id: target,
+                query: "continue interrupted leaf".into(),
+                expected_tip_session_id: cursor.tip_session_id,
+                expected_event_sequence: cursor.event_sequence,
+                expected_custody_generation: cursor.custody_generation,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .map(drop)
+}
+
+async fn operator_pause(p: &Pilot, id: Uuid) -> bool {
+    p.manager
+        .store
+        .lock()
+        .await
+        .manager_action_operator_paused(id)
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn manager_continue_child_authorizes_soft_pause_only() {
+    use crate::store::manager_actions::OperatorPause;
+
+    let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_operator_pause(worker, OperatorPause::Soft)
+        .unwrap();
+    manager_continue_authorization(&p, worker).await.unwrap();
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_operator_pause(worker, OperatorPause::Hard)
+        .unwrap();
+    assert!(manager_continue_authorization(&p, worker).await.is_err());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn manager_archive_paths_preserve_operator_interrupt_ownership() {
+    let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
+    operator_interrupted(&p, worker).await;
+
+    let queued = control(&p, 2, "k7-archive-interrupted", archive(&p, worker).await)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, worker).await.status, SessionStatus::Archived);
+    assert!(operator_pause(&p, worker).await);
+
+    p.manager.unarchive_session(worker).await.unwrap();
+    assert_eq!(row(&p, worker).await.status, SessionStatus::Completed);
+    assert!(operator_pause(&p, worker).await);
+    let denied = manager_continue_authorization(&p, worker)
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains(ARCHIVE_BLOCKERS), "{denied}");
+
+    // Only the explicit operator path releases the durable pause.
+    p.manager
+        .store
+        .lock()
+        .await
+        .record_manager_operator_pause(worker, false)
+        .unwrap();
+    assert!(!operator_pause(&p, worker).await);
+    manager_continue_authorization(&p, worker)
+        .await
+        .expect("manager continuation authorization succeeds after operator release");
+
+    // Container cascades archive terminal descendants through the same
+    // persistence boundary and must retain the interrupted leaf's marker.
+    let cascade_leaf = add_leaf(&p, p.epic, SessionStatus::Completed).await;
+    operator_interrupted(&p, cascade_leaf).await;
+    let group = row(&p, p.group).await;
+    let archived = control(
+        &p,
+        2,
+        "k7-archive-interrupted-cascade",
+        ManagerActionV2::ArchiveContainer {
+            container_id: p.group,
+            expected_updated_at: group.updated_at,
+        },
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(archived.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, cascade_leaf).await.status, SessionStatus::Archived);
+    assert!(operator_pause(&p, cascade_leaf).await);
+
+    let group = row(&p, p.group).await;
+    let restored = control(
+        &p,
+        2,
+        "k7-restore-interrupted-cascade",
+        ManagerActionV2::RestoreContainer {
+            container_id: p.group,
+            expected_updated_at: group.updated_at,
+        },
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(restored.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, cascade_leaf).await.status, SessionStatus::Completed);
+    assert!(operator_pause(&p, cascade_leaf).await);
+}
+
 /// One settled source-worktree settlement item (with its run row) against
 /// `session`: the historical-restore gate must refuse it.
 fn seed_settlement_item(p: &Pilot, session: Uuid) {
@@ -156,6 +313,7 @@ fn seed_settlement_item(p: &Pilot, session: Uuid) {
     store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_archive_then_restore_a_completed_scoped_worker() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
@@ -209,6 +367,7 @@ async fn manager_session_archive_then_restore_a_completed_scoped_worker() {
     assert_eq!(unarchived, vec![worker]);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_archive_refuses_unsettled_or_structural_targets() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
@@ -289,8 +448,9 @@ async fn manager_session_archive_refuses_unsettled_or_structural_targets() {
     assert_eq!(queued, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
-async fn manager_session_archive_refuses_an_in_memory_retry_owner_at_execution() {
+async fn manager_session_archive_cancels_an_in_memory_retry_owner() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
     let (retry_cancel, mut retry_observer) = tokio::sync::oneshot::channel();
     p.manager
@@ -303,25 +463,18 @@ async fn manager_session_archive_refuses_an_in_memory_retry_owner_at_execution()
     let queued = control(&p, 2, "k7-retry-owner", archive(&p, worker).await)
         .await
         .unwrap();
-    assert!(
-        p.execute()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains(ARCHIVE_BLOCKERS)
-    );
-    assert_eq!(row(&p, worker).await.status, SessionStatus::Completed);
-    assert!(matches!(
-        retry_observer.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    assert!(p.manager.completed.read().await.contains_key(&worker));
+    p.execute().await.unwrap();
+    assert_eq!(row(&p, worker).await.status, SessionStatus::Archived);
+    assert!(retry_observer.try_recv().is_ok());
+    assert!(!p.manager.completed.read().await.contains_key(&worker));
+    assert!(!p.manager.active.read().await.contains_key(&worker));
     assert_eq!(
         p.receipt(queued.operation_id).await.state,
-        ManagerActionStateV2::Running
+        ManagerActionStateV2::Succeeded
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_actions_require_scope_grant_and_execute_mode() {
     // Missing SessionControl: the base pilot policy (version 1) lacks it.
@@ -390,6 +543,7 @@ async fn manager_session_actions_require_scope_grant_and_execute_mode() {
     assert_eq!(row(&p, outside).await.status, SessionStatus::Completed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_restore_refuses_purged_sandbox_and_settlement_history() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
@@ -424,6 +578,7 @@ async fn manager_session_restore_refuses_purged_sandbox_and_settlement_history()
 
 /// K4 reviewer follow-up: a cascade restore also honours settlement history
 /// recorded against one of its recorded members.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_container_restore_refuses_a_member_with_settlement_history() {
     let (p, _worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
@@ -465,6 +620,7 @@ async fn manager_container_restore_refuses_a_member_with_settlement_history() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_update_applies_every_field_with_operator_side_effects() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
@@ -573,6 +729,7 @@ async fn manager_session_update_applies_every_field_with_operator_side_effects()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_session_update_refuses_invalid_patch_stale_fence_and_archived_target() {
     let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;

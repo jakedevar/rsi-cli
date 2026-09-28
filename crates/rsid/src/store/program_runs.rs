@@ -5149,6 +5149,7 @@ mod tests {
         serde_json::from_str(&payload).unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_action_payload_uses_committed_two_cursor_projection() {
         let fixture = fixture("D05 two-cursor payload");
@@ -5197,6 +5198,7 @@ mod tests {
         assert_eq!(payload["run_version"], advanced.run.row_version);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_failed_gate_payload_uses_revision_target_projection() {
         let fixture = fixture("D05 failed gate payload");
@@ -5448,6 +5450,7 @@ mod tests {
         assert_eq!(wake_jobs, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_passed_gate_payload_uses_advanced_projection() {
         let fixture = fixture("D05 passed gate payload");
@@ -5517,6 +5520,7 @@ mod tests {
         assert_eq!(payload["status"], "ready");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_replay_before_stale_and_changed_replay_conflicts() {
         let fixture = fixture("D05 replay");
@@ -5580,6 +5584,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_semantic_failpoints_are_all_old_or_all_new_with_one_linked_idea_event() {
         fn snapshot(fixture: &Fixture, run_id: Uuid) -> Vec<String> {
@@ -5711,6 +5716,7 @@ mod tests {
         assert_eq!(linked, (1, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_duplicate_master_action_claim_and_active_action_constraints_hold() {
         let fixture = fixture("D05 claims");
@@ -5819,6 +5825,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_expired_claim_reconciles_and_reclaims_same_action_identity() {
         let fixture = fixture("D05 expired claim");
@@ -5912,6 +5919,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_deadline_before_first_preserves_cursor_and_offline_controller_is_visible() {
         let fixture = fixture("D05 reconciliation deadline");
@@ -5964,6 +5972,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_fifo_lock_caps_expiry_and_aba_are_fenced() {
         let first = fixture("D05 FIFO first");
@@ -6143,6 +6152,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_concurrent_lock_grants_preserve_fifo_winner() {
         let fixture = fixture("D05 concurrent FIFO");
@@ -6198,6 +6208,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_lock_queue_caps_fail_closed_through_create_path() {
         let per_key = fixture("D05 per-key cap");
@@ -6247,6 +6258,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_six_budgets_reserve_consume_release_and_exhaust_independently() {
         let fixture = fixture("D05 budgets");
@@ -6428,6 +6440,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_each_budget_exhausts_at_its_production_semantic_boundary() {
         let one_productive = fixture("D05 productive exhaustion");
@@ -6788,6 +6801,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_terminal_session_never_commits_output_gate_or_settlement() {
         let fixture = fixture("D05 terminal fact");
@@ -6974,6 +6988,7 @@ mod tests {
         assert_eq!(settled.run.status, ProgramRunStatusV1::Settled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_rr2_delayed_semantic_claim_is_fenced_without_mutation() {
         let fixture = fixture("D05 RR2 stale semantic claim");
@@ -7093,6 +7108,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_rr2_confirmed_pre_effect_failure_advertises_executable_cancel_and_replays() {
         let fixture = fixture("D05 RR2 failed reserved attempt");
@@ -7207,6 +7223,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_v4_failure_replay_survives_store_reopen_without_any_fact_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -7379,6 +7396,7 @@ mod tests {
         assert_eq!(std::fs::read(&db_path).unwrap(), bytes_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_v4_failed_attempt_status_ignores_consumed_acknowledgement_history() {
         for (name, confirmed_pre_effect) in [("confirmed", true), ("uncertain", false)] {
@@ -7498,6 +7516,7 @@ mod tests {
         assert_eq!(awaiting.run.status, ProgramRunStatusV1::AwaitingGate);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_rr2_uncertain_and_post_effect_failures_never_refund_work_budget() {
         let uncertain = fixture("D05 RR2 uncertain failure");

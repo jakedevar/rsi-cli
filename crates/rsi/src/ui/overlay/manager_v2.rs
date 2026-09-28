@@ -517,7 +517,13 @@ fn render_board(frame: &mut Frame, area: Rect, state: &board::BoardState, sectio
         Paragraph::new(format!(
             "{section_name} · {}",
             if let ManagerSection::Inspect(s) = section {
-                format!("{s:?} · [ ] section")
+                let label = match s {
+                    rsi_common::harness_manager_v2::ManagerInspectSectionV2::MigrationAllocations => {
+                        "Migration allocations".to_string()
+                    }
+                    _ => format!("{s:?}"),
+                };
+                format!("{label} · [ ] section")
             } else {
                 String::new()
             }

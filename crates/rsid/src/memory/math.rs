@@ -32,37 +32,44 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_empty_vectors() {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_one_empty() {
         assert_eq!(cosine_similarity(&[], &[1.0, 2.0]), 0.0);
         assert_eq!(cosine_similarity(&[1.0, 2.0], &[]), 0.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_zero_vectors() {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_identical_unit() {
         assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_opposite_unit() {
         assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) - (-1.0)).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_orthogonal() {
         assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_45_degrees() {
         let sim = cosine_similarity(&[1.0, 0.0], &[1.0, 1.0]);
@@ -70,17 +77,20 @@ mod tests {
         assert!((sim - expected).abs() < 1e-5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_different_lengths() {
         let sim = cosine_similarity(&[1.0, 0.0, 0.0], &[1.0, 0.0]);
         assert!((sim - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_single_element() {
         assert!((cosine_similarity(&[3.0], &[3.0]) - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_realistic_embeddings() {
         // Two 384-dim vectors: one filled with 1.0, one filled with 0.5
@@ -92,11 +102,13 @@ mod tests {
         assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_one_zero_magnitude() {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_cosine_negative_values() {
         assert!((cosine_similarity(&[-1.0, -2.0], &[-1.0, -2.0]) - 1.0).abs() < 1e-6);

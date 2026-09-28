@@ -317,6 +317,7 @@ mod tests {
         (dir, store)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_insert_and_list_observation() {
         let (_dir, store) = test_store();
@@ -342,6 +343,7 @@ mod tests {
         assert_eq!(list[0].id, obs.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_soft_delete_observation() {
         let (_dir, store) = test_store();
@@ -367,6 +369,7 @@ mod tests {
         assert!(list.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_count_observations_since() {
         let (_dir, store) = test_store();
@@ -393,6 +396,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_dream_state_get_set() {
         let (_dir, store) = test_store();
@@ -415,6 +419,7 @@ mod tests {
         assert_eq!(val.as_deref(), Some("2026-03-30T00:00:00Z"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_sessions_needing_extraction_empty() {
         let (_dir, store) = test_store();
@@ -422,6 +427,7 @@ mod tests {
         assert!(ids.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_deductive_observation_with_sources() {
         let (_dir, store) = test_store();
@@ -450,6 +456,7 @@ mod tests {
         assert!(list[0].source_ids.contains(&source_id2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_inductive_observation_with_confidence() {
         let (_dir, store) = test_store();
@@ -474,6 +481,7 @@ mod tests {
         assert_eq!(list[0].confidence, Some(ObservationConfidence::Medium));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_list_observations_by_project() {
         let (_dir, store) = test_store();

@@ -482,6 +482,7 @@ mod tests {
     /// local row in `running`/`claimed` — the linear row is left untouched
     /// in the DB (non-mutating) and simply absent from this process's
     /// in-memory state.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn restore_from_db_filters_cross_kind_dispatches_under_local_kind() {
         let store = Store::open_in_memory().unwrap();
@@ -536,6 +537,7 @@ mod tests {
     /// Pre-C2 every dispatch row was `tracker="linear"` (column default),
     /// so this also pins byte-for-byte prior behavior for the existing
     /// Linear-only deployment shape.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn restore_from_db_filters_cross_kind_dispatches_under_linear_kind() {
         let store = Store::open_in_memory().unwrap();
@@ -660,6 +662,7 @@ mod tests {
     /// (the catch-up the `Lagged` arm now calls) against a dispatch whose
     /// backing session already completed in the store, and asserts it gets
     /// closed out exactly as the live event would have closed it out.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recheck_running_dispatches_for_completion_closes_out_completed_session() {
         let store = Store::open_in_memory().unwrap();
@@ -720,6 +723,7 @@ mod tests {
     /// catch-up path directly against a `Failed` session and asserts it gets
     /// closed out (removed from `running`, persisted with a non-"completed"
     /// terminal reason) exactly like a `Completed` session already was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn recheck_running_dispatches_for_completion_closes_out_failed_session() {
         let store = Store::open_in_memory().unwrap();
@@ -778,6 +782,7 @@ mod tests {
     /// match arm is reverted to matching only `Completed` (the pre-fix
     /// shape), this test fails because the dispatch is never observed by
     /// the listener and stays in `running` forever.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn spawn_completion_listener_closes_out_failed_session_via_real_event_bus() {
         let store = Store::open_in_memory().unwrap();

@@ -35,6 +35,14 @@ pub(super) fn delegated_effect_session(action: &ManagerActionV2) -> Option<Uuid>
     }
 }
 
+pub(super) fn delegated_archive_effect(action: &ManagerActionV2) -> bool {
+    matches!(
+        action,
+        ManagerActionV2::OperatorCall { call, .. }
+            if matches!(call.typed(), Ok(DelegatedOperatorCallV1::ArchiveSession(_)))
+    )
+}
+
 fn typed_call(claim: &ManagerActionClaimV2) -> Result<DelegatedOperatorCallV1> {
     match claim.action() {
         ManagerActionV2::OperatorCall { call, .. } => call.typed().map_err(refused),
@@ -139,10 +147,19 @@ impl Store {
 
     /// Why a delegated logical archive of `session` is refused now (§5.2):
     /// the housekeeping gates first, then the decided retention exclusions.
-    pub(super) fn delegated_archive_blocker(
+    pub(crate) fn delegated_archive_blocker(
         &self,
         session: &Session,
         now: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        self.delegated_archive_blocker_with_window(session, now, RETENTION_ACTIVITY_WINDOW_HOURS)
+    }
+
+    pub(crate) fn delegated_archive_blocker_with_window(
+        &self,
+        session: &Session,
+        now: DateTime<Utc>,
+        window_hours: i64,
     ) -> Result<Option<String>> {
         if !rsi_common::is_leaf_kind(session.session_kind) {
             return Ok(Some("manager_v2_leaf_required".into()));
@@ -158,7 +175,8 @@ impl Store {
         let id = session.id.to_string();
         let wake: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
-              WHERE enabled=1 AND (wake_session_id=?1 OR wake_mode=?2))",
+              WHERE enabled=1 AND
+                ((wake_session_id=?1 AND wake_mode<>'resume') OR wake_mode=?2))",
             params![id, format!("on_terminal:{id}")],
             |row| row.get(0),
         )?;
@@ -175,22 +193,22 @@ impl Store {
         if review {
             return Ok(Some("manager_v2_retention_live_review".into()));
         }
-        if let Some(project) = session.project_id
+        let live_worktree = session.sandbox_kind == Some(SandboxKind::GitWorktree)
+            && session.sandbox_cleanup_state == Some(SandboxCleanupState::Live);
+        if !live_worktree
+            && let Some(project) = session.project_id
             && self.manager_v2_session_is_sealed_source(project, session.id)?
         {
             return Ok(Some("manager_v2_retention_sealed_source".into()));
         }
-        if self
-            .delegated_last_activity(session)?
-            .is_none_or(|at| at > now - Duration::hours(RETENTION_ACTIVITY_WINDOW_HOURS))
+        if session.status == SessionStatus::Completed
+            && self
+                .delegated_last_activity(session)?
+                .is_none_or(|at| at > now - Duration::hours(window_hours))
         {
             return Ok(Some("manager_v2_retention_recent_activity".into()));
         }
-        // Step 1 skips live worktrees so they stay reclaimable by the
-        // unchanged cleanup proof service (K14c).
-        if session.sandbox_kind == Some(SandboxKind::GitWorktree)
-            && session.sandbox_cleanup_state == Some(SandboxCleanupState::Live)
-        {
+        if Self::manager_action_live_worktree_blocked(session) {
             return Ok(Some("manager_v2_retention_live_worktree".into()));
         }
         Ok(None)
@@ -208,7 +226,10 @@ impl Store {
     /// some event time is not a text RFC3339 instant; callers treat that as
     /// recent activity (fail closed). Admission, the effect-time re-check and
     /// `ListSessions` all use this one function.
-    fn delegated_last_activity(&self, session: &Session) -> Result<Option<DateTime<Utc>>> {
+    pub(crate) fn delegated_last_activity(
+        &self,
+        session: &Session,
+    ) -> Result<Option<DateTime<Utc>>> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT created_at FROM conversation_events WHERE session_id=?1")?;
@@ -238,13 +259,16 @@ impl Store {
             return Err(refused("manager_v2_not_operator_call"));
         };
         let changed = self.conn.execute(
-            "UPDATE sessions SET status='Archived',pending_archive=0,updated_at=?2
+            "UPDATE sessions SET status='Archived',pending_archive=0,
+             retry_attempt=COALESCE(max_retries,retry_attempt),updated_at=?2
              WHERE id=?1 AND status IN ('Completed','Failed','Interrupted')",
             params![params.session_id.to_string(), stamp(Utc::now())],
         )?;
         if changed != 1 {
             return Err(refused("manager_v2_session_state_changed"));
         }
+        Store::resolve_c5_autofile_pending_tx(&tx, params.session_id)?;
+        Store::cancel_queued_recovery_for_archive_on(&tx, params.session_id)?;
         let result = OperatorCallResultV1::Scalar {
             method: "ArchiveSession".into(),
             result: serde_json::to_value(ArchiveSessionResultV1::no_cleanup_required())?,
@@ -488,6 +512,7 @@ mod tests {
 
     const RECENT: Option<&str> = Some("manager_v2_retention_recent_activity");
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn retention_activity_refuses_a_sub_millisecond_newer_event_with_mixed_offsets() {
         // Cutoff (now - 24 h) is 00:00:00.000250Z. The older event (.000100Z,
@@ -519,6 +544,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn retention_activity_fails_closed_on_an_offsetless_event_that_is_not_the_latest() {
         let now = at("2026-09-23T12:00:00Z");

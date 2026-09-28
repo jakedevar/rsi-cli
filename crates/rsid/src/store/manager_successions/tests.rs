@@ -254,6 +254,7 @@ impl World {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_drain_defers_same_occurrence_after_v110_migration_and_reopen() {
     let w = World::new(false);
@@ -360,6 +361,7 @@ fn root_succession_drain_defers_same_occurrence_after_v110_migration_and_reopen(
     w.store.manager_succession_effect_gate(&settled).unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_drain_stale_claim_and_changed_policy_cannot_requeue() {
     let w = World::new(false);
@@ -433,6 +435,7 @@ fn root_succession_drain_stale_claim_and_changed_policy_cannot_requeue() {
     assert_running();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_drain_refuses_after_settlement_admission_and_provider_ownership() {
     for phase in ["settled", "admitted", "effect"] {
@@ -479,6 +482,7 @@ fn root_succession_drain_refuses_after_settlement_admission_and_provider_ownersh
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_drain_guard_rejects_partial_effect_witnesses() {
     for assignment in [
@@ -515,6 +519,7 @@ fn root_succession_drain_guard_rejects_partial_effect_witnesses() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_drain_failure_rolls_back_journal_root_and_audit_together() {
     let w = World::new(false);
@@ -567,6 +572,7 @@ fn root_succession_drain_failure_rolls_back_journal_root_and_audit_together() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_replay_conflict_and_wait_do_not_charge_or_claim_twice() {
     let w = World::new(false);
@@ -618,6 +624,7 @@ fn root_succession_replay_conflict_and_wait_do_not_charge_or_claim_twice() {
     assert_eq!(original[0].known_floor_usd, 0.0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_active_wait_skips_project_queue_and_intents_have_no_authority() {
     let w = World::new(false);
@@ -654,6 +661,7 @@ fn root_succession_active_wait_skips_project_queue_and_intents_have_no_authority
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_two_connections_reopen_share_reservation_and_single_claim() {
     let w = World::new(false);
@@ -704,6 +712,7 @@ fn root_succession_two_connections_reopen_share_reservation_and_single_claim() {
     assert!(w.store.manager_succession_effect_gate(&claim).is_err());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_distinct_publication_preserves_logical_policy_work_and_dirty_custody() {
     let mut w = World::new(true);
@@ -791,6 +800,7 @@ fn root_succession_distinct_publication_preserves_logical_policy_work_and_dirty_
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_publishes_after_normal_result_telemetry_write() {
     let mut w = World::new(true);
@@ -876,6 +886,7 @@ fn root_succession_publishes_after_normal_result_telemetry_write() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_refuses_authority_change_after_enqueue() {
     let w = World::new(false);
@@ -904,6 +915,7 @@ fn root_succession_refuses_authority_change_after_enqueue() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_publication_failure_rolls_back_edge_archive_epoch_root_and_journal() {
     let mut w = World::new(true);
@@ -954,6 +966,7 @@ fn root_succession_publication_failure_rolls_back_edge_archive_epoch_root_and_jo
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_epoch_covers_normal_rotation_restore_retirement_foreign_project_and_overflow() {
     let w = World::new(false);
@@ -1016,6 +1029,7 @@ fn root_succession_epoch_covers_normal_rotation_restore_retirement_foreign_proje
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_scope_change_blocks_effect_and_retains_creation_charge() {
     let w = World::new(false);
@@ -1064,6 +1078,7 @@ fn root_succession_scope_change_blocks_effect_and_retains_creation_charge() {
     assert_eq!(w.count("manager_root_successions"), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_admission_and_journal_recovery_are_atomic_and_usage_stays_unknown() {
     let w = World::new(false);
@@ -1131,6 +1146,7 @@ fn root_succession_admission_and_journal_recovery_are_atomic_and_usage_stays_unk
     assert_eq!(unknown, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_invalid_metadata_and_early_publication_do_not_confer_authority() {
     let w = World::new(false);
@@ -1174,6 +1190,7 @@ fn root_succession_invalid_metadata_and_early_publication_do_not_confer_authorit
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_new_event_policy_and_operator_pause_invalidate_settlement() {
     let w = World::new(false);
@@ -1199,6 +1216,7 @@ fn root_succession_new_event_policy_and_operator_pause_invalidate_settlement() {
     assert!(w.store.manager_succession_effect_gate(&claim).is_err());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_concurrent_connections_admit_only_one_occurrence() {
     let w = World::new(false);
@@ -1233,6 +1251,7 @@ fn root_succession_concurrent_connections_admit_only_one_occurrence() {
     assert_eq!(w.count("harness_manager_v2_operations"), 2); // policy save + root action
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_real_pending_mail_survives_publication_and_reopen() {
     use rsi_common::harness_manager::{AgentManagerInboxRequestV1, AgentManagerSendRequestV1};
@@ -1262,6 +1281,7 @@ fn root_succession_real_pending_mail_survives_publication_and_reopen() {
                 epic_id: epic.id,
                 message: "pending scoped exchange".into(),
                 idempotency_key: "pending-mail".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -1301,6 +1321,7 @@ fn root_succession_real_pending_mail_survives_publication_and_reopen() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_admission_failure_rolls_back_invocation_origin_and_marker() {
     let w = World::new(false);
@@ -1327,6 +1348,7 @@ fn root_succession_admission_failure_rolls_back_invocation_origin_and_marker() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_manual_disable_preserved_and_checked_failed_interrupted_are_supported() {
     for status in [SessionStatus::Failed, SessionStatus::Interrupted] {
@@ -1369,6 +1391,7 @@ fn root_succession_manual_disable_preserved_and_checked_failed_interrupted_are_s
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_reopen_changed_legacy_invocation_refuses_old_settlement() {
     let w = World::new(false);
@@ -1419,6 +1442,7 @@ fn root_succession_reopen_changed_legacy_invocation_refuses_old_settlement() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_original_spend_floor_never_resets_or_asserts_zero_history() {
     let w = World::new(false);
@@ -1455,6 +1479,7 @@ fn root_succession_original_spend_floor_never_resets_or_asserts_zero_history() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_invocation_replay_requires_exact_frozen_choice_and_only_one_row() {
     let w = World::new(false);
@@ -1490,6 +1515,7 @@ fn root_succession_invocation_replay_requires_exact_frozen_choice_and_only_one_r
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_lost_owner_failure_rolls_back_both_aggregates() {
     let w = World::new(false);

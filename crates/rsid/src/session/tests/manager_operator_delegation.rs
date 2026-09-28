@@ -15,7 +15,7 @@ use rsi_common::manager_operator_delegation::{
     DelegatedListSessionsParamsV1, NEVER_DELEGABLE_OPERATOR_METHODS_V1,
     OPERATOR_METHOD_NOT_DELEGABLE, OperatorCallFenceV1, OperatorCallResultV1, OperatorCallV1,
 };
-use rsi_common::types::WakeMode;
+use rsi_common::types::{SandboxCleanupState, WakeMode};
 use serde_json::{Value, json};
 
 const RPC_SOURCE: &str = include_str!("../../rpc.rs");
@@ -75,6 +75,29 @@ async fn row(p: &Pilot, id: Uuid) -> Session {
         .get_session(id)
         .unwrap()
         .unwrap()
+}
+
+fn archive_worktree(p: &Pilot) -> std::path::PathBuf {
+    let path = p._dir.path().join(format!("archive-{}", Uuid::new_v4()));
+    let branch = format!("archive-{}", Uuid::new_v4());
+    git(
+        &p.repo,
+        &["worktree", "add", "-qb", &branch, path.to_str().unwrap()],
+    );
+    path
+}
+
+async fn mark_live_worktree(p: &Pilot, id: Uuid, path: &std::path::Path) {
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET sandbox_kind='GitWorktree',sandbox_root=?2,sandbox_cleanup_state='Live' WHERE id=?1",
+            rusqlite::params![id.to_string(), path.to_str().unwrap()],
+        )
+        .unwrap();
 }
 
 fn call(
@@ -179,6 +202,7 @@ fn rpc_const_list(name: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_catalog_refuses_every_non_allowlisted_rpc_method() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -233,6 +257,7 @@ async fn operator_call_catalog_refuses_every_non_allowlisted_rpc_method() {
     assert_eq!(journaled(), before);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_leaves_the_tokened_gate_and_agent_catalog_unchanged() {
     // The delegated path adds no socket verb: every attributed-caller verb is
@@ -325,6 +350,7 @@ async fn operator_call_leaves_the_tokened_gate_and_agent_catalog_unchanged() {
     serve.abort();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_grants_nothing_to_non_managers_or_ungranted_policies() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -369,6 +395,7 @@ async fn operator_call_grants_nothing_to_non_managers_or_ungranted_policies() {
     assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_revoked_after_queueing_settles_revoked_and_keeps_the_session() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -385,6 +412,7 @@ async fn operator_call_revoked_after_queueing_settles_revoked_and_keeps_the_sess
     assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_archives_an_idle_project_leaf_logically_with_manager_attribution() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -460,6 +488,7 @@ async fn operator_call_archives_an_idle_project_leaf_logically_with_manager_attr
     assert!(replay.is_err() || replay.unwrap().operation_id == queued.operation_id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_reads_archive_cleanup_status_for_a_project_session() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -617,6 +646,7 @@ fn hours_ago(hours: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() - chrono::Duration::hours(hours)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_archive_uses_the_latest_event_time_not_the_latest_sequence() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -709,6 +739,7 @@ async fn operator_call_archive_uses_the_latest_event_time_not_the_latest_sequenc
     assert_eq!(row(&p, raced).await.status, SessionStatus::Completed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_archive_refuses_every_retention_exclusion() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -729,8 +760,7 @@ async fn operator_call_archive_refuses_every_retention_exclusion() {
             ],
         )
         .unwrap();
-    // A non-resume wake bound to the session (a resume wake is already a
-    // recovery-owner gate, asserted below).
+    // A non-resume wake remains a retention gate; archive cancels resume wakes.
     let wake_own = leaf(&p, None, SessionStatus::Completed, 25).await;
     insert_job(&p, wake_own, WakeMode::Fresh);
     let wake_resume = leaf(&p, None, SessionStatus::Completed, 25).await;
@@ -775,7 +805,6 @@ async fn operator_call_archive_refuses_every_retention_exclusion() {
         (pinned, "manager_v2_retention_pinned"),
         (p.lead, "manager_v2_session_is_lead"),
         (wake_own, "manager_v2_retention_enabled_wake"),
-        (wake_resume, "manager_v2_human_or_recovery_owner"),
         (wake_watched, "manager_v2_retention_enabled_wake"),
         (author, "manager_v2_retention_live_review"),
         (reviewer, "manager_v2_retention_live_review"),
@@ -790,6 +819,26 @@ async fn operator_call_archive_refuses_every_retention_exclusion() {
         refused_with(&p, &format!("k14-keep-{id}"), archive(&p, id).await, code).await;
         assert_eq!(row(&p, id).await.status, before, "{code}");
     }
+
+    control(&p, "k14-cancel-resume-wake", archive(&p, wake_resume).await)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(row(&p, wake_resume).await.status, SessionStatus::Archived);
+    let enabled_resume_wakes: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT count(*) FROM scheduled_jobs
+             WHERE wake_session_id=?1 AND wake_mode='resume' AND enabled=1",
+            [wake_resume.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(enabled_resume_wakes, 0);
 
     // Positive control: integrated work no longer protects its source.
     let integrated = leaf(&p, None, SessionStatus::Completed, 25).await;
@@ -806,6 +855,335 @@ async fn operator_call_archive_refuses_every_retention_exclusion() {
     assert_eq!(row(&p, integrated).await.status, SessionStatus::Archived);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn operator_call_archives_clean_tracked_live_worktree_without_changing_custody() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, None, SessionStatus::Completed, 25).await;
+    let worktree = archive_worktree(&p);
+    mark_live_worktree(&p, target, &worktree).await;
+    insert_work(
+        &p,
+        "archive-unmerged-source",
+        target,
+        &json!({"source_commit": git(&worktree, &["rev-parse", "HEAD"])}),
+    );
+    std::fs::write(worktree.join("untracked"), "retained\n").unwrap();
+    let branch = git(&worktree, &["branch", "--show-current"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let queued = control(&p, "archive-clean-worktree", archive(&p, target).await)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    let archived = row(&p, target).await;
+    assert_eq!(archived.status, SessionStatus::Archived);
+    assert_eq!(archived.sandbox_root.as_deref(), Some(worktree.as_path()));
+    assert_eq!(
+        archived.sandbox_cleanup_state,
+        Some(SandboxCleanupState::Live)
+    );
+    assert_eq!(git(&worktree, &["branch", "--show-current"]), branch);
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("untracked")).unwrap(),
+        "retained\n"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn operator_call_refuses_dirty_or_in_progress_live_worktree_at_admission_and_effect() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, None, SessionStatus::Completed, 25).await;
+    let worktree = archive_worktree(&p);
+    mark_live_worktree(&p, target, &worktree).await;
+    std::fs::write(worktree.join("source"), "dirty tracked source\n").unwrap();
+    refused_with(
+        &p,
+        "archive-dirty-worktree",
+        archive(&p, target).await,
+        "manager_v2_retention_live_worktree",
+    )
+    .await;
+    git(&worktree, &["restore", "source"]);
+
+    let git_dir = std::path::PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]));
+    std::fs::write(
+        git_dir.join("MERGE_HEAD"),
+        git(&worktree, &["rev-parse", "HEAD"]),
+    )
+    .unwrap();
+    refused_with(
+        &p,
+        "archive-merging-worktree",
+        archive(&p, target).await,
+        "manager_v2_retention_live_worktree",
+    )
+    .await;
+    std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
+
+    let queued = control(
+        &p,
+        "archive-worktree-effect-race",
+        archive(&p, target).await,
+    )
+    .await
+    .unwrap();
+    std::fs::write(worktree.join("source"), "dirty after admission\n").unwrap();
+    let error = p.execute().await.unwrap_err().to_string();
+    assert!(
+        error.contains("manager_v2_retention_live_worktree"),
+        "{error}"
+    );
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Running
+    );
+    assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn manager_paused_terminal_epic_archives_clean_live_worktree_without_resuming() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let worktree = archive_worktree(&p);
+    mark_live_worktree(&p, p.lead, &worktree).await;
+    let epic = row(&p, p.epic).await;
+    let action = ManagerActionV2::ArchiveContainer {
+        container_id: p.epic,
+        expected_updated_at: epic.updated_at,
+    };
+    std::fs::write(worktree.join("source"), "dirty tracked source\n").unwrap();
+    refused_with(
+        &p,
+        "archive-container-dirty-worktree",
+        action.clone(),
+        "manager_v2_retention_live_worktree",
+    )
+    .await;
+    git(&worktree, &["restore", "source"]);
+    let git_dir = std::path::PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]));
+    std::fs::write(
+        git_dir.join("CHERRY_PICK_HEAD"),
+        git(&worktree, &["rev-parse", "HEAD"]),
+    )
+    .unwrap();
+    refused_with(
+        &p,
+        "archive-container-cherry-pick",
+        action.clone(),
+        "manager_v2_retention_live_worktree",
+    )
+    .await;
+    std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD")).unwrap();
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store
+            .manager_v2_set_lead_pause(
+                &config,
+                p.epic,
+                Uuid::new_v4(),
+                Some(p.owner),
+                Some(p.lead),
+                "terminal archive",
+            )
+            .unwrap();
+    }
+    let queued = control(&p, "archive-paused-terminal-epic", action)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, p.epic).await.status, SessionStatus::Archived);
+    assert_eq!(row(&p, p.lead).await.status, SessionStatus::Archived);
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+    assert!(worktree.exists());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn lead_pause_allows_delegated_cleanup_and_keeps_continuations_stopped() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, Some(p.epic), SessionStatus::Completed, 30).await;
+    insert_job(&p, p.lead, WakeMode::Resume);
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET enabled=0 WHERE wake_session_id=?1",
+                [p.lead.to_string()],
+            )
+            .unwrap();
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store
+            .manager_v2_set_lead_pause(
+                &config,
+                p.epic,
+                Uuid::new_v4(),
+                Some(p.owner),
+                Some(p.lead),
+                "stop lead continuations",
+            )
+            .unwrap();
+        assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+    }
+
+    // A lead pause still fences new work under the Epic.
+    let create = control(
+        &p,
+        "paused-create-session",
+        ManagerActionV2::CreateSession {
+            parent_id: p.epic,
+            kind: SessionKind::Task,
+            query: "new work".into(),
+            launch: p.policy.allowed_launches[0].clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let claim = p.claim().await;
+    let error = p
+        .manager
+        .check_manager_action_runtime(&claim, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_manager_paused"));
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(
+            &claim,
+            ManagerActionStateV2::Blocked,
+            "manager_v2_manager_paused",
+        )
+        .unwrap();
+    assert_eq!(
+        p.receipt(create.operation_id).await.state,
+        ManagerActionStateV2::Blocked
+    );
+
+    for (key, action, method) in [
+        (
+            "paused-list",
+            call("ListSessions", json!({"limit": 64}), None),
+            "ListSessions",
+        ),
+        (
+            "paused-status",
+            call(
+                "GetArchiveCleanupStatus",
+                json!({"session_id": target}),
+                None,
+            ),
+            "GetArchiveCleanupStatus",
+        ),
+        (
+            "paused-archive",
+            archive(&p, target).await,
+            "ArchiveSession",
+        ),
+    ] {
+        let queued = control(&p, key, action).await.unwrap();
+        p.execute().await.unwrap();
+        let receipt = p.receipt(queued.operation_id).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Succeeded, "{method}");
+        let returned_method = match *receipt.operator_result.unwrap() {
+            OperatorCallResultV1::Scalar { method, .. }
+            | OperatorCallResultV1::Page { method, .. } => method,
+        };
+        assert_eq!(returned_method, method);
+    }
+    assert_eq!(row(&p, target).await.status, SessionStatus::Archived);
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+        let enabled_wakes: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scheduled_jobs WHERE wake_session_id=?1 AND enabled=1",
+                [p.lead.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled_wakes, 0);
+    }
+    let queued = control(&p, "paused-unarchive", unarchive(&p, target).await)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
+
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+    let disabled_wakes: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM scheduled_jobs WHERE wake_session_id=?1 AND enabled=0",
+            [p.lead.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(disabled_wakes, 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn operator_policy_pause_still_refuses_delegated_cleanup() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, Some(p.epic), SessionStatus::Completed, 30).await;
+    let mut policy = p.policy.clone();
+    policy
+        .capabilities
+        .push(ManagerCapabilityV2::OperatorDelegation);
+    policy.paused_epic_ids.push(p.epic);
+    reconfigure(&p, 2, policy.clone());
+    let error = control_as(
+        &p,
+        p.owner,
+        3,
+        "paused-epic-archive",
+        archive(&p, target).await,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_policy_paused"));
+    assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
+
+    policy.paused_epic_ids.clear();
+    policy.paused = true;
+    reconfigure(&p, 3, policy);
+    let error = control_as(
+        &p,
+        p.owner,
+        4,
+        "paused-global-list",
+        call("ListSessions", json!({}), None),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_policy_paused"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_archive_rechecks_retention_inside_the_effect_transaction() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -827,6 +1205,7 @@ async fn operator_call_archive_rechecks_retention_inside_the_effect_transaction(
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_reach_is_the_grant_project_only() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -898,6 +1277,7 @@ async fn operator_call_reach_is_the_grant_project_only() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_list_sessions_pages_are_byte_bounded_and_complete() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -982,6 +1362,7 @@ async fn operator_call_list_sessions_pages_are_byte_bounded_and_complete() {
     assert_eq!(next_after.unwrap().id, rows.last().unwrap().id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_fences_and_backpressure_are_enforced() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -1038,6 +1419,101 @@ async fn unarchive(p: &Pilot, id: Uuid) -> ManagerActionV2 {
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn operator_call_archive_preserves_marker_through_operator_unarchive() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, None, SessionStatus::Interrupted, 25).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .record_manager_operator_pause(target, true)
+        .unwrap();
+
+    let queued = control(&p, "k14-interrupted-archive", archive(&p, target).await)
+        .await
+        .unwrap();
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(queued.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(row(&p, target).await.status, SessionStatus::Archived);
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .manager_action_operator_paused(target)
+            .unwrap()
+    );
+
+    p.manager.unarchive_session(target).await.unwrap();
+    assert_eq!(row(&p, target).await.status, SessionStatus::Completed);
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .manager_action_operator_paused(target)
+            .unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn delegated_operator_archive_cancels_retry_without_provider_launch() {
+    let p = op_pilot(ManagerOperatingModeV2::Execute).await;
+    let target = leaf(&p, None, SessionStatus::Failed, 0).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET retry_attempt=0,max_retries=2 WHERE id=?1",
+            [target.to_string()],
+        )
+        .unwrap();
+    let (retry_cancel, mut retry_observer) = tokio::sync::oneshot::channel();
+    p.manager
+        .completed
+        .write()
+        .await
+        .get_mut(&target)
+        .unwrap()
+        .retry_cancel = Some(retry_cancel);
+
+    let queued = control(
+        &p,
+        "delegated-archive-cancels-retry",
+        archive(&p, target).await,
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+
+    let row = row(&p, target).await;
+    assert_eq!(row.status, SessionStatus::Archived);
+    assert_eq!(row.retry_attempt, Some(2));
+    assert!(retry_observer.try_recv().is_ok());
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Succeeded);
+    let invocations: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row("SELECT count(*) FROM model_invocations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(invocations, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_unarchive_restores_an_archived_project_leaf_logically() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -1098,6 +1574,7 @@ async fn operator_call_unarchive_restores_an_archived_project_leaf_logically() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_unarchive_refusals_leave_the_row_archived() {
     let p = op_pilot(ManagerOperatingModeV2::Execute).await;
@@ -1205,6 +1682,7 @@ async fn operator_call_unarchive_refusals_leave_the_row_archived() {
     assert_eq!(row(&p, foreign).await.status, SessionStatus::Archived);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn operator_call_unarchive_of_a_non_archived_session_is_refused_not_a_no_op() {
     // Chosen behaviour: refused with a typed code (not a silent success), so a

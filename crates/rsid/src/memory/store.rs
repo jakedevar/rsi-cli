@@ -1608,6 +1608,7 @@ mod tests {
     // Vendored sqlite-vec registration
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_vendored_sqlite_vec_loads() {
         let registered = register_sqlite_vec();
@@ -1639,6 +1640,7 @@ mod tests {
     // Store core tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_open_in_memory() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1661,6 +1663,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_open_creates_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1670,6 +1673,7 @@ mod tests {
         assert!(db_path.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_schema_version() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1682,6 +1686,7 @@ mod tests {
         assert_eq!(version, 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_schema_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1700,12 +1705,14 @@ mod tests {
     // Meta CRUD tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_get_meta_missing() {
         let store = MemoryStore::open_in_memory().unwrap();
         assert_eq!(store.get_meta("nonexistent").unwrap(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_set_and_get_meta() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1716,6 +1723,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_set_meta_overwrites() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1724,6 +1732,7 @@ mod tests {
         assert_eq!(store.get_meta("k").unwrap(), Some("v2".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_meta() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1732,12 +1741,14 @@ mod tests {
         assert_eq!(store.get_meta("k").unwrap(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_load_index_meta_empty() {
         let store = MemoryStore::open_in_memory().unwrap();
         assert!(store.load_index_meta().unwrap().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_save_and_load_index_meta() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1761,6 +1772,7 @@ mod tests {
         assert_eq!(loaded.vector_dims, meta.vector_dims);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_load_index_meta_partial() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1773,6 +1785,7 @@ mod tests {
     // Files CRUD tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_upsert_file_new() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1783,6 +1796,7 @@ mod tests {
         assert_eq!(got.hash, "abc123");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_upsert_file_update() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1794,18 +1808,21 @@ mod tests {
         assert_eq!(got.hash, "newHash");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_get_file_missing() {
         let store = MemoryStore::open_in_memory().unwrap();
         assert!(store.get_file("nonexistent.md").unwrap().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_list_files_empty() {
         let store = MemoryStore::open_in_memory().unwrap();
         assert!(store.list_files().unwrap().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_list_files_ordered() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1819,6 +1836,7 @@ mod tests {
         assert_eq!(files[2].path, "c.md");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_file() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1827,6 +1845,7 @@ mod tests {
         assert!(store.get_file("x.md").unwrap().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_file_count() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1840,6 +1859,7 @@ mod tests {
     // Chunks CRUD tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_insert_chunks_empty() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1849,6 +1869,7 @@ mod tests {
         assert_eq!(store.chunk_count().unwrap(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_insert_and_get_chunks() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1869,6 +1890,7 @@ mod tests {
         assert_eq!(got[2].start_line, 11);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_insert_chunks_upsert() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1907,6 +1929,7 @@ mod tests {
         assert_eq!(got[0].text, "updated");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_chunks_for_file() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1925,6 +1948,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_chunks_returns_count() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1942,6 +1966,7 @@ mod tests {
         assert_eq!(deleted, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_get_all_chunks() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1957,6 +1982,7 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_chunk_count() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1973,6 +1999,7 @@ mod tests {
     // Embedding cache tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_load_cache_empty() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1982,6 +2009,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_load_cache_no_matches() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -1991,6 +2019,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_upsert_and_load_cache() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2009,6 +2038,7 @@ mod tests {
         assert!(!result.contains_key("h2"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_upsert_cache_overwrites() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2022,6 +2052,7 @@ mod tests {
         assert_eq!(result["h1"], "[9.0]");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_prune_cache_under_limit() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2034,6 +2065,7 @@ mod tests {
         assert_eq!(store.cache_entry_count().unwrap(), 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_prune_cache_over_limit() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2050,6 +2082,7 @@ mod tests {
         assert_eq!(store.cache_entry_count().unwrap(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_entry_count() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2060,6 +2093,7 @@ mod tests {
         assert_eq!(store.cache_entry_count().unwrap(), 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_load_cache_batching() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2080,6 +2114,7 @@ mod tests {
     // FTS5 tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_fts_available_after_open() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2087,6 +2122,7 @@ mod tests {
         assert!(store.fts_available());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_insert_fts_chunks() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2109,6 +2145,7 @@ mod tests {
         store.insert_fts_chunks(&chunks).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_fts_no_results() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2119,6 +2156,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_fts_basic() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2159,6 +2197,7 @@ mod tests {
         assert_eq!(results[0].0, "t:memory:0:h1");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_fts_limit() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2185,6 +2224,7 @@ mod tests {
         assert!(results.len() <= 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_fts_chunks() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2212,6 +2252,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_fts_noop_when_unavailable() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2239,6 +2280,7 @@ mod tests {
     // Vector table tests (require sqlite-vec — ignored by default)
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_ensure_vector_table() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2246,6 +2288,7 @@ mod tests {
         assert!(store.vector_available());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_ensure_vector_table_idempotent() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2254,6 +2297,7 @@ mod tests {
         assert!(store.vector_available());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_vec0_dims() {
         assert_eq!(
@@ -2271,6 +2315,7 @@ mod tests {
     /// Swapping embedding models changes the vector width. The vec0 column
     /// validates length on insert, so a table left at the old width would
     /// reject every write and silently degrade search to FTS-only.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_ensure_vector_table_recreates_on_dim_change() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2303,6 +2348,7 @@ mod tests {
         assert_eq!(results[0].0, "new");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_insert_vector_chunks() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2311,6 +2357,7 @@ mod tests {
         store.insert_vector_chunks(&chunks).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_basic() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2325,6 +2372,7 @@ mod tests {
         assert_eq!(results[0].0, "id1");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_delete_vector_chunks() {
         let mut store = MemoryStore::open_in_memory().unwrap();
@@ -2353,6 +2401,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_vector_noop_when_unavailable() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2370,6 +2419,7 @@ mod tests {
     // Composite operation tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_index_file_chunks_fresh() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2391,6 +2441,7 @@ mod tests {
         assert!(store.get_file("doc.md").unwrap().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_index_file_chunks_reindex() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2421,6 +2472,7 @@ mod tests {
         assert_eq!(file.hash, "hash2");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_index_file_chunks_no_embeddings() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -2444,6 +2496,7 @@ mod tests {
     // Embedding blob conversion tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_embedding_to_blob_roundtrip() {
         let embedding = vec![1.0f32, 2.5, -3.5, 0.0];
@@ -2455,6 +2508,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_embedding_to_blob_empty() {
         let blob = embedding_to_blob(&[]);

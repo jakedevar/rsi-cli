@@ -5,7 +5,7 @@ use rsi_common::{harness_manager::HarnessManagerConfigV1, harness_manager_v2::*}
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const SECTIONS: [ManagerInspectSectionV2; 11] = [
+pub const SECTIONS: [ManagerInspectSectionV2; 12] = [
     ManagerInspectSectionV2::Overview,
     ManagerInspectSectionV2::Workers,
     ManagerInspectSectionV2::Work,
@@ -17,6 +17,7 @@ pub const SECTIONS: [ManagerInspectSectionV2; 11] = [
     ManagerInspectSectionV2::Events,
     ManagerInspectSectionV2::Archive,
     ManagerInspectSectionV2::Health,
+    ManagerInspectSectionV2::MigrationAllocations,
 ];
 
 pub struct BoardState {
@@ -215,9 +216,17 @@ fn health_label(row: &Value) -> String {
         Some(_) => "unverified".to_string(),
         None => "stuck unknown".to_string(),
     };
-    // Stuck codes lead: a narrow band column clips the tail, not the signal.
+    // Request counts lead each row so the narrow board keeps them visible.
     let mut line = format!(
-        "{} · {} · {lead} · live {} · notices {pending}",
+        "{} pending/{} info · {} · {} · {lead} · live {} · notices {pending}",
+        row.get("reports")
+            .and_then(|reports| reports.get("pending_requests"))
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".into(), |n| n.to_string()),
+        row.get("reports")
+            .and_then(|reports| reports.get("informational_messages"))
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".into(), |n| n.to_string()),
         text(row, "title")
             .or_else(|| text(row, "epic_id"))
             .unwrap_or("Epic"),
@@ -371,6 +380,16 @@ fn action_title(row: &Value) -> Option<String> {
 }
 
 pub fn row_title(row: &Value) -> String {
+    if text(row, "type") == Some("migration_allocation") {
+        let version = row.get("version").map(scalar).unwrap_or_else(|| "?".into());
+        let work = text(row, "work_key").unwrap_or("unknown work");
+        let state = if row["conflict"] == Value::Bool(true) {
+            "conflict"
+        } else {
+            text(row, "state").unwrap_or("unknown")
+        };
+        return format!("schema v{version} · {work} · {state}");
+    }
     if text(row, "type") == Some("action") {
         if let Some(title) = action_title(row) {
             return title;

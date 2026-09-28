@@ -539,6 +539,17 @@ fn provider_wrapper_and_exact_effort_ladders_cover_appserver_and_unknown_capabil
         let menu = manager_launch_effort_choices(provider, "gpt-6-astra");
         assert!(menu.values().contains(&Some("ultra".into())));
         assert_eq!(menu.values()[0], None);
+        let sol = manager_launch_effort_choices(provider, "gpt-6-sol");
+        assert!(sol.values().contains(&Some("ultra".into())));
+        assert!(matches!(
+            sol,
+            ManagerEffortChoices::Known {
+                default_hint: Some("medium"),
+                ..
+            }
+        ));
+        let luna = manager_launch_effort_choices(provider, "gpt-6-luna");
+        assert_eq!(luna.values().last(), Some(&Some("max".into())));
         assert_eq!(
             manager_launch_effort_choices(provider, "future-reasoning-model"),
             ManagerEffortChoices::DefaultOnly {

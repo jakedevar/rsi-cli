@@ -44,6 +44,47 @@ static ARCHIVE_PROJECTION_DISPATCH_FAULT: std::sync::Mutex<
 > = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+static ARCHIVE_CLEANUP_TEST_HOLDER_PROCS: std::sync::Mutex<Vec<(Uuid, PathBuf, PathBuf, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub struct ArchiveCleanupTestHolderProc {
+    session_id: Uuid,
+    sandbox_base: PathBuf,
+    _proc: super::reaper::SyntheticQuarantineHolderProc,
+}
+
+#[cfg(test)]
+impl Drop for ArchiveCleanupTestHolderProc {
+    fn drop(&mut self) {
+        let mut contexts = ARCHIVE_CLEANUP_TEST_HOLDER_PROCS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = contexts
+            .iter()
+            .position(|(session_id, sandbox_base, _, _)| {
+                *session_id == self.session_id && *sandbox_base == self.sandbox_base
+            })
+        {
+            contexts.swap_remove(index);
+        }
+    }
+}
+
+#[cfg(test)]
+fn archive_cleanup_test_holder_proc(
+    session_id: Uuid,
+    sandbox_base: &Path,
+) -> Option<(PathBuf, u32)> {
+    ARCHIVE_CLEANUP_TEST_HOLDER_PROCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(id, base, _, _)| *id == session_id && base == sandbox_base)
+        .map(|(_, _, proc_root, uid)| (proc_root.clone(), *uid))
+}
+
+#[cfg(test)]
 fn install_archive_projection_dispatch_fault(
     projection_id: Uuid,
     consumer: ArchiveProjectionConsumer,
@@ -108,6 +149,37 @@ struct ArchiveRemovalAuthorityV1 {
 }
 
 impl SessionManager {
+    #[cfg(test)]
+    pub(crate) fn install_archive_cleanup_test_holder_proc(
+        &self,
+        session_id: Uuid,
+    ) -> ArchiveCleanupTestHolderProc {
+        let proc = super::reaper::SyntheticQuarantineHolderProc::new();
+        let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
+        {
+            let mut contexts = ARCHIVE_CLEANUP_TEST_HOLDER_PROCS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                contexts
+                    .iter()
+                    .all(|(id, base, _, _)| { *id != session_id || *base != sandbox_base }),
+                "duplicate archive cleanup test holder process fixture"
+            );
+            contexts.push((
+                session_id,
+                sandbox_base.clone(),
+                proc.proc_root().to_path_buf(),
+                proc.uid(),
+            ));
+        }
+        ArchiveCleanupTestHolderProc {
+            session_id,
+            sandbox_base,
+            _proc: proc,
+        }
+    }
+
     pub(super) async fn try_archive_cleanup(
         &self,
         session_id: Uuid,
@@ -149,8 +221,6 @@ impl SessionManager {
                         && completed.session.updated_at == session.updated_at
                         && completed.session.sandbox_root == session.sandbox_root
                         && completed.session.sandbox_branch == session.sandbox_branch
-                        && completed.retry_cancel.is_none()
-                        && completed.retry_fired_at.is_none()
                         && completed.superseded_by_retry.is_none()
                 });
         if !completed_matches {
@@ -161,7 +231,18 @@ impl SessionManager {
                 true,
             ));
         }
+        #[cfg(test)]
+        let test_holder_proc =
+            archive_cleanup_test_holder_proc(session_id, self.sandbox_allocator.base_dir());
+        #[cfg(test)]
+        let test_provider_proc = test_holder_proc.clone();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((proc_root, uid)) = test_provider_proc {
+                return super::reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
+                    super::reaper::prove_archive_cleanup_has_no_provider_processes(&[session_id])
+                });
+            }
             super::reaper::prove_archive_cleanup_has_no_provider_processes(&[session_id])
         })
         .await
@@ -178,6 +259,12 @@ impl SessionManager {
         let store = Arc::clone(&self.store);
         let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
         let receipt = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((proc_root, uid)) = test_holder_proc {
+                return super::reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
+                    resume_or_start_cleanup_blocking(&store, &sandbox_base, session_id)
+                });
+            }
             resume_or_start_cleanup_blocking(&store, &sandbox_base, session_id)
         })
         .await
@@ -217,8 +304,6 @@ impl SessionManager {
                         && completed.session.updated_at == session.updated_at
                         && completed.session.sandbox_root == session.sandbox_root
                         && completed.session.sandbox_branch == session.sandbox_branch
-                        && completed.retry_cancel.is_none()
-                        && completed.retry_fired_at.is_none()
                         && completed.superseded_by_retry.is_none()
                 });
         if !completed_matches {
@@ -1592,7 +1677,7 @@ fn archive_cleanup_error(
     retryable: bool,
 ) -> DaemonError {
     let next_action = if retryable {
-        "Stop competing maintenance, resolve the reported condition, then retry archive."
+        "Resolve the reported condition, then retry this archive attempt. The session does not need to restart."
     } else {
         "Preserve the repository and quarantine evidence; use a compatible recovery binary."
     };
@@ -1679,6 +1764,15 @@ mod tests {
     }
 
     impl CleanupFixture {
+        fn projection_runtime_config(&self) -> Arc<RuntimeConfig> {
+            let mut config = Config::from_env();
+            // These tests exercise projection delivery, including a real memory
+            // worker after retry. An ambient daemon policy must not disable it.
+            config.memory_enabled = true;
+            config.memory_dir = self._temp.path().join("memory");
+            RuntimeConfig::from_config(&config)
+        }
+
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("fixture root");
             let repository = temp.path().join("repository");
@@ -1810,7 +1904,7 @@ mod tests {
                     .join(format!("daemon-{}.sock", Uuid::new_v4())),
                 memory_handle,
                 Vec::new(),
-                RuntimeConfig::from_config(&Config::from_env()),
+                self.projection_runtime_config(),
                 self.sandbox_base.clone(),
             )
             .expect("projection manager")
@@ -1940,7 +2034,7 @@ mod tests {
                 main_store,
                 None,
                 Arc::clone(&bus),
-                RuntimeConfig::from_config(&Config::from_env()),
+                self.projection_runtime_config(),
             );
             let task = tokio::spawn(async move { worker.run().await });
             handle.status().await.expect("memory worker startup");
@@ -2375,6 +2469,7 @@ mod tests {
         error
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn removal_marker_is_canonical_and_rejects_unknown_authority() {
         let marker = ArchiveRemovalAuthorityV1 {
@@ -2408,6 +2503,36 @@ mod tests {
         assert!(serde_json::from_value::<ArchiveRemovalAuthorityV1>(value).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pending_retry_still_uses_sandbox_preservation_route() {
+        let fixture = CleanupFixture::new();
+        let manager = fixture.projection_manager(Arc::new(EventBus::new(128)), None);
+        let session = manager
+            .store
+            .lock()
+            .await
+            .get_session(fixture.session_id)
+            .unwrap()
+            .unwrap();
+        let (retry_cancel, _retry_observer) = tokio::sync::oneshot::channel();
+        let mut completed = super::super::types::CompletedSession::for_test(session.clone());
+        completed.retry_cancel = Some(retry_cancel);
+        manager
+            .completed
+            .write()
+            .await
+            .insert(fixture.session_id, completed);
+
+        assert!(
+            manager
+                .archive_cleanup_route_selected(&session)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn no_output_cleanup_settles_and_preserves_direct_branch() {
         let fixture = CleanupFixture::new();
@@ -2421,6 +2546,7 @@ mod tests {
         assert_eq!(replay, receipt);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn settled_replay_retains_one_projection_and_forward_consumer_receipts() {
         let fixture = CleanupFixture::new();
@@ -2496,6 +2622,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_crash_before_application_recovers_all_consumers_once() {
         let fixture = CleanupFixture::new();
@@ -2568,6 +2695,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_crash_after_bus_application_redelivers_same_id_then_acks_once() {
         let fixture = CleanupFixture::new();
@@ -2661,6 +2789,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_memory_worker_failure_remains_delivering_until_same_id_succeeds() {
         let fixture = CleanupFixture::new();
@@ -2743,6 +2872,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_without_memory_worker_remains_delivering_for_later_recovery() {
         let fixture = CleanupFixture::new();
@@ -2787,6 +2917,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_recovery_without_memory_worker_terminates_at_full_32_row_page() {
         assert_disabled_memory_projection_batch_is_bounded(
@@ -2794,6 +2925,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_recovery_without_memory_worker_drains_33_rows_in_bounded_pages() {
         assert_disabled_memory_projection_batch_is_bounded(
@@ -2801,6 +2933,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn same_session_33rd_public_archive_drains_new_watch_and_bus_without_memory() {
         let fixture = Arc::new(CleanupFixture::new());
@@ -2816,6 +2949,8 @@ mod tests {
                 let event_bus = Arc::new(EventBus::new(128));
                 let mut events = event_bus.subscribe();
                 let manager = fixture.projection_manager(Arc::clone(&event_bus), None);
+                let _holder_proc =
+                    manager.install_archive_cleanup_test_holder_proc(fixture.session_id);
                 let mut projection_ids = Vec::with_capacity(projection_count);
                 let mut older_before_final_archive = None;
 
@@ -3026,6 +3161,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_memory_enqueue_then_worker_crash_redelivers_same_id_after_restart() {
         let fixture = CleanupFixture::new();
@@ -3090,6 +3226,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn projection_memory_success_before_ack_crash_retries_idempotently_after_restart() {
         let fixture = CleanupFixture::new();
@@ -3160,6 +3297,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn interrupted_cleanup_recovery_settles_and_dispatches_one_stable_projection() {
         let fixture = CleanupFixture::new();
@@ -3223,6 +3361,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn integrated_ancestor_cleanup_settles_and_preserves_direct_branch() {
         let fixture = CleanupFixture::new();
@@ -3240,6 +3379,7 @@ mod tests {
         fixture.assert_settled(&receipt, &source_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn settled_cleanup_allows_fresh_custody_unarchive_without_reusing_source_branch() {
         let fixture = CleanupFixture::new();
@@ -3317,6 +3457,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn unique_output_is_refused_before_intent_with_zero_git_effects() {
         let fixture = CleanupFixture::new();
@@ -3342,6 +3483,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn dirty_worktree_is_refused_before_intent_with_zero_git_effects() {
         let fixture = CleanupFixture::new();
@@ -3356,6 +3498,7 @@ mod tests {
         fixture.assert_retained(&fixture.allocation_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn preintent_classifier_distinguishes_cleanup_dependency_from_dirty_worktree() {
         for (message, expected) in [
@@ -3378,6 +3521,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn later_lineage_successor_is_refused_before_intent() {
         let fixture = CleanupFixture::new();
@@ -3398,6 +3542,7 @@ mod tests {
         fixture.assert_retained(&fixture.allocation_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn lost_move_acknowledgement_recovers_from_exact_quarantine() {
         let fixture = CleanupFixture::new();
@@ -3409,6 +3554,7 @@ mod tests {
         fixture.assert_settled(&receipt, &fixture.allocation_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn forged_marker_becomes_durable_recovery_required_without_removal() {
         let fixture = CleanupFixture::new();
@@ -3438,6 +3584,7 @@ mod tests {
         assert_eq!(latest.phase, ArchiveCleanupPhaseV1::RecoveryRequired);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn lost_removal_acknowledgement_recovers_only_from_exact_absence() {
         let fixture = CleanupFixture::new();
@@ -3449,6 +3596,7 @@ mod tests {
         fixture.assert_settled(&receipt, &fixture.allocation_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn final_transaction_failure_rolls_back_and_exact_retry_settles() {
         let fixture = CleanupFixture::new();

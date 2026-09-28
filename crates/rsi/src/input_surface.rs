@@ -230,7 +230,8 @@ pub struct InputSurfaceConfig<'a> {
 /// Process a key event through the InputSurface.
 ///
 /// Handles: Ctrl+Enter (submit), correction preview accept/discard,
-/// insert mode editing + suggestions, normal mode vim commands.
+/// insert mode editing + suggestions (including textarea Ctrl bindings),
+/// normal mode vim commands.
 ///
 /// Does NOT handle: grammar correction triggering (caller-specific),
 /// clipboard paste (needs app context), Ctrl+T/Ctrl+S overlay-specific submits,
@@ -359,19 +360,35 @@ fn handle_insert_mode(
     }
 
     // Pass-through mode: Up/Down pass through for session detail scroll
-    if config.pass_through_unhandled && (key.code == KeyCode::Up || key.code == KeyCode::Down) {
+    if config.pass_through_unhandled
+        && key.modifiers.is_empty()
+        && matches!(key.code, KeyCode::Up | KeyCode::Down)
+    {
         return InputAction::Passthrough(key);
     }
 
-    // Arrow keys for cursor movement
+    // Plain arrow keys for cursor movement. Modified arrows use the textarea's
+    // built-in bindings below (for example, Ctrl+Left/Right moves by word).
     match key.code {
-        KeyCode::Left => {
+        KeyCode::Left
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             surface.textarea.move_cursor(CursorMove::Back);
         }
-        KeyCode::Right => {
+        KeyCode::Right
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             surface.textarea.move_cursor(CursorMove::Forward);
         }
-        KeyCode::Up => {
+        KeyCode::Up
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             let wrap_width = surface.wrap_width.get();
             crate::vim_textarea::move_vertical_with_curswant(
                 &mut surface.textarea,
@@ -381,7 +398,11 @@ fn handle_insert_mode(
                 true,
             );
         }
-        KeyCode::Down => {
+        KeyCode::Down
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             let wrap_width = surface.wrap_width.get();
             crate::vim_textarea::move_vertical_with_curswant(
                 &mut surface.textarea,
@@ -392,7 +413,7 @@ fn handle_insert_mode(
             );
         }
         _ => {
-            surface.textarea.input_without_shortcuts(key);
+            surface.textarea.input(key);
         }
     }
 

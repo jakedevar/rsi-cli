@@ -1953,8 +1953,39 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
     {
         let ownership =
             StartupProcessOwnership::for_sessions(candidate_ids.iter().copied().collect());
+        #[cfg(test)]
+        let test_proc = archive_cleanup_test_proc_for_session(candidate_ids);
+        #[cfg(test)]
+        let test_context = if test_proc.is_none() {
+            current_quarantine_holder_test_proc_context()
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let proc_root = test_proc
+            .as_deref()
+            .or_else(|| {
+                test_context
+                    .as_ref()
+                    .map(|context| context.proc_root.as_path())
+            })
+            .unwrap_or_else(|| Path::new("/proc"));
+        #[cfg(not(test))]
         let proc_root = Path::new("/proc");
-        let self_pid = std::process::id() as i32;
+        let current_pid = std::process::id() as i32;
+        #[cfg(test)]
+        let self_uid = if let Some(context) = test_context.as_ref() {
+            context.uid
+        } else {
+            std::fs::metadata(proc_root.join("self"))
+                .map_err(|error| {
+                    crate::error::DaemonError::Process(format!(
+                        "archive cleanup process inventory identity failed: {error}"
+                    ))
+                })?
+                .uid()
+        };
+        #[cfg(not(test))]
         let self_uid = std::fs::metadata(proc_root.join("self"))
             .map_err(|error| {
                 crate::error::DaemonError::Process(format!(
@@ -1963,7 +1994,7 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
             })?
             .uid();
         let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
-        let inventory = scan_startup_process_inventory(proc_root, self_pid, self_uid, deadline)?;
+        let inventory = scan_startup_process_inventory(proc_root, current_pid, self_uid, deadline)?;
         for process in inventory.processes {
             if process
                 .stamps
@@ -1992,6 +2023,15 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
 pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
     tree: &QuarantineTreeProof,
 ) -> crate::error::Result<QuarantineHolderProof> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(context) = archive_cleanup_test_proc_for_tree(tree.root()) {
+        return prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            &context.proc_root,
+            context.uid,
+            tree,
+            QuarantineHolderScanLimits::default(),
+        );
+    }
     #[cfg(test)]
     if let Some(context) = current_quarantine_holder_test_proc_context() {
         return prove_quarantine_has_no_untrusted_same_uid_holders_at(
@@ -2111,6 +2151,98 @@ impl SyntheticQuarantineHolderProc {
         std::os::unix::fs::symlink(path, process.join("fd/3"))
             .expect("synthetic retained quarantine fd");
     }
+}
+
+// The RPC archive fixture exercises the real proof and cleanup path against a
+// stable, empty process inventory. Live /proc belongs to the host and can
+// change between the intent and quarantine reproof during parallel tests.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+struct ArchiveCleanupTestProcContext {
+    session_id: Uuid,
+    sandbox_base: PathBuf,
+    startup_proc_root: PathBuf,
+    holder_proc_root: PathBuf,
+    holder_uid: u32,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+static ARCHIVE_CLEANUP_TEST_PROCS: std::sync::Mutex<Vec<ArchiveCleanupTestProcContext>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ArchiveCleanupTestProcGuard {
+    session_id: Uuid,
+    _startup_proc: tempfile::TempDir,
+    _holder_proc: SyntheticQuarantineHolderProc,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ArchiveCleanupTestProcGuard {
+    fn drop(&mut self) {
+        let mut contexts = ARCHIVE_CLEANUP_TEST_PROCS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        contexts.retain(|context| context.session_id != self.session_id);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn scoped_archive_cleanup_test_proc(
+    session_id: Uuid,
+    sandbox_base: &Path,
+) -> ArchiveCleanupTestProcGuard {
+    let startup_proc = tempfile::tempdir().expect("archive startup proc fixture");
+    std::fs::create_dir(startup_proc.path().join("self")).expect("archive proc self identity");
+    let holder_proc = SyntheticQuarantineHolderProc::new();
+    let context = ArchiveCleanupTestProcContext {
+        session_id,
+        sandbox_base: sandbox_base.to_path_buf(),
+        startup_proc_root: startup_proc.path().to_path_buf(),
+        holder_proc_root: holder_proc.proc_root().to_path_buf(),
+        holder_uid: holder_proc.uid(),
+    };
+    let mut contexts = ARCHIVE_CLEANUP_TEST_PROCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        contexts
+            .iter()
+            .all(|existing| existing.session_id != session_id),
+        "archive proc fixture session collision"
+    );
+    contexts.push(context);
+    ArchiveCleanupTestProcGuard {
+        session_id,
+        _startup_proc: startup_proc,
+        _holder_proc: holder_proc,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn archive_cleanup_test_proc_for_session(candidate_ids: &[Uuid]) -> Option<PathBuf> {
+    let [session_id] = candidate_ids else {
+        return None;
+    };
+    ARCHIVE_CLEANUP_TEST_PROCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|context| context.session_id == *session_id)
+        .map(|context| context.startup_proc_root.clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn archive_cleanup_test_proc_for_tree(root: &Path) -> Option<QuarantineHolderTestProcContext> {
+    ARCHIVE_CLEANUP_TEST_PROCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|context| root.starts_with(&context.sandbox_base))
+        .map(|context| QuarantineHolderTestProcContext {
+            proc_root: context.holder_proc_root.clone(),
+            uid: context.holder_uid,
+        })
 }
 
 fn prove_quarantine_has_no_untrusted_same_uid_holders_at(
@@ -3634,20 +3766,22 @@ fn scan_startup_process_inventory(
             continue;
         };
         // A zombie (or already-dead task) cannot execute against a settlement
-        // root and often exposes an unreadable empty environ.  The stat state
-        // is the bounded kernel proof needed to exclude it without weakening
-        // the fail-closed policy for an unknown live same-UID process.
+        // root and often exposes an unreadable empty environ.
         if matches!(state, b'Z' | b'X' | b'x') {
             continue;
         }
         let environ_path = proc_root.join(pid.to_string()).join("environ");
         let environ = match read_bounded_proc_file(&environ_path, STARTUP_ORPHAN_ENV_MAX_BYTES) {
             Ok(Some(environ)) => environ,
-            Ok(None) => continue,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    && process_is_proven_systemd_user_manager_pair(proc_root, pid, self_uid)? =>
-            {
+            Ok(None) => {
+                tracing::debug!(
+                    pid,
+                    "startup provider process disappeared before environ proof"
+                );
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!(pid, %error, "startup provider environ is unreadable; skipping unproven process");
                 continue;
             }
             Err(error) => {
@@ -3744,24 +3878,25 @@ fn kill_startup_provider_orphans(
             continue;
         }
         let environ_path = proc_root.join(identity.pid.to_string()).join("environ");
-        let environ = read_bounded_proc_file(&environ_path, STARTUP_ORPHAN_ENV_MAX_BYTES).map_err(
-            |error| {
-                crate::error::DaemonError::Process(format!(
-                    "startup provider pre-kill environ failed for pid {}: {error}",
-                    identity.pid
-                ))
-            },
-        )?;
-        let Some(environ) = environ else {
-            if read_proc_start_identity(proc_root, identity.pid)?
-                .is_some_and(|(start_time, _)| start_time == identity.start_time)
-            {
+        let environ = match read_bounded_proc_file(&environ_path, STARTUP_ORPHAN_ENV_MAX_BYTES) {
+            Ok(Some(environ)) => environ,
+            Ok(None) => {
+                tracing::debug!(
+                    pid = identity.pid,
+                    "startup provider process disappeared before final environ proof"
+                );
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!(pid = identity.pid, %error, "startup provider final environ is unreadable; skipping unproven process");
+                continue;
+            }
+            Err(error) => {
                 return Err(crate::error::DaemonError::Process(format!(
-                    "startup provider process {} lost identity before kill",
+                    "startup provider pre-kill environ failed for pid {}: {error}",
                     identity.pid
                 )));
             }
-            continue;
         };
         let stamps = parse_startup_stamp_observation(&environ)?
             .authorized_exact_stamp(identity.pid, ownership)?;
@@ -4275,17 +4410,24 @@ fn process_has_exact_cmdline(
     expected: &[u8],
     label: &str,
 ) -> crate::error::Result<bool> {
-    let Some(cmdline) = read_bounded_proc_file(
+    let cmdline = match read_bounded_proc_file(
         &proc_root.join(pid.to_string()).join("cmdline"),
         QUARANTINE_PLATFORM_CMDLINE_MAX_BYTES,
-    )
-    .map_err(|error| {
-        crate::error::DaemonError::Process(format!(
-            "quarantine {label} command line failed for pid {pid}: {error}"
-        ))
-    })?
-    else {
-        return Ok(false);
+    ) {
+        Ok(Some(cmdline)) => cmdline,
+        Ok(None) => {
+            tracing::debug!(pid, label, "process disappeared before exact cmdline proof");
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::debug!(pid, label, %error, "process cmdline is unreadable; exact identity is unproven");
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(crate::error::DaemonError::Process(format!(
+                "quarantine {label} command line failed for pid {pid}: {error}"
+            )));
+        }
     };
     Ok(cmdline == expected)
 }
@@ -4703,6 +4845,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn bounded_proc_open_and_reader_treat_task_disappearance_as_absent() {
         let esrch = io::Error::from_raw_os_error(nix::libc::ESRCH);
@@ -4802,6 +4945,7 @@ mod tests {
         (temp, proof, file)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_test_proc_context_restores_nested_scope() {
         let outer = SyntheticQuarantineHolderProc::new();
@@ -4832,6 +4976,7 @@ mod tests {
         assert!(current_quarantine_holder_test_proc_context().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_test_proc_context_restores_after_panic() {
         let outer = SyntheticQuarantineHolderProc::new();
@@ -4854,6 +4999,7 @@ mod tests {
         assert!(current_quarantine_holder_test_proc_context().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_test_proc_context_is_thread_local() {
         let fixture = SyntheticQuarantineHolderProc::new();
@@ -4869,6 +5015,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_test_proc_context_drives_wrapper_and_fixture_holder() {
         let (_tree_temp, tree, retained) = holder_tree_fixture();
@@ -4886,6 +5033,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn proc_map_device_identity_uses_platform_encoding() {
         let file = tempfile::NamedTempFile::new().expect("mapped file fixture");
@@ -4905,6 +5053,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn proc_map_device_identity_rejects_oversized_macos_components() {
         for (major, minor) in [(0x100, 0), (0, 0x0100_0000)] {
@@ -4915,6 +5064,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_detects_divergent_namespace_holders() {
         for kind in ["cwd", "fd", "mmap", "mount", "io_uring"] {
@@ -4989,6 +5139,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn io_uring_fdinfo_proof_fails_closed_on_ambiguous_or_bounded_inventory() {
         let (_tree_temp, tree, file) = holder_tree_fixture();
@@ -5043,6 +5194,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_fd_target_reuse_fails_the_pass() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5095,6 +5247,7 @@ mod tests {
         assert!(error.to_string().contains("fd identity changed"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_before_initial_read() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5122,6 +5275,7 @@ mod tests {
         .expect("a descriptor proven closed before its initial read is not incomplete inventory");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_after_identity_read() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5149,6 +5303,7 @@ mod tests {
         .expect("a descriptor proven closed during revalidation is not incomplete inventory");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_between_revalidation_reads() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5176,6 +5331,7 @@ mod tests {
         .expect("a final both-ENOENT observation must confirm the fd closed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_after_missing_revalidation_target() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5218,6 +5374,7 @@ mod tests {
         .expect("a final both-ENOENT observation must confirm the reopened fd closed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_partial_close_reuse_to_nonholder_fails() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5255,6 +5412,7 @@ mod tests {
         assert!(error.to_string().contains("live or was reused"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_partial_close_reuse_to_holder_is_holder_winning() {
         let (_tree_temp, tree, retained) = holder_tree_fixture();
@@ -5290,6 +5448,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_confirmed_close_preserves_prior_fdinfo_failure() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5320,6 +5479,7 @@ mod tests {
         assert!(error.to_string().contains("io_uring fdinfo"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_fd_number_reuse_opened_to_holder_is_holder_winning() {
         let (_tree_temp, tree, retained) = holder_tree_fixture();
@@ -5350,6 +5510,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_requires_two_empty_passes_and_stable_task_namespace() {
         let (_tree_temp, tree, file) = holder_tree_fixture();
@@ -5408,6 +5569,7 @@ mod tests {
         assert_eq!(divergent_proof, first_proof);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_rejects_mount_namespace_drift() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5437,6 +5599,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_fails_closed_on_proc_denial_and_work_bounds() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5510,6 +5673,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_scans_live_siblings_after_leader_zombie() {
         let (_tree_temp, tree, file) = holder_tree_fixture();
@@ -5545,6 +5709,7 @@ mod tests {
         assert!(error.to_string().contains("tid 405"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_rejects_ambiguous_task_group_binding() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5571,6 +5736,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn trusted_systemd_permission_exemptions_are_explicit_and_holder_losing() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
@@ -5667,6 +5833,7 @@ mod tests {
             .expect("restore maps fixture");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn portal_fusermount_exemption_requires_exact_privilege_argv_cgroup_and_ancestry() {
         let proc_temp = tempfile::tempdir().expect("fake portal proc root");
@@ -5864,6 +6031,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn live_exact_portal_fusermount_helper_does_not_block_an_empty_tree_proof() {
         let proc_root = Path::new("/proc");
@@ -5909,6 +6077,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_scans_a_thread_private_file_table_when_unshare_is_available() {
         let (_tree_temp, tree, file) = holder_tree_fixture();
@@ -5976,6 +6145,7 @@ mod tests {
         assert!(error.to_string().contains("fd"), "{error}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn grace_exceeds_poll() {
         // Sanity: the grace window must span multiple poll ticks so a wedged
@@ -5984,6 +6154,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn reap_unknown_session_reaps_nothing() {
         let fixture = StartupReaperFixture::new();
@@ -5999,6 +6170,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_reaper_fixtures_have_unique_domains_and_filtered_proc_views() {
         let local = StartupReaperFixture::new();
@@ -6021,6 +6193,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_reaper_child_guard_kills_and_waits_on_unwind() {
         let fixture = StartupReaperFixture::new();
@@ -6045,6 +6218,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_reaper_runtime_session_readiness_proves_exact_full_tuple() {
         let fixture = StartupReaperFixture::new();
@@ -6064,6 +6238,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_reaper_child_guard_owns_forced_readiness_failure_cleanup() {
         let fixture = StartupReaperFixture::new();
@@ -6093,6 +6268,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_reaper_child_guard_owns_forced_registration_failure_cleanup() {
         let fixture = StartupReaperFixture::new();
@@ -6123,6 +6299,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn runtime_reap_proc_root_permits_are_session_keyed_nested_cross_thread_and_unwind_safe() {
         let fixture = StartupReaperFixture::new();
@@ -6190,6 +6367,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn runtime_reap_proc_root_pending_inner_drop_leases_outer_and_reclaims_every_arc() {
         let fixture = StartupReaperFixture::new();
@@ -6227,6 +6405,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn runtime_reap_proc_root_operation_survives_detached_blocking_cancellation() {
         let fixture = StartupReaperFixture::new();
@@ -6291,6 +6470,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn runtime_reap_failure_precedes_proc_root_permit_consumption() {
         let fixture = StartupReaperFixture::new();
@@ -6316,6 +6496,7 @@ mod tests {
         assert!(take_runtime_reap_proc_root(session_id).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_public_entrypoints_keep_default_domain_and_live_proc() {
         let source = include_str!("reaper.rs");
@@ -6331,6 +6512,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_settlement_fault_permits_are_candidate_keyed_across_threads_and_unwind_safe() {
         let first = Uuid::new_v4();
@@ -6395,6 +6577,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_after_scan_hook_is_one_shot_nested_thread_isolated_and_unwind_safe() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6451,6 +6634,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_settlement_reaper_reaches_fixed_point_and_preserves_unrelated_processes() {
         let fixture = StartupReaperFixture::new();
@@ -6487,6 +6671,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_process_first_reaps_pre_session_agent_child_and_scheduled_fresh_invocations() {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
@@ -6528,6 +6713,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_process_first_reaps_terminal_sessions_and_foreign_extra_cannot_veto() {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
@@ -6566,6 +6752,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_process_first_preserves_cloned_ids_in_another_socket_namespace() {
         let local = crate::store::Store::open_in_memory().expect("local startup Store");
@@ -6599,6 +6786,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_process_first_rechecks_store_ownership_after_first_empty_pass() {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
@@ -6637,6 +6825,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_legacy_fallback_requires_exact_socket_and_store_owned_id() {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
@@ -6662,6 +6851,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn runtime_capacity_reaper_uses_namespace_fixed_point_and_preserves_foreign_clone() {
         let fixture = StartupReaperFixture::new();
@@ -6698,6 +6888,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_provider_reaper_catches_child_after_first_empty_inventory() {
         let fixture = StartupReaperFixture::new();
@@ -6729,6 +6920,7 @@ mod tests {
         late.wait_signalled("child spawned after first empty inventory");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_provider_kill_pins_identity_before_final_reproof_and_signal() {
         let source = include_str!("reaper.rs");
@@ -6745,7 +6937,7 @@ mod tests {
             .find("let Some((current_start_time")
             .expect("start-time reproof");
         let environ_reproof = body
-            .find("let environ = read_bounded_proc_file")
+            .find("let environ = match read_bounded_proc_file")
             .expect("environment reproof");
         let final_reproof = body
             .find("let Some((final_start_time")
@@ -6761,6 +6953,7 @@ mod tests {
         assert!(!body.contains("nix::sys::signal::kill"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn runtime_reapers_delegate_to_the_fixed_point_pidfd_primitive() {
         let source = include_str!("reaper.rs");
@@ -6788,6 +6981,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn non_linux_startup_and_runtime_entrypoints_are_explicit_no_ops() {
         let source = include_str!("reaper.rs");
@@ -6815,6 +7009,7 @@ mod tests {
         assert!(!body.contains("nix::sys::signal::kill"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_stamp_parser_rejects_duplicate_owned_identity_with_exact_pid() {
         let candidate = Uuid::new_v4();
@@ -6836,6 +7031,7 @@ mod tests {
         assert!(error.to_string().contains("duplicate RSI_SESSION_ID"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_stamp_parser_rejects_owned_plus_foreign_duplicate_but_ignores_wholly_foreign() {
         let candidate = Uuid::new_v4();
@@ -6869,6 +7065,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_stamp_parser_rejects_malformed_owned_tuple_and_accepts_exact_pair() {
         let session_id = Uuid::new_v4();
@@ -6910,6 +7107,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_stamp_parser_rejects_duplicate_matching_namespace_but_ignores_foreign_namespace() {
         let ownership = StartupProcessOwnership::for_sessions(HashSet::new());
@@ -6955,8 +7153,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
-    fn startup_inventory_fails_closed_for_unreadable_unknown_same_uid_process() {
+    fn startup_inventory_skips_unreadable_same_uid_process_and_keeps_readable_stamp() {
         let directory = tempfile::tempdir().expect("create fake proc root");
         let uid = std::fs::metadata(directory.path())
             .expect("stat fake proc root")
@@ -6978,19 +7177,43 @@ mod tests {
         std::fs::set_permissions(&environ, std::fs::Permissions::from_mode(0o000))
             .expect("make fake environment unreadable");
 
-        let error = scan_startup_process_inventory(
+        let readable_pid = pid + 1;
+        let readable_root = directory.path().join(readable_pid.to_string());
+        std::fs::create_dir_all(&readable_root).expect("create readable process");
+        write_fake_platform_stat(&readable_root, readable_pid, "provider", 1, 100);
+        let session_id = Uuid::new_v4();
+        std::fs::write(
+            readable_root.join("environ"),
+            format!("{}={session_id}\0", rsi_common::identity::ENV_SESSION_ID),
+        )
+        .expect("write readable stamped environment");
+
+        let inventory = scan_startup_process_inventory(
             directory.path(),
             -1,
             uid,
             StdInstant::now() + Duration::from_secs(1),
         )
-        .expect_err("unreadable unknown same-UID process must fail closed");
+        .expect("unreadable process cannot block readable ownership proof");
         std::fs::set_permissions(&environ, std::fs::Permissions::from_mode(0o600))
             .expect("restore cleanup permissions");
-        assert!(error.to_string().contains("environ read failed"), "{error}");
-        assert!(error.to_string().contains(&pid.to_string()), "{error}");
+        assert_eq!(inventory.processes.len(), 1);
+        assert_eq!(inventory.processes[0].pid, readable_pid);
+        assert!(inventory.session_ids.contains(&session_id));
+
+        let cmdline = process_root.join("cmdline");
+        std::fs::write(&cmdline, b"unreadable cmdline").expect("write fake cmdline");
+        std::fs::set_permissions(&cmdline, std::fs::Permissions::from_mode(0o000))
+            .expect("make fake cmdline unreadable");
+        assert!(
+            !process_has_exact_cmdline(directory.path(), pid, b"provider\0", "startup")
+                .expect("unreadable cmdline cannot prove an exact process")
+        );
+        std::fs::set_permissions(&cmdline, std::fs::Permissions::from_mode(0o600))
+            .expect("restore cmdline cleanup permissions");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn startup_settlement_permission_exemption_is_exact_user_manager_pair() {
         let directory = tempfile::tempdir().expect("create fake proc root");

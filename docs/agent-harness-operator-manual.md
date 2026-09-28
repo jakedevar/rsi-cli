@@ -259,19 +259,26 @@ using any advanced orchestration.
 
 ### 1. Confirm the control plane is alive
 
-Start the daemon before connecting the TUI. In a repository development setup,
-the supported helpers are:
+Start the TUI; it launches `rsid` if no daemon is accepting connections and the
+daemon binary is available. The `dev-tui.sh` helper only builds the TUI, so in
+a repository development setup start the daemon in one terminal:
 
 ```bash
-make release-install
 ./scripts/dev-daemon.sh
+```
+
+Then start the TUI in another terminal:
+
+```bash
 ./scripts/dev-tui.sh
 ```
 
-For an installed environment, use the daemon/service management method your
-deployment provides. RSI normally communicates through a Unix socket at
-`~/.rsi/daemon.sock` and stores durable state under `~/.rsi/`; do not edit the
-database as routine administration.
+Use `make release-install` to install the release binaries.
+
+For an installed environment, run `rsi`; it starts the daemon automatically on
+Linux and macOS when needed. You can still start `rsid` manually. RSI normally
+communicates through a Unix socket at `~/.rsi/daemon.sock` and stores durable
+state under `~/.rsi/`; do not edit the database as routine administration.
 
 If the TUI cannot connect, do not start multiple daemons blindly. First inspect
 the existing daemon process, socket, and logs. RSI expects one active daemon
@@ -298,7 +305,7 @@ for a bounded one-shot task.
 
 | Action | Shortcut | Command mode equivalent |
 |---|---|---|
-| Open general Blank session prompt | `<Space>m` | `:blank` |
+| Open general Blank session prompt | `<Space>n` | `:blank` |
 | Launch Blank session with prompt | — | `:blank <objective>` |
 | Open TaskRabbit one-shot prompt | `<Space>o` | `:task` |
 | Launch TaskRabbit with prompt | — | `:task <objective>` |
@@ -741,7 +748,8 @@ private capacity tables or manufacture a Fresh successor.
 
 - Open the local issue tracker with `<Space>i` when a finding needs durable
   follow-up rather than another vague reminder.
-- Open notification history with `gn`; use `]a` / `[a` for the attention queue.
+- Open notification history with `<Space>N` or `:alerts`; use `]a` / `[a` for
+  the attention queue.
 - Use `<Space>S` or `:stopall` only as a break-glass control. It prevents new
   paid work and cancels live invocations; investigate the resulting terminal
   state before restarting normal work.
@@ -900,7 +908,7 @@ read [Keybindings Reference](keybindings.md) for exhaustive, current mappings.
 
 | Goal | Control |
 |---|---|
-| Launch general work | `<Space>m`, `:blank [objective]` |
+| Launch general work | `<Space>n`, `:blank [objective]` |
 | Launch one-shot work | `<Space>o`, `:task [objective]` |
 | Choose project | `<Space>p`, `:projects`, `:project <name>` |
 | Inspect session facts | `F3` |

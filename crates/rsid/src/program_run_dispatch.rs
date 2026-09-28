@@ -621,6 +621,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn d05_v8_exact_production_sql_plans_and_history_work_are_bounded() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
@@ -1277,6 +1278,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn d05_v5_due_claim_sql_scope_precedes_limit_and_preserves_foreign_facts() {
         for scenario in [
@@ -1389,6 +1391,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v6_dispatch_progress_survives_dispatcher_manager_and_boot_recreation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1478,6 +1481,7 @@ mod tests {
         assert_eq!((attempts, retried, retry_budget_used), (65, 0, 0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v6_repeated_boot_reclaim_prioritizes_never_claimed_authorities() {
         let dir = tempfile::tempdir().unwrap();
@@ -1553,6 +1557,7 @@ mod tests {
         assert_eq!((attempts, retried, retry_budget_used), (96, 31, 31));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v6_sparse_scan_skips_empty_failed_removed_and_replaced_prefixes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1676,6 +1681,7 @@ mod tests {
     }
 
     #[allow(clippy::significant_drop_tightening)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v7_unchanged_current_prefix_rotates_durably_without_republication() {
         let dir = tempfile::tempdir().unwrap();
@@ -1880,6 +1886,7 @@ mod tests {
     }
 
     #[allow(clippy::significant_drop_tightening)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v7_sparse_portfolio_has_exact_tick_work_and_index_bounds() {
         const SPARSE_LIVE_AUTHORITIES: usize = 10_001;
@@ -1945,6 +1952,7 @@ mod tests {
         assert_exact_dispatch_sql_plans(&store.conn);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_real_dispatcher_reopen_converges_all_wake_outbox_crash_boundaries() {
         for boundary in [
@@ -2041,6 +2049,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v4_uncertain_publication_is_finite_expiry_gated_and_fair() {
         let dir = tempfile::tempdir().unwrap();
@@ -2216,6 +2225,7 @@ mod tests {
         assert_eq!(cancelled.run.status, ProgramRunStatusV1::Cancelled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_v4_published_reference_reconciles_without_republication() {
         let dir = tempfile::tempdir().unwrap();
@@ -2328,6 +2338,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn d05_rr2_consumed_wake_history_cannot_acknowledge_or_starve_new_wakes() {
         let dir = tempfile::tempdir().unwrap();

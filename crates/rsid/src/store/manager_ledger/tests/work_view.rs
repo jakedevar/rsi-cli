@@ -90,6 +90,7 @@ fn rotate(f: &Fixture, predecessor: Uuid) -> Uuid {
     next.id
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_shows_granted_ownership_to_manager_created_worker() {
     let f = fixture();
@@ -204,6 +205,7 @@ fn work_view_shows_granted_ownership_to_manager_created_worker() {
     assert_eq!(exact.works[0].work_key, "beta");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_refuses_unmanaged_sessions_with_exact_codes() {
     let f = fixture();
@@ -276,6 +278,7 @@ fn work_view_refuses_unmanaged_sessions_with_exact_codes() {
     assert!(refusal(&f, worker).contains("manager_work_view_not_managed"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_reads_current_grant_and_refuses_out_of_scope_epic() {
     let f = fixture();
@@ -311,6 +314,7 @@ fn work_view_reads_current_grant_and_refuses_out_of_scope_epic() {
     assert!(refusal(&f, stray).contains("manager_v2_epic_out_of_scope"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_follows_rotation() {
     let f = fixture();
@@ -330,6 +334,7 @@ fn work_view_follows_rotation() {
     assert!(refusal(&f, worker).contains("manager_work_view_stale_session"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_reports_pause_without_refusing() {
     let f = fixture();
@@ -352,6 +357,7 @@ fn work_view_reports_pause_without_refusing() {
     assert_eq!(page.epic_id, f.epic);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_under_busy_lead_returns_relay_delivery_state() {
     let f = fixture();
@@ -367,6 +373,7 @@ fn work_view_under_busy_lead_returns_relay_delivery_state() {
                 epic_id: f.epic,
                 message: "Please grant the worker src/lib.rs".into(),
                 idempotency_key: "relay".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -420,6 +427,7 @@ fn work_view_under_busy_lead_returns_relay_delivery_state() {
                 request_id: sent.message_id,
                 message: "Granted".into(),
                 idempotency_key: "relay-reply".into(),
+                still_running: false,
             },
         )
         .unwrap();
@@ -430,6 +438,7 @@ fn work_view_under_busy_lead_returns_relay_delivery_state() {
 /// as page listings, so integrated work (and its still-active claim) is
 /// answered by the typed `manager_work_view_work_not_live` code while live
 /// work by exact key keeps returning its full view.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_exact_key_refuses_integrated_work_and_serves_live_work() {
     let f = fixture();
@@ -506,6 +515,7 @@ fn work_view_exact_key_refuses_integrated_work_and_serves_live_work() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn work_view_is_side_effect_free() {
     let f = fixture();
@@ -519,6 +529,7 @@ fn work_view_is_side_effect_free() {
                 epic_id: f.epic,
                 message: "Queued relay".into(),
                 idempotency_key: "relay".into(),
+                informational: false,
             },
         )
         .unwrap();

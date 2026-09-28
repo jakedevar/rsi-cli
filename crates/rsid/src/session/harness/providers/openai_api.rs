@@ -8,7 +8,8 @@
 
 use crate::error::DaemonError;
 use crate::model_control::ModelExecutionCapability;
-use crate::session::harness::api_key::{OPENAI_ENV_VARS, resolve_api_key};
+use crate::session::harness::api_key::ApiCredential;
+use crate::session::harness::errors;
 use crate::session::harness::provider::{ApiProvider, Result};
 use crate::session::harness::sse::read_openai_sse_stream;
 use crate::session::harness::types::*;
@@ -17,14 +18,68 @@ use tokio::sync::mpsc;
 
 pub struct OpenAiApiProvider {
     http: reqwest::Client,
-    api_key: Option<String>,
+    credential: ApiCredential,
     base_url: String,
     quirks: ProviderQuirks,
+    execution_route: crate::model_control::registry::RuntimeExecutionRoute,
 }
 
 impl OpenAiApiProvider {
+    async fn send_openai_request(
+        &self,
+        request: &ChatRequest,
+        execution: ModelExecutionCapability,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = self.build_request_body(request);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body);
+        let key = self.credential.current();
+        if let Some(key) = key {
+            req = req.bearer_auth(key.expose());
+        }
+        let response = execution
+            .bind_http(
+                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
+                req,
+            )
+            .send("OpenAI")
+            .await
+            .map_err(errors::transport)?;
+        Ok(response)
+    }
+
+    async fn send_openrouter_request(
+        &self,
+        request: &ChatRequest,
+        execution: ModelExecutionCapability,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = self.build_request_body(request);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body);
+        let key = self.credential.current().ok_or_else(|| {
+            DaemonError::OpenAiApiError("OpenRouter credential unavailable".to_string())
+        })?;
+        req = req.bearer_auth(key.expose());
+        let response = execution
+            .bind_http(
+                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp,
+                req,
+            )
+            .send("OpenRouter")
+            .await
+            .map_err(errors::transport)?;
+        Ok(response)
+    }
     pub fn new(explicit_key: Option<&str>) -> Result<Self> {
-        let api_key = resolve_api_key(explicit_key, OPENAI_ENV_VARS);
+        let credential = ApiCredential::for_slot(explicit_key, Some(crate::vault::Slot::Openai));
         let base_url = std::env::var("OPENAI_API_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".into());
 
@@ -35,8 +90,10 @@ impl OpenAiApiProvider {
 
         Ok(Self {
             http,
-            api_key,
+            credential,
             base_url,
+            execution_route:
+                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
             quirks: ProviderQuirks {
                 native_tools: true,
                 ..Default::default()
@@ -44,10 +101,11 @@ impl OpenAiApiProvider {
         })
     }
 
-    /// Create with explicit base URL and key (for compatible providers).
+    /// Create with explicit base URL and credential (for compatible
+    /// providers). The credential is evaluated on every request.
     pub fn with_config(
         base_url: String,
-        api_key: Option<String>,
+        credential: ApiCredential,
         quirks: ProviderQuirks,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -57,16 +115,38 @@ impl OpenAiApiProvider {
 
         Ok(Self {
             http,
-            api_key,
+            credential,
             base_url,
             quirks,
+            execution_route:
+                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
         })
+    }
+
+    pub fn openrouter() -> Result<Self> {
+        let mut provider = Self::with_config(
+            crate::openrouter::OPENROUTER_API_BASE_URL.to_string(),
+            ApiCredential::for_slot_only(crate::vault::Slot::Openrouter),
+            ProviderQuirks {
+                native_tools: true,
+                ..Default::default()
+            },
+        )?;
+        provider.execution_route =
+            crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp;
+        Ok(provider)
     }
 
     fn build_request_body(&self, request: &ChatRequest) -> Value {
         let mut messages: Vec<Value> = Vec::new();
+        let mut pending_image_messages: Vec<Value> = Vec::new();
 
         for msg in &request.messages {
+            // Chat Completions requires every tool reply for one assistant turn
+            // before the next user message. Defer image parts until the batch ends.
+            if msg.role != MessageRole::Tool {
+                messages.append(&mut pending_image_messages);
+            }
             match msg.role {
                 MessageRole::System => {
                     if !self.quirks.merge_system_into_user {
@@ -107,14 +187,67 @@ impl OpenAiApiProvider {
                     messages.push(m);
                 }
                 MessageRole::Tool => {
+                    let blocks = msg.tool_blocks();
+                    let mut text = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ToolContentBlock::Text { text } => Some(text.as_str()),
+                            ToolContentBlock::Image { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let image_parts = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ToolContentBlock::Image { media_type, data } => Some(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{media_type};base64,{data}"),
+                                },
+                            })),
+                            ToolContentBlock::Text { .. } => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !image_parts.is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[Image attached in the following user message]");
+                    }
+                    let content = if msg.is_error {
+                        json!({
+                            "error": {
+                                "type": "tool_execution",
+                                "message": text,
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        text
+                    };
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                        "content": msg.content,
+                        "content": content,
                     }));
+                    if !image_parts.is_empty() {
+                        let mut user_parts = vec![json!({
+                            "type": "text",
+                            "text": format!(
+                                "Image returned by tool call {}:",
+                                msg.tool_call_id.as_deref().unwrap_or("")
+                            ),
+                        })];
+                        user_parts.extend(image_parts);
+                        pending_image_messages.push(json!({
+                            "role": "user",
+                            "content": user_parts,
+                        }));
+                    }
                 }
             }
         }
+        messages.append(&mut pending_image_messages);
 
         // Handle merge_system_into_user quirk
         if self.quirks.merge_system_into_user {
@@ -189,31 +322,16 @@ impl ApiProvider for OpenAiApiProvider {
         request: &ChatRequest,
         execution: ModelExecutionCapability,
     ) -> Result<ChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = self.build_request_body(request);
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body);
-
-        if let Some(ref key) = self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = execution
-            .bind_http(
-                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
-                req,
-            )
-            .send("OpenAI")
-            .await?;
+        let resp = if self.execution_route
+            == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
+        {
+            self.send_openrouter_request(request, execution).await?
+        } else {
+            self.send_openai_request(request, execution).await?
+        };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(DaemonError::Process(format!("OpenAI API {status}: {body}")));
+            return Err(errors::classify_response(resp).await);
         }
 
         let json: Value = resp
@@ -301,35 +419,16 @@ impl ApiProvider for OpenAiApiProvider {
             return Ok(response);
         }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut streaming_request = request.clone();
-        streaming_request.stream = true;
-        let body = self.build_request_body(&streaming_request);
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body);
-
-        if let Some(ref key) = self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = execution
-            .bind_http(
-                crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
-                req,
-            )
-            .send("OpenAI")
-            .await?;
+        let resp = if self.execution_route
+            == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
+        {
+            self.send_openrouter_request(request, execution).await?
+        } else {
+            self.send_openai_request(request, execution).await?
+        };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(DaemonError::Process(format!(
-                "OpenAI API {status}: {body_text}"
-            )));
+            return Err(errors::classify_response(resp).await);
         }
 
         let (content, acc_tool_calls, usage, stop_reason) =
@@ -363,5 +462,121 @@ impl ApiProvider for OpenAiApiProvider {
 
     fn supports_streaming(&self) -> bool {
         !self.quirks.disable_streaming
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn request(messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            messages,
+            model: "test-model".into(),
+            temperature: None,
+            max_tokens: None,
+            tools: Vec::new(),
+            stream: false,
+            reasoning_effort: None,
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn tool_results_use_text_tool_messages_and_user_image_parts() {
+        let provider = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks::default(),
+        )
+        .unwrap();
+        let body = provider.build_request_body(&request(vec![
+            ChatMessage::tool_result("legacy", "plain text"),
+            ChatMessage::tool_result_blocks(
+                "text",
+                vec![ToolContentBlock::Text {
+                    text: "typed text".into(),
+                }],
+                false,
+            ),
+            ChatMessage::tool_result_blocks(
+                "image",
+                vec![
+                    ToolContentBlock::Text {
+                        text: "preview".into(),
+                    },
+                    ToolContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                false,
+            ),
+            ChatMessage::tool_result_blocks(
+                "error",
+                vec![ToolContentBlock::Text {
+                    text: "failed".into(),
+                }],
+                true,
+            ),
+        ]));
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "tool", "tool_call_id": "legacy", "content": "plain text"
+            })
+        );
+        assert_eq!(
+            body["messages"][1],
+            json!({
+                "role": "tool", "tool_call_id": "text", "content": "typed text"
+            })
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "tool", "tool_call_id": "image",
+                "content": "preview\n[Image attached in the following user message]"
+            })
+        );
+        assert_eq!(body["messages"][3]["role"], "tool");
+        let error: Value =
+            serde_json::from_str(body["messages"][3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            error,
+            json!({"error": {"type": "tool_execution", "message": "failed"}})
+        );
+        assert_eq!(
+            body["messages"][4],
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Image returned by tool call image:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ]
+            })
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn openrouter_harness_uses_openrouter_endpoint_and_vault_slot() {
+        let provider = OpenAiApiProvider::openrouter().unwrap();
+        assert_eq!(
+            provider.base_url,
+            crate::openrouter::OPENROUTER_API_BASE_URL
+        );
+        assert_eq!(
+            provider.execution_route,
+            crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
+        );
+        assert!(matches!(
+            provider.credential,
+            ApiCredential::VaultSlotOnly {
+                slot: crate::vault::Slot::Openrouter,
+                ..
+            }
+        ));
+        assert!(provider.supports_native_tools());
     }
 }

@@ -269,6 +269,7 @@ fn enforce_with_policy(index_root: &Path, policy: RetentionPolicy) -> Result<Ret
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn physical_admission_reserves_wal_and_rejects_protected_overflow() {
         assert_eq!(planned_main_file_limit(1_000, 100, 100), Some(375));
@@ -276,6 +277,7 @@ mod tests {
         assert_eq!(planned_main_file_limit(1_000, 1_001, 400), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn second_project_consumes_global_write_budget_without_pruning_ready_heads() {
         use crate::codegraph::{
@@ -358,6 +360,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn global_ceiling_prunes_prior_generations_across_projects() {
         use crate::codegraph::{
@@ -410,6 +413,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn age_boundary_prunes_only_prior_generation() {
         use crate::codegraph::{
@@ -448,6 +452,7 @@ mod tests {
         assert_eq!(store.generation_details().unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn count_boundary_keeps_current_and_nineteen_prior() {
         use crate::codegraph::{
@@ -484,6 +489,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn current_survives_count_age_and_ceiling() {
         let now = Utc::now();

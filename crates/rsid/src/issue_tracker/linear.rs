@@ -459,6 +459,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_full() {
         let node = sample_issue_node();
@@ -473,6 +474,7 @@ mod tests {
         assert_eq!(issue.assignee_id, Some("user-1".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_nil_description() {
         let mut node = sample_issue_node();
@@ -481,6 +483,7 @@ mod tests {
         assert!(issue.description.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_nil_priority() {
         let mut node = sample_issue_node();
@@ -489,6 +492,7 @@ mod tests {
         assert!(issue.priority.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_empty_labels() {
         let mut node = sample_issue_node();
@@ -497,6 +501,7 @@ mod tests {
         assert!(issue.labels.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_no_relations() {
         let mut node = sample_issue_node();
@@ -505,6 +510,7 @@ mod tests {
         assert!(issue.blocked_by.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn normalize_issue_no_assignee() {
         let mut node = sample_issue_node();
@@ -513,6 +519,7 @@ mod tests {
         assert!(issue.assignee_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn blocked_by_only_blocks_relation_type() {
         let node = serde_json::json!({

@@ -22,17 +22,21 @@ pub mod model_utils;
 pub mod program_runs;
 pub mod prompt_compile;
 pub mod provider_capabilities;
+pub mod provider_credentials;
 pub mod recursive_dag;
 pub mod recursive_dag_validation;
 pub mod research_schema;
 pub mod review_model_family;
+pub mod rolling_health;
 pub mod rpc;
 pub mod sandbox_storage;
+pub mod satellite;
 pub mod schedule;
 pub mod tag;
+pub mod topology_agent;
 pub mod types;
 pub mod verification_manifest;
-pub mod rolling_health;
+pub mod worker_memory;
 
 pub use agent_contract::{
     ClosurePipelineHandoffV1, ClosureReviewHandoffV1, ContractError, PipelineHandoff, Stage,

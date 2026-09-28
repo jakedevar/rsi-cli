@@ -318,6 +318,7 @@ mod session_authority_classification_tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn every_session_field_has_exactly_one_rotation_authority_class() {
         let session = crate::store::tests::make_test_session();
@@ -347,6 +348,7 @@ mod session_authority_classification_tests {
         assert!(authority.contains("sandbox_root"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn completed_rotation_fence_accepts_late_result_telemetry_but_rejects_model_change() {
         let store = Store::open_in_memory().unwrap();
@@ -441,6 +443,37 @@ pub(crate) struct NewCustodyRoot {
     pub repository_identity: String,
     pub source_commit: String,
     pub cause: CustodyCause,
+}
+
+/// SQL predicate over `sessions s` joined to its own `sandbox_custody_roots r`:
+/// the root is ownerless-terminal, this session was the owner that left it
+/// terminal, custody never transferred away from this session, and no
+/// lineage successor exists that could claim the workspace.
+const REPLACEABLE_TERMINAL_CUSTODY_PREDICATE: &str = "
+    s.status IN ('Completed','Failed','Interrupted')
+    AND s.pending_archive=0
+    AND s.sandbox_kind='GitWorktree'
+    AND r.state IN ('quarantined','failed','purged')
+    AND r.owner_session_id IS NULL
+    AND r.reserved_effects=0 AND r.active_effects=0
+    AND EXISTS (
+        SELECT 1 FROM sandbox_custody_events e
+        WHERE e.custody_id=r.custody_id AND e.from_owner_session_id=s.id
+          AND e.to_owner_session_id IS NULL
+          AND e.next_state IN ('quarantined','failed','purged'))
+    AND NOT EXISTS (
+        SELECT 1 FROM sandbox_custody_events e
+        WHERE e.custody_id=r.custody_id AND e.event_kind='transferred'
+          AND e.from_owner_session_id=s.id)
+    AND NOT EXISTS (SELECT 1 FROM sessions succ WHERE succ.continued_from=s.id)";
+
+/// The terminal root a replacement supersedes (see
+/// [`Store::replaceable_terminal_custody`]).
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalCustodyRoot {
+    pub(crate) custody_id: Uuid,
+    pub(crate) sandbox_root: PathBuf,
+    pub(crate) sandbox_branch: String,
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +1002,46 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Backfill a missing allocation identity with the exact V98 rule: the
+    /// owner named by the root's sequence-one `allocated` event.
+    ///
+    /// V98 guaranteed no NULL rows at migration time, but a daemon binary
+    /// built before V98 that ran against the migrated store could still insert
+    /// roots without the column. Every startup and reclaim reader treats the
+    /// identity as required, so one such row made startup custody
+    /// reconciliation fail for every session. Rows without a sequence-one
+    /// allocation event, or whose derived identity is already in use by
+    /// another root, are left untouched rather than invented. Idempotent.
+    pub(crate) fn repair_missing_custody_allocation_ids(&self) -> Result<usize> {
+        let candidates: Vec<(String, String)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT r.custody_id,e.to_owner_session_id
+                 FROM sandbox_custody_roots r
+                 JOIN sandbox_custody_events e
+                   ON e.custody_id=r.custody_id AND e.sequence=1 AND e.event_kind='allocated'
+                 WHERE r.allocation_id IS NULL AND e.to_owner_session_id IS NOT NULL
+                 ORDER BY r.custody_id",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut repaired = 0;
+        for (custody_id, allocation_id) in candidates {
+            // Checked per row so two legacy roots deriving the same identity
+            // cannot trip the unique index and fail the whole repair.
+            repaired += self.conn.execute(
+                "UPDATE sandbox_custody_roots SET allocation_id=?2
+                 WHERE custody_id=?1 AND allocation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sandbox_custody_roots other WHERE other.allocation_id=?2
+                   )",
+                params![custody_id, allocation_id],
+            )?;
+        }
+        Ok(repaired)
+    }
+
     pub(crate) fn startup_custody_root_for_sandbox_root(
         &self,
         sandbox_root: &str,
@@ -1247,6 +1320,104 @@ impl Store {
         tx.commit()?;
         self.get_session(session_id)?.ok_or_else(|| {
             DaemonError::Store("restored sandbox session disappeared after commit".into())
+        })
+    }
+
+    /// A non-archived sandboxed session whose own custody root reached an
+    /// ownerless terminal state (`quarantined`, `failed`, `purged`) while this
+    /// session was its last owner. Ownership was never transferred to a
+    /// successor, so no other session can hold or inherit the workspace; an
+    /// operator continuation may therefore replace the root instead of
+    /// refusing with `ownership_missing`. Returns the terminal root.
+    pub(crate) fn replaceable_terminal_custody(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<TerminalCustodyRoot>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT r.custody_id, r.sandbox_root, r.sandbox_branch
+                     FROM sessions s
+                     JOIN sandbox_custody_roots r ON r.custody_id=s.sandbox_custody_id
+                     WHERE s.id=?1 AND {REPLACEABLE_TERMINAL_CUSTODY_PREDICATE}"
+                ),
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(custody_id, sandbox_root, sandbox_branch)| {
+                Ok(TerminalCustodyRoot {
+                    custody_id: Uuid::parse_str(&custody_id)
+                        .map_err(|error| DaemonError::Store(error.to_string()))?,
+                    sandbox_root: std::path::PathBuf::from(sandbox_root),
+                    sandbox_branch,
+                })
+            })
+            .transpose()
+    }
+
+    /// Rebind a session whose terminal custody root satisfies
+    /// [`Self::replaceable_terminal_custody`] to a newly allocated root. The
+    /// old root stays immutable history; the replacement is a distinct
+    /// generation-one root, exactly as archived-purge restoration does. The
+    /// terminal-state predicate is re-proved inside this IMMEDIATE transaction.
+    pub(crate) fn replace_terminal_session_custody(
+        &mut self,
+        session_id: Uuid,
+        terminal_custody_id: Uuid,
+        binding: SessionCustodyBinding,
+    ) -> Result<Session> {
+        let SessionCustodyBinding::New(root) = binding else {
+            return Err(DaemonError::Store(
+                "terminal custody replacement requires a fresh custody root".into(),
+            ));
+        };
+        let _root_guard = lock_custody_root(root.custody_id);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let replaced = tx.execute(
+            &format!(
+                "UPDATE sessions
+                 SET working_dir=?1,
+                     git_branch=?2,
+                     sandbox_root=?3,
+                     sandbox_branch=?2,
+                     sandbox_cleanup_state='Live',
+                     sandbox_custody_id=NULL,
+                     updated_at=?4
+                 WHERE id=?5
+                   AND sandbox_custody_id=?6
+                   AND EXISTS (
+                       SELECT 1 FROM sessions s
+                       JOIN sandbox_custody_roots r ON r.custody_id=s.sandbox_custody_id
+                       WHERE s.id=sessions.id AND {REPLACEABLE_TERMINAL_CUSTODY_PREDICATE}
+                   )"
+            ),
+            params![
+                &root.canonical_repo_dir,
+                &root.sandbox_branch,
+                &root.sandbox_root,
+                timestamp(),
+                session_id.to_string(),
+                terminal_custody_id.to_string(),
+            ],
+        )?;
+        if replaced != 1 {
+            return Err(DaemonError::Store(
+                "terminal custody replacement lost its terminal-state fence".into(),
+            ));
+        }
+        insert_new_root(&tx, session_id, root)?;
+        tx.commit()?;
+        self.get_session(session_id)?.ok_or_else(|| {
+            DaemonError::Store("session disappeared after terminal custody replacement".into())
         })
     }
 

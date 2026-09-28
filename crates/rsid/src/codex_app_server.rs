@@ -682,8 +682,7 @@ impl CodexAppServerProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
+        crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
     /// Non-blocking check if the process has exited.
@@ -1266,6 +1265,7 @@ impl CodexAppServerClient {
 
         let mut cmd =
             build_app_server_command(&self.binary_path, config, model_invocation_id, &working_dir)?;
+        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, model_invocation_id)?;
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -1888,6 +1888,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_initialize_request_serialization() {
         let request = json!({
@@ -1910,6 +1911,7 @@ mod tests {
         assert_eq!(parsed["method"], "initialize");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_thread_start_request_serialization() {
         let request = json!({
@@ -1928,6 +1930,7 @@ mod tests {
         assert_eq!(parsed["params"]["input"], "test query");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn thread_start_params_keep_input_as_query_body_and_send_developer_instructions_separately() {
         let config = launch_config_for_prompt_test(
@@ -1951,6 +1954,22 @@ mod tests {
         assert!(!input.contains("/spawn_child"));
     }
 
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn app_server_command_scrubs_every_provider_credential() {
+        let config = launch_config_for_prompt_test("scrub", None);
+        let command = build_app_server_command(
+            Path::new("/usr/bin/codex"),
+            &config,
+            uuid::Uuid::new_v4(),
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        crate::vault::env_scrub::tests::assert_only_injected(&command, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn ordinary_app_server_review_launch_gets_current_invocation_without_authority_token() {
         let session_id = uuid::Uuid::new_v4();
@@ -1989,6 +2008,7 @@ mod tests {
         assert!(!env.contains_key(rsi_common::identity::ENV_SESSION_TOKEN));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn app_server_command_stamps_authenticated_execution_scratch() {
         use crate::sandbox::execution_scratch::SandboxExecutionScratch;
@@ -2049,6 +2069,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn ordinary_app_server_environment_preserves_pre_slice8_ownership_only() {
         let root = std::env::var_os("CARGO_TARGET_DIR")
@@ -2082,6 +2103,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn thread_start_params_omit_developer_instructions_when_no_system_prompt() {
         let config = launch_config_for_prompt_test("plain query", None);
@@ -2091,6 +2113,7 @@ mod tests {
         assert!(params.get("developerInstructions").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn thread_start_params_preserve_dynamic_tool_shape() {
         let config = launch_config_for_prompt_test("query", Some("contract"));
@@ -2113,6 +2136,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn thread_start_params_preserve_manager_tool_schemas() {
         use rsi_common::agent_control_schema::AgentControlVerbV1;
@@ -2148,6 +2172,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_turn_start_request_serialization() {
         let request = json!({
@@ -2166,6 +2191,7 @@ mod tests {
         assert_eq!(parsed["params"]["threadId"], "thread-abc");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_thread_start_response_parses_thread_id() {
         let result = json!({
@@ -2179,6 +2205,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn thread_start_json_rpc_error_and_empty_thread_id_settle_the_admission() {
         for (response_envelope, expected_error_class) in [
@@ -2249,6 +2276,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn terminal_error_notification_normalizes_but_retrying_error_remains_control_only() {
         let terminal = app_server_notification_to_stream_event(
@@ -2279,6 +2307,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn post_admission_missing_binary_settles_before_client_ownership_is_released() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2309,6 +2338,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_approval_request_normalization_all_methods() {
         for method in [
@@ -2338,6 +2368,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_tool_call_event_normalization() {
         let msg = json!({
@@ -2375,6 +2406,7 @@ mod tests {
         assert_eq!(event.data["name"], "rsi_memory_search");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_send_approval_serializes_correct_jsonrpc() {
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -2413,6 +2445,7 @@ mod tests {
         assert_eq!(msg["result"], json!({"decision":"accept"}));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_send_approval_deny() {
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -2449,6 +2482,7 @@ mod tests {
         assert_eq!(msg["result"], json!({"decision":"decline"}));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_start_turn_serializes_correct_request() {
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -2480,6 +2514,7 @@ mod tests {
         assert_eq!(msg["params"]["input"], "continue working");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_start_turn_denial_prevents_second_send() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2531,6 +2566,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_turn_completed_settles_current_turn_exactly_once() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2599,6 +2635,7 @@ mod tests {
         assert_eq!(settled.3, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn completed_turn_requires_a_new_admission_for_the_next_send() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2674,6 +2711,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn real_completion_notification_settles_initial_thread_start_and_allows_followup() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2792,6 +2830,7 @@ mod tests {
         assert_eq!(rows[1].2, "running");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn denied_followup_turn_performs_zero_additional_sends() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2852,6 +2891,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn dropping_session_settles_the_in_flight_turn() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2906,6 +2946,7 @@ mod tests {
         .expect("drop settlement completes");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn turn_start_send_failure_settles_the_admitted_permit() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2946,6 +2987,7 @@ mod tests {
         assert_eq!(settled.1.as_deref(), Some("turn_start_send_failed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_process_error_settles_current_turn_once() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -3021,6 +3063,7 @@ mod tests {
         assert_eq!(settled.1.as_deref(), Some("turn_failed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_supports_multi_turn_true() {
         let (_, event_rx) = mpsc::channel::<StreamEvent>(1);
@@ -3037,6 +3080,7 @@ mod tests {
         assert!(session.supports_multi_turn());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_supports_approvals_true() {
         let (_, event_rx) = mpsc::channel::<StreamEvent>(1);
@@ -3053,6 +3097,7 @@ mod tests {
         assert!(session.supports_approvals());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn token_usage_notification_normalizes_current_window_usage() {
         let event = map_token_usage_notification(&json!({
@@ -3076,6 +3121,7 @@ mod tests {
     /// A mailbox with no consumer left is CLOSED, not overflowing. That is the
     /// pre-existing post-handshake state of `response_rx`, so treating it as
     /// overflow would terminate every healthy live session.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn a_closed_mailbox_is_not_overflow_and_never_terminates_ingress() {
         let plane = Arc::new(AppServerControlPlane::new());
@@ -3118,6 +3164,7 @@ mod tests {
     /// them can tell a transient backlog from a fatal one. Ordinary live turns
     /// back up the 100-slot `event_tx` routinely (a busy monitor under DB
     /// pressure), and the router must recover rather than stay poisoned.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn a_mailbox_that_fills_then_drains_resumes_delivering_evidence() {
         let plane = Arc::new(AppServerControlPlane::new());
@@ -3247,6 +3294,7 @@ mod tests {
     /// running, which wedges the session permanently.
     ///
     /// Driven through the real production reader against a REAL child process.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn ingress_failing_closed_terminates_the_provider_instead_of_abandoning_it() {
         use std::os::unix::process::ExitStatusExt;
@@ -3408,6 +3456,7 @@ mod tests {
     /// later boundary rather than interrupting the provider. The refusal is
     /// PROVED pre-effect here rather than asserted — no byte reaches the writer
     /// channel, which is checked directly.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn an_admitted_message_turn_is_refused_before_any_effect_while_a_turn_is_live() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -3496,6 +3545,7 @@ mod tests {
     /// value. `RejectedBeforeEnqueue` is produced when `Sender::send` returns
     /// the value unsent — positive evidence the bytes were never queued — which
     /// this test drives by dropping the writer's receiving end.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn a_refused_enqueue_maps_to_rejected_before_effect_rather_than_dispatched() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));

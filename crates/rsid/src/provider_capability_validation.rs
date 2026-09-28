@@ -870,7 +870,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     ConsumerContract {
         role: ConsumerRole::RestorationReopen,
         path: "crates/rsid/src/session/lifecycle.rs",
-        symbol: "SessionManager::continue_session_with_delivery",
+        symbol: "SessionManager::continue_session_fenced_inner",
         source: FlowSource::Call("resolve_new_incarnation_context_budget"),
         sinks: &[
             FlowSink::Call("compare_and_update_session_model"),
@@ -901,7 +901,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     ConsumerContract {
         role: ConsumerRole::Rotation,
         path: "crates/rsid/src/session/rotation.rs",
-        symbol: "SessionManager::rotate_completed_session",
+        symbol: "SessionManager::decide_rotation_successor",
         source: FlowSource::Call("resolve_new_incarnation_context_budget"),
         sinks: &[
             FlowSink::StructField("context_window"),
@@ -918,7 +918,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     ConsumerContract {
         role: ConsumerRole::HarnessFullWindowCompaction,
         path: "crates/rsid/src/session/harness/mod.rs",
-        symbol: "HarnessClient::launch",
+        symbol: "HarnessClient::launch_with_binding",
         source: FlowSource::Parameter("resolved_context_budget"),
         sinks: &[FlowSink::Call("run_harness_loop")],
     },
@@ -972,7 +972,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
         path: "crates/rsi/src/ui/session.rs",
         symbol: "render_inspector_context",
         source: FlowSource::Call("detail_rows"),
-        sinks: &[FlowSink::Call("push_inspector_section")],
+        sinks: &[FlowSink::Call("wrap_plain")],
     },
     ConsumerContract {
         role: ConsumerRole::DetailHeaderContext,
@@ -984,8 +984,8 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     ConsumerContract {
         role: ConsumerRole::WideInspectorCompact,
         path: "crates/rsi/src/ui/session.rs",
-        symbol: "render_inspector_runtime",
-        source: FlowSource::FieldPath("runtime.context"),
+        symbol: "render_embedded_session_inspector",
+        source: FlowSource::FieldPath("inspector.runtime.context"),
         sinks: &[FlowSink::Call("compact_label")],
     },
     ConsumerContract {
@@ -2143,12 +2143,14 @@ mod tests {
         (root, snapshot)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn production_repository_is_provider_capability_complete() {
         validate_repository(ValidationInput::production(production_root()))
             .expect("production provider capability contract");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn catches_historical_name_and_effort_only_projection() {
         let (root, mut snapshot) = semantic_root_and_snapshot();
@@ -2172,6 +2174,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn rejects_unknown_catalog_field_drift() {
         let (mut root, _) = semantic_root_and_snapshot();
@@ -2188,6 +2191,7 @@ mod tests {
             .any(|violation| violation.contains("unknown catalog field `future_capacity_hint`")));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn rejects_missing_provenance() {
         let mut input = ValidationInput::production(production_root());
@@ -2213,6 +2217,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn rejects_duplicate_context_mappings() {
         let mappings = &[("gpt-example", 10_000), ("GPT-EXAMPLE", 20_000)];
@@ -2225,6 +2230,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn independent_role_anchor_rejects_inventory_deletion() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2235,6 +2241,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn session_list_compact_row_contract_is_anchored_and_rejects_bypass() {
         let contract = *CONSUMER_INVENTORY
@@ -2274,6 +2281,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn consumer_inventory_rejects_unused_source_decoy_inside_named_symbol() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2303,6 +2311,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn consumer_inventory_accepts_source_to_sink_dataflow() {
         let file = syn::parse_file(
@@ -2330,6 +2339,7 @@ mod tests {
         assert_eq!(analysis.reached_sinks, [true]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn rejects_generated_documentation_drift() {
         let (_, snapshot) = semantic_root_and_snapshot();
@@ -2347,6 +2357,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_is_ast_aware_and_ignores_test_only_mappings() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2372,6 +2383,7 @@ mod tests {
         assert!(!violations[0].contains("gpt-test"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_rejects_mapping_split_across_constants() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2399,6 +2411,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_rejects_helper_return_indirection() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2426,6 +2439,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_rejects_map_insertion() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2453,6 +2467,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_exempts_only_the_exact_canonical_module_path() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2487,6 +2502,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_scan_rejects_obsolete_provider_specific_resolver_calls() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -2507,6 +2523,7 @@ mod tests {
         assert!(violations[0].contains("codex_cli_context_window_for_model"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn schema_fixture_mechanically_covers_catalog_union() {
         let raw = include_bytes!("../tests/fixtures/codex-models-0.155.1-schema.json");

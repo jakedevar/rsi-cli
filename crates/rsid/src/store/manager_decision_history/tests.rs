@@ -32,6 +32,7 @@ fn answer(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn manager_decision_history_preserves_all_pages_and_routes_new_answers_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -243,6 +244,7 @@ fn manager_decision_history_preserves_all_pages_and_routes_new_answers_after_reo
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn manager_decision_history_keeps_agent_metadata_quota_and_uses_current_queue_indexes() {
     let store = Store::open_in_memory().unwrap();

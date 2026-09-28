@@ -214,6 +214,7 @@ mod tests {
 
     // --- chunk_markdown tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_empty_input() {
         let chunks = chunk_markdown("", 100, 10);
@@ -224,6 +225,7 @@ mod tests {
         assert_eq!(chunks[0].text, "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_single_short_line() {
         let chunks = chunk_markdown("hello world", 100, 10);
@@ -233,6 +235,7 @@ mod tests {
         assert_eq!(chunks[0].text, "hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_single_line_exact_boundary() {
         // max_tokens=8 -> max_chars=32. Create a 32-char line.
@@ -242,6 +245,7 @@ mod tests {
         assert_eq!(chunks[0].text, line);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_single_long_line() {
         // max_tokens=8 -> max_chars=32. Create a 100-char line.
@@ -255,6 +259,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_multiple_lines_no_overflow() {
         // max_tokens=100 -> max_chars=400. Several short lines.
@@ -266,6 +271,7 @@ mod tests {
         assert_eq!(chunks[0].text, content);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_multiple_lines_with_flush() {
         // max_tokens=8 -> max_chars=32
@@ -275,6 +281,7 @@ mod tests {
         assert!(chunks.len() >= 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_overlap_carry() {
         // max_tokens=8 -> max_chars=32, overlap=4 -> overlap_chars=16
@@ -287,6 +294,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_zero_overlap() {
         let content = "aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc\ndddddddddd";
@@ -297,6 +305,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_all_empty_lines() {
         let content = "\n\n\n\n\n\n\n\n\n\n";
@@ -305,6 +314,7 @@ mod tests {
         assert!(!chunks.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_unicode_content() {
         let content = "こんにちは世界\n🌍🌎🌏";
@@ -313,6 +323,7 @@ mod tests {
         assert_eq!(chunks[0].text, content);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_hash_determinism() {
         let content = "# Test\n\nSome content here.";
@@ -324,6 +335,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_max_tokens_zero() {
         // Should clamp to max_chars=32, not panic
@@ -331,6 +343,7 @@ mod tests {
         assert!(!chunks.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_chunk_markdown_with_headings() {
         let content = "# Heading 1\n\nSome paragraph text.\n\n## Heading 2\n\n- item 1\n- item 2\n\n```\ncode block\n```";
@@ -343,6 +356,7 @@ mod tests {
 
     // --- enforce_max_input_tokens tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_enforce_max_input_tokens_passthrough() {
         let chunks = vec![
@@ -365,6 +379,7 @@ mod tests {
         assert_eq!(result[1].text, "also short");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_enforce_max_input_tokens_split() {
         let long_text = "a".repeat(20);
@@ -393,6 +408,7 @@ mod tests {
         assert_eq!(result[1].end_line, 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_enforce_max_input_tokens_utf8_boundary() {
         // "é" is 2 bytes in UTF-8
@@ -416,6 +432,7 @@ mod tests {
         assert_eq!(reassembled, text);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_enforce_max_input_tokens_empty_chunks() {
         let result = enforce_max_input_tokens(vec![], 100);
@@ -424,6 +441,7 @@ mod tests {
 
     // --- remap_chunk_lines tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_remap_chunk_lines_basic() {
         let mut chunks = vec![MemoryChunk {
@@ -438,6 +456,7 @@ mod tests {
         assert_eq!(chunks[0].end_line, 30);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_remap_chunk_lines_empty_map() {
         let mut chunks = vec![MemoryChunk {
@@ -451,6 +470,7 @@ mod tests {
         assert_eq!(chunks[0].end_line, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_remap_chunk_lines_out_of_bounds() {
         let mut chunks = vec![MemoryChunk {
@@ -465,6 +485,7 @@ mod tests {
         assert_eq!(chunks[0].end_line, 5); // line 5 -> index 4 -> out of bounds, preserved
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_remap_chunk_lines_single_line() {
         let mut chunks = vec![
@@ -491,6 +512,7 @@ mod tests {
 
     // --- Integration smoke tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_file_pipeline_integration() {
         use crate::memory::files::{build_file_entry, list_memory_files};
@@ -527,6 +549,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_session_pipeline_integration() {
         use crate::memory::session_text::extract_session_text;

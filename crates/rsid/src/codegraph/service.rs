@@ -1,7 +1,11 @@
 //! Shared read core for operator RPC and session-bound native adapters.
 //! Adapters supply authority; this service rechecks live S3 registration on
 //! every call and pins S2 query sessions before reading any facts.
-use std::path::{Component, Path};
+use std::cell::OnceCell;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rsi_codegraph::{
     CodegraphStore, EvidenceView, NodeKind, NodeView, ReadySnapshot, RelationKind, RelationView,
@@ -10,11 +14,14 @@ use rsi_codegraph::{
 };
 use rsi_common::codegraph::*;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
     IndexHandle, IndexWorkspaceBinding, NATIVE_MAX_OUTPUT_BYTES, NATIVE_MAX_OUTPUT_TOKENS,
+    RegisteredWorkspace,
 };
+use crate::store::Store;
 
 #[derive(Debug, Error)]
 pub enum CodegraphServiceError {
@@ -65,6 +72,8 @@ impl BoundCodegraphScope {
 
 pub struct CodegraphReadService<'a> {
     handle: &'a IndexHandle,
+    store: Option<Arc<Mutex<Store>>>,
+    project_roots: OnceCell<Vec<(Uuid, PathBuf, IndexWorkspaceBinding)>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -89,7 +98,19 @@ struct WorkspaceCursorV1 {
 
 impl<'a> CodegraphReadService<'a> {
     pub fn new(handle: &'a IndexHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            store: None,
+            project_roots: OnceCell::new(),
+        }
+    }
+
+    pub fn with_store(handle: &'a IndexHandle, store: Arc<Mutex<Store>>) -> Self {
+        Self {
+            handle,
+            store: Some(store),
+            project_roots: OnceCell::new(),
+        }
     }
 
     /// Operator scope is resolved only against the live project registration.
@@ -130,26 +151,280 @@ impl<'a> CodegraphReadService<'a> {
         project_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<IndexWorkspaceBinding, CodegraphServiceError> {
-        let binding = self
-            .handle
-            .registered_workspace(workspace_id)?
-            .ok_or(CodegraphServiceError::ScopeDenied)?;
-        if binding.workspace.project_id() != project_id {
-            return Err(CodegraphServiceError::ScopeDenied);
+        let store_guard = self.store.as_ref().map(|store| store.blocking_lock());
+        let store = store_guard.as_ref().map(|guard| &**guard);
+        if let Some(store) = store {
+            self.project_roots_from_store(store)?;
         }
-        if binding.workspace.root().canonicalize().ok().as_deref() != Some(binding.workspace.root())
+        let registered = self.handle.registered_workspace(workspace_id)?;
+        if let Some(binding) = registered {
+            return self.registered_binding(project_id, binding, store);
+        }
+        let Some(store) = store else {
+            return Err(CodegraphServiceError::ScopeDenied);
+        };
+        let mut fence = store
+            .codegraph_read_fence()
+            .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
+        drop(store_guard);
+        let store = self.store.as_ref().expect("dormant binding has Store");
+        let started = Instant::now();
+        let mut after = None;
+        let mut scanned = 0usize;
+        loop {
+            let page = {
+                let guard = store.blocking_lock();
+                if !guard
+                    .codegraph_read_fence_matches(&mut fence)
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                {
+                    return Err(CodegraphServiceError::ScopeDenied);
+                }
+                guard
+                    .codegraph_custody_page(after, false, 64)
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+            };
+            if page.is_empty() {
+                return Err(CodegraphServiceError::ScopeDenied);
+            }
+            for row in page {
+                scanned += 1;
+                if scanned > 65_536 || started.elapsed() > Duration::from_secs(30) {
+                    return Err(CodegraphServiceError::ResourceLimit);
+                }
+                after = Some(row.0);
+                let candidate =
+                    CodegraphStore::workspace_id(project_id, &format!("rsi-sandbox:{}", row.0))?;
+                if candidate == workspace_id {
+                    let binding = self
+                        .custody_binding(project_id, row)?
+                        .ok_or(CodegraphServiceError::ScopeDenied)?;
+                    if !store
+                        .blocking_lock()
+                        .codegraph_read_fence_matches(&mut fence)
+                        .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                    {
+                        return Err(CodegraphServiceError::ScopeDenied);
+                    }
+                    return Ok(binding);
+                }
+            }
+        }
+    }
+
+    fn registered_binding(
+        &self,
+        project_id: Uuid,
+        binding: IndexWorkspaceBinding,
+        store: Option<&Store>,
+    ) -> Result<IndexWorkspaceBinding, CodegraphServiceError> {
+        if binding.workspace.project_id() != project_id
+            || binding.workspace.root().canonicalize().ok().as_deref()
+                != Some(binding.workspace.root())
         {
             return Err(CodegraphServiceError::ScopeDenied);
         }
+        if let Some(store) = store {
+            let registered_project = self
+                .project_roots_from_store(store)?
+                .iter()
+                .any(|(id, root, _)| *id == project_id && root == &binding.workspace.project_root);
+            if !registered_project {
+                return Err(CodegraphServiceError::ScopeDenied);
+            }
+            if let rsi_codegraph::WorkspaceInstanceKey::RsiSandbox(custody_id) =
+                &binding.workspace.instance
+            {
+                let row = store
+                    .codegraph_custody_by_id(*custody_id)
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                    .ok_or(CodegraphServiceError::ScopeDenied)?;
+                let resolved = self
+                    .custody_binding(project_id, row)?
+                    .ok_or(CodegraphServiceError::ScopeDenied)?;
+                if resolved.workspace.workspace_id() != binding.workspace.workspace_id()
+                    || resolved.workspace.root() != binding.workspace.root()
+                {
+                    return Err(CodegraphServiceError::ScopeDenied);
+                }
+                return Ok(resolved);
+            }
+            if store
+                .is_known_codegraph_custody_root(binding.workspace.root())
+                .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                && !matches!(
+                    binding.workspace.instance,
+                    rsi_codegraph::WorkspaceInstanceKey::Primary
+                )
+            {
+                return Err(CodegraphServiceError::ScopeDenied);
+            }
+        }
         Ok(binding)
+    }
+
+    fn custody_binding(
+        &self,
+        project_id: Uuid,
+        row: (Uuid, Uuid, PathBuf, PathBuf, i64),
+    ) -> Result<Option<IndexWorkspaceBinding>, CodegraphServiceError> {
+        let (custody_id, _, repo, root, _) = row;
+        if repo.canonicalize().ok().as_ref() != Some(&repo)
+            || root.canonicalize().ok().as_ref() != Some(&root)
+        {
+            return Ok(None);
+        }
+        let projects = self.project_roots()?;
+        let mut matches = Vec::new();
+        for project in projects {
+            let (project_id, project_root, primary) = project;
+            if repo.starts_with(project_root) {
+                matches.push((*project_id, project_root.components().count(), primary));
+            }
+        }
+        let longest = matches.iter().map(|(_, length, _)| *length).max();
+        let mut longest_matches = matches
+            .into_iter()
+            .filter(|(_, length, _)| Some(*length) == longest);
+        let Some((owner, _, primary)) = longest_matches.next() else {
+            return Ok(None);
+        };
+        if longest_matches.next().is_some() || owner != project_id {
+            return Ok(None);
+        }
+        let workspace = RegisteredWorkspace::registered_checkout(
+            project_id,
+            &repo,
+            &root,
+            rsi_codegraph::WorkspaceInstanceKey::RsiSandbox(custody_id),
+        )?;
+        if workspace.root() != root {
+            return Ok(None);
+        }
+        Ok(Some(IndexWorkspaceBinding {
+            workspace,
+            db_path: primary.db_path.clone(),
+        }))
+    }
+
+    fn project_roots(
+        &self,
+    ) -> Result<&Vec<(Uuid, PathBuf, IndexWorkspaceBinding)>, CodegraphServiceError> {
+        if self.project_roots.get().is_none() {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or(CodegraphServiceError::ScopeDenied)?;
+            return self.project_roots_from_store(&store.blocking_lock());
+        }
+        Ok(self
+            .project_roots
+            .get()
+            .expect("Codegraph project roots initialized"))
+    }
+
+    fn project_roots_from_store(
+        &self,
+        store: &Store,
+    ) -> Result<&Vec<(Uuid, PathBuf, IndexWorkspaceBinding)>, CodegraphServiceError> {
+        if self.project_roots.get().is_none() {
+            let projects = store
+                .load_projects()
+                .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
+            let mut roots = Vec::new();
+            for project in projects {
+                let primary_id = CodegraphStore::workspace_id(project.id, "primary")?;
+                if let Some(primary) = self.handle.registered_workspace(primary_id)?
+                    && project
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.canonicalize().ok())
+                        .as_deref()
+                        == Some(primary.workspace.root())
+                {
+                    roots.push((project.id, primary.workspace.root().to_path_buf(), primary));
+                }
+            }
+            let _ = self.project_roots.set(roots);
+        }
+        Ok(self
+            .project_roots
+            .get()
+            .expect("Codegraph project roots initialized"))
+    }
+
+    /// Resolve a continued session before its durable status becomes Starting.
+    /// The exact custody owner and original workspace identity come from Store.
+    pub(crate) fn native_launch_scope(
+        &self,
+        project_id: Uuid,
+        session_id: Uuid,
+        root: &Path,
+    ) -> Result<Option<(Uuid, bool)>, CodegraphServiceError> {
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
+        let binding = if let Some(store) = &self.store {
+            let row = store
+                .blocking_lock()
+                .codegraph_custody_by_root(&root)
+                .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
+            if let Some(row) = row {
+                if row.1 != session_id {
+                    return Ok(None);
+                }
+                self.custody_binding(project_id, row)?
+            } else {
+                if store
+                    .blocking_lock()
+                    .is_known_codegraph_custody_root(&root)
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                {
+                    return Ok(None);
+                }
+                self.handle
+                    .registered_project_workspaces(project_id)?
+                    .into_iter()
+                    .find(|binding| binding.workspace.root() == root)
+            }
+        } else {
+            self.handle
+                .registered_project_workspaces(project_id)?
+                .into_iter()
+                .find(|binding| binding.workspace.root() == root)
+        };
+        let Some(binding) = binding.filter(|binding| binding.workspace.root() == root) else {
+            return Ok(None);
+        };
+        let scope = BoundCodegraphScope::from_daemon_identity(
+            project_id,
+            binding.workspace.workspace_id(),
+            false,
+        );
+        let ready = self.status_with_binding(&scope, &binding)?.ready.is_some();
+        Ok(Some((binding.workspace.workspace_id(), ready)))
     }
 
     pub fn status(
         &self,
         scope: &BoundCodegraphScope,
     ) -> Result<CodegraphStatusV1, CodegraphServiceError> {
-        self.binding(scope.project_id, scope.workspace_id)?;
-        let durable = self.handle.durable_status(scope.workspace_id)?;
+        let binding = self.binding(scope.project_id, scope.workspace_id)?;
+        self.status_with_binding(scope, &binding)
+    }
+
+    fn status_with_binding(
+        &self,
+        scope: &BoundCodegraphScope,
+        binding: &IndexWorkspaceBinding,
+    ) -> Result<CodegraphStatusV1, CodegraphServiceError> {
+        let durable = if binding.db_path.is_file() {
+            CodegraphStore::open(&binding.db_path, scope.project_id)?
+                .index_status(scope.workspace_id)?
+        } else {
+            None
+        };
         let transient = self.handle.status(scope.workspace_id);
         if let Some(ref item) = durable {
             if item.project_id != scope.project_id || item.workspace_id != scope.workspace_id {
@@ -219,56 +494,146 @@ impl<'a> CodegraphReadService<'a> {
             ));
         }
         let project_id = request.project_id;
-        let mut registered = self.handle.registered_project_workspaces(project_id)?;
-        registered.sort_by_key(|binding| binding.workspace.workspace_id());
-        let mut hasher = blake3::Hasher::new();
-        for binding in &registered {
-            hasher.update(binding.workspace.workspace_id().as_bytes());
-            let root = binding.workspace.root().as_os_str().as_encoded_bytes();
-            hasher.update(&(root.len() as u64).to_be_bytes());
-            hasher.update(root);
-        }
-        let digest = hasher.finalize().to_hex().to_string();
-        let start = if let Some(cursor) = request.cursor {
+        let cursor = if let Some(cursor) = request.cursor {
             if cursor.len() > 512 {
                 return Err(CodegraphServiceError::CursorExpired);
             }
             let bytes = hex::decode(cursor).map_err(|_| CodegraphServiceError::CursorExpired)?;
             let cursor: WorkspaceCursorV1 =
                 serde_json::from_slice(&bytes).map_err(|_| CodegraphServiceError::CursorExpired)?;
-            if cursor.project_id != project_id
-                || cursor.registration_digest != digest
-                || cursor.limit != request.limit
-            {
+            if cursor.project_id != project_id || cursor.limit != request.limit {
                 return Err(CodegraphServiceError::CursorExpired);
             }
-            registered
-                .iter()
-                .position(|binding| binding.workspace.workspace_id() == cursor.after_workspace_id)
-                .map(|index| index + 1)
-                .ok_or(CodegraphServiceError::CursorExpired)?
+            Some(cursor)
         } else {
-            0
+            None
         };
-        let has_more = registered.len().saturating_sub(start) > request.limit;
-        let workspaces = registered
-            .into_iter()
-            .skip(start)
-            .take(request.limit)
+        let after_workspace_id = cursor.as_ref().map(|cursor| cursor.after_workspace_id);
+        let mut anchor_seen = after_workspace_id.is_none();
+        let mut next = BTreeMap::<Uuid, IndexWorkspaceBinding>::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"codegraph-registration-v3");
+        let mut record = |binding: IndexWorkspaceBinding, custody: Option<(Uuid, i64)>| {
+            let id = binding.workspace.workspace_id();
+            hasher.update(binding.workspace.project_id().as_bytes());
+            hasher.update(id.as_bytes());
+            if let Some((owner, generation)) = custody {
+                hasher.update(b"custody");
+                hasher.update(owner.as_bytes());
+                hasher.update(&generation.to_be_bytes());
+            } else {
+                hasher.update(b"registered");
+            }
+            let root = binding.workspace.root().as_os_str().as_encoded_bytes();
+            hasher.update(&(root.len() as u64).to_be_bytes());
+            hasher.update(root);
+            if after_workspace_id == Some(id) {
+                anchor_seen = true;
+            }
+            if after_workspace_id.is_none_or(|after| id > after) {
+                next.insert(id, binding);
+                if next.len() > request.limit + 1 {
+                    next.pop_last();
+                }
+            }
+        };
+        let mut registered = self.handle.registered_project_workspaces(project_id)?;
+        registered.sort_by_key(|binding| binding.workspace.workspace_id());
+        let mut fence = if let Some(store) = &self.store {
+            let guard = store.blocking_lock();
+            self.project_roots_from_store(&guard)?;
+            Some(
+                guard
+                    .codegraph_read_fence()
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        for binding in registered {
+            if self.store.is_some()
+                && matches!(
+                    binding.workspace.instance,
+                    rsi_codegraph::WorkspaceInstanceKey::RsiSandbox(_)
+                )
+            {
+                continue;
+            }
+            match self.binding(project_id, binding.workspace.workspace_id()) {
+                Ok(binding) => record(binding, None),
+                Err(CodegraphServiceError::ScopeDenied) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(store) = &self.store {
+            let started = Instant::now();
+            let mut after = None;
+            let mut scanned = 0usize;
+            loop {
+                let page = {
+                    let guard = store.blocking_lock();
+                    if !guard
+                        .codegraph_read_fence_matches(fence.as_mut().expect("Store read fence"))
+                        .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                    {
+                        return Err(CodegraphServiceError::CursorExpired);
+                    }
+                    guard
+                        .codegraph_custody_page(after, false, 64)
+                        .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+                };
+                if page.is_empty() {
+                    break;
+                }
+                for row in page {
+                    scanned += 1;
+                    if scanned > 65_536 || started.elapsed() > Duration::from_secs(30) {
+                        return Err(CodegraphServiceError::ResourceLimit);
+                    }
+                    after = Some(row.0);
+                    let custody = (row.1, row.4);
+                    let binding = self.custody_binding(project_id, row)?;
+                    if let Some(binding) = binding {
+                        record(binding, Some(custody));
+                    }
+                }
+            }
+        }
+        let digest = hasher.finalize().to_hex().to_string();
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.registration_digest != digest)
+            || !anchor_seen
+        {
+            return Err(CodegraphServiceError::CursorExpired);
+        }
+        let has_more = next.len() > request.limit;
+        if has_more {
+            next.pop_last();
+        }
+        let workspaces = next
+            .into_values()
             .map(|binding| {
                 let workspace_id = binding.workspace.workspace_id();
-                let status = self.status(&BoundCodegraphScope::from_daemon_identity(
-                    project_id,
-                    workspace_id,
-                    false,
-                ))?;
-                Ok::<CodegraphWorkspaceV1, CodegraphServiceError>(CodegraphWorkspaceV1 {
+                let scope =
+                    BoundCodegraphScope::from_daemon_identity(project_id, workspace_id, false);
+                let status = self.status_with_binding(&scope, &binding)?;
+                Ok(CodegraphWorkspaceV1 {
                     project_id,
                     workspace_id,
                     status,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, CodegraphServiceError>>()?;
+        if let Some(store) = &self.store {
+            if !store
+                .blocking_lock()
+                .codegraph_read_fence_matches(fence.as_mut().expect("Store read fence"))
+                .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
+            {
+                return Err(CodegraphServiceError::CursorExpired);
+            }
+        }
         let next_cursor = if has_more {
             let last = workspaces.last().expect("nonempty workspace page");
             Some(hex::encode(
@@ -1108,6 +1473,7 @@ fn validate_paths(v: &CodegraphReadValueV1) -> Result<(), CodegraphServiceError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn status_error_projection_is_utf8_and_bounded() {
         let source = "é".repeat(1_000);
@@ -1116,6 +1482,7 @@ mod tests {
         assert!(source.starts_with(&error));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn native_presentation_keeps_whole_records_and_reports_omissions() {
         let id = Uuid::new_v4();
@@ -1193,6 +1560,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn rejects_unsafe_paths_and_invalid_limits() {
         assert!(safe_path("src/lib.rs"));
@@ -1211,6 +1579,7 @@ mod tests {
         let native = to_limits(CodegraphQueryLimitsV1::default(), true).unwrap();
         assert_eq!(native.max_output_bytes, NATIVE_MAX_OUTPUT_BYTES);
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn live_registration_enforces_project_and_workspace_isolation() {
         let root = tempfile::tempdir().unwrap();
@@ -1307,6 +1676,7 @@ mod tests {
             Err(CodegraphServiceError::AmbiguousWorkspace)
         ));
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn snapshot_scope_rejects_cross_project_and_workspace() {
         let project_id = Uuid::new_v4();

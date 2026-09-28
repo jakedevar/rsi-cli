@@ -1,7 +1,8 @@
 //! Typed resolution of preserved work (#634, plan §3.4).
 //!
-//! Operator-only in T2 (`ResolveTopologyAttempt`); T4 adds the scoped agent
-//! verb over the same function. Every action is CAS-fenced on the execution
+//! The operator RPC `ResolveTopologyAttempt` (T2) and the scoped agent verb
+//! `AgentTopologyResolveAttempt` (T4, #633) run the same function; only the
+//! recorded actor differs. Every action is CAS-fenced on the execution
 //! `row_version`, idempotent per key, and audited in `topology_events`.
 
 use rsi_common::rpc::{
@@ -11,11 +12,12 @@ use rsi_common::rpc::{
 use serde_json::json;
 
 use crate::error::{DaemonError, Result};
+use crate::store::Store;
 use crate::topology::custody::{self, node_pin_ref};
 use crate::topology::executor::{Executor, NodeEffects};
 use crate::topology::graph::MAX_ATTEMPTS_PER_NODE;
 use crate::topology::store::{
-    self as rows, AttemptRow, AttemptStatus, ExecutionRow, NewAttempt, ResolutionGate,
+    self as rows, Actor, AttemptRow, AttemptStatus, ExecutionRow, NewAttempt, ResolutionGate,
     ResolutionWrite, failure,
 };
 
@@ -68,7 +70,7 @@ fn validate(params: &ResolveTopologyAttemptParams) -> Result<()> {
     }
 }
 
-fn summary(attempt: &AttemptRow) -> TopologyAttemptSummary {
+pub(crate) fn summary(attempt: &AttemptRow) -> TopologyAttemptSummary {
     TopologyAttemptSummary {
         attempt_id: attempt.id,
         node_id: attempt.node_id.clone(),
@@ -132,6 +134,25 @@ impl<E: NodeEffects> Executor<E> {
         &self,
         params: &ResolveTopologyAttemptParams,
     ) -> Result<ResolveTopologyAttemptResponse> {
+        self.resolve_attempt_as(params, &|_: &Store| Ok(Actor::OPERATOR))
+            .await
+    }
+
+    /// Apply one resolution attributed to the actor `authorize` returns
+    /// (#633). `authorize` runs under every store guard that decides or
+    /// records the resolution — the replay gate, the inspection record and
+    /// the accept/retry/discard write — before any effect, so authority
+    /// revoked during an await refuses and records nothing. The caller
+    /// wakes the execution driver.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "authority is re-checked and the resolution recorded under one guard"
+    )]
+    pub(crate) async fn resolve_attempt_as(
+        &self,
+        params: &ResolveTopologyAttemptParams,
+        authorize: &(dyn Fn(&Store) -> Result<Actor> + Send + Sync),
+    ) -> Result<ResolveTopologyAttemptResponse> {
         validate(params)?;
         let (execution, attempt) = self.load_pair(params).await?;
         let fingerprint = rows::resolution_fingerprint(
@@ -140,12 +161,11 @@ impl<E: NodeEffects> Executor<E> {
             params.expected_row_version,
             params.confirm_preserved_commit.as_deref(),
         );
-        let gate = rows::resolution_gate(
-            &*self.store.lock().await,
-            execution.id,
-            &params.idempotency_key,
-            &fingerprint,
-        )?;
+        let gate = {
+            let store = self.store.lock().await;
+            authorize(&store)?;
+            rows::resolution_gate(&store, execution.id, &params.idempotency_key, &fingerprint)?
+        };
         if matches!(gate, ResolutionGate::Replay) {
             // A replayed discard also finishes any interrupted phase 2.
             if params.action == TopologyAttemptAction::Discard {
@@ -164,13 +184,18 @@ impl<E: NodeEffects> Executor<E> {
         self.effects.before_resolution_record(execution.id).await;
         if params.action == TopologyAttemptAction::Inspect {
             let report = Self::inspect(&attempt);
-            let recorded = rows::record_inspection(
-                &*self.store.lock().await,
-                execution.id,
-                &attempt,
-                &params.idempotency_key,
-                &fingerprint,
-            )?;
+            let recorded = {
+                let store = self.store.lock().await;
+                let actor = authorize(&store)?;
+                rows::record_inspection(
+                    &store,
+                    execution.id,
+                    &attempt,
+                    &params.idempotency_key,
+                    &fingerprint,
+                    actor,
+                )?
+            };
             return match recorded {
                 rows::Recorded::Fresh(updates) => {
                     for update in updates {
@@ -188,14 +213,26 @@ impl<E: NodeEffects> Executor<E> {
                 "only a blocked preserved-work attempt can be accepted, retried or discarded",
             ));
         }
-        let mut write = match params.action {
-            TopologyAttemptAction::Accept => Self::accept_write(&execution, &attempt, params)?,
-            TopologyAttemptAction::Retry => self.retry_write(&execution, &attempt, params).await?,
-            TopologyAttemptAction::Discard => discard_write(&execution, &attempt, params)?,
-            TopologyAttemptAction::Inspect => unreachable!("inspect returned above"),
+        // One guard authorizes, builds (the accept pin is the first effect)
+        // and records the resolution.
+        let recorded = {
+            let store = self.store.lock().await;
+            let actor = authorize(&store)?;
+            let mut write = match params.action {
+                TopologyAttemptAction::Accept => {
+                    Self::accept_write(&execution, &attempt, params, actor)?
+                }
+                TopologyAttemptAction::Retry => {
+                    Self::retry_write(&store, &execution, &attempt, params, actor)?
+                }
+                TopologyAttemptAction::Discard => {
+                    discard_write(&execution, &attempt, params, actor)?
+                }
+                TopologyAttemptAction::Inspect => unreachable!("inspect returned above"),
+            };
+            write.fingerprint = &fingerprint;
+            rows::write_resolution(&store, write)?
         };
-        write.fingerprint = &fingerprint;
-        let recorded = rows::write_resolution(&*self.store.lock().await, write)?;
         let deduplicated = match recorded {
             rows::Recorded::Fresh(updates) => {
                 for update in updates {
@@ -238,6 +275,7 @@ impl<E: NodeEffects> Executor<E> {
         execution: &ExecutionRow,
         attempt: &'a AttemptRow,
         params: &'a ResolveTopologyAttemptParams,
+        actor: Actor,
     ) -> Result<ResolutionWrite<'a>> {
         let sandbox = attempt
             .sandbox_root
@@ -268,21 +306,20 @@ impl<E: NodeEffects> Executor<E> {
             event_kind: "preserved_work_accepted",
             fingerprint: "",
             resume: true,
+            actor,
         })
     }
 
     /// `retry`: only from a verified preservation point, as a new `attempt_no`
     /// forked from `preserved_commit`. The old sandbox and ref are kept.
-    async fn retry_write<'a>(
-        &self,
+    fn retry_write<'a>(
+        store: &Store,
         execution: &ExecutionRow,
         attempt: &'a AttemptRow,
         params: &'a ResolveTopologyAttemptParams,
+        actor: Actor,
     ) -> Result<ResolutionWrite<'a>> {
-        let attempts = {
-            let store = self.store.lock().await;
-            rows::load_attempts(&store, execution.id)?
-        };
+        let attempts = rows::load_attempts(store, execution.id)?;
         let charged = attempts
             .iter()
             .filter(|row| row.node_id == attempt.node_id && row.iteration == attempt.iteration)
@@ -347,6 +384,7 @@ impl<E: NodeEffects> Executor<E> {
             event_kind: "preserved_work_retried",
             fingerprint: "",
             resume: true,
+            actor,
         })
     }
 
@@ -400,6 +438,7 @@ fn discard_write<'a>(
     execution: &ExecutionRow,
     attempt: &'a AttemptRow,
     params: &'a ResolveTopologyAttemptParams,
+    actor: Actor,
 ) -> Result<ResolutionWrite<'a>> {
     let confirm = params
         .confirm_preserved_commit
@@ -425,7 +464,8 @@ fn discard_write<'a>(
         result_commit: None,
         pin_ref: None,
         detail: json!({
-            "actor_kind": "operator",
+            "actor_kind": actor.kind,
+            "actor_session_id": actor.session_id,
             "preserved_commit": attempt.preserved_commit,
             "preserved_ref": attempt.preserved_ref,
         }),
@@ -433,5 +473,6 @@ fn discard_write<'a>(
         event_kind: "preserved_work_discarded",
         fingerprint: "",
         resume: false,
+        actor,
     })
 }

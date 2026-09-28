@@ -30,6 +30,10 @@ pub enum ActionId {
     SettingsDelete,
     SettingsEnable,
     SettingsRefresh,
+    ProviderKeySet,
+    ProviderKeyRotate,
+    ProviderKeyCheck,
+    ProviderKeyImport,
     SettingsSearch,
     SettingsNextMatch,
     SettingsPrevMatch,
@@ -90,6 +94,9 @@ pub enum ActionId {
     ThemeRoleCommit,
     ThemeRoleReset,
     InterruptSession,
+    HardInterruptSession,
+    DowngradeOperatorPause,
+    ClearOperatorPause,
     ContinueSession,
     TogglePin,
     ArchiveSession,
@@ -171,7 +178,6 @@ pub enum ActionId {
     ReassignProject,
     ToggleRotation,
     CancelRetry,
-    ExecuteDocRegBlocks,
     CommitAndPush,
     OpenSessionInNewTab,
     GitPanel,
@@ -269,6 +275,7 @@ pub enum AvailabilitySelector {
     SettingsDelete,
     SettingsEnable,
     SettingsRefresh,
+    ProviderKeys,
     Navigation,
     SessionListConnected,
     ContinueSessionMutation,
@@ -588,7 +595,7 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.editable = facts.exists;
         }
         SettingsSection::Screen => {
-            facts.exists = index < 4;
+            facts.exists = index < 6;
             facts.editable = facts.exists;
         }
         SettingsSection::TranscriptDefaults => {
@@ -648,6 +655,12 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.exists = index < crate::model_control_stats::stats_row_count(app);
             facts.editable =
                 facts.exists && crate::model_control_stats::stats_row_action(app, index).is_some();
+        }
+        SettingsSection::ProviderKeys => {
+            facts.exists =
+                index < rsi_common::provider_credentials::ProviderCredentialSlot::ALL.len();
+            facts.editable = facts.exists;
+            facts.deletable = facts.exists;
         }
         SettingsSection::Budgets => {
             let count = app
@@ -1089,6 +1102,10 @@ const SETTINGS_ADD: &[ActionBinding] = &[binding("a", ActionRoute::Settings)];
 const SETTINGS_DELETE_ITEM: &[ActionBinding] = &[binding("d", ActionRoute::Settings)];
 const SETTINGS_ENABLE: &[ActionBinding] = &[binding("e", ActionRoute::Settings)];
 const SETTINGS_REFRESH: &[ActionBinding] = &[binding("R", ActionRoute::Settings)];
+const PROVIDER_KEY_SET: &[ActionBinding] = &[binding("s", ActionRoute::Settings)];
+const PROVIDER_KEY_ROTATE: &[ActionBinding] = &[binding("r", ActionRoute::Settings)];
+const PROVIDER_KEY_CHECK: &[ActionBinding] = &[binding("c", ActionRoute::Settings)];
+const PROVIDER_KEY_IMPORT: &[ActionBinding] = &[binding("i", ActionRoute::Settings)];
 const SETTINGS_SEARCH: &[ActionBinding] = &[binding("/", ActionRoute::Settings)];
 const SETTINGS_NEXT_MATCH: &[ActionBinding] = &[binding("n", ActionRoute::Settings)];
 const SETTINGS_PREV_MATCH: &[ActionBinding] = &[binding("N", ActionRoute::Settings)];
@@ -1105,10 +1122,10 @@ const NORMAL_MANAGER_POLICY: &[ActionBinding] = &[binding("<Space>gp", ActionRou
 const NORMAL_MANAGER_BOARD: &[ActionBinding] = &[binding("<Space>gb", ActionRoute::Normal)];
 const NORMAL_MANAGER_DECISIONS: &[ActionBinding] = &[binding("<Space>gd", ActionRoute::Normal)];
 const NORMAL_INTERRUPT: &[ActionBinding] = &[binding("x", ActionRoute::Normal)];
-const NORMAL_CONTINUE: &[ActionBinding] = &[
-    binding("X", ActionRoute::Normal),
-    binding("<Space>c", ActionRoute::Normal),
-];
+const NORMAL_HARD_INTERRUPT: &[ActionBinding] = &[binding("X", ActionRoute::Normal)];
+const NORMAL_DOWNGRADE_PAUSE: &[ActionBinding] = &[binding("<Space>hs", ActionRoute::Normal)];
+const NORMAL_CLEAR_PAUSE: &[ActionBinding] = &[binding("<Space>hc", ActionRoute::Normal)];
+const NORMAL_CONTINUE: &[ActionBinding] = &[binding("<Space>c", ActionRoute::Normal)];
 const NORMAL_TOGGLE_PIN: &[ActionBinding] = &[binding("P", ActionRoute::Normal)];
 const NORMAL_ARCHIVE: &[ActionBinding] = &[binding("<Space>a", ActionRoute::Normal)];
 const NORMAL_UNARCHIVE: &[ActionBinding] = &[binding("U", ActionRoute::Normal)];
@@ -1131,12 +1148,15 @@ const NORMAL_QUIT: &[ActionBinding] = &[
 ];
 const NORMAL_PROJECTS: &[ActionBinding] = &[binding("<Space>p", ActionRoute::Normal)];
 const NORMAL_SETTINGS_COMMAND: &[ActionBinding] = &[binding("<Space>,", ActionRoute::Normal)];
-const NORMAL_STOP_ALL: &[ActionBinding] = &[binding("<Space>S", ActionRoute::Normal)];
+const NORMAL_STOP_ALL: &[ActionBinding] = &[binding("<Space>X", ActionRoute::Normal)];
 const NORMAL_ALERTS: &[ActionBinding] = &[binding("<Space>n", ActionRoute::Normal)];
 const NORMAL_GRAPH: &[ActionBinding] = &[binding("<Space>v", ActionRoute::Normal)];
 const NORMAL_LEAD: &[ActionBinding] = &[binding("gL", ActionRoute::Normal)];
 const NORMAL_TASK: &[ActionBinding] = &[binding("<Space>o", ActionRoute::Normal)];
-const NORMAL_BLANK: &[ActionBinding] = &[binding("<Space>m", ActionRoute::Normal)];
+const NORMAL_BLANK: &[ActionBinding] = &[
+    binding("Ctrl-N", ActionRoute::Normal),
+    binding("<Space>N", ActionRoute::Normal),
+];
 const NORMAL_TAB_PREV: &[ActionBinding] = &[binding("<", ActionRoute::Normal)];
 const NORMAL_TAB_NEXT: &[ActionBinding] = &[binding(">", ActionRoute::Normal)];
 const NORMAL_CLOSE_PANE: &[ActionBinding] = &[binding("<Space>q", ActionRoute::Normal)];
@@ -1188,8 +1208,7 @@ const NORMAL_MODEL_DROPDOWN: &[ActionBinding] = &[binding("Ctrl-M", ActionRoute:
 const NORMAL_REASSIGN_PROJECT: &[ActionBinding] = &[binding("<Space>C", ActionRoute::Normal)];
 const NORMAL_TOGGLE_ROTATION: &[ActionBinding] = &[binding("<Space>r", ActionRoute::Normal)];
 const NORMAL_CANCEL_RETRY: &[ActionBinding] = &[binding("<Space>k", ActionRoute::Normal)];
-const NORMAL_EXECUTE_DOC_REG_BLOCKS: &[ActionBinding] = &[binding("<Space>x", ActionRoute::Normal)];
-const NORMAL_COMMIT_AND_PUSH: &[ActionBinding] = &[binding("<Space>X", ActionRoute::Normal)];
+const NORMAL_COMMIT_AND_PUSH: &[ActionBinding] = &[binding("<Space>x", ActionRoute::Normal)];
 const NORMAL_OPEN_SESSION_IN_NEW_TAB: &[ActionBinding] =
     &[binding("<Space>T", ActionRoute::Normal)];
 const NORMAL_GIT_PANEL: &[ActionBinding] = &[binding("<Space>gg", ActionRoute::Normal)];
@@ -1366,6 +1385,7 @@ pub static NORMAL_KEY_RESERVATIONS: &[NormalKeyReservation] = &[
     prefix("gf", "prefix of gf1..gf9 (Vim's gf would open a file path)"),
     inert("<Space>gr", "retired; the label picker is `:group`"),
     inert("<Space>R", "retired; the rating overlay is `:rate`"),
+    inert("<Space>S", "retired emergency-stop chord; use <Space>X"),
     inert("gm", "retired merge-queue chord"),
     inert("g?", "retired; the dialectic overlay is `:ask`"),
     inert("gX", RETIRED_LAUNCHER),
@@ -1594,8 +1614,8 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     },
     ActionDescriptor {
         id: ActionId::InterruptSession,
-        label: "Interrupt running session",
-        summary: "Interrupts the selected running session.",
+        label: "Soft interrupt running session",
+        summary: "Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.",
         category: "SESSION",
         bindings: NORMAL_INTERRUPT,
         command_aliases: &["kill", "ki"],
@@ -1604,9 +1624,42 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::HardInterruptSession,
+        label: "Hard interrupt running session",
+        summary: "Immediately interrupts the selected session and marks it HARD; only the operator may clear it.",
+        category: "SESSION",
+        bindings: NORMAL_HARD_INTERRUPT,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::RunningLeafSessionMutation,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::DowngradeOperatorPause,
+        label: "Downgrade hard pause to soft",
+        summary: "Changes the selected session's HARD marker to SOFT so a granted manager may restart it.",
+        category: "SESSION",
+        bindings: NORMAL_DOWNGRADE_PAUSE,
+        command_aliases: &["pause soft"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::PinSessionMutation,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ClearOperatorPause,
+        label: "Clear operator pause",
+        summary: "Clears the selected session's SOFT or HARD marker.",
+        category: "SESSION",
+        bindings: NORMAL_CLEAR_PAUSE,
+        command_aliases: &["pause clear"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::PinSessionMutation,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::ContinueSession,
         label: "Continue selected session",
-        summary: "Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly.",
+        summary: "`<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly.",
         category: "SESSION",
         bindings: NORMAL_CONTINUE,
         command_aliases: &["continue", "cont"],
@@ -1727,7 +1780,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::SettingsDelete,
         label: "Delete item",
-        summary: "Deletes the selected item from a settings list.",
+        summary: "Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.",
         category: "SETTINGS",
         bindings: SETTINGS_DELETE_ITEM,
         command_aliases: &[],
@@ -1755,6 +1808,50 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::SettingsRefresh,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ProviderKeySet,
+        label: "Set provider key",
+        summary: "Opens the masked Set form for the selected provider key slot.",
+        category: "SETTINGS",
+        bindings: PROVIDER_KEY_SET,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::ProviderKeys,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ProviderKeyRotate,
+        label: "Rotate provider key",
+        summary: "Opens the masked Rotate form for the selected provider key slot.",
+        category: "SETTINGS",
+        bindings: PROVIDER_KEY_ROTATE,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::ProviderKeys,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ProviderKeyCheck,
+        label: "Check provider key",
+        summary: "Checks the selected provider key slot with its provider.",
+        category: "SETTINGS",
+        bindings: PROVIDER_KEY_CHECK,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::ProviderKeys,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ProviderKeyImport,
+        label: "Import provider keys",
+        summary: "Imports available provider keys from the process environment into vault slots.",
+        category: "SETTINGS",
+        bindings: PROVIDER_KEY_IMPORT,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::ProviderKeys,
         show_in_help: true,
     },
     ActionDescriptor {
@@ -2444,7 +2541,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::StopAll,
         label: "Emergency stop all",
-        summary: "Emergency stop: denies new paid work and cancels live model invocations.",
+        summary: "Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD.",
         category: "SESSION",
         bindings: NORMAL_STOP_ALL,
         command_aliases: &["stopall", "stop-all"],
@@ -3091,17 +3188,6 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
-        id: ActionId::ExecuteDocRegBlocks,
-        label: "Run docregblock tags",
-        summary: "Launches a session for every docregblock tag in the selected session's output.",
-        category: "SESSION",
-        bindings: NORMAL_EXECUTE_DOC_REG_BLOCKS,
-        command_aliases: &[],
-        command_argument: CommandArgument::None,
-        availability: AvailabilitySelector::Always,
-        show_in_help: true,
-    },
-    ActionDescriptor {
         id: ActionId::CommitAndPush,
         label: "Commit and push",
         summary: "Continues the selected session with `/ci_commit` to commit and push its work.",
@@ -3165,7 +3251,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
-        show_in_help: true,
+        show_in_help: false,
     },
     ActionDescriptor {
         id: ActionId::PromptCreator,
@@ -3679,6 +3765,7 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                         | SettingsSection::ClaudeHooks
                         | SettingsSection::ClaudeSkills
                         | SettingsSection::Budgets
+                        | SettingsSection::ProviderKeys
                 )
         }
         SettingsEnable => {
@@ -3686,6 +3773,12 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 && context.settings_focus == SettingsFocus::Items
                 && context.settings_row_enableable
                 && context.settings_category == SettingsSection::ClaudeSkills
+        }
+        ProviderKeys => {
+            context.surface == ActionSurface::Settings
+                && context.settings_focus == SettingsFocus::Items
+                && context.settings_category == SettingsSection::ProviderKeys
+                && context.settings_row_exists
         }
         SettingsRefresh => {
             context.surface == ActionSurface::Settings
@@ -3755,8 +3848,18 @@ pub fn available_actions(context: &ActionContext) -> Vec<AvailableAction> {
         .collect()
 }
 
+/// Count the descriptors shown by the complete help reference.
+#[must_use]
+pub fn all_commands_descriptor_count() -> usize {
+    ACTION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.id != ActionId::OpenRecentFile)
+        .count()
+}
+
 /// The complete help reference, grouped in the same chapter order as the manual.
-/// Descriptor rows are intentionally independent of `show_in_help`.
+/// Most descriptors remain available here even when hidden from contextual help;
+/// recent-file slots are omitted from both help views.
 #[must_use]
 pub fn all_commands_sections(context: &ActionContext) -> Vec<(String, Vec<String>)> {
     use crate::manual::model::MANUAL_CHAPTERS;
@@ -3765,6 +3868,7 @@ pub fn all_commands_sections(context: &ActionContext) -> Vec<(String, Vec<String
         let mut rows = Vec::new();
         for descriptor in ACTION_DESCRIPTORS
             .iter()
+            .filter(|descriptor| descriptor.id != ActionId::OpenRecentFile)
             .filter(|descriptor| chapter.categories.contains(&descriptor.category))
         {
             let marker = if matches!(
@@ -4019,6 +4123,9 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::OpenColorCustomizer => ActionId::OpenLegacyColors,
         LcAction::OpenIssuesWorkspace => ActionId::OpenIssuesWorkspace,
         LcAction::InterruptSession => ActionId::InterruptSession,
+        LcAction::HardInterruptSession => ActionId::HardInterruptSession,
+        LcAction::DowngradeOperatorPause => ActionId::DowngradeOperatorPause,
+        LcAction::ClearOperatorPause => ActionId::ClearOperatorPause,
         LcAction::QuickContinue => ActionId::ContinueSession,
         LcAction::TogglePinSession => ActionId::TogglePin,
         LcAction::ArchiveSession => ActionId::ArchiveSession,
@@ -4204,6 +4311,7 @@ pub enum OverlayHelpClass {
     CardEditor,
     Dialectic,
     InputModal,
+    ProviderCredentialForm,
 }
 
 impl OverlayHelpClass {
@@ -4265,6 +4373,7 @@ impl OverlayHelpClass {
         Self::CardEditor,
         Self::Dialectic,
         Self::InputModal,
+        Self::ProviderCredentialForm,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -4327,6 +4436,7 @@ impl OverlayHelpClass {
             Self::CardEditor => 53,
             Self::Dialectic => 54,
             Self::InputModal => 55,
+            Self::ProviderCredentialForm => 56,
         }
     }
 }
@@ -4354,7 +4464,7 @@ const LIST_NAV: &[OverlayHelpEntry] = &[
 /// `overlay::handle_text_overlay_prompt_leader` for non-text overlays.
 const OVERLAY_LEADER: &[OverlayHelpEntry] = &[
     act("Space o", "Close and open a TaskRabbit session prompt"),
-    act("Space m", "Close and open a blank session prompt"),
+    act("Space N", "Close and open a blank session prompt"),
     act("Space ;", "Open the command palette"),
 ];
 const CREATE_ENTITY_COMMON: &[OverlayHelpEntry] = &[
@@ -4895,6 +5005,15 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             ],
             TEXT_SURFACE,
         ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::ProviderCredentialForm,
+        title: "Provider Key Form",
+        groups: &[&[
+            edit("Type / Backspace", "Edit masked credential"),
+            act("Enter", "Save credential"),
+            close("Esc", "Cancel and scrub"),
+        ]],
     },
     OverlayHelpRoute {
         class: OverlayHelpClass::MessageBridgeForm,
@@ -5448,6 +5567,7 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::ProjectForm { .. } => Routed(C::ProjectForm),
         OverlayState::LabelForm { .. } => Routed(C::LabelForm),
         OverlayState::ProviderForm { .. } => Routed(C::ProviderForm),
+        OverlayState::ProviderCredentialForm { .. } => Routed(C::ProviderCredentialForm),
         OverlayState::MessageBridgeForm { .. } => Routed(C::MessageBridgeForm),
         OverlayState::HookForm { .. } => Routed(C::HookForm),
         OverlayState::HookConflictPrompt { .. } => Routed(C::HookConflict),
@@ -6822,7 +6942,7 @@ mod tests {
         fn keys(sequence: &str) -> Vec<String> {
             if matches!(
                 sequence,
-                "Enter" | "Backspace" | "F2" | "F3" | "Ctrl-M" | "Ctrl-Alt-G"
+                "Enter" | "Backspace" | "F2" | "F3" | "Ctrl-M" | "Ctrl-N" | "Ctrl-Alt-G"
             ) {
                 return vec![sequence.to_string()];
             }
@@ -6941,13 +7061,11 @@ mod tests {
                 ActionId::ReassignProject,
                 ActionId::ToggleRotation,
                 ActionId::CancelRetry,
-                ActionId::ExecuteDocRegBlocks,
                 ActionId::CommitAndPush,
                 ActionId::OpenSessionInNewTab,
                 ActionId::GitPanel,
                 ActionId::FileExplorer,
                 ActionId::Telescope,
-                ActionId::OpenRecentFile,
                 ActionId::PromptCreator,
                 ActionId::CommandPalette,
                 ActionId::QuestionModal,
@@ -6964,6 +7082,29 @@ mod tests {
                 ActionId::MoveToRoot,
             ]
         );
+    }
+
+    #[test]
+    fn recent_file_navigation_stays_bound_while_help_shows_file_explorer() {
+        let recent = ACTION_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.id == ActionId::OpenRecentFile)
+            .expect("recent file action remains registered for navigation");
+        assert_eq!(recent.bindings.len(), 9);
+        assert!(!recent.show_in_help);
+
+        let context = ActionContext {
+            surface: ActionSurface::SessionList,
+            has_selection: true,
+            ..ActionContext::default()
+        };
+        let sections = all_commands_sections(&context);
+        let rows: Vec<&str> = sections
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(String::as_str))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("File explorer")));
+        assert!(rows.iter().all(|row| !row.contains("Open recent file N")));
     }
 
     #[test]
@@ -7031,6 +7172,7 @@ mod tests {
             OverlayState::ProjectForm { .. } => "ProjectForm",
             OverlayState::FileExplorer { .. } => "FileExplorer",
             OverlayState::ProviderForm { .. } => "ProviderForm",
+            OverlayState::ProviderCredentialForm { .. } => "ProviderCredentialForm",
             OverlayState::MessageBridgeForm { .. } => "MessageBridgeForm",
             OverlayState::HookForm { .. } => "HookForm",
             OverlayState::BudgetPolicyForm { .. } => "BudgetPolicyForm",
@@ -7701,6 +7843,21 @@ mod tests {
             crate::overlay::provider_form::open_provider_form(&mut app, None);
             let overlay = std::mem::replace(&mut app.overlay, OverlayState::None);
             push("ProviderForm", &app, overlay, Routed(C::ProviderForm));
+        }
+        {
+            let mut app = fixture_app();
+            crate::overlay::provider_credential_form::open_provider_credential_form(
+                &mut app,
+                rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
+                false,
+            );
+            let overlay = std::mem::replace(&mut app.overlay, OverlayState::None);
+            push(
+                "ProviderCredentialForm",
+                &app,
+                overlay,
+                Routed(C::ProviderCredentialForm),
+            );
         }
         push(
             "MessageBridgeForm",

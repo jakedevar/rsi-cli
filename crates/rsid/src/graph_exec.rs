@@ -202,6 +202,7 @@ mod tests {
             .with_edge(EdgeDef::new("b", "c"))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn execute_simple_three_node_pipeline_succeeds() {
         let workflow = three_node_pipeline();
@@ -226,6 +227,7 @@ mod tests {
         assert_eq!(updates.lock().unwrap().len(), 6);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn execute_workflow_with_invalid_compilation_returns_error() {
         let workflow = WorkflowDefinition::new("bad")
@@ -240,6 +242,7 @@ mod tests {
         assert!(result.error.unwrap().contains("Compilation failed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn node_lifecycle_updates_cover_all_nodes() {
         let workflow = three_node_pipeline();
@@ -274,6 +277,7 @@ mod tests {
         assert_eq!(succeeded, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn cancellation_aborts_before_node_execution() {
         let workflow = three_node_pipeline();

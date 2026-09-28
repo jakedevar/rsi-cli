@@ -26,6 +26,7 @@ pub mod profiling;
 pub mod prompt_creator;
 pub mod prompt_creator_keys;
 pub mod prompt_processor;
+pub mod provider_credential_rows;
 pub mod settings;
 pub mod settings_keys;
 pub mod settings_registry;

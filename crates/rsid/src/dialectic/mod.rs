@@ -541,6 +541,7 @@ mod production_path_tests {
             .expect("invocation row")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn admitted_dialectic_request_uses_loopback_and_settles_completed() {
         let (api_url, requests, server) = response_server(
@@ -568,6 +569,7 @@ mod production_path_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn denied_dialectic_request_sends_nothing() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -603,6 +605,7 @@ mod production_path_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn failed_dialectic_request_settles_failed_once() {
         let (api_url, requests, server) =
@@ -626,6 +629,7 @@ mod production_path_tests {
         assert!(error_class.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(start_paused = true)]
     async fn outer_timeout_settles_admitted_dialectic_invocation_exactly_once() {
         let listener = TcpListener::bind("127.0.0.1:0")

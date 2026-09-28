@@ -580,6 +580,7 @@ mod tests {
     /// the `Lagged` arm now calls) against an active session whose current
     /// turn already contains the `/halt` directive, and asserts it recovers
     /// the session id that the missed bus event would have carried.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn find_missed_halt_directive_recovers_current_turn_halt() {
         let (manager, _dir) = manager();
@@ -607,6 +608,7 @@ mod tests {
     /// false-positive the catch-up scan — mirrors the live monitor path,
     /// which clears `accumulated_assistant_content` on every `Role::User`
     /// event.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn find_missed_halt_directive_ignores_stale_prior_turn_halt() {
         let (manager, _dir) = manager();

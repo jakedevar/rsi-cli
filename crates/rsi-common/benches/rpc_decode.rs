@@ -19,6 +19,7 @@ const LAUNCH_SESSION_FRAME: &[u8] = br#"{
         "working_dir": "/home/jake/rsi",
         "provider": "Claude",
         "model": "claude-opus-4-7",
+        "tags": ["benchmark"],
         "system_prompt": null,
         "session_kind": "Standard",
         "max_retries": 0

@@ -57,6 +57,10 @@ pub fn parse_command(input: &str) -> CommandResult {
 
         // :kill / :ki — interrupt session
         ActionId::InterruptSession => CommandResult::LcAction(LcAction::InterruptSession),
+        ActionId::DowngradeOperatorPause => {
+            CommandResult::LcAction(LcAction::DowngradeOperatorPause)
+        }
+        ActionId::ClearOperatorPause => CommandResult::LcAction(LcAction::ClearOperatorPause),
 
         // :delete / :del — delete selected session
         ActionId::DeleteSession => CommandResult::LcAction(LcAction::DeleteSession),
@@ -448,6 +452,18 @@ mod tests {
         assert_eq!(
             parse_command("ki"),
             CommandResult::LcAction(LcAction::InterruptSession)
+        );
+    }
+
+    #[test]
+    fn operator_pause_commands_select_explicit_changes() {
+        assert_eq!(
+            parse_command("pause soft"),
+            CommandResult::LcAction(LcAction::DowngradeOperatorPause)
+        );
+        assert_eq!(
+            parse_command("pause clear"),
+            CommandResult::LcAction(LcAction::ClearOperatorPause)
         );
     }
 

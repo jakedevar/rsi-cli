@@ -325,21 +325,25 @@ async fn run_clear_failure(retain_first_cleanup: bool, crash: Option<CrashWindow
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_v2_question_clear_failure_settles_spawned_provider_and_keeps_uncertainty() {
     run_clear_failure(false, None).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_v2_question_clear_failure_retains_capacity_until_checked_reap_succeeds() {
     run_clear_failure(true, None).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_v2_answer_reopen_before_cleanup_marker_does_not_copy_prior_zero_cost() {
     run_clear_failure(false, Some(CrashWindow::BeforeCleanup)).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_v2_answer_reopen_after_failed_cleanup_marker_preserves_unknown_spend() {
     run_clear_failure(false, Some(CrashWindow::FailedMarker)).await;

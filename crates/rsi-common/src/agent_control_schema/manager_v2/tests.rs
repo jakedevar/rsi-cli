@@ -89,6 +89,9 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"update":"dependency","key":"w","expected_row_version":1,"prerequisite":"base","require_integrated":true,"enabled":true}),
         json!({"update":"ownership","key":"w","expected_row_version":1,"domain":"domain","mode":"exclusive","files":["file.rs"],"active":true}),
         json!({"update":"migration","key":"w","expected_row_version":1,"version":105,"baseline_commit":"a".repeat(40),"inventory_digest":"digest"}),
+        json!({"update":"migration_seal","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"expires_at":"2026-09-27T10:00:00.000000000Z"}),
+        json!({"update":"migration_seal_release","key":"w","expected_row_version":1,"claim_id":id,"source_commit":"a".repeat(40)}),
+        json!({"update":"migration_seal_transfer","key":"w","expected_row_version":1,"claim_id":id,"source_commit":"a".repeat(40),"new_source_commit":"b".repeat(40),"expires_at":"2026-09-27T10:00:00.000000000Z"}),
         json!({"update":"migration_transfer","key":"new-holder","expected_row_version":1,"version":105}),
         json!({"update":"migration_release","key":"w","expected_row_version":2,"version":105}),
         json!({"update":"request_review","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"query":"Review exact source","launch":launch}),
@@ -160,6 +163,10 @@ fn inspect_defaults_pages_and_provider_alias_follow_the_shared_contract() {
     assert!(accepts(&inspect(), &serde_json::to_value(default).unwrap()));
     assert!(accepts(&inspect(), &json!({"section":"archive","limit":1})));
     assert!(accepts(&inspect(), &json!({"section":"health","limit":1})));
+    assert!(accepts(
+        &inspect(),
+        &json!({"section":"migration_allocations","limit":1})
+    ));
     let health =
         serde_json::from_value::<AgentManagerInspectRequestV2>(json!({"section":"health"}))
             .map(|request| request.section);

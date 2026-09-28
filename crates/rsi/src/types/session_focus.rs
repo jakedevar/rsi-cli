@@ -258,6 +258,33 @@ mod tests {
     }
 
     #[test]
+    fn container_inherits_nested_descendant_recency() {
+        let now = Utc::now();
+        let group_id = Uuid::new_v4();
+        let epic_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut group = baseline_session(group_id, SessionKind::Group);
+        group.status = SessionStatus::Completed;
+        group.updated_at = now - chrono::Duration::days(30);
+        let mut epic = baseline_session(epic_id, SessionKind::Epic);
+        epic.status = SessionStatus::Completed;
+        epic.parent_id = Some(group_id);
+        epic.updated_at = now - chrono::Duration::days(20);
+        let mut child = baseline_session(child_id, SessionKind::Standard);
+        child.status = SessionStatus::Completed;
+        child.parent_id = Some(epic_id);
+        child.updated_at = now - chrono::Duration::hours(4);
+        let sessions = HashMap::from([
+            (group_id, SessionState::new(group)),
+            (epic_id, SessionState::new(epic)),
+            (child_id, SessionState::new(child)),
+        ]);
+        let index = compute_session_focus_index(&sessions, now);
+        assert_eq!(index[&epic_id].group, SessionFocusGroup::Recent);
+        assert_eq!(index[&group_id].group, SessionFocusGroup::Recent);
+    }
+
+    #[test]
     fn direct_states_map_to_stable_focus_groups() {
         let now = Utc::now();
         let waiting_id = Uuid::new_v4();

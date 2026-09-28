@@ -989,6 +989,75 @@ pub(crate) async fn execute_manager_tool(
     }
 }
 
+/// Scoped agent topology tools (#633): the registration-bound caller reaches
+/// the same guarded service as the token-authenticated `AgentTopology*` RPC
+/// verbs. `verb` is one of `topology_agent_verbs::TOPOLOGY_AGENT_VERBS`.
+pub(crate) async fn execute_topology_tool(
+    control: &AgentControlHandle,
+    caller: Uuid,
+    verb: AgentControlVerbV1,
+    args: serde_json::Value,
+) -> crate::error::Result<serde_json::Value> {
+    control
+        .topology_manager()?
+        .agent_topology_call(caller, verb, &args)
+        .await
+}
+
+/// Native tool name of a catalogued topology verb.
+pub(crate) fn topology_tool_name(verb: AgentControlVerbV1) -> &'static str {
+    verb.descriptor().native_tool.map_or(
+        "",
+        rsi_common::agent_control_schema::NativeAgentControlToolV1::name,
+    )
+}
+
+pub struct RsiControlTopologyTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+    verb: AgentControlVerbV1,
+}
+
+impl RsiControlTopologyTool {
+    pub const fn new(
+        control: AgentControlHandle,
+        caller_session_id: Uuid,
+        verb: AgentControlVerbV1,
+    ) -> Self {
+        Self {
+            control,
+            caller_session_id,
+            verb,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlTopologyTool {
+    fn name(&self) -> &str {
+        topology_tool_name(self.verb)
+    }
+
+    fn description(&self) -> &str {
+        self.verb.descriptor().description
+    }
+
+    fn parameters_json(&self) -> &str {
+        self.verb.descriptor().parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        match execute_topology_tool(&self.control, self.caller_session_id, self.verb, args).await {
+            Ok(value) => ToolResult {
+                success: true,
+                output: value.to_string(),
+                error_msg: None,
+            },
+            Err(error) => err(crate::session::topology_agent_verbs::error_json(error)),
+        }
+    }
+}
+
 pub struct RsiControlManagerTool {
     control: AgentControlHandle,
     caller_session_id: Uuid,
@@ -1084,6 +1153,7 @@ impl HarnessTool for RsiControlHaltTool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn manager_native_tools_reject_identity_and_redact_malformed_args() {
         let control = test_control_handle();
@@ -1158,6 +1228,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn manager_native_tools_validate_page_and_message_bounds_before_service() {
         let control = test_control_handle();
@@ -1195,6 +1266,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn d05_program_run_authority_fields_are_absent_from_native_schemas() {
@@ -1225,6 +1297,7 @@ mod tests {
     /// The bound caller session id is a private field set at construction and
     /// is NOT present in any tool's JSON input schema — the agent can neither
     /// supply nor spoof it. (Native-tool session-binding ratchet.)
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn caller_session_id_is_never_in_the_input_schema() {
         for schema in rsi_common::agent_control_schema::agent_control_catalog_v1()
@@ -1249,6 +1322,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn successor_schema_uses_baton_specific_language() {
         let successor = AgentControlVerbV1::ReserveSuccessor
@@ -1264,6 +1338,7 @@ mod tests {
         assert!(!successor.contains("child's initial prompt"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn spawn_schema_accepts_an_explicit_child_provider() {
         let request = spawn_request_from_args(&serde_json::json!({
@@ -1281,6 +1356,7 @@ mod tests {
         assert_eq!(request.model.as_deref(), Some("claude-sonnet-5"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn spawn_schema_accepts_explicit_pioneer_child_provider() {
         let request = spawn_request_from_args(&serde_json::json!({
@@ -1318,6 +1394,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_issue_harness_parser_and_authority_failures_use_safe_envelopes() {
         use rsi_common::rpc::{
@@ -1415,6 +1492,7 @@ mod tests {
     /// caller is absent from the empty maps the guarded verb returns
     /// "not found", proving both the binding and that the call reached the
     /// shared authority path. (Native-tool session-binding ratchet.)
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn status_tool_binds_caller_and_routes_through_guarded_verb() {
         let control = test_control_handle();
@@ -1431,6 +1509,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn progress_tool_binds_caller_and_routes_through_guarded_verb() {
         let control = test_control_handle();
@@ -1449,6 +1528,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn program_guard_tool_is_argument_free_and_routes_bound_caller() {
         let control = test_control_handle();
@@ -1480,6 +1560,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn progress_tool_rejects_257_duplicate_entries_before_authorization() {
         let control = test_control_handle();
@@ -1504,6 +1585,7 @@ mod tests {
     /// P2-03: the send schema forbids every sender-identity spelling, so the
     /// advertised contract cannot invite an agent to name its own sender, and
     /// the strict parser refuses one even if an agent guesses a field name.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn send_message_schema_and_parser_reject_every_sender_field() {
         let schema = AgentControlVerbV1::SendMessage.descriptor().parameters();
@@ -1576,6 +1658,7 @@ mod tests {
 
     /// The native tool routes through the same guarded handle as the RPC verb,
     /// so an unauthorized target is refused identically here.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn send_message_tool_denies_an_unauthorized_target() {
         let control = test_control_handle();
@@ -1601,6 +1684,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn halt_tool_rejects_malformed_session_id() {
         let control = test_control_handle();

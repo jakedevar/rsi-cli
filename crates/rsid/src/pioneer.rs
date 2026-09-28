@@ -87,7 +87,7 @@ impl fmt::Debug for PioneerCredential {
 #[derive(Debug, Error)]
 pub enum PioneerError {
     #[error(
-        "Pioneer credential is not configured; set {PIONEER_PRIMARY_ENV} or {PIONEER_FALLBACK_ENV}"
+        "Pioneer credential is not configured; set it in the RSI key vault (SetProviderCredential) or export {PIONEER_PRIMARY_ENV} or {PIONEER_FALLBACK_ENV}"
     )]
     MissingCredential,
     #[error("Pioneer catalog HTTP client could not be configured")]
@@ -118,26 +118,74 @@ pub enum PioneerError {
     CacheIo(std::io::ErrorKind),
 }
 
-/// Resolves the Pioneer credential using the documented environment precedence.
+/// Resolves the Pioneer credential through the key vault: a vault entry,
+/// then (unless cleared) `PIONEER_AI_INFERENCE` / `PIONEER_API_KEY` under
+/// `vault.env_compat`.
 ///
 /// # Errors
 ///
-/// Returns [`PioneerError::MissingCredential`] when neither environment variable
-/// contains a non-blank credential.
-pub fn pioneer_credential_from_env() -> Result<PioneerCredential, PioneerError> {
-    resolve_credential_with(|name| std::env::var(name).ok())
+/// Returns [`PioneerError::MissingCredential`] when the slot does not resolve.
+pub fn pioneer_credential() -> Result<PioneerCredential, PioneerError> {
+    pioneer_credential_from(&crate::vault::global())
+}
+
+/// Vault-resolved Pioneer credential. A vault value is injected under the
+/// primary env name; an env-compat value keeps the name it came from.
+///
+/// # Errors
+///
+/// Returns [`PioneerError::MissingCredential`] when the slot does not resolve.
+pub fn pioneer_credential_from(
+    vault: &crate::vault::VaultHandle,
+) -> Result<PioneerCredential, PioneerError> {
+    let resolved = vault
+        .resolve(crate::vault::Slot::Pioneer)
+        .ok()
+        .flatten()
+        .ok_or(PioneerError::MissingCredential)?;
+    let source = if resolved.env_var == Some(PIONEER_FALLBACK_ENV) {
+        PioneerCredentialSource::ApiKey
+    } else {
+        PioneerCredentialSource::AiInference
+    };
+    Ok(PioneerCredential {
+        source,
+        value: resolved.secret.expose().to_string(),
+    })
 }
 
 #[must_use]
 pub fn pioneer_provider_available(codex_cli_available: bool) -> bool {
-    pioneer_provider_available_with(codex_cli_available, |name| std::env::var(name).ok())
+    crate::vault::provider_available(
+        &crate::vault::global(),
+        crate::vault::Slot::Pioneer,
+        codex_cli_available,
+    )
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+fn env_only_vault(
+    read: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+) -> crate::vault::VaultHandle {
+    crate::vault::VaultHandleBuilder::new(std::sync::Arc::new(
+        crate::vault::VaultSettings::default(),
+    ))
+    .env(read)
+    .open()
+    .expect("file-less vault opens")
+}
+
+#[cfg(test)]
 fn pioneer_provider_available_with(
     codex_cli_available: bool,
-    read: impl FnMut(&str) -> Option<String>,
+    read: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
 ) -> bool {
-    codex_cli_available && resolve_credential_with(read).is_ok()
+    crate::vault::provider_available(
+        &env_only_vault(read),
+        crate::vault::Slot::Pioneer,
+        codex_cli_available,
+    )
 }
 
 /// Fetches the current Pioneer account catalog, atomically refreshes the RSI
@@ -147,9 +195,24 @@ fn pioneer_provider_available_with(
 ///
 /// Returns a secret-safe credential, transport, catalog, or cache error.
 pub async fn discover_pioneer_models() -> Result<Vec<(String, String)>, PioneerError> {
-    let credential = pioneer_credential_from_env()?;
     let client = PioneerCatalogClient::new()?;
-    discover_pioneer_models_with(&client, &credential, &rsi_common::identity::data_dir()).await
+    discover_pioneer_models_from(
+        &crate::vault::global(),
+        &client,
+        &rsi_common::identity::data_dir(),
+    )
+    .await
+}
+
+/// Discovery with the credential resolved through `vault` (vault entry, then
+/// env compat), so a vault-only key is discoverable.
+async fn discover_pioneer_models_from(
+    vault: &crate::vault::VaultHandle,
+    client: &PioneerCatalogClient,
+    data_dir: &Path,
+) -> Result<Vec<(String, String)>, PioneerError> {
+    let credential = pioneer_credential_from(vault)?;
+    discover_pioneer_models_with(client, &credential, data_dir).await
 }
 
 async fn discover_pioneer_models_with(
@@ -166,24 +229,11 @@ async fn discover_pioneer_models_with(
         .collect())
 }
 
+#[cfg(test)]
 fn resolve_credential_with(
-    mut read: impl FnMut(&str) -> Option<String>,
+    read: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
 ) -> Result<PioneerCredential, PioneerError> {
-    for source in [
-        PioneerCredentialSource::AiInference,
-        PioneerCredentialSource::ApiKey,
-    ] {
-        if let Some(value) = read(source.env_name()) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Ok(PioneerCredential {
-                    source,
-                    value: value.to_string(),
-                });
-            }
-        }
-    }
-    Err(PioneerError::MissingCredential)
+    pioneer_credential_from(&env_only_vault(read))
 }
 
 #[derive(Clone)]
@@ -612,6 +662,7 @@ mod tests {
         serde_json::from_slice(CATALOG_FIXTURE).unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_catalog_projects_only_valid_top_level_models_deterministically() {
         let catalog = PioneerCatalog::parse(CATALOG_FIXTURE).unwrap();
@@ -647,6 +698,7 @@ mod tests {
         assert_eq!(models[4].display_name, "Pioneer Auto Router");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_launch_model_defaults_and_migrates_only_retired_router() {
         assert_eq!(pioneer_launch_model(None), PIONEER_DEFAULT_MODEL);
@@ -660,6 +712,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_catalog_does_not_synthesize_models_absent_from_live_catalog() {
         let catalog = PioneerCatalog::parse(
@@ -680,6 +733,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn cached_pioneer_model_availability_uses_the_filtered_catalog() {
         let directory = tempfile::tempdir().unwrap();
@@ -706,6 +760,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_catalog_rejects_malformed_missing_non_array_empty_and_oversized() {
         assert!(matches!(
@@ -728,6 +783,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_credentials_prefer_primary_trim_and_fall_back_safely() {
         let preferred = resolve_credential_with(|name| match name {
@@ -755,6 +811,7 @@ mod tests {
         assert!(!format!("{preferred:?}").contains("preferred"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_availability_requires_codex_boundary_and_supported_credential() {
         assert!(!pioneer_provider_available_with(false, |_| Some(
@@ -769,6 +826,7 @@ mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn pioneer_client_uses_exact_get_auth_and_top_level_models() {
         let server = MockServer::start().await;
@@ -797,6 +855,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn pioneer_client_timeout_is_bounded() {
         let server = MockServer::start().await;
@@ -824,6 +883,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn pioneer_discovery_returns_current_projection_and_refreshes_exact_cache() {
         let server = MockServer::start().await;
@@ -863,6 +923,66 @@ mod tests {
         assert_eq!(cached["models"], fixture_document()["models"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn vault_only_pioneer_is_available_and_discovery_sends_vault_key() {
+        let vault = env_only_vault(|_| None);
+        assert!(!crate::vault::provider_available(
+            &vault,
+            crate::vault::Slot::Pioneer,
+            true
+        ));
+        vault
+            .set(crate::vault::Slot::Pioneer, "sk-test-vault-only-pioneer")
+            .unwrap();
+        assert!(crate::vault::provider_available(
+            &vault,
+            crate::vault::Slot::Pioneer,
+            true
+        ));
+        // Route is the Codex CLI until slice R: Codex must be present.
+        assert!(!crate::vault::provider_available(
+            &vault,
+            crate::vault::Slot::Pioneer,
+            false
+        ));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer sk-test-vault-only-pioneer"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(CATALOG_FIXTURE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = PioneerCatalogClient::with_endpoint(
+            Client::new(),
+            &format!("{}/v1/models", server.uri()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let models = discover_pioneer_models_from(&vault, &client, directory.path())
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 5);
+
+        // A cleared slot is neither available nor discoverable.
+        vault.clear(crate::vault::Slot::Pioneer).unwrap();
+        assert!(!crate::vault::provider_available(
+            &vault,
+            crate::vault::Slot::Pioneer,
+            true
+        ));
+        assert!(matches!(
+            discover_pioneer_models_from(&vault, &client, directory.path()).await,
+            Err(PioneerError::MissingCredential)
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn pioneer_discovery_failure_preserves_previous_cache() {
         let server = MockServer::start().await;
@@ -899,6 +1019,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"previous-cache\n");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn pioneer_client_status_and_oversized_errors_are_secret_safe() {
         let status_server = MockServer::start().await;
@@ -950,6 +1071,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_cache_is_exact_bounded_rsi_envelope_and_replaces_atomically() {
         let directory = tempfile::tempdir().unwrap();
@@ -973,6 +1095,7 @@ mod tests {
         assert_eq!(cached["models"][0]["future_metadata"]["preserved"], true);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_cache_failed_replacement_preserves_old_file_and_removes_temp() {
         let directory = tempfile::tempdir().unwrap();
@@ -997,6 +1120,7 @@ mod tests {
         assert!(!temporary_path.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_cache_rejects_relative_root_and_oversized_serialization() {
         let catalog = PioneerCatalog::parse(CATALOG_FIXTURE).unwrap();
@@ -1017,6 +1141,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_codex_cache_path_requires_regular_bounded_parseable_envelope() {
         let directory = tempfile::tempdir().unwrap();
@@ -1050,6 +1175,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_codex_overrides_are_deterministic_optional_and_secret_safe() {
         let directory = tempfile::tempdir().unwrap();
@@ -1099,6 +1225,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_codex_overrides_append_exact_scoped_config_arguments() {
         let overrides =
@@ -1119,6 +1246,7 @@ mod tests {
         assert!(!args.join(" ").contains(TEST_CREDENTIAL));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_codex_overrides_reject_relative_and_parent_paths() {
         for path in [
@@ -1133,6 +1261,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_codex_overrides_reject_non_utf8_absolute_path() {
         use std::ffi::OsString;

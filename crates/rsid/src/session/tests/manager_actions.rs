@@ -420,11 +420,13 @@ async fn manager_program_resume_cases(cases: &[(&str, bool)]) {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_stranded_resume_preserves_source_and_one_writer() {
     manager_program_resume_cases(&[("on_terminal", true), ("resume", false)]).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_interrupted_partial_turn_resumes_once() {
     manager_program_resume_cases(&[("partial", true)]).await;
@@ -509,6 +511,7 @@ async fn manager_program_report_fragments_remain_unknown(fragments: &[&str]) {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_truncated_legacy_report_is_unknown_before_provider() {
     manager_program_report_fragments_remain_unknown(&[
@@ -526,6 +529,7 @@ async fn manager_actions_program_truncated_legacy_report_is_unknown_before_provi
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_markdown_emphasis_report_is_unknown_before_provider() {
     manager_program_report_fragments_remain_unknown(&[
@@ -546,6 +550,7 @@ async fn manager_actions_program_markdown_emphasis_report_is_unknown_before_prov
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_markdown_blocks_report_is_unknown_before_provider() {
     manager_program_report_fragments_remain_unknown(&[
@@ -565,6 +570,7 @@ async fn manager_actions_program_markdown_blocks_report_is_unknown_before_provid
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_program_store_requires_conclusive_missing_or_disabled_owner() {
     for mode in ["on_terminal", "resume"] {
@@ -586,6 +592,7 @@ async fn manager_actions_program_store_requires_conclusive_missing_or_disabled_o
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_program_protected_and_unknown_owners_keep_safe_receipts() {
     for case in [
@@ -831,6 +838,7 @@ async fn manager_actions_program_protected_and_unknown_owners_keep_safe_receipts
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[test]
 fn manager_actions_program_safe_error_retains_redacted_owner_class() {
     assert_eq!(
@@ -847,6 +855,7 @@ fn manager_actions_program_safe_error_retains_redacted_owner_class() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_program_partial_turn_requires_interrupted_status_and_bounded_evidence() {
     let p = pilot().await;
@@ -898,6 +907,7 @@ async fn manager_actions_program_partial_turn_requires_interrupted_status_and_bo
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_program_partial_turn_does_not_authorize_pause_or_replacement() {
     for replace in [false, true] {
@@ -937,6 +947,7 @@ async fn manager_actions_program_partial_turn_does_not_authorize_pause_or_replac
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_program_partial_turn_preserves_capacity_owner() {
     let p = pilot().await;
@@ -1177,6 +1188,7 @@ fn prepared_resume(p: &Pilot) -> AgentManagerPrepareControlRequestV2 {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_action_is_preflight_only_then_commits_once() {
     let p = pilot().await;
@@ -1283,6 +1295,7 @@ async fn prepared_manager_action_is_preflight_only_then_commits_once() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_native_tools_route_end_to_end() {
     let p = pilot().await;
@@ -1333,6 +1346,7 @@ async fn prepared_manager_native_tools_route_end_to_end() {
     assert_eq!(observed.state, ManagerActionStateV2::Queued);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_action_refuses_changed_lead_without_journal_effect() {
     let p = pilot().await;
@@ -1383,6 +1397,42 @@ async fn prepared_manager_action_refuses_changed_lead_without_journal_effect() {
     assert_eq!(actions, 0);
 }
 
+/// A manager that reaches for `replace_lead` on an Epic that never had a lead
+/// must be told to use `create_session` + `assign_lead`, not handed a generic
+/// source refusal it cannot act on.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn prepared_replace_lead_without_current_lead_names_create_session_path() {
+    let p = pilot().await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_lead_session(p.epic, None)
+        .unwrap();
+    let error = p
+        .manager
+        .store
+        .lock()
+        .await
+        .prepare_manager_action(
+            p.owner,
+            AgentManagerPrepareControlRequestV2 {
+                operation: PreparedManagerActionV2::ReplaceLead {
+                    epic_id: p.epic,
+                    query: "lead the epic".into(),
+                    launch: p.policy.allowed_launches[0].clone(),
+                },
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        crate::session::manager_actions::safe_action_error(&error),
+        "manager_v2_replace_lead_requires_lead_use_create_session"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_action_refuses_changed_scope_and_policy_without_journal_effect() {
     let p = pilot().await;
@@ -1518,6 +1568,7 @@ async fn prepared_manager_action_refuses_changed_scope_and_policy_without_journa
     assert_eq!(actions, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_action_reports_runtime_blocker_without_queueing() {
     let p = pilot().await;
@@ -1566,6 +1617,105 @@ async fn prepared_manager_action_reports_runtime_blocker_without_queueing() {
     assert_eq!(actions, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn soft_operator_pause_admits_only_explicit_manager_restart() {
+    use crate::store::manager_actions::OperatorPause;
+
+    let p = pilot().await;
+    let store = p.manager.store.lock().await;
+    store
+        .set_operator_pause(p.lead, OperatorPause::Soft)
+        .unwrap();
+    assert_eq!(
+        store.get_operator_pause(p.lead).unwrap(),
+        OperatorPause::Soft
+    );
+    store.manager_restart_human_gate(p.lead, false).unwrap();
+    assert!(store.manager_action_human_gate(p.lead).is_err());
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET pending_question_json='{}' WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    assert!(store.manager_restart_human_gate(p.lead, false).is_err());
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET pending_question_json=NULL WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    let prepared = store
+        .prepare_manager_action(p.owner, prepared_resume(&p))
+        .unwrap();
+    assert_eq!(prepared.readiness, ManagerPreparedActionReadinessV2::Ready);
+
+    store
+        .set_operator_pause(p.lead, OperatorPause::Hard)
+        .unwrap();
+    assert!(store.manager_restart_human_gate(p.lead, false).is_err());
+    let prepared = store
+        .prepare_manager_action(p.owner, prepared_resume(&p))
+        .unwrap();
+    assert_eq!(
+        prepared.readiness,
+        ManagerPreparedActionReadinessV2::Blocked
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE daemon_settings SET value='true' WHERE key=?1",
+            [format!("manager_operator_pause:{}", p.lead)],
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_operator_pause(p.lead).unwrap(),
+        OperatorPause::Hard
+    );
+    assert!(store.manager_restart_human_gate(p.lead, false).is_err());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn soft_operator_pause_clear_is_audited_with_manager_result() {
+    use crate::store::manager_actions::OperatorPause;
+
+    let p = pilot().await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_operator_pause(p.lead, OperatorPause::Soft)
+        .unwrap();
+    let receipt = p
+        .admit(
+            "soft-resume",
+            ManagerActionV2::ResumeLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "resume after soft pause".into(),
+            },
+        )
+        .await;
+    let claim = p.claim().await;
+    let store = p.manager.store.lock().await;
+    store.manager_action_runtime_gate(&claim, false).unwrap();
+    store
+        .finish_manager_action(&claim, ManagerActionStateV2::Succeeded, "lead_resumed")
+        .unwrap();
+    assert_eq!(
+        store.get_operator_pause(p.lead).unwrap(),
+        OperatorPause::None
+    );
+    let audit: i64 = store.conn.query_row("SELECT count(*) FROM harness_manager_v2_events WHERE kind='operator_pause_cleared' AND record_key=?1 AND json_extract(payload_json,'$.action_id')=?2", rusqlite::params![p.lead.to_string(), receipt.operation_id.to_string()], |row| row.get(0)).unwrap();
+    assert_eq!(audit, 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn prepared_manager_action_attributes_the_live_rotated_manager() {
     let p = pilot().await;
@@ -1646,6 +1796,7 @@ async fn prepared_manager_action_attributes_the_live_rotated_manager() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_creation_limit() {
     let mut p = pilot().await;
@@ -1747,6 +1898,7 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
     assert!(error.to_string().contains("manager_v2_creation_limit"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_empty_launch_list_retains_model_and_effort_validation() {
     let mut p = pilot().await;
@@ -1797,6 +1949,7 @@ async fn manager_actions_empty_launch_list_retains_model_and_effort_validation()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_populated_launch_list_requires_exact_provider_model_and_effort() {
     let p = pilot().await;
@@ -1842,6 +1995,7 @@ async fn manager_actions_populated_launch_list_requires_exact_provider_model_and
     assert_eq!(receipt.state, ManagerActionStateV2::Queued);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal() {
     let p = pilot().await;
@@ -2029,6 +2183,7 @@ async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal
     assert_eq!(row.lead_session_id, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(
     clippy::clone_on_copy,
@@ -2043,11 +2198,13 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
     let worker = Uuid::new_v4();
     let nested_worker = Uuid::new_v4();
     let pre_archived = Uuid::new_v4();
+    let deleted_worker = Uuid::new_v4();
     {
         let store = p.manager.store.lock().await;
         for (id, status) in [
             (worker, SessionStatus::Completed),
             (pre_archived, SessionStatus::Archived),
+            (deleted_worker, SessionStatus::Deleted),
         ] {
             let mut row = bare_session(id);
             row.project_id = Some(p.project);
@@ -2115,6 +2272,15 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
         .lock()
         .await
         .get_session(pre_archived)
+        .unwrap()
+        .unwrap()
+        .updated_at;
+    let deleted_updated_at = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(deleted_worker)
         .unwrap()
         .unwrap()
         .updated_at;
@@ -2319,6 +2485,7 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
             && ids.contains(&nested_worker)
     );
     assert!(!ids.contains(&pre_archived));
+    assert!(!ids.contains(&deleted_worker));
     assert_eq!(
         p.manager
             .store
@@ -2329,6 +2496,28 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
             .unwrap()
             .updated_at,
         pre_archived_updated_at
+    );
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(deleted_worker)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Deleted
+    );
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(deleted_worker)
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        deleted_updated_at
     );
     for id in [p.group, p.epic, p.lead, worker, nested_worker] {
         assert_eq!(
@@ -2451,6 +2640,17 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
             .store
             .lock()
             .await
+            .get_session(deleted_worker)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Deleted
+    );
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
             .get_session(pre_archived)
             .unwrap()
             .unwrap()
@@ -2520,6 +2720,7 @@ async fn manager_container_archive_cascades_atomically_and_restore_uses_recorded
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures, clippy::significant_drop_tightening)]
@@ -2578,10 +2779,11 @@ async fn manager_container_archive_refuses_an_active_map_descendant() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures, clippy::significant_drop_tightening)]
-async fn manager_container_archive_refuses_a_retry_owned_descendant() {
+async fn manager_container_archive_cancels_a_retry_owned_descendant() {
     let p = pilot().await;
     let child = Uuid::new_v4();
     let mut row = bare_session(child);
@@ -2603,24 +2805,15 @@ async fn manager_container_archive_refuses_a_retry_owned_descendant() {
         .unwrap()
         .unwrap();
     p.admit(
-        "retry-owner-cascade-refusal",
+        "retry-owner-cascade-archive",
         ManagerActionV2::ArchiveContainer {
             container_id: p.group,
             expected_updated_at: group.updated_at,
         },
     )
     .await;
-    assert!(
-        p.execute()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("manager_v2_human_or_recovery_owner")
-    );
-    assert!(matches!(
-        retry_observer.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
+    p.execute().await.unwrap();
+    assert!(retry_observer.try_recv().is_ok());
     assert_eq!(
         p.manager
             .store
@@ -2630,10 +2823,128 @@ async fn manager_container_archive_refuses_a_retry_owned_descendant() {
             .unwrap()
             .unwrap()
             .status,
-        SessionStatus::Completed
+        SessionStatus::Archived
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn operator_archive_epic_cancels_queued_manager_retry_without_launch() {
+    let p = pilot().await;
+    manager_program_status(&p, SessionStatus::Failed).await;
+    let retry = p
+        .admit(
+            "archive-cancels-manager-retry",
+            ManagerActionV2::RetryLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "retry later".into(),
+                launch: None,
+            },
+        )
+        .await;
+    assert_eq!(retry.state, ManagerActionStateV2::Queued);
+
+    p.manager.archive_session(p.epic).await.unwrap();
+
+    let store = p.manager.store.lock().await;
+    assert_eq!(
+        store.get_session(p.epic).unwrap().unwrap().status,
+        SessionStatus::Archived
+    );
+    assert_eq!(
+        store.get_session(p.lead).unwrap().unwrap().status,
+        SessionStatus::Archived
+    );
+    drop(store);
+    let settled = p.receipt(retry.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Blocked);
+    assert_eq!(settled.outcome.as_deref(), Some("cancelled_by_archive"));
+    assert!(!p.manager.active.read().await.contains_key(&p.lead));
+    let invocations: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row("SELECT count(*) FROM model_invocations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(invocations, 0);
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action(p.manager.program_run_boot_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn manager_archive_container_cancels_queued_retry_without_launch() {
+    let p = pilot().await;
+    manager_program_status(&p, SessionStatus::Failed).await;
+    let retry = p
+        .admit(
+            "manager-container-cancels-retry",
+            ManagerActionV2::RetryLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "retry later".into(),
+                launch: None,
+            },
+        )
+        .await;
+    let epic = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(p.epic)
+        .unwrap()
+        .unwrap();
+    let archive = p
+        .admit(
+            "manager-container-archive-after-retry",
+            ManagerActionV2::ArchiveContainer {
+                container_id: p.epic,
+                expected_updated_at: epic.updated_at,
+            },
+        )
+        .await;
+
+    p.execute().await.unwrap();
+
+    assert_eq!(
+        p.receipt(archive.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    let settled = p.receipt(retry.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Blocked);
+    assert_eq!(settled.outcome.as_deref(), Some("cancelled_by_archive"));
+    let store = p.manager.store.lock().await;
+    assert_eq!(
+        store.get_session(p.epic).unwrap().unwrap().status,
+        SessionStatus::Archived
+    );
+    assert_eq!(
+        store.get_session(p.lead).unwrap().unwrap().status,
+        SessionStatus::Archived
+    );
+    let invocations: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM model_invocations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(invocations, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures)]
@@ -2707,6 +3018,7 @@ async fn manager_container_restore_refuses_a_stale_recorded_member() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures)]
@@ -2771,6 +3083,7 @@ async fn manager_container_restore_refuses_a_purged_gitworktree_leaf() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_exact_payload_authority_and_restart_claims() {
     let p = pilot().await;
@@ -2848,8 +3161,9 @@ async fn manager_actions_exact_payload_authority_and_restart_claims() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
-async fn manager_actions_aba_raw_question_operator_pause_and_retry_switch() {
+async fn manager_actions_aba_raw_question_operator_pause_and_explicit_retry() {
     let p = pilot().await;
     let original = p.fence().await;
     let receipt = p
@@ -2978,15 +3292,20 @@ async fn manager_actions_aba_raw_question_operator_pause_and_retry_switch() {
             .is_none()
     );
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    assert!(
-        p.execute()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("retry_disabled")
-    );
+    let claim = p.claim().await;
+    p.manager
+        .check_manager_action_runtime(&claim, false)
+        .await
+        .unwrap();
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(&claim, ManagerActionStateV2::Blocked, "test_settled")
+        .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_fresh_provider_custody_and_explicit_assignment() {
     let p = pilot().await;
@@ -3084,6 +3403,7 @@ async fn manager_actions_fresh_provider_custody_and_explicit_assignment() {
     super::super::launch::drop_controller_candidate_test_stream(child);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_replacement_preserves_committed_predecessor_and_blocks_dirty_source() {
     let p = pilot().await;
@@ -3208,6 +3528,7 @@ async fn manager_actions_replacement_preserves_committed_predecessor_and_blocks_
     super::super::launch::drop_controller_candidate_test_stream(child);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(
     clippy::unwrap_used,
@@ -3227,6 +3548,7 @@ async fn manager_replace_lead_reissues_request_and_new_lead_reply_reaches_manage
                 epic_id: p.epic,
                 message: "Report replacement evidence".into(),
                 idempotency_key: "replace-mail".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -3262,6 +3584,7 @@ async fn manager_replace_lead_reissues_request_and_new_lead_reply_reaches_manage
                 request_id: original.message_id,
                 message: "old ID".into(),
                 idempotency_key: "stale-replacement-reply".into(),
+                still_running: false,
             },
         )
         .unwrap_err();
@@ -3274,6 +3597,7 @@ async fn manager_replace_lead_reissues_request_and_new_lead_reply_reaches_manage
                 request_id: new_id,
                 message: "Replacement evidence complete".into(),
                 idempotency_key: "replacement-reply".into(),
+                still_running: false,
             },
         )
         .unwrap();
@@ -3309,6 +3633,7 @@ async fn manager_replace_lead_reissues_request_and_new_lead_reply_reaches_manage
     super::super::launch::drop_controller_candidate_test_stream(child);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
 async fn operator_set_epic_lead_reissues_request_without_duplicate_on_replay() {
@@ -3324,6 +3649,7 @@ async fn operator_set_epic_lead_reissues_request_without_duplicate_on_replay() {
                 epic_id: p.epic,
                 message: "Operator replacement report".into(),
                 idempotency_key: "operator-lead-mail".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -3357,6 +3683,7 @@ async fn operator_set_epic_lead_reissues_request_without_duplicate_on_replay() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_internal_intent_has_daemon_attribution_and_policy_gate() {
     let p = pilot().await;
@@ -3412,6 +3739,7 @@ async fn wait_launch_event(p: &Pilot, id: Uuid) {
     }).await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_live_pause_then_same_session_resume_preserves_dirty_custody() {
     let p = pilot().await;
@@ -3430,7 +3758,6 @@ async fn manager_actions_live_pause_then_same_session_resume_preserves_dirty_cus
     let initial = super::super::launch::install_controller_candidate_test_process(id);
     p.execute().await.unwrap();
     wait_launch_event(&p, id).await;
-    let before_init = p.fence().await.event_sequence;
     super::super::launch::send_controller_candidate_test_event(
         id,
         crate::claude::StreamEvent {
@@ -3439,12 +3766,20 @@ async fn manager_actions_live_pause_then_same_session_resume_preserves_dirty_cus
         },
     )
     .await;
-    // Capture is projected before the init event is durably appended. Observe
-    // that append before taking the pause fence; an active-map-only wait races
-    // the very event-sequence guard this test is exercising.
+    // A content-free init updates the provider session ID, but deliberately
+    // creates no conversation event. Wait for its durable capture before pause.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if p.fence().await.event_sequence > before_init
+            if p.manager
+                .store
+                .lock()
+                .await
+                .get_session(id)
+                .unwrap()
+                .unwrap()
+                .claude_session_id
+                .as_deref()
+                == Some("manager-resumable-provider")
                 && p.manager.persistence.pending.load(Ordering::SeqCst) == 0
             {
                 break;
@@ -3537,6 +3872,7 @@ async fn manager_actions_live_pause_then_same_session_resume_preserves_dirty_cus
     super::super::launch::drop_controller_candidate_test_stream(id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_guard_rechecks_revocation_before_provider_and_preserves_allocation() {
     let p = pilot().await;
@@ -3611,6 +3947,7 @@ async fn manager_actions_guard_rechecks_revocation_before_provider_and_preserves
     super::super::launch::drop_controller_candidate_test_process(id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_container_transaction_rolls_back_tags_enrollment_and_success_receipt() {
     let p = pilot().await;
@@ -3649,6 +3986,7 @@ async fn manager_actions_container_transaction_rolls_back_tags_enrollment_and_su
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_codex_app_server_establishment_precedes_assignment() {
     use std::os::unix::fs::PermissionsExt;
@@ -3728,6 +4066,7 @@ done
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_resource_decision_holds_and_queued_policy_changes_are_fenced() {
     use crate::store::manager_actions::*;
@@ -3807,6 +4146,7 @@ async fn manager_actions_resource_decision_holds_and_queued_policy_changes_are_f
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_update_delete_restore_and_group_scope_are_distinct() {
     let p = pilot().await;
@@ -3950,6 +4290,7 @@ async fn manager_actions_update_delete_restore_and_group_scope_are_distinct() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_retry_uses_own_journal_budget_without_forging_c5() {
     let p = pilot().await;
@@ -4005,6 +4346,7 @@ async fn manager_actions_retry_uses_own_journal_budget_without_forging_c5() {
     super::super::launch::drop_controller_candidate_test_stream(id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_live_reassignment_settles_old_incarnation_and_reaper_failure_blocks_turnover()
  {
@@ -4091,6 +4433,7 @@ async fn manager_actions_live_reassignment_settles_old_incarnation_and_reaper_fa
     super::super::launch::drop_controller_candidate_test_stream(next);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_cancelled_reconciler_retains_uncertain_claim_without_second_launch() {
     let p = pilot().await;
@@ -4137,6 +4480,7 @@ async fn manager_actions_cancelled_reconciler_retains_uncertain_claim_without_se
     super::super::launch::drop_controller_candidate_test_process(id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_operator_pause_publishes_intent_before_waiting_on_spawn_guard() {
     let p = pilot().await;
@@ -4147,7 +4491,7 @@ async fn manager_actions_operator_pause_publishes_intent_before_waiting_on_spawn
         tokio::select! {
             result=&mut pause=>panic!("operator pause bypassed held spawn guard: {result:?}"),
             ()=async {loop {
-                let marked:bool=p.manager.store.lock().await.conn.query_row("SELECT EXISTS(SELECT 1 FROM daemon_settings WHERE key=?1 AND value='true')",[format!("manager_operator_pause:{}",p.lead)],|r|r.get(0)).unwrap();
+                let marked:bool=p.manager.store.lock().await.conn.query_row("SELECT EXISTS(SELECT 1 FROM daemon_settings WHERE key=?1 AND value='hard')",[format!("manager_operator_pause:{}",p.lead)],|r|r.get(0)).unwrap();
                 if marked {break}tokio::task::yield_now().await;
             }}=>{},
         }
@@ -4174,6 +4518,7 @@ async fn manager_actions_operator_pause_publishes_intent_before_waiting_on_spawn
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_deferred_revocation_settles_starting_candidate_without_launch() {
     let mut p = pilot().await;
@@ -4257,6 +4602,7 @@ async fn manager_actions_deferred_revocation_settles_starting_candidate_without_
     assert!(!op.effect_started);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_stale_candidate_cannot_assign_or_stop_operator_continuation() {
     let p = pilot().await;
@@ -4280,22 +4626,28 @@ async fn manager_actions_stale_candidate_cannot_assign_or_stop_operator_continua
     let operator = async {
         reached.await.unwrap();
         wait_launch_event(&p, id).await;
-        let before: i64 = p
-            .manager
-            .store
-            .lock()
-            .await
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(sequence),0) FROM conversation_events WHERE session_id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .unwrap();
         super::super::launch::send_controller_candidate_test_event(id,crate::claude::StreamEvent{event_type:"system".into(),data:serde_json::json!({"subtype":"init","session_id":"operator-resume-candidate"})}).await;
-        tokio::time::timeout(std::time::Duration::from_secs(5),async {loop {
-            let current:i64=p.manager.store.lock().await.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM conversation_events WHERE session_id=?1",[id.to_string()],|r|r.get(0)).unwrap();if current>before {break}tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }}).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let captured = p
+                    .manager
+                    .store
+                    .lock()
+                    .await
+                    .get_session(id)
+                    .unwrap()
+                    .unwrap()
+                    .claude_session_id
+                    .as_deref()
+                    == Some("operator-resume-candidate");
+                if captured && p.manager.persistence.pending.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         let next = super::super::launch::install_controller_candidate_test_process(id);
         p.manager
             .continue_session_operator(id, "operator continuation".into())
@@ -4344,6 +4696,7 @@ mod session_actions;
 #[path = "manager_operator_delegation.rs"]
 mod operator_delegation;
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_group_scope_enrolls_created_epics_above_32_with_explicit_policy() {
     let p = pilot().await;
@@ -4455,6 +4808,7 @@ fn commit_atop(repo: &std::path::Path, temp_root: &std::path::Path, parent: &str
     oid
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integrate_executor_advances_target_ref_and_succeeds() {
     let mut p = pilot().await;
@@ -4530,6 +4884,7 @@ async fn integrate_executor_advances_target_ref_and_succeeds() {
     assert_eq!(git(&p.repo, &["rev-parse", "refs/heads/rolling"]), source);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integrate_executor_blocks_when_acceptance_revoked_before_effect() {
     let mut p = pilot().await;
@@ -4641,6 +4996,7 @@ async fn integrate_executor_blocks_when_acceptance_revoked_before_effect() {
 
 // ── RME-S2A-003: executor error-path and boot-recovery E2E tests ─────
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integrate_executor_error_path_never_leaves_running() {
     let mut p = pilot().await;
@@ -4732,6 +5088,7 @@ async fn integrate_executor_error_path_never_leaves_running() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integrate_boot_recovery_settles_uncertain_and_releases_singleton() {
     let mut p = pilot().await;
@@ -4909,6 +5266,7 @@ async fn pilot_created_usage(p: &Pilot) -> i64 {
     store.manager_v2_created_usage(&config, false).unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_or_revoked() {
     let mut p = pilot().await;
@@ -4993,6 +5351,7 @@ async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_
     assert_eq!(pilot_created_usage(&p).await, 4);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn creation_limit_still_bounds_workers_retry_and_replace_while_review_launches_are_excluded()
 {
@@ -5096,6 +5455,7 @@ async fn creation_limit_still_bounds_workers_retry_and_replace_while_review_laun
 /// Issue #548: a session the manager created through V2 `create_session`
 /// reads its Epic's live work and granted file ownership without a relay turn;
 /// a lead-owned session does not.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::significant_drop_tightening, clippy::large_futures)]
 async fn manager_created_worker_reads_its_work_and_ownership_view() {
@@ -5245,71 +5605,75 @@ async fn retry_operation_count(p: &Pilot) -> i64 {
     ).unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn manager_retry_lead_recovers_interrupted_lead_without_provider_session() {
-    let p = pilot().await;
-    settle_pilot_lead(&p, SessionStatus::Interrupted, false).await;
-    p.manager
-        .runtime_config
-        .retry_enabled
-        .store(true, Ordering::Relaxed);
-    let source_commit = git(&p.repo, &["rev-parse", "HEAD"]);
-    {
-        let store = p.manager.store.lock().await;
-        assert!(store.load_events(p.lead).unwrap().is_empty());
+async fn manager_retry_lead_recovers_failed_and_interrupted_without_auto_retry() {
+    for status in [SessionStatus::Failed, SessionStatus::Interrupted] {
+        let p = pilot().await;
+        settle_pilot_lead(&p, status, false).await;
+        p.manager
+            .runtime_config
+            .retry_enabled
+            .store(false, Ordering::Relaxed);
+        let source_commit = git(&p.repo, &["rev-parse", "HEAD"]);
+        {
+            let store = p.manager.store.lock().await;
+            assert!(store.load_events(p.lead).unwrap().is_empty());
+            assert_eq!(
+                store
+                    .get_session(p.lead)
+                    .unwrap()
+                    .unwrap()
+                    .claude_session_id,
+                None
+            );
+        }
+        let receipt = p
+            .admit("recover-terminal", retry(&p, p.fence().await))
+            .await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued, "{status:?}");
+        assert_eq!(receipt.action_kind, ManagerActionKindV2::RetryLead);
+        let id = receipt.target_session_id.unwrap();
+        let process = super::super::launch::install_controller_candidate_test_process(id);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        p.execute().await.unwrap();
+        let settled = p.receipt(receipt.operation_id).await;
+        assert_eq!(settled.state, ManagerActionStateV2::Succeeded, "{status:?}");
         assert_eq!(
-            store
-                .get_session(p.lead)
-                .unwrap()
-                .unwrap()
-                .claude_session_id,
-            None
+            settled.result,
+            Some(ManagerActionResultV2::ProviderEstablished {
+                lead_state: Some(ManagerLeadAssignmentStateV2::Assigned),
+            })
         );
+        assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+        {
+            let store = p.manager.store.lock().await;
+            let child = store.get_session(id).unwrap().unwrap();
+            assert_eq!(child.continued_from, Some(p.lead));
+            assert_eq!(child.parent_id, Some(p.epic));
+            assert_eq!(
+                store.get_session(p.epic).unwrap().unwrap().lead_session_id,
+                Some(id)
+            );
+            // Fresh successor custody forked from the predecessor's frozen source.
+            let root = child.sandbox_root.unwrap();
+            assert!(root.is_dir());
+            assert_eq!(git(&root, &["rev-parse", "HEAD"]), source_commit);
+            assert_eq!(
+                store.live_custody_for_session(id).unwrap().owner_session_id,
+                id
+            );
+        }
+        // One operation row, counted against max_recovery_attempts.
+        assert_eq!(retry_operation_count(&p).await, 1);
+        super::super::lifecycle::interrupt_active_in_maps(&p.manager.active, id)
+            .await
+            .unwrap();
+        super::super::launch::drop_controller_candidate_test_stream(id);
     }
-    let receipt = p
-        .admit("recover-interrupted", retry(&p, p.fence().await))
-        .await;
-    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
-    assert_eq!(receipt.action_kind, ManagerActionKindV2::RetryLead);
-    let id = receipt.target_session_id.unwrap();
-    let process = super::super::launch::install_controller_candidate_test_process(id);
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    p.execute().await.unwrap();
-    let settled = p.receipt(receipt.operation_id).await;
-    assert_eq!(settled.state, ManagerActionStateV2::Succeeded);
-    assert_eq!(
-        settled.result,
-        Some(ManagerActionResultV2::ProviderEstablished {
-            lead_state: Some(ManagerLeadAssignmentStateV2::Assigned),
-        })
-    );
-    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
-    {
-        let store = p.manager.store.lock().await;
-        let child = store.get_session(id).unwrap().unwrap();
-        assert_eq!(child.continued_from, Some(p.lead));
-        assert_eq!(child.parent_id, Some(p.epic));
-        assert_eq!(
-            store.get_session(p.epic).unwrap().unwrap().lead_session_id,
-            Some(id)
-        );
-        // Fresh successor custody forked from the predecessor's frozen source.
-        let root = child.sandbox_root.unwrap();
-        assert!(root.is_dir());
-        assert_eq!(git(&root, &["rev-parse", "HEAD"]), source_commit);
-        assert_eq!(
-            store.live_custody_for_session(id).unwrap().owner_session_id,
-            id
-        );
-    }
-    // One operation row, counted against max_recovery_attempts.
-    assert_eq!(retry_operation_count(&p).await, 1);
-    super::super::lifecycle::interrupt_active_in_maps(&p.manager.active, id)
-        .await
-        .unwrap();
-    super::super::launch::drop_controller_candidate_test_stream(id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_retry_lead_admits_completed_lead_only_without_provider_session() {
     let p = pilot().await;
@@ -5329,6 +5693,80 @@ async fn manager_retry_lead_admits_completed_lead_only_without_provider_session(
     assert_eq!(retry_operation_count(&p).await, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn completed_codex_lead_with_latest_prespawn_refusal_is_ready_for_fresh_retry() {
+    let p = pilot().await;
+    settle_pilot_lead(&p, SessionStatus::Completed, true).await;
+    let store = p.manager.store.lock().await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET provider='Codex' WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    let lead = store.get_session(p.lead).unwrap().unwrap();
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let record = |class: &str, stamp: &str| {
+        store.conn.execute(
+            "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,error_class,created_at,completed_at)
+             VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable','admitted','failed','manager-recovery-test',?2,?3,?4,?4)",
+            rusqlite::params![Uuid::new_v4().to_string(), p.lead.to_string(), class, stamp],
+        ).unwrap();
+    };
+    record("codex_resume_rollout_torn_tail", &stamp);
+    assert!(store.manager_lead_transcript_unresumable(&lead).unwrap());
+    assert!(store.manager_retry_admissible_for_lead(&lead).is_ok());
+    assert_eq!(
+        typed_next_action(&store.manager_resume_available_for_lead(&lead).unwrap_err()),
+        ("manager_v2_resume_unavailable".into(), "retry_lead".into())
+    );
+
+    // The older transcript-validity class also frees a Completed lead from
+    // the resume/retry deadlock; an unrelated later failure clears that proof.
+    record(
+        "codex_resume_tool_history_invalid",
+        "9999-01-01T00:00:00.000000000Z",
+    );
+    assert!(store.manager_retry_admissible_for_lead(&lead).is_ok());
+    record("spawn_failed", "9999-01-02T00:00:00.000000000Z");
+    assert!(!store.manager_lead_transcript_unresumable(&lead).unwrap());
+    drop(store);
+
+    // Reinstating a proved refusal admits the normal guarded manager action,
+    // which reserves a fresh successor and charges the existing retry budget.
+    {
+        let store = p.manager.store.lock().await;
+        let later = "9999-01-03T00:00:00.000000000Z";
+        store.conn.execute(
+            "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,error_class,created_at,completed_at)
+             VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable','admitted','failed','manager-recovery-test',?2,'codex_resume_rollout_torn_tail',?3,?3)",
+            rusqlite::params![Uuid::new_v4().to_string(), p.lead.to_string(), later],
+        ).unwrap();
+    }
+    let mut action = retry(&p, p.fence().await);
+    if let ManagerActionV2::RetryLead { launch, .. } = &mut action {
+        *launch = Some(p.policy.allowed_launches[0].clone());
+    }
+    let receipt = p.admit("torn-tail-fresh-retry", action).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    assert!(receipt.target_session_id.is_some_and(|id| id != p.lead));
+
+    let store = p.manager.store.lock().await;
+    for _ in 0..2 {
+        store
+            .record_manager_transcript_refusal_notice(p.lead, "codex_resume_rollout_torn_tail")
+            .unwrap();
+    }
+    let notices: i64 = store.conn.query_row(
+        "SELECT count(*) FROM harness_manager_notices WHERE subject_id=?1 AND subject_version LIKE 'transcript_unresumable:%'",
+        [p.lead.to_string()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(notices, 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_retry_lead_refuses_running_and_starting_leads() {
     let p = pilot().await;
@@ -5362,6 +5800,7 @@ async fn manager_retry_lead_refuses_running_and_starting_leads() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_resume_lead_without_provider_session_names_retry_lead() {
     let p = pilot().await;
@@ -5392,6 +5831,7 @@ async fn manager_resume_lead_without_provider_session_names_retry_lead() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_retry_lead_budget_and_delay_apply_to_interrupted_leads() {
     let p = pilot().await;
@@ -5399,7 +5839,7 @@ async fn manager_retry_lead_budget_and_delay_apply_to_interrupted_leads() {
     p.manager
         .runtime_config
         .retry_enabled
-        .store(true, Ordering::Relaxed);
+        .store(false, Ordering::Relaxed);
     for attempt in 0..p.policy.max_recovery_attempts {
         let receipt = p
             .admit(&format!("attempt-{attempt}"), retry(&p, p.fence().await))
@@ -5436,6 +5876,56 @@ async fn manager_retry_lead_budget_and_delay_apply_to_interrupted_leads() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn manager_retry_lead_policy_stop_applies_with_auto_retry_disabled() {
+    for (name, pause, budget, expected) in [
+        ("paused", true, 3, "manager_v2_policy_paused"),
+        ("zero-budget", false, 0, "manager_v2_retry_budget_exhausted"),
+    ] {
+        let p = pilot().await;
+        settle_pilot_lead(&p, SessionStatus::Failed, false).await;
+        p.manager
+            .runtime_config
+            .retry_enabled
+            .store(false, Ordering::Relaxed);
+        let mut policy = p.policy.clone();
+        policy.paused = pause;
+        policy.max_recovery_attempts = budget;
+        p.manager
+            .store
+            .lock()
+            .await
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: p.project,
+                expected_scope_version: 1,
+                expected_policy_version: 1,
+                idempotency_key: format!("stop-{name}"),
+                policy,
+            })
+            .unwrap();
+        let error = p
+            .manager
+            .agent_control()
+            .agent_manager_control(
+                p.owner,
+                AgentManagerControlRequestV2 {
+                    fence: ManagerFenceV2 {
+                        scope_version: 1,
+                        policy_version: 2,
+                    },
+                    idempotency_key: format!("retry-{name}"),
+                    operation: retry(&p, p.fence().await),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), format!("Invalid parameter: {expected}"));
+        assert_eq!(retry_operation_count(&p).await, 0);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_appserver_lead_with_provider_session_is_retried_not_resumed() {
     let p = pilot().await;
@@ -5492,6 +5982,7 @@ async fn manager_appserver_lead_with_provider_session_is_retried_not_resumed() {
 
 /// `resume_lead` admission, `retry_lead` admission and the manager continuation
 /// gate agree for every provider, settled/unsettled status and id presence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[test]
 fn manager_resume_and_retry_predicates_agree_with_continuation_gate() {
     use crate::session::lifecycle::check_manager_resume_target as gate;

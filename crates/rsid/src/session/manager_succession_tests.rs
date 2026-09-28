@@ -14,12 +14,19 @@ struct RootWorld {
 }
 impl RootWorld {
     async fn new() -> Self {
+        Self::with_rotation_enabled(true).await
+    }
+    async fn with_rotation_enabled(enabled: bool) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
             .with_test_writer()
             .try_init();
         let (mut manager, dir, sandbox) = manager();
-        manager.context_rotation_enabled = true;
+        manager.context_rotation_enabled = enabled;
+        manager
+            .runtime_config
+            .update_field("context_rotation_enabled", &serde_json::json!(enabled))
+            .unwrap();
         init_d00_git_repo(dir.path());
         std::fs::write(
             dir.path().join("handoff.md"),
@@ -52,6 +59,12 @@ impl RootWorld {
         let now = chrono::Utc::now();
         {
             let store = manager.store.lock().await;
+            crate::store::daemon_settings::persist_runtime_config_field(
+                &store,
+                &manager.runtime_config,
+                "context_rotation_enabled",
+            )
+            .unwrap();
             store
                 .insert_project(&Project {
                     id: project,
@@ -107,6 +120,20 @@ impl RootWorld {
             owner,
             handoff,
         }
+    }
+    async fn set_live_rotation_enabled(&self, enabled: bool) {
+        // Match UpdateDaemonConfig's live-first, persistence-second ordering.
+        self.manager
+            .runtime_config
+            .update_field("context_rotation_enabled", &serde_json::json!(enabled))
+            .unwrap();
+        let store = self.manager.store.lock().await;
+        crate::store::daemon_settings::persist_runtime_config_field(
+            &store,
+            &self.manager.runtime_config,
+            "context_rotation_enabled",
+        )
+        .unwrap();
     }
     async fn request(
         &self,
@@ -321,6 +348,169 @@ async fn assert_drain_reserved_without_effect(
     root.row_version
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establishes_once() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let w = RootWorld::with_rotation_enabled(false).await;
+        let request = w
+            .request(
+                w.owner,
+                "live-enable",
+                SessionProvider::Codex,
+                "gpt-6-astra",
+                None,
+            )
+            .await;
+        let epoch = w
+            .manager
+            .store
+            .lock()
+            .await
+            .manager_authority_epoch(w.project)
+            .unwrap();
+        let disabled = w
+            .manager
+            .agent_control()
+            .agent_manager_control(w.owner, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::session::manager_actions::safe_action_error(&disabled),
+            "manager_succession_rotation_disabled"
+        );
+        {
+            let store = w.manager.store.lock().await;
+            let reservations: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM manager_root_successions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(reservations, 0);
+            assert_eq!(store.manager_authority_epoch(w.project).unwrap(), epoch);
+            assert_eq!(
+                store.get_harness_manager(w.project).unwrap().unwrap().current_session_id,
+                Some(w.owner)
+            );
+        }
+
+        w.set_live_rotation_enabled(true).await;
+        assert!(!w.manager.context_rotation_enabled);
+        let (receipt, root) = w.enqueue(w.owner, request.clone()).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+        let (replay, replay_root) = w.enqueue(w.owner, request).await;
+        assert!(replay.deduplicated);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay_root.candidate_session_id, root.candidate_session_id);
+        w.terminal(w.owner).await;
+        let process = install_controller_candidate_test_process(root.candidate_session_id);
+        assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+        assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 0);
+        assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+        {
+            let store = w.manager.store.lock().await;
+            let current = store.manager_succession(root.operation_id).unwrap().unwrap();
+            assert_eq!(current.state, ManagerRootState::Committed);
+            assert!(current.admission_recorded && current.effect_claimed);
+            assert_eq!(current.candidate_session_id, root.candidate_session_id);
+            assert_eq!(current.model_invocation_id, root.model_invocation_id);
+            assert_eq!(current.published_epoch, Some(epoch + 1));
+            assert_eq!(store.manager_authority_epoch(w.project).unwrap(), epoch + 1);
+            assert_eq!(
+                store.manager_action_operation(root.operation_id).unwrap().unwrap().receipt.state,
+                ManagerActionStateV2::Succeeded
+            );
+            assert_eq!(
+                store.get_harness_manager(w.project).unwrap().unwrap().current_session_id,
+                Some(root.candidate_session_id)
+            );
+            let source = store.get_session(w.owner).unwrap().unwrap();
+            let candidate = store.get_session(root.candidate_session_id).unwrap().unwrap();
+            assert_eq!(source.status, SessionStatus::Archived);
+            assert_eq!(candidate.continued_from, Some(w.owner));
+            assert_eq!(candidate.rotation_disabled_at, source.rotation_disabled_at);
+            let invocations: i64 = store.conn.query_row(
+                "SELECT count(*) FROM model_invocations WHERE session_id=?1",
+                [root.candidate_session_id.to_string()], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(invocations, 1);
+            let charge: (i64, i64, i64) = store.conn.query_row(
+                "SELECT count(*),sum(creation_quantity),sum(recovery_quantity) FROM manager_root_successions",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(charge, (1, 1, 0));
+        }
+        w.stop_scripted(root.candidate_session_id, &process).await;
+    })
+    .await
+    .expect("live rotation enable must settle within the local fixture deadline");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_runtime_live_rotation_disable_after_admission_refuses_without_effect() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // First isolate the live guard before write-through persistence catches
+        // up; then cover the completed operator update with both values false.
+        for persist_disabled in [false, true] {
+            let w = RootWorld::new().await;
+            let request = w
+                .request(
+                    w.owner,
+                    "live-disable",
+                    SessionProvider::Codex,
+                    "gpt-6-astra",
+                    None,
+                )
+                .await;
+            let (receipt, root) = w.enqueue(w.owner, request).await;
+            assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+            assert!(w.manager.context_rotation_enabled);
+            if persist_disabled {
+                w.set_live_rotation_enabled(false).await;
+            } else {
+                w.manager.runtime_config
+                    .update_field("context_rotation_enabled", &serde_json::json!(false))
+                    .unwrap();
+            }
+            w.terminal(w.owner).await;
+            let process = install_controller_candidate_test_process(root.candidate_session_id);
+            assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+            assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 0);
+            assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
+            assert_eq!(process.interrupt_count.load(Ordering::SeqCst), 0);
+            {
+                let store = w.manager.store.lock().await;
+                let current = store.manager_succession(root.operation_id).unwrap().unwrap();
+                let action = store.manager_action_operation(root.operation_id).unwrap().unwrap();
+                assert_eq!(current.state, ManagerRootState::Blocked);
+                assert_eq!(action.receipt.state, ManagerActionStateV2::Blocked);
+                assert_eq!(action.receipt.outcome.as_deref(), Some("manager_succession_rotation_disabled"));
+                assert!(!current.admission_recorded && !current.effect_claimed && !action.effect_started);
+                assert_eq!(current.published_epoch, None);
+                assert_eq!(current.candidate_session_id, root.candidate_session_id);
+                assert_eq!(current.model_invocation_id, root.model_invocation_id);
+                assert!(store.get_session(root.candidate_session_id).unwrap().is_none());
+                assert!(store.load_model_invocation_record(root.model_invocation_id).unwrap().is_none());
+                let config = store.get_harness_manager(w.project).unwrap().unwrap();
+                assert_eq!(config.current_session_id, Some(w.owner));
+                assert_eq!(store.manager_authority_epoch(w.project).unwrap(), root.authority_epoch);
+                assert_eq!(store.get_session(w.owner).unwrap().unwrap().status, SessionStatus::Completed);
+                let charge: (i64, i64, i64) = store.conn.query_row(
+                    "SELECT count(*),sum(creation_quantity),sum(recovery_quantity) FROM manager_root_successions",
+                    [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                ).unwrap();
+                assert_eq!(charge, (1, 1, 0));
+            }
+            drop_controller_candidate_test_process(root.candidate_session_id);
+        }
+    })
+    .await
+    .expect("live rotation disable must settle within the local fixture deadline");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_drain_deferral_repeats_then_establishes_same_occurrence() {
     let w = RootWorld::new().await;
@@ -441,6 +631,7 @@ async fn manager_root_runtime_drain_deferral_repeats_then_establishes_same_occur
     w.stop_scripted(root.candidate_session_id, &process).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_drain_deferral_rechecks_policy_after_active_owner_leaves() {
     let w = RootWorld::new().await;
@@ -534,6 +725,7 @@ async fn manager_root_runtime_drain_deferral_rechecks_policy_after_active_owner_
     assert_eq!(charge, (1, 0));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_and_policy() {
     for (downgrade_model, downgrade_effort) in [("gpt-6-astra", Some("medium")), ("gpt-5.5", None)]
@@ -565,6 +757,7 @@ async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_
                         epic_id: epic.id,
                         message: "Pending exact manager exchange".into(),
                         idempotency_key: "root-mail".into(),
+                        informational: false,
                     },
                 )
                 .unwrap()
@@ -770,6 +963,7 @@ async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_root_runtime_committed_blob_refuses_mismatch_symlink_and_bounds() {
     let w = RootWorld::new().await;
@@ -816,6 +1010,7 @@ async fn manager_root_runtime_committed_blob_refuses_mismatch_symlink_and_bounds
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_policy_changes_before_and_after_effect_stop_exact_candidate() {
     for (phase, expected_starts) in [
@@ -892,10 +1087,11 @@ async fn manager_root_runtime_policy_changes_before_and_after_effect_stop_exact_
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknown_spend_refuse() {
     for case in 0..10 {
-        let mut w = RootWorld::new().await;
+        let w = RootWorld::new().await;
         match case {
             0 => w.policy(|p| p.max_created_sessions = 0).await,
             1 | 8 => {
@@ -933,7 +1129,11 @@ async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknow
                 })
                 .await
             }
-            4 => w.manager.context_rotation_enabled = false,
+            4 => w
+                .manager
+                .runtime_config
+                .context_rotation_enabled
+                .store(false, Ordering::Relaxed),
             5 => {
                 w.policy(|p| {
                     p.allowed_launches = vec![ManagerLaunchChoiceV2 {
@@ -1025,6 +1225,7 @@ async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknow
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_writer() {
     for case in 0..3 {
@@ -1220,6 +1421,7 @@ async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_w
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_unpublished_admission_reopen_settles_without_resend_or_spend_reset() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -1353,6 +1555,7 @@ async fn manager_root_runtime_unpublished_admission_reopen_settles_without_resen
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_live_source_scope_epoch_custody_human_recovery_fences() {
     for case in 0..6 {
@@ -1447,6 +1650,7 @@ async fn manager_root_runtime_live_source_scope_epoch_custody_human_recovery_fen
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_pause_during_initialize_prevents_productive_wire_request() {
     let w = RootWorld::new().await;
@@ -1534,6 +1738,7 @@ async fn manager_root_runtime_pause_during_initialize_prevents_productive_wire_r
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transport_fails() {
     let w = RootWorld::new().await;

@@ -300,7 +300,7 @@ pub fn role_color(role: &str) -> Color {
 // Gauges and path compaction
 // ---------------------------------------------------------------------------
 
-/// Ten-cell `▰▱` gauge for a 0–100 percentage.
+/// Ten-cell `▮▯` gauge for a 0–100 percentage. Both glyphs share a baseline.
 #[must_use]
 pub fn percent_gauge(percent: f64, cells: u8) -> String {
     let filled = ((percent.clamp(0.0, 100.0) / 100.0) * f64::from(cells)).round();
@@ -309,8 +309,8 @@ pub fn percent_gauge(percent: f64, cells: u8) -> String {
     let filled = (filled as u8).min(cells);
     format!(
         "{}{}",
-        "▰".repeat(usize::from(filled)),
-        "▱".repeat(usize::from(cells - filled))
+        "▮".repeat(usize::from(filled)),
+        "▯".repeat(usize::from(cells - filled))
     )
 }
 
@@ -509,8 +509,8 @@ mod tests {
 
     #[test]
     fn percent_gauge_fills_proportionally() {
-        assert_eq!(percent_gauge(42.0, 10), "▰▰▰▰▱▱▱▱▱▱");
-        assert_eq!(percent_gauge(100.0, 4), "▰▰▰▰");
-        assert_eq!(percent_gauge(0.0, 4), "▱▱▱▱");
+        assert_eq!(percent_gauge(42.0, 10), "▮▮▮▮▯▯▯▯▯▯");
+        assert_eq!(percent_gauge(100.0, 4), "▮▮▮▮");
+        assert_eq!(percent_gauge(0.0, 4), "▯▯▯▯");
     }
 }

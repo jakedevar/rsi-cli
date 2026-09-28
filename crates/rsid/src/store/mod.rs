@@ -24,6 +24,7 @@ pub(crate) mod manager_coordinator;
 mod manager_decision_history;
 pub(crate) mod manager_decisions;
 pub(crate) mod pending_approvals;
+pub(crate) mod session_retention;
 pub(crate) mod source_worktree_v120;
 pub(crate) use ideas::IdeaControllerReconciliationCursor;
 #[cfg(test)]
@@ -43,6 +44,7 @@ pub(crate) mod manager_reviews;
 pub(crate) mod manager_successions;
 pub(crate) mod manager_watch_settlement;
 mod metrics;
+pub(crate) mod migration_allocation;
 mod model_control;
 mod observations;
 mod offload;
@@ -54,11 +56,15 @@ mod projects;
 pub mod queue;
 mod rate_limits;
 pub mod recursive_dag;
+pub(crate) mod restart_intents;
 mod rotation_events;
 mod row_mappers;
 pub(crate) mod sandbox_custody;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) mod sandbox_reclaim;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod satellite_identity;
+pub(crate) mod satellite_registry;
 pub mod scheduled_jobs;
 mod session_diagnostics;
 mod session_model_updates;
@@ -69,6 +75,7 @@ pub(crate) mod target_reclaim_sweep;
 #[cfg(test)]
 pub(crate) mod tests;
 mod topologies; // P1.4 — DB-stored named topology templates.
+pub(crate) mod topology_agent_audit; // #633 agent topology request ledger.
 pub(crate) mod topology_v129; // #634 durable topology executor tables.
 mod usage; // T8 — read-only lifetime usage aggregate for Settings -> Stats.
 mod workflows;
@@ -109,7 +116,22 @@ use uuid::Uuid;
 /// Released migration DDL, catalog projections, and fingerprints are
 /// immutable. Never repair them in place; add a forward migration. The
 /// repository guard pins each released block and the marked helper regions.
-pub const LATEST_SCHEMA_VERSION: i32 = 132;
+// Provisional for the migration allocator; the lander assigns the final number.
+pub const LATEST_SCHEMA_VERSION: i32 = 137;
+
+// V136's released call used the then-current global head. Preserve its pinned
+// block exactly, with that former value bound locally during replay.
+#[rustfmt::skip]
+impl Store {
+    fn apply_released_satellite_registry(&self, version: i32) -> Result<()> {
+        const LATEST_SCHEMA_VERSION: i32 = 136;
+        // Inert satellite peer/link registry; operator controls arrive in S3.
+        if version < 136 {
+            satellite_registry::apply_migration(self, LATEST_SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+}
 
 // RSI-RELEASED-MIGRATION-BEGIN: v112-archive-cleanup-catalog
 pub(crate) const V112_ARCHIVE_CATALOG_OBJECTS: [(&str, &str); 10] = [
@@ -10423,7 +10445,7 @@ impl Store {
         // fingerprint. Rebuild those two tables onto the canonical catalog here
         // so the pinned V115/V116 drivers authenticate the database instead of
         // refusing it. No-op when the catalog is already canonical.
-        if version == 114 {
+        if version <= 114 {
             self.converge_v114_deployed_additive_catalog()?;
         }
 
@@ -10541,13 +10563,43 @@ impl Store {
         if version < 132 {
             session_model_updates::apply_v132_migration(self)?;
         }
+        // V133: append-only agent topology request ledger (#633).
+        if version < 133 {
+            topology_agent_audit::apply_v133_migration(self)?;
+        }
+
+        // V134: exact graceful-restart continuation owner.
+        if version < 134 {
+            restart_intents::apply_v134_migration(self)?;
+        }
+
+        // V135: stable, locally persisted installation identity.
+        if version < 135 {
+            satellite_identity::apply_v135_migration(self)?;
+        }
+
+        self.apply_released_satellite_registry(version)?;
+
+        // Durable migration allocation claims; the version is provisional.
+        if version < 137 {
+            migration_allocation::apply_migration(self, 137)?;
+        }
+
         // V120 definitions and the internal cursor key are authenticated on
         // every reopen, before any projection reconciliation can write.
         source_worktree_v120::validate_v120_catalog(&self.conn)?;
-        manager_review_v121::validate_v121_catalog(&self.conn)?;
+        let live_version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if live_version < 134 {
+            manager_review_v121::validate_v121_catalog(&self.conn)?;
+        }
         agent_coordination::watch_repair_v123::validate_v123_catalog(&self.conn)?;
         crate::daemon_restart_persistence::validate_v128_catalog(&self.conn)?;
         topology_v129::validate_v129_catalog(&self.conn)?;
+        topology_agent_audit::validate_v133_catalog(&self.conn)?;
+        restart_intents::validate_v134_catalog(&self.conn)?;
+        satellite_registry::validate_catalog(&self.conn)?;
 
         // Path evidence is never assumed from the raw scheduled-job field.
         // Reconciliation is bounded and leaves malformed/missing rows

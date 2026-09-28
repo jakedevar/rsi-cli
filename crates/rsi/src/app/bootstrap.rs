@@ -843,6 +843,11 @@ impl App {
     /// Classify a loss discovered by an owned background task on the main
     /// task, then reuse the same single-flight bootstrap/reconnect path.
     pub(crate) fn mark_transport_lost(&mut self, error: String) {
+        if let Some(handle) = self.worker_pressure_refresh_handle.take() {
+            handle.abort();
+        }
+        self.worker_slice_memory_pressure = None;
+        self.worker_pressure_next_refresh_at = Instant::now();
         if let Some(handle) = self.conversation_poll_handle.take() {
             handle.abort();
         }
@@ -1239,6 +1244,10 @@ impl App {
 
                         match health {
                             Ok(status) => {
+                                self.worker_slice_memory_pressure =
+                                    status.worker_slice_memory_pressure.clone();
+                                self.worker_pressure_next_refresh_at =
+                                    Instant::now() + Duration::from_secs(15);
                                 if let Some(restart) = &status.latest_daemon_restart {
                                     self.push_notification(
                                         crate::types::NotificationKind::Info,

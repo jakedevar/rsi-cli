@@ -34,8 +34,17 @@ pub enum InsertStyle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LcAction {
     // --- Session Lifecycle ---
-    /// Interrupt the session under the cursor.
+    /// Request a soft operator pause for the session under the cursor.
     InterruptSession,
+
+    /// Immediately interrupt and hard-pause the session under the cursor.
+    HardInterruptSession,
+
+    /// Downgrade the selected session's HARD operator pause to SOFT.
+    DowngradeOperatorPause,
+
+    /// Clear the selected session's operator pause marker.
+    ClearOperatorPause,
 
     /// Continue a completed/interrupted session with a follow-up query.
     ContinueSession(Option<String>),
@@ -529,6 +538,41 @@ pub enum LcAction {
         policy: rsi_common::model_control::ModelBudgetPolicy,
         editing_index: Option<usize>,
     },
+
+    // --- Provider Keys / key vault (#694 K1b) ---
+    /// Refresh `App::cached_provider_credentials` from the daemon
+    /// (`ListProviderCredentials`). Queued on every entry to Settings ->
+    /// Provider Keys (1:1 clone of `RefreshDaemonFeatures`).
+    RefreshProviderCredentials,
+
+    /// Set the credential for `slot` to `secret` (`SetProviderCredential`).
+    /// Built from the `ProviderCredentialForm` overlay's masked buffer at
+    /// submit time; the overlay's own buffer is scrubbed the instant this
+    /// is enqueued, and the async handler scrubs its local copy after the
+    /// RPC send completes.
+    SetProviderCredentialSecret {
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+        secret: String,
+    },
+
+    /// Rotate the credential for `slot` to `secret` (`RotateProviderCredential`).
+    /// Same secret-handling contract as `SetProviderCredentialSecret`.
+    RotateProviderCredentialSecret {
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+        secret: String,
+    },
+
+    /// Clear the credential for `slot` (`ClearProviderCredential`). Only
+    /// ever enqueued after the settings pane's `d`/`d` arm-then-confirm
+    /// sequence (mirrors `IssueCancelConfirmation`).
+    ClearProviderCredentialSlot(rsi_common::provider_credentials::ProviderCredentialSlot),
+
+    /// Run a validity/credit check for `slot` (`CheckProviderCredential`).
+    CheckProviderCredentialSlot(rsi_common::provider_credentials::ProviderCredentialSlot),
+
+    /// Import every importable slot from its legacy env var
+    /// (`ImportProviderCredentialsFromEnv`).
+    ImportProviderCredentialsFromEnv,
 }
 
 #[cfg(test)]
@@ -544,6 +588,9 @@ impl LcAction {
     fn variant_name(&self) -> &'static str {
         match self {
             LcAction::InterruptSession => "InterruptSession",
+            LcAction::HardInterruptSession => "HardInterruptSession",
+            LcAction::DowngradeOperatorPause => "DowngradeOperatorPause",
+            LcAction::ClearOperatorPause => "ClearOperatorPause",
             LcAction::ContinueSession(..) => "ContinueSession",
             LcAction::QuickContinue => "QuickContinue",
             LcAction::EnterSession => "EnterSession",
@@ -690,6 +737,12 @@ impl LcAction {
             LcAction::RefreshUsageStats => "RefreshUsageStats",
             LcAction::DeleteBudgetPolicy(..) => "DeleteBudgetPolicy",
             LcAction::SubmitBudgetPolicy { .. } => "SubmitBudgetPolicy",
+            Self::RefreshProviderCredentials => "RefreshProviderCredentials",
+            Self::SetProviderCredentialSecret { .. } => "SetProviderCredentialSecret",
+            Self::RotateProviderCredentialSecret { .. } => "RotateProviderCredentialSecret",
+            Self::ClearProviderCredentialSlot(..) => "ClearProviderCredentialSlot",
+            Self::CheckProviderCredentialSlot(..) => "CheckProviderCredentialSlot",
+            Self::ImportProviderCredentialsFromEnv => "ImportProviderCredentialsFromEnv",
         }
     }
 }
@@ -821,6 +874,9 @@ mod tests {
     fn test_all_variants_exist() {
         let _variants: Vec<LcAction> = vec![
             LcAction::InterruptSession,
+            LcAction::HardInterruptSession,
+            LcAction::DowngradeOperatorPause,
+            LcAction::ClearOperatorPause,
             LcAction::ContinueSession(None),
             LcAction::QuickContinue,
             LcAction::OpenQuestionModal,
@@ -1000,6 +1056,23 @@ mod tests {
             LcAction::OpenHarnessManagerInspect,
             LcAction::JumpAttentionN(1),
             LcAction::OpenRecentFileN(1),
+            // --- Provider Keys / key vault (#694 K1b) ---
+            LcAction::RefreshProviderCredentials,
+            LcAction::SetProviderCredentialSecret {
+                slot: rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
+                secret: "sk-test".to_string(),
+            },
+            LcAction::RotateProviderCredentialSecret {
+                slot: rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
+                secret: "sk-test".to_string(),
+            },
+            LcAction::ClearProviderCredentialSlot(
+                rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
+            ),
+            LcAction::CheckProviderCredentialSlot(
+                rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
+            ),
+            LcAction::ImportProviderCredentialsFromEnv,
         ];
 
         // `LcAction::variant_name` is an exhaustive match with no wildcard

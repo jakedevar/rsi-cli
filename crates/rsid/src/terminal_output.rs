@@ -14,6 +14,7 @@ pub(crate) fn select_last_terminal_output<T>(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn selector_returns_last_policy_accepted_record() {
         let records = [

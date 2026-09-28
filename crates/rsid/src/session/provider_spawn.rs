@@ -74,16 +74,22 @@ pub(super) fn installed_provider_confirmation(
     let exact_variant = matches!(
         (provider, &*process),
         (SessionProvider::Claude, ProviderProcess::Claude(_))
-            | (SessionProvider::Codex, ProviderProcess::Codex(_))
-            | (SessionProvider::Pioneer, ProviderProcess::Codex(_))
-            | (SessionProvider::OpenRouter, ProviderProcess::Codex(_))
-            | (SessionProvider::Bedrock, ProviderProcess::Codex(_))
+            | (
+                SessionProvider::Codex
+                    | SessionProvider::Pioneer
+                    | SessionProvider::OpenRouter
+                    | SessionProvider::Bedrock,
+                ProviderProcess::Codex(_)
+            )
+            | (
+                SessionProvider::OpenRouter | SessionProvider::Harness,
+                ProviderProcess::Harness(_)
+            )
             | (SessionProvider::Local, ProviderProcess::Local(_))
             | (
                 SessionProvider::Antigravity,
                 ProviderProcess::Antigravity(_)
             )
-            | (SessionProvider::Harness, ProviderProcess::Harness(_))
     );
     if !exact_variant || !process.is_alive() {
         return None;
@@ -145,6 +151,9 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
     admission_permit: &AdmissionPermit,
     _guard: &SpawnGuard,
 ) -> Result<(ProviderProcess, mpsc::Receiver<StreamEvent>)> {
+    // #694 K1: an authoritative invalid/exhausted credential check is a
+    // launch-time admission refusal, never a mid-run crash.
+    crate::vault::admit_provider_spawn(provider, config)?;
     match provider {
         SessionProvider::Claude => {
             let (p, rx) = launcher.launch_claude(
@@ -167,12 +176,48 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
             )?;
             Ok((ProviderProcess::Codex(p), rx))
         }
-        SessionProvider::Bedrock | SessionProvider::OpenRouter => {
+        SessionProvider::Bedrock => {
             let (p, rx) = launcher.launch_codex(
                 config,
                 admission_permit.claim_cli_execution(RuntimeExecutionRoute::CodexCli)?,
             )?;
             Ok((ProviderProcess::Codex(p), rx))
+        }
+        SessionProvider::OpenRouter => {
+            let model = config
+                .model
+                .as_deref()
+                .unwrap_or(crate::openrouter::OPENROUTER_DEFAULT_MODEL);
+            if launcher.runtime_config().openrouter_route_for(model)
+                == crate::config::OpenRouterRoute::CodexCli
+            {
+                let (p, rx) = launcher.launch_codex(
+                    config,
+                    admission_permit.claim_cli_execution(RuntimeExecutionRoute::CodexCli)?,
+                )?;
+                return Ok((ProviderProcess::Codex(p), rx));
+            }
+            let preflight =
+                openrouter_harness_preflight(model, launcher.openrouter_credential_available());
+            if let Err(cause) = preflight {
+                if !launcher
+                    .runtime_config()
+                    .api_route_fallback
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(DaemonError::OpenRouterRoutePreflight { cause });
+                }
+                let (p, rx) = launcher.launch_codex(
+                    config,
+                    admission_permit.claim_cli_execution(RuntimeExecutionRoute::CodexCli)?,
+                )?;
+                return Ok((
+                    ProviderProcess::Codex(p),
+                    prepend_fallback_events(rx, cause),
+                ));
+            }
+            let (p, rx) = launcher.launch_harness(config)?;
+            Ok((ProviderProcess::Harness(p), rx))
         }
         // Local is an in-process OpenAI-compatible HTTP task, not a CLI child.
         // Its per-request admission is intentionally outside this CLI/process
@@ -213,12 +258,57 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
     }
 }
 
+fn openrouter_harness_preflight(
+    model: &str,
+    credential_available: bool,
+) -> std::result::Result<(), &'static str> {
+    let normalized = crate::openrouter::harness_model_id(model).ok_or("unsupported_model")?;
+    if !credential_available {
+        return Err("missing_credential");
+    }
+    if crate::openrouter::catalog_tool_support(normalized) == Some(false) {
+        return Err("no_tool_support");
+    }
+    Ok(())
+}
+
+fn prepend_fallback_events(
+    mut source: mpsc::Receiver<StreamEvent>,
+    cause: &'static str,
+) -> mpsc::Receiver<StreamEvent> {
+    let (tx, rx) = mpsc::channel(256);
+    for event in [
+        StreamEvent {
+            event_type: "route_fallback".into(),
+            data: serde_json::json!({"from":"harness","to":"codex_cli","reason":cause}),
+        },
+        StreamEvent {
+            event_type: "credential_cli_exposure".into(),
+            data: serde_json::json!({"reason":"fallback"}),
+        },
+    ] {
+        let _ = tx.try_send(event);
+    }
+    tokio::spawn(async move {
+        while let Some(event) = source.recv().await {
+            if tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// Parametrizes the genuine per-site launch differences behind a closed set of
 /// two impls: [`CachedLauncher`] (the `&self` sites, reusing the manager's
 /// cached provider clients) and [`FreshLauncher`] (the rotation sites, building
 /// fresh clients inline). Each leaf launches one provider and returns the same
 /// `(Process, event_rx)` pair the primitive wraps.
 pub(super) trait ProviderLauncher {
+    fn runtime_config(&self) -> &crate::config::RuntimeConfig;
+    fn openrouter_credential_available(&self) -> bool {
+        crate::openrouter::openrouter_credential().is_ok()
+    }
     fn launch_claude(
         &self,
         config: &LaunchConfig,
@@ -281,6 +371,9 @@ pub(super) struct HarnessLaunchCtx {
 }
 
 impl ProviderLauncher for CachedLauncher<'_> {
+    fn runtime_config(&self) -> &crate::config::RuntimeConfig {
+        &self.mgr.runtime_config
+    }
     fn launch_claude(
         &self,
         config: &LaunchConfig,
@@ -396,6 +489,76 @@ impl ProviderLauncher for CachedLauncher<'_> {
     }
 }
 
+/// Continue-only launch adapter: install custody-bound Codegraph tools before Harness starts.
+pub(super) struct ResumedLauncher<'a> {
+    pub base: CachedLauncher<'a>,
+    pub codegraph_binding: Option<crate::codegraph::NativeCodegraphBinding>,
+}
+
+impl ProviderLauncher for ResumedLauncher<'_> {
+    fn runtime_config(&self) -> &crate::config::RuntimeConfig {
+        self.base.runtime_config()
+    }
+
+    fn launch_claude(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+    ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
+        self.base.launch_claude(config, execution)
+    }
+
+    fn launch_codex(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+    ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+        self.base.launch_codex(config, execution)
+    }
+
+    fn launch_local(
+        &self,
+        config: &LaunchConfig,
+        permit: AdmissionPermit,
+    ) -> Result<(OpenAiProcess, mpsc::Receiver<StreamEvent>)> {
+        self.base.launch_local(config, permit)
+    }
+
+    fn launch_agy(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+    ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
+        self.base.launch_agy(config, execution)
+    }
+
+    fn launch_harness(
+        &self,
+        config: &LaunchConfig,
+    ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)> {
+        let working_dir = config
+            .working_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
+        self.base.mgr.harness_client.launch_with_binding(
+            config,
+            &self.base.harness.resolved_context_budget,
+            config.system_prompt.clone(),
+            working_dir,
+            self.base.harness.conversation_history.clone(),
+            self.base.harness.initial_admission_permit.clone(),
+            self.base.mgr.memory_handle.clone(),
+            self.base.harness.project_id,
+            Arc::clone(&self.base.mgr.store),
+            Arc::clone(self.base.mgr.event_bus()),
+            self.base.harness.model_call_settlements.clone(),
+            config.rsi_session_id,
+            Some(self.base.mgr.agent_control()),
+            self.codegraph_binding.clone(),
+        )
+    }
+}
+
 /// Family B — the two owned/static rotation sites (`resume_for_handoff_write`,
 /// `spawn_rotation_child`). Constructs fresh provider clients inline. The Harness
 /// arm rebuilds the SAME full in-process client fresh launches use, with an
@@ -443,6 +606,9 @@ impl FreshLauncher {
 }
 
 impl ProviderLauncher for FreshLauncher {
+    fn runtime_config(&self) -> &crate::config::RuntimeConfig {
+        &self.runtime_config
+    }
     fn launch_claude(
         &self,
         config: &LaunchConfig,
@@ -539,6 +705,7 @@ mod codegraph_rotation_tests {
     use super::*;
     use crate::session::harness::tools::HarnessToolRegistry;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn fresh_harness_client_rebinds_registered_codegraph_scope() {
         let root = tempfile::tempdir().unwrap();
@@ -586,5 +753,303 @@ mod codegraph_rotation_tests {
             &store,
         );
         assert!(wrong_project.specs().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use rsi_common::types::ControllerConfirmationKindV1;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RouteLauncher {
+        runtime: Arc<crate::config::RuntimeConfig>,
+        credential_available: bool,
+        codex_starts: AtomicUsize,
+        harness_starts: AtomicUsize,
+    }
+
+    impl RouteLauncher {
+        fn new(runtime: Arc<crate::config::RuntimeConfig>, credential_available: bool) -> Self {
+            Self {
+                runtime,
+                credential_available,
+                codex_starts: AtomicUsize::new(0),
+                harness_starts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ProviderLauncher for RouteLauncher {
+        fn runtime_config(&self) -> &crate::config::RuntimeConfig {
+            &self.runtime
+        }
+        fn openrouter_credential_available(&self) -> bool {
+            self.credential_available
+        }
+        fn launch_claude(
+            &self,
+            _: &LaunchConfig,
+            _: CliExecutionCapability,
+        ) -> Result<(crate::claude::ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
+            unreachable!()
+        }
+        fn launch_codex(
+            &self,
+            _: &LaunchConfig,
+            _: CliExecutionCapability,
+        ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+            self.codex_starts.fetch_add(1, Ordering::SeqCst);
+            let child = tokio::process::Command::new("sleep").arg("30").spawn()?;
+            let (_, rx) = mpsc::channel(1);
+            Ok((CodexProcess::from_child_for_route_test(child), rx))
+        }
+        fn launch_local(
+            &self,
+            _: &LaunchConfig,
+            _: AdmissionPermit,
+        ) -> Result<(OpenAiProcess, mpsc::Receiver<StreamEvent>)> {
+            unreachable!()
+        }
+        fn launch_agy(
+            &self,
+            _: &LaunchConfig,
+            _: CliExecutionCapability,
+        ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
+            unreachable!()
+        }
+        fn launch_harness(
+            &self,
+            _: &LaunchConfig,
+        ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)> {
+            self.harness_starts.fetch_add(1, Ordering::SeqCst);
+            let (_, rx) = mpsc::channel(1);
+            Ok((
+                HarnessProcess {
+                    task_handle: tokio::spawn(std::future::pending()),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                },
+                rx,
+            ))
+        }
+    }
+
+    fn route_config(model: String) -> LaunchConfig {
+        LaunchConfig {
+            query: "route dispatch".into(),
+            title: None,
+            agent_role: None,
+            epic_spawn_ordinal: None,
+            working_dir: None,
+            provider: Some(SessionProvider::OpenRouter),
+            model: Some(model),
+            configured_context_window: None,
+            max_turns: None,
+            system_prompt: None,
+            resume_session_id: None,
+            session_kind: None,
+            project_id: None,
+            rsi_session_id: None,
+            rsi_socket: None,
+            rsi_session_token: None,
+            continued_from: None,
+            openai_base_url: None,
+            openai_api_key: None,
+            conversation_history: None,
+            workflow_id: None,
+            workflow_id_override: None,
+            max_retries: None,
+            group_id: None,
+            skip_project_model_default: false,
+            model_invocation_purpose:
+                rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
+            parent_id: None,
+            effort: None,
+            issue_identifier: None,
+            issue_url: None,
+            issue_tracker_id: None,
+            scheduled_job_id: None,
+            model_invocation_owner: None,
+            model_invocation_dedup_key: None,
+            model_invocation_request_fingerprint: None,
+            sandbox: None,
+            cargo_target_dir: None,
+            execution_scratch: None,
+            is_eval: false,
+            skip_context_pipeline: true,
+            capability_class: None,
+            tags: Vec::new(),
+            topology_node_id: None,
+            topology_iteration: 0,
+            closure_selector: None,
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn openrouter_spawn_dispatch_selects_harness_codex_and_preflight_fallback() {
+        let model = format!("vendor/dispatch-{}", Uuid::new_v4());
+        let config = route_config(model);
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        let harness_launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &harness_launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Harness(_)));
+        assert_eq!(harness_launcher.harness_starts.load(Ordering::SeqCst), 1);
+        process.kill().await.unwrap();
+
+        let fallback_launcher = RouteLauncher::new(Arc::clone(&runtime), false);
+        let (mut process, mut events) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &fallback_launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        assert_eq!(events.recv().await.unwrap().event_type, "route_fallback");
+        assert_eq!(
+            events.recv().await.unwrap().event_type,
+            "credential_cli_exposure"
+        );
+        process.kill().await.unwrap();
+
+        runtime
+            .update_field("api_route.fallback", &serde_json::json!(false))
+            .unwrap();
+        let refusing_launcher = RouteLauncher::new(Arc::clone(&runtime), false);
+        assert!(matches!(
+            spawn_provider_process(
+                SessionProvider::OpenRouter,
+                &config,
+                &refusing_launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard
+            ),
+            Err(DaemonError::OpenRouterRoutePreflight {
+                cause: "missing_credential"
+            })
+        ));
+        assert_eq!(refusing_launcher.codex_starts.load(Ordering::SeqCst), 0);
+
+        crate::openrouter::record_test_catalog_tool_support(
+            config.model.as_deref().unwrap(),
+            false,
+        );
+        let no_tools_launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        assert!(matches!(
+            spawn_provider_process(
+                SessionProvider::OpenRouter,
+                &config,
+                &no_tools_launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard
+            ),
+            Err(DaemonError::OpenRouterRoutePreflight {
+                cause: "no_tool_support"
+            })
+        ));
+        assert_eq!(no_tools_launcher.codex_starts.load(Ordering::SeqCst), 0);
+        runtime
+            .update_field("api_route.fallback", &serde_json::json!(true))
+            .unwrap();
+        let no_tools_fallback = RouteLauncher::new(Arc::clone(&runtime), true);
+        let (mut process, mut events) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &no_tools_fallback,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        assert_eq!(
+            events.recv().await.unwrap().data["reason"],
+            "no_tool_support"
+        );
+        process.kill().await.unwrap();
+
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("codex_cli"))
+            .unwrap();
+        let codex_launcher = RouteLauncher::new(runtime, false);
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &codex_launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        assert_eq!(codex_launcher.harness_starts.load(Ordering::SeqCst), 0);
+        process.kill().await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn openrouter_controller_and_rotation_witness_accepts_each_installed_route() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut codex = ProviderProcess::Codex(CodexProcess::from_child_for_route_test(child));
+        assert_eq!(
+            installed_provider_confirmation(SessionProvider::OpenRouter, &mut codex),
+            Some(ControllerConfirmationKindV1::InstalledProvider)
+        );
+        assert!(matches_live_controller_confirmation(
+            SessionProvider::OpenRouter,
+            ControllerConfirmationKindV1::InstalledProvider,
+            &mut codex
+        ));
+        codex.kill().await.unwrap();
+
+        let mut harness = ProviderProcess::Harness(HarnessProcess {
+            task_handle: tokio::spawn(std::future::pending()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        assert_eq!(
+            installed_provider_confirmation(SessionProvider::OpenRouter, &mut harness),
+            Some(ControllerConfirmationKindV1::InstalledProvider)
+        );
+        assert!(matches_live_controller_confirmation(
+            SessionProvider::OpenRouter,
+            ControllerConfirmationKindV1::InstalledProvider,
+            &mut harness
+        ));
+        harness.kill().await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn openrouter_fallback_emits_route_and_cli_exposure_before_provider_events() {
+        let (tx, source) = mpsc::channel(1);
+        tx.send(StreamEvent {
+            event_type: "system".into(),
+            data: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let mut rx = prepend_fallback_events(source, "no_tool_support");
+        let fallback = rx.recv().await.unwrap();
+        assert_eq!(fallback.event_type, "route_fallback");
+        assert_eq!(fallback.data["reason"], "no_tool_support");
+        let exposure = rx.recv().await.unwrap();
+        assert_eq!(exposure.event_type, "credential_cli_exposure");
+        assert_eq!(exposure.data["reason"], "fallback");
+        assert_eq!(rx.recv().await.unwrap().event_type, "system");
     }
 }

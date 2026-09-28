@@ -320,13 +320,37 @@ impl AgentControlHandle {
             return Err(refused("manager_v2_record_changed"));
         }
         let receipt = store.manager_v2_commit_update(caller, &request, &observed)?;
-        if matches!(request.change, ManagerUpdateV2::RequestReview { .. })
+        if matches!(&request.change, ManagerUpdateV2::RequestReview { .. })
             && let Ok(assignment_id) = Uuid::parse_str(&receipt.key)
             && let Err(error) = store.allocate_manager_review_assignment(assignment_id)
         {
             // The durable reserved row is the restart-safe retry owner. A
             // transient capacity/source race must not create a second action.
             tracing::warn!(%assignment_id,%error,"manager review allocation deferred");
+        }
+        let integration_notice = if matches!(&request.change, ManagerUpdateV2::Integration { .. })
+            && !receipt.deduplicated
+        {
+            match store.manager_integration_notice_for_committed_update(
+                context.authority.config.project_id,
+                &receipt.key,
+                receipt.row_version,
+            ) {
+                Ok(job) => job,
+                Err(error) => {
+                    // The ledger update has committed. Its keyset reconciler
+                    // can recover this notice without making the RPC retry it.
+                    tracing::warn!(%error, work_key=%receipt.key, "manager integration notice deferred");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        drop(store);
+        if let Some(job_id) = integration_notice {
+            self.event_bus
+                .publish(crate::bus::DaemonEvent::ManagerNoticeQueued { job_id });
         }
         Ok(receipt)
     }
@@ -374,7 +398,12 @@ impl AgentControlHandle {
         }
         if evidence.is_none()
             && integration.is_none()
-            && !matches!(request.change, ManagerUpdateV2::Migration { .. })
+            && !matches!(
+                request.change,
+                ManagerUpdateV2::Migration { .. }
+                    | ManagerUpdateV2::MigrationSeal { .. }
+                    | ManagerUpdateV2::MigrationSealTransfer { .. }
+            )
         {
             return Ok(LedgerObservation::default());
         }
@@ -442,6 +471,60 @@ impl AgentControlHandle {
             ..Default::default()
         };
         let mut remote_url = None;
+        if let ManagerUpdateV2::MigrationSealTransfer {
+            new_source_commit, ..
+        } = &request.change
+        {
+            let head = git::head(root, "HEAD").await?;
+            git::sealed_source_holds(root, new_source_commit, &head).await?;
+            if git::ancestor(root, new_source_commit, &custody.source_commit).await? {
+                return Err(refused("manager_review_source_not_authored"));
+            }
+            observation.source_commit = Some(new_source_commit.clone());
+            return Ok(observation);
+        }
+        if let ManagerUpdateV2::MigrationSeal { source_commit, .. } = &request.change {
+            let head = git::head(root, "HEAD").await?;
+            git::sealed_source_holds(root, source_commit, &head).await?;
+            if git::ancestor(root, source_commit, &custody.source_commit).await? {
+                return Err(refused("manager_review_source_not_authored"));
+            }
+            let (rolling_tip, landed_version) = git::migration_seal_head(root).await?;
+            let repository = custody.repository_identity.clone();
+            let (prior, claims) = self
+                .store
+                .lock()
+                .await
+                .migration_allocation_view(&repository)?;
+            if claims.len() >= 256 {
+                return Err(refused("manager_v2_migration_inspection_limit"));
+            }
+            if let Some(prior) = &prior {
+                if prior.landed_version > landed_version
+                    || !git::ancestor(root, &prior.remote_tip, &rolling_tip).await?
+                {
+                    return Err(refused("manager_v2_migration_remote_changed"));
+                }
+            }
+            let mut published_sources = Vec::new();
+            for claim in claims
+                .iter()
+                .filter(|claim| claim.state == "active" && claim.assigned_version <= landed_version)
+            {
+                if git::ancestor(root, &claim.source_commit, &rolling_tip).await? {
+                    published_sources.push(claim.source_commit.clone());
+                }
+            }
+            observation.source_commit = Some(source_commit.clone());
+            observation.migration_seal = Some((
+                repository,
+                rolling_tip,
+                landed_version,
+                prior.map(|head| head.remote_tip),
+                published_sources,
+            ));
+            return Ok(observation);
+        }
         if let ManagerUpdateV2::Migration {
             baseline_commit,
             inventory_digest,
@@ -808,6 +891,8 @@ const fn requires_work_version_match(change: &ManagerUpdateV2) -> bool {
             ..
         } | ManagerUpdateV2::Integration { .. }
             | ManagerUpdateV2::Migration { .. }
+            | ManagerUpdateV2::MigrationSeal { .. }
+            | ManagerUpdateV2::MigrationSealTransfer { .. }
             | ManagerUpdateV2::RequestReview { .. }
     )
 }

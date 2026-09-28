@@ -116,6 +116,7 @@ pub(crate) fn assert_request(method: &str, request_id: &Value, params: &Value) {
     assert!(conforms(&schema, &schema, request_id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn generated_approval_schema_fixtures_are_pinned_and_reject_old_boolean_responses() {
     let provenance: Value = serde_json::from_str(PROVENANCE).unwrap();
@@ -145,6 +146,7 @@ fn generated_approval_schema_fixtures_are_pinned_and_reject_old_boolean_response
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn generated_server_request_inventory_separates_unsupported_protocols() {
     let methods: Value = serde_json::from_str(METHODS).unwrap();
@@ -178,6 +180,7 @@ fn generated_server_request_inventory_separates_unsupported_protocols() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn both_provider_and_writer_paths_conform_for_all_supported_methods_ids_and_answers() {
     let (write_tx, mut write_rx) = mpsc::channel(16);
@@ -229,6 +232,7 @@ async fn both_provider_and_writer_paths_conform_for_all_supported_methods_ids_an
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn offered_decisions_constrain_replies_without_inventing_cancel_or_policy_grants() {
     let mut p = params();

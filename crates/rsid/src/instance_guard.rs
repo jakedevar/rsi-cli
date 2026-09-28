@@ -172,6 +172,7 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn exclusive_database_lease_reports_incumbent_and_releases_on_drop() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -192,6 +193,7 @@ mod tests {
             DaemonInstanceGuard::acquire(&database, &socket).expect("lease after release");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn database_directories_have_independent_leases() {
         let first_temp = tempfile::tempdir().expect("first tempdir");
@@ -209,6 +211,7 @@ mod tests {
         assert_ne!(first.path(), second.path());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_socket_is_refused_and_stale_socket_is_recoverable() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -231,6 +234,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn absent_socket_is_recoverable() {
         let temp = tempfile::tempdir().expect("tempdir");

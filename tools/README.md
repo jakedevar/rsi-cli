@@ -27,10 +27,12 @@ worktrees). Two responsibilities:
 ## Pre-push hook — `git-hooks/pre-push`
 
 Installed by the same script. An agent session (marked by `RSI_SESSION_ID` or
-`RSI_SESSION_TOKEN`) cannot push an update to
-`refs/heads/rolling` or `refs/heads/main`. Other refs and operator pushes are
-unaffected. The guarded `rsi-rolling-land` publisher uses a private clone and
-disables hooks for its validated push.
+`RSI_SESSION_TOKEN`) cannot push to `refs/heads/main` or make an unmarked push
+to `refs/heads/rolling`. Other refs and operator pushes are unaffected. The
+guarded `rsi-rolling-land` publisher uses a private clone and sets
+`RSI_ROLLING_LANDER=1` for its validated rolling push. This hook is a cooperative
+guard rail, not a security boundary: any agent can spoof the marker or bypass
+the hook. The lander enforces test gates and fast-forward publication.
 
 Run `python3 tools/test_pre_push.py` for real Git push checks.
 

@@ -58,6 +58,7 @@ use rsi_common::{
     RecursiveTaskGraphId, RecursiveTaskGraphSummary, RecursiveTaskId, RecursiveTaskNode,
     RunRecursiveLiveSchedulerResponse,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -90,6 +91,15 @@ pub enum ClientError {
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+/// Operator pause strength returned by the daemon for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperatorPauseLevel {
+    None,
+    Soft,
+    Hard,
+}
 
 impl ClientError {
     pub fn reclaim_prepared_retry_ms(&self) -> Option<u64> {
@@ -906,14 +916,52 @@ impl DaemonClient {
         self.request_launch_session(params).await
     }
 
-    /// Interrupt a running session.
+    /// Interrupt a running session with the legacy HARD operator pause.
     pub async fn interrupt_session(&mut self, session_id: uuid::Uuid) -> Result<()> {
+        self.interrupt_session_with_pause(session_id, true).await
+    }
+
+    /// Interrupt a running session and persist the requested operator pause strength.
+    pub async fn interrupt_session_with_pause(
+        &mut self,
+        session_id: uuid::Uuid,
+        hard: bool,
+    ) -> Result<()> {
         self.request(
             "InterruptSession",
-            serde_json::json!({ "session_id": session_id }),
+            serde_json::json!({ "session_id": session_id, "pause_level": if hard { "hard" } else { "soft" } }),
         )
         .await?;
         Ok(())
+    }
+
+    /// Read one persisted operator pause marker.
+    pub async fn get_operator_pause(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<OperatorPauseLevel> {
+        let response = self
+            .request(
+                "GetOperatorPause",
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(serde_json::from_value(response["pause_level"].clone())?)
+    }
+
+    /// Downgrade or clear a persisted operator pause marker.
+    pub async fn set_operator_pause(
+        &mut self,
+        session_id: uuid::Uuid,
+        pause_level: OperatorPauseLevel,
+    ) -> Result<OperatorPauseLevel> {
+        let response = self
+            .request(
+                "SetOperatorPause",
+                serde_json::json!({ "session_id": session_id, "pause_level": pause_level }),
+            )
+            .await?;
+        Ok(serde_json::from_value(response["pause_level"].clone())?)
     }
 
     /// Cancel a pending retry for a failed session.
@@ -1317,6 +1365,132 @@ impl DaemonClient {
                     "replace_policies": true,
                     "policies": policies
                 }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ListProviderCredentials` (#694 K1b) — secret-free per-slot metadata
+    /// for every `ProviderCredentialSlot`, plus the current
+    /// `vault.env_compat`/`vault.check_ttl_secs` settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn list_provider_credentials(
+        &mut self,
+    ) -> Result<rsi_common::provider_credentials::ListProviderCredentialsResult> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_LIST,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `SetProviderCredential` — stores `secret` in the vault for `slot` and
+    /// removes any tombstone. Returns the slot's updated secret-free
+    /// metadata (the daemon runs a check right away).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn set_provider_credential(
+        &mut self,
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+        secret: String,
+    ) -> Result<rsi_common::provider_credentials::ProviderCredentialMetadata> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_SET,
+                serde_json::to_value(
+                    rsi_common::provider_credentials::SetProviderCredentialParams { slot, secret },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `RotateProviderCredential` — same contract as `set_provider_credential`,
+    /// but preserves `rotated_from_fingerprint` metadata on the daemon side.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn rotate_provider_credential(
+        &mut self,
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+        secret: String,
+    ) -> Result<rsi_common::provider_credentials::ProviderCredentialMetadata> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_ROTATE,
+                serde_json::to_value(
+                    rsi_common::provider_credentials::SetProviderCredentialParams { slot, secret },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ClearProviderCredential` — removes the vault entry for `slot` and
+    /// writes a durable tombstone (suppresses env/generator fallback until
+    /// the next Set/Rotate/Import).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn clear_provider_credential(
+        &mut self,
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+    ) -> Result<rsi_common::provider_credentials::ProviderCredentialMetadata> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_CLEAR,
+                serde_json::to_value(
+                    rsi_common::provider_credentials::ProviderCredentialSlotParams { slot },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `CheckProviderCredential` — runs an immediate validity/credit check
+    /// for `slot` and returns its updated secret-free metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn check_provider_credential(
+        &mut self,
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+    ) -> Result<rsi_common::provider_credentials::ProviderCredentialMetadata> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_CHECK,
+                serde_json::to_value(
+                    rsi_common::provider_credentials::ProviderCredentialSlotParams { slot },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ImportProviderCredentialsFromEnv` — copies every importable slot's
+    /// legacy env var into the vault (skips slots that already have a vault
+    /// entry or a tombstone; never imports the Bedrock generator).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn import_provider_credentials_from_env(
+        &mut self,
+    ) -> Result<rsi_common::provider_credentials::ImportProviderCredentialsResult> {
+        let result = self
+            .request(
+                rsi_common::provider_credentials::METHOD_IMPORT,
+                serde_json::json!({}),
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -2848,6 +3022,81 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operator_pause_rpcs_send_strength_and_decode_readback() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let socket_path = crate::test_support::short_socket_path("operator-pause");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "GetOperatorPause" => {
+                        serde_json::json!({"session_id": session_id, "pause_level": "hard"})
+                    }
+                    "SetOperatorPause" => {
+                        serde_json::json!({"session_id": session_id, "pause_level": "soft"})
+                    }
+                    _ => Value::Null,
+                };
+                writer
+                    .write_all(
+                        format!("{}\n", serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+
+        let mut client = DaemonClient::new(socket_path.clone());
+        client.connect().await.unwrap();
+        client
+            .interrupt_session_with_pause(session_id, false)
+            .await
+            .unwrap();
+        client.interrupt_session(session_id).await.unwrap();
+        assert_eq!(
+            client.get_operator_pause(session_id).await.unwrap(),
+            OperatorPauseLevel::Hard
+        );
+        assert_eq!(
+            client
+                .set_operator_pause(session_id, OperatorPauseLevel::Soft)
+                .await
+                .unwrap(),
+            OperatorPauseLevel::Soft
+        );
+        let requests = server.await.unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+
+        assert_eq!(requests[0]["method"], "InterruptSession");
+        assert_eq!(
+            requests[0]["params"],
+            serde_json::json!({"session_id": session_id, "pause_level": "soft"})
+        );
+        assert_eq!(
+            requests[1]["params"],
+            serde_json::json!({"session_id": session_id, "pause_level": "hard"})
+        );
+        assert_eq!(requests[2]["method"], "GetOperatorPause");
+        assert_eq!(requests[3]["method"], "SetOperatorPause");
+        assert_eq!(
+            requests[3]["params"],
+            serde_json::json!({"session_id": session_id, "pause_level": "soft"})
+        );
+    }
 
     #[test]
     fn reclaim_prepared_hint_is_narrow_and_bounded() {

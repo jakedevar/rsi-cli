@@ -104,6 +104,7 @@ pub fn make_work_unit_key(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_task_type_as_str_roundtrip() {
         let variants = [
@@ -120,24 +121,28 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_task_type_from_str_unknown() {
         assert_eq!(TaskType::from_str("nonexistent"), None);
         assert_eq!(TaskType::from_str(""), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_make_work_unit_key_format() {
         let key = make_work_unit_key(TaskType::ExtractObservations, Some("proj-123"), "sess-456");
         assert_eq!(key, "extract_observations:proj-123:sess-456");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_make_work_unit_key_no_project() {
         let key = make_work_unit_key(TaskType::Summarize, None, "sess-789");
         assert_eq!(key, "summarize:_:sess-789");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_queue_config_default() {
         let config = QueueConfig::default();
@@ -149,6 +154,7 @@ mod tests {
         assert!(config.enabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_task_type_serde_roundtrip() {
         let original = TaskType::ExtractObservations;
@@ -157,6 +163,7 @@ mod tests {
         assert_eq!(original, deser);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_task_type_display() {
         assert_eq!(format!("{}", TaskType::Dream), "dream");

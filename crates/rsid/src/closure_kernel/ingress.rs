@@ -993,6 +993,7 @@ mod tests {
             .to_string()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_missing_output_replay_and_terminal_crash_boundaries_converge_once() {
         let fixture = IngressFixture::new("missing-replay");
@@ -1018,6 +1019,7 @@ mod tests {
         assert_eq!(fixture.counts().await, (1, 0, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_valid_output_followed_by_stderr_selects_provider_and_race_converges() {
         let fixture = IngressFixture::new("provider-before-stderr");
@@ -1065,6 +1067,7 @@ mod tests {
         assert!(detail.integration_queue_item_id.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_present_malformed_and_missing_outputs_replay_exactly_once() {
         for (label, content, expected, queued) in [
@@ -1117,6 +1120,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_requires_terminal_invocation_and_never_infers_output_from_status() {
         let deferred = IngressFixture::new("running-invocation");
@@ -1154,6 +1158,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_committed_blocker_and_dirty_git_edges_are_bound_to_observation() {
         let committed = IngressFixture::new("committed");
@@ -1224,6 +1229,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_later_terminal_key_can_succeed_after_blocked_validation() {
         let fixture = IngressFixture::new("blocked-then-valid-rotation");
@@ -1268,6 +1274,7 @@ mod tests {
         assert_eq!(fixture.counts().await, (2, 1, 2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_rotation_advances_generation_and_binds_terminal_tip() {
         let fixture = IngressFixture::new("rotation");
@@ -1325,6 +1332,7 @@ mod tests {
         assert_eq!(generations, [1, 2]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_restart_settles_single_unbound_rotation_as_ambiguous_lineage() {
         let fixture = IngressFixture::new("unbound-rotation");
@@ -1365,6 +1373,7 @@ mod tests {
         assert_eq!(fixture.counts().await, (1, 0, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_startup_recovery_scans_bounded_pages_without_skips() {
         let fixture = IngressFixture::new("paged-recovery");

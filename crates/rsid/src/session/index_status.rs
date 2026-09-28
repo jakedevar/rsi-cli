@@ -303,6 +303,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_create_on_first_write() {
         let ctx = Ctx::new();
@@ -320,6 +321,7 @@ mod tests {
         assert!(ticket.last_shipped_commit.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_status_update_transition() {
         let ctx = Ctx::new();
@@ -364,6 +366,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_shipped_fields_populated() {
         let ctx = Ctx::new();
@@ -393,6 +396,7 @@ mod tests {
         assert!(ticket.last_shipped_at.is_some(), "shipped_at should be set");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_project_name_validation_rejects_traversal() {
         let result = validate_project_name("../evil");
@@ -402,6 +406,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_project_name_validation_rejects_slash() {
         let result = validate_project_name("foo/bar");
@@ -411,6 +416,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_atomic_rename_integrity() {
         let ctx = Ctx::new();
@@ -431,6 +437,7 @@ mod tests {
         assert!(parsed.get("schema_version").is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_project_name_valid() {
         for name in &["topology-on-epic", "my_project", "proj1", "A-B_C123"] {

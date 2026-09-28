@@ -29,6 +29,7 @@ mod project_form;
 mod project_picker;
 mod prompt;
 mod prompt_preview;
+mod provider_credential_form;
 mod provider_form;
 mod question_modal;
 mod rating;
@@ -1028,6 +1029,15 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                 rate_window_seconds,
                 alert_threshold_ratio,
                 editing.is_some(),
+            );
+        }
+        OverlayState::ProviderCredentialForm {
+            slot,
+            rotate,
+            secret,
+        } => {
+            provider_credential_form::render_provider_credential_form(
+                frame, area, *slot, *rotate, secret,
             );
         }
         OverlayState::SkillPreview {

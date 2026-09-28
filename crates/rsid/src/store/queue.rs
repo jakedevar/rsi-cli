@@ -281,6 +281,7 @@ mod tests {
         (dir, store)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_enqueue_task() {
         let (_dir, store) = open_test_store();
@@ -311,6 +312,7 @@ mod tests {
         assert_eq!(items[0].attempts, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_enqueue_returns_incrementing_ids() {
         let (_dir, store) = open_test_store();
@@ -323,6 +325,7 @@ mod tests {
         assert!(id2 > id1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_list_eligible_above_threshold() {
         let (_dir, store) = open_test_store();
@@ -341,6 +344,7 @@ mod tests {
         assert_eq!(eligible[0].item_count, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_list_eligible_below_threshold() {
         let (_dir, store) = open_test_store();
@@ -352,6 +356,7 @@ mod tests {
         assert!(eligible.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_list_eligible_skips_claimed() {
         let (_dir, store) = open_test_store();
@@ -368,6 +373,7 @@ mod tests {
         assert!(eligible.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_claim_work_unit() {
         let (_dir, store) = open_test_store();
@@ -381,6 +387,7 @@ mod tests {
         assert!(claimed[0].claimed_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_claim_already_claimed() {
         let (_dir, store) = open_test_store();
@@ -395,6 +402,7 @@ mod tests {
         assert!(second.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_complete_work_unit() {
         let (_dir, store) = open_test_store();
@@ -413,6 +421,7 @@ mod tests {
         assert!(items[0].completed_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_fail_work_unit_with_retry() {
         let (_dir, store) = open_test_store();
@@ -433,6 +442,7 @@ mod tests {
         assert_eq!(items[0].error.as_deref(), Some("timeout error"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_fail_work_unit_is_atomic_on_partial_failure() {
         // Proves the three UPDATEs in `fail_work_unit` run inside a single
@@ -506,6 +516,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_fail_work_unit_exhausted() {
         let (_dir, store) = open_test_store();
@@ -533,6 +544,7 @@ mod tests {
         assert_eq!(failed[0].attempts, 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_release_stale_claims() {
         let (_dir, store) = open_test_store();
@@ -559,6 +571,7 @@ mod tests {
         assert_eq!(items.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_queue_metrics() {
         let (_dir, store) = open_test_store();
@@ -585,6 +598,7 @@ mod tests {
         assert_eq!(metrics.failed, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_purge_completed_items() {
         let (_dir, store) = open_test_store();
@@ -610,6 +624,7 @@ mod tests {
         assert_eq!(metrics.completed, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn test_work_unit_grouping() {
         let (_dir, store) = open_test_store();

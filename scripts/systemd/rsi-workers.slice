@@ -1,0 +1,4 @@
+[Unit]
+Description=RSI aggregate worker slice
+
+[Slice]

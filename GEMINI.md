@@ -2,6 +2,10 @@
 
 This file provides foundational mandates and instructional context for Gemini CLI when working in the `rsi` repository.
 
+Appointed harness managers must read `.claude/skills/rsi-project-manager/SKILL.md`
+and follow its standing operator edicts on autonomy, Issue/lead/child execution,
+and carrying authorization and unfinished work through manager succession.
+
 ## Project Overview
 
 **Rsi** is a Vim-like Terminal User Interface (TUI) designed for managing multiple AI coding sessions across various providers (Claude, Codex, Gemini, and Local models). It is optimized for power users who prefer keyboard-driven workflows and high information density.

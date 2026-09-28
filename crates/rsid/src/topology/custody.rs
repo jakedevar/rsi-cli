@@ -940,6 +940,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a1_every_node_allocates_fresh_sandbox() {
         let (repo, base) = repo();
@@ -970,6 +971,7 @@ mod tests {
         assert_ne!(allocation.root, std::env::current_dir().unwrap());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a2_downstream_forks_observed_upstream_commit() {
         let (repo, base) = repo();
@@ -1032,6 +1034,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a3_non_repo_working_dir_is_invalid_before_allocation() {
         let non_repo = TempDir::new().unwrap();
@@ -1041,6 +1044,7 @@ mod tests {
         assert!(matches!(error, DaemonError::InvalidParam(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a4_dirty_upstream_fails_uncommitted_work() {
         let (repo, base) = repo();
@@ -1062,6 +1066,7 @@ mod tests {
         assert!(custody.fork(Some("node:A")).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a5_terminal_node_reclaims_only_its_build_cache() {
         let (repo, base) = repo();
@@ -1116,6 +1121,7 @@ mod tests {
         assert!(sessions[1].1.join("B.bin").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn t1_a6_effort_kind_and_node_id_pass_through() {
         let (repo, base) = repo();

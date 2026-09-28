@@ -101,6 +101,7 @@ async fn assert_review_at_seal(f: &Fixture, receipt: &ManagerMutationReceiptV2) 
     assert_eq!(context["source"]["commit"], json!(f.source_head));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn review_seal_survives_a_thoughts_only_commit_at_the_original_sha() {
     let f = fixture().await;
@@ -132,6 +133,7 @@ async fn review_seal_survives_a_thoughts_only_commit_at_the_original_sha() {
     assert_eq!(state, "allocating");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn code_commit_after_the_seal_keeps_the_review_at_the_exact_sha() {
     let f = fixture().await;
@@ -156,6 +158,7 @@ async fn code_commit_after_the_seal_keeps_the_review_at_the_exact_sha() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn archived_author_is_reviewed_through_its_rotation_tip_without_substitution() {
     let f = fixture().await;
@@ -199,6 +202,7 @@ async fn archived_author_is_reviewed_through_its_rotation_tip_without_substituti
     assert_eq!(source["historical_commit"], json!(true));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn archived_author_without_a_same_custody_tip_is_unavailable() {
     let f = fixture().await;
@@ -222,6 +226,7 @@ async fn archived_author_without_a_same_custody_tip_is_unavailable() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn two_unarchived_claimants_of_one_sandbox_are_refused() {
     let f = fixture().await;
@@ -242,6 +247,7 @@ async fn two_unarchived_claimants_of_one_sandbox_are_refused() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn stage_and_integration_keep_the_archived_source_refusal() {
     let f = fixture().await;
@@ -300,6 +306,7 @@ async fn seal_with_note(f: &mut Fixture, key: &str) {
     record_db_review_source(f, key).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn post_seal_notes_may_be_added_and_then_revised() {
     let mut f = fixture().await;
@@ -323,6 +330,7 @@ async fn post_seal_notes_may_be_added_and_then_revised() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn sealed_notes_rewrite_after_the_seal_keeps_the_sealed_bytes_under_review() {
     let mut f = fixture().await;
@@ -348,6 +356,7 @@ async fn sealed_notes_rewrite_after_the_seal_keeps_the_sealed_bytes_under_review
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn dirty_holder_tree_does_not_block_a_review_request() {
     let f = fixture().await;
@@ -366,6 +375,7 @@ async fn dirty_holder_tree_does_not_block_a_review_request() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn merge_and_long_history_after_the_seal_keep_the_review() {
     let f = fixture().await;
@@ -413,6 +423,7 @@ async fn merge_and_long_history_after_the_seal_keep_the_review() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn reviewing_the_custody_base_commit_is_not_authored() {
     let f = fixture().await;
@@ -503,6 +514,7 @@ pub(super) fn claim_and_cross_launch_gate(store: &Store, tip: Uuid) {
     store.manager_action_runtime_gate(&claim, true).unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
 async fn rotated_review_source_crosses_the_pending_acceptance_gate() {
@@ -516,6 +528,7 @@ async fn rotated_review_source_crosses_the_pending_acceptance_gate() {
     claim_and_cross_launch_gate(&store, tip);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
 async fn unrotated_author_review_crosses_the_pending_acceptance_gate() {
@@ -555,6 +568,7 @@ fn persist_action_source(store: &Store, action: Uuid, path: &str, value: &Value)
     assert_eq!(changed, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 #[allow(
     clippy::unwrap_used,

@@ -221,6 +221,16 @@ impl Store {
                     .all(|row| row["complete"] == true);
                 rows
             }
+            ManagerInspectSectionV2::MigrationAllocations => {
+                let (rows, complete) = self.manager_v2_migration_allocation_rows(
+                    config,
+                    q.epic_id,
+                    &after,
+                    usize::from(q.limit) + 1,
+                )?;
+                coverage = complete;
+                rows
+            }
             ManagerInspectSectionV2::Overview => {
                 let work = self.manager_v2_work_rows(config, q.epic_id)?;
                 let mut out = Vec::new();
@@ -564,6 +574,231 @@ impl Store {
             next_cursor,
             complete: coverage && !more,
         })
+    }
+
+    /// Read bounded allocations for the manager's project and exact Epic scope.
+    /// The tables land with the migration allocator; keeping absence explicit lets
+    /// this reader deploy first without presenting missing schema as empty data.
+    fn manager_v2_migration_allocation_rows(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Option<Uuid>,
+        after: &str,
+        limit: usize,
+    ) -> Result<(Vec<Value>, bool)> {
+        let present: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('migration_allocation_repositories','migration_allocation_claims')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present != 2 {
+            return Ok((
+                vec![json!({
+                    "type":"migration_allocation_source",
+                    "key":"migration_allocation_source",
+                    "state":"unavailable",
+                    "reason":"migration allocation tables are not installed"
+                })],
+                false,
+            ));
+        }
+
+        let work_rows = self.manager_v2_work_rows(config, epic)?;
+        if work_rows.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let mut work_scope = Vec::new();
+        let mut source_sessions = Vec::new();
+        for row in &work_rows {
+            let (Some(work_key), Some(epic_id)) = (
+                row.get("key").and_then(Value::as_str),
+                row.get("epic_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            work_scope.push(json!({"work_key":work_key,"epic_id":epic_id}));
+            if let Some(source) = row.get("source_session_id").and_then(Value::as_str) {
+                source_sessions.push(source.to_string());
+            }
+        }
+        if work_scope.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let custody_complete = source_sessions.len() == work_scope.len();
+        let source_sessions_json = serde_json::to_string(&source_sessions)?;
+        let mut custody_stmt = self.conn.prepare(
+            "SELECT DISTINCT root.canonical_repo_dir,root.repository_identity
+             FROM sandbox_custody_roots root
+             WHERE root.state='live' AND root.validation_state='verified'
+               AND EXISTS(SELECT 1 FROM sessions source
+                          WHERE source.id IN (SELECT value FROM json_each(?1))
+                            AND source.project_id=?2
+                            AND (root.owner_session_id=source.id
+                                 OR source.sandbox_custody_id=root.custody_id))
+             ORDER BY root.canonical_repo_dir,root.repository_identity",
+        )?;
+        let custody_repositories = custody_stmt
+            .query_map(
+                params![source_sessions_json, config.project_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut repositories = std::collections::BTreeSet::new();
+        for (canonical_repo_dir, repository_identity) in custody_repositories {
+            repositories.insert(canonical_repo_dir);
+            repositories.insert(repository_identity.clone());
+            if let Some(common_dir) = repository_identity.strip_prefix("git-common-dir:") {
+                repositories.insert(common_dir.to_string());
+            }
+        }
+        if repositories.is_empty() {
+            return Ok((
+                vec![json!({
+                    "type":"migration_allocation_source",
+                    "key":"migration_allocation_source",
+                    "state":"unavailable",
+                    "reason":"scoped Work has no verified repository custody"
+                })],
+                false,
+            ));
+        }
+
+        let after_sequence = if after.is_empty() {
+            -1
+        } else {
+            after
+                .parse::<i64>()
+                .map_err(|_| refused("manager_v2_invalid_cursor"))?
+        };
+        let repositories_json = serde_json::to_string(&repositories)?;
+        let work_scope_json = serde_json::to_string(&work_scope)?;
+        let mut statement = self.conn.prepare(
+            "SELECT claim.sequence,claim.id,claim.repository,claim.source_commit,
+                    claim.work_key,claim.epic_id,claim.assigned_version,claim.state,
+                    claim.remote_tip,claim.candidate_commit,claim.expires_at,claim.row_version,
+                    claim.created_at,claim.updated_at,head.remote_tip,head.landed_version,
+                    CASE
+                      WHEN claim.state IN ('active','publishing') AND claim.remote_tip<>head.remote_tip
+                        THEN 'remote_tip_changed'
+                      WHEN claim.state IN ('active','publishing') AND
+                           claim.assigned_version != head.landed_version +
+                             (SELECT COUNT(*) FROM migration_allocation_claims prior
+                              WHERE prior.repository=claim.repository
+                                AND prior.state IN ('active','publishing')
+                                AND prior.sequence<claim.sequence) + 1
+                        THEN 'version_order_changed'
+                      WHEN claim.state IN ('active','publishing') AND EXISTS(
+                           SELECT 1 FROM migration_allocation_claims competing
+                           WHERE competing.repository=claim.repository
+                             AND competing.id<>claim.id
+                             AND competing.state IN ('active','publishing')
+                             AND (competing.assigned_version=claim.assigned_version
+                                  OR competing.source_commit=claim.source_commit))
+                        THEN 'competing_live_claim'
+                      ELSE NULL
+                    END AS conflict_reason,
+                    (SELECT json_group_array(source_commit) FROM (
+                         SELECT prior.source_commit FROM migration_allocation_claims prior
+                         WHERE prior.repository=claim.repository
+                           AND prior.state IN ('active','publishing')
+                           AND prior.sequence<claim.sequence
+                         ORDER BY prior.sequence LIMIT 257
+                    )) AS predecessor_sources
+             FROM migration_allocation_claims claim
+             JOIN migration_allocation_repositories head USING(repository)
+             WHERE claim.repository IN (SELECT value FROM json_each(?1))
+               AND claim.sequence>?2
+               AND EXISTS(SELECT 1 FROM json_each(?3) scoped_work
+                          WHERE json_extract(scoped_work.value,'$.work_key')=claim.work_key
+                            AND json_extract(scoped_work.value,'$.epic_id')=claim.epic_id)
+             ORDER BY claim.sequence
+             LIMIT ?4",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    repositories_json,
+                    after_sequence,
+                    work_scope_json,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, i64>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, String>(17)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = rows
+            .into_iter()
+            .map(
+                |(
+                    sequence,
+                    claim_id,
+                    _repository,
+                    source_commit,
+                    work_key,
+                    epic_id,
+                    version,
+                    state,
+                    remote_tip,
+                    candidate_commit,
+                    expires_at,
+                    row_version,
+                    created_at,
+                    updated_at,
+                    head_remote_tip,
+                    landed_version,
+                    conflict_reason,
+                    predecessor_sources,
+                )|
+                 -> Result<Value> {
+                    let predecessor_sources: Vec<String> =
+                        serde_json::from_str(&predecessor_sources)?;
+                    Ok(json!({
+                        "type":"migration_allocation",
+                        "key":format!("{sequence:020}"),
+                        "sequence":sequence,
+                        "claim_id":claim_id,
+                        "work_key":work_key,
+                        "epic_id":epic_id,
+                        "source_commit":source_commit,
+                        "version":version,
+                        "state":state,
+                        "remote_tip":remote_tip,
+                        "candidate_commit":candidate_commit,
+                        "row_version":row_version,
+                        "expires_at":expires_at,
+                        "created_at":created_at,
+                        "updated_at":updated_at,
+                        "repository_remote_tip":head_remote_tip,
+                        "landed_version":landed_version,
+                        "conflict":conflict_reason.is_some(),
+                        "conflict_reason":conflict_reason,
+                        "predecessor_sources":predecessor_sources,
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows, custody_complete))
     }
     pub(crate) fn manager_v2_work_rows(
         &self,

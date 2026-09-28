@@ -265,6 +265,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn resolve_viewer_id_is_local() {
         let tracker = LocalTracker::new(make_store());
@@ -272,6 +273,7 @@ mod tests {
         assert_eq!(tracker.resolve_viewer_id(&config).await.unwrap(), "local");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn fetch_candidates_maps_ready_issues_and_excludes_blocked() {
         let store = make_store();
@@ -317,6 +319,7 @@ mod tests {
         assert!(b_tracked.blocked_by.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn fetch_by_ids_maps_every_status_and_skips_unknown_or_bad_ids() {
         let store = make_store();
@@ -368,6 +371,7 @@ mod tests {
         assert_eq!(state_type_of(cancelled_issue.id), "cancelled");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn fetch_by_ids_empty_input_short_circuits() {
         let tracker = LocalTracker::new(make_store());
@@ -381,6 +385,7 @@ mod tests {
     /// relations out from under a live, already-created issue id (with FKs
     /// deliberately disabled only in this corruption fixture), so
     /// `get_issue`'s `SELECT` fails at the SQLite layer.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn fetch_by_ids_propagates_store_errors_instead_of_silently_omitting() {
         let store = make_store();
@@ -409,6 +414,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn issue_writer_update_issue_state_completed_is_project_scoped_and_audited() {
         let store = make_store();
@@ -464,6 +470,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn update_issue_state_cancelled_maps_to_cancelled() {
         let store = make_store();
@@ -487,6 +494,7 @@ mod tests {
         assert!(reloaded.closed_at.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn update_issue_state_unknown_name_warns_and_defaults_to_closed() {
         let store = make_store();
@@ -509,6 +517,7 @@ mod tests {
         assert_eq!(reloaded.status, IssueStatus::Closed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn update_issue_state_bad_uuid_errors_without_panic() {
         let tracker = LocalTracker::new(make_store());
@@ -544,6 +553,7 @@ mod tests {
     /// store — mirrors `tick_dispatches_up_to_max_concurrent`
     /// (`poller.rs:378`), but through the local store path instead of a
     /// `MockTracker`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn poller_tick_dispatches_ready_local_issues_bounded_by_max_concurrent() {
         let store = make_store();
@@ -582,6 +592,7 @@ mod tests {
     /// Review F2/F5c: the canonical serde variant strings (`Closed`,
     /// `Cancelled`) must map like their lowercase Linear-style aliases —
     /// never fall through to the unknown-name arm.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn update_issue_state_accepts_canonical_capitalized_names() {
         let store = make_store();
@@ -617,6 +628,7 @@ mod tests {
 
     /// Review F5d: empty body maps to `description: None`, non-empty body to
     /// `Some(body)`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn fetch_candidates_maps_empty_body_to_none_description() {
@@ -646,6 +658,7 @@ mod tests {
     /// than re-dispatch. `max_concurrent` is deliberately larger than the
     /// issue count so a dedup failure would be visible as extra launches
     /// instead of being masked by slot exhaustion.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn poller_second_tick_does_not_redispatch_claimed_open_issues() {
         let store = make_store();
@@ -687,6 +700,7 @@ mod tests {
         assert_eq!(state.running.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn config_project_drift_rejects_candidates_by_id_completion_and_tick_before_store_or_launch()

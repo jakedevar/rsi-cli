@@ -526,6 +526,7 @@ mod tests {
     /// The rebuilt table is the released V97 table with exactly two edits: the
     /// actor enum gains `'manager'` and the provenance CHECK gains the manager
     /// disjunct. Indexes and immutability triggers are the V97 text verbatim.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn issue_events_manager_actor_ddl_is_released_v97_plus_only_the_manager_actor() {
         let released = normalized_sql(V97_EVENT_TABLE_SQL);

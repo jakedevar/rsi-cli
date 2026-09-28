@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::Utc;
 use rsi_common::harness_manager::*;
+use rsi_common::harness_manager_v2::ManagerRequestStateV2;
 use rsi_common::types::{
     Recurrence, ScheduleSpec, ScheduledJob, Session, SessionKind, SessionStatus, WakeMode,
 };
@@ -160,13 +161,15 @@ pub(super) fn current_manager_session_on(
 /// fingerprints. This is the durable, insert-time origin witness that keeps
 /// every `request_id IS NULL` projection exact without a direction column.
 const LEAD_NOTICE_FINGERPRINT_PREFIX: &str = "lead-notice:v1:";
+/// Server-owned prefix on informational manager mail. It cannot be confused
+/// with an actionable request and survives manager and lead rotation.
+const MANAGER_INFO_FINGERPRINT_PREFIX: &str = "manager-info:v1:";
 
 /// SQL predicate selecting manager-origin requests only. Lead-origin notices
 /// also have `request_id IS NULL` but are never requests: they do not count
 /// toward the pending request budget, are never reply targets, and never
 /// appear as `recent_requests` or v2 request rows.
-pub(super) const MANAGER_REQUEST_ROW: &str =
-    "request_id IS NULL AND request_fingerprint NOT GLOB 'lead-notice:*'";
+pub(super) const MANAGER_REQUEST_ROW: &str = "request_id IS NULL AND request_fingerprint NOT GLOB 'lead-notice:*' AND request_fingerprint NOT GLOB 'manager-info:*'";
 
 /// Settlement markers (#664). Each is an append-only v2 record keyed by the
 /// request id in the request's own (project, anchor, scope) — never a message
@@ -230,7 +233,11 @@ const ORPHAN_SWEEP_LIMIT: i64 = 256;
 pub(super) fn manager_request_open_sql() -> String {
     format!(
         "{MANAGER_REQUEST_ROW}
-         AND NOT EXISTS(SELECT 1 FROM harness_manager_messages reply WHERE reply.request_id=m.id)
+         AND (NOT EXISTS(SELECT 1 FROM harness_manager_messages reply WHERE reply.request_id=m.id)
+           OR EXISTS(SELECT 1 FROM harness_manager_v2_records active WHERE active.project_id=m.project_id
+             AND active.manager_session_id=m.manager_session_id AND active.scope_version=m.scope_version
+             AND active.record_key=m.id AND active.kind='request'
+             AND json_extract(active.payload_json,'$.state')='running'))
          AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_records v WHERE v.project_id=m.project_id
            AND v.manager_session_id=m.manager_session_id AND v.scope_version=m.scope_version AND v.record_key=m.id
            AND (v.kind IN ('request_readdress','{REQUEST_SETTLE_KIND}','{REQUEST_RELEASED_KIND}')
@@ -248,7 +255,11 @@ pub(super) fn manager_request_open_sql() -> String {
 pub(super) fn manager_request_unanswered_sql() -> String {
     format!(
         "{MANAGER_REQUEST_ROW}
-         AND NOT EXISTS(SELECT 1 FROM harness_manager_messages reply WHERE reply.request_id=m.id)
+         AND (NOT EXISTS(SELECT 1 FROM harness_manager_messages reply WHERE reply.request_id=m.id)
+           OR EXISTS(SELECT 1 FROM harness_manager_v2_records active WHERE active.project_id=m.project_id
+             AND active.manager_session_id=m.manager_session_id AND active.scope_version=m.scope_version
+             AND active.record_key=m.id AND active.kind='request'
+             AND json_extract(active.payload_json,'$.state')='running'))
          AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_records v WHERE v.project_id=m.project_id
            AND v.manager_session_id=m.manager_session_id AND v.scope_version=m.scope_version AND v.record_key=m.id
            AND (v.kind IN ('request_readdress','{REQUEST_SETTLE_KIND}')
@@ -306,6 +317,7 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     }
     let request: Option<String> = row.get(2)?;
     let created: String = row.get(7)?;
+    let request_fingerprint: String = row.get(11)?;
     Ok(StoredMessage {
         public: HarnessManagerMessageV1 {
             message_id: id(row, 0)?,
@@ -332,13 +344,14 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
                 )
             })?,
             replied: false,
+            informational: request_fingerprint.starts_with(MANAGER_INFO_FINGERPRINT_PREFIX),
             readdressed_from: None,
             standing_root_id: None,
         },
         project_id: id(row, 8)?,
         manager_session_id: id(row, 9)?,
         scope_version: row.get(10)?,
-        request_fingerprint: row.get(11)?,
+        request_fingerprint,
         idempotency_key: row.get(12)?,
     })
 }
@@ -1617,6 +1630,36 @@ impl Store {
         Ok((total, per_epic))
     }
 
+    /// The oldest actionable ids give a lead concrete requests to settle when
+    /// admission refuses a new one. Informational mail is excluded by the
+    /// shared open predicate.
+    fn manager_oldest_settleable_requests(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Option<Uuid>,
+    ) -> Result<String> {
+        let query = format!(
+            "SELECT m.id FROM harness_manager_messages m WHERE m.project_id=?1
+             AND m.manager_session_id=?2 AND m.scope_version=?3
+             AND (?4 IS NULL OR m.epic_id=?4) AND {}
+             ORDER BY m.sequence LIMIT 3",
+            manager_request_open_sql()
+        );
+        let mut statement = self.conn.prepare(&query)?;
+        let ids = statement
+            .query_map(
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    epic.map(|id| id.to_string())
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids.join(","))
+    }
+
     /// #664 (f): capacity summary plus the per-Epic open counts behind it.
     pub(crate) fn manager_mail_capacity(
         &self,
@@ -1939,6 +1982,7 @@ impl Store {
             epic_id: epic,
             message: original.public.message.clone(),
             idempotency_key: key.clone(),
+            informational: false,
         })?;
         let receipt = if let Some(receipt) = self.manager_replay(manager, config, &key, &digest)? {
             let replayed = self
@@ -2004,6 +2048,11 @@ impl Store {
             return Err(refused("manager_scope_denied"));
         }
         let digest = fingerprint(request)?;
+        let digest = if request.informational {
+            format!("{MANAGER_INFO_FINGERPRINT_PREFIX}{digest}")
+        } else {
+            digest
+        };
         if let Some(mut receipt) =
             self.manager_replay(caller, &config, &request.idempotency_key, &digest)?
         {
@@ -2018,17 +2067,23 @@ impl Store {
         if lead.id == caller {
             return Err(refused("manager_cannot_supervise_itself"));
         }
-        self.settle_orphaned_manager_requests(&config)?;
-        // #664 (c): both caps read the post-sweep open counts inside this
-        // Immediate transaction; the open count grows only through this path.
-        let (pending, per_epic) = self.manager_open_request_counts(&config)?;
-        if per_epic.get(&request.epic_id).copied().unwrap_or(0) >= MAX_PENDING_REQUESTS_PER_EPIC {
-            return Err(refused(
-                "manager_epic_pending_request_limit: next_action=settle_or_send_notice",
-            ));
-        }
-        if pending >= i64::from(MAX_PENDING_REQUESTS_PER_PROJECT) {
-            return Err(refused("manager_pending_request_limit"));
+        if !request.informational {
+            self.settle_orphaned_manager_requests(&config)?;
+            // Informational mail remains deliverable when requests fill the cap.
+            let (pending, per_epic) = self.manager_open_request_counts(&config)?;
+            if per_epic.get(&request.epic_id).copied().unwrap_or(0) >= MAX_PENDING_REQUESTS_PER_EPIC
+            {
+                return Err(DaemonError::InvalidParam(format!(
+                    "manager_epic_pending_request_limit: oldest_settleable={}; next_action=settle_or_send_notice",
+                    self.manager_oldest_settleable_requests(&config, Some(request.epic_id))?
+                )));
+            }
+            if pending >= i64::from(MAX_PENDING_REQUESTS_PER_PROJECT) {
+                return Err(DaemonError::InvalidParam(format!(
+                    "manager_pending_request_limit: oldest_settleable={}; next_action=settle_or_send_notice",
+                    self.manager_oldest_settleable_requests(&config, None)?
+                )));
+            }
         }
         let mut receipt = self.insert_manager_message(
             &config,
@@ -2076,6 +2131,7 @@ impl Store {
         }
         if original.public.request_id.is_some()
             || original.is_lead_notice()
+            || original.public.informational
             || !self.manager_message_live(&config, &original)?
             || self.manager_lineage_tip(original.public.recipient_session_id)? != caller
         {
@@ -2089,6 +2145,7 @@ impl Store {
             request_id: chain.root,
             message: request.message.clone(),
             idempotency_key: request.idempotency_key.clone(),
+            still_running: request.still_running,
         })?;
         if let Some(mut receipt) = self.manager_reply_replay(
             caller,
@@ -2101,6 +2158,12 @@ impl Store {
             receipt.manager_seat = self.manager_seat_state(&config)?;
             tx.commit()?;
             return Ok(receipt);
+        }
+        if self
+            .manager_v2_record(&config, "request", &request.request_id.to_string())?
+            .is_some_and(|row| row.payload["execution_evidence"]["kind"] == "manager_disposition")
+        {
+            return Err(refused("manager_request_settled"));
         }
         // #664 settled-reply rule: an exact replay above still returns its
         // original receipt; any NEW reply to a manager-settled request is
@@ -2153,6 +2216,43 @@ impl Store {
             &request.idempotency_key,
             &digest,
         )?;
+        let key = request.request_id.to_string();
+        let previous = self.manager_v2_record(&config, "request", &key)?;
+        let state = if request.still_running {
+            ManagerRequestStateV2::Running
+        } else {
+            ManagerRequestStateV2::Completed
+        };
+        let record = super::manager_ledger::RequestRecord {
+            request_id: request.request_id,
+            state,
+            message: request.message.clone(),
+            work_key: previous
+                .as_ref()
+                .and_then(|row| row.payload["work_key"].as_str().map(str::to_owned)),
+            lead_session_id: caller,
+            execution_evidence: Some(
+                serde_json::json!({"kind":"attributed_reply","message_id":receipt.message_id}),
+            ),
+            updated_at: stamp(),
+        };
+        self.manager_v2_put_record(
+            &config,
+            "request",
+            &key,
+            Some(original.public.epic_id),
+            previous.as_ref().map_or(0, |row| row.row_version),
+            &serde_json::to_value(record)?,
+        )?;
+        if !request.still_running {
+            self.manager_v2_release_request(
+                &config,
+                caller,
+                original.public.epic_id,
+                request.request_id,
+                state,
+            )?;
+        }
         receipt.rolled_over_from = (generation != chain.root).then_some(chain.root);
         let lead = self.manager_lead(config.project_id, original.public.epic_id)?;
         self.ensure_manager_watch(&config, &lead, true, &lead.updated_at.to_rfc3339(), true)?;
@@ -2189,6 +2289,7 @@ impl Store {
             epic_id: epic,
             message: original.public.message.clone(),
             idempotency_key: key.clone(),
+            informational: false,
         })?;
         let successor = self.insert_manager_message(
             config,
@@ -2483,7 +2584,8 @@ impl Store {
         ))
     }
 
-    /// Project-wide manager action results use one exact durable transport.
+    /// Manager action results and lead-origin event notices share one exact
+    /// durable transport per manager scope.
     /// Its source and target are the manager lineage anchor: the scheduler
     /// resolves both to the current tip and fires only after that tip is idle.
     /// This covers topology, session-creation, vacant-lead, and succession
@@ -2861,10 +2963,12 @@ impl Store {
         let enabled = self
             .get_scheduled_job(&job_id)?
             .is_some_and(|job| job.enabled);
-        Ok(enabled
-            && self
-                .harness_manager_watch_route(job_id)?
-                .is_some_and(|(_, target)| target == target_session_id))
+        if !enabled || self.manager_action_operator_paused(target_session_id)? {
+            return Ok(false);
+        }
+        Ok(self
+            .harness_manager_watch_route(job_id)?
+            .is_some_and(|(_, target)| target == target_session_id))
     }
 
     /// Durable reconciliation, also accelerated by session bus events. A
@@ -3013,9 +3117,11 @@ mod tests {
             epic_id,
             message: "Report readiness with verification evidence.".into(),
             idempotency_key: key.into(),
+            informational: false,
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn identical_scope_resave_preserves_policy_watches_and_retirement_state() {
@@ -3115,6 +3221,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn identical_scope_resave_canonicalizes_modes_ids_and_lineage_tip() {
@@ -3239,6 +3346,7 @@ mod tests {
         (epic.id, lead.id)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_groups_include_future_epics_and_union_explicit_selection() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3321,6 +3429,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_project_scope_pages_more_than_32_epics_and_defers_notice_overflow() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3409,6 +3518,7 @@ mod tests {
                     request_id: sent.message_id,
                     message: "Ready for review".into(),
                     idempotency_key: "overflow-reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap();
@@ -3444,6 +3554,7 @@ mod tests {
             )
             .unwrap();
         assert!(settled_for_watch >= 1);
+        let (reply_watch, _, _) = f.store.manager_action_watch_identity(&config);
         let pending_reply_for_watch: i64 = f
             .store
             .conn
@@ -3451,14 +3562,14 @@ mod tests {
                 "SELECT count(*) FROM harness_manager_notices
                  WHERE job_id=?1 AND kind='message' AND subject_id=?2
                    AND settled_at IS NULL",
-                params![watch.id.to_string(), reply.message_id.to_string()],
+                params![reply_watch.to_string(), reply.message_id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(pending_reply_for_watch, 1);
         assert!(
             f.store
-                .get_scheduled_job(&watch.id)
+                .get_scheduled_job(&reply_watch)
                 .unwrap()
                 .unwrap()
                 .enabled,
@@ -3471,6 +3582,7 @@ mod tests {
         assert!(refreshed.epic_ids.contains(&future));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn group_scope_notice_discovery_advances_in_fixed_indexed_cursor_pages() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3539,6 +3651,7 @@ mod tests {
         assert!(!excluded);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn project_scope_retains_exact_notices_beyond_transport_capacity() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3697,6 +3810,7 @@ mod tests {
         assert_eq!(pending, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_scope_discovery_includes_empty_groups_and_rejects_foreign_groups() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3755,6 +3869,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_v110_migration_preserves_legacy_selection_and_revocation() {
         for revoked in [false, true] {
@@ -3780,6 +3895,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_group_selection_survives_restart_and_future_enrollment() {
         let directory = tempfile::tempdir().unwrap();
@@ -3824,6 +3940,7 @@ mod tests {
         assert_eq!(refreshed.row_version, grant.row_version);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_picker_pages_all_legal_epics_beyond_selection_limit() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3882,6 +3999,7 @@ mod tests {
         assert!(f.store.list_harness_manager_epics(&request).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_two_epic_round_trip_keeps_identity_and_correlation() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -3912,6 +4030,7 @@ mod tests {
                         request_id: sent.message_id,
                         message: format!("Feature {index} is ready; evidence: commit abc{index}."),
                         idempotency_key: format!("reply-{index}"),
+                        still_running: false,
                     },
                 )
                 .unwrap();
@@ -3948,6 +4067,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used, clippy::too_many_lines)]
     fn operator_lead_replacement_reissues_open_mail_once_and_routes_replies() {
@@ -3996,6 +4116,7 @@ mod tests {
                     request_id: original.message_id,
                     message: "old correlation".into(),
                     idempotency_key: "old-reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap_err();
@@ -4017,6 +4138,7 @@ mod tests {
                     request_id: new_id,
                     message: "new lead evidence".into(),
                     idempotency_key: "new-reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap();
@@ -4080,6 +4202,7 @@ mod tests {
         assert_eq!(new["readdressed_from"], original.message_id.to_string());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used, clippy::too_many_lines)]
     fn authorized_replacement_preserves_answered_terminal_and_revoked_requests() {
@@ -4095,6 +4218,7 @@ mod tests {
                     request_id: answered.message_id,
                     message: "done".into(),
                     idempotency_key: "answered-reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap();
@@ -4186,6 +4310,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn raw_lead_link_does_not_reissue_mail_without_authorized_change() {
@@ -4220,6 +4345,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_config_cas_and_non_lead_calls_preserve_scope() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4261,6 +4387,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_revoke_and_regrant_does_not_revive_old_exchange_or_wakes() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4292,6 +4419,7 @@ mod tests {
                         request_id: sent.message_id,
                         message: "reply".into(),
                         idempotency_key: "reply".into(),
+                        still_running: false,
                     }
                 )
                 .is_err()
@@ -4329,6 +4457,7 @@ mod tests {
         assert_eq!(replay.message_id, sent.message_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_current_session_id_is_the_manager_classification_source() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4387,6 +4516,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_rotation_follows_lineage_but_replacement_refuses_old_request() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4438,6 +4568,7 @@ mod tests {
                     request_id: sent.message_id,
                     message: "Current lead reply".into(),
                     idempotency_key: "reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap();
@@ -4465,7 +4596,8 @@ mod tests {
                     &AgentManagerReplyRequestV1 {
                         request_id: sent.message_id,
                         message: "Unrelated lead".into(),
-                        idempotency_key: "other".into()
+                        idempotency_key: "other".into(),
+                        still_running: false,
                     }
                 )
                 .is_err()
@@ -4480,6 +4612,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_restart_replays_receipts_and_retains_inbox_and_notices() {
         let directory = tempfile::tempdir().unwrap();
@@ -4536,6 +4669,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn harness_manager_fresh_lineage_does_not_transfer_authority_but_rotation_does() {
@@ -4634,6 +4768,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_watch_capacity_failure_rolls_back_message_acceptance() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4674,6 +4809,7 @@ mod tests {
         assert!(inbox.messages.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_cross_project_enrollment_is_refused_without_changes() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4715,6 +4851,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_moved_principal_revokes_old_project_inbox_and_wakes() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4787,6 +4924,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_deleted_anchor_can_revoke_without_resurrection() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4818,6 +4956,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn harness_manager_inbox_pagination_and_human_question_survive_reads_and_mail() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4872,6 +5011,7 @@ mod tests {
         assert_eq!(lead.status, SessionStatus::WaitingApproval);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_session_scope_reaches_leads_and_descendants_only_for_the_current_manager() {
         let f = fixture(Store::open_in_memory().unwrap());
@@ -4954,6 +5094,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_session_scope_refuses_a_foreign_project_session() {
         let f = fixture(Store::open_in_memory().unwrap());

@@ -112,6 +112,7 @@ async fn fire(manager: &Arc<SessionManager>, job: &rsi_common::types::ScheduledJ
 /// rotates and publishes L2 before L1's guard is taken, and the guarded check
 /// refuses `continuation_tip_changed`. The one-shot wake is retained with
 /// durable backoff, L1 is not restarted, and the next pass delivers to L2.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used)]
 async fn continuation_captured_before_rotation_publication_retries_then_delivers_to_successor()
@@ -206,6 +207,7 @@ async fn continuation_captured_before_rotation_publication_retries_then_delivers
 /// K2 finding a: C1 publication waits for guard(P) held by an in-flight
 /// continuation, so the tip and lead generation cannot move between that
 /// continuation's check and its provider installation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotation_publication_waits_for_in_flight_continuation_guard() -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
@@ -252,6 +254,7 @@ async fn rotation_publication_waits_for_in_flight_continuation_guard() -> anyhow
 /// the tip even when the predecessor's latest earlier rotation is a legacy
 /// `completed` without a successor id. Delivery to P is refused
 /// `continuation_publication_pending`; after C1 the tip is S.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reserved_unpublished_successor_is_not_the_tip_after_a_legacy_rotation()
 -> anyhow::Result<()> {
@@ -314,6 +317,7 @@ async fn reserved_unpublished_successor_is_not_the_tip_after_a_legacy_rotation()
 
 /// Design test 14: a stall nudge addressed to a rotated-away session is a
 /// typed refusal; the published successor keeps its incarnation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stall_nudge_after_rotation_is_typed_and_successor_keeps_its_incarnation()
 -> anyhow::Result<()> {
@@ -339,6 +343,7 @@ async fn stall_nudge_after_rotation_is_typed_and_successor_keeps_its_incarnation
 
 /// Design test 5 (RPC-1 C4): a refused successor settled Failed is never the
 /// tip, so a scheduled wake still delivers to the predecessor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_unpublished_successor_leaves_wake_delivered_to_predecessor() -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
@@ -374,6 +379,7 @@ async fn failed_unpublished_successor_leaves_wake_delivered_to_predecessor() -> 
 
 /// Design test 17: operator-authorized exact-id continuation of a
 /// superseded session is unfenced by design and still proceeds.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operator_continuation_of_superseded_session_proceeds() -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
@@ -404,6 +410,7 @@ async fn operator_continuation_of_superseded_session_proceeds() -> anyhow::Resul
 /// Design test 4 (#620): an orphan Starting tip is retried with backoff and,
 /// at the bound, the one-shot wake is disabled and stamped (never deleted)
 /// with a typed `continuation_retry_exhausted` naming the tip.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orphan_starting_tip_exhausts_retry_and_settles_typed() -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
@@ -451,6 +458,7 @@ async fn orphan_starting_tip_exhausts_retry_and_settles_typed() -> anyhow::Resul
 /// one-shot settlement. The restarted daemon reopens to the durable attempt
 /// history, not a fresh budget: its next refusal settles the job (disabled,
 /// stamped, retry state cleared in the same write) with one typed message.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exhausted_resume_retry_survives_crash_before_settlement_without_fresh_budget()
 -> anyhow::Result<()> {
@@ -507,6 +515,7 @@ async fn exhausted_resume_retry_survives_crash_before_settlement_without_fresh_b
 
 /// Design test 15: an operator "trigger now" refused by the fence is typed
 /// and consumes nothing: the row stays enabled, unstamped, with no retry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_trigger_refused_by_fence_leaves_row_unchanged() -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
@@ -538,6 +547,7 @@ async fn manual_trigger_refused_by_fence_leaves_row_unchanged() -> anyhow::Resul
 /// Design test 18: the retry state is daemon-owned. A row without it
 /// decodes; an operator schedule edit replaces the spec and resets it; a
 /// client-supplied key never reaches the row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn continuation_retry_state_is_daemon_owned_and_reset_by_schedule_edits() -> anyhow::Result<()>
 {
@@ -672,6 +682,7 @@ fn continue_refusal(error: &crate::error::DaemonError) -> (String, String) {
 /// L2 before the effect. The continuation is refused with the typed
 /// `continuation_actor_authority_changed` under W's guard, W is not started
 /// and keeps its history, and the new lead L2 continues W with the same cursor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_continue_by_a_lead_replaced_after_authorization_is_refused_typed()
 -> anyhow::Result<()> {
@@ -764,6 +775,7 @@ async fn agent_continue_by_a_lead_replaced_after_authorization_is_refused_typed(
 /// the effect claim. `SetEpicLead` takes only guard(L1) and guard(L2), so it
 /// commits; the effect claim's revalidation then refuses L1 with the typed
 /// code. W is not started and keeps its history, and L2 continues W.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_continue_lead_replaced_after_guarded_check_is_refused_at_effect_claim()
 -> anyhow::Result<()> {
@@ -847,6 +859,7 @@ async fn agent_continue_lead_replaced_after_guarded_check_is_refused_at_effect_c
 /// is refused with the typed `continuation_tip_changed`; a fresh cursor at the
 /// published successor succeeds; and continuing that successor while it is
 /// busy still interrupts and delivers (the verb's documented contract).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_continue_child_refuses_moved_tip_typed_then_continues_fresh_and_busy()
 -> anyhow::Result<()> {

@@ -34,7 +34,7 @@ use crate::topology::store::{self as rows, AttemptRow, AttemptStatus, NewAttempt
 
 // ─── fixture ────────────────────────────────────────────────────────────────
 
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args([
             "-c",
@@ -84,7 +84,7 @@ struct FakeRun {
 /// Process group the fake reports for every op.
 const FAKE_PGID: i32 = 4242;
 
-struct Fake {
+pub(super) struct Fake {
     world: Arc<StdMutex<World>>,
     store: Arc<Mutex<Store>>,
     allocator: SandboxAllocator,
@@ -99,7 +99,7 @@ struct Fake {
     build_cap: std::sync::atomic::AtomicU32,
     /// One-shot suspension between a resolution's key pre-check and its
     /// recording transaction: `(entered, go)`.
-    record_hold: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    pub(super) record_hold: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl NodeEffects for Fake {
@@ -286,18 +286,18 @@ fn admit_invocation(store: &Store, session_id: Uuid, key: &str) -> rusqlite::Res
     )
 }
 
-struct Harness {
+pub(super) struct Harness {
     _dirs: (TempDir, TempDir),
-    repo: PathBuf,
-    base: String,
+    pub(super) repo: PathBuf,
+    pub(super) base: String,
     db: PathBuf,
     sandboxes: PathBuf,
     world: Arc<StdMutex<World>>,
-    executor: Executor<Fake>,
+    pub(super) executor: Executor<Fake>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let repo_dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         let repo = repo_dir.path().canonicalize().unwrap();
@@ -341,18 +341,19 @@ impl Harness {
             repo_root: self.repo.clone(),
             base_commit: self.base.clone(),
             input: None,
+            requester: None,
         };
         let store = self.executor.store.lock().await;
         rows::insert_execution(&store, &new).unwrap();
         new.id
     }
 
-    async fn attempts(&self, execution_id: Uuid) -> Vec<AttemptRow> {
+    pub(super) async fn attempts(&self, execution_id: Uuid) -> Vec<AttemptRow> {
         let store = self.executor.store.lock().await;
         rows::load_attempts(&store, execution_id).unwrap()
     }
 
-    async fn attempt(
+    pub(super) async fn attempt(
         &self,
         execution_id: Uuid,
         node: &str,
@@ -368,7 +369,7 @@ impl Harness {
             .unwrap_or_else(|| panic!("attempt {node}@{iteration}#{attempt} missing"))
     }
 
-    async fn status(&self, execution_id: Uuid) -> rows::ExecutionStatus {
+    pub(super) async fn status(&self, execution_id: Uuid) -> rows::ExecutionStatus {
         let store = self.executor.store.lock().await;
         rows::load_execution(&store, execution_id)
             .unwrap()
@@ -376,22 +377,22 @@ impl Harness {
             .status
     }
 
-    async fn row_version(&self, execution_id: Uuid) -> i64 {
+    pub(super) async fn row_version(&self, execution_id: Uuid) -> i64 {
         let store = self.executor.store.lock().await;
         rows::current_row_version(&store, execution_id).unwrap()
     }
 
-    fn launches(&self) -> Vec<(String, Uuid, String)> {
+    pub(super) fn launches(&self) -> Vec<(String, Uuid, String)> {
         self.world.lock().unwrap().launches.clone()
     }
 
-    fn sandbox(&self, session_id: Uuid) -> PathBuf {
+    pub(super) fn sandbox(&self, session_id: Uuid) -> PathBuf {
         self.world.lock().unwrap().sessions[&session_id]
             .sandbox
             .clone()
     }
 
-    fn set_status(&self, session_id: Uuid, status: SessionStatus) {
+    pub(super) fn set_status(&self, session_id: Uuid, status: SessionStatus) {
         self.world
             .lock()
             .unwrap()
@@ -402,7 +403,7 @@ impl Harness {
     }
 
     /// The node's agent commits one change and its session completes.
-    fn commit_and_complete(&self, session_id: Uuid, label: &str) -> String {
+    pub(super) fn commit_and_complete(&self, session_id: Uuid, label: &str) -> String {
         let sandbox = self.sandbox(session_id);
         std::fs::write(sandbox.join(format!("{label}.txt")), label).unwrap();
         git(&sandbox, &["add", "-A"]);
@@ -626,7 +627,7 @@ async fn reserve_only(harness: &Harness, execution_id: Uuid, node: &str) -> Atte
     harness.attempt(execution_id, node, 0, 1).await
 }
 
-fn error_code(error: &DaemonError) -> String {
+pub(super) fn error_code(error: &DaemonError) -> String {
     match error {
         DaemonError::StructuredRpc { data, .. } => data["code"].as_str().unwrap().to_owned(),
         other => panic!("expected a typed resolution error, got {other}"),
@@ -651,6 +652,7 @@ async fn block_on_interrupt(harness: &Harness, execution_id: Uuid) -> AttemptRow
 
 // ─── A1–A5: restart, dedup, loss, interrupt ─────────────────────────────────
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a1_blocked_handoff_blocks_execution_with_evidence() {
     let harness = Harness::new();
@@ -688,6 +690,7 @@ async fn t3a_a1_blocked_handoff_blocks_execution_with_evidence() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a2_malformed_handoff_is_handoff_invalid() {
     let harness = Harness::new();
@@ -719,6 +722,7 @@ async fn t3a_a2_malformed_handoff_is_handoff_invalid() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a7_legacy_session_workflow_still_runs() {
     let harness = Harness::new();
@@ -736,6 +740,7 @@ async fn t3a_a7_legacy_session_workflow_still_runs() {
 
 /// T3a-A8: typed handoff fields flow downstream; the full last message is
 /// replaced by them unless the consumer sets `pass_content: true`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a8_typed_handoff_fields_flow_without_full_message_by_default() {
     let harness = Harness::new();
@@ -790,6 +795,7 @@ async fn running_command(harness: &Harness, execution: Uuid, node: &str) -> Atte
 /// T3a-A4 (R2-3): a catalog op that writes a tracked file is detected after
 /// the fact: `sandbox_mutated`, preserved work blocks the execution, and a
 /// restart never re-runs the op (one start in total).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a4_catalog_op_sandbox_write_detected_not_replayed() {
     let mut harness = Harness::new();
@@ -855,6 +861,7 @@ async fn t3a_a4_catalog_op_sandbox_write_detected_not_replayed() {
 /// (build output under `target/` is ignored): the stale group is killed,
 /// the attempt settles `interrupted`, and the op re-runs only as a new
 /// attempt in a fresh sandbox — never resumed in place.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a5_catalog_op_clean_interrupt_reruns_as_new_attempt() {
     let mut harness = Harness::new();
@@ -912,6 +919,7 @@ async fn t3a_a5_catalog_op_clean_interrupt_reruns_as_new_attempt() {
 
 /// T3a-A6: a gate routes on upstream typed output; the untaken branch is
 /// `skipped` and skipping propagates; a nonzero command routes `failure`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_a6_gate_routes_and_untaken_branch_is_skipped() {
     let harness = Harness::new();
@@ -995,6 +1003,7 @@ async fn t3a_a6_gate_routes_and_untaken_branch_is_skipped() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a2_completed_edge_runs_consumer_on_success() {
     let harness = Harness::new();
@@ -1017,6 +1026,7 @@ async fn t3a2_completed_edge_runs_consumer_on_success() {
     assert!(report.query().contains("exit_code: 0"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a2_completed_edge_runs_consumer_on_failure_with_typed_output() {
     let harness = Harness::new();
@@ -1047,6 +1057,7 @@ async fn t3a2_completed_edge_runs_consumer_on_failure_with_typed_output() {
     assert!(query.contains("failure_class: exit_nonzero"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a2_gate_reads_exit_code_from_completed_source() {
     let harness = Harness::new();
@@ -1073,6 +1084,7 @@ async fn t3a2_gate_reads_exit_code_from_completed_source() {
     assert_eq!(gate.output.as_ref().unwrap()["fields"]["value"], true);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a2_failure_and_success_edges_unchanged() {
     for (exit_code, expected_success, expected_failure) in [
@@ -1106,6 +1118,7 @@ async fn t3a2_failure_and_success_edges_unchanged() {
 
 /// `topology_max_concurrent_build_nodes` bounds concurrently running
 /// catalog ops daemon-wide; a waiting op starts when a slot frees.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_build_node_cap_bounds_concurrent_ops() {
     let harness = Harness::new();
@@ -1145,6 +1158,7 @@ async fn t3a_build_node_cap_bounds_concurrent_ops() {
 
 /// T2-A1: a restart adopts the running node session instead of relaunching,
 /// including a crash between the launch and the `running` record.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a1_restart_adopts_running_session() {
     let mut harness = Harness::new();
@@ -1201,6 +1215,7 @@ async fn t2_a1_restart_adopts_running_session() {
 /// `Failed`; the executor treats that as the restart interrupting the
 /// attempt (clean ⇒ a new attempt, diverged ⇒ preserved work), never as a
 /// node failure.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a1_restart_failed_session_is_interrupted_not_failed() {
     let mut harness = Harness::new();
@@ -1247,6 +1262,7 @@ async fn t2_a1_restart_failed_session_is_interrupted_not_failed() {
 
 /// T2-A2: an attempt reserved but never launched relaunches after a restart
 /// with exactly the reserved dedup key and pre-minted session id.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a2_reserved_attempt_relaunches_with_same_dedup_key() {
     let mut harness = Harness::new();
@@ -1272,6 +1288,7 @@ async fn t2_a2_reserved_attempt_relaunches_with_same_dedup_key() {
 /// T2-A3: recovery run twice (and a relaunch race) launches once; an
 /// admitted launch without a session settles `lost` and is replaced by a new
 /// uncharged attempt, never relaunched under the admitted key.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a3_recovery_twice_launches_once() {
     let mut harness = Harness::new();
@@ -1326,6 +1343,7 @@ async fn t2_a3_recovery_twice_launches_once() {
 /// reservation window (ready set decided, transaction not yet run) while the
 /// second is released against the same execution; each node still gets
 /// exactly one attempt, one admission row and one launch.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t2_concurrent_advancers_launch_once() {
     let harness = Harness::new();
@@ -1370,6 +1388,7 @@ async fn t2_concurrent_advancers_launch_once() {
 
 /// T2-A4: a session lost after it existed is replaced by a new attempt, and
 /// the per-node bound (3) ends the execution.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a4_loss_after_session_retries_within_bound() {
     let harness = Harness::new();
@@ -1406,6 +1425,7 @@ async fn t2_a4_loss_after_session_retries_within_bound() {
 
 /// T2-A5: interrupt is durable (`cancelling`), interrupts every node
 /// session, reclaims each attempt's cache, and settles `cancelled`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a5_interrupt_settles_cancelled() {
     let harness = Harness::new();
@@ -1467,6 +1487,7 @@ async fn t2_a5_interrupt_settles_cancelled() {
 
 /// Kill switch: with `topology_executor_enabled=false` nothing advances or
 /// recovers; re-enabling resumes the same reserved attempt exactly once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_kill_switch_pauses_all_effects() {
     let mut harness = Harness::new();
@@ -1510,6 +1531,7 @@ async fn t2_kill_switch_pauses_all_effects() {
 /// T2-A7: the durable projection round-trips the TUI/RPC contract: the
 /// snapshot replays exactly the published updates in sequence, and a blocked
 /// execution carries its CAS version and blocked attempt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a7_tui_contract_round_trips() {
     let harness = Harness::new();
@@ -1600,6 +1622,7 @@ async fn t2_a7_tui_contract_round_trips() {
 /// T2-A9: an interrupted diverged session blocks on preserved work; inspect,
 /// a refused stale CAS, a refused confirmation on a non-discard action, and
 /// accept (clean tree ⇒ `result_commit` = HEAD) resume the execution.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a9_operator_resolve_preserved_work() {
     let harness = Harness::new();
@@ -1697,6 +1720,7 @@ async fn t2_a9_operator_resolve_preserved_work() {
 /// edit plus untracked file) without touching the sandbox; a wrong discard is
 /// refused, retry forks `preserved_commit`, and a confirmed discard deletes
 /// the ref and is audited.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn t2_a12_retry_preserves_uncommitted_bytes() {
@@ -1874,6 +1898,7 @@ async fn t2_a12_retry_preserves_uncommitted_bytes() {
 /// T2-A13: a clean diverged attempt needs no snapshot: its HEAD is pinned
 /// create-only and verified; retry forks that HEAD, and a moved ref refuses
 /// retry with `preservation_point_unverified`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a13_clean_diverged_retry_forks_verified_pin() {
     let harness = Harness::new();
@@ -1946,6 +1971,7 @@ async fn t2_a13_clean_diverged_retry_forks_verified_pin() {
 
 /// T2-A10: A→B→C with back-edge C→B, two iterations and a restart between
 /// them: B@1 forks C@0's persisted pin and A stays an ancestor of C@1.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a10_two_iteration_loop_lineage() {
     let mut harness = Harness::new();
@@ -2086,6 +2112,7 @@ fn two_regions(
 /// T2-A14 (R4-3): a forward edge between two loop regions is an entry edge:
 /// Y's iteration 0 forks X's final iteration, and a cross-region
 /// `custody.from` never asks for a nonexistent same-iteration pin.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_a14_cross_region_forward_edge_forks_final_iteration() {
     // (a) X and Y both run two iterations.
@@ -2205,6 +2232,7 @@ async fn block_all(harness: &Harness, execution: Uuid) -> Vec<AttemptRow> {
 /// Round 1 (`resolution_key_not_request_bound`): the idempotency key binds
 /// the whole request. The same key and fingerprint replay; the same key and
 /// action for another attempt or another CAS version conflict.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_resolution_key_is_request_bound() {
     let harness = Harness::new();
@@ -2275,6 +2303,7 @@ async fn t2_r1_resolution_key_is_request_bound() {
 /// Round 1 (`preservation_crash_not_idempotent`): a crash after the
 /// create-only preservation ref exists but before the attempt records it is
 /// replayed as the same preservation point, for dirty and clean custody.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_preservation_crash_is_idempotent() {
     for dirty in [true, false] {
@@ -2337,6 +2366,7 @@ fn with_failure_policy(
 /// legacy budget exactly: `repeat_policy.max_iterations` retries (5 ⇒ six
 /// launches), and the legacy runner reads the same budget function, so the
 /// kill switch cannot change it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_retry_budget_matches_legacy_runner() {
     let harness = Harness::new();
@@ -2374,6 +2404,7 @@ async fn t2_r1_retry_budget_matches_legacy_runner() {
 
 /// Round 1 (`loop_cap_without_until`): a loop guarded only by node
 /// `max_iterations` runs to that cap.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_cap_only_loop_runs_to_node_cap() {
     let harness = Harness::new();
@@ -2412,6 +2443,7 @@ async fn t2_r1_cap_only_loop_runs_to_node_cap() {
 /// path@commit, is read back and digest-verified by the next daemon
 /// incarnation, and reaches a downstream prompt planned after the restart in
 /// full.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_large_output_round_trips_through_git() {
     let mut harness = Harness::new();
@@ -2481,6 +2513,7 @@ async fn t2_r1_large_output_round_trips_through_git() {
 /// effect failure after the discard is recorded leaves it pending (the
 /// execution stays blocked); recovery or a replay of the same request
 /// finishes it, and only then does the execution resume.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_discard_completes_after_crash() {
     let mut harness = Harness::new();
@@ -2569,6 +2602,7 @@ async fn t2_r1_discard_completes_after_crash() {
 /// Round 1 (`terminal_sessions_not_archived`): success and cancellation
 /// archive node sessions at settlement; failure preserves them until the
 /// forensic TTL; a preserved-work sandbox is never archived.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_settlement_archives_node_sessions() {
     let harness = Harness::new();
@@ -2655,6 +2689,7 @@ async fn t2_r1_settlement_archives_node_sessions() {
 
 /// Round 1 (`success_pin_cleanup_crash_gap`): a crash after `succeeded` but
 /// before the pins were released is repaired by the next recovery pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r1_success_pins_released_after_crash() {
     let mut harness = Harness::new();
@@ -2719,6 +2754,7 @@ async fn t2_r1_success_pins_released_after_crash() {
 /// parked before its recording transaction while the second records; the
 /// first then sees the key inside its transaction: a different request is an
 /// `idempotency_conflict`, an identical one a replay. Exactly one event per key.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t2_r2_concurrent_resolution_key_records_once() {
     let harness = Harness::new();
@@ -2809,6 +2845,7 @@ async fn run_with_failures(harness: &Harness, execution: Uuid, succeed_at: Optio
 /// retries launches 66 times; two sequential Retry nodes with 32 retries each
 /// succeed after 66 launches. The kill-switch runner uses the same budget
 /// function (source-level parity, as in round 1).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t2_r2_legacy_retry_budget_above_default_cap() {
     let retrying = |nodes: &[&str], edges: &[(&str, &str)], budget: usize| {
@@ -2860,6 +2897,7 @@ async fn t2_r2_legacy_retry_budget_above_default_cap() {
 /// stored `max_node_attempts` (64); a node's `max_attempts` is 1 by default,
 /// and 3 at most under `Retry`. A legacy shape keeps its derived cap
 /// (`t2_r2_legacy_retry_budget_above_default_cap`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn t3a_typed_topology_uses_plan_attempt_cap() {
     use crate::topology::graph::GraphShape;

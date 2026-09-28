@@ -119,6 +119,7 @@ pub fn is_system_blocked(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_is_system_blocked() {
         assert!(is_system_blocked(Path::new("/etc/passwd")));
@@ -129,6 +130,7 @@ mod tests {
         assert!(!is_system_blocked(Path::new("/tmp/workdir/file.txt")));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_registry_unknown_tool() {
         let registry = HarnessToolRegistry::new();
@@ -142,6 +144,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("Unknown tool"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_default_tools_has_all_builtins() {
         let registry = HarnessToolRegistry::default_tools();
@@ -153,6 +156,7 @@ mod tests {
         assert!(names.contains(&"git".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_specs_returns_all() {
         let registry = HarnessToolRegistry::default_tools();
@@ -160,6 +164,7 @@ mod tests {
         assert_eq!(specs.len(), 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_register_and_specs() {
         let mut registry = HarnessToolRegistry::new();

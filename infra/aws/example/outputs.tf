@@ -1,0 +1,14 @@
+output "instance_id" { value = module.rsid_host.instance_id }
+output "vpc_id" { value = module.rsid_host.vpc_id }
+output "subnet_id" { value = module.rsid_host.subnet_id }
+output "host_security_group_id" { value = module.rsid_host.security_group_id }
+output "public_ip_enabled" { value = module.rsid_host.public_ip_enabled }
+output "data_volume_id" { value = module.rsid_host.data_volume_id }
+output "backup_bucket" { value = module.rsid_host.backup_bucket }
+output "ssm_start_session" { value = module.rsid_host.ssm_start_session }
+output "secret_parameter_paths" { value = module.rsid_host.secret_parameter_paths }
+output "client_vpn_endpoint_id" { value = var.enable_client_vpn ? module.client_vpn[0].endpoint_id : null }
+output "client_vpn_dns_name" { value = var.enable_client_vpn ? module.client_vpn[0].dns_name : null }
+output "client_vpn_association_id" { value = var.enable_client_vpn ? module.client_vpn[0].association_id : null }
+output "client_vpn_security_group_id" { value = var.enable_client_vpn ? module.client_vpn[0].security_group_id : null }
+output "client_vpn_log_group" { value = var.enable_client_vpn ? module.client_vpn[0].log_group_name : null }

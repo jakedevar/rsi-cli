@@ -274,6 +274,125 @@ async fn execute(
     }
 
     #[test]
+    fn cli_boundary_allows_one_invocation_id_read_before_consumption() {
+        let root = fixture_root("cli-invocation-id-read");
+        let path = "crates/rsid/src/provider.rs";
+        write(
+            &root,
+            path,
+            r#"
+use crate::model_control::CliExecutionCapability;
+fn execute(execution: CliExecutionCapability) {
+    let invocation_id = execution.invocation_id();
+    stamp(&mut cmd, invocation_id);
+    execution.bind_command(RuntimeExecutionRoute::ClaudeCli, cmd).spawn();
+}
+"#,
+        );
+        validate_repository(input(
+            &root,
+            vec![purpose("cli")],
+            vec![CLI_BOUNDARY],
+            vec![],
+        ))
+        .expect("one identity read then one consuming spawn");
+
+        let source = fs::read_to_string(root.join(path)).expect("fixture source");
+        write(
+            &root,
+            path,
+            &source.replace(
+                "    stamp(&mut cmd, invocation_id);",
+                "    stamp(&mut cmd, invocation_id);\n    let extra = execution.invocation_id();",
+            ),
+        );
+        let error = validate_repository(input(
+            &root,
+            vec![purpose("cli")],
+            vec![CLI_BOUNDARY],
+            vec![],
+        ))
+        .expect_err("second identity read must fail");
+        assert!(
+            error.contains("used outside its registered consume operation"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn transport_factory_proves_the_spawned_app_server_command() {
+        let root = fixture_root("app-server-transport-factory");
+        let path = "crates/rsid/src/provider.rs";
+        let source = r#"
+fn build_app_server_command(binary: &str) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.arg("app-server");
+    cmd
+}
+fn launch_with_gate(binary: &str) {
+    let mut cmd = build_app_server_command(binary);
+    cmd = wrap(cmd);
+    cmd.spawn();
+}
+"#;
+        let contract = NonInvocationContract {
+            id: "app-server-transport",
+            path,
+            item: "launch_with_gate",
+            allowed_operation: AllowedExclusionOperation::TransportSpawn,
+            proof_ident: "build_app_server_command",
+            occurrences: 1,
+        };
+        write(&root, path, source);
+        validate_repository(input(&root, vec![], vec![], vec![contract]))
+            .expect("spawn must trace to a factory that fixes app-server mode");
+
+        write(
+            &root,
+            path,
+            &source.replace("cmd.arg(\"app-server\");", "cmd.arg(\"other\");"),
+        );
+        let error = validate_repository(input(&root, vec![], vec![], vec![contract]))
+            .expect_err("changed transport mode must fail");
+        assert!(
+            error.contains("exclusion predicate TransportSpawn failed"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn exact_utility_cli_exclusion_rejects_model_executable_mutation() {
+        let root = fixture_root("utility-cli-exclusion");
+        let path = "crates/rsid/src/provider.rs";
+        let contract = NonInvocationContract {
+            id: "git-utility",
+            path,
+            item: "run",
+            allowed_operation: AllowedExclusionOperation::UtilityCliSpawn,
+            proof_ident: "git",
+            occurrences: 1,
+        };
+        write(&root, path, "fn run() { Command::new(\"git\").spawn(); }");
+        validate_repository(input(&root, vec![], vec![], vec![contract]))
+            .expect("exact Git utility spawn");
+
+        write(
+            &root,
+            path,
+            "fn run() { Command::new(\"claude\").spawn(); }",
+        );
+        let error = validate_repository(input(&root, vec![], vec![], vec![contract]))
+            .expect_err("model executable cannot use utility exclusion");
+        assert!(
+            error.contains("exclusion predicate UtilityCliSpawn failed"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn rejects_unused_borrowed_shadowed_displaced_and_aliased_capabilities() {
         let cases = [
             (

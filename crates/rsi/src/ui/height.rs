@@ -90,12 +90,11 @@ pub fn update_event_heights(state: &mut SessionState, width: u16) {
         && state.event_heights.len() == state.events.len()
     {
         // Geometry is unchanged, but the activity-indicator slack is not part
-        // of the cache key: a freshly appended event arms the formulation
-        // animation, which hides the indicator while this cache is built, and
-        // the indicator returns ~500ms later with no new generation. Re-derive
-        // the slack from the cached offsets so the tail keeps its separator
-        // row above the indicator instead of butting against it until the
-        // next full recompute.
+        // of the cache key: session status (live vs idle) and the content
+        // area height can change with no new generation. Re-derive the slack
+        // from the cached offsets so the tail keeps its separator row above
+        // the indicator instead of butting against it until the next full
+        // recompute.
         let content_height = state
             .event_offsets
             .last()
@@ -275,22 +274,13 @@ pub fn update_event_heights(state: &mut SessionState, width: u16) {
 
 /// Extra scrollable row reserved above the activity indicator while the
 /// session is live. Mirrors the `show_loading_bar` predicate in
-/// `ui::mod` / `render_session_detail`, including the formulation-animation
-/// hold-off that temporarily hides the indicator.
+/// `ui::mod` / `render_session_detail`.
 fn activity_indicator_slack(state: &SessionState) -> usize {
     let is_active = matches!(
         state.session.status,
         rsi_common::types::SessionStatus::Running | rsi_common::types::SessionStatus::Starting
     );
-    let formulation_active = state
-        .formulation
-        .as_ref()
-        .map(|f| {
-            chrono::Utc::now().timestamp_millis() - f.started_at_ms
-                < crate::ui::session::FORMULATION_ANIMATION_MS
-        })
-        .unwrap_or(false);
-    let show_loading_bar = is_active && state.last_content_area.height > 5 && !formulation_active;
+    let show_loading_bar = is_active && state.last_content_area.height > 5;
     usize::from(show_loading_bar)
 }
 
@@ -821,27 +811,26 @@ mod tests {
     }
 
     #[test]
-    fn cached_path_restores_activity_indicator_slack_after_formulation_ends() {
+    fn formulation_reveal_keeps_activity_indicator_slack() {
         let mut state = make_test_state();
         state.session.status = rsi_common::types::SessionStatus::Running;
         state.last_content_area = ratatui::layout::Rect::new(0, 0, 80, 40);
 
-        // A freshly appended event arms the formulation animation, which
-        // hides the activity indicator while the height cache is built.
+        // The formulation reveal is render-only: an armed reveal must not
+        // change the layout (the indicator stays, so the slack row stays).
         state.formulation = Some(crate::types::FormulationState {
             event_index: 1,
             started_at_ms: chrono::Utc::now().timestamp_millis(),
-            target_height: 0,
         });
         update_event_heights(&mut state, 80);
         let content_height: usize = state.event_heights.iter().sum();
         assert_eq!(
-            state.total_content_height, content_height,
-            "indicator hidden during formulation: no slack row"
+            state.total_content_height,
+            content_height + 1,
+            "tail separator sits above the activity indicator during the reveal"
         );
 
-        // Animation expires with no new events, width, or generation: the
-        // cached path must still reserve the slack row above the indicator.
+        // Reveal ends with no new events, width, or generation: unchanged.
         state.formulation = None;
         update_event_heights(&mut state, 80);
         assert_eq!(

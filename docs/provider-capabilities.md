@@ -78,20 +78,20 @@ The semantic fixture is bounded and omits provider prompt payloads. Its digest i
 | --- | --- | --- | --- |
 | startup-catalog-refresh | `crates/rsid/src/session/mod.rs` | `SessionManager::refresh_codex_catalog_at_startup` | `call:provider_capabilities` → `call:refresh_catalog` |
 | launch | `crates/rsid/src/session/launch.rs` | `build_starting_session` | `call:resolve_fresh_context_budget` → `field:context_window, field:resolved_context_budget` |
-| restoration-reopen | `crates/rsid/src/session/lifecycle.rs` | `SessionManager::continue_session_with_delivery` | `call:resolve_new_incarnation_context_budget` → `call:compare_and_update_session_model, call:install_context_budget` |
+| restoration-reopen | `crates/rsid/src/session/lifecycle.rs` | `SessionManager::continue_session_fenced_inner` | `call:resolve_new_incarnation_context_budget` → `call:compare_and_update_session_model, call:install_context_budget` |
 | live-monitor | `crates/rsid/src/session/monitor.rs` | `persist_runtime_context_observation` | `call:resolve_runtime_context_budget` → `call:compare_and_update_session_model, call:install_context_budget, return` |
 | memory-flush | `crates/rsid/src/session/monitor.rs` | `memory_flush_turn_candidate` | `call:context_budget` → `call:should_run_memory_flush, field:active_tokens` |
-| rotation | `crates/rsid/src/session/rotation.rs` | `SessionManager::rotate_completed_session` | `call:resolve_new_incarnation_context_budget` → `field:context_window, field:resolved_context_budget` |
+| rotation | `crates/rsid/src/session/rotation.rs` | `SessionManager::decide_rotation_successor` | `call:resolve_new_incarnation_context_budget` → `field:context_window, field:resolved_context_budget` |
 | context-injection | `crates/rsid/src/session/launch.rs` | `SessionManager::launch_session_with_retry_admission` | `call:context_injection_allowance` → `call:assemble` |
-| harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch` | `parameter:resolved_context_budget` → `call:run_harness_loop` |
+| harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch_with_binding` | `parameter:resolved_context_budget` → `call:run_harness_loop` |
 | persistence | `crates/rsid/src/store/sessions.rs` | `persisted_context_budget` | `parameter:resolved` → `field:source, field:source_version, field:source_digest, field:observed_at` |
 | rpc-session | `crates/rsid/src/session/queries.rs` | `rehydrate_context_budget_projection` | `call:rehydrate_resolved_context_budget` → `assignment:session.resolved_context_budget` |
 | bus-publication | `crates/rsid/src/monitor.rs` | `publish_context_usage` | `parameter:resolved_context_budget` → `field:context_window, field:resolved_context_budget` |
 | polling | `crates/rsi/src/app/polling.rs` | `App::apply_push_event` | `field:parsed.resolved_context_budget` → `assignment:state.session.resolved_context_budget` |
 | f3-detail | `crates/rsi/src/ui/overlay/session_info.rs` | `session_info_lines` | `call:detail_rows` → `call:field_line` |
-| wide-inspector-detail | `crates/rsi/src/ui/session.rs` | `render_inspector_context` | `call:detail_rows` → `call:push_inspector_section` |
+| wide-inspector-detail | `crates/rsi/src/ui/session.rs` | `render_inspector_context` | `call:detail_rows` → `call:wrap_plain` |
 | detail-header-context | `crates/rsi/src/ui/status.rs` | `render_context_percent_segment_for` | `call:compact_label` → `call:styled` |
-| wide-inspector-compact | `crates/rsi/src/ui/session.rs` | `render_inspector_runtime` | `field:runtime.context` → `call:compact_label` |
+| wide-inspector-compact | `crates/rsi/src/ui/session.rs` | `render_embedded_session_inspector` | `field:inspector.runtime.context` → `call:compact_label` |
 | session-list-compact-row | `crates/rsi/src/types/row.rs` | `compute_session_row_for_state_with_focus` | `call:compute_context_budget_view` → `call:compact_label` |
 | tests | `crates/rsid/src/provider_capabilities.rs` | `real_codex_0_155_1_fixture_preserves_capacity_reasoning_and_projection` | `call:fixture_snapshot` → `macro:assert_eq` |
 

@@ -4,7 +4,7 @@ use super::{
     Store,
     harness_manager_v2::{fingerprint, now, refused},
     manager_actions::{ManagerActionOperationV2, ManagerActionOriginV2},
-    manager_ledger::{Acceptance, WorkRecord, canonical_sha},
+    manager_ledger::{Acceptance, WorkRecord, canonical_sha, decode},
 };
 #[cfg(test)]
 use crate::error::DaemonError;
@@ -27,6 +27,145 @@ const MAX_ASSIGNMENTS_PER_WORK: i64 = 64;
 const MAX_REVIEW_ROUNDS_PER_REVISION: usize = 3;
 const REVIEW_RECONCILE_BATCH: usize = 16;
 const MAX_INFRA_RELAUNCHES: usize = 2;
+
+impl Store {
+    /// A live DB review owns this reviewer's next turn. Generic continuation
+    /// has no review origin and must be refused before it interrupts the turn.
+    /// The restart reconciler also uses this predicate to leave recovery with
+    /// the review reconciler instead of claiming the generic restart journal.
+    pub(crate) fn manager_review_has_live_reviewer(&self, session_id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_review_assignments
+              WHERE reviewer_session_id=?1 AND state IN ('allocating','active'))",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Read durable review and source ownership at each automatic rotation gate.
+    /// A failed read must defer rotation; callers must not interpret it as clear.
+    pub(crate) fn automatic_rotation_protection(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<&'static str>> {
+        let reviewer: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_review_assignments
+              WHERE reviewer_session_id=?1 AND state IN ('reserved','allocating','active'))",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if reviewer {
+            return Ok(Some("db_native_reviewer"));
+        }
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let Some(project_id) = session.project_id else {
+            return Ok(None);
+        };
+        let Some(config) = self.get_harness_manager(project_id)? else {
+            return Ok(None);
+        };
+        for record in self.manager_v2_records(&config, "work")? {
+            if record.archived {
+                continue;
+            }
+            let work: WorkRecord = decode(&record)?;
+            let Some(source_sha) = work.source_commit.as_deref() else {
+                continue;
+            };
+            let Some(author_id) = work.source_session_id else {
+                continue;
+            };
+            if !work.stages.iter().any(|stage| {
+                stage.stage == ManagerWorkStageV2::Implementation
+                    && stage.state == ManagerStageStateV2::Passed
+            }) || work.acceptance.as_ref().is_some_and(|acceptance| {
+                acceptance.spec_revision == work.spec_revision
+                    && acceptance.source_commit == source_sha
+            }) {
+                continue;
+            }
+            let latest: Option<(String, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT a.state,r.verdict FROM manager_review_assignments a
+                   LEFT JOIN manager_review_receipts r ON r.assignment_id=a.assignment_id
+                  WHERE a.project_id=?1 AND a.epic_id=?2 AND a.work_key=?3
+                    AND a.spec_revision=?4 AND a.source_sha=?5
+                    AND a.superseded_by_assignment_id IS NULL
+                  LIMIT 1",
+                    params![
+                        project_id.to_string(),
+                        work.epic_id.to_string(),
+                        work.key,
+                        work.spec_revision,
+                        source_sha
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let review_pending = match latest.as_ref() {
+                None => !self.manager_review_enrolled(&config, &work, source_sha)?,
+                Some((state, _))
+                    if matches!(state.as_str(), "reserved" | "allocating" | "active") =>
+                {
+                    true
+                }
+                Some((state, Some(verdict))) if state == "submitted" && verdict == "accepted" => {
+                    true
+                }
+                _ => false,
+            };
+            if !review_pending {
+                continue;
+            }
+            let Some(author) = self.get_session(author_id)? else {
+                continue;
+            };
+            if self.manager_v2_descendant_epic(&config, author_id)? != work.epic_id {
+                continue;
+            }
+            let holder = match self.manager_review_source_holder(&config, work.epic_id, &author) {
+                Ok(holder) => holder,
+                Err(error)
+                    if author_id == session_id
+                        || (author.sandbox_root.is_some()
+                            && author.sandbox_root == session.sandbox_root) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => continue,
+            };
+            if holder.id != session_id {
+                continue;
+            }
+            let custody = self.live_custody_for_session(holder.id)?;
+            let root = std::path::Path::new(&custody.sandbox_root);
+            crate::sandbox::git_worktree::review_source_custody_holds_bounded(
+                root,
+                &custody.sandbox_branch,
+                &custody.repository_identity,
+            )?;
+            let (clean, head) = crate::sandbox::git_worktree::observe_clean_head_bounded(root)?;
+            if !clean {
+                return Err(refused("automatic_rotation_source_dirty"));
+            }
+            match crate::sandbox::git_worktree::review_sealed_source_holds_bounded(
+                root, source_sha, &head,
+            ) {
+                Ok(()) => return Ok(Some("sealed_unaccepted_source")),
+                Err(crate::error::DaemonError::InvalidParam(code))
+                    if code.starts_with("manager_review_source_changed") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,7 +471,13 @@ fn counted_review_attempts(
         }
         let launched = chain.iter().any(|row| row.launched);
         let in_flight = matches!(end.state.as_str(), "reserved" | "allocating" | "active");
-        let spends = if chain.iter().any(|row| row.has_receipt) {
+        // A terminal void releases its attempt, even if a receipt remains for
+        // audit. A live infra-retry successor still spends the chain's round.
+        // `cancelled` is the persisted v121 spelling; `voided` is reserved for
+        // a future lifecycle.
+        let spends = if matches!(end.state.as_str(), "cancelled" | "voided") {
+            false
+        } else if chain.iter().any(|row| row.has_receipt) {
             true
         } else if pending_supersede == Some(end.assignment_id) {
             in_flight && launched
@@ -1308,6 +1453,100 @@ impl Store {
         Ok(())
     }
 
+    /// Prove a successor invocation from persisted daemon ownership. A prompt,
+    /// caller-supplied prefix, or a bare trigger label cannot rebind a review.
+    fn manager_review_owned_invocation(
+        &self,
+        assignment: &ReviewAssignment,
+        prior_invocation: Option<Uuid>,
+        invocation: Uuid,
+        require_running: bool,
+    ) -> Result<bool> {
+        let reviewer = assignment
+            .reviewer_session_id
+            .ok_or_else(|| refused("manager_review_reviewer_unavailable"))?;
+        let manager_action: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_invocations m
+              JOIN harness_manager_v2_operations action
+                ON m.dedup_key='manager.action:'||action.id
+             WHERE m.id=?1 AND m.session_id=?2 AND m.project_id=?3
+               AND m.purpose='session.continue.resume'
+               AND m.trigger_source='continue_session'
+               AND (?4=0 OR m.status='running') AND m.admission_status='admitted'
+               AND (?5 IS NULL OR m.parent_invocation_id=?5)
+               AND action.target_session_id=m.session_id
+               AND action.project_id=m.project_id
+               AND action.kind='lifecycle_action'
+               AND action.state IN ('running','succeeded')
+               AND json_extract(action.payload_json,'$.request.operation.action')='resume_lead')",
+            params![
+                invocation.to_string(),
+                reviewer.to_string(),
+                assignment.project_id.to_string(),
+                require_running,
+                prior_invocation.map(|value| value.to_string()),
+            ],
+            |row| row.get(0),
+        )?;
+        if manager_action {
+            return Ok(true);
+        }
+
+        // The forward migration owns this table. Until it is installed, a
+        // restart label has no durable witness and cannot authorize a rebind.
+        let has_journal: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+              WHERE type='table' AND name='daemon_restart_intents')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_journal {
+            return Ok(false);
+        }
+        let custody_id = assignment
+            .reviewer_custody_id
+            .ok_or_else(|| refused("manager_review_custody_changed"))?;
+        let custody_generation = assignment
+            .reviewer_custody_generation
+            .ok_or_else(|| refused("manager_review_custody_changed"))?;
+        let custody_generation = i64::try_from(custody_generation)
+            .map_err(|_| refused("manager_review_custody_changed"))?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_invocations m
+              JOIN daemon_restart_intents intent
+                ON m.dedup_key='daemon.restart:'||intent.id
+              JOIN model_invocations previous ON previous.id=intent.invocation_id
+             WHERE m.id=?1 AND m.session_id=?2 AND m.project_id=?3
+               AND m.purpose='session.continue.resume'
+               AND m.trigger_source='daemon_restart'
+               AND (?7=0 OR m.status='running') AND m.admission_status='admitted'
+               AND intent.session_id=m.session_id
+               AND (?4 IS NULL OR intent.invocation_id=?4)
+               AND intent.custody_id=?5
+               AND intent.custody_generation=?6
+               AND m.parent_invocation_id=intent.invocation_id
+               AND intent.continuation_invocation_id=m.id
+               AND intent.state='delivered'
+               AND intent.outcome IN ('shutdown_cancelled','restart_reconciled_interrupted')
+               AND previous.session_id=m.session_id
+               AND previous.status IN ('failed','cancelled')
+               AND previous.error_class IN (
+                   'restart_reconciled_interrupted','cancelled','operator_cancelled',
+                   'stop_all','interrupted','user_cancelled',
+                   'cancelled_after_restart','restart_reconciled_cancel'))",
+            params![
+                invocation.to_string(),
+                reviewer.to_string(),
+                assignment.project_id.to_string(),
+                prior_invocation.map(|value| value.to_string()),
+                custody_id.to_string(),
+                custody_generation,
+                require_running,
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn refresh_manager_review_assignment(&self, assignment_id: Uuid) -> Result<bool> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let assignment = self.manager_review_assignment(assignment_id)?;
@@ -1357,8 +1596,12 @@ impl Store {
             return Ok(changed);
         }
         let Some(session) = self.get_session(reviewer)? else {
+            let changed = self.fail_manager_review_assignment(
+                &assignment,
+                "manager_review_reviewer_unavailable",
+            )?;
             tx.commit()?;
-            return Ok(false);
+            return Ok(changed);
         };
         if session.project_id != Some(assignment.project_id)
             || session.parent_id != Some(assignment.epic_id)
@@ -1370,29 +1613,56 @@ impl Store {
             tx.commit()?;
             return Ok(changed);
         }
-        let Some(invocation) = self.session_model_invocation_id(reviewer)? else {
+        if matches!(
+            session.status,
+            SessionStatus::Archived | SessionStatus::Deleted
+        ) {
+            let changed = self
+                .fail_manager_review_assignment(&assignment, "manager_review_reviewer_archived")?;
+            tx.commit()?;
+            return Ok(changed);
+        }
+        let current_invocation = self.session_model_invocation_id(reviewer)?;
+        let invocation = if assignment.state == "active" {
+            assignment.reviewer_invocation_id
+        } else {
+            current_invocation
+        };
+        let Some(invocation) = invocation else {
             tx.commit()?;
             return Ok(false);
         };
-        let invocation_state: Option<(String, Option<String>)> = self
+        let invocation_state: Option<(String, Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT status,error_class FROM model_invocations
+                "SELECT status,error_class,dedup_key FROM model_invocations
                   WHERE id=?1 AND session_id=?2 AND project_id=?3
-                    AND admission_status='admitted' AND dedup_key=?4",
+                    AND admission_status='admitted'
+                    AND (?4='active' OR dedup_key=?5)",
                 params![
                     invocation.to_string(),
                     reviewer.to_string(),
                     assignment.project_id.to_string(),
+                    assignment.state,
                     format!("manager.action:{action_id}")
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((invocation_state, invocation_error_class)) = invocation_state else {
+        let Some((invocation_state, invocation_error_class, invocation_dedup_key)) =
+            invocation_state
+        else {
             tx.commit()?;
             return Ok(false);
         };
+        let allocation_key = format!("manager.action:{action_id}");
+        if assignment.state == "active"
+            && invocation_dedup_key.as_deref() != Some(allocation_key.as_str())
+            && !self.manager_review_owned_invocation(&assignment, None, invocation, false)?
+        {
+            tx.commit()?;
+            return Ok(false);
+        }
         let custody = match self.live_custody_for_session(reviewer) {
             Ok(custody) => custody,
             Err(_) => {
@@ -1404,6 +1674,14 @@ impl Store {
                     tx.commit()?;
                     return Ok(changed);
                 }
+                if session.status == SessionStatus::Completed {
+                    let changed = self.fail_manager_review_assignment(
+                        &assignment,
+                        "manager_review_custody_unavailable",
+                    )?;
+                    tx.commit()?;
+                    return Ok(changed);
+                }
                 tx.commit()?;
                 return Ok(false);
             }
@@ -1411,6 +1689,15 @@ impl Store {
         if custody.source_commit != assignment.source_sha {
             let changed =
                 self.fail_manager_review_assignment(&assignment, "manager_review_source_mismatch")?;
+            tx.commit()?;
+            return Ok(changed);
+        }
+        if assignment.state == "active"
+            && (assignment.reviewer_custody_id != Some(custody.custody_id)
+                || assignment.reviewer_custody_generation != Some(custody.generation))
+        {
+            let changed =
+                self.fail_manager_review_assignment(&assignment, "manager_review_custody_changed")?;
             tx.commit()?;
             return Ok(changed);
         }
@@ -1431,6 +1718,50 @@ impl Store {
             )?;
             tx.commit()?;
             return Ok(true);
+        }
+        if let Some(next) = current_invocation.filter(|next| *next != invocation) {
+            if !matches!(
+                invocation_state.as_str(),
+                "failed" | "cancelled" | "completed"
+            ) {
+                tx.commit()?;
+                return Ok(false);
+            }
+            if matches!(
+                session.status,
+                SessionStatus::Starting | SessionStatus::Running
+            ) {
+                if self.manager_review_owned_invocation(
+                    &assignment,
+                    Some(invocation),
+                    next,
+                    true,
+                )? {
+                    let changed = self.conn.execute(
+                        "UPDATE manager_review_assignments
+                            SET reviewer_invocation_id=?2,row_version=row_version+1,
+                                updated_at=?3
+                          WHERE assignment_id=?1 AND state='active'
+                            AND reviewer_invocation_id=?4
+                            AND NOT EXISTS(SELECT 1 FROM manager_review_receipts
+                                            WHERE assignment_id=?1)",
+                        params![
+                            assignment_id.to_string(),
+                            next.to_string(),
+                            now(),
+                            invocation.to_string()
+                        ],
+                    )?;
+                    tx.commit()?;
+                    return Ok(changed == 1);
+                }
+                let changed = self.fail_manager_review_assignment(
+                    &assignment,
+                    "manager_review_unproven_continuation",
+                )?;
+                tx.commit()?;
+                return Ok(changed);
+            }
         }
         if let Some(code) = receipt_missing_failure_code(
             &invocation_state,
@@ -1954,7 +2285,57 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsi_common::types::SessionProvider;
 
+    fn attempt_row(state: &str, launched: bool, has_receipt: bool) -> ReviewAttemptRow {
+        ReviewAttemptRow {
+            assignment_id: Uuid::new_v4(),
+            state: state.into(),
+            launched,
+            superseded_by: None,
+            created_at: "2026-01-01T00:00:00.000000000Z".into(),
+            terminal_at: None,
+            has_receipt,
+            request: ReviewAllocationRequest {
+                requester_session_id: Uuid::nil(),
+                fence: ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version: 1,
+                },
+                query: String::new(),
+                launch: ManagerLaunchChoiceV2 {
+                    provider: SessionProvider::Claude,
+                    model: "claude-sonnet-5".into(),
+                    effort: None,
+                },
+                infra_retry_of: None,
+                contributor_session_ids: Vec::new(),
+                contributor_families: Vec::new(),
+                family_override_key: None,
+            },
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn voided_review_attempts_do_not_consume_rounds_even_with_a_receipt() {
+        let rows = [
+            attempt_row("cancelled", true, true),
+            attempt_row("voided", true, true),
+        ];
+        assert!(counted_review_attempts(&rows, None).is_empty());
+
+        let mut cancelled = attempt_row("cancelled", true, true);
+        let mut active_retry = attempt_row("active", true, false);
+        cancelled.superseded_by = Some(active_retry.assignment_id);
+        active_retry.request.infra_retry_of = Some(cancelled.assignment_id);
+        assert_eq!(
+            counted_review_attempts(&[cancelled, active_retry], None).len(),
+            1
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn receipt_missing_code_types_each_terminal_cause() {
         let cases = [
@@ -2029,6 +2410,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn receipt_missing_code_keeps_final_without_receipt_even_after_tool_denials() {
         for (status, session) in [
@@ -2046,6 +2428,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn receipt_missing_code_waits_while_review_is_live() {
         for session in [
@@ -2057,6 +2440,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn reviewer_prompt_states_bounded_receipt_first_contract_before_query() {
         let assignment_id = Uuid::new_v4();

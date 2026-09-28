@@ -696,17 +696,32 @@ pub(crate) fn configure_std_process_group(
     Ok(())
 }
 
-/// Terminate the complete group, falling back to the direct child only when
-/// group signalling itself fails. ESRCH is already a successful postcondition.
-pub(crate) fn terminate_process_group(pgid: nix::unistd::Pid) {
+/// Signal one owned process group. A caller must supply the direct child PID
+/// of a command configured with `process_group(0)`, never an untrusted PID.
+/// Fall back to that exact child only if group signalling fails. ESRCH means
+/// the entire group has already exited.
+pub(crate) fn signal_process_group(
+    pgid: nix::unistd::Pid,
+    signal: nix::sys::signal::Signal,
+) -> std::result::Result<(), nix::errno::Errno> {
     use nix::errno::Errno;
-    use nix::sys::signal::{Signal, kill, killpg};
-    match killpg(pgid, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => {}
-        Err(_) => {
-            let _ = kill(pgid, Signal::SIGKILL);
-        }
+    use nix::sys::signal::{kill, killpg};
+    if pgid.as_raw() <= 0 {
+        return Err(Errno::EINVAL);
     }
+    match killpg(pgid, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(_) => match kill(pgid, signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// Terminate the complete group, retaining the existing best-effort cleanup
+/// policy for bounded capture and settlement callers.
+pub(crate) fn terminate_process_group(pgid: nix::unistd::Pid) {
+    let _ = signal_process_group(pgid, nix::sys::signal::Signal::SIGKILL);
 }
 
 fn configure_no_escape(command: &mut std::process::Command) -> DaemonResult<()> {
@@ -873,6 +888,7 @@ mod tests {
         command
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bounded_capture_accepts_exact_caps_on_both_streams() {
         let output = capture_bounded(
@@ -889,6 +905,7 @@ mod tests {
         assert!(!output.stderr_truncated);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bounded_capture_rejects_one_byte_over_either_cap() {
         for (script, expected) in [
@@ -912,6 +929,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn truncate_mode_stays_bounded_while_draining_to_exit() {
         let output = capture_bounded(
@@ -928,6 +946,7 @@ mod tests {
         assert!(output.stderr_truncated);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn continuously_writable_truncated_stream_still_honors_deadline() {
         let mut limits = short_limits(OverflowBehavior::TruncateAndDrain);
@@ -943,6 +962,7 @@ mod tests {
     }
 
     #[allow(clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn retain_tail_preserves_output_emitted_before_timeout() {
         let mut limits = short_limits(OverflowBehavior::RetainTail);
@@ -963,6 +983,7 @@ mod tests {
     }
 
     #[allow(clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn retain_tail_retains_final_bytes_past_bound() {
         let output = capture_bounded(
@@ -986,6 +1007,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn timeout_kills_and_reaps_the_direct_child() {
         let temp = TempDir::new().expect("tempdir");
@@ -1011,6 +1033,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn cancellation_kills_and_reaps_the_direct_child() {
         let temp = TempDir::new().expect("tempdir");
@@ -1044,6 +1067,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn parent_exit_cannot_leave_a_quiet_descendant_holding_pipes() {
         let temp = TempDir::new().expect("tempdir");
@@ -1064,6 +1088,7 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bounded_lines_accepts_exact_limit_and_crlf() {
         let mut lines = BoundedLines::new(Cursor::new(b"12345678\r\nnext".to_vec()), 8);
@@ -1075,6 +1100,7 @@ mod tests {
         assert_eq!(lines.next_line().await.unwrap(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bounded_lines_rejects_before_extending_past_limit() {
         let mut lines = BoundedLines::new(Cursor::new(b"123456789\n".to_vec()), 8);
@@ -1086,6 +1112,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn no_escape_containment_denies_setsid_and_setpgid() {
         let output = capture_bounded(
@@ -1101,6 +1128,7 @@ mod tests {
         assert!(output.status.success());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn configured_limits_pin_the_route_contracts() {
         assert_eq!(CaptureLimits::session_tool().max_stdout_bytes, 1024 * 1024);
@@ -1129,6 +1157,7 @@ mod tests {
         assert_eq!(AGY_MAX_TURN_BYTES, 4 * 1024 * 1024);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bounded_concat_accepts_n_and_marks_n_plus_one_inside_the_cap() {
         assert_eq!(
@@ -1149,6 +1178,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bounded_concat_never_splits_utf8_or_expands_invalid_input_past_cap() {
         assert_eq!(

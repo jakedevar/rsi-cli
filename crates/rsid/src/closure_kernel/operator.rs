@@ -944,6 +944,7 @@ mod tests {
             .to_string()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn closure_program_identity_uses_explicit_refs_when_canonical_head_differs() {
         let directory = tempfile::tempdir().expect("temporary repository");
@@ -1456,6 +1457,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn closure_evidence_accepts_strict_bundle_and_replays_without_mutating_source() {
         let fixture = EvidenceFixture::new("valid", EvidenceMutation::Valid);
@@ -1568,6 +1570,7 @@ mod tests {
         assert_eq!(forbidden_k2_k3, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_evidence_concurrent_admission_durably_consumes_loser_key() {
         let fixture = EvidenceFixture::new("concurrent-admission", EvidenceMutation::Valid);
@@ -1655,6 +1658,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_evidence_transaction_stale_sha_refusal_is_durable() {
         let fixture = EvidenceFixture::new("transaction-stale-sha", EvidenceMutation::Valid);
@@ -1718,6 +1722,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closure_evidence_transaction_invalid_custody_refusal_is_durable() {
         let fixture = EvidenceFixture::new("transaction-invalid-custody", EvidenceMutation::Valid);
@@ -1787,6 +1792,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn closure_evidence_rejects_schema_binding_custody_and_git_failures() {
         for (label, mutation, refusal) in [
@@ -1904,6 +1910,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn closure_evidence_requires_reviewer_outside_source_lineage_and_custody() {
         let fixture = EvidenceFixture::new("source-as-reviewer", EvidenceMutation::Valid);
@@ -1925,6 +1932,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn closure_verification_policy_rejects_vacuous_or_nonverified_manifest_v2() {
         let source_head = ClosureGitShaV1::parse("a".repeat(40)).expect("source head");

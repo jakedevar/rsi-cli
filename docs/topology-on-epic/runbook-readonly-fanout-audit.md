@@ -32,8 +32,13 @@ OpenRouter fan-out policy.
 
 ## Upsert and execute
 
-Today, topology writes are operator RPCs; agent topology verbs are a T4
-follow-up. Start from the repository root:
+The operator uses the operator RPCs below. An Epic lead (in its own Epic) or
+the appointed manager holding `Automation` uses the agent verbs instead (#633):
+`AgentTopologyUpsert` with the file's `name` and `definition` and
+`"scope":"epic"`, then `AgentTopologyExecute` with the returned `topology_id`,
+`definition_digest` as `expected_digest`, the `epic_id` and an
+`idempotency_key`. Every session node's provider/model/effort must be in the
+operator's `allowed_launches`. From the repository root, as the operator:
 
 ```bash
 rpc CreateTopology --params "$(jq -c '{name,definition}' docs/topology-on-epic/topologies/readonly-fanout-audit.json)"
@@ -78,9 +83,10 @@ Codex rates; bound each area and its requested evidence to keep the total small.
   behind OpenRouter today. The definition explicitly selects a Codex/OpenAI
   summarizer, but the static validator cannot prove that its vendor family is
   different from those unclassified OpenRouter models.
-- The operator `CreateTopology` flow has no T4 `allowed_launches` policy
-  context; that model-triple policy is enforced only on the future agent upsert
-  and execute surfaces.
+- The operator `CreateTopology` flow has no `allowed_launches` policy context.
+  The agent verbs (#633) enforce the model triples at upsert, execute and each
+  launch, and refuse this four-wide layer unless it runs on OpenRouter while
+  `topology_bulk_fanout_min_openrouter` is at most 4 (it is).
 
 ## What v1 does not enforce
 

@@ -188,6 +188,8 @@ pub enum AgentSpawnChildOutcome {
 #[derive(Clone)]
 pub struct AgentControlHandle {
     pub(super) custody_runtime: Option<crate::sandbox::custody::CustodyExecutionRuntime>,
+    /// Route for the `rsi_control_topology_*` native tools (#633).
+    pub(super) topology_agent: Option<super::TopologyAgentSelf>,
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     pub(super) store: Arc<tokio::sync::Mutex<crate::store::Store>>,
@@ -209,6 +211,7 @@ impl AgentControlHandle {
     ) -> Self {
         Self {
             custody_runtime: None,
+            topology_agent: None,
             active,
             completed,
             store,
@@ -222,6 +225,11 @@ impl AgentControlHandle {
         runtime: crate::sandbox::custody::CustodyExecutionRuntime,
     ) -> Self {
         self.custody_runtime = Some(runtime);
+        self
+    }
+
+    pub(super) fn with_topology_agent(mut self, handle: super::TopologyAgentSelf) -> Self {
+        self.topology_agent = Some(handle);
         self
     }
 
@@ -509,7 +517,7 @@ impl AgentControlHandle {
         // or wider set here would leave a master able to halt a child it
         // cannot restart, or restart one it never owned.
         let logical_target = self
-            .authorize_agent_mutation_target(caller_session_id, request.target_session_id)
+            .authorize_agent_continue_target(caller_session_id, request.target_session_id)
             .await
             .map_err(|error| match error {
                 DaemonError::InvalidParam(ref code) if code.starts_with("manager_v2_") => error,
@@ -546,7 +554,7 @@ impl AgentControlHandle {
         let effective_target = if observed.tip_session_id == logical_target.id {
             logical_target
         } else {
-            self.authorize_agent_mutation_target(caller_session_id, observed.tip_session_id)
+            self.authorize_agent_continue_target(caller_session_id, observed.tip_session_id)
                 .await
                 .map_err(|error| {
                     if matches!(&error, DaemonError::InvalidParam(code) if code.starts_with("manager_v2_")) {
@@ -590,6 +598,20 @@ impl AgentControlHandle {
                 ));
             }
             return Ok(observed);
+        }
+        // A DB-native review owns this reviewer's next turn. Refuse before
+        // continue_session can interrupt the provider holding the receipt.
+        if self
+            .store
+            .lock()
+            .await
+            .manager_review_has_live_reviewer(observed.tip_session_id)?
+        {
+            return Err(crate::error::agent_continue_error(
+                AgentContinueErrorCodeV1::ContinuationFailed,
+                Some("manager_review_reviewer_continuation_owned".into()),
+                None,
+            ));
         }
 
         // Staleness gate. This is a STALENESS check, not a mutual-exclusion
@@ -876,15 +898,33 @@ impl AgentControlHandle {
                 prior_capacity.as_ref(),
             )?
         };
+        let repairable_malformed_guard =
+            if registration_evidence == ProgramRegistrationEvidence::Malformed {
+                let store = self.store.lock().await;
+                store.enabled_scheduled_job_exists(&program_guard_id)?
+            } else {
+                false
+            };
         let program_registered = matches!(
             registration_evidence,
             ProgramRegistrationEvidence::EnabledSentinel
                 | ProgramRegistrationEvidence::ClosedCapacityTerminalReplay
+                | ProgramRegistrationEvidence::Malformed
         );
         let parsed = rsi_common::agent_contract::program_continuation_intent_v1_with_registration(
             assistant_output,
             program_registered,
         );
+        if caller.status == rsi_common::types::SessionStatus::Failed
+            && self
+                .completed
+                .read()
+                .await
+                .get(&caller_session_id)
+                .is_some_and(|completed| completed.retry_cancel.is_some())
+        {
+            return Ok(MasterNoIdleOutcome::OrdinaryGuardPresent);
+        }
         let mut intent = match registration_evidence {
             ProgramRegistrationEvidence::ClosedSentinel
                 if parsed == ProgramContinuationIntentV1::NotProgram =>
@@ -895,6 +935,26 @@ impl AgentControlHandle {
                 ProgramContinuationIntentV1::InvalidProgram(
                     "program guard is closed and must be explicitly re-registered".into(),
                 )
+            }
+            ProgramRegistrationEvidence::Malformed
+                if repairable_malformed_guard
+                    && program_guard_id
+                    == crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(
+                        controller_session_id,
+                    )
+                    && matches!(
+                        &parsed,
+                        ProgramContinuationIntentV1::TerminalAllowed
+                            | ProgramContinuationIntentV1::RequireChildWatch { .. }
+                            | ProgramContinuationIntentV1::RequireResumeWake { .. }
+                    ) =>
+            {
+                // A row at the daemon-derived id proves prior registration,
+                // even when its mutable envelope cannot be decoded. Repair it
+                // only for a strict valid program carrier before settlement.
+                self.register_bound_program_guard(controller_session_id)
+                    .await?;
+                parsed
             }
             ProgramRegistrationEvidence::Malformed => ProgramContinuationIntentV1::InvalidProgram(
                 format!("program guard row {program_guard_id} is malformed"),
@@ -908,17 +968,6 @@ impl AgentControlHandle {
             }
             _ => parsed,
         };
-        if caller.status == rsi_common::types::SessionStatus::Failed
-            && self
-                .completed
-                .read()
-                .await
-                .get(&caller_session_id)
-                .is_some_and(|completed| completed.retry_cancel.is_some())
-        {
-            return Ok(MasterNoIdleOutcome::OrdinaryGuardPresent);
-        }
-
         let exact_capacity_failure = caller.provider == rsi_common::types::SessionProvider::Codex
             && caller.stop_reason.as_deref() == Some("provider_error:codex_usage_limit");
         if exact_capacity_failure {
@@ -1107,10 +1156,20 @@ impl AgentControlHandle {
             | ProgramContinuationIntentV1::TerminalAllowed => unreachable!("returned above"),
         };
         let issue_cause = normalize_master_no_idle_reason(&reason);
+        // A malformed/absent carrier means the queue state was never
+        // established, so the session cannot be told to dispatch a next slice
+        // it has not authorized. Require the carrier itself; settlement
+        // re-evaluates the repaired report on the next terminal turn.
+        let recovery_instruction = match &intent {
+            ProgramContinuationIntentV1::InvalidProgram(_) => {
+                "Re-emit exactly one valid orchestration_outcome_v1 carrier describing the current program state; the queue state could not be established, so no slice is authorized."
+            }
+            _ => "Reconcile the program ledger and dispatch the exact next authorized slice.",
+        };
         let delivery = rsi_common::daemon_message::wrap(
             "orchestration-no-idle",
             &format!(
-                "[rsid-no-idle] Recovered unattended program continuation after {reason}. Reconcile the program ledger and dispatch the exact next authorized slice."
+                "[rsid-no-idle] Recovered unattended program continuation after {reason}. {recovery_instruction}"
             ),
         );
         let mut wake = crate::session::harness::tools::schedule_wake::build_agent_scheduled_job(
@@ -1829,7 +1888,7 @@ impl AgentControlHandle {
         target_session_id: Uuid,
     ) -> Result<Session> {
         Ok(self
-            .authorize_agent_target_impl(caller_session_id, target_session_id, false)
+            .authorize_agent_target_impl(caller_session_id, target_session_id, false, false)
             .await?
             .0)
     }
@@ -1839,8 +1898,44 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         target_session_id: Uuid,
     ) -> Result<(Session, Option<ManagerSessionScope>)> {
-        self.authorize_agent_target_impl(caller_session_id, target_session_id, true)
+        self.authorize_agent_target_impl(caller_session_id, target_session_id, true, false)
             .await
+    }
+
+    async fn authorize_agent_continue_target(
+        &self,
+        caller_session_id: Uuid,
+        target_session_id: Uuid,
+    ) -> Result<(Session, Option<ManagerSessionScope>)> {
+        use crate::store::manager_actions::OperatorPause;
+
+        let (target, scope) = self
+            .authorize_agent_target_impl(caller_session_id, target_session_id, true, true)
+            .await?;
+        let store = self.store.lock().await;
+        match store.get_operator_pause(target_session_id)? {
+            OperatorPause::None => Ok((target, scope)),
+            OperatorPause::Hard => Err(DaemonError::InvalidParam(
+                "manager_v2_human_or_recovery_owner: hard operator pause".into(),
+            )),
+            OperatorPause::Soft => {
+                // Direct parents and Epic leads return before the manager gate
+                // in authorize_agent_target_impl. Only a live manager
+                // SessionControl grant may clear a soft pause.
+                let manager_scope = store.manager_session_control_scope_with_soft_restart(
+                    caller_session_id,
+                    target_session_id,
+                    true,
+                    true,
+                )?;
+                match manager_scope {
+                    Some(manager_scope) => Ok((target, Some(manager_scope))),
+                    None => Err(DaemonError::InvalidParam(
+                        "manager_v2_human_or_recovery_owner: soft operator pause".into(),
+                    )),
+                }
+            }
+        }
     }
 
     async fn authorize_agent_target_impl(
@@ -1848,6 +1943,7 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         target_session_id: Uuid,
         mutation: bool,
+        allow_soft_restart: bool,
     ) -> Result<(Session, Option<ManagerSessionScope>)> {
         let target = self
             .get_session(target_session_id)
@@ -1882,7 +1978,12 @@ impl AgentControlHandle {
 
         let manager_scope = {
             let store = self.store.lock().await;
-            store.manager_session_control_scope(caller_session_id, target_session_id, mutation)?
+            store.manager_session_control_scope_with_soft_restart(
+                caller_session_id,
+                target_session_id,
+                mutation,
+                allow_soft_restart,
+            )?
         };
         if let Some(scope) = manager_scope {
             return Ok((target, Some(scope)));
@@ -2266,6 +2367,7 @@ mod manager_session_control_tests {
     use rsi_common::types::{Project, SessionStatus};
     use tempfile::TempDir;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn manager_continue_child_keeps_manager_watch_after_full_continuation() {
         let directory = TempDir::new().unwrap();
@@ -2459,6 +2561,7 @@ mod manager_session_control_tests {
         crate::session::launch::drop_controller_candidate_test_stream(lead);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn manager_fresh_relaunch_replay_keeps_one_audit_and_watch() {
         let directory = TempDir::new().unwrap();
@@ -2628,6 +2731,7 @@ mod manager_session_control_tests {
         crate::session::launch::drop_controller_candidate_test_stream(lead);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn current_manager_controls_epic_lead_worker_and_nested_worker_through_agent_verbs() {
         let (control, shared) = control_handle_with_store();
@@ -2849,6 +2953,7 @@ impl SessionManager {
             Arc::clone(&self.spawn_coordinator),
         )
         .with_custody_runtime(self.custody_execution_runtime())
+        .with_topology_agent(Arc::clone(&self.topology_agent_self))
     }
 
     /// `AgentCreateIssue` RPC delegator — creator identity is passed only from
@@ -3034,7 +3139,7 @@ impl SessionManager {
             .authorize_continue_child(caller_session_id, &request)
             .await?;
         let manager_scope = control
-            .authorize_agent_mutation_target(caller_session_id, observed.tip_session_id)
+            .authorize_agent_continue_target(caller_session_id, observed.tip_session_id)
             .await?
             .1;
         let manager_controlled = manager_scope.is_some();
@@ -3559,6 +3664,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn c5_agent_halt_pending_retry_exhausts_budget_and_suppresses_marker() {
         let active = Arc::new(RwLock::new(HashMap::new()));
@@ -3626,8 +3732,9 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
-    async fn agent_halt_invalid_nonpending_target_retains_c5_marker() {
+    async fn agent_halt_terminal_nonpending_target_retains_c5_marker() {
         let (control, store) = control_handle_with_store();
         let dir = TempDir::new().unwrap();
         let session_id = Uuid::new_v4();
@@ -3635,11 +3742,20 @@ pub(crate) mod tests {
         insert_failed_pending(&store, &session).await;
         let pending_key = crate::store::daemon_settings::c5_autofile_pending_key(session_id);
 
-        let error = control
+        control
             .agent_halt(session_id, session_id)
             .await
-            .expect_err("non-pending halt must retain its existing not-found error");
-        assert!(matches!(error, DaemonError::SessionNotFound(id) if id == session_id));
+            .expect("terminal halt is idempotent when no provider remains");
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_session(session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Failed
+        );
         assert!(
             store
                 .lock()
@@ -3647,11 +3763,12 @@ pub(crate) mod tests {
                 .get_daemon_setting(&pending_key)
                 .unwrap()
                 .is_some(),
-            "an invalid AgentHalt must not suppress an eligible failure marker"
+            "a terminal halt without pending retry keeps the failure marker"
         );
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_halt_reaps_authorized_terminal_orphan_absent_from_maps() {
         let (control, store, event_bus) = control_handle_with_store_and_bus();
@@ -3721,8 +3838,9 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
-    async fn agent_halt_fixture_root_unreadable_registered_entry_fails_closed_before_signal() {
+    async fn agent_halt_fixture_root_skips_unreadable_sibling_and_reaps_exact_target() {
         let (control, store, event_bus) = control_handle_with_store_and_bus();
         let mut events = event_bus.subscribe();
         let dir = TempDir::new().unwrap();
@@ -3743,21 +3861,21 @@ pub(crate) mod tests {
             .scoped_runtime_reap_root(session_id)
             .expect("register exact AgentHalt fixture root");
 
-        let error = control
+        control
             .agent_halt(session_id, session_id)
             .await
-            .expect_err("unreadable registered inventory must fail closed");
-        assert!(error.to_string().contains("environ read failed"), "{error}");
-        assert!(
-            error.to_string().contains(&unreadable.pid().to_string()),
-            "error must name the unreadable registered pid: {error}"
-        );
-        assert!(target.is_alive("target survives failed inventory proof"));
-        assert!(unreadable.is_alive("unreadable sibling survives failed inventory proof"));
-        assert!(
-            system_messages(&mut events).is_empty(),
-            "no reap warning on failed proof"
-        );
+            .expect("unreadable sibling does not block exact target proof");
+        target.wait_signalled("exact target is reaped");
+        assert!(unreadable.is_alive("unreadable sibling remains unproven"));
+        let warnings = system_messages(&mut events)
+            .into_iter()
+            .filter(|(level, message)| {
+                level == "warn"
+                    && message.contains("AgentHalt reaped 1 terminal provider orphan(s)")
+                    && message.contains(&session_id.to_string())
+            })
+            .count();
+        assert_eq!(warnings, 1, "AgentHalt reports one exact target reap");
         assert_eq!(
             store
                 .lock()
@@ -3771,6 +3889,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_halt_does_not_reap_untracked_nonterminal_process() {
         let (control, store) = control_handle_with_store();
@@ -3798,6 +3917,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_halt_terminal_orphan_proof_failure_is_fail_closed() {
         let (control, store) = control_handle_with_store();
@@ -3959,6 +4079,7 @@ pub(crate) mod tests {
         invocation
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn no_idle_replay_capacity_uses_invocation_identity_and_never_sequence_fallback() {
         let (control, store) = control_handle_with_store();
@@ -4044,6 +4165,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn capacity_terminal_initial_and_exact_replay_close_all_custody_for_both_carriers() {
         for (continuation_state, blocker_class) in [
@@ -4230,6 +4352,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn ordinary_terminal_invocation_closes_open_capacity_without_claiming_exact_receipt() {
         for program_terminal in [false, true] {
@@ -4343,6 +4466,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn capacity_terminal_reopen_authenticates_both_strict_carriers_without_rearm() {
         for (continuation_state, blocker_class) in [
@@ -4445,6 +4569,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_capacity_retry_owner_precedes_incident_creation() {
         let (control, store) = control_handle_with_store();
@@ -4486,6 +4611,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_noncapacity_failure_keeps_sequence_keyed_recovery() {
         let (control, store) = control_handle_with_store();
@@ -4526,6 +4652,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn no_idle_recovery_capacity_retries_one_atomic_store_fault() {
         let (control, store) = control_handle_with_store();
@@ -4572,6 +4699,7 @@ pub(crate) mod tests {
         assert_eq!(locked.list_issues(&Default::default()).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_capacity_store_error_retains_ordinary_c5_filing_or_projectless_error() {
         for project_backed in [true, false] {
@@ -4637,6 +4765,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn issue_writer_master_no_idle_recovers_with_resume_and_attributed_issue_once() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -4808,6 +4937,7 @@ pub(crate) mod tests {
         assert_eq!(locked.list_scheduled_jobs().unwrap().len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn master_no_idle_reason_normalization_deduplicates_embedded_job_ids() {
         assert_eq!(
@@ -4824,6 +4954,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn issue373_no_idle_quoted_examples_preserve_existing_jobs_and_issues() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -4889,6 +5020,7 @@ pub(crate) mod tests {
         assert_eq!(system_messages(&mut receiver), Vec::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn issue373_no_idle_closed_guard_stays_closed_for_examples() {
         let (control, store) = control_handle_with_store();
@@ -4943,6 +5075,7 @@ pub(crate) mod tests {
         assert_eq!(store.list_issues(&Default::default()).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_accepts_real_watch_queue_exhaustion_and_human_gate() {
         let (control, store) = control_handle_with_store();
@@ -5010,6 +5143,224 @@ pub(crate) mod tests {
         assert!(!guard.enabled, "typed terminal outcome disables sentinel");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn malformed_existing_program_guard_is_repaired_for_strict_terminal_outcome() {
+        for unreadable in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let database = dir.path().join("program-guard.sqlite");
+            let (control, store, _) = control_handle_for_store(Store::open(&database).unwrap());
+            let session_id = Uuid::new_v4();
+            let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+            session.status = SessionStatus::Completed;
+            store.lock().await.insert_session(&session).unwrap();
+            let guard_id = register_program_guard(&control, &session).await;
+            {
+                let store = store.lock().await;
+                if unreadable {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE scheduled_jobs SET schedule_json='invalid-json' WHERE id=?1",
+                            [guard_id.to_string()],
+                        )
+                        .unwrap();
+                    assert!(store.get_scheduled_job(&guard_id).unwrap().is_none());
+                } else {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE scheduled_jobs SET wake_mode='fresh' WHERE id=?1",
+                            [guard_id.to_string()],
+                        )
+                        .unwrap();
+                    assert!(store.get_scheduled_job(&guard_id).unwrap().is_some());
+                }
+            }
+
+            let outcome = control
+                .enforce_master_no_idle(
+                    session_id,
+                    41,
+                    &program_outcome(false, "queue_exhausted", None, None),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MasterNoIdleOutcome::TerminalAllowed { capacity: None }
+            );
+            let store = store.lock().await;
+            let guard = store
+                .get_scheduled_job(&guard_id)
+                .unwrap()
+                .expect("repaired guard");
+            assert!(
+                crate::session::harness::tools::schedule_wake::is_program_guard_sentinel(
+                    &guard, session_id
+                )
+            );
+            assert!(!guard.enabled);
+            assert_eq!(store.list_scheduled_jobs().unwrap().len(), 1);
+            drop(store);
+
+            let reopened = Store::open(&database).unwrap();
+            let durable = reopened
+                .get_scheduled_job(&guard_id)
+                .unwrap()
+                .expect("repaired guard survives store reopen");
+            assert!(
+                crate::session::harness::tools::schedule_wake::is_program_guard_sentinel(
+                    &durable, session_id
+                )
+            );
+            assert!(!durable.enabled);
+            drop(reopened);
+
+            control
+                .register_bound_program_guard(session_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                control
+                    .enforce_master_no_idle(
+                        session_id,
+                        42,
+                        &program_outcome(false, "queue_exhausted", None, None),
+                    )
+                    .await
+                    .unwrap(),
+                MasterNoIdleOutcome::TerminalAllowed { capacity: None },
+                "a new terminal classification requires explicit re-registration"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn malformed_existing_program_guard_is_repaired_for_strict_child_watch() {
+        let (control, store) = control_handle_with_store();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&session).unwrap();
+        let guard_id = register_program_guard(&control, &session).await;
+        let watch = watch_candidate(session_id, Uuid::new_v4());
+        {
+            let store = store.lock().await;
+            store.insert_scheduled_job(&watch).unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE scheduled_jobs SET wake_mode='fresh' WHERE id=?1",
+                    [guard_id.to_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            control
+                .enforce_master_no_idle(
+                    session_id,
+                    42,
+                    &program_outcome(true, "child_watch", Some(watch.id), None),
+                )
+                .await
+                .unwrap(),
+            MasterNoIdleOutcome::OrdinaryGuardPresent
+        );
+        let store = store.lock().await;
+        let guard = store
+            .get_scheduled_job(&guard_id)
+            .unwrap()
+            .expect("repaired guard");
+        assert!(
+            crate::session::harness::tools::schedule_wake::is_program_guard_sentinel(
+                &guard, session_id
+            )
+        );
+        assert!(guard.enabled);
+        assert_eq!(store.list_scheduled_jobs().unwrap().len(), 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn malformed_guard_with_invalid_carrier_and_absent_guard_still_fail_closed() {
+        let (control, store) = control_handle_with_store();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&session).unwrap();
+        assert!(matches!(
+            control
+                .enforce_master_no_idle(
+                    session_id,
+                    43,
+                    &program_outcome(false, "queue_exhausted", None, None),
+                )
+                .await
+                .unwrap(),
+            MasterNoIdleOutcome::GenericRecovered { .. }
+        ));
+
+        let (control, store) = control_handle_with_store();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&session).unwrap();
+        let guard_id = register_program_guard(&control, &session).await;
+        store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET schedule_json='invalid-json' WHERE id=?1",
+                [guard_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            control
+                .enforce_master_no_idle(session_id, 44, "orchestration_outcome_v1: not-json")
+                .await
+                .unwrap(),
+            MasterNoIdleOutcome::GenericRecovered { .. }
+        ));
+        let store = store.lock().await;
+        assert!(store.scheduled_job_exists(&guard_id).unwrap());
+        assert!(store.get_scheduled_job(&guard_id).unwrap().is_none());
+        drop(store);
+
+        let (control, store) = control_handle_with_store();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&session).unwrap();
+        let guard_id = register_program_guard(&control, &session).await;
+        store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET schedule_json='invalid-json', enabled=0 WHERE id=?1",
+                [guard_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            control
+                .enforce_master_no_idle(
+                    session_id,
+                    45,
+                    &program_outcome(false, "queue_exhausted", None, None),
+                )
+                .await
+                .unwrap(),
+            MasterNoIdleOutcome::GenericRecovered { .. }
+        ));
+        let store = store.lock().await;
+        assert!(!store.enabled_scheduled_job_exists(&guard_id).unwrap());
+        assert!(store.get_scheduled_job(&guard_id).unwrap().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn consumed_child_watch_recovers_program_before_scheduler_retires_row() {
         use rsi_common::types::{ConversationEvent, EventType, Role};
@@ -5066,6 +5417,7 @@ pub(crate) mod tests {
         assert!(store.get_scheduled_job(&watch.id).unwrap().unwrap().enabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn closed_program_guard_is_silent_rearms_explicitly_and_recovers_program_output_once() {
         for (offset, terminal_state, blocker_class) in [
@@ -5174,6 +5526,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn closed_program_guard_remains_silent_after_store_reopen() {
         let directory = TempDir::new().unwrap();
@@ -5221,6 +5574,7 @@ pub(crate) mod tests {
         assert!(system_messages(&mut receiver).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_requires_the_exact_one_shot_resume_row() {
         let (control, store) = control_handle_with_store();
@@ -5257,6 +5611,7 @@ pub(crate) mod tests {
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn program_sentinel_is_not_a_continuation_but_real_resume_wake_is() {
         let (control, store) = control_handle_with_store();
@@ -5309,6 +5664,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_failed_session_recovers_only_without_pending_retry() {
         let (control, store) = control_handle_with_store();
@@ -5366,6 +5722,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn master_no_idle_recovers_invalid_program_outcome() {
         let (control, store) = control_handle_with_store();
@@ -5384,6 +5741,7 @@ pub(crate) mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn registered_program_fails_closed_for_missing_duplicate_malformed_and_slice_output() {
         let (control, store) = control_handle_with_store();
@@ -5420,7 +5778,8 @@ pub(crate) mod tests {
             );
         }
         let store = store.lock().await;
-        assert_eq!(store.list_issues(&Default::default()).unwrap().len(), 5);
+        // Five recovery wakes contain four distinct normalized failure causes.
+        assert_eq!(store.list_issues(&Default::default()).unwrap().len(), 4);
         assert_eq!(
             store
                 .conn
@@ -5433,6 +5792,60 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn registered_program_missing_carrier_recovers_with_carrier_demand_not_slice_dispatch() {
+        let (control, store) = control_handle_with_store();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&session).unwrap();
+        register_program_guard(&control, &session).await;
+
+        let outcome = control
+            .enforce_master_no_idle(
+                session_id,
+                60,
+                "Here is a prompt for later human use; no strict carrier follows.\n",
+            )
+            .await
+            .unwrap();
+        let MasterNoIdleOutcome::GenericRecovered { wake_job_id, .. } = outcome else {
+            panic!("a registered program omitting its carrier must fail closed: {outcome:?}");
+        };
+
+        let store = store.lock().await;
+        let recovery = store.get_scheduled_job(&wake_job_id).unwrap().unwrap();
+        assert!(recovery.enabled);
+        assert_eq!(recovery.wake_mode, WakeMode::Resume);
+        assert_eq!(recovery.wake_session_id, Some(session_id));
+        assert!(
+            recovery
+                .message
+                .contains("registered program omitted orchestration_outcome_v1"),
+            "recovery must name the omitted-carrier cause: {}",
+            recovery.message
+        );
+        // The positive end state: the recovery's instruction slot carries the
+        // carrier demand used for this cause, and nothing follows it.
+        assert!(
+            recovery.message.contains(
+                "invalid program outcome: registered program omitted orchestration_outcome_v1. \
+                 Re-emit exactly one valid orchestration_outcome_v1 carrier describing the \
+                 current program state; the queue state could not be established, so no slice \
+                 is authorized.\n</rsid-daemon-message>"
+            ),
+            "recovery must demand the carrier rather than dispatch a slice: {}",
+            recovery.message
+        );
+        assert_eq!(
+            store.list_issues(&Default::default()).unwrap().len(),
+            1,
+            "the omitted-carrier cause files exactly one attributed issue"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn malformed_strict_plus_legacy_program_recovers_but_real_slice_is_not_applicable() {
         let (control, store) = control_handle_with_store();
@@ -5463,6 +5876,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn no_idle_recovery_retries_atomically_after_wake_fault() {
         let (control, store) = control_handle_with_store();
@@ -5511,6 +5925,7 @@ pub(crate) mod tests {
         assert_eq!(store.list_issues(&Default::default()).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn no_idle_replay_finishes_a_missing_issue_without_duplicating_the_wake() {
         let (control, store) = control_handle_with_store();
@@ -5574,6 +5989,7 @@ pub(crate) mod tests {
         assert_eq!(store.list_issues(&Default::default()).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn projectless_recovery_is_visible_wake_only_and_uses_sandbox_root() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -5616,6 +6032,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn exact_guard_reads_ignore_a_large_disabled_job_corpus() {
         let (control, store) = control_handle_with_store();
@@ -5703,6 +6120,7 @@ pub(crate) mod tests {
         envelope.code
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn relaunch_intent_migration_creates_table_indexes_and_triggers() {
         let store = Store::open_in_memory().expect("migrated store");
@@ -5755,6 +6173,7 @@ pub(crate) mod tests {
         (manager, dir, caller, tip)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_entry_prechecks_before_fence_capture() {
         use rsi_common::agent_coordination::AgentContinueErrorCodeV1;
@@ -5782,6 +6201,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_relaunches_fresh_when_no_provider_session_id() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -5813,6 +6233,7 @@ pub(crate) mod tests {
         assert_eq!(row.invocation_id, Some(relaunch.invocation_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn fresh_relaunch_replay_after_success_returns_original_receipt() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -5841,6 +6262,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn fresh_relaunch_same_key_different_query_is_idempotency_conflict() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -5862,6 +6284,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn fresh_relaunch_two_keys_each_replay_returns_its_own_receipt() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -5951,6 +6374,7 @@ pub(crate) mod tests {
         assert_eq!(launched, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn fresh_relaunch_concurrent_identical_requests_launch_once() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -5991,6 +6415,7 @@ pub(crate) mod tests {
         assert_eq!((intents, admissions), (1, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_fresh_relaunch_refuses_without_durable_task() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -6021,6 +6446,7 @@ pub(crate) mod tests {
         assert_eq!(count, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_fresh_relaunch_uses_same_sandbox_and_row() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -6066,6 +6492,7 @@ pub(crate) mod tests {
         assert_eq!(rows, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_fresh_relaunch_task_skips_create_handoff_lineage() {
         let (manager, dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -6107,6 +6534,7 @@ pub(crate) mod tests {
         }).await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn fresh_relaunch_system_prompt_carries_kind_preamble() {
         let parts = crate::session::launch::fresh_launch_preamble_parts(SessionKind::Task);
@@ -6122,6 +6550,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn boot_recovery_settles_open_intent_and_launches_nothing() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
@@ -6227,6 +6656,7 @@ pub(crate) mod tests {
     /// Self-continuation is an unowned self-injection loop. It must be refused
     /// before ANY Store read, so the verb cannot be used to confirm the
     /// caller's own row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_refuses_self_target() {
         let (control, _store) = control_handle_with_store();
@@ -6245,6 +6675,7 @@ pub(crate) mod tests {
 
     /// A session the caller neither parents nor leads is out of scope, and the
     /// refusal must not leak whether the row exists.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_refuses_unrelated_target() {
         let (control, store) = control_handle_with_store();
@@ -6276,8 +6707,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// An operator pause applies to the continuation authority of both a
+    /// direct parent and the lead of the child's Epic.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn continue_child_operator_pause_refuses_parent_and_epic_lead() {
+        use crate::store::manager_actions::OperatorPause;
+
+        let (control, store) = control_handle_with_store();
+        let dir = TempDir::new().unwrap();
+        let caller = Uuid::new_v4();
+        let epic = Uuid::new_v4();
+        let direct_child = Uuid::new_v4();
+        let epic_child = Uuid::new_v4();
+        {
+            let store = store.lock().await;
+            store
+                .insert_session(&test_session(caller, dir.path().to_path_buf()))
+                .unwrap();
+            let mut epic_row = test_session(epic, dir.path().to_path_buf());
+            epic_row.session_kind = SessionKind::Epic;
+            epic_row.lead_session_id = Some(caller);
+            store.insert_session(&epic_row).unwrap();
+            for (child_id, parent_id) in [(direct_child, caller), (epic_child, epic)] {
+                let mut child = test_session(child_id, dir.path().to_path_buf());
+                child.parent_id = Some(parent_id);
+                store.insert_session(&child).unwrap();
+            }
+        }
+
+        for child_id in [direct_child, epic_child] {
+            control
+                .authorize_continue_child(caller, &continue_request(child_id, child_id, 0, None))
+                .await
+                .expect("unpaused parent or Epic lead may continue a child");
+
+            for (pause, strength) in [
+                (OperatorPause::Soft, "soft operator pause"),
+                (OperatorPause::Hard, "hard operator pause"),
+            ] {
+                store
+                    .lock()
+                    .await
+                    .set_operator_pause(child_id, pause)
+                    .unwrap();
+                let error = control
+                    .authorize_continue_child(
+                        caller,
+                        &continue_request(child_id, child_id, 0, None),
+                    )
+                    .await
+                    .expect_err("operator pause must refuse child continuation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("manager_v2_human_or_recovery_owner"),
+                    "operator pause must return the human authority refusal: {error}"
+                );
+                assert!(error.to_string().contains(strength));
+            }
+        }
+    }
+
     /// CodexAppServer allocates a fresh session id on continue, so continuing
     /// it under the named id would hand back an already-wrong receipt.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_refuses_codex_app_server_provider() {
         let (control, store) = control_handle_with_store();
@@ -6309,6 +6803,7 @@ pub(crate) mod tests {
     /// Provider policy follows the row actually continued. A logical
     /// CodexAppServer root may already resolve to an ordinary Codex replacement
     /// whose stable id is safe to continue.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_checks_provider_on_the_resolved_tip() {
         let (control, store) = control_handle_with_store();
@@ -6344,6 +6839,7 @@ pub(crate) mod tests {
     /// Authority is checked again on the resolved lineage tip before a stale
     /// witness is returned. A caller authorized only on the logical root must
     /// neither continue nor learn the cursor of a reparented successor tip.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_reauthorizes_the_resolved_tip() {
         let (control, store) = control_handle_with_store();
@@ -6396,6 +6892,7 @@ pub(crate) mod tests {
     }
 
     /// The happy path clears and returns the exact cursor the fence checked.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_clears_a_matching_cursor() {
         let (control, store) = control_handle_with_store();
@@ -6414,6 +6911,7 @@ pub(crate) mod tests {
 
     /// A cursor that has moved on is exactly the case this verb exists to
     /// refuse, and the refusal must carry the version witness to retry with.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_refuses_stale_sequence_and_returns_the_witness() {
         let (control, store) = control_handle_with_store();
@@ -6437,6 +6935,7 @@ pub(crate) mod tests {
     /// Once a continuation event is durable, a request carrying the prior
     /// sequence is stale. This tests the cursor fence only; dispatch itself is
     /// asynchronous and is not deduplicated by this tuple.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_refuses_replay_after_event_sequence_advances() {
         use rsi_common::types::{ConversationEvent, EventType, Role};
@@ -6484,6 +6983,7 @@ pub(crate) mod tests {
     /// Custody generation is fenced on full equality INCLUDING absence: a caller
     /// that expected a sandboxed child must not silently continue one that has
     /// no custody projection.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_custody_absence_is_part_of_the_fence() {
         let (control, store) = control_handle_with_store();
@@ -6509,6 +7009,7 @@ pub(crate) mod tests {
 
     /// Bounds are checked before scope, so an oversized payload cannot be used
     /// to probe authority.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continue_child_rejects_an_empty_query_before_scope() {
         let (control, _store) = control_handle_with_store();
@@ -6539,6 +7040,7 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn c5_automatic_error_observation_has_one_log_and_one_system_message_choke() {
         // This module has no tracing capture harness. Pin the production source
@@ -6566,6 +7068,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn c5_replay_retains_malformed_middle_row_and_settles_later_rows_once() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -6631,6 +7134,7 @@ pub(crate) mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn c5_replay_reports_batch_read_failure_once_without_mutating_session_or_issue_state() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -6658,6 +7162,7 @@ pub(crate) mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn c5_settlement_failure_reports_once_then_replay_repairs_without_duplicate() {
         let (control, store, bus) = control_handle_with_store_and_bus();
@@ -6745,6 +7250,7 @@ pub(crate) mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_create_issue_is_durable_first_write_wins_and_binds_creator() {
         let (control, store) = control_handle_with_store();
@@ -6815,6 +7321,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_issue_guarded_control_handle_routes_all_seven_lead_verbs() {
         let (control, store) = control_handle_with_store();
@@ -6999,6 +7506,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn c5_namespace_literal_is_the_pinned_url_v5_derivation() {
         assert_eq!(
@@ -7114,6 +7622,7 @@ pub(crate) mod tests {
             .count()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_repair_is_automatic_and_deduplicated() {
         let (control, store) = control_handle_with_store();
@@ -7193,6 +7702,7 @@ pub(crate) mod tests {
         assert_eq!(enabled_watch_count(&store, owner_id).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_repairs_consumed_live_and_missing_terminal_watches() {
         let (control, store) = control_handle_with_store();
@@ -7299,6 +7809,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_rearms_terminal_child_missing_its_watch() {
         let (control, store) = control_handle_with_store();
@@ -7341,6 +7852,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn manager_watch_insert_does_not_advance_child_arm_witness() {
         let (control, store) = control_handle_with_store();
@@ -7446,6 +7958,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_respects_explicit_retirement_and_owner_state() {
         let (control, store) = control_handle_with_store();
@@ -7621,6 +8134,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_repairs_completed_owner_with_v123_arm_intent() {
         let (control, store) = control_handle_with_store();
@@ -7704,6 +8218,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn terminal_watch_restart_historical_children_do_not_starve_missing_live_watch() {
         let (control, store) = control_handle_with_store();
@@ -7771,6 +8286,7 @@ pub(crate) mod tests {
     /// insert and every other caller gets `Deduplicated` with the winner's
     /// row. The pre-A8.1 split (check under one lock scope, insert under a
     /// later one) allowed double-inserts here.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_identical_arms_insert_exactly_one_row() {
         let (control, store) = control_handle_with_store();
@@ -7822,6 +8338,7 @@ pub(crate) mod tests {
     /// A8.1 F-2 (b): concurrent DISTINCT arms racing for the last slots below
     /// `MAX_TERMINAL_WATCHES_PER_MASTER` — the enabled-watch count never
     /// overshoots the cap, and exactly the free slots are won.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_distinct_arms_never_exceed_cap() {
         let (control, store) = control_handle_with_store();
@@ -7877,6 +8394,7 @@ pub(crate) mod tests {
     /// A8.1 F-2 (c): a sequential re-arm of the same (caller, watched) key
     /// returns the EXISTING job id (not the discarded candidate's) and
     /// inserts nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn rearm_returns_existing_job_id() {
         let (control, store) = control_handle_with_store();
@@ -7905,6 +8423,7 @@ pub(crate) mod tests {
         assert_eq!(enabled_watch_count(&store, caller).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn continued_child_reuses_watch_with_new_delivery_epoch() {
         let (control, store) = control_handle_with_store();
@@ -7966,6 +8485,7 @@ pub(crate) mod tests {
     /// A8.1 review F2 (defense-in-depth): a candidate whose wake target is
     /// bound to anyone but the arming caller — or that watches the caller
     /// itself — is rejected by the service before any row is written.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn arm_rejects_misbound_candidate_wake_target() {
         let (control, store) = control_handle_with_store();
@@ -8006,6 +8526,7 @@ pub(crate) mod tests {
     /// A8.1 review F6: the non-`OnTerminal` candidate guard arm — a
     /// fresh-mode job handed to the watch service is `InvalidParam`, and
     /// nothing is inserted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn arm_rejects_non_on_terminal_candidate() {
         use crate::session::harness::tools::schedule_wake::{
@@ -8168,6 +8689,7 @@ mod send_message_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_accepts_a_direct_child_and_binds_no_reservation() {
         let (control, store) = control_handle_with_store();
@@ -8192,6 +8714,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_refuses_a_terminal_current_target_at_acceptance() {
         let (control, store) = control_handle_with_store();
@@ -8215,6 +8738,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_accepts_a_terminal_root_with_a_live_rotation_tip() {
         let (control, store) = control_handle_with_store();
@@ -8249,6 +8773,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_accepts_a_child_of_an_epic_the_caller_leads() {
         let (control, store) = control_handle_with_store();
@@ -8270,6 +8795,7 @@ mod send_message_tests {
     /// Self-send is denied even though `AgentGetStatus`/`AgentHalt` admit self.
     /// A session mailing itself is a self-injection loop with no owner to
     /// settle it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_denies_self_and_persists_nothing() {
         let (control, store) = control_handle_with_store();
@@ -8295,6 +8821,7 @@ mod send_message_tests {
             .expect("AgentGetStatus still admits self");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_denies_a_foreign_session_and_persists_nothing() {
         let (control, store) = control_handle_with_store();
@@ -8311,6 +8838,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_denies_a_child_of_an_epic_led_by_someone_else() {
         let (control, store) = control_handle_with_store();
@@ -8335,6 +8863,7 @@ mod send_message_tests {
     /// never grants authority". `lead_session_id` is only meaningful on a
     /// container kind, so a parent carrying one without being an Epic must not
     /// be treated as one.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_denies_a_non_epic_parent_carrying_a_matching_lead() {
         for parent_kind in [SessionKind::Group, SessionKind::Task, SessionKind::Standard] {
@@ -8367,6 +8896,7 @@ mod send_message_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_binds_the_callers_own_reservation_before_launch() {
         let (control, store) = control_handle_with_store();
@@ -8389,6 +8919,7 @@ mod send_message_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_denies_a_reservation_owned_by_another_session() {
         let (control, store) = control_handle_with_store();
@@ -8409,6 +8940,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_reports_an_unknown_target_as_target_unknown() {
         let (control, store) = control_handle_with_store();
@@ -8427,6 +8959,7 @@ mod send_message_tests {
     /// the V81 `agent_messages_v81_target_custody` trigger refuses it. Prove
     /// the verb refuses it FIRST, with a typed class rather than a raw SQL
     /// abort leaking through.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_refuses_a_permanently_failed_reservation() {
         let (control, store) = control_handle_with_store();
@@ -8452,6 +8985,7 @@ mod send_message_tests {
 
     /// Payload bounds are refused before authority is even consulted, so an
     /// oversized send cannot be used to probe the topology.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_rejects_malformed_requests_before_any_store_write() {
         let (control, store) = control_handle_with_store();
@@ -8478,6 +9012,7 @@ mod send_message_tests {
         assert_eq!(message_row_count(&store).await, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_exact_replay_returns_the_original_receipt() {
         let (control, store) = control_handle_with_store();
@@ -8508,6 +9043,7 @@ mod send_message_tests {
 
     /// The cursor-bearing state event is published only after the Store
     /// transaction commits, and a denied send publishes nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_send_message_publishes_a_cursor_bearing_event_only_after_commit() {
         let (control, store, bus) = control_handle_with_store_and_bus();

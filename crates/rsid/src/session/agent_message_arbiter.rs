@@ -620,6 +620,7 @@ mod tests {
     /// compiling. `decide_next_boundary` returning an owned value that borrows
     /// nothing from `&Store` is what lets the monitor drop its store guard
     /// before `start_turn`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_arbiter_owns_no_channel_and_no_async_surface() {
         let _pure: fn(
@@ -644,6 +645,7 @@ mod tests {
     /// is only ever one candidate. The arbiter's own selection rule is pinned
     /// separately by
     /// `the_arbiter_selects_the_earliest_candidate_addressed_to_its_tip`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn only_the_head_of_this_sessions_root_is_offered_at_a_boundary() {
         let arbiter = arbiter();
@@ -672,6 +674,7 @@ mod tests {
     /// reduction, this gives two distinct roots the same delivery tip so two
     /// candidates genuinely reach the scan. The arbiter must take the *first*
     /// — taking the last would deliver newer mail ahead of older.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_arbiter_selects_the_earliest_candidate_addressed_to_its_tip() {
         let arbiter = arbiter();
@@ -705,6 +708,7 @@ mod tests {
     /// sequence is not atomic, though, so the reservation itself must also
     /// refuse — otherwise two monitors racing the same root could both believe
     /// they hold it. This exercises that refusal directly.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_registry_refuses_a_second_reservation_of_the_same_root() {
         let arbiter = arbiter();
@@ -734,6 +738,7 @@ mod tests {
 
     /// The dispatcher-level half: a duplicate or stale wake sees the root
     /// already granted and produces no second grant.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn one_outstanding_grant_blocks_every_other_grant_for_that_root() {
         let arbiter = arbiter();
@@ -764,6 +769,7 @@ mod tests {
         drop(held);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn releasing_a_grant_lets_the_next_boundary_take_the_root_again() {
         let arbiter = arbiter();
@@ -791,6 +797,7 @@ mod tests {
 
     /// A monitor that breaks out of its loop — or panics — must not wedge its
     /// logical root for the daemon's lifetime.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn dropping_a_grant_without_releasing_it_frees_the_root() {
         let arbiter = arbiter();
@@ -816,6 +823,7 @@ mod tests {
 
     /// A grant dropped after a newer grant legitimately re-took the same root
     /// must not evict the newer one.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn a_late_drop_does_not_evict_a_newer_grant_for_the_same_root() {
         let arbiter = arbiter();
@@ -851,6 +859,7 @@ mod tests {
         drop(newer);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn mail_addressed_to_another_session_never_grants_to_this_monitor() {
         let arbiter = arbiter();
@@ -873,6 +882,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn an_empty_queue_leaves_the_synthetic_continuation_path_untouched() {
         let arbiter = arbiter();
@@ -884,6 +894,7 @@ mod tests {
     /// The rotated case: the monitor knows its own tip and not its root, so
     /// held-back attribution must key on the tip. Keying on the root would
     /// mis-attribute every held-back row for any session that has rotated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn held_back_attribution_keys_on_the_delivery_tip_not_the_logical_root() {
         let arbiter = arbiter();
@@ -916,6 +927,7 @@ mod tests {
     /// The registry exists so the *dispatcher* can see outstanding grants:
     /// `plan_dispatch_tick`'s `roots_with_outstanding_grant` parameter has no
     /// correct argument unless this set is visible outside the holding monitor.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_registry_is_the_argument_the_dispatcher_tick_needs() {
         let arbiter = arbiter();
@@ -952,6 +964,7 @@ mod tests {
     /// C-P2-04 / the delivered-payload protection this arbiter is the first
     /// wired consumer of: the granted path cannot emit an unneutralised
     /// payload.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_wired_delivery_path_cannot_emit_an_unneutralised_payload() {
         let arbiter = arbiter();
@@ -1022,6 +1035,7 @@ mod tests {
     /// `RootHeldBackReason::TickGrantBudgetSpent` on every boundary forever.
     /// The budget assumes a *next tick* carries the remainder; a pull has none,
     /// and takes at most one grant anyway.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn a_boundary_pull_is_not_declined_by_the_dispatchers_tick_grant_budget() {
         let arbiter = arbiter();
@@ -1054,6 +1068,7 @@ mod tests {
     /// to the authority it was designed for. Without this, a later edit could
     /// "fix" R3-002 by removing the budget outright and both tests would still
     /// look green.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn the_tick_budget_still_binds_the_dispatchers_own_push_authority() {
         let my_tip = Uuid::new_v4();
@@ -1086,6 +1101,7 @@ mod tests {
     /// page 2 would look like a head, and the pull could grant a message that
     /// is not its root's head — delivering mail out of order behind an
     /// already-reduced head.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn paging_keeps_one_reduction_so_a_later_page_cannot_forge_a_new_root_head() {
         let root = Uuid::new_v4();
@@ -1133,6 +1149,7 @@ mod tests {
     /// two roots share a tip). If the pull broke on the first *hold* for its
     /// tip, a grantable head for that tip's other root — sitting later in the
     /// page — would be unreachable.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn a_held_back_head_for_this_tip_does_not_stop_the_scan() {
         let arbiter = arbiter();

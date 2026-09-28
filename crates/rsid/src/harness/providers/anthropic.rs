@@ -418,6 +418,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn current_models_use_adaptive_thinking_without_temperature_or_budget() {
         for model in [
@@ -437,6 +438,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn suffixed_current_models_use_adaptive_thinking() {
         let body = provider().build_request_body(&request("claude-opus-5-20260724", Some("max")));
@@ -446,6 +448,7 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn current_models_without_effort_omit_thinking_and_output_config() {
         let body = provider().build_request_body(&request("claude-opus-5", None));
@@ -455,6 +458,7 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn older_models_keep_legacy_thinking_request_shape() {
         let body = provider().build_request_body(&request("claude-opus-4-6", Some("high")));

@@ -108,11 +108,12 @@ operator must re-apply the saved Full preset to make live `SessionControl` use
 effective (2026-09-23 K1; `docs/harness-manager.md` policy history).
 
 For a new policy, Execute/Full start with four active sessions, eight created
-containers, 32 created sessions and three automatic recoveries. Empty launch
-restrictions cover any valid choice. Saved and manually edited limits always
-survive preset selection, including zero, provider ceilings, spend, pauses and
-model restrictions. A zero that disables a profile operation is shown explicitly;
-the policy remains valid Custom. **Use suggested allowances** changes only the
+containers, 32 created sessions and three automatic recoveries. An empty launch
+list allows valid explicit manager launches but holds automatic intent recovery
+until the operator selects permitted launch choices. Saved and manually edited
+limits always survive preset selection, including zero, provider ceilings,
+spend, pauses and model restrictions. A zero that disables a profile operation
+is shown explicitly; the policy remains valid Custom. **Use suggested allowances** changes only the
 listed conflicting zero fields in the draft. For example, a saved recovery limit
 of zero stays zero until explicitly edited; it does not prevent separately granted
 manual succession when its creation and runtime gates pass. Existing additional
@@ -134,12 +135,13 @@ Budgets section.
 | Grant SessionControl | Permits `AgentHalt`, `AgentContinueChild` and `AgentSendMessage` against Epic leads and their descendants inside the manager's live scope (Execute mode, not paused, no pending operator question, approval or pause on the target). Read-only `AgentGetStatus`/`AgentGetProgress`/terminal-watch reach over scoped sessions needs appointment scope only. Also permits the `archive_session`, `restore_session` and `update_session` housekeeping actions on one scoped leaf (see Scoped session housekeeping). Leads and workers never inherit it. |
 | Grant IssueCoordinate | Permit the current appointed manager to use the guarded Issue controls project-wide, alongside the current owning-Epic lead path: the reads (`AgentListIssues`, `AgentGetIssue`, `AgentListIssueEvents`) and the four CAS mutations (`AgentUpdateIssue`, `AgentUpdateIssueStatus`, `AgentArchiveIssue`, `AgentRestoreIssue`). Each manager mutation is audited in `issue_events` with actor `manager` (its own session ID and request key, no owning Epic); the grant and live scope are rechecked inside the mutation transaction. This does not expose operator-only generic Issue RPC or ProgramRun, and revocation takes effect within the next Issue transaction. |
 | Grant OperatorDelegation | Permit `AgentManagerControl` `operator_call` (Execute mode, not paused) to invoke one method from the closed, versioned `DELEGABLE_OPERATOR_METHODS` allowlist against a leaf in the manager's own project. See Operator delegation below. |
+| Grant Automation | Permit the current appointed manager to author, execute, interrupt and resolve deterministic topologies on in-scope Epics through the six `AgentTopology*` verbs (#633). Every session node's explicit provider/model/effort must equal an `allowed_launches` entry (empty fails closed); manager-requested node launches charge the created-session quota; effects need Execute mode and no pause. Distinct from `Topology` (containers). Discarding preserved work is manager-only and needs the exact preserved commit. |
 | Grant Group / Grant Group by ID | Select existing project Groups (at most 32). Enter an ID if it is not cached in the session list. |
 | Allow root Group creation | Separate root-creation opt-in; also requires Topology. |
 | Created container / session quota | Persistent creation ceilings: 0–64 containers and 0–1024 sessions. Defaults are zero. Policy edits do not reset scope usage. Manager workers, `retry_lead`, `replace_lead` and root successions consume the session quota. DB-native reviewer launches do not; they stay bounded by per-work review rounds and the active session limit. A blocked or revoked operation that never created its session is not charged (queued, running, failed and uncertain operations are). |
 | Active session limit | 1–100, default 4; applies alongside existing provider/Model Control admission. |
 | Provider active limits | Optional 1–64 ceiling per provider. Blank removes the override and uses the overall policy. |
-| Allowed launches | Empty means any provider/model/effort is permitted by this policy. Adding entries restricts launches to those exact choices (up to 32). Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. Default effort means no explicit effort; it is not an effort wildcard. Enter on Remove deletes that draft choice; removing the last entry restores unrestricted choice. Use currently configured valid model/effort values. |
+| Allowed launches | Empty permits any valid explicit manager launch but holds automatic intent recovery. Adding entries restricts launches to those exact choices (up to 32) and enables intent recovery to choose among them, subject to its other gates. Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. Default effort means no explicit effort; it is not an effort wildcard. Enter on Remove deletes that draft choice; removing the last entry restores unrestricted explicit choices and holds intent recovery. Use currently configured valid model/effort values. |
 | Recovery attempt limit | 0–32 persisted attempts; default zero disables automatic recovery allowance. Existing retry owners and kill-switches still apply. |
 | Retry delay | 1–86400 seconds, default 60. Waiting for a due time remains an outstanding obligation. |
 | Request timeout | 30–604800 seconds, default 900. Expiration records a blocker/recovery obligation, never invented completion. |
@@ -160,11 +162,13 @@ attempt only after proving its process cohort gone; it does not infer permission
 to reuse a worktree from its pathname. The receipt identifies the retained
 allocation for the established custody-recovery workflow.
 
-With an empty allowed-launch list, automatic recovery retains the current lead's
-provider/model/effort. The manager can explicitly select another valid launch
-choice. If the current lead has no known model, automatic recovery reports that
-no choice is available rather than guessing one. Execute mode, capability grants,
-creation/recovery limits and operator pauses apply independently of this list.
+With an empty allowed-launch list, automatic intent recovery records a
+`manager_v2_intent_launch_allowlist_required` hold. Explicit manager actions can
+still select any valid launch choice through their own admission path. With a
+nonempty list, intent recovery prefers the current lead's exact
+provider/model/effort when permitted, then tries the other listed choices under
+resource gates. Execute mode, capability grants, creation/recovery limits and
+operator pauses also apply.
 
 An action receipt may be queued, running, succeeded, failed, blocked, uncertain or
 revoked. Inspect it before making another action; uncertain publication is not a

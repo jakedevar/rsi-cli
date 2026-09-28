@@ -112,6 +112,7 @@ fn true_live(f: &Fixture, config: &HarnessManagerConfigV1, kinds: &str) -> i64 {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn live_counts_sweep_and_kind_reads_use_the_live_scope_indexes() {
     let f = fixture();
@@ -133,6 +134,7 @@ fn live_counts_sweep_and_kind_reads_use_the_live_scope_indexes() {
     assert!(detail.contains(COORDINATION_INDEX), "{detail}");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn archived_history_leaves_live_counts_and_scan_work_unchanged() {
     let f = fixture();
@@ -228,6 +230,7 @@ fn archived_history_leaves_live_counts_and_scan_work_unchanged() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn displayed_bookkeeping_limit_is_the_enforced_limit() {
     for (class, kind, code) in [
@@ -269,6 +272,7 @@ fn displayed_bookkeeping_limit_is_the_enforced_limit() {
 /// standing request), settle and unsettle (one row per request id) classes
 /// are unmetered, so the Inspector displays `limit: null` and a new record
 /// still lands past `BOOKKEEPING_LIMIT` live rows.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn per_request_marker_classes_are_unmetered_and_displayed_as_such() {
     for kind in ["request_rollover", "request_settle", "request_unsettled"] {
@@ -290,6 +294,7 @@ fn per_request_marker_classes_are_unmetered_and_displayed_as_such() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn previous_schema_upgrades_to_the_live_bookkeeping_indexes() {
     // V124 is the index migration under test; later migrations sit above it,

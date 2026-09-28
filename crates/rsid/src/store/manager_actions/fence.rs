@@ -213,6 +213,15 @@ impl Store {
         if claimed != 1 {
             return Err(refused(CONTINUATION_TIP_CHANGED));
         }
+        if let ContinuationAuthorityV1::AgentChild { caller } = fence.authority {
+            if let Some(scope) =
+                self.manager_session_control_scope_with_soft_restart(caller, fence.tip, true, true)?
+            {
+                if self.clear_soft_operator_pause(fence.tip, caller, "AgentContinueChild")? {
+                    self.manager_v2_event(&scope.config, Some(caller), "operator_pause_cleared", &fence.tip.to_string(), 1, &serde_json::json!({"action":"AgentContinueChild","session_id":fence.tip,"level":"soft"}))?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -248,6 +257,16 @@ impl Store {
     /// hold: `caller` is the tip's direct parent, the lead of its parent, or
     /// the appointed manager with a live `SessionControl` grant over it.
     fn agent_continue_actor_authorized(&self, caller: Uuid, tip: Uuid) -> Result<bool> {
+        let pause = self.get_operator_pause(tip)?;
+        if pause == super::OperatorPause::Hard {
+            return Ok(false);
+        }
+        if pause == super::OperatorPause::Soft {
+            return Ok(matches!(
+                self.manager_session_control_scope_with_soft_restart(caller, tip, true, true),
+                Ok(Some(_))
+            ));
+        }
         let direct_parent: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND parent_id=?2)",
             [tip.to_string(), caller.to_string()],
@@ -257,7 +276,7 @@ impl Store {
             return Ok(true);
         }
         Ok(matches!(
-            self.manager_session_control_scope(caller, tip, true),
+            self.manager_session_control_scope_with_soft_restart(caller, tip, true, true),
             Ok(Some(_))
         ))
     }

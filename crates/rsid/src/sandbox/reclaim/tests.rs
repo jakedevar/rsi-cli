@@ -136,6 +136,7 @@ fn item_effect(f: &Fixture, run_id: Uuid) -> (u64, String, i64, String) {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn absent_live_terminal_owner_is_adopted_and_linked_session_is_purged() {
     let mut f = fixture();
@@ -177,6 +178,7 @@ fn absent_live_terminal_owner_is_adopted_and_linked_session_is_purged() {
     assert_eq!(item.2, expected_branch_oid);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn absent_quarantined_root_missing_is_adopted() {
     let mut f = fixture();
@@ -212,6 +214,7 @@ fn absent_quarantined_root_missing_is_adopted() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn retry_eligible_owner_is_retained_with_gate_code() {
     let mut f = fixture();
@@ -237,6 +240,7 @@ fn retry_eligible_owner_is_retained_with_gate_code() {
     assert_eq!(item, ("retained".into(), "retry_eligible".into()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn live_lead_owner_is_retained_with_gate_code() {
     let mut f = fixture();
@@ -267,6 +271,7 @@ fn live_lead_owner_is_retained_with_gate_code() {
     assert_eq!(reason, "live_lead");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn dry_run_journals_without_custody_change() {
     let mut f = fixture();
@@ -287,6 +292,7 @@ fn dry_run_journals_without_custody_change() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn present_directory_is_retained() {
     let mut f = fixture();
@@ -304,6 +310,7 @@ fn present_directory_is_retained() {
     assert_eq!(reason, "directory_present");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn retained_directory_is_adopted_at_same_generation_after_external_removal() {
     let mut f = fixture();
@@ -334,6 +341,7 @@ fn retained_directory_is_adopted_at_same_generation_after_external_removal() {
     assert_eq!(item_effect(&f, retained_run).2, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn retry_eligible_retention_can_be_adopted_at_same_generation_after_gate_clears() {
     let mut f = fixture();
@@ -368,6 +376,7 @@ fn retry_eligible_retention_can_be_adopted_at_same_generation_after_gate_clears(
     assert_eq!(item_effect(&f, retained_run).2, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn dry_run_then_real_run_adopts_at_same_generation() {
     let mut f = fixture();

@@ -15,6 +15,10 @@ name = "rsi-rolling-land"
 path = "src/bin/rsi-rolling-land.rs"
 
 [[bin]]
+name = "rsi-build-rustc"
+path = "src/bin/rsi-build-rustc.rs"
+
+[[bin]]
 name = "rsi-recursive-dag-smoke-fixture"
 path = "src/bin/rsi-recursive-dag-smoke-fixture.rs"
 required-features = ["dev-fixtures"]
@@ -44,10 +48,11 @@ anyhow = "1"
 async-trait = "0.1"
 regex = { workspace = true }
 reqwest = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 futures = { workspace = true }
 tiktoken-rs = { workspace = true }
 sha2 = "0.10"
+zeroize = "1"
 hex = "0.4"
 walkdir = "2"
 notify = "7"
@@ -86,6 +91,25 @@ criterion = { workspace = true }
 default = []
 test-ollama = []
 dev-fixtures = ["rusqlite/backup"]
+# Unit-test shards keep direct `cargo test -p rsid --lib` complete. Selecting
+# exactly one shard feature enables mode and compiles only that shard's tests.
+test-shard-mode = []
+test-shard-store-01 = ["test-shard-mode"]
+test-shard-store-02 = ["test-shard-mode"]
+test-shard-store-03 = ["test-shard-mode"]
+test-shard-store-04 = ["test-shard-mode"]
+test-shard-session-01 = ["test-shard-mode"]
+test-shard-session-02 = ["test-shard-mode"]
+test-shard-session-03 = ["test-shard-mode"]
+test-shard-session-04 = ["test-shard-mode"]
+test-shard-session-05 = ["test-shard-mode"]
+test-shard-memory-01 = ["test-shard-mode"]
+test-shard-memory-02 = ["test-shard-mode"]
+test-shard-other-01 = ["test-shard-mode"]
+test-shard-other-02 = ["test-shard-mode"]
+test-shard-other-03 = ["test-shard-mode"]
+test-shard-other-04 = ["test-shard-mode"]
+test-shard-other-05 = ["test-shard-mode"]
 # Heap profiling — gates `tests/dhat_baseline.rs` + `#[global_allocator]` setup.
 dhat-heap = ["dep:dhat"]
 # tokio-console subscriber — gates conditional init in main.rs (RSI_TOKIO_CONSOLE=1).

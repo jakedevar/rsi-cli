@@ -86,6 +86,7 @@ async fn release(p: &Pilot) {
     launch::drop_controller_candidate_test_stream(p.owner);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_failed_tip_resumes_once_in_place() {
     let p = pilot().await;
@@ -152,6 +153,7 @@ async fn seat_failed_tip_resumes_once_in_place() {
     release(&p).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_recovery_single_flight_under_concurrent_passes() {
     let p = pilot().await;
@@ -173,7 +175,18 @@ async fn seat_recovery_single_flight_under_concurrent_passes() {
     )
     .await
     .unwrap_err();
-    assert!(wake.to_string().contains("is still active"), "{wake}");
+    assert!(
+        matches!(
+            wake,
+            crate::error::DaemonError::InvalidParam(ref message)
+                if message == &format!(
+                    "{}:{}",
+                    crate::store::manager_actions::fence::CONTINUATION_TARGET_BUSY,
+                    p.owner
+                )
+        ),
+        "{wake}"
+    );
     for _ in 0..3 {
         p.manager.reconcile_harness_managers_once().await.unwrap();
     }
@@ -232,6 +245,7 @@ async fn claim_only(p: &Pilot) -> crate::store::manager_intent::manager_seat::Ma
 
 /// Round 2 (appserver_new_row): the coordinator never claims a Failed
 /// `CodexAppServer` seat, whose continuation would allocate a new row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_codex_appserver_tip_is_never_resumed_in_place() {
     let p = pilot().await;
@@ -274,6 +288,7 @@ async fn seat_codex_appserver_tip_is_never_resumed_in_place() {
 
 /// Round 2 (stale_claim_effect): an operator pause between claim and effect
 /// is honoured at the continuation boundary; no provider launches.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_pause_after_claim_is_refused_at_continuation_boundary() {
     let p = pilot().await;
@@ -326,6 +341,7 @@ async fn seat_pause_after_claim_is_refused_at_continuation_boundary() {
 /// Round 2 (stale_claim_effect): a rotation between claim and effect is a
 /// typed refusal; the claimed tip is not resumed and the successor is never
 /// launched by seat recovery.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_rotation_after_claim_never_launches_successor() {
     let p = pilot().await;
@@ -512,17 +528,20 @@ async fn late_mutation_is_refused_before_launch(kind: LateMutation, code: &str) 
     launch::take_controller_candidate_test_process(successor);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_pause_after_early_gate_is_refused_before_launch() {
     late_mutation_is_refused_before_launch(LateMutation::Pause, "manager_v2_policy_paused").await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_revocation_after_early_gate_is_refused_before_launch() {
     late_mutation_is_refused_before_launch(LateMutation::Revoke, "manager_seat_scope_changed")
         .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_question_after_early_gate_is_refused_before_launch() {
     late_mutation_is_refused_before_launch(
@@ -532,6 +551,7 @@ async fn seat_question_after_early_gate_is_refused_before_launch() {
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seat_rotation_after_early_gate_is_refused_before_launch() {
     late_mutation_is_refused_before_launch(LateMutation::Rotate, "manager_seat_tip_changed").await;

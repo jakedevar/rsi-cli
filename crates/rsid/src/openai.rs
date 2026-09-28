@@ -373,6 +373,58 @@ fn bash_timeout_ms(args: &Value) -> u64 {
         .clamp(1, MAX_BASH_TIMEOUT_MS)
 }
 
+/// The Local provider's agent-callable bash child (#694 K1).
+///
+/// Like the Harness shell tool, it starts from an empty environment plus
+/// the `SAFE_ENV_VARS` allowlist and the rsi identity stamps, so no daemon
+/// API key (vault slot, generic fallback or daemon service key) can reach an
+/// agent tool shell.
+fn bash_tool_command(
+    working_dir: &Path,
+    rsi_session_id: Option<uuid::Uuid>,
+    launch_invocation_id: uuid::Uuid,
+    command: &str,
+) -> tokio::process::Command {
+    bash_tool_command_with_env(
+        working_dir,
+        rsi_session_id,
+        launch_invocation_id,
+        command,
+        |name| std::env::var(name).ok(),
+    )
+}
+
+fn bash_tool_command_with_env(
+    working_dir: &Path,
+    rsi_session_id: Option<uuid::Uuid>,
+    launch_invocation_id: uuid::Uuid,
+    command: &str,
+    read_parent_env: impl Fn(&str) -> Option<String>,
+) -> tokio::process::Command {
+    let mut command_process = tokio::process::Command::new("bash");
+    command_process
+        .args(["-c", command])
+        .current_dir(working_dir)
+        .env_clear();
+    for var in crate::session::harness::tools::shell::SAFE_ENV_VARS {
+        if let Some(value) = read_parent_env(var) {
+            command_process.env(var, value);
+        }
+    }
+    command_process.env(
+        rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
+        rsi_common::identity::process_ownership_namespace(),
+    );
+    if let Some(session_id) = rsi_session_id {
+        command_process.env(rsi_common::identity::ENV_SESSION_ID, session_id.to_string());
+    }
+    command_process.env(
+        rsi_common::identity::ENV_MODEL_INVOCATION_ID,
+        launch_invocation_id.to_string(),
+    );
+    command_process
+}
+
 async fn exec_bash(
     working_dir: &Path,
     rsi_session_id: Option<uuid::Uuid>,
@@ -386,21 +438,8 @@ async fn exec_bash(
         .unwrap_or_default();
     let timeout_ms = bash_timeout_ms(args);
 
-    let mut command_process = tokio::process::Command::new("bash");
-    command_process
-        .args(["-c", command])
-        .current_dir(working_dir);
-    command_process.env(
-        rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
-        rsi_common::identity::process_ownership_namespace(),
-    );
-    if let Some(session_id) = rsi_session_id {
-        command_process.env(rsi_common::identity::ENV_SESSION_ID, session_id.to_string());
-    }
-    command_process.env(
-        rsi_common::identity::ENV_MODEL_INVOCATION_ID,
-        launch_invocation_id.to_string(),
-    );
+    let command_process =
+        bash_tool_command(working_dir, rsi_session_id, launch_invocation_id, command);
 
     let mut limits = CaptureLimits::local_tool();
     limits.execution_timeout = std::time::Duration::from_millis(timeout_ms);
@@ -958,6 +997,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, oneshot};
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bash_timeout_is_nonzero_and_bounded() {
         assert_eq!(bash_timeout_ms(&serde_json::json!({})), 120_000);
@@ -968,6 +1008,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bash_tool_uses_bound_rsi_ownership_ids() {
         let session_id = uuid::Uuid::new_v4();
@@ -989,6 +1030,85 @@ mod tests {
         .await;
 
         assert_eq!(output, format!("{session_id}\n{invocation_id}"));
+    }
+
+    /// #694 K1: the agent-callable bash child is built from an empty env
+    /// plus the allowlist. With every scrubbed key name (and harmless vars)
+    /// in a controlled parent env, the child carries exactly the allowlisted
+    /// harmless vars and the rsi stamps.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn bash_tool_child_env_is_allowlist_only() {
+        let invocation_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let parent = crate::vault::env_scrub::tests::controlled_parent_env();
+        let command = bash_tool_command_with_env(
+            &std::env::temp_dir(),
+            Some(session_id),
+            invocation_id,
+            "true",
+            |name| parent.get(name).cloned(),
+        );
+        let child = crate::vault::env_scrub::tests::env_view(&command);
+        let mut expected: std::collections::BTreeMap<String, Option<String>> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/rsi-test"),
+            ("LANG", "C.UTF-8"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), Some(value.to_string())))
+        .collect();
+        expected.insert(
+            rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE.to_string(),
+            Some(rsi_common::identity::process_ownership_namespace()),
+        );
+        expected.insert(
+            rsi_common::identity::ENV_SESSION_ID.to_string(),
+            Some(session_id.to_string()),
+        );
+        expected.insert(
+            rsi_common::identity::ENV_MODEL_INVOCATION_ID.to_string(),
+            Some(invocation_id.to_string()),
+        );
+        assert_eq!(child, expected);
+    }
+
+    /// The real child runs and sees an allowlisted harmless var while a
+    /// provider key exported by the daemon is absent (fake `sk-test` value).
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn bash_tool_runs_with_credentials_absent_from_child_env() {
+        let invocation_id = uuid::Uuid::new_v4();
+        temp_env::async_with_vars(
+            [
+                ("OPEN_ROUTER", Some("sk-test-local-bash-openrouter")),
+                ("LOCAL_LLM_API_KEY", Some("sk-test-local-bash-local")),
+                ("EDITOR", Some("rsi-k1-editor")),
+            ],
+            async {
+                let cancel = CancellationToken::new();
+                let output = exec_bash(
+                    &std::env::temp_dir(),
+                    None,
+                    invocation_id,
+                    &cancel,
+                    &serde_json::json!({
+                        "command": format!(
+                            "printf '%s|%s|%s|%s' \"$EDITOR\" \"${{{}:-MISSING}}\" \"${{OPEN_ROUTER-absent}}\" \"${{LOCAL_LLM_API_KEY-absent}}\"",
+                            rsi_common::identity::ENV_MODEL_INVOCATION_ID,
+                        ),
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    output,
+                    format!("rsi-k1-editor|{invocation_id}|absent|absent")
+                );
+            },
+        )
+        .await;
     }
 
     #[cfg(target_os = "linux")]
@@ -1017,6 +1137,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bash_timeout_kills_and_reaps_direct_child() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1043,6 +1164,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bash_cancellation_kills_and_reaps_direct_child() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1259,6 +1381,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_tool_schemas_valid_json() {
         let schemas = tool_schemas();
@@ -1269,6 +1392,7 @@ mod tests {
         assert_eq!(tools[2]["function"]["name"].as_str().unwrap(), "bash");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_normal() {
         let wd = std::env::temp_dir();
@@ -1277,6 +1401,7 @@ mod tests {
         assert!(result.unwrap().starts_with(wd.canonicalize().unwrap()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_traversal_rejected() {
         let wd = std::env::temp_dir().join("test_sandbox");
@@ -1285,6 +1410,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_absolute_rejected() {
         let wd = std::env::temp_dir();
@@ -1295,6 +1421,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn denied_openai_compatible_turn_sends_no_request() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1316,6 +1443,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn one_openai_compatible_iteration_has_one_request_and_terminal_row() {
         let (base_url, requests, server) = loopback_server(vec![final_sse("done", 3, 2)]).await;
@@ -1339,6 +1467,7 @@ mod tests {
         test.worker.shutdown().await.expect("settlement shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn tool_loop_iterations_are_independently_admitted_and_settled() {
         let (base_url, requests, server) =
@@ -1366,6 +1495,7 @@ mod tests {
         test.worker.shutdown().await.expect("settlement shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn cancellation_after_admission_settles_once() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1402,6 +1532,7 @@ mod tests {
         test.worker.shutdown().await.expect("settlement shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn compatible_provider_label_follows_resolved_transport() {
         let loopback = OpenAiClient::with_config("http://127.0.0.1:11434/v1".to_string(), None)

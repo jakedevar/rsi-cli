@@ -122,6 +122,13 @@ impl SessionManager {
         &self,
         topology: &Topology,
     ) -> Result<WorkflowDefinition, BridgeError> {
+        Self::bridge_topology(topology)
+    }
+
+    /// The pure translation behind [`Self::bridge_topology_to_workflow`],
+    /// callable without a manager (agent topology verbs, #633).
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn bridge_topology(topology: &Topology) -> Result<WorkflowDefinition, BridgeError> {
         let def = &topology.definition;
         // #635: typed steps are re-validated on every bridge (upsert and
         // execute) and travel in metadata, never as tags.
@@ -606,6 +613,7 @@ mod tests {
 
     // ── Unit tests — need tokio because SessionManager::new spawns background tasks ──
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn t1_a3_sandbox_false_is_invalid_before_launch() {
         let repo = TempDir::new().unwrap();
@@ -630,6 +638,7 @@ mod tests {
         assert!(matches!(error, DaemonError::InvalidParam(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_acyclic_succeeds() {
         let (mgr, _dir) = manager();
@@ -650,6 +659,7 @@ mod tests {
 
     /// P1.11: inverted from P1.10 "loop edge must fail" — now loop edges produce
     /// metadata-stamped Ok(workflow) instead of Err(LoopEdgeUnsupported).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_loop_edge_rejected() {
         let (mgr, _dir) = manager();
@@ -672,6 +682,7 @@ mod tests {
         assert_eq!(wf.edges.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_until_predicate_warns_not_errors() {
         let (mgr, _dir) = manager();
@@ -693,6 +704,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_prereqs_without_edges_errors() {
         let (mgr, _dir) = manager();
@@ -718,6 +730,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_params_provider_to_node_def() {
         let (mgr, _dir) = manager();
@@ -734,6 +747,7 @@ mod tests {
         assert_eq!(wf.nodes[0].provider, Some("codex".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_params_unknown_keys_to_tags() {
         let (mgr, _dir) = manager();
@@ -754,6 +768,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_kind_encoded_as_tag() {
         let (mgr, _dir) = manager();
@@ -766,6 +781,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_max_iterations_to_repeat_policy() {
         let (mgr, _dir) = manager();
@@ -780,6 +796,7 @@ mod tests {
         assert_eq!(policy.max_iterations, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_metadata_provenance_stamped() {
         let (mgr, _dir) = manager();
@@ -790,6 +807,7 @@ mod tests {
         assert!(wf.metadata.contains_key("bridged_at"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_failure_policy_in_metadata() {
         let (mgr, _dir) = manager();
@@ -810,6 +828,7 @@ mod tests {
 
     // ── Integration tests (async, use manager()) ──────────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_execute_topology_round_trip() {
         let (mgr, _dir) = manager();
@@ -864,6 +883,7 @@ mod tests {
     /// P1.11: inverted from P1.10 "loop edge RPC returns InvalidParam" — now the
     /// bridge succeeds with metadata stamps, so the RPC path returns Ok with
     /// loop_edges and scc_regions populated in the workflow metadata.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_bridge_loop_edge_rpc_returns_invalid_param() {
         let (mgr, _dir) = manager();
@@ -905,6 +925,7 @@ mod tests {
     /// `upsert_bridged_workflow` creates a workflow row on first call against
     /// a fresh topology. Row id is `derive_workflow_id(topology.id)` so the
     /// upsert is idempotent (verified separately in the next test).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_execute_topology_upserts_workflow_row() {
         let (mgr, _dir) = manager();
@@ -932,6 +953,7 @@ mod tests {
     /// Calling `upsert_bridged_workflow` twice against the same topology
     /// results in exactly one row in the `workflows` table — confirms the
     /// `ON CONFLICT(id) DO UPDATE` upsert path.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_execute_topology_upsert_is_idempotent() {
         let (mgr, _dir) = manager();
@@ -953,6 +975,7 @@ mod tests {
     /// title when the topology is renamed. We simulate the handler by calling
     /// `upsert_bridged_workflow` again with a renamed topology that shares
     /// the same id.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_update_topology_cascades_to_workflow_row() {
         let (mgr, _dir) = manager();
@@ -978,6 +1001,7 @@ mod tests {
     /// Re-bridging a topology without an explicit project_id must preserve an
     /// already-bound project scope so the picker stays visible under a project
     /// filter after rename/update flows.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_upsert_bridged_workflow_preserves_existing_project_id() {
         let (mgr, _dir) = manager();
@@ -1021,6 +1045,7 @@ mod tests {
 
     /// Startup reconciliation backfills a missing workflow row for a stored
     /// topology so legacy/restored topologies appear in the gv picker.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_reconcile_topology_workflows_backfills_legacy_topology_rows() {
         let (mgr, _dir) = manager();
@@ -1059,6 +1084,7 @@ mod tests {
 
     /// `delete_workflow_by_source_topology` cascades a delete: after the call,
     /// no rows remain mirrored from that topology id.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_delete_topology_removes_workflow_row() {
         let (mgr, _dir) = manager();
@@ -1080,6 +1106,7 @@ mod tests {
 
     /// `delete_workflow_by_source_topology` is idempotent: deleting a topology
     /// that has no mirrored row succeeds without error.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_delete_workflow_by_source_topology_is_idempotent() {
         let (mgr, _dir) = manager();
@@ -1099,6 +1126,7 @@ mod tests {
     /// at upsert (`create_topology`), when a stored topology is bridged for
     /// `ExecuteTopology`, and when a snapshot reaches `execute_workflow_live`
     /// — each before any execution row exists.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn t3a_a3_author_command_input_rejected() {
@@ -1243,6 +1271,7 @@ mod tests {
             .expect("typed catalog op is accepted");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn derive_workflow_id_is_deterministic_and_distinct() {
         let topo1 = Uuid::new_v4();

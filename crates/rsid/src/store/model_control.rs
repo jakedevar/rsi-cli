@@ -4844,6 +4844,7 @@ mod tests {
     use rsi_common::types::{SessionProvider, SessionStatus};
     use tempfile::TempDir;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn effort_rank_orders_current_codex_efforts() {
         assert_eq!(effort_rank(None), 0);
@@ -5016,6 +5017,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_generic_channel_rejects_capacity_shape_without_mutation() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5035,6 +5037,7 @@ mod tests {
         assert_eq!(capacity_admission_mutation_snapshot(&store), before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_typed_channel_rejects_inexact_envelopes_without_mutation() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5092,6 +5095,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_duplicate_without_receipt_is_closed_integrity_error() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5137,6 +5141,7 @@ mod tests {
         assert_eq!(capacity_admission_mutation_snapshot(&store), before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[tokio::test]
     async fn capacity_resume_policy_denial_is_persisted_and_emitted_exactly_once() {
         let (store, controller, wake, due) = capacity_resume_fixture();
@@ -5193,6 +5198,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_admission_receipt_is_atomic_and_failed_replay_is_duplicate() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5298,6 +5304,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn restart_reconcile_preserves_only_dispatchable_capacity_admission_receipts() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5526,6 +5533,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn restart_reconcile_invalid_capacity_admission_is_atomic_with_wake_disable() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5617,6 +5625,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_reopen_replays_one_receipt_and_disables_only_persisted_due_slot() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5750,6 +5759,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn capacity_resume_rotation_lineage_corruption_and_conflicts_fail_closed() {
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
@@ -5874,6 +5884,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn normal_admits_only_default_enabled_paid_background_purpose() {
         let store = Store::open_in_memory().expect("store");
@@ -5942,6 +5953,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn agent_schedule_wake_fresh_is_denied_by_stronger_modes() {
         let registry = registry::lookup(ModelInvocationPurpose::AgentScheduleWakeFresh)
@@ -5974,6 +5986,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn duplicate_admission_reuses_existing_row_without_double_reserving_counters() {
         let store = Store::open_in_memory().expect("store");
@@ -6037,6 +6050,7 @@ mod tests {
         assert_eq!(active_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn completion_is_idempotent_and_uses_baseline_deltas() {
         let store = Store::open_in_memory().expect("store");
@@ -6128,6 +6142,7 @@ mod tests {
         assert_eq!(counters.3, 75);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn retry_and_child_invocations_share_tree_scope_root() {
         let store = Store::open_in_memory().expect("store");
@@ -6267,6 +6282,7 @@ mod tests {
         assert_eq!(retry_budget, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn long_tree_and_retry_lineages_have_no_lifetime_cap() {
         const LINK_COUNT: usize = 96;
@@ -6353,6 +6369,7 @@ mod tests {
         assert_eq!(retry_root, root_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn preview_orchestration_escalation_matches_admit_model_invocation() {
         let store = Store::open_in_memory().expect("store");
@@ -6469,6 +6486,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn durable_denied_and_corrupt_rows_load_visibly() {
         let store = Store::open_in_memory().expect("store");
@@ -6504,6 +6522,7 @@ mod tests {
         assert!(record.policy_snapshot_error.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn cancel_terminal_invocation_is_explicit_no_op() {
         let store = Store::open_in_memory().expect("store");
@@ -6543,6 +6562,7 @@ mod tests {
         assert_eq!(record.status, ModelInvocationStatus::Completed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn provider_circuit_denies_new_admissions() {
         let store = Store::open_in_memory().expect("store");
@@ -6585,6 +6605,7 @@ mod tests {
         assert!(matches!(outcome, StoreAdmissionOutcome::Denied { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn cancellation_request_keeps_counters_reserved_until_terminal_winner_releases_once() {
         let store = Store::open_in_memory().expect("store");
@@ -6726,6 +6747,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn provider_terminal_failures_open_circuit_and_block_followup_admissions() {
         for error_class in ["auth", "authorization", "quota", "invalid_provider_config"] {
@@ -6786,6 +6808,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn half_open_probe_lease_persists_across_restart_and_success_closes_circuit() {
         let dir = TempDir::new().expect("tempdir");
@@ -6896,6 +6919,7 @@ mod tests {
         assert!(matches!(admitted, StoreAdmissionOutcome::Admitted(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn repeated_budget_alert_crossings_are_deduplicated() {
         let store = Store::open_in_memory().expect("store");
@@ -6953,6 +6977,7 @@ mod tests {
         assert_eq!(persisted[0].metric, "calls");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn over_budget_actual_sets_breaker_and_blocks_next_paid_call() {
         let store = Store::open_in_memory().expect("store");
@@ -7047,6 +7072,7 @@ mod tests {
         assert!(matches!(denied, StoreAdmissionOutcome::Denied { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn over_reservation_without_explicit_usage_budget_stays_completed_and_admits_follow_up() {
         let store = Store::open_in_memory().expect("store");
@@ -7110,6 +7136,7 @@ mod tests {
         assert!(matches!(follow_up, StoreAdmissionOutcome::Admitted(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn legacy_invocation_without_usage_budget_snapshot_keeps_fail_closed_settlement() {
         let store = Store::open_in_memory().expect("store");
@@ -7166,6 +7193,7 @@ mod tests {
         assert_eq!(settled.1.as_deref(), Some("over_budget_actual_exceeded"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn cache_read_overrun_alone_does_not_trip_breaker() {
         let store = Store::open_in_memory().expect("store");
@@ -7289,6 +7317,7 @@ mod tests {
     /// identical content. This is the deadlock that stalled memory-transcript
     /// sync: the failed row's content-derived dedup key matched every retry, so
     /// the batch was rejected forever and no transcript was ever indexed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn failed_invocation_does_not_block_retry_of_identical_request() {
         let store = Store::open_in_memory().expect("store");
@@ -7341,6 +7370,7 @@ mod tests {
     /// The retry itself claims the key, so a *second* concurrent attempt while
     /// the retry is still running is suppressed as before. Releasing dead keys
     /// must not degrade in-flight double-spend protection.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn running_invocation_still_suppresses_duplicate_after_failed_predecessor() {
         let store = Store::open_in_memory().expect("store");
@@ -7375,6 +7405,7 @@ mod tests {
     }
 
     /// A completed attempt is real work with a real result; its key stays held.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn completed_invocation_still_suppresses_duplicate() {
         let store = Store::open_in_memory().expect("store");
@@ -7458,6 +7489,7 @@ mod tests {
             .expect("completion");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn explicit_policies_displace_default_caps() {
         let store = Store::open_in_memory().expect("store");
@@ -7519,6 +7551,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn default_caps_do_not_apply_without_explicit_policies() {
         let store = Store::open_in_memory().expect("store");
@@ -7546,6 +7579,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn explicit_tree_premium_cap_denies_fifth_call() {
         let store = Store::open_in_memory().expect("store");
@@ -7730,6 +7764,7 @@ mod tests {
     /// `premium` tier on both sides, denied purely because the child asked for
     /// `xhigh` under a `high` orchestrator. With the operator ceiling declared
     /// once for the campaign, the same spawn is admitted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn operator_effort_ceiling_admits_child_above_tree_root_effort() {
         let store = Store::open_in_memory().expect("store");
@@ -7754,6 +7789,7 @@ mod tests {
 
     /// The surviving guardrail, effort half: raising the ceiling to `xhigh`
     /// must NOT uncap effort — `max` is still above the declared limit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn operator_effort_ceiling_still_denies_above_the_declared_limit() {
         let store = Store::open_in_memory().expect("store");
@@ -7775,6 +7811,7 @@ mod tests {
     /// The surviving guardrail, tier half: the effort ceiling must not open a
     /// hole in the cost-dominant tier check. Even with effort uncapped to the
     /// top rank, a `premium` child under a `standard` root stays denied.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn operator_effort_ceiling_does_not_relax_the_model_tier_guardrail() {
         let store = Store::open_in_memory().expect("store");
@@ -7809,6 +7846,7 @@ mod tests {
 
     /// Default (key unset) is bit-for-bit the pre-#34 rule, and the denial now
     /// names the knob instead of only stating the limit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn unset_operator_ceiling_preserves_tree_root_effort_limit_and_names_the_knob() {
         let store = Store::open_in_memory().expect("store");
@@ -7834,6 +7872,7 @@ mod tests {
 
     /// The ceiling REPLACES the root's effort, so it can tighten as well as
     /// raise: a `high` child under a `high` root is denied at a `low` ceiling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn operator_effort_ceiling_can_tighten_below_the_tree_root() {
         let store = Store::open_in_memory().expect("store");
@@ -7862,6 +7901,7 @@ mod tests {
     /// orchestration spawn — including children at or below the tree root's
     /// own effort, which no ceiling should ever refuse. It must now degrade to
     /// unset and fall back to the tree root.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn non_text_operator_ceiling_degrades_to_unset_instead_of_denying_every_spawn() {
         let store = Store::open_in_memory().expect("store");
@@ -7919,6 +7959,7 @@ mod tests {
     /// Issue #35. The explicit "unset" sentinel the operator surface writes
     /// must read back as absence — the pre-#34 tree-root rule — and must not
     /// be reported as an unrecognized typo.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn explicit_unset_sentinel_reads_as_absent_ceiling() {
         let store = Store::open_in_memory().expect("store");
@@ -7959,6 +8000,7 @@ mod tests {
     /// function must not drift apart: every non-sentinel choice the operator
     /// can pick has to be a rank `effort_rank` actually recognizes, or picking
     /// it would silently install a deny-everything ceiling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn orchestration_max_child_effort_choices_match_effort_rank() {
         use rsi_common::model_control::{
@@ -7997,6 +8039,7 @@ mod tests {
     /// write-through, exactly what `UpdateDaemonConfig` does) must actually
     /// change admission. Before this, #34's mechanism was live but inert —
     /// reachable only by hand-writing SQL.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn ceiling_set_through_the_operator_write_path_changes_admission() {
         let store = Store::open_in_memory().expect("store");
@@ -8066,6 +8109,7 @@ mod tests {
     /// Issue #35. The persisted field name must equal the key the admission
     /// read path looks up, or the operator surface would write to a row nothing
     /// reads.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn orchestration_max_child_effort_field_name_matches_store_key() {
         assert!(
@@ -8078,6 +8122,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn unrecognized_operator_ceiling_falls_back_to_tree_root_instead_of_denying_everything() {
         let store = Store::open_in_memory().expect("store");
@@ -8130,6 +8175,7 @@ mod tests {
     /// The ordinary paths stay untouched: a child BELOW the root is admitted,
     /// and a non-`Orchestration` purpose is not subject to the guardrail at all
     /// even when it exceeds a deliberately tight ceiling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn child_below_root_and_non_orchestration_purpose_are_unaffected() {
         let store = Store::open_in_memory().expect("store");
@@ -8177,6 +8223,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn low_tier_root_denies_premium_effort_escalation() {
         let store = Store::open_in_memory().expect("store");
@@ -8220,6 +8267,7 @@ mod tests {
         assert!(matches!(denied, StoreAdmissionOutcome::Denied { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn dedup_conflict_is_denied_when_fingerprint_changes() {
         let store = Store::open_in_memory().expect("store");
@@ -8249,6 +8297,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn scheduled_replay_dedup_requires_exact_stable_owner_identity() {
         let ordinary_store = Store::open_in_memory().expect("ordinary store");
@@ -8416,6 +8465,7 @@ mod tests {
         assert!(matches!(same_session_error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn missing_lineage_ancestor_is_denied() {
         let store = Store::open_in_memory().expect("store");
@@ -8436,6 +8486,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn cyclic_lineage_is_denied() {
         let store = Store::open_in_memory().expect("store");
@@ -8509,6 +8560,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn parent_and_retry_links_must_converge_on_one_root() {
         let store = Store::open_in_memory().expect("store");
@@ -8585,6 +8637,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn reconcile_running_model_invocations_releases_active_counters() {
         let store = Store::open_in_memory().expect("store");

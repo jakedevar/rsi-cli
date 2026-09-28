@@ -73,6 +73,7 @@ pub(crate) fn should_enqueue_title_refinement(
 mod identity_policy_tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn title_generation_suppression_covers_both_invocation_boundaries() {
         let parent_id = Some(Uuid::new_v4());
@@ -666,22 +667,37 @@ async fn generate_ollama_admitted(
 
 /// LLM generation via headless Claude CLI (fallback).
 async fn generate_cli_fallback(prompt: &str, model: &str) -> Result<String> {
-    let output = tokio::process::Command::new("claude")
-        .args([
-            "-p",
-            prompt,
-            "--model",
-            model,
-            "--output-format",
-            "text",
-            "--no-session-persistence",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
+    let mut command = title_cli_command(prompt, model);
+    let output = command
         .output()
         .await
         .map_err(|e| DaemonError::Store(format!("Title generation failed: {}", e)))?;
+    title_cli_output(&output, model)
+}
 
+/// The title fallback's bypass-permissions Claude child (agent-facing).
+// Reached only through `generate_cli_fallback`, which is currently unwired.
+#[allow(dead_code)]
+fn title_cli_command(prompt: &str, model: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("claude");
+    command.args([
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--output-format",
+        "text",
+        "--no-session-persistence",
+        "--permission-mode",
+        "bypassPermissions",
+    ]);
+    // #694 K1: a bypass-permissions Claude is agent-facing; scrub keys.
+    crate::vault::scrub_credential_env(&mut command);
+    command
+}
+
+#[allow(dead_code)]
+fn title_cli_output(output: &std::process::Output, model: &str) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let detail = if stderr.is_empty() {
@@ -725,6 +741,7 @@ mod title_shape_tests {
         title.split_whitespace().count()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn structured_output_keeps_role_and_slice() {
         let title = title_of(
@@ -734,6 +751,7 @@ mod title_shape_tests {
         assert_eq!(title, "Implementer: S3 Custody Fence");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn sentence_title_is_clamped_to_the_word_budget() {
         // The pre-change prompt asked for 150-250 characters of prose; a model
@@ -749,17 +767,20 @@ mod title_shape_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn missing_colon_promotes_the_first_word_to_the_role() {
         let title = title_of("TITLE: Debugger stall detector regression", None);
         assert_eq!(title, "Debugger: stall detector regression");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn role_only_output_survives_as_the_whole_title() {
         assert_eq!(title_of("TITLE: Reviewer", None), "Reviewer");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quoting_and_emphasis_are_stripped_and_role_is_capitalized() {
         assert_eq!(
@@ -768,6 +789,7 @@ mod title_shape_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn unlabeled_backend_output_is_normalized_the_same_way() {
         // Small local models frequently drop the TITLE:/DESCRIPTION: labels.
@@ -777,6 +799,7 @@ mod title_shape_tests {
         assert!(word_count(&title) <= TITLE_MAX_WORDS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn lead_authority_replaces_whatever_role_the_model_chose() {
         let title = title_of(
@@ -786,6 +809,7 @@ mod title_shape_tests {
         assert_eq!(title, "Demiurge: S3 Custody Fence");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn lead_authority_applies_to_unlabeled_and_role_only_output() {
         assert_eq!(
@@ -799,11 +823,13 @@ mod title_shape_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn empty_output_yields_no_title() {
         assert!(parse_title_and_description("   \n  ", None).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn description_is_preserved_alongside_the_short_title() {
         let parsed = parse_title_and_description(
@@ -822,6 +848,7 @@ mod title_shape_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn prompt_states_the_word_budget_and_the_forced_lead_role() {
         let plain = build_title_and_description_prompt("do the thing", None, None);
@@ -855,6 +882,7 @@ mod body_snapshot_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn title_request_body_matches_pinned_snapshot() {
         let opts = title_opts(512);
@@ -900,6 +928,7 @@ mod http_tests {
     // serialise env-var mutation across this binary's HTTP tests. Dropping
     // before await would defeat its purpose.
     #[allow(clippy::await_holding_lock)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn title_generate_ollama_posts_expected_body_shape() {
         let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
@@ -938,5 +967,15 @@ mod http_tests {
             body.get("keep_alive").is_none(),
             "keep_alive key must be absent"
         );
+    }
+}
+
+#[cfg(test)]
+mod title_cli_env_tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn title_cli_child_suppresses_daemon_keys_and_keeps_ordinary_env() {
+        let command = super::title_cli_command("name this session", "claude-haiku-4-5");
+        crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&command, None);
     }
 }

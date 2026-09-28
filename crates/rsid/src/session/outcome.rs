@@ -247,6 +247,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn empty_event_stream_returns_none_none() {
         let probe = probe_outcomes(&[]);
@@ -254,6 +255,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn session_without_cargo_returns_none_none() {
         let events = vec![plain_message(1), plain_message(2)];
@@ -262,6 +264,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn passing_cargo_test_returns_some_true() {
         let events = vec![
@@ -277,6 +280,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn failing_cargo_test_returns_some_false() {
         let events = vec![
@@ -291,6 +295,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn final_invocation_wins_over_earlier() {
         // First invocation passes, second fails → Some(false).
@@ -305,6 +310,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn unparseable_result_preserves_earlier_known_value() {
         // First run passes; second run's result is unparseable garbage.
@@ -319,6 +325,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn clippy_with_error_line_is_failing() {
         let events = vec![
@@ -334,6 +341,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn clippy_with_only_warnings_is_passing() {
         let events = vec![
@@ -348,6 +356,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn clippy_empty_output_is_none() {
         let events = vec![bash_use(1, "cargo clippy"), tool_result(2, "   \n\t\n")];
@@ -355,6 +364,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn non_bash_tools_ignored() {
         // A Read or Grep tool invocation that happens to contain "cargo test"
@@ -370,6 +380,7 @@ mod tests {
         assert_eq!(probe.test_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn tool_use_without_matching_result_is_dropped() {
         // A ToolUse with no following ToolResult — session interrupted mid-tool.
@@ -379,6 +390,7 @@ mod tests {
         assert_eq!(probe.test_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn parse_test_result_picks_last_line() {
         // Multi-crate run: first crate fails, second passes. cargo's overall
@@ -389,12 +401,14 @@ mod tests {
         assert_eq!(parse_test_result(content), Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn parse_test_result_missing_returns_none() {
         assert_eq!(parse_test_result("random binary output"), None);
         assert_eq!(parse_test_result(""), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn exact_id_pairing_ignores_unrelated_results() {
         // A result for some other tool call (id "zzz") must not be consumed
@@ -408,6 +422,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn interleaved_parallel_calls_attributed_by_id() {
         // Two cargo test calls dispatched in parallel; results arrive in the
@@ -431,6 +446,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn parallel_clippy_result_not_attributed_to_test() {
         // clippy's output contains no `test result:` line; if it were
@@ -447,6 +463,7 @@ mod tests {
         assert_eq!(probe.clippy_passed, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn legacy_null_id_events_use_chronological_fallback() {
         // Pre-V81 rows: no ids anywhere. Behavior must be unchanged from the
@@ -461,6 +478,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(false));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn legacy_null_id_results_do_not_collide() {
         // Two id-less matching ToolUses back to back overwrite the single
@@ -476,6 +494,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn mixed_stream_id_less_result_falls_back_to_oldest_call() {
         // ToolUse has an id but its result row predates the migration.
@@ -487,6 +506,7 @@ mod tests {
         assert_eq!(probe.test_passed, Some(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn orphan_call_with_no_result_is_none() {
         let events = vec![bash_use_id(1, "cargo test", "t1"), plain_message(2)];
@@ -494,6 +514,7 @@ mod tests {
         assert_eq!(probe.test_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn orphan_result_with_no_call_is_none() {
         let events = vec![tool_result_id(
@@ -508,6 +529,7 @@ mod tests {
         assert_eq!(probe_outcomes(&legacy).test_passed, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn mixed_test_and_clippy_in_same_session() {
         let events = vec![

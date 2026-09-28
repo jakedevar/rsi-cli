@@ -1062,6 +1062,7 @@ mod tests {
             .expect("invocation row")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn dropped_settlement_identity_fails_the_row_exactly_once() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1125,6 +1126,7 @@ mod tests {
         worker.shutdown().await.expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn controller_drop_without_a_runtime_settles_the_unused_initial_row() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1166,6 +1168,7 @@ mod tests {
             .expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn runtime_shutdown_settles_an_in_flight_call_before_task_ownership_is_released() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1216,6 +1219,7 @@ mod tests {
             .expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn explicit_completion_wins_a_race_with_fallback_drop_settlement() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1267,6 +1271,7 @@ mod tests {
         worker.shutdown().await.expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settlement_drop_returns_while_store_mutex_is_contended_then_drains() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1311,6 +1316,7 @@ mod tests {
         worker.shutdown().await.expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn controller_drop_returns_while_store_mutex_is_contended_then_drains() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1348,6 +1354,7 @@ mod tests {
         worker.shutdown().await.expect("settlement worker shutdown");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn shutdown_waits_for_a_late_settlement_owner_before_returning_success() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1413,6 +1420,7 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("model_call_task_exited"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn shutdown_reports_a_live_producer_instead_of_abandoning_its_row() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1465,6 +1473,7 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("model_call_task_exited"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_reply_timeout_retries_boundedly_then_returns_cached_success() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1536,6 +1545,7 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("model_call_task_exited"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_returns_the_cached_worker_error_after_join() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1584,6 +1594,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_fail_pending_hands_its_taken_permit_to_settlement_recovery() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));

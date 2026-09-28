@@ -335,12 +335,14 @@ pub trait EmbeddingProvider: Send + Sync {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_memory_source_as_str() {
         assert_eq!(MemorySource::Memory.as_str(), "memory");
         assert_eq!(MemorySource::Sessions.as_str(), "sessions");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_str_to_memory_source_valid() {
         assert_eq!(
@@ -353,6 +355,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_str_to_memory_source_invalid() {
         let err = str_to_memory_source("unknown").unwrap_err();
@@ -362,6 +365,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_memory_search_result_serde() {
         let result = MemorySearchResult {
@@ -382,6 +386,7 @@ mod tests {
         assert_eq!(deserialized.source, result.source);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_memory_provider_status_serde() {
         let status = MemoryProviderStatus {
@@ -412,6 +417,7 @@ mod tests {
         assert_eq!(deserialized.cache_entries, status.cache_entries);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_stored_chunk_make_id() {
         let id = StoredChunk::make_id("memory/test.md", MemorySource::Memory, 5, "abc123");
@@ -421,6 +427,7 @@ mod tests {
         assert_eq!(id2, "sessions/x.md:sessions:0:deadbeef");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_memory_index_meta_serde() {
         let meta = MemoryIndexMeta {
@@ -458,6 +465,7 @@ mod tests {
         assert_eq!(deser2.vector_dims, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_memory_config_default() {
         let cfg = MemoryConfig::default();

@@ -471,11 +471,9 @@ impl SessionManager {
                 {
                     let completed = self.completed.read().await;
                     if tree.iter().any(|id| {
-                        completed.get(id).is_some_and(|cs| {
-                            cs.retry_cancel.is_some()
-                                || cs.retry_fired_at.is_some()
-                                || cs.superseded_by_retry.is_some()
-                        })
+                        completed
+                            .get(id)
+                            .is_some_and(|cs| cs.superseded_by_retry.is_some())
                     }) {
                         return Err(refused("manager_v2_human_or_recovery_owner"));
                     }
@@ -553,11 +551,13 @@ impl SessionManager {
         }
         match claim.action() {
             ManagerActionV2::ArchiveSession { .. } => {
-                if self.completed.read().await.get(&id).is_some_and(|cs| {
-                    cs.retry_cancel.is_some()
-                        || cs.retry_fired_at.is_some()
-                        || cs.superseded_by_retry.is_some()
-                }) {
+                if self
+                    .completed
+                    .read()
+                    .await
+                    .get(&id)
+                    .is_some_and(|cs| cs.superseded_by_retry.is_some())
+                {
                     return Err(refused("manager_v2_human_or_recovery_owner"));
                 }
                 self.store
@@ -719,11 +719,6 @@ impl SessionManager {
         claim: &ManagerActionClaimV2,
         effect: bool,
     ) -> Result<()> {
-        if matches!(claim.action(), ManagerActionV2::RetryLead { .. })
-            && !self.runtime_config.retry_enabled.load(Ordering::Relaxed)
-        {
-            return Err(refused("manager_v2_retry_disabled"));
-        }
         if let Some(lead) = action_fence(claim.action()).and_then(|f| f.lead_session_id) {
             if let Some(cs) = self.completed.read().await.get(&lead) {
                 if cs.retry_cancel.is_some()
@@ -1108,7 +1103,11 @@ impl SessionManager {
             let candidate = store
                 .get_session(target)?
                 .ok_or_else(|| refused("manager_v2_candidate_unavailable"))?;
-            store.manager_action_human_gate(target)?;
+            if matches!(claim.action(), ManagerActionV2::AssignLead { .. }) {
+                store.manager_restart_human_gate(target, false)?;
+            } else {
+                store.manager_action_human_gate(target)?;
+            }
             if candidate.pending_question.is_some()
                 || candidate.pending_archive
                 || candidate.status == SessionStatus::WaitingApproval
@@ -1324,6 +1323,7 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_v2_launch_not_granted",
     "manager_v2_source_changed",
     "manager_v2_source_worktree_dirty",
+    "manager_v2_replace_lead_requires_lead_use_create_session",
     "manager_v2_predecessor_unsettled",
     "manager_v2_candidate_unconfirmed",
     "manager_v2_candidate_cancelled",

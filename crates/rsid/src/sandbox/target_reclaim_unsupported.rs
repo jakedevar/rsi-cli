@@ -306,6 +306,7 @@ pub(crate) fn fail_delete_after_for_test(_custody_id: uuid::Uuid, _generation: u
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn refuses_reclaim_without_linux_openat2_containment() {
         let error = PinnedSandboxRoot::open(

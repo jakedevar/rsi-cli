@@ -147,54 +147,63 @@ mod tests {
         PathBuf::from("/home/user/.flywheel/memory")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_empty_path() {
         assert!(validate_read_path("", &test_dir()).is_err());
         assert!(validate_read_path("   ", &test_dir()).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_traversal_attack() {
         let err = validate_read_path("../../../etc/passwd", &test_dir()).unwrap_err();
         assert!(err.to_string().contains("outside memory scope"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_absolute_outside_path() {
         let err = validate_read_path("/etc/passwd", &test_dir()).unwrap_err();
         assert!(err.to_string().contains("outside memory scope"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_non_memory_path() {
         let err = validate_read_path("src/main.rs", &test_dir()).unwrap_err();
         assert!(err.to_string().contains("outside memory scope"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_non_md_file() {
         let err = validate_read_path("memory/notes.txt", &test_dir()).unwrap_err();
         assert!(err.to_string().contains("only .md files"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_valid_memory_md() {
         let result = validate_read_path("MEMORY.md", &test_dir()).unwrap();
         assert_eq!(result, "MEMORY.md");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_valid_memory_subdir() {
         let result = validate_read_path("memory/2026-02-28.md", &test_dir()).unwrap();
         assert_eq!(result, "memory/2026-02-28.md");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_valid_nested_path() {
         let result = validate_read_path("memory/topic/notes.md", &test_dir()).unwrap();
         assert_eq!(result, "memory/topic/notes.md");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_backslash_normalized() {
         // Windows-style separators should be normalized but the path must still be valid

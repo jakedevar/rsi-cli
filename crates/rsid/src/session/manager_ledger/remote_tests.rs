@@ -75,6 +75,7 @@ fn repos() -> Repos {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_rejects_forward_revert_despite_source_ancestry() {
     let r = repos();
@@ -98,6 +99,7 @@ async fn accepted_content_rejects_forward_revert_despite_source_ancestry() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_allows_independent_change_and_rejects_partial_revert() {
     let r = repos();
@@ -127,6 +129,7 @@ async fn accepted_content_allows_independent_change_and_rejects_partial_revert()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_rejects_restored_deletion() {
     let r = repos();
@@ -148,6 +151,47 @@ async fn accepted_content_rejects_restored_deletion() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_skips_oversized_base_blob_deleted_on_both_sides() {
+    let r = repos();
+    git(r.local(), &["switch", "source"]);
+    let wal = r.local().join(".fractal/fractal.db-wal");
+    std::fs::create_dir_all(wal.parent().unwrap()).unwrap();
+    std::fs::write(&wal, vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
+    git(r.local(), &["add", ".fractal/fractal.db-wal"]);
+    git(r.local(), &["commit", "-m", "old WAL base"]);
+    let base = git(r.local(), &["rev-parse", "HEAD"]);
+
+    git(r.local(), &["rm", ".fractal/fractal.db-wal"]);
+    std::fs::write(r.local().join("source"), "accepted change\n").unwrap();
+    git(
+        r.local(),
+        &["commit", "-am", "delete WAL and change source"],
+    );
+    let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+    std::fs::write(r.local().join("target-only"), "independent\n").unwrap();
+    git(r.local(), &["add", "target-only"]);
+    git(r.local(), &["commit", "-m", "independent target change"]);
+    let target = git(r.local(), &["rev-parse", "HEAD"]);
+    git::accepted_content(r.local(), &base, &accepted, &target)
+        .await
+        .unwrap();
+
+    std::fs::write(r.local().join("source"), "source").unwrap();
+    git(r.local(), &["commit", "-am", "lose accepted change"]);
+    let lost = git(r.local(), &["rev-parse", "HEAD"]);
+    let error = git::accepted_content(r.local(), &base, &accepted, &lost)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_accepted_content_lost")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_allows_merged_rolling_and_same_file_evolution() {
     let r = repos();
@@ -192,6 +236,7 @@ async fn accepted_content_allows_merged_rolling_and_same_file_evolution() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_uses_newest_rolling_merge_after_fast_forward_landing() {
     let r = repos();
@@ -256,6 +301,7 @@ async fn accepted_content_uses_newest_rolling_merge_after_fast_forward_landing()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn historical_landing_excludes_prior_published_work_and_survives_later_evolution() {
     let r = repos();
@@ -293,6 +339,7 @@ async fn historical_landing_excludes_prior_published_work_and_survives_later_evo
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn historical_landing_checks_prior_source_at_first_crossing() {
     let r = repos();
@@ -341,6 +388,84 @@ async fn historical_landing_checks_prior_source_at_first_crossing() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn historical_landing_checks_more_than_64_prefix_paths_at_first_merge() {
+    for drop_prior_path in [false, true] {
+        let r = repos();
+        git(r.local(), &["switch", "source"]);
+        for index in 0..80 {
+            std::fs::write(r.local().join(format!("prior-{index}")), "prior source\n").unwrap();
+        }
+        git(r.local(), &["add", "."]);
+        git(r.local(), &["commit", "-m", "long source prefix"]);
+        let prior_source = git(r.local(), &["rev-parse", "HEAD"]);
+        assert!(
+            git(r.local(), &["diff", "--name-only", &r.base, &prior_source])
+                .lines()
+                .count()
+                > 64
+        );
+
+        std::fs::write(r.local().join("current"), "new accepted content\n").unwrap();
+        git(r.local(), &["add", "current"]);
+        git(r.local(), &["commit", "-m", "one-file source continuation"]);
+        let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(
+                r.local(),
+                &["diff", "--name-only", &prior_source, &accepted]
+            ),
+            "current"
+        );
+
+        git(r.local(), &["switch", "rolling"]);
+        git(
+            r.local(),
+            &["merge", "--no-ff", "--no-commit", &prior_source],
+        );
+        if drop_prior_path {
+            std::fs::remove_file(r.local().join("prior-0")).unwrap();
+            git(r.local(), &["add", "-A"]);
+        }
+        git(r.local(), &["commit", "-m", "first rolling publication"]);
+        let crossing = git(r.local(), &["rev-parse", "HEAD"]);
+        let parents = git(r.local(), &["rev-list", "--parents", "-n", "1", &crossing]);
+        assert_eq!(parents.split_whitespace().count(), 3);
+        assert!(
+            !git::ancestor(r.local(), &prior_source, &format!("{crossing}^1"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            git::ancestor(r.local(), &prior_source, &crossing)
+                .await
+                .unwrap()
+        );
+
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+        let landing = git(r.local(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git::content_base(r.local(), &r.base, &accepted, &landing)
+                .await
+                .unwrap(),
+            prior_source
+        );
+        let proof = git::accepted_content(r.local(), &r.base, &accepted, &landing).await;
+        if drop_prior_path {
+            assert!(
+                proof
+                    .unwrap_err()
+                    .to_string()
+                    .contains("manager_v2_accepted_content_lost")
+            );
+        } else {
+            proof.unwrap();
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn lead_branch_source_excludes_incoming_rolling_paths_at_landing() {
     let r = repos();
@@ -389,6 +514,366 @@ async fn lead_branch_source_excludes_incoming_rolling_paths_at_landing() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn criss_cross_landing_checks_prior_content_evolved_on_either_side() {
+    for scenario in ["rolling_evolved", "source_evolved", "landing_drops_prior"] {
+        let r = repos();
+        git(r.local(), &["switch", "source"]);
+        std::fs::write(r.local().join("prior"), "prior source content\n").unwrap();
+        git(r.local(), &["add", "prior"]);
+        git(r.local(), &["commit", "-m", "prior source content"]);
+        let prior_source = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        std::fs::write(r.local().join("rolling-only"), "rolling side\n").unwrap();
+        git(r.local(), &["add", "rolling-only"]);
+        git(r.local(), &["commit", "-m", "rolling side content"]);
+        let rolling_side = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "source"]);
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &rolling_side]);
+        if scenario != "rolling_evolved" {
+            std::fs::write(
+                r.local().join("prior"),
+                "prior source content\nsource addition\n",
+            )
+            .unwrap();
+            git(r.local(), &["commit", "-am", "evolve source prior content"]);
+        }
+        std::fs::write(r.local().join("feature"), "accepted feature\n").unwrap();
+        git(r.local(), &["add", "feature"]);
+        git(r.local(), &["commit", "-m", "accepted feature"]);
+        let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &prior_source]);
+        assert_eq!(
+            std::fs::read_to_string(r.local().join("prior")).unwrap(),
+            "prior source content\n"
+        );
+        if scenario == "rolling_evolved" {
+            std::fs::write(r.local().join("prior"), "later prior evolution\n").unwrap();
+            git(
+                r.local(),
+                &["commit", "-am", "evolve published prior source"],
+            );
+        }
+        let rolling_parent = git(r.local(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(
+                r.local(),
+                &["merge-base", "--all", &accepted, &rolling_parent]
+            )
+            .lines()
+            .count(),
+            2
+        );
+        if scenario == "landing_drops_prior" {
+            git(r.local(), &["merge", "--no-ff", "--no-commit", &accepted]);
+            std::fs::write(r.local().join("prior"), "source addition\n").unwrap();
+            git(r.local(), &["add", "prior"]);
+            git(r.local(), &["commit", "-m", "landing drops prior content"]);
+        } else {
+            git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+        }
+        let landing = git(r.local(), &["rev-parse", "HEAD"]);
+        let proof = git::accepted_content(r.local(), &r.base, &accepted, &landing).await;
+        if scenario == "landing_drops_prior" {
+            assert!(
+                proof
+                    .unwrap_err()
+                    .to_string()
+                    .contains("manager_v2_accepted_content_lost")
+            );
+        } else {
+            proof.unwrap();
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn criss_cross_landing_checks_virtual_base_and_still_rejects_dropped_content() {
+    for scenario in [
+        "preserved",
+        "dropped_feature",
+        "dropped_source",
+        "rolling_evolved",
+    ] {
+        let r = repos();
+        std::fs::write(r.local().join("rolling-only"), "rolling\n").unwrap();
+        git(r.local(), &["add", "rolling-only"]);
+        git(r.local(), &["commit", "-m", "rolling side"]);
+        let rolling_side = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "source"]);
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &rolling_side]);
+        std::fs::write(r.local().join("feature"), "accepted feature\n").unwrap();
+        git(r.local(), &["add", "feature"]);
+        git(r.local(), &["commit", "-m", "accepted feature"]);
+        let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        // Merge the old source side, not its current tip. The two branches now
+        // have distinct merges of the same two commits (criss-cross history).
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &r.source]);
+        let rolling_parent = git(r.local(), &["rev-parse", "HEAD"]);
+        let bases = git(
+            r.local(),
+            &["merge-base", "--all", &accepted, &rolling_parent],
+        );
+        assert_eq!(bases.lines().count(), 2);
+        if scenario != "preserved" {
+            git(r.local(), &["merge", "--no-ff", "--no-commit", &accepted]);
+            match scenario {
+                "dropped_feature" => std::fs::remove_file(r.local().join("feature")).unwrap(),
+                "dropped_source" => std::fs::remove_file(r.local().join("source")).unwrap(),
+                "rolling_evolved" => {
+                    std::fs::write(r.local().join("rolling-only"), "rolling evolved\n").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            git(r.local(), &["add", "-A"]);
+            git(r.local(), &["commit", "-m", "landing changes content"]);
+        } else {
+            git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+        }
+        let landing = git(r.local(), &["rev-parse", "HEAD"]);
+        let proof = git::accepted_content(r.local(), &r.base, &accepted, &landing).await;
+        if scenario.starts_with("dropped_") {
+            assert!(
+                proof
+                    .unwrap_err()
+                    .to_string()
+                    .contains("manager_v2_accepted_content_lost")
+            );
+        } else {
+            proof.unwrap();
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn criss_cross_landing_admits_source_side_worker_merge_and_checks_its_content() {
+    for drop_worker in [false, true] {
+        let r = repos();
+        git(r.local(), &["switch", "source"]);
+        git(r.local(), &["switch", "-c", "worker"]);
+        std::fs::write(r.local().join("worker"), "accepted worker\n").unwrap();
+        git(r.local(), &["add", "worker"]);
+        git(r.local(), &["commit", "-m", "worker content"]);
+        git(r.local(), &["switch", "source"]);
+        std::fs::write(r.local().join("lead"), "accepted lead\n").unwrap();
+        git(r.local(), &["add", "lead"]);
+        git(r.local(), &["commit", "-m", "lead content"]);
+        git(r.local(), &["merge", "--no-ff", "--no-edit", "worker"]);
+        let source_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        std::fs::write(r.local().join("rolling-only"), "rolling\n").unwrap();
+        git(r.local(), &["add", "rolling-only"]);
+        git(r.local(), &["commit", "-m", "rolling content"]);
+        let rolling_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "source"]);
+        git(
+            r.local(),
+            &["merge", "--no-ff", "--no-edit", &rolling_side_base],
+        );
+        std::fs::write(r.local().join("feature"), "accepted feature\n").unwrap();
+        git(r.local(), &["add", "feature"]);
+        git(r.local(), &["commit", "-m", "accepted feature"]);
+        let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        git(
+            r.local(),
+            &["merge", "--no-ff", "--no-edit", &source_side_base],
+        );
+        let rolling_parent = git(r.local(), &["rev-parse", "HEAD"]);
+        let bases = git(
+            r.local(),
+            &["merge-base", "--all", &accepted, &rolling_parent],
+        );
+        assert_eq!(bases.lines().count(), 2);
+        if drop_worker {
+            git(r.local(), &["merge", "--no-ff", "--no-commit", &accepted]);
+            std::fs::remove_file(r.local().join("worker")).unwrap();
+            git(r.local(), &["add", "-A"]);
+            git(r.local(), &["commit", "-m", "landing drops worker content"]);
+        } else {
+            git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+        }
+        let landing = git(r.local(), &["rev-parse", "HEAD"]);
+        let proof = git::accepted_content(r.local(), &r.base, &accepted, &landing).await;
+        if drop_worker {
+            assert!(
+                proof
+                    .unwrap_err()
+                    .to_string()
+                    .contains("manager_v2_accepted_content_lost")
+            );
+        } else {
+            proof.unwrap();
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn criss_cross_landing_refuses_unattributable_rolling_fast_forward() {
+    for imported_side_branch in [false, true] {
+        let r = repos();
+        git(r.local(), &["merge", "--ff-only", "source"]);
+        if imported_side_branch {
+            git(r.local(), &["switch", "-c", "rolling-side"]);
+            std::fs::write(r.local().join("rolling-side"), "rolling side content\n").unwrap();
+            git(r.local(), &["add", "rolling-side"]);
+            git(r.local(), &["commit", "-m", "rolling side content"]);
+            git(r.local(), &["switch", "rolling"]);
+        }
+        std::fs::write(r.local().join("rolling-only"), "rolling\n").unwrap();
+        git(r.local(), &["add", "rolling-only"]);
+        git(r.local(), &["commit", "-m", "rolling content"]);
+        let rolling_import = if imported_side_branch {
+            git(
+                r.local(),
+                &["merge", "--no-ff", "--no-edit", "rolling-side"],
+            );
+            git(r.local(), &["rev-parse", "rolling-side"])
+        } else {
+            git(r.local(), &["rev-parse", "HEAD"])
+        };
+
+        git(r.local(), &["switch", "source"]);
+        git(r.local(), &["merge", "--ff-only", &rolling_import]);
+        std::fs::write(r.local().join("source-next"), "source next\n").unwrap();
+        git(r.local(), &["add", "source-next"]);
+        git(r.local(), &["commit", "-m", "source next"]);
+        let source_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        std::fs::write(r.local().join("rolling-next"), "rolling next\n").unwrap();
+        git(r.local(), &["add", "rolling-next"]);
+        git(r.local(), &["commit", "-m", "rolling next"]);
+        let rolling_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+        if imported_side_branch {
+            let rolling_first_parent = git(
+                r.local(),
+                &["rev-list", "--first-parent", &rolling_side_base],
+            );
+            assert!(
+                !rolling_first_parent
+                    .lines()
+                    .any(|sha| sha == rolling_import)
+            );
+        }
+
+        git(r.local(), &["switch", "source"]);
+        git(
+            r.local(),
+            &["merge", "--no-ff", "--no-edit", &rolling_side_base],
+        );
+        std::fs::write(r.local().join("feature"), "accepted feature\n").unwrap();
+        git(r.local(), &["add", "feature"]);
+        git(r.local(), &["commit", "-m", "accepted feature"]);
+        let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+
+        git(r.local(), &["switch", "rolling"]);
+        git(
+            r.local(),
+            &["merge", "--no-ff", "--no-edit", &source_side_base],
+        );
+        let rolling_parent = git(r.local(), &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(
+                r.local(),
+                &["merge-base", "--all", &accepted, &rolling_parent]
+            )
+            .lines()
+            .count(),
+            2
+        );
+        git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+        let landing = git(r.local(), &["rev-parse", "HEAD"]);
+        let error = git::accepted_content(r.local(), &r.base, &accepted, &landing)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manager_v2_accepted_content_ambiguous")
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn criss_cross_landing_refuses_worker_import_of_rolling_history() {
+    let r = repos();
+    std::fs::write(r.local().join("rolling-only"), "rolling\n").unwrap();
+    git(r.local(), &["add", "rolling-only"]);
+    git(r.local(), &["commit", "-m", "rolling content"]);
+    let rolling_import = git(r.local(), &["rev-parse", "HEAD"]);
+    std::fs::write(r.local().join("rolling-next"), "rolling next\n").unwrap();
+    git(r.local(), &["add", "rolling-next"]);
+    git(r.local(), &["commit", "-m", "rolling next"]);
+    let rolling_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+
+    git(r.local(), &["switch", "source"]);
+    git(r.local(), &["switch", "-c", "worker"]);
+    git(
+        r.local(),
+        &["merge", "--no-ff", "--no-edit", &rolling_import],
+    );
+    std::fs::write(r.local().join("worker"), "accepted worker\n").unwrap();
+    git(r.local(), &["add", "worker"]);
+    git(r.local(), &["commit", "-m", "worker content"]);
+    git(r.local(), &["switch", "source"]);
+    std::fs::write(r.local().join("lead"), "accepted lead\n").unwrap();
+    git(r.local(), &["add", "lead"]);
+    git(r.local(), &["commit", "-m", "lead content"]);
+    git(r.local(), &["merge", "--no-ff", "--no-edit", "worker"]);
+    let source_side_base = git(r.local(), &["rev-parse", "HEAD"]);
+    git(
+        r.local(),
+        &["merge", "--no-ff", "--no-edit", &rolling_side_base],
+    );
+    std::fs::write(r.local().join("feature"), "accepted feature\n").unwrap();
+    git(r.local(), &["add", "feature"]);
+    git(r.local(), &["commit", "-m", "accepted feature"]);
+    let accepted = git(r.local(), &["rev-parse", "HEAD"]);
+
+    git(r.local(), &["switch", "rolling"]);
+    git(
+        r.local(),
+        &["merge", "--no-ff", "--no-edit", &source_side_base],
+    );
+    let rolling_parent = git(r.local(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            r.local(),
+            &["merge-base", "--all", &accepted, &rolling_parent]
+        )
+        .lines()
+        .count(),
+        2
+    );
+    git(r.local(), &["merge", "--no-ff", "--no-edit", &accepted]);
+    let landing = git(r.local(), &["rev-parse", "HEAD"]);
+    let error = git::accepted_content(r.local(), &r.base, &accepted, &landing)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_accepted_content_ambiguous")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn historical_landing_rejects_source_content_lost_at_that_commit() {
     let r = repos();
@@ -407,6 +892,7 @@ async fn historical_landing_rejects_source_content_lost_at_that_commit() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn historical_landing_retains_accepted_lines_across_target_insertions() {
     let r = repos();
@@ -430,6 +916,7 @@ async fn historical_landing_retains_accepted_lines_across_target_insertions() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn later_landing_cannot_hide_lost_prior_source_content() {
     let r = repos();
@@ -470,6 +957,7 @@ async fn later_landing_cannot_hide_lost_prior_source_content() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn landing_target_remains_valid_after_sandbox_fast_forward() {
     let r = repos();
@@ -499,6 +987,7 @@ async fn landing_target_remains_valid_after_sandbox_fast_forward() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn source_side_merge_is_not_a_historical_landing_target() {
     let r = repos();
@@ -547,8 +1036,9 @@ async fn source_side_merge_is_not_a_historical_landing_target() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
-async fn accepted_content_path_cap_counts_code_without_thoughts() {
+async fn accepted_content_admits_more_than_64_code_paths_with_later_evolution() {
     let r = repos();
     git(r.local(), &["switch", "source"]);
     std::fs::create_dir(r.local().join("thoughts")).unwrap();
@@ -562,22 +1052,31 @@ async fn accepted_content_path_cap_counts_code_without_thoughts() {
         .await
         .unwrap();
 
-    for index in 0..64 {
+    for index in 0..65 {
         std::fs::write(r.local().join(format!("code-{index}.txt")), "code\n").unwrap();
     }
     git(r.local(), &["add", "."]);
     git(r.local(), &["commit", "-m", "many code paths"]);
-    let too_many = git(r.local(), &["rev-parse", "HEAD"]);
-    let error = git::accepted_content(r.local(), &r.base, &too_many, &too_many)
+    let many_code_paths = git(r.local(), &["rev-parse", "HEAD"]);
+    git::accepted_content(r.local(), &r.base, &many_code_paths, &many_code_paths)
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("manager_v2_accepted_content_path_limit")
-    );
+        .unwrap();
+
+    for index in 0..65 {
+        std::fs::write(
+            r.local().join(format!("code-{index}.txt")),
+            "code\nlater evolution\n",
+        )
+        .unwrap();
+    }
+    git(r.local(), &["commit", "-am", "evolve all code paths"]);
+    let evolved = git(r.local(), &["rev-parse", "HEAD"]);
+    git::accepted_content(r.local(), &r.base, &many_code_paths, &evolved)
+        .await
+        .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_delivery_admits_local_lag_without_moving_local_rolling() {
     let r = repos();
@@ -617,6 +1116,7 @@ async fn remote_delivery_admits_local_lag_without_moving_local_rolling() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_delivery_uses_default_dev_when_rolling_is_absent() {
     let r = repos();
@@ -637,6 +1137,7 @@ async fn remote_delivery_uses_default_dev_when_rolling_is_absent() {
     assert_eq!(git(r.local(), &["rev-parse", "refs/heads/rolling"]), before);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_delivery_requires_a_resolved_default_without_rolling() {
     let r = repos();
@@ -647,6 +1148,7 @@ async fn remote_delivery_requires_a_resolved_default_without_rolling() {
     assert!(error.to_string().contains("manager_v2_remote_unknown"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_delivery_keeps_rolling_precedence_over_default_dev() {
     let r = repos();
@@ -670,6 +1172,7 @@ async fn remote_delivery_keeps_rolling_precedence_over_default_dev() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_mismatch_and_wrong_remote_are_refused() {
     let r = repos();
@@ -696,6 +1199,7 @@ async fn remote_mismatch_and_wrong_remote_are_refused() {
     assert!(error.to_string().contains("manager_v2_remote_unknown"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn wrong_repository_cannot_supply_a_remote_target() {
     let r = repos();
@@ -726,6 +1230,7 @@ async fn wrong_repository_cannot_supply_a_remote_target() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn missing_source_and_unrelated_source_are_refused() {
     let r = repos();
@@ -764,6 +1269,7 @@ async fn missing_source_and_unrelated_source_are_refused() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_advance_after_evidence_preserves_the_landing_target() {
     let r = repos();
@@ -793,6 +1299,7 @@ async fn remote_advance_after_evidence_preserves_the_landing_target() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn remote_target_off_rolling_and_target_missing_source_are_refused() {
     let r = repos();
@@ -821,6 +1328,7 @@ async fn remote_target_off_rolling_and_target_missing_source_are_refused() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn offline_and_missing_remote_refuse_local_equal_without_explicit_policy() {
     let r = repos();

@@ -4018,6 +4018,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn source_ref_policy_accepts_only_rsi_local_branches() {
         assert!(valid_source_branch("rsi/506dc38e"));
@@ -4036,6 +4037,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn no_live_roots_audit_exposes_latest_durable_receipt_without_apply_authority() {
         let mut fixture = IntegratedFixture::new("receipt-only-audit");
@@ -4065,6 +4067,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn zero_live_receipt_recovery_does_not_require_repository_path() {
         let mut fixture = IntegratedFixture::new("missing-repository-receipt-only");
@@ -4098,6 +4101,7 @@ mod tests {
         assert!(audit.items.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn live_unverified_inventory_is_retained_instead_of_failing_to_decode() {
         let fixture = IntegratedFixture::new("live-unverified-inventory");
@@ -4139,6 +4143,7 @@ mod tests {
             .expect("retained unverified inventory is wire-valid");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn canonical_hash_is_stable_and_domain_separated() {
         #[derive(Serialize)]
@@ -4165,6 +4170,7 @@ mod tests {
         assert_ne!(first, changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn enabled_scheduled_dependencies_retain_every_watch_direction() {
         let fixture = IntegratedFixture::new("scheduled-dependencies");
@@ -4251,6 +4257,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scheduled_dependency_scan_streams_past_ten_thousand_unrelated_rows() {
         let mut fixture = IntegratedFixture::new("scheduled-dependency-cardinality");
@@ -4323,6 +4330,7 @@ mod tests {
         assert_eq!(matching_tail.report.items[0].scheduled_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scheduled_dependency_scan_fails_closed_at_its_total_work_bound() {
         let mut fixture = IntegratedFixture::new("scheduled-dependency-total-bound");
@@ -4378,6 +4386,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scheduled_dependency_scan_observes_invalid_initial_keys_and_owner_ids() {
         for case in ["empty", "null", "uppercase-owner"] {
@@ -4416,6 +4425,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn list_allows_257_cohorts_while_audit_refuses_257_roots_explicitly() {
         let mut list_fixture = IntegratedFixture::new("list-257");
@@ -4458,6 +4468,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn runtime_dependency_evidence_checks_working_dir_and_sandbox_root_independently() {
         let fixture = IntegratedFixture::new("runtime-crossed-fields");
@@ -4537,6 +4548,7 @@ mod tests {
         assert_ne!(sandbox_digest, audit.report.items[0].evidence_digest);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn durable_session_dependency_checks_crossed_path_fields_independently() {
         let fixture = IntegratedFixture::new("durable-crossed-fields");
@@ -4674,6 +4686,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn durable_live_projection_effective_cwd_retains_candidate() {
         let mut fixture = IntegratedFixture::new("durable-live-projection-cwd");
@@ -4710,6 +4723,7 @@ mod tests {
         assert_eq!(audit.report.items[0].session_path_dependency_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn malformed_session_kind_and_custody_only_projection_fail_closed() {
         let mut fixture = IntegratedFixture::new("malformed-session-dependency");
@@ -4810,6 +4824,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn terminal_cleanup_failed_and_quarantined_projections_are_inert_dependencies() {
         use rsi_common::types::SandboxCustodyErrorCodeV1;
@@ -4964,6 +4979,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn durable_session_scan_streams_past_ten_thousand_unrelated_rows() {
         let mut fixture = IntegratedFixture::new("session-dependency-cardinality");
@@ -5047,6 +5063,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn durable_session_scan_fails_closed_at_its_total_work_bound() {
         let mut fixture = IntegratedFixture::new("session-dependency-total-bound");
@@ -5102,6 +5119,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn session_keyset_scans_observe_empty_and_null_legacy_ids() {
         for case in ["empty", "null"] {
@@ -5130,7 +5148,7 @@ mod tests {
             fixture
                 .store
                 .conn
-                .execute_batch("PRAGMA foreign_keys=OFF;")
+                .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
                 .expect("open hostile Session key seam");
             let hostile_id = (case == "empty").then(String::new);
             fixture
@@ -5144,7 +5162,7 @@ mod tests {
             fixture
                 .store
                 .conn
-                .execute_batch("PRAGMA foreign_keys=ON;")
+                .execute_batch("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;")
                 .expect("close hostile Session key seam");
 
             let audit = fixture.audit();
@@ -5173,6 +5191,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn durable_journal_path_fence_binds_raw_canonical_descendants_and_controls() {
         let mut fixture = IntegratedFixture::new("journal-path-admission");
@@ -5218,6 +5237,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn startup_orphan_candidates_cover_owner_and_every_path_identity() {
         let mut fixture = IntegratedFixture::new("startup-orphan-candidates");
@@ -5319,6 +5339,7 @@ mod tests {
         assert!(!candidates.contains(&unrelated_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn startup_orphan_candidates_reject_owner_root_mismatch() {
         let mut fixture = IntegratedFixture::new("startup-orphan-owner-mismatch");
@@ -5348,6 +5369,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn startup_orphan_candidates_reject_symlinked_journal_root() {
         let mut fixture = IntegratedFixture::new("startup-orphan-symlink-root");
@@ -5403,6 +5425,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn startup_orphan_candidates_reject_malformed_receipt_before_process_authority() {
         let mut fixture = IntegratedFixture::new("startup-malformed-receipt");
@@ -5450,6 +5473,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn new_settlement_run_rejects_nil_authority_ids() {
         let mut fixture = IntegratedFixture::new("new-run-nil-identities");
@@ -5483,6 +5507,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn planned_only_journal_does_not_authorize_process_reaping() {
         let mut fixture = IntegratedFixture::new("startup-planned-control");
@@ -5521,6 +5546,7 @@ mod tests {
         process.assert_alive("planned-only process");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scheduled_dependency_identity_and_direction_are_digest_bound() {
         let fixture = IntegratedFixture::new("scheduled-dependency-identity");
@@ -5573,6 +5599,7 @@ mod tests {
         assert_ne!(resume.report.plan_digest, watch.report.plan_digest);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn missing_and_symbolic_source_resolution_are_digest_distinct() {
         let fixture = IntegratedFixture::new("source-resolution-outcome");
@@ -5600,6 +5627,7 @@ mod tests {
         assert_ne!(missing.report.plan_digest, symbolic.report.plan_digest);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn invalid_source_refs_are_bounded_wire_valid_retained_evidence() {
         let fixture = IntegratedFixture::new("invalid-source-ref-wire");
@@ -5683,6 +5711,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn unrelated_symref_dependency_retains_source_before_any_effect() {
         let fixture = IntegratedFixture::new("symref-dependent");
@@ -5708,6 +5737,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn ignored_content_is_retained_before_non_force_removal() {
         let fixture = IntegratedFixture::new("ignored-content");
@@ -5737,6 +5767,7 @@ mod tests {
         assert!(fixture.allocation.root.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn canonical_evidence_binds_collapsed_session_and_git_observation_drift() {
         let fixture = IntegratedFixture::new("canonical-evidence");
@@ -5804,6 +5835,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn final_database_fault_stays_branch_removed_and_exact_replay_settles() {
         let fixture = IntegratedFixture::new("database-retry");
@@ -5889,6 +5921,7 @@ mod tests {
             .expect("settled retry receipt is wire-valid");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn integrated_ancestor_apply_is_local_exact_atomic_and_replay_safe() {
         let directory = tempfile::tempdir().expect("settlement fixture directory");
@@ -6225,6 +6258,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn clean_nonancestor_is_retained_without_phrase_or_writes() {
         let directory = tempfile::tempdir().expect("nonancestor fixture directory");
@@ -6347,6 +6381,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_reaps_scheduled_alias_then_requires_recovery_before_git_effects() {
         let mut fixture = IntegratedFixture::new("startup-scheduled-alias");
@@ -6411,6 +6446,7 @@ mod tests {
         assert_eq!(alias.status, SessionStatus::Failed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn fresh_apply_reaps_exact_owner_only_after_durable_intent() {
         let mut fixture = IntegratedFixture::new("fresh-apply-orphan");
@@ -6472,6 +6508,7 @@ mod tests {
         orphan.wait_signalled("fresh apply orphan");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn replay_reaps_only_effect_capable_owner_after_an_earlier_refusal() {
         let mut fixture = IntegratedFixture::new("replay-effect-capable-orphan");
@@ -6572,6 +6609,7 @@ mod tests {
         refused_process.assert_alive("Refused owner is safe to relaunch and must not be signaled");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_apply_scan_proof_failure_has_zero_intent_git_or_process_effects() {
         let fixture = IntegratedFixture::new("fresh-apply-proof-failure");
@@ -6634,6 +6672,7 @@ mod tests {
         orphan.assert_alive("read-only proof failure must not signal the process");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_apply_reap_failure_retains_intent_before_all_git_effects() {
         let fixture = IntegratedFixture::new("fresh-apply-reap-failure");
@@ -6692,6 +6731,7 @@ mod tests {
         assert_eq!(git(&repository, &["rev-parse", &source_ref]), source_oid);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn quarantine_crash_boundaries_replay_to_one_exact_settlement() {
         #[derive(Clone, Copy)]
@@ -6791,6 +6831,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn missing_source_restoration_precedes_quarantine_tree_or_admin_reproof() {
         for case in [
@@ -6848,6 +6889,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn missing_source_restoration_precedes_holder_or_registration_reproof() {
         for case in ["holder", "registration"] {
@@ -6899,6 +6941,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn missing_source_restore_lock_refusal_is_explicit_and_never_overwrites() {
         let mut fixture = IntegratedFixture::new("restore-lock-refusal");
@@ -6943,6 +6986,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn branch_first_restore_collision_preserves_drift_and_quarantine() {
         let mut fixture = IntegratedFixture::new("branch-first-restore-collision");
@@ -6974,6 +7018,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn branch_first_restore_ignores_target_drift_then_full_proof_retains() {
         let mut fixture = IntegratedFixture::new("branch-first-restore-target-drift");
@@ -7010,6 +7055,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn dangling_quarantine_remove_failure_restores_source_and_reattaches() {
         let mut fixture = IntegratedFixture::new("branch-first-remove-failure");
@@ -7042,6 +7088,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn post_remove_source_recreation_fails_closed_without_second_delete() {
         let mut fixture = IntegratedFixture::new("branch-first-post-remove-recreation");
@@ -7072,6 +7119,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn post_remove_target_drift_restores_source_without_overwrite() {
         let mut fixture = IntegratedFixture::new("branch-first-post-remove-target-drift");
@@ -7107,6 +7155,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn post_remove_path_recreation_does_not_block_exact_source_compensation() {
         let mut fixture = IntegratedFixture::new("branch-first-post-remove-path-drift");
@@ -7137,6 +7186,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn canonical_marker_rejects_original_recreation_and_extra_same_ref_registration() {
         for case in ["original-recreated", "extra-registration"] {
@@ -7186,6 +7236,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn malformed_or_mismatched_marker_retains_quarantine_and_source_ref() {
         for case in ["noncanonical", "mismatched-run"] {
@@ -7233,6 +7284,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn quarantine_alias_dependency_introduced_after_move_retains_candidate() {
         let mut fixture = IntegratedFixture::new("quarantine-alias-after-move");
@@ -7270,6 +7322,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn persistent_quarantine_authority_failure_is_bounded_before_marker_or_removal() {
         let mut fixture = IntegratedFixture::new("quarantine-proof-failure-bound");
@@ -7298,6 +7351,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn legacy_worktree_phase_never_authorizes_a_new_ref_delete() {
         let mut canonical = IntegratedFixture::new("canonical-worktree-phase-source-present");
@@ -7363,6 +7417,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn settlement_session_layer_contains_no_force_prune_or_recursive_delete_fallback() {
         let source = include_str!("cohort_settlement.rs");
@@ -7379,6 +7434,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_recovery_without_marker_preserves_source_ref_and_requires_recovery() {
         let directory = tempfile::tempdir().expect("recovery fixture directory");

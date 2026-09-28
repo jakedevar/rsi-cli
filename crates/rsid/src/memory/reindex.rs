@@ -224,6 +224,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_no_meta() {
         let provider = make_fts_only_provider();
@@ -232,6 +233,7 @@ mod tests {
         assert_eq!(result, Some(ReindexTrigger::NoMeta));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_model_changed() {
         let meta = make_meta("old-model", "none", 400, 80);
@@ -241,6 +243,7 @@ mod tests {
         assert!(matches!(result, Some(ReindexTrigger::ModelChanged { .. })));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_provider_changed() {
         let meta = make_meta("none", "ollama", 400, 80);
@@ -253,6 +256,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_chunk_settings_changed() {
         let meta = make_meta("none", "none", 400, 80);
@@ -265,6 +269,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_no_trigger() {
         let meta = make_meta("none", "none", 400, 80);
@@ -274,6 +279,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_check_reindex_fts_only_to_fts_only() {
         let meta = make_meta("none", "none", 400, 80);
@@ -283,6 +289,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_cleanup_stale_temp_files() {
         let dir = TempDir::new().unwrap();
@@ -302,6 +309,7 @@ mod tests {
         assert!(!temp1_wal.exists(), "stale wal should be removed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_cleanup_stale_temp_no_false_positives() {
         let dir = TempDir::new().unwrap();
@@ -317,6 +325,7 @@ mod tests {
         assert!(unrelated.exists(), "unrelated file should be preserved");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_cleanup_stale_backup_files() {
         let dir = TempDir::new().unwrap();
@@ -331,6 +340,7 @@ mod tests {
         assert!(!backup.exists(), "stale backup should be removed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_swap_index_files_basic() {
         let dir = TempDir::new().unwrap();
@@ -346,6 +356,7 @@ mod tests {
         assert!(!temp.exists(), "temp should be removed after swap");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_swap_index_files_handles_wal_shm() {
         let dir = TempDir::new().unwrap();

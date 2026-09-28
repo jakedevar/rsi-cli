@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/rsid-processes.sh"
+source "$ROOT/scripts/rsid-health.sh"
 BIN_DIR="${RSI_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 RSI_HOME_DIR="$HOME/.rsi"
 DAEMON_LOG="$RSI_HOME_DIR/daemon.log"
@@ -43,6 +45,7 @@ target_dir() {
 TARGET_DIR="$(target_dir)"
 RSI_BIN="$TARGET_DIR/release/rsi"
 RSID_BIN="$TARGET_DIR/release/rsid"
+BUILD_RUSTC_BIN="$TARGET_DIR/release/rsi-build-rustc"
 RSI_RPC_BIN="$TARGET_DIR/release/rsi-rpc"
 RSI_AGENT_MCP_BIN="$TARGET_DIR/release/rsi-agent-mcp"
 COMPAT_RELEASE_DIR="$ROOT/target/release"
@@ -72,10 +75,10 @@ if [[ "$TUI_ONLY" -eq 1 ]]; then
 fi
 
 if [[ "$LINK_ONLY" -eq 0 ]]; then
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc
 fi
 
-if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" ]]; then
+if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" || ! -x "$BUILD_RUSTC_BIN" ]]; then
     echo "Release binaries not found at $TARGET_DIR/release" >&2
     exit 1
 fi
@@ -83,6 +86,7 @@ fi
 mkdir -p "$BIN_DIR"
 ln -sfn "$RSI_BIN" "$BIN_DIR/rsi"
 ln -sfn "$RSID_BIN" "$BIN_DIR/rsid"
+ln -sfn "$BUILD_RUSTC_BIN" "$BIN_DIR/rsi-build-rustc"
 ln -sfn "$RSI_RPC_BIN" "$BIN_DIR/rsi-rpc"
 ln -sfn "$RSI_AGENT_MCP_BIN" "$BIN_DIR/rsi-agent-mcp"
 
@@ -90,6 +94,7 @@ if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
     mkdir -p "$COMPAT_RELEASE_DIR"
     ln -sfn "$RSI_BIN" "$COMPAT_RELEASE_DIR/rsi"
     ln -sfn "$RSID_BIN" "$COMPAT_RELEASE_DIR/rsid"
+    ln -sfn "$BUILD_RUSTC_BIN" "$COMPAT_RELEASE_DIR/rsi-build-rustc"
     ln -sfn "$RSI_RPC_BIN" "$COMPAT_RELEASE_DIR/rsi-rpc"
     ln -sfn "$RSI_AGENT_MCP_BIN" "$COMPAT_RELEASE_DIR/rsi-agent-mcp"
 fi
@@ -97,6 +102,7 @@ fi
 echo "Linked:"
 echo "  $BIN_DIR/rsi     -> $RSI_BIN"
 echo "  $BIN_DIR/rsid    -> $RSID_BIN"
+echo "  $BIN_DIR/rsi-build-rustc -> $BUILD_RUSTC_BIN"
 echo "  $BIN_DIR/rsi-rpc -> $RSI_RPC_BIN"
 echo "  $BIN_DIR/rsi-agent-mcp -> $RSI_AGENT_MCP_BIN"
 if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
@@ -113,78 +119,130 @@ fi
 # daemon here so `make release-install` always leaves the running process
 # matching what it just built, instead of silently leaving a stale rsid
 # serving requests from before this build.
+daemon_socket_path() {
+    printf '%s\n' "${RSI_DAEMON_SOCKET_PATH:-${RSI_SOCKET:-${MOTHERSHIP_SOCKET:-${FLYWHEEL_SOCKET:-$RSI_HOME_DIR/daemon.sock}}}}"
+}
+
+run_restart_drain_hook() {
+    # #929 can install this operator-owned hook to request a safe daemon drain.
+    # Its failure prevents the restart. No provider environment is printed.
+    local hook="$HOME/.config/rsi/pre-restart-drain"
+    if [[ -e "$hook" ]]; then
+        if [[ ! -x "$hook" ]]; then
+            echo "rsid drain hook is not executable: $hook" >&2
+            return 1
+        fi
+        "$hook" "$(daemon_socket_path)"
+    fi
+}
+
 restart_rsid() {
+    local platform
+    platform="$(uname -s)"
+    if [[ "$platform" != Linux && "$platform" != Darwin ]]; then
+        echo "Automatic rsid restart is unsupported on $platform; use --no-restart." >&2
+        return 1
+    fi
+
     # Match by exact name, current user only -- never touch another user's
     # process, and never match on a substring (e.g. a path containing "rsid").
     local old_pids
-    old_pids="$(pgrep -x -u "$(id -u)" rsid || true)"
+    old_pids="$(rsid_running_pids)"
+
+    if [[ "$platform" == Linux ]]; then
+        load_rsid_scope_settings
+    fi
+
+    if [[ "$platform" == Linux ]] && systemctl --user cat rsid.service >/dev/null 2>&1; then
+        if [[ -n "$old_pids" ]] && ! systemctl --user is-active --quiet rsid.service; then
+            echo "rsid.service is installed but a legacy daemon is running; stop the legacy daemon before switching launchers." >&2
+            return 1
+        fi
+        run_restart_drain_hook
+        provision_worker_slice
+        # Keep verified aggregate limits across a reboot of the managed unit.
+        # A busy slice with conflicting limits is left untouched by
+        # provision_worker_slice and is not persisted here.
+        if verify_worker_slice; then
+            systemctl --user set-property rsi-workers.slice \
+                "MemoryHigh=${WORKER_SCOPE_MEMORY_HIGH_MIB}M" \
+                "MemoryMax=${WORKER_SCOPE_MEMORY_MAX_MIB}M" \
+                "MemorySwapMax=${WORKER_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
+                "CPUWeight=${WORKER_SCOPE_CPU_WEIGHT}"
+        fi
+        systemctl --user set-property rsid.service \
+            "MemoryHigh=${RSID_SCOPE_MEMORY_HIGH_MIB}M" \
+            "MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
+            "MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
+            "CPUWeight=${RSID_SCOPE_CPU_WEIGHT}"
+        echo "Restarting managed rsid.service ..."
+        systemctl --user restart rsid.service
+        wait_for_rsid_health "$RSI_RPC_BIN" "$(daemon_socket_path)" 90 rsid.service
+        verify_rsid_scope rsid.service
+        return
+    fi
 
     if [[ -z "$old_pids" ]]; then
         echo "rsid is not currently running -- skipping restart."
         return 0
     fi
 
-    load_rsid_scope_settings
+    run_restart_drain_hook
 
     echo "Restarting rsid (was running as PID(s): $(echo "$old_pids" | tr '\n' ' ')) ..."
 
-    # SIGINT, not SIGTERM: rsid's shutdown listener is tokio::signal::ctrl_c(),
-    # which only observes SIGINT. SIGTERM would skip that handler entirely and
-    # fall straight to the OS default action.
+    # Legacy supervisor path. The managed service uses systemd's stop signal.
     # shellcheck disable=SC2086
     kill -INT $old_pids 2>/dev/null || true
 
     local waited=0
-    while [[ "$waited" -lt 100 ]]; do
-        if ! kill -0 $old_pids 2>/dev/null; then
+    while [[ "$waited" -lt 900 ]]; do
+        if [[ -z "$(rsid_running_pids)" ]]; then
             break
         fi
         sleep 0.1
         waited=$((waited + 1))
     done
 
-    # shellcheck disable=SC2086
-    if kill -0 $old_pids 2>/dev/null; then
-        echo "rsid did not exit within 10s of SIGINT -- sending SIGKILL." >&2
-        kill -KILL $old_pids 2>/dev/null || true
-        sleep 0.2
+    if [[ -n "$(rsid_running_pids)" ]]; then
+        echo "rsid did not stop within 90s; leaving it running and refusing a second daemon." >&2
+        return 1
     fi
 
-    if pgrep -x -u "$(id -u)" rsid >/dev/null 2>&1; then
-        echo "rsid did not stop; refusing to start a second daemon." >&2
-        exit 1
+    if [[ "$platform" == Linux ]]; then
+        provision_worker_slice
     fi
 
     mkdir -p "$RSI_HOME_DIR"
-    nohup systemd-run --user --scope --collect --unit=rsid.scope \
-        --slice=user.slice \
-        --property="MemoryHigh=${RSID_SCOPE_MEMORY_HIGH_MIB}M" \
-        --property="MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
-        --property="MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
-        --property="CPUWeight=${RSID_SCOPE_CPU_WEIGHT}" \
-        -- "$ROOT/scripts/rsid-supervisor.sh" "$RSID_BIN" \
-        </dev/null >>"$DAEMON_LOG" 2>&1 &
+    local scope_unit=""
+    if [[ "$platform" == Linux ]]; then
+        scope_unit="rsid-install-$(date +%s)-$$-$RANDOM.scope"
+        nohup systemd-run --user --scope --collect --unit="$scope_unit" \
+            --slice=user.slice \
+            --property="MemoryHigh=${RSID_SCOPE_MEMORY_HIGH_MIB}M" \
+            --property="MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
+            --property="MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
+            --property="CPUWeight=${RSID_SCOPE_CPU_WEIGHT}" \
+            -- "$ROOT/scripts/rsid-supervisor.sh" "$RSID_BIN" \
+            </dev/null >>"$DAEMON_LOG" 2>&1 &
+    else
+        nohup "$RSID_BIN" </dev/null >>"$DAEMON_LOG" 2>&1 &
+    fi
     local launcher_pid=$!
     disown "$launcher_pid"
 
-    local started=0
-    for _ in {1..100}; do
-        if systemctl --user is-active --quiet rsid.scope \
-            && pgrep -x -u "$(id -u)" rsid >/dev/null 2>&1; then
-            started=1
-            break
-        fi
-        if ! kill -0 "$launcher_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.1
-    done
-    if [[ "$started" -ne 1 ]]; then
-        echo "rsid did not become active in rsid.scope -- check $DAEMON_LOG" >&2
+    local socket_path
+    socket_path="$(daemon_socket_path)"
+    if ! wait_for_rsid_health "$RSI_RPC_BIN" "$socket_path" 90; then
+        echo "rsid did not answer GetHealthStatus on $socket_path after restart -- check $DAEMON_LOG" >&2
         exit 1
     fi
-    verify_rsid_scope
-    echo "rsid supervisor restarted in rsid.scope, logging to $DAEMON_LOG"
+    if [[ "$platform" == Linux ]]; then
+        verify_rsid_scope "$scope_unit"
+        echo "rsid supervisor restarted in $scope_unit, logging to $DAEMON_LOG"
+    else
+        echo "rsid restarted on macOS, logging to $DAEMON_LOG"
+    fi
 }
 
 load_rsid_scope_settings() {
@@ -192,13 +250,27 @@ load_rsid_scope_settings() {
     # after the operator changes any scope limit.
     mkdir -p "$RSI_HOME_DIR"
     if [[ ! -e "$RSID_SCOPE_SETTINGS" ]]; then
-        umask 077
-        cat >"$RSID_SCOPE_SETTINGS" <<'EOF'
+        local temp_settings
+        temp_settings="$(mktemp "$RSI_HOME_DIR/.rsid-scope.XXXXXXXX")"
+        cat >"$temp_settings" <<'EOF'
 rsid_scope_memory_high_mib=6144
 rsid_scope_memory_max_mib=8192
 rsid_scope_memory_swap_max_mib=0
 rsid_scope_cpu_weight=20
+worker_scope_memory_high_mib=6144
+worker_scope_memory_max_mib=8192
+worker_scope_memory_swap_max_mib=0
+worker_scope_cpu_weight=20
 EOF
+        # Publish a complete file without replacing a concurrent TUI launch
+        # or an operator-updated snapshot.
+        if ! ln "$temp_settings" "$RSID_SCOPE_SETTINGS" 2>/dev/null \
+            && [[ ! -e "$RSID_SCOPE_SETTINGS" ]]; then
+            rm -f "$temp_settings"
+            echo "Cannot create rsid scope settings at $RSID_SCOPE_SETTINGS" >&2
+            exit 1
+        fi
+        rm -f "$temp_settings"
     fi
     if [[ ! -r "$RSID_SCOPE_SETTINGS" ]]; then
         echo "Cannot read rsid scope settings at $RSID_SCOPE_SETTINGS" >&2
@@ -206,6 +278,11 @@ EOF
     fi
 
     local seen_high=0 seen_max=0 seen_swap=0 seen_weight=0 key value
+    local seen_worker_high=0 seen_worker_max=0 seen_worker_swap=0 seen_worker_weight=0
+    WORKER_SCOPE_MEMORY_HIGH_MIB=6144
+    WORKER_SCOPE_MEMORY_MAX_MIB=8192
+    WORKER_SCOPE_MEMORY_SWAP_MAX_MIB=0
+    WORKER_SCOPE_CPU_WEIGHT=20
     while IFS='=' read -r key value || [[ -n "${key:-}${value:-}" ]]; do
         [[ -z "${key//[[:space:]]/}" || "$key" == \#* ]] && continue
         value="${value//[[:space:]]/}"
@@ -226,6 +303,18 @@ EOF
             rsid_scope_cpu_weight)
                 (( seen_weight == 0 )) || { echo "Duplicate $key in $RSID_SCOPE_SETTINGS" >&2; exit 1; }
                 seen_weight=1; RSID_SCOPE_CPU_WEIGHT="$value" ;;
+            worker_scope_memory_high_mib)
+                (( seen_worker_high == 0 )) || { echo "Duplicate $key in $RSID_SCOPE_SETTINGS" >&2; exit 1; }
+                seen_worker_high=1; WORKER_SCOPE_MEMORY_HIGH_MIB="$value" ;;
+            worker_scope_memory_max_mib)
+                (( seen_worker_max == 0 )) || { echo "Duplicate $key in $RSID_SCOPE_SETTINGS" >&2; exit 1; }
+                seen_worker_max=1; WORKER_SCOPE_MEMORY_MAX_MIB="$value" ;;
+            worker_scope_memory_swap_max_mib)
+                (( seen_worker_swap == 0 )) || { echo "Duplicate $key in $RSID_SCOPE_SETTINGS" >&2; exit 1; }
+                seen_worker_swap=1; WORKER_SCOPE_MEMORY_SWAP_MAX_MIB="$value" ;;
+            worker_scope_cpu_weight)
+                (( seen_worker_weight == 0 )) || { echo "Duplicate $key in $RSID_SCOPE_SETTINGS" >&2; exit 1; }
+                seen_worker_weight=1; WORKER_SCOPE_CPU_WEIGHT="$value" ;;
             *) echo "Unknown rsid scope setting $key in $RSID_SCOPE_SETTINGS" >&2; exit 1 ;;
         esac
     done <"$RSID_SCOPE_SETTINGS"
@@ -239,11 +328,84 @@ EOF
         echo "Invalid or incomplete rsid scope settings in $RSID_SCOPE_SETTINGS" >&2
         exit 1
     fi
+    local worker_keys_seen=$((seen_worker_high + seen_worker_max + seen_worker_swap + seen_worker_weight))
+    if [[ "$worker_keys_seen" -ne 0 && "$worker_keys_seen" -ne 4 ]]; then
+        echo "Incomplete worker slice settings in $RSID_SCOPE_SETTINGS" >&2
+        exit 1
+    fi
+    if [[ "$WORKER_SCOPE_MEMORY_HIGH_MIB" -lt 256 || "$WORKER_SCOPE_MEMORY_HIGH_MIB" -gt 1048576 \
+        || "$WORKER_SCOPE_MEMORY_MAX_MIB" -lt 256 || "$WORKER_SCOPE_MEMORY_MAX_MIB" -gt 1048576 \
+        || "$WORKER_SCOPE_MEMORY_HIGH_MIB" -ge "$WORKER_SCOPE_MEMORY_MAX_MIB" \
+        || "$WORKER_SCOPE_MEMORY_SWAP_MAX_MIB" -gt 1048576 \
+        || "$WORKER_SCOPE_CPU_WEIGHT" -lt 1 || "$WORKER_SCOPE_CPU_WEIGHT" -gt 10000 ]]; then
+        echo "Invalid worker slice settings in $RSID_SCOPE_SETTINGS" >&2
+        exit 1
+    fi
+}
+
+verify_worker_slice() {
+    local properties control_group active_state memory_high memory_max memory_swap_max cpu_weight
+    properties="$(systemctl --user show rsi-workers.slice \
+        --property=ActiveState --property=ControlGroup --property=MemoryHigh \
+        --property=MemoryMax --property=MemorySwapMax --property=CPUWeight)" || return 1
+    active_state="$(sed -n 's/^ActiveState=//p' <<<"$properties")"
+    control_group="$(sed -n 's/^ControlGroup=//p' <<<"$properties")"
+    memory_high="$(sed -n 's/^MemoryHigh=//p' <<<"$properties")"
+    memory_max="$(sed -n 's/^MemoryMax=//p' <<<"$properties")"
+    memory_swap_max="$(sed -n 's/^MemorySwapMax=//p' <<<"$properties")"
+    cpu_weight="$(sed -n 's/^CPUWeight=//p' <<<"$properties")"
+    [[ "$active_state" == active && "$control_group" == /user.slice/* \
+        && "$control_group" == */rsi-workers.slice \
+        && "$memory_high" =~ ^[0-9]+$ && "$memory_max" =~ ^[0-9]+$ \
+        && "$memory_swap_max" =~ ^[0-9]+$ && "$cpu_weight" =~ ^[0-9]+$ \
+        && "$memory_high" -eq $((WORKER_SCOPE_MEMORY_HIGH_MIB * 1024 * 1024)) \
+        && "$memory_max" -eq $((WORKER_SCOPE_MEMORY_MAX_MIB * 1024 * 1024)) \
+        && "$memory_swap_max" -eq $((WORKER_SCOPE_MEMORY_SWAP_MAX_MIB * 1024 * 1024)) \
+        && "$cpu_weight" -eq "$WORKER_SCOPE_CPU_WEIGHT" ]]
+}
+
+worker_slice_is_empty() {
+    local properties control_group populated descendants
+    properties="$(systemctl --user show rsi-workers.slice --property=ControlGroup)" || return 1
+    control_group="$(sed -n 's/^ControlGroup=//p' <<<"$properties")"
+    [[ "$control_group" == "/user.slice/user-${EUID}.slice/user@${EUID}.service/rsi.slice/rsi-workers.slice" ]] || return 1
+    populated="$(sed -n 's/^populated \([0-9][0-9]*\)$/\1/p' "/sys/fs/cgroup${control_group}/cgroup.events")" || return 1
+    descendants="$(sed -n 's/^nr_descendants \([0-9][0-9]*\)$/\1/p' "/sys/fs/cgroup${control_group}/cgroup.stat")" || return 1
+    [[ "$populated" == 0 && "$descendants" == 0 ]]
+}
+
+provision_worker_slice() {
+    local before
+    before="$(systemctl --user show rsi-workers.slice --property=ActiveState)" || {
+        echo "Cannot inspect rsi-workers.slice." >&2
+        exit 1
+    }
+    if [[ "$before" == ActiveState=active ]]; then
+        if verify_worker_slice; then
+            return 0
+        fi
+        if ! worker_slice_is_empty; then
+            echo "Active rsi-workers.slice differs from configured limits and may contain workers; daemon will restart to reap owned workers, while new worker admission stays closed." >&2
+            return 0
+        fi
+        echo "Reconciling empty rsi-workers.slice with configured limits." >&2
+    fi
+    systemctl --user set-property --runtime rsi-workers.slice \
+        "MemoryHigh=${WORKER_SCOPE_MEMORY_HIGH_MIB}M" \
+        "MemoryMax=${WORKER_SCOPE_MEMORY_MAX_MIB}M" \
+        "MemorySwapMax=${WORKER_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
+        "CPUWeight=${WORKER_SCOPE_CPU_WEIGHT}" || exit 1
+    systemctl --user start rsi-workers.slice || exit 1
+    if ! verify_worker_slice; then
+        echo "rsi-workers.slice did not acquire configured aggregate limits; refusing daemon start." >&2
+        exit 1
+    fi
 }
 
 verify_rsid_scope() {
+    local scope_unit="$1"
     local properties control_group active_state memory_high memory_max memory_swap_max cpu_weight
-    properties="$(systemctl --user show rsid.scope \
+    properties="$(systemctl --user show "$scope_unit" \
         --property=ActiveState --property=ControlGroup --property=MemoryHigh \
         --property=MemoryMax --property=MemorySwapMax --property=CPUWeight)" || {
         echo "Cannot inspect effective rsid scope limits." >&2
@@ -256,15 +418,15 @@ verify_rsid_scope() {
     memory_swap_max="$(sed -n 's/^MemorySwapMax=//p' <<<"$properties")"
     cpu_weight="$(sed -n 's/^CPUWeight=//p' <<<"$properties")"
     if [[ "$active_state" != active || "$control_group" != /user.slice/* \
-        || "$control_group" != */rsid.scope || ! "$memory_high" =~ ^[0-9]+$ \
+        || "$control_group" != */"$scope_unit" || ! "$memory_high" =~ ^[0-9]+$ \
         || ! "$memory_max" =~ ^[0-9]+$ || ! "$memory_swap_max" =~ ^[0-9]+$ \
         || ! "$cpu_weight" =~ ^[0-9]+$ \
         || "$memory_high" -ne $((RSID_SCOPE_MEMORY_HIGH_MIB * 1024 * 1024)) \
         || "$memory_max" -ne $((RSID_SCOPE_MEMORY_MAX_MIB * 1024 * 1024)) \
         || "$memory_swap_max" -ne $((RSID_SCOPE_MEMORY_SWAP_MAX_MIB * 1024 * 1024)) \
         || "$cpu_weight" -ne "$RSID_SCOPE_CPU_WEIGHT" ]]; then
-        echo "rsid.scope is active without the configured effective limits or user-slice placement." >&2
-        systemctl --user stop rsid.scope >/dev/null 2>&1 || true
+        echo "$scope_unit is active without the configured effective limits or user-slice placement." >&2
+        systemctl --user stop "$scope_unit" >/dev/null 2>&1 || true
 
         exit 1
     fi

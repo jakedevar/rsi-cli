@@ -1,5 +1,6 @@
 #![allow(clippy::redundant_pub_crate)]
 
+pub(crate) mod agent;
 pub(crate) mod catalog;
 pub(crate) mod command;
 pub(crate) mod custody;
@@ -12,5 +13,7 @@ pub(crate) mod resolve;
 pub(crate) mod steps;
 pub(crate) mod store;
 
+#[cfg(test)]
+mod agent_tests;
 #[cfg(test)]
 mod tests;

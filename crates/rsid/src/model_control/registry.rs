@@ -777,6 +777,7 @@ pub enum RuntimeExecutionRoute {
     HarnessOpenAiHttp,
     HarnessAnthropicHttp,
     SessionHarnessOpenAiHttp,
+    SessionHarnessOpenRouterHttp,
     SessionHarnessAnthropicHttp,
     CodexAppServer,
 }
@@ -800,6 +801,7 @@ pub enum AllowedExclusionOperation {
     HttpGetProbe,
     TcpProbe,
     TransportSpawn,
+    UtilityCliSpawn,
     LoopbackModelPost,
     NonModelHttpPost,
     QueueNoOp,
@@ -815,6 +817,9 @@ impl AllowedExclusionOperation {
             Self::TcpProbe => "One source-bound TCP availability probe; no paid sink family.",
             Self::TransportSpawn => {
                 "One `codex app-server` transport spawn; no model request primitive."
+            }
+            Self::UtilityCliSpawn => {
+                "One source-bound utility subprocess spawn; no model executable or model request primitive."
             }
             Self::LoopbackModelPost => {
                 "One POST whose URL is the value returned by `ollama_url()`; no other paid sink family."
@@ -848,8 +853,8 @@ const HARNESS_BOUNDARIES: &[&str] = &[
     "harness_openai_stream",
     "harness_anthropic_chat",
     "harness_anthropic_stream",
-    "session_harness_openai_chat",
-    "session_harness_openai_stream",
+    "session_harness_openai_request",
+    "session_harness_openrouter_request",
     "session_harness_anthropic_chat",
     "session_harness_anthropic_stream",
 ];
@@ -862,15 +867,15 @@ const SESSION_BOUNDARIES: &[&str] = &[
     "harness_openai_stream",
     "harness_anthropic_chat",
     "harness_anthropic_stream",
-    "session_harness_openai_chat",
-    "session_harness_openai_stream",
+    "session_harness_openai_request",
+    "session_harness_openrouter_request",
     "session_harness_anthropic_chat",
     "session_harness_anthropic_stream",
     "appserver_model_request",
 ];
 const MEMORY_BOUNDARIES: &[&str] = &[
     "memory_cli_launch",
-    "session_harness_openai_chat",
+    "session_harness_openai_request",
     "session_harness_anthropic_chat",
 ];
 const EMBEDDING_BOUNDARIES: &[&str] = &[
@@ -962,7 +967,7 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
     boundary(
         "memory_cli_launch",
         "crates/rsid/src/memory/llm.rs",
-        "run_cancellable_cli_with_killer",
+        "run_cancellable_cli_with_limits",
         "CliExecutionCapability",
         "execution",
         PrimitiveKind::CliSpawn,
@@ -1050,9 +1055,9 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
         RuntimeExecutionRoute::HarnessOpenAiHttp,
     ),
     boundary(
-        "session_harness_openai_chat",
+        "session_harness_openai_request",
         "crates/rsid/src/session/harness/providers/openai_api.rs",
-        "OpenAiApiProvider::chat",
+        "OpenAiApiProvider::send_openai_request",
         "ModelExecutionCapability",
         "execution",
         PrimitiveKind::HttpPost,
@@ -1060,14 +1065,14 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
         RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
     ),
     boundary(
-        "session_harness_openai_stream",
+        "session_harness_openrouter_request",
         "crates/rsid/src/session/harness/providers/openai_api.rs",
-        "OpenAiApiProvider::stream_chat",
+        "OpenAiApiProvider::send_openrouter_request",
         "ModelExecutionCapability",
         "execution",
         PrimitiveKind::HttpPost,
-        CapabilityConsumption::BindHttpOrProviderChat,
-        RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
+        CapabilityConsumption::BindHttpSend,
+        RuntimeExecutionRoute::SessionHarnessOpenRouterHttp,
     ),
     boundary(
         "harness_anthropic_chat",
@@ -1126,9 +1131,65 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
     exclusion(
         "appserver_transport_spawn",
         "crates/rsid/src/codex_app_server.rs",
-        "CodexAppServerClient::launch",
+        "CodexAppServerClient::launch_with_gate",
         AllowedExclusionOperation::TransportSpawn,
-        "app-server",
+        "build_app_server_command",
+    ),
+    exclusion(
+        "rolling_land_remote_fetch",
+        "crates/rsid/src/bin/rsi-rolling-land.rs",
+        "remote_fetch",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "remote_git_command",
+    ),
+    exclusion(
+        "rolling_land_remote_tip",
+        "crates/rsid/src/bin/rsi-rolling-land.rs",
+        "remote_tip",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "remote_git_command",
+    ),
+    exclusion(
+        "integration_git_reference_transaction",
+        "crates/rsid/src/integration/git.rs",
+        "run_reference_transaction",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "command_with_config",
+    ),
+    exclusion(
+        "bounded_process_capture",
+        "crates/rsid/src/process_control.rs",
+        "capture_bounded",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "capture_bounded_with_spawn",
+    ),
+    exclusion(
+        "sandbox_git_bounded_process",
+        "crates/rsid/src/sandbox/git_worktree.rs",
+        "run_bounded_process",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "Git",
+    ),
+    exclusion(
+        "manager_ledger_git",
+        "crates/rsid/src/session/manager_ledger/git.rs",
+        "run",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git",
+    ),
+    exclusion(
+        "topology_cargo_catalog",
+        "crates/rsid/src/topology/catalog.rs",
+        "run",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "invocations",
+    ),
+    exclusion(
+        "topology_custody_git",
+        "crates/rsid/src/topology/custody.rs",
+        "git_with_stdin",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git",
     ),
     exclusion(
         "claude_catalog",
@@ -1406,6 +1467,7 @@ mod tests {
         ModelInvocationPurpose::AgentReserveSuccessor,
     ];
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn registry_rows_are_total_unique_and_identity_mapped() {
         assert_eq!(REGISTRY.len(), PURPOSES.len(), "no default/sentinel rows");
@@ -1423,6 +1485,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn agent_schedule_wake_fresh_is_the_only_default_enabled_paid_background_purpose() {
         let enabled: Vec<_> = REGISTRY

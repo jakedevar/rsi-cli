@@ -397,7 +397,14 @@ fn validate_boundary(
             contract.path, contract.item, contract.capability_ident, direct_uses, expected_direct
         ));
     }
-    if facts.capability_uses != allowed_ident_uses {
+    let invocation_id_reads = if contract.consumption == CapabilityConsumption::BindCommandSpawn {
+        facts.capability_invocation_id_reads
+    } else {
+        0
+    };
+    if facts.capability_invocation_id_reads > 1
+        || facts.capability_uses != allowed_ident_uses + invocation_id_reads
+    {
         violations.push(format!(
             "{}:{}: capability `{}` is borrowed, displaced, unused, or used outside its registered consume operation (uses={}, direct={})",
             contract.path,
@@ -646,6 +653,9 @@ fn validate_exclusion(
             contract.path, contract.item
         ));
     }
+    let transport_factory_proof = contract.allowed_operation
+        == AllowedExclusionOperation::TransportSpawn
+        && transport_factory_proves_app_server(file, item.block, contract.proof_ident);
     let proof_present = match contract.allowed_operation {
         AllowedExclusionOperation::HttpGetProbe => {
             operation_proof_count(&facts.get_operation_proofs, contract.proof_ident, false)
@@ -664,6 +674,7 @@ fn validate_exclusion(
                     violations,
                 )
         }
+        AllowedExclusionOperation::TransportSpawn if transport_factory_proof => true,
         _ => facts
             .operation_proofs
             .iter()
@@ -693,7 +704,14 @@ fn validate_exclusion(
             }
             AllowedExclusionOperation::TransportSpawn => {
                 facts.spawn == contract.occurrences
-                    && facts.transport_spawn == contract.occurrences
+                    && (facts.transport_spawn == contract.occurrences || transport_factory_proof)
+                    && facts.post == 0
+                    && facts.raw_http_send == 0
+                    && no_model_family
+            }
+            AllowedExclusionOperation::UtilityCliSpawn => {
+                facts.spawn == contract.occurrences
+                    && !facts.model_executable
                     && facts.post == 0
                     && facts.raw_http_send == 0
                     && no_model_family
@@ -740,6 +758,30 @@ fn validate_exclusion(
             facts.tcp_connect,
         ));
     }
+}
+
+fn transport_factory_proves_app_server(file: &syn::File, block: &Block, name: &str) -> bool {
+    let mut caller = ItemFacts::new("", None, HashSet::new(), canonical_path_aliases(file));
+    caller.visit_block(block);
+    if caller.spawn_command_proofs.len() != 1
+        || !caller.spawn_command_proofs[0].contains(&format!("ident:{name}"))
+        || caller.model_executable
+    {
+        return false;
+    }
+    let matches = find_items(file, name);
+    if matches.len() != 1 {
+        return false;
+    }
+    let mut factory = ItemFacts::new("", None, HashSet::new(), canonical_path_aliases(file));
+    factory.visit_block(matches[0].block);
+    factory.transport_commands.len() == 1
+        && factory.process_commands.len() == 1
+        && !factory.model_executable
+        && factory.spawn == 0
+        && factory.post == 0
+        && factory.provider_chat == 0
+        && factory.appserver_calls == 0
 }
 
 fn operation_proof_count(
@@ -1065,6 +1107,9 @@ fn discover_repository_sinks(
     }
     let mut discovered = Vec::new();
     for path in rust_paths {
+        if source_file_is_test_module(&path) {
+            continue;
+        }
         let relative = relative(&input.repo_root, &path);
         if relative.ends_with("model_control/validator.rs")
             || relative.ends_with("bin/rsi-model-control-validate.rs")
@@ -1098,6 +1143,28 @@ fn discover_repository_sinks(
         }
     }
     discovered
+}
+
+fn source_file_is_test_module(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    if stem != "tests" {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let module_path = parent.join("mod.rs");
+    let Ok(source) = fs::read_to_string(module_path) else {
+        return false;
+    };
+    let Ok(module_file) = syn::parse_file(&source) else {
+        return false;
+    };
+    module_file.items.iter().any(|item| {
+        matches!(item, Item::Mod(module) if module.ident == stem && has_cfg_test(&module.attrs))
+    })
 }
 
 fn discover_items(
@@ -1298,6 +1365,9 @@ fn exclusion_covers(operation: AllowedExclusionOperation, kind: PrimitiveKind) -
             AllowedExclusionOperation::TransportSpawn,
             PrimitiveKind::CliSpawn
         ) | (
+            AllowedExclusionOperation::UtilityCliSpawn,
+            PrimitiveKind::CliSpawn
+        ) | (
             AllowedExclusionOperation::LoopbackModelPost,
             PrimitiveKind::HttpPost
         ) | (
@@ -1337,6 +1407,7 @@ struct ItemFacts<'a> {
     local_bindings: HashSet<String>,
     assigned_bindings: HashSet<String>,
     capability_uses: usize,
+    capability_invocation_id_reads: usize,
     shadowed: bool,
     assigned: bool,
     builder_flow_invalid: bool,
@@ -1355,6 +1426,7 @@ struct ItemFacts<'a> {
     bound_post_raw_send: usize,
     bound_get_raw_send: usize,
     transport_spawn: usize,
+    spawn_command_proofs: Vec<HashSet<String>>,
     ollama_url_calls: usize,
     loopback_bound_posts: usize,
     post_operation_proofs: Vec<HashSet<String>>,
@@ -1389,6 +1461,7 @@ impl<'a> ItemFacts<'a> {
             local_bindings: HashSet::new(),
             assigned_bindings: HashSet::new(),
             capability_uses: 0,
+            capability_invocation_id_reads: 0,
             shadowed: false,
             assigned: false,
             builder_flow_invalid: false,
@@ -1407,6 +1480,7 @@ impl<'a> ItemFacts<'a> {
             bound_post_raw_send: 0,
             bound_get_raw_send: 0,
             transport_spawn: 0,
+            spawn_command_proofs: Vec::new(),
             ollama_url_calls: 0,
             loopback_bound_posts: 0,
             post_operation_proofs: Vec::new(),
@@ -1597,6 +1671,9 @@ impl<'ast> Visit<'ast> for ItemFacts<'_> {
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
+        if method == "invocation_id" && expr_is_ident(&node.receiver, self.capability_ident) {
+            self.capability_invocation_id_reads += 1;
+        }
         self.operation_proofs.insert(method.clone());
         match method.as_str() {
             "post" => {
@@ -1648,6 +1725,8 @@ impl<'ast> Visit<'ast> for ItemFacts<'_> {
                 if receiver_looks_process(node.receiver.as_ref(), &self.process_commands) =>
             {
                 self.spawn += 1;
+                self.spawn_command_proofs
+                    .push(expression_operation_proofs(&node.receiver, &self.value_proofs));
                 if let Expr::MethodCall(bind) = node.receiver.as_ref()
                     && bind.method == "bind_command"
                     && expr_is_ident(&bind.receiver, self.capability_ident)
@@ -1784,6 +1863,10 @@ impl<'ast> Visit<'ast> for ItemFacts<'_> {
             }
             Some(AssociatedSinkCall::CommandSpawn) => {
                 self.spawn += 1;
+                if let Some(command) = node.args.first() {
+                    self.spawn_command_proofs
+                        .push(expression_operation_proofs(command, &self.value_proofs));
+                }
                 if node
                     .args
                     .first()

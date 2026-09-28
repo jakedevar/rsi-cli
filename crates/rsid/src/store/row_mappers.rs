@@ -1600,6 +1600,7 @@ mod tests {
     use super::{session_provider_to_str, str_to_session_provider};
     use rsi_common::types::SessionProvider;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_session_provider_antigravity_string_roundtrip_and_alias() {
         assert_eq!(
@@ -1616,6 +1617,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_session_provider_bedrock_string_roundtrip() {
         assert_eq!(session_provider_to_str(SessionProvider::Bedrock), "Bedrock");
@@ -1625,6 +1627,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_session_provider_pioneer_string_roundtrip() {
         assert_eq!(session_provider_to_str(SessionProvider::Pioneer), "Pioneer");

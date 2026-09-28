@@ -150,6 +150,7 @@ fn lead_review(f: &Fixture, key: &str, policy_version: i64) -> Uuid {
     assignment
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn current_lead_request_review_reserves_with_itself_as_requester() {
     let f = fixture();
@@ -172,6 +173,7 @@ fn current_lead_request_review_reserves_with_itself_as_requester() {
     assert_eq!(state, "allocating");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_request_review_for_another_epics_work_is_out_of_scope() {
     let f = fixture();
@@ -267,6 +269,7 @@ fn lead_request_review_for_another_epics_work_is_out_of_scope() {
     assert_eq!(count, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn rotated_lead_tip_may_request_and_stale_predecessor_may_not() {
     let f = fixture();
@@ -305,6 +308,7 @@ fn rotated_lead_tip_may_request_and_stale_predecessor_may_not() {
     assert_eq!(requester, tip.id.to_string());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_review_keeps_contributor_and_manager_owned_supersession_guards() {
     let f = fixture();
@@ -330,6 +334,7 @@ fn lead_review_keeps_contributor_and_manager_owned_supersession_guards() {
     assert!(error.contains("manager_review_manager_owned"), "{error}");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn paused_policy_blocks_a_lead_review_allocation() {
     let f = fixture();
@@ -343,6 +348,7 @@ fn paused_policy_blocks_a_lead_review_allocation() {
     assert!(error.contains("manager_v2_policy_paused"), "{error}");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_review_does_not_grant_manager_only_updates() {
     let f = fixture();

@@ -547,6 +547,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn tick_dispatches_up_to_max_concurrent() {
         let dir = tempfile::tempdir().unwrap();
@@ -578,6 +579,7 @@ mod tests {
         assert_eq!(state.running.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn local_dispatch_mismatch_is_rejected_before_launch_or_state_mutation() {
@@ -630,6 +632,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn tick_reconciles_terminal_issues() {
         let dir = tempfile::tempdir().unwrap();
@@ -678,6 +681,7 @@ mod tests {
         assert_eq!(result.dispatched, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn tick_with_zero_candidates() {
         let dir = tempfile::tempdir().unwrap();

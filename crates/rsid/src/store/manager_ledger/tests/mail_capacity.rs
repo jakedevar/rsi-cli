@@ -23,6 +23,7 @@ fn send(f: &Fixture, key: &str) -> Result<HarnessManagerMessageReceiptV1> {
             epic_id: f.epic,
             message: format!("Request {key}"),
             idempotency_key: key.into(),
+            informational: false,
         },
     )
 }
@@ -75,6 +76,7 @@ fn reply(
             request_id,
             message: format!("Reply {key}"),
             idempotency_key: key.into(),
+            still_running: false,
         },
     )
 }
@@ -127,6 +129,7 @@ fn rotate_lead(f: &Fixture) -> Uuid {
     next.id
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn lead_terminal_request_state_frees_pending_slot() {
     let f = fixture();
@@ -148,6 +151,141 @@ fn lead_terminal_request_state_frees_pending_slot() {
     assert_refused(send(&f, "over-cap-again"), EPIC_FULL);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn informational_mail_delivers_past_request_cap_and_board_reports_it() {
+    let f = fixture();
+    fill(&f);
+    let mut first_info = None;
+    for index in 0..40 {
+        let receipt = f
+            .store
+            .manager_send(
+                f.manager,
+                &AgentManagerSendRequestV1 {
+                    epic_id: f.epic,
+                    message: format!("Informational ruling {index}"),
+                    idempotency_key: format!("info-{index}"),
+                    informational: true,
+                },
+            )
+            .unwrap();
+        first_info.get_or_insert(receipt);
+    }
+    assert_eq!(open_total(&f), CAP);
+    let reports = health_reports(&f);
+    assert_eq!(reports["reports"]["pending_requests"], CAP);
+    assert_eq!(reports["reports"]["informational_messages"], 40);
+    let inbox = f
+        .store
+        .manager_inbox(
+            f.lead,
+            &AgentManagerInboxRequestV1 {
+                after_sequence: first_info.as_ref().unwrap().sequence - 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(inbox.messages.iter().any(|message| message.informational));
+    assert_refused(
+        reply(&f, f.lead, first_info.unwrap().message_id, "not-a-request"),
+        "manager_request_not_in_scope",
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn manager_can_withdraw_own_request_without_lead_retrieval() {
+    let f = fixture();
+    let ids = fill(&f);
+    let receipt = f
+        .store
+        .manager_v2_commit_update(
+            f.manager,
+            &request(
+                ManagerUpdateV2::Request {
+                    request_id: ids[0],
+                    expected_row_version: 0,
+                    state: ManagerRequestStateV2::Declined,
+                    message: "Withdrawn after changed priorities".into(),
+                    work_key: None,
+                },
+                "manager-withdraw",
+            ),
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+    assert_eq!(receipt.row_version, 1);
+    assert_eq!(open_total(&f), CAP - 1);
+    let record = f
+        .store
+        .manager_v2_record(&config(&f), "request", &ids[0].to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.payload["state"], "declined");
+    assert_eq!(
+        record.payload["execution_evidence"]["actor"],
+        f.manager.to_string()
+    );
+    assert_refused(
+        reply(&f, f.lead, ids[0], "after-withdraw"),
+        "manager_request_settled",
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn reply_settles_unless_lead_marks_still_running() {
+    let f = fixture();
+    let id = send(&f, "reply-state").unwrap().message_id;
+    retrieve(&f, f.lead);
+    f.store
+        .manager_reply(
+            f.lead,
+            &AgentManagerReplyRequestV1 {
+                request_id: id,
+                message: "Started the work".into(),
+                idempotency_key: "still-running".into(),
+                still_running: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(open_total(&f), 1);
+    assert_eq!(
+        f.store
+            .manager_v2_record(&config(&f), "request", &id.to_string())
+            .unwrap()
+            .unwrap()
+            .payload["state"],
+        "running"
+    );
+    reply(&f, f.lead, id, "finished").unwrap();
+    assert_eq!(open_total(&f), 0);
+    let record = f
+        .store
+        .manager_v2_record(&config(&f), "request", &id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.payload["state"], "completed");
+    assert_eq!(
+        record.payload["execution_evidence"]["kind"],
+        "attributed_reply"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn cap_refusal_identifies_oldest_settleable_requests() {
+    let f = fixture();
+    let ids = fill(&f);
+    let error = send(&f, "overflow").unwrap_err().to_string();
+    assert!(error.contains(EPIC_FULL));
+    for id in ids.iter().take(3) {
+        assert!(error.contains(&id.to_string()));
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn lead_failed_then_accepted_does_not_reclaim_slot() {
     let f = fixture();
@@ -218,6 +356,7 @@ fn unanswered_ids(f: &Fixture) -> Vec<String> {
 /// and in Health, but never reclaims a slot: the send cap, Progress
 /// `pending_requests`, mail capacity and Health `pending_requests` stay 32
 /// while Inspect unanswered and Health `active_requests` show all 33.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn reopened_request_stays_visible_but_never_reclaims_a_slot() {
     let f = fixture();
@@ -276,6 +415,7 @@ fn reopened_request_stays_visible_but_never_reclaims_a_slot() {
     assert_eq!(open_total(&f), CAP);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn pre_upgrade_failed_request_releases_before_reopen() {
     let f = fixture();
@@ -310,6 +450,7 @@ fn pre_upgrade_failed_request_releases_before_reopen() {
     assert_eq!(open_total(&f), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn orphan_on_raw_replaced_lead_settles_as_lead_replaced() {
     let f = fixture();
@@ -339,6 +480,7 @@ fn orphan_on_raw_replaced_lead_settles_as_lead_replaced() {
     assert_eq!(unanswered[0]["request_id"], fresh.message_id.to_string());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn rotated_lead_request_stays_open() {
     let f = fixture();
@@ -353,6 +495,7 @@ fn rotated_lead_request_stays_open() {
     assert_eq!(open_total(&f), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn orphan_sweep_skips_vacant_lead() {
     let f = fixture();
@@ -379,6 +522,7 @@ fn unsettled(f: &Fixture, id: Uuid) -> Option<ManagerRecordV2> {
 /// caller is again the request's current recipient lead. The reply writes a
 /// `request_unsettled` marker, lands, and the request is then an ordinary
 /// replied request; replay rules are unchanged.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn restored_lead_reply_unsettles_a_daemon_lead_replaced_request() {
     let f = fixture();
@@ -456,6 +600,7 @@ fn restored_lead_reply_unsettles_a_daemon_lead_replaced_request() {
     assert!(unsettled(&f, answered).is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn restored_lead_unsettle_succeeds_at_coordination_limit() {
     let f = fixture();
@@ -473,6 +618,7 @@ fn restored_lead_unsettle_succeeds_at_coordination_limit() {
 /// Plan (a) settled-reply rule for a manager settle: an exact replay still
 /// returns its original receipt; any new reply is refused, even from the
 /// request's current recipient lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn reply_to_manager_settled_request_refuses_after_exact_replay() {
     let f = fixture();
@@ -507,6 +653,7 @@ fn reply_to_manager_settled_request_refuses_after_exact_replay() {
     assert!(unsettled(&f, answered).is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn lead_lifecycle_on_settled_request_refuses() {
     let f = fixture();
@@ -609,6 +756,7 @@ fn send_to(f: &Fixture, epic_id: Uuid, key: &str) -> Result<HarnessManagerMessag
             epic_id,
             message: format!("Request {key}"),
             idempotency_key: key.into(),
+            informational: false,
         },
     )
 }
@@ -628,6 +776,7 @@ fn progress_pending(progress: &AgentManagerProgressResultV1, epic_id: Uuid) -> u
         .pending_requests
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn per_epic_cap_does_not_block_other_epics() {
     let (f, epics) = multi_fixture(2);
@@ -644,6 +793,7 @@ fn per_epic_cap_does_not_block_other_epics() {
     send_to(&f, epics[1], "y-second").unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn project_ceiling_256() {
     let (f, epics) = multi_fixture(9);
@@ -666,6 +816,7 @@ fn project_ceiling_256() {
     assert_eq!(progress_pending(&progress, epics[8]), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn progress_and_inspect_report_mail_capacity_with_75pct_warning() {
     let (f, epics) = multi_fixture(2);
@@ -800,6 +951,7 @@ fn filtered_inbox(f: &Fixture, caller: Uuid, request_id: Uuid) -> Vec<HarnessMan
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn standing_request_rolls_over_at_33rd_reply() {
     let f = fixture();
@@ -892,6 +1044,7 @@ fn standing_request_rolls_over_at_33rd_reply() {
     assert_eq!(summary(successor).rolled_over_to, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn rollover_replay_is_idempotent() {
     let f = fixture();
@@ -923,6 +1076,7 @@ fn rollover_replay_is_idempotent() {
                 request_id: root,
                 message: "different".into(),
                 idempotency_key: "r-32".into(),
+                still_running: false,
             },
         ),
         "manager_idempotency_conflict",
@@ -930,6 +1084,7 @@ fn rollover_replay_is_idempotent() {
     assert_eq!(reply_count(&f, successor), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn concurrent_rollover_single_successor() {
     let dir = tempfile::Builder::new()
@@ -954,6 +1109,7 @@ fn concurrent_rollover_single_successor() {
                         request_id: root,
                         message: format!("Reply {key}"),
                         idempotency_key: key.into(),
+                        still_running: false,
                     },
                 )
                 .unwrap()
@@ -982,6 +1138,7 @@ fn concurrent_rollover_single_successor() {
     assert_eq!(successors, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn manager_send_rejects_rollover_key_prefix() {
     let f = fixture();
@@ -1000,6 +1157,7 @@ fn manager_send_rejects_rollover_key_prefix() {
     assert_eq!(open_total(&f), 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn rollover_replay_after_lead_rotation_dedups() {
     let f = fixture();
@@ -1027,6 +1185,7 @@ fn rollover_replay_after_lead_rotation_dedups() {
     assert_eq!(reply_count(&f, successor), 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn rollover_replay_naming_successor_id_dedups() {
     let f = fixture();
@@ -1055,6 +1214,7 @@ fn rollover_replay_naming_successor_id_dedups() {
     assert_eq!(reply_count(&f, successor), 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn existing_reply_digest_unchanged_for_unrolled_request() {
     use sha2::{Digest, Sha256};
@@ -1158,6 +1318,7 @@ fn released(f: &Fixture, id: Uuid) -> Option<ManagerRecordV2> {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn lead_terminal_release_succeeds_at_coordination_limit() {
     use ManagerRequestStateV2::{Accepted, Blocked, Declined, Failed};
@@ -1210,6 +1371,7 @@ fn lead_terminal_release_succeeds_at_coordination_limit() {
     assert_coordination_still_full(&f, full);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn orphan_sweep_settles_at_coordination_limit() {
     let f = fixture();
@@ -1250,6 +1412,7 @@ fn marker_rows(f: &Fixture, kind: &str) -> i64 {
 /// `request_settle` class cap. The sweep still settles every new orphan batch
 /// and `manager_send` admits again; a restored lead can still lift a
 /// settlement past that many settled rows.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn orphan_sweep_never_stops_after_1024_settled_orphans() {
     let f = fixture();
@@ -1310,6 +1473,7 @@ fn orphan_sweep_never_stops_after_1024_settled_orphans() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn standing_request_rolls_over_at_coordination_limit() {
     let f = fixture();
@@ -1414,6 +1578,7 @@ fn rollover_rows(f: &Fixture) -> i64 {
 /// scope holds one chain record per chain, the per-request 256-generation
 /// bound still refuses, and replay naming any generation, including after
 /// lead rotation, returns the original receipt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn rollover_succeeds_when_other_chains_exceed_1024_generations() {
     let f = fixture();

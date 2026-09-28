@@ -92,6 +92,7 @@ impl Default for IssueTrackerConfig {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn tracked_issue_serde_roundtrip() {
         let issue = TrackedIssue {
@@ -123,6 +124,7 @@ mod tests {
         assert_eq!(deser.blocked_by.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn issue_tracker_config_default_correctness() {
         let config = IssueTrackerConfig::default();
@@ -133,6 +135,7 @@ mod tests {
         assert_eq!(config.active_states, vec!["started", "unstarted"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn dispatch_record_serde_roundtrip() {
         let record = DispatchRecord {
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(deser.tracker, "linear");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn tick_result_serde_roundtrip() {
         let result = TickResult {

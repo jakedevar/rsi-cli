@@ -83,6 +83,7 @@ async fn notices(pilot: &Pilot) -> Vec<ScheduledJob> {
         .collect()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(
     clippy::unwrap_used,
@@ -123,6 +124,7 @@ async fn agent_manager_notify_publishes_manager_notice_job() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_watch_coalesces_epics_separately_from_ordinary_watches_and_defers_busy_recipient()
 {
@@ -214,6 +216,7 @@ async fn manager_watch_coalesces_epics_separately_from_ordinary_watches_and_defe
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_watch_busy_turn_output_keeps_undelivered_notice_armed() {
     use crate::issue_tracker::poller::SessionLauncher;
@@ -274,6 +277,7 @@ async fn manager_watch_busy_turn_output_keeps_undelivered_notice_armed() {
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_action_self_transport_reaches_idle_manager_and_settles_only_on_inbox() {
     let pilot = pilot().await;
@@ -373,6 +377,7 @@ async fn manager_action_self_transport_reaches_idle_manager_and_settles_only_on_
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_watch_provider_output_does_not_settle_a_delivered_exact_notice() {
     let pilot = pilot().await;
@@ -427,6 +432,7 @@ async fn manager_watch_provider_output_does_not_settle_a_delivered_exact_notice(
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn pre_v117_manager_watch_keeps_legacy_delivery_confirmation_after_upgrade() {
     let pilot = pilot().await;
@@ -494,6 +500,7 @@ async fn pre_v117_manager_watch_keeps_legacy_delivery_confirmation_after_upgrade
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_watch_follows_committed_rotation_and_revalidates_scope() {
     let pilot = pilot().await;
@@ -561,6 +568,7 @@ async fn manager_watch_follows_committed_rotation_and_revalidates_scope() {
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_watch_scheduler_disables_changed_envelope_without_fresh_launch() {
     use crate::issue_tracker::poller::{SessionLauncher, WatchFireOutcome};
@@ -683,6 +691,7 @@ async fn manager_request(pilot: &Pilot, key: &str) -> HarnessManagerMessageRecei
                 epic_id: pilot.epics[0],
                 message: format!("Status request {key}"),
                 idempotency_key: key.into(),
+                informational: false,
             },
         )
         .await
@@ -699,6 +708,7 @@ async fn lead_reply(pilot: &Pilot, request_id: Uuid, key: &str) -> HarnessManage
                 request_id,
                 message: format!("SEALED {key}"),
                 idempotency_key: key.into(),
+                still_running: false,
             },
         )
         .await
@@ -729,6 +739,7 @@ async fn current_job(pilot: &Pilot, job_id: Uuid) -> ScheduledJob {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn running_lead_reply_wakes_idle_manager_once_until_inbox_retrieval() {
     let pilot = pilot().await;
@@ -737,7 +748,7 @@ async fn running_lead_reply_wakes_idle_manager_once_until_inbox_retrieval() {
     let request = manager_request(&pilot, "status-1").await;
 
     let first = lead_reply(&pilot, request.message_id, "reply-1").await;
-    let job = route_job(&pilot, pilot.leads[0], pilot.owner).await;
+    let job = route_job(&pilot, pilot.owner, pilot.owner).await;
     let WatchFirePlan::Deliver {
         tip,
         message,
@@ -749,10 +760,6 @@ async fn running_lead_reply_wakes_idle_manager_once_until_inbox_retrieval() {
     };
     assert_eq!(tip, pilot.owner);
     assert_eq!(job_ids, vec![job.id]);
-    assert!(
-        message.starts_with("1 durable manager notices pending; read AgentManagerInbox"),
-        "{message}"
-    );
     assert!(message.contains(&format!("message subject={}", first.message_id)));
     settle_delivery(&pilot, job.id).await;
 
@@ -805,6 +812,80 @@ async fn running_lead_reply_wakes_idle_manager_once_until_inbox_retrieval() {
     assert!(message.contains(&format!("message subject={}", third.message_id)));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn replies_from_two_live_epics_share_one_manager_event_wake() {
+    let pilot = pilot().await;
+    drain_manager_inbox(&pilot).await;
+    for lead in pilot.leads {
+        set_status(&pilot, lead, SessionStatus::Running).await;
+    }
+    let first_request = manager_request(&pilot, "coalesced-first").await;
+    let first = lead_reply(&pilot, first_request.message_id, "coalesced-first-reply").await;
+    let second_request = pilot
+        .manager
+        .agent_control()
+        .agent_manager_send(
+            pilot.owner,
+            AgentManagerSendRequestV1 {
+                epic_id: pilot.epics[1],
+                message: "Second status request".into(),
+                idempotency_key: "coalesced-second".into(),
+                informational: false,
+            },
+        )
+        .await
+        .unwrap();
+    let second = pilot
+        .manager
+        .agent_control()
+        .agent_manager_reply(
+            pilot.leads[1],
+            AgentManagerReplyRequestV1 {
+                request_id: second_request.message_id,
+                message: "Second result".into(),
+                idempotency_key: "coalesced-second-reply".into(),
+                still_running: false,
+            },
+        )
+        .await
+        .unwrap();
+    let store = pilot.manager.store.lock().await;
+    let first_job = store
+        .manager_notice_job_for_subject(
+            "message",
+            &first.message_id.to_string(),
+            &first.sequence.to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let second_job = store
+        .manager_notice_job_for_subject(
+            "message",
+            &second.message_id.to_string(),
+            &second.sequence.to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_job, second_job);
+    let job = store.get_scheduled_job(&first_job).unwrap().unwrap();
+    drop(store);
+    let WatchFirePlan::Deliver {
+        tip,
+        message,
+        job_ids,
+        ..
+    } = pilot.manager.plan_terminal_watch_fire(&job).await.unwrap()
+    else {
+        panic!("both live-Epic replies must share the idle manager wake");
+    };
+    assert_eq!(tip, pilot.owner);
+    assert_eq!(job_ids, vec![first_job]);
+    assert!(message.contains(&first.message_id.to_string()));
+    assert!(message.contains(&second.message_id.to_string()));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn running_manager_holds_lead_reply_until_it_goes_idle() {
     let pilot = pilot().await;
@@ -813,7 +894,7 @@ async fn running_manager_holds_lead_reply_until_it_goes_idle() {
     let request = manager_request(&pilot, "status-busy").await;
     set_status(&pilot, pilot.owner, SessionStatus::Running).await;
     let reply = lead_reply(&pilot, request.message_id, "reply-busy").await;
-    let job = route_job(&pilot, pilot.leads[0], pilot.owner).await;
+    let job = route_job(&pilot, pilot.owner, pilot.owner).await;
     assert_eq!(
         pilot.manager.plan_terminal_watch_fire(&job).await.unwrap(),
         WatchFirePlan::NotReady
@@ -835,6 +916,100 @@ async fn running_manager_holds_lead_reply_until_it_goes_idle() {
     assert_eq!(job_ids, vec![job.id]);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn reply_event_wake_follows_manager_rotation_and_refuses_revoked_scope() {
+    let pilot = pilot().await;
+    drain_manager_inbox(&pilot).await;
+    set_status(&pilot, pilot.leads[0], SessionStatus::Running).await;
+    let request = manager_request(&pilot, "rotate-reply").await;
+    let reply = lead_reply(&pilot, request.message_id, "rotate-reply-result").await;
+    let job = route_job(&pilot, pilot.owner, pilot.owner).await;
+    let successor = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut next = store.get_session(pilot.owner).unwrap().unwrap();
+        next.id = successor;
+        next.continued_from = Some(pilot.owner);
+        next.rotation_depth += 1;
+        next.status = SessionStatus::Completed;
+        store.insert_session(&next).unwrap();
+        store
+            .update_session_status(pilot.owner, SessionStatus::Archived)
+            .unwrap();
+        store
+            .record_harness_manager_rotation(pilot.owner, successor)
+            .unwrap();
+    }
+    let WatchFirePlan::Deliver { tip, message, .. } =
+        pilot.manager.plan_terminal_watch_fire(&job).await.unwrap()
+    else {
+        panic!("the pending reply must follow the current manager tip");
+    };
+    assert_eq!(tip, successor);
+    assert!(message.contains(&reply.message_id.to_string()));
+    pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+            group_ids: Vec::new(),
+            project_id: pilot.config.project_id,
+            session_id: pilot.owner,
+            epic_ids: Some(Vec::new()),
+            expected_row_version: pilot.config.row_version,
+        })
+        .unwrap();
+    assert!(matches!(
+        pilot.manager.plan_terminal_watch_fire(&job).await.unwrap(),
+        WatchFirePlan::Abandon(_)
+    ));
+    assert!(
+        !pilot
+            .manager
+            .store
+            .lock()
+            .await
+            .harness_manager_wake_authorized(job.id, successor)
+            .unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn reply_event_wake_respects_operator_pause_at_delivery() {
+    let pilot = pilot().await;
+    drain_manager_inbox(&pilot).await;
+    let request = manager_request(&pilot, "paused-reply").await;
+    lead_reply(&pilot, request.message_id, "paused-reply-result").await;
+    let job = route_job(&pilot, pilot.owner, pilot.owner).await;
+    let store = pilot.manager.store.lock().await;
+    assert!(
+        store
+            .harness_manager_wake_authorized(job.id, pilot.owner)
+            .unwrap()
+    );
+    store
+        .record_manager_operator_pause(pilot.owner, true)
+        .unwrap();
+    assert!(
+        !store
+            .harness_manager_wake_authorized(job.id, pilot.owner)
+            .unwrap()
+    );
+    assert_eq!(store.manager_notice_undelivered_count(job.id).unwrap(), 1);
+    store
+        .record_manager_operator_pause(pilot.owner, false)
+        .unwrap();
+    assert!(
+        store
+            .harness_manager_wake_authorized(job.id, pilot.owner)
+            .unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn manager_mail_wakes_idle_lead_while_manager_is_running() {
     let pilot = pilot().await;
@@ -851,6 +1026,7 @@ async fn manager_mail_wakes_idle_lead_while_manager_is_running() {
     assert!(message.contains(&format!("message subject={}", request.message_id)));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn gated_or_failed_recipient_keeps_manager_mail_pending() {
     for status in [SessionStatus::WaitingApproval, SessionStatus::Failed] {
@@ -886,6 +1062,7 @@ async fn gated_or_failed_recipient_keeps_manager_mail_pending() {
 /// gate defers a non-Completed recipient. The exact subject stays pending and
 /// undelivered (never abandoned or consumed) and delivers once the seat's
 /// recovered turn completes.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn failed_manager_seat_keeps_lead_reply_pending_until_recovered() {
     let pilot = pilot().await;
@@ -894,7 +1071,7 @@ async fn failed_manager_seat_keeps_lead_reply_pending_until_recovered() {
     let reply = lead_reply(&pilot, request.message_id, "seat-down-reply").await;
     set_status(&pilot, pilot.leads[0], SessionStatus::Completed).await;
     set_status(&pilot, pilot.owner, SessionStatus::Failed).await;
-    let job = route_job(&pilot, pilot.leads[0], pilot.owner).await;
+    let job = route_job(&pilot, pilot.owner, pilot.owner).await;
     let outcome = pilot.manager.fire_terminal_watch(&job).await.unwrap();
     assert!(
         matches!(
@@ -1073,6 +1250,7 @@ mod abandoned_delivery {
             .enabled
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn abandoned_delivery_to_managed_lead_records_health_fact_and_wakes_manager_once() {
         let Pilot {
@@ -1168,6 +1346,7 @@ mod abandoned_delivery {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn abandoned_delivery_to_non_lead_worker_records_health_fact_only() {
         let Pilot {
@@ -1229,6 +1408,7 @@ mod abandoned_delivery {
             .collect()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn replayed_abandonment_of_the_same_job_records_one_fact_and_one_notice() {
         let Pilot {
@@ -1271,6 +1451,7 @@ mod abandoned_delivery {
 
     /// A failure anywhere inside the atomic abandonment leaves the watch armed
     /// with neither fact nor notice; the next pass settles all three together.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn failure_between_retirement_and_notice_keeps_watch_armed_then_settles_atomically() {
         let Pilot {
@@ -1353,6 +1534,7 @@ mod abandoned_delivery {
     /// #530 interaction: a tip behind a retryable custody gate (Prepared
     /// target reclaim) is deferred, never retired, by the unconsumed-delivery
     /// give-up; once the gate clears the same watch settles atomically.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn custody_gated_tip_defers_give_up_then_settles_once_gate_clears() {
         use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -1616,11 +1798,13 @@ mod abandoned_delivery {
         assert_eq!(notices[0].1, lead.to_string());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn rearm_after_capture_makes_legacy_manager_abandonment_stale() {
         stale_legacy_manager_capture_settles_nothing(false).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn disable_after_capture_makes_legacy_manager_abandonment_stale() {
         stale_legacy_manager_capture_settles_nothing(true).await;
@@ -1647,6 +1831,7 @@ mod abandoned_delivery {
     /// lead is refused (`sandbox_custody:cleanup_failed`) before any provider
     /// launch, so the delivery is never consumed. At the give-up the lead
     /// carries one health fact and the idle manager receives one notice.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn restart_with_refused_lead_deliveries_notifies_manager_at_give_up() {
         let Pilot {
@@ -1800,6 +1985,7 @@ mod abandoned_delivery {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn abandoned_delivery_without_appointed_manager_records_health_fact_only() {
         let (manager, _directory) = manager();
@@ -1846,6 +2032,7 @@ mod abandoned_delivery {
 /// the V2 policy opt-in is still observed: durable Down record, operator
 /// `[manager-seat]` SystemMessage, and the lead-visible `manager_seat`.
 /// Automatic recovery stays disabled.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn v1_appointed_failed_seat_is_signalled_without_v2_policy() {
     let pilot = pilot().await;
@@ -1953,6 +2140,7 @@ async fn v1_project(manager: &SessionManager, project_id: Uuid) -> (Uuid, Uuid, 
 /// than one coordinator page, the wrapping cursor still reaches the last
 /// project within ceil(n / page) passes: Down record, operator alert and the
 /// lead-visible seat.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn v1_failed_seat_beyond_first_page_is_signalled_within_bounded_passes() {
     let (manager, _directory) = manager();

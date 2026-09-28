@@ -1818,6 +1818,7 @@ mod tests {
         session.id
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn terminal_custody_reclaim_candidates_feed_durable_sweep_and_survive_reopen() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-reopen");
@@ -1874,6 +1875,7 @@ mod tests {
         assert_eq!(next_cycle.candidates[0].session_id, ids[0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_upper_bound_defers_new_rows_and_forward_guards_reject_rewind() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-upper");
@@ -1912,6 +1914,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_bounds_raw_rows_and_custody_lookups_before_later_candidate() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-raw-bound");
@@ -1949,6 +1952,7 @@ mod tests {
             .active()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn prepared_recovery_page_wraps_past_stuck_gate_and_skips_staged_rows() {
         let fixture = FixtureDirectory::create("prepared-recovery-page");
@@ -1970,6 +1974,7 @@ mod tests {
         assert_eq!(wrapped, vec![first]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn prepared_reclaim_blocks_effect_and_tombstone_then_staged_allows_effect() {
         let fixture = FixtureDirectory::create("prepared-reclaim-gate");
@@ -2002,6 +2007,7 @@ mod tests {
         store.settle_effect(reservation, false).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn unbound_starting_successor_prevents_prepared_reclaim() {
         let fixture = FixtureDirectory::create("successor-before-reclaim");
@@ -2032,6 +2038,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn prepared_reclaim_refuses_retry_and_rotation_before_successor_insert() {
         use super::super::daemon_settings::{
@@ -2105,6 +2112,7 @@ mod tests {
         assert_eq!(staged.state, TargetReclaimIntentState::Staged);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_intent_scheduler_crosses_two_pages_after_reopen_and_defers_new_tail() {
         let fixture = FixtureDirectory::create("target-reclaim-intent-pages");
@@ -2150,6 +2158,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn pending_intent_survives_fail_closed_custody_lifecycle_transition() {
         let fixture = FixtureDirectory::create("target-reclaim-intent-lifecycle");
@@ -2176,6 +2185,7 @@ mod tests {
         assert_eq!(page.intents, vec![intent]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_intent_fsm_retains_terminal_evidence_and_cas_fences() {
         let fixture = FixtureDirectory::create("target-reclaim-intent-fsm");
@@ -2271,6 +2281,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_clamps_future_observation_and_rejects_non_rfc3339_cursor() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-clock");
@@ -2355,6 +2366,7 @@ mod tests {
         assert!(first.evidence.upper_bound.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_v119_migration_faults_rollback_retry_and_reopen() -> anyhow::Result<()>
     {
@@ -2390,11 +2402,12 @@ mod tests {
             );
             validate_v119_catalog(&reopened.conn)?;
             crate::store::source_worktree_v120::validate_v120_catalog(&reopened.conn)?;
-            crate::store::manager_review_v121::validate_v121_catalog(&reopened.conn)?;
+            crate::store::restart_intents::validate_v134_catalog(&reopened.conn)?;
         }
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_limits_and_catalog_indexes_are_bounded() {
         let store = Store::open_in_memory().unwrap();
@@ -2483,6 +2496,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_write_contention_is_bounded_and_restores_timeout() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-busy");

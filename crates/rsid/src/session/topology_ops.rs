@@ -622,6 +622,7 @@ mod tests {
         definition
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn stored_topology_automation_definitions_validate() {
@@ -703,6 +704,7 @@ mod tests {
 
     // ── Pure-fn validator tests (no daemon needed) ─────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_acyclic_passes() {
         let def = TopologyDefinition {
@@ -717,6 +719,7 @@ mod tests {
         assert!(validate_topology_definition(&def).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_cycle_without_loop_edge_rejected() {
         let def = TopologyDefinition {
@@ -730,6 +733,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_cycle_with_loop_edge_passes() {
         // a→b acyclic; b→a is marked loop_edge so Kahn excludes it.
@@ -743,6 +747,7 @@ mod tests {
         assert!(validate_topology_definition(&def).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_node_kind_epic_rejected() {
         let def = TopologyDefinition {
@@ -756,6 +761,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_validate_edge_to_unknown_node_rejected() {
         let def = TopologyDefinition {
@@ -769,6 +775,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_max_iterations_cap_rejected() {
         let mut n = node("a", SessionKind::Task);
@@ -784,6 +791,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_loop_without_termination_rejected() {
         // SCC {a,b} via loop_edge: true, neither node has max_iterations,
@@ -799,6 +807,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_loop_with_max_iterations_passes() {
         let mut a = node("a", SessionKind::Task);
@@ -811,6 +820,7 @@ mod tests {
         assert!(validate_topology_definition(&def).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_loop_with_until_predicate_passes() {
         let def = TopologyDefinition {
@@ -867,6 +877,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_create_topology_duplicate_name_rejected() {
         let (mgr, _dir) = manager();
@@ -886,6 +897,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_create_topology_creates_bridged_workflow_row() {
         let (mgr, _dir) = manager();
@@ -906,6 +918,7 @@ mod tests {
         assert_eq!(workflow.project_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_update_topology_rename_to_existing_rejected() {
         let (mgr, _dir) = manager();
@@ -930,6 +943,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_delete_topology_unreferenced_succeeds() {
         let (mgr, _dir) = manager();
@@ -950,6 +964,7 @@ mod tests {
         assert!(matches!(result, Err(DaemonError::InvalidParam(_))));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_delete_topology_in_use_rejected() {
         let (mgr, _dir) = manager();
@@ -1000,6 +1015,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_list_topologies_filters_by_prefix() {
         let (mgr, _dir) = manager();
@@ -1035,6 +1051,7 @@ mod tests {
         assert!(names.contains(&"alpine"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_topology_params_round_trip() {
         let (mgr, _dir) = manager();
@@ -1068,6 +1085,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_topology_node_missing_params_deserializes() {
         let json = r#"{

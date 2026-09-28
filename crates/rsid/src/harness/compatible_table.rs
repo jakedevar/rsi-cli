@@ -229,6 +229,7 @@ static COMPATIBLE_TABLE: &[CompatibleEntry] = &[
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_lookup_by_name() {
         let entry = lookup("groq").unwrap();
@@ -236,6 +237,7 @@ mod tests {
         assert!(entry.quirks.native_tools);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_lookup_by_model_prefix() {
         // "deepseek-chat" should match "deepseek"
@@ -244,6 +246,7 @@ mod tests {
         assert!(entry.quirks.strip_think_tags);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_lookup_mercury_routes_to_inception() {
         let entry = lookup("mercury-2").unwrap();
@@ -253,23 +256,27 @@ mod tests {
         assert!(entry.quirks.native_tools);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_lookup_case_insensitive() {
         assert!(lookup("Groq").is_some());
         assert!(lookup("DEEPSEEK").is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_lookup_unknown_returns_none() {
         assert!(lookup("unknown-provider-xyz").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_perplexity_no_streaming() {
         let entry = lookup("perplexity").unwrap();
         assert!(entry.quirks.disable_streaming);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_local_providers_no_auth() {
         for name in &["lmstudio", "llamacpp", "vllm", "ollama"] {

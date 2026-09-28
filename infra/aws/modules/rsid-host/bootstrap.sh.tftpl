@@ -1,0 +1,326 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/rsi-bootstrap.log) 2>&1
+
+REGION='${region}'
+PREFIX='${prefix}'
+VOLUME_ID='${volume_id}'
+BUCKET='${bucket}'
+SOURCE_REF='${source_ref}'
+SOURCE_URL="$(printf '%s' '${base64encode(source_repo_url)}' | base64 -d)"
+INSTALL_MODE='${install_mode}'
+ARCHITECTURE='${architecture}'
+ARTIFACT_URL="$(printf '%s' '${base64encode(artifact_url)}' | base64 -d)"
+ARTIFACT_SHA256='${artifact_sha256}'
+SECRET_NAMES='${join(" ", secret_names)}'
+IDLE_MINUTES='${stop_when_idle_minutes}'
+DEADLINE_UTC='${shutdown_at_utc}'
+
+# Install the one-shot stop before package downloads or volume setup can fail.
+# EC2 is configured to stop, rather than terminate, on guest shutdown.
+if [ -n "$DEADLINE_UTC" ]; then
+  cat > /etc/systemd/system/rsi-deadline-stop.service <<'UNIT'
+[Unit]
+Description=Stop RSI host at its hard UTC deadline
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/shutdown -h now
+UNIT
+  cat > /etc/systemd/system/rsi-deadline-stop.timer <<UNIT
+[Unit]
+Description=Enforce RSI host hard UTC deadline
+[Timer]
+OnCalendar=$(date -u -d "$DEADLINE_UTC" '+%Y-%m-%d %H:%M:%S UTC')
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now rsi-deadline-stop.timer
+fi
+
+dnf install -y git sqlite awscli-2 xfsprogs amazon-cloudwatch-agent tar python3.11
+if [ "$INSTALL_MODE" = 'build' ] || [ "$INSTALL_MODE" = 'deferred' ]; then
+  dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config openssl-devel fontconfig-devel
+fi
+id rsi >/dev/null 2>&1 || useradd --home-dir /srv/rsi --shell /bin/bash rsi
+mkdir -p /srv/rsi /var/log/rsi /usr/local/libexec
+chown rsi:rsi /var/log/rsi
+
+# Nitro exposes EBS volumes as NVMe devices; match the volume serial, never /dev/sdf.
+SERIAL="$(printf '%s' "$VOLUME_ID" | tr -d '-')"
+DEVICE=''
+for attempt in $(seq 1 120); do
+  DEVICE="$(lsblk -dn -o NAME,SERIAL | awk -v serial="$SERIAL" '{gsub("-", "", $2); if ($2 == serial) print "/dev/" $1}' | head -n 1)"
+  [ -n "$DEVICE" ] && break
+  sleep 5
+done
+[ -n "$DEVICE" ] || { echo 'Data volume did not attach'; exit 1; }
+if ! blkid "$DEVICE" >/dev/null 2>&1; then mkfs.xfs -f "$DEVICE"; fi
+UUID="$(blkid -s UUID -o value "$DEVICE")"
+grep -q "UUID=$UUID " /etc/fstab || printf 'UUID=%s /srv/rsi xfs defaults,nofail 0 2\n' "$UUID" >> /etc/fstab
+mountpoint -q /srv/rsi || mount /srv/rsi
+chown rsi:rsi /srv/rsi
+install -d -m 700 -o rsi -g rsi /srv/rsi/.rsi /srv/rsi/backups /var/log/rsi
+mkdir -p /srv/rsi/src
+chown -R rsi:rsi /srv/rsi/.rsi /srv/rsi/src /srv/rsi/backups
+
+cat > /usr/local/libexec/rsi-run <<'RUN'
+#!/bin/bash
+set -euo pipefail
+export HOME=/srv/rsi
+export AWS_DEFAULT_REGION='${region}'
+mkdir -p /run/rsi/ssh
+chmod 700 /run/rsi /run/rsi/ssh
+for name in ${join(" ", secret_names)}; do
+  value="$(aws ssm get-parameter --name '/${prefix}/rsid/'"$name" --with-decryption --query 'Parameter.Value' --output text)"
+  case "$name" in
+    codex_api_key) export OPENAI_API_KEY="$value" ;;
+    openrouter_api_key) export OPENROUTER_API_KEY="$value" OPEN_ROUTER="$value" ;;
+    github_deploy_key)
+      printf '%s\n' "$value" > /run/rsi/ssh/id_ed25519
+      chmod 600 /run/rsi/ssh/id_ed25519
+      export GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes -i /run/rsi/ssh/id_ed25519'
+      ;;
+  esac
+  unset value
+done
+exec /usr/local/bin/rsid
+RUN
+chmod 755 /usr/local/libexec/rsi-run
+
+cat > /etc/systemd/system/rsid.service <<'UNIT'
+[Unit]
+Description=RSI daemon
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/rsi
+[Service]
+Type=simple
+User=rsi
+Group=rsi
+WorkingDirectory=/srv/rsi
+RuntimeDirectory=rsi
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/libexec/rsi-run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+UMask=0077
+ProtectSystem=full
+PrivateTmp=true
+ReadWritePaths=/srv/rsi /var/log/rsi /run/rsi
+StandardOutput=append:/var/log/rsi/rsid.log
+StandardError=append:/var/log/rsi/rsid.log
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+if [ "$INSTALL_MODE" = 'artifact' ]; then
+  ARTIFACT_DIR="$(mktemp -d)"
+  trap 'rm -rf "$ARTIFACT_DIR"' EXIT
+  curl --fail --location --silent --show-error --retry 3 \
+    --proto '=https' --proto-redir '=https' "$ARTIFACT_URL" -o "$ARTIFACT_DIR/bundle.tar.gz"
+  printf '%s  %s\n' "$ARTIFACT_SHA256" "$ARTIFACT_DIR/bundle.tar.gz" | sha256sum --check --status
+  while IFS= read -r entry; do
+    case "$entry" in
+      ./|./rsi|./rsid|./rsi-rpc|./rsi-agent-mcp|./source-commit|./architecture) ;;
+      *) echo "Unexpected artifact member: $entry" >&2; exit 1 ;;
+    esac
+  done < <(tar -tzf "$ARTIFACT_DIR/bundle.tar.gz")
+  tar -xzf "$ARTIFACT_DIR/bundle.tar.gz" --no-same-owner --no-same-permissions -C "$ARTIFACT_DIR"
+  for member in rsi rsid rsi-rpc rsi-agent-mcp source-commit architecture; do
+    test -f "$ARTIFACT_DIR/$member" && test ! -L "$ARTIFACT_DIR/$member"
+  done
+  test "$(cat "$ARTIFACT_DIR/source-commit")" = "$SOURCE_REF"
+  test "$(cat "$ARTIFACT_DIR/architecture")" = "$ARCHITECTURE"
+  BIN_DIR="$ARTIFACT_DIR"
+elif [ "$INSTALL_MODE" = 'build' ]; then
+  # A private Git source can use an operator-provided deploy key in tmpfs.
+  if [[ " $SECRET_NAMES " == *' github_deploy_key '* ]]; then
+    install -d -m 700 -o rsi -g rsi /run/rsi/ssh
+    aws ssm get-parameter --name "/$PREFIX/rsid/github_deploy_key" --with-decryption --query 'Parameter.Value' --output text > /run/rsi/ssh/id_ed25519
+    chown rsi:rsi /run/rsi/ssh/id_ed25519
+    chmod 600 /run/rsi/ssh/id_ed25519
+    export GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -i /run/rsi/ssh/id_ed25519'
+  fi
+  if [ ! -d /srv/rsi/src/.git ]; then
+    runuser -u rsi -- env GIT_SSH_COMMAND="$${GIT_SSH_COMMAND:-}" git clone --no-checkout "$SOURCE_URL" /srv/rsi/src
+  fi
+  runuser -u rsi -- env GIT_SSH_COMMAND="$${GIT_SSH_COMMAND:-}" git -C /srv/rsi/src fetch --no-tags origin "$SOURCE_REF"
+  runuser -u rsi -- git -C /srv/rsi/src checkout --detach "$SOURCE_REF"
+  test "$(git -C /srv/rsi/src rev-parse HEAD)" = "$SOURCE_REF"
+  if [ ! -x /srv/rsi/.cargo/bin/cargo ]; then
+    runuser -u rsi -- env HOME=/srv/rsi sh -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal'
+  fi
+  runuser -u rsi -- env HOME=/srv/rsi PATH="/srv/rsi/.cargo/bin:$PATH" CARGO_TARGET_DIR=/srv/rsi/target \
+    bash -c 'cd /srv/rsi/src && cargo build --locked --release --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp'
+  BIN_DIR=/srv/rsi/target/release
+fi
+if [ "$INSTALL_MODE" != 'deferred' ]; then
+  for binary in rsi rsid rsi-rpc rsi-agent-mcp; do
+    test -f "$BIN_DIR/$binary"
+    install -m 755 "$BIN_DIR/$binary" "/usr/local/bin/$binary"
+  done
+fi
+if [ "$INSTALL_MODE" = 'artifact' ]; then
+  rm -rf "$ARTIFACT_DIR"
+  trap - EXIT
+fi
+
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CW'
+{
+  "logs": {"logs_collected": {"files": {"collect_list": [{
+    "file_path": "/var/log/rsi/rsid.log",
+    "log_group_name": "${log_group}",
+    "log_stream_name": "{instance_id}"
+  }]}}}
+}
+CW
+touch /var/log/rsi/rsid.log
+chown rsi:rsi /var/log/rsi/rsid.log
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+cat > /usr/local/libexec/rsi-health <<'HEALTH'
+#!/bin/bash
+set -euo pipefail
+TOKEN="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)"
+INSTANCE_ID="$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)"
+DISK="$(df -P /srv/rsi | awk 'NR==2 {gsub("%", "", $5); print $5}')"
+SERVICE=0
+systemctl is-active --quiet rsid || SERVICE=1
+AGE=9999
+if [ -r /srv/rsi/.last-backup ]; then
+  AGE="$(( ($(date +%s) - $(cat /srv/rsi/.last-backup)) / 3600 ))"
+fi
+aws cloudwatch put-metric-data --region '${region}' --namespace '${prefix}/rsid' --metric-data \
+  "MetricName=DiskUsedPercent,Dimensions=[{Name=InstanceId,Value=$INSTANCE_ID}],Value=$DISK,Unit=Percent" \
+  "MetricName=ServiceFailed,Dimensions=[{Name=InstanceId,Value=$INSTANCE_ID}],Value=$SERVICE,Unit=Count" \
+  "MetricName=BackupAgeHours,Dimensions=[{Name=InstanceId,Value=$INSTANCE_ID}],Value=$AGE,Unit=Hours"
+HEALTH
+chmod 755 /usr/local/libexec/rsi-health
+cat > /etc/systemd/system/rsi-health.service <<'UNIT'
+[Unit]
+Description=Publish RSI health metrics
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/rsi-health
+UNIT
+cat > /etc/systemd/system/rsi-health.timer <<'UNIT'
+[Unit]
+Description=Publish RSI health every five minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+
+cat > /usr/local/libexec/rsi-backup <<'BACKUP'
+#!/bin/bash
+set -euo pipefail
+DB=/srv/rsi/.rsi/rsi.db
+[ -r "$DB" ] || exit 1
+ACTIVE="$(sqlite3 -readonly "$DB" "SELECT count(*) FROM sessions WHERE status IN ('Starting','Running','WaitingApproval');")"
+[ "$ACTIVE" -eq 0 ] || { echo 'Active sessions: backup deferred'; exit 1; }
+systemctl stop rsid
+trap 'systemctl start rsid' EXIT
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+ARCHIVE="/srv/rsi/backups/$STAMP.tar.gz"
+tar --exclude='./backups' --exclude='./target' -C /srv/rsi -czf "$ARCHIVE" .
+aws s3 cp --region '${region}' "$ARCHIVE" 's3://${bucket}/backups/'"$STAMP.tar.gz"
+date +%s > /srv/rsi/.last-backup
+rm -f "$ARCHIVE"
+BACKUP
+chmod 700 /usr/local/libexec/rsi-backup
+cat > /etc/systemd/system/rsi-backup.service <<'UNIT'
+[Unit]
+Description=Quiesced RSI backup
+RequiresMountsFor=/srv/rsi
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/rsi-backup
+UNIT
+cat > /etc/systemd/system/rsi-backup.timer <<'UNIT'
+[Unit]
+Description=Nightly RSI backup
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
+if [ '${enable_tailscale}' = 'true' ]; then
+  curl -fsSL https://tailscale.com/install.sh | sh
+  install -d -m 700 /run/rsi
+  aws ssm get-parameter --name "/$PREFIX/rsid/tailscale_auth_key" --with-decryption --query 'Parameter.Value' --output text > /run/rsi/tailscale-authkey
+  chmod 600 /run/rsi/tailscale-authkey
+  tailscale up --auth-key=file:/run/rsi/tailscale-authkey --accept-dns=false
+  rm -f /run/rsi/tailscale-authkey
+fi
+
+if [ "$IDLE_MINUTES" -gt 0 ]; then
+  cat > /usr/local/libexec/rsi-idle-stop <<'IDLE'
+#!/bin/bash
+set -euo pipefail
+# Fail closed if the daemon DB cannot be read. SSM, SSH, TUI and provider
+# processes keep the instance running even when their CPU use is low.
+if [ -e /srv/rsi/.keep-running ] || [ -n "$(who)" ] || \
+   pgrep -u ssm-user >/dev/null 2>&1 || \
+   pgrep -f '^sshd: .+@' >/dev/null 2>&1 || \
+   pgrep -x rsi >/dev/null 2>&1 || \
+   pgrep -u rsi -f 'codex|claude|opencode|pioneer|antigravity|cargo|rustc|nextest|cloud-sweep' >/dev/null 2>&1; then
+  rm -f /run/rsi-idle-since
+  exit 0
+fi
+DB=/srv/rsi/.rsi/rsi.db
+if [ -r "$DB" ]; then
+  ACTIVE="$(sqlite3 -readonly "$DB" "SELECT count(*) FROM sessions WHERE status IN ('Starting','Running','WaitingApproval');")" || exit 0
+  if [ "$ACTIVE" -ne 0 ]; then
+    rm -f /run/rsi-idle-since
+    exit 0
+  fi
+  # Future daemon wakes need the host online even when no provider is running.
+  PENDING="$(sqlite3 -readonly "$DB" 'SELECT count(*) FROM scheduled_jobs WHERE enabled = 1;')" || exit 0
+  if [ "$PENDING" -ne 0 ]; then
+    rm -f /run/rsi-idle-since
+    exit 0
+  fi
+elif [ '${install_mode}' != 'deferred' ]; then
+  exit 0
+fi
+if [ ! -f /run/rsi-idle-since ]; then date +%s > /run/rsi-idle-since; exit 0; fi
+NOW="$(date +%s)"
+SINCE="$(cat /run/rsi-idle-since)"
+if [ "$((NOW - SINCE))" -ge "$(( ${stop_when_idle_minutes} * 60 ))" ]; then
+  TOKEN="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)"
+  INSTANCE_ID="$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)"
+  aws ec2 stop-instances --region '${region}' --instance-ids "$INSTANCE_ID" >/dev/null
+fi
+IDLE
+  chmod 700 /usr/local/libexec/rsi-idle-stop
+  cat > /etc/systemd/system/rsi-idle-stop.service <<'UNIT'
+[Unit]
+Description=Stop idle RSI host
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/rsi-idle-stop
+UNIT
+  cat > /etc/systemd/system/rsi-idle-stop.timer <<'UNIT'
+[Unit]
+Description=Check RSI host idle state
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+fi
+
+systemctl daemon-reload
+if [ "$INSTALL_MODE" != 'deferred' ]; then
+  systemctl enable --now rsid.service rsi-health.timer rsi-backup.timer
+fi
+if [ "$IDLE_MINUTES" -gt 0 ]; then systemctl enable --now rsi-idle-stop.timer; fi

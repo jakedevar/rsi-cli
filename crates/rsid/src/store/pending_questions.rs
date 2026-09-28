@@ -315,6 +315,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_same_text_reservation_blocks_old_tool_before_insert() {
         let store = Store::open_in_memory().unwrap();
@@ -365,6 +366,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_failed_event_insert_stays_unresolved_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -404,6 +406,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_event_and_invocation_bind_or_roll_back_together() {
         let store = Store::open_in_memory().unwrap();
@@ -467,6 +470,7 @@ mod tests {
         assert_eq!(store.load_events_since(session, None).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_interrupted_reservation_survives_restart_without_inference() {
         let dir = tempfile::tempdir().unwrap();
@@ -487,6 +491,7 @@ mod tests {
         unresolved(&store, session);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_stale_producer_cannot_overwrite_newer_or_cleared_epoch() {
         let store = Store::open_in_memory().unwrap();
@@ -532,6 +537,7 @@ mod tests {
         assert_eq!(store.load_events_since(session, None).unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_legacy_and_partial_remain_readable_unresolved_gates() {
         let store = Store::open_in_memory().unwrap();
@@ -573,6 +579,7 @@ mod tests {
         assert_eq!(store.pending_question_target(session).unwrap(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_has_no_synthetic_non_claude_support() {
         let store = Store::open_in_memory().unwrap();
@@ -595,6 +602,7 @@ mod tests {
         assert_eq!(store.load_events_since(session.id, None).unwrap().len(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_current_survives_reopen_but_later_user_input_is_stale() {
         let dir = tempfile::tempdir().unwrap();
@@ -626,6 +634,7 @@ mod tests {
                 .contains("question_identity_stale")
         );
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn pending_question_publication_preserves_explicit_purge_of_legacy_session_data() {
         let store = Store::open_in_memory().unwrap();

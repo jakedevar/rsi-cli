@@ -16,7 +16,7 @@ pub(super) const WRITING_HANDOFF_TIMEOUT_SECS: u64 = 300;
 pub(crate) enum RotationState {
     /// Not in any rotation flow. Initial state.
     Idle,
-    /// Context hit 65%, stop signal sent. Waiting for monitor loop to break.
+    /// Context reached its threshold, stop signal sent. Waiting for monitor loop to break.
     PendingInterrupt { deadline: tokio::time::Instant },
     /// Session resumed with /create_handoff. Waiting for handoff doc to be written.
     WritingHandoff {
@@ -31,16 +31,26 @@ pub(crate) enum RotationState {
 #[derive(Debug)]
 pub(super) enum RotationEvent {
     /// Token usage updated.
-    ThresholdCheck { pct: f64 },
+    ThresholdCheck {
+        pct: f64,
+    },
+    ThresholdCheckConfigured {
+        pct: f64,
+        threshold_pct: f64,
+    },
     /// User explicitly requested manual rotation.
     /// This bypasses auto-rotation enablement.
     ManualTrigger,
     /// A handoff filepath was detected in Write tool_use or assistant text.
-    HandoffFileDetected { path: String },
+    HandoffFileDetected {
+        path: String,
+    },
     /// The current rotation phase deadline elapsed.
     DeadlineElapsed,
     /// The monitor loop exited.
-    MonitorCompleted { break_reason: MonitorBreakReason },
+    MonitorCompleted {
+        break_reason: MonitorBreakReason,
+    },
 }
 
 /// Actions the monitor loop must execute in response to a coordinator decision.
@@ -171,8 +181,11 @@ impl RotationCoordinator {
     pub(super) fn advance(&mut self, event: RotationEvent) -> RotationAction {
         match (&self.state, event) {
             // ── Threshold check ──
-            (RotationState::Idle, RotationEvent::ThresholdCheck { pct }) if self.enabled => {
-                if pct >= 65.0 {
+            (
+                RotationState::Idle,
+                RotationEvent::ThresholdCheckConfigured { pct, threshold_pct },
+            ) if self.enabled => {
+                if pct >= threshold_pct {
                     self.ensure_rotation_id();
                     self.state = Self::pending_interrupt_state();
                     RotationAction::InterruptForRotation
@@ -180,6 +193,12 @@ impl RotationCoordinator {
                     RotationAction::NoOp
                 }
             }
+
+            (RotationState::Idle, RotationEvent::ThresholdCheck { pct }) if self.enabled => self
+                .advance(RotationEvent::ThresholdCheckConfigured {
+                    pct,
+                    threshold_pct: 65.0,
+                }),
 
             // ── Manual rotation request ──
             (RotationState::Idle, RotationEvent::ManualTrigger) => {
@@ -283,6 +302,7 @@ pub(crate) fn is_pipeline_artifact(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn idle_below_threshold_is_noop() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, true);
@@ -293,6 +313,27 @@ mod tests {
         assert!(matches!(c.state, RotationState::Idle));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[test]
+    fn configured_threshold_controls_interrupt() {
+        let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, true);
+        assert!(matches!(
+            c.advance(RotationEvent::ThresholdCheckConfigured {
+                pct: 70.0,
+                threshold_pct: 80.0
+            }),
+            RotationAction::NoOp
+        ));
+        assert!(matches!(
+            c.advance(RotationEvent::ThresholdCheckConfigured {
+                pct: 80.0,
+                threshold_pct: 80.0
+            }),
+            RotationAction::InterruptForRotation
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn idle_above_65_depth0_interrupts() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, true);
@@ -304,6 +345,7 @@ mod tests {
         assert!(c.current_deadline().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn idle_above_65_depth_four_rotates() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 4, true);
@@ -314,6 +356,7 @@ mod tests {
         assert!(matches!(c.state, RotationState::PendingInterrupt { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn pending_interrupt_rotation_sends_create_handoff() {
         let sid = Uuid::new_v4();
@@ -330,6 +373,7 @@ mod tests {
         assert!(matches!(c.state, RotationState::WritingHandoff { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn pending_interrupt_timeout_breaks_monitor_and_kills_process() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, true);
@@ -346,6 +390,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn writing_handoff_timeout_breaks_monitor_without_killing_process() {
         let mut c = RotationCoordinator::new_writing_handoff(Uuid::new_v4(), 0, true);
@@ -359,6 +404,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn writing_handoff_detects_file() {
         let mut c = RotationCoordinator::new_writing_handoff(Uuid::new_v4(), 0, true);
@@ -374,6 +420,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn writing_handoff_with_path_spawns_child() {
         let mut c = RotationCoordinator::new_writing_handoff(Uuid::new_v4(), 0, true);
@@ -392,6 +439,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn writing_handoff_without_path_spawns_with_none() {
         let mut c = RotationCoordinator::new_writing_handoff(Uuid::new_v4(), 0, true);
@@ -406,6 +454,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn disabled_rotation_is_noop() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, false);
@@ -415,6 +464,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn set_enabled_toggles_threshold_behavior() {
         // Initially enabled — should trigger
@@ -440,6 +490,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn rotation_id_generated_on_threshold() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, true);
@@ -448,6 +499,7 @@ mod tests {
         assert!(c.rotation_id().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn manual_trigger_interrupts_even_when_auto_rotation_disabled() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 0, false);
@@ -460,6 +512,7 @@ mod tests {
         assert!(c.current_deadline().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn manual_trigger_is_independent_of_rotation_depth() {
         let mut c = RotationCoordinator::new(Uuid::new_v4(), 4, true);
@@ -470,12 +523,14 @@ mod tests {
         assert!(matches!(c.state, RotationState::PendingInterrupt { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn rotation_id_preset_for_writing_handoff() {
         let c = RotationCoordinator::new_writing_handoff(Uuid::new_v4(), 0, true);
         assert!(c.rotation_id().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn writing_handoff_preserves_supplied_rotation_id() {
         let c = RotationCoordinator::new_writing_handoff_with_rotation_id(
@@ -487,6 +542,7 @@ mod tests {
         assert_eq!(c.rotation_id(), Some("rotation-123"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn is_handoff_file_matches() {
         assert!(is_handoff_file(
@@ -502,6 +558,7 @@ mod tests {
         assert!(!is_handoff_file("src/main.rs"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn is_pipeline_artifact_matches() {
         assert!(is_pipeline_artifact(

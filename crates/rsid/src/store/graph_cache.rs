@@ -132,6 +132,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn init_cache_table_creates_table() {
         let conn = Connection::open_in_memory().unwrap();
@@ -142,6 +143,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn save_and_load_entry_roundtrip() {
         let conn = setup_db();
@@ -161,6 +163,7 @@ mod tests {
         assert_eq!(loaded.workflow.name, "test-workflow");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn changed_content_yields_distinct_key_and_cache_miss() {
         let conn = setup_db();
@@ -184,6 +187,7 @@ mod tests {
         assert!(load_entry(&conn, &stale_key).unwrap().is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn legacy_shaped_rows_load_with_defaulted_content_hash() {
         // Simulate a pre-V69 DB: create the table WITHOUT content_hash, insert a
@@ -242,6 +246,7 @@ mod tests {
         assert_ne!(key.to_key_string(), legacy_key);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn clear_cache_removes_all_entries() {
         let conn = setup_db();

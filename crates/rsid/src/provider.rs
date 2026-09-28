@@ -291,6 +291,7 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_cli_provider_session_wraps_and_forwards() {
         let (tx, rx) = mpsc::channel(4);
@@ -313,6 +314,7 @@ mod tests {
         assert!(done.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_send_approval_default_refuses_unsupported_transport() {
         let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
@@ -328,6 +330,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_start_turn_default_returns_err() {
         let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
@@ -340,6 +343,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_supports_multi_turn_default_false() {
         let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
@@ -347,6 +351,7 @@ mod tests {
         assert!(!session.supports_multi_turn());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_supports_approvals_default_false() {
         let (_tx, rx) = mpsc::channel::<StreamEvent>(1);

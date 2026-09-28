@@ -1446,6 +1446,7 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn loop_reentry_uses_previous_iteration_commit_and_keeps_ancestry() {
         let (repo, base) = custody_test_repo();
@@ -1508,6 +1509,7 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn hub_fanin_uses_declared_lineage_and_unresolved_fanin_is_rejected() {
         let (repo, base) = custody_test_repo();
@@ -1556,6 +1558,7 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn layer_preparation_error_returns_no_partial_launches() {
         let (repo, base) = custody_test_repo();
@@ -1614,6 +1617,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn cache_reclaim_error_preserves_completed_status() {
         let status = report_reclaim_without_changing_status(
@@ -1624,6 +1628,7 @@ mod tests {
         assert_eq!(status, SessionStatus::Completed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn topological_layers_linear_pipeline() {
         let nodes = vec![
@@ -1640,6 +1645,7 @@ mod tests {
         assert_eq!(layers[2], vec!["c"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn topological_layers_diamond() {
         let nodes = vec![
@@ -1663,6 +1669,7 @@ mod tests {
         assert_eq!(layers[2], vec!["d"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn topological_layers_detects_cycle() {
         let nodes = vec![NodeDef::action("a", "A"), NodeDef::action("b", "B")];
@@ -1674,6 +1681,7 @@ mod tests {
         assert!(result.unwrap_err().contains("cycle"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn topological_layers_loop_edge_excluded_from_kahn() {
         // A→B (acyclic), B→A (loop_edge). Without the filter, Kahn would detect a cycle.
@@ -1688,6 +1696,7 @@ mod tests {
         assert_eq!(layers[1], vec!["b"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn topological_layers_disconnected_nodes() {
         let nodes = vec![
@@ -1703,6 +1712,7 @@ mod tests {
         assert_eq!(layers[0].len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn build_node_query_with_context_and_instructions() {
         let node = NodeDef::action("test", "Test Node");
@@ -1723,6 +1733,7 @@ mod tests {
         assert!(query.contains("Analyze the data"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn pipeline_entry_goal_flows_without_visible_restatement() {
         let mut entry = NodeDef::action("entry", "Entry");
@@ -1749,6 +1760,7 @@ mod tests {
         assert!(!query.contains(PIPELINE_ENTRY_CONTEXT_KEY));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn build_node_query_empty_falls_back_to_name() {
         let node = NodeDef::action("test", "My Node");
@@ -1758,6 +1770,7 @@ mod tests {
         assert_eq!(query, "Execute node: My Node");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn resolve_provider_from_node_field() {
         let mut node = NodeDef::action("test", "Test");
@@ -1766,6 +1779,7 @@ mod tests {
         assert_eq!(resolve_provider(&node), Some(SessionProvider::Antigravity));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn resolve_provider_accepts_pioneer() {
         let mut node = NodeDef::action("test", "Test");
@@ -1774,6 +1788,7 @@ mod tests {
         assert_eq!(resolve_provider(&node), Some(SessionProvider::Pioneer));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn resolve_provider_falls_back_to_model_settings() {
         use rsi_graph::format::ModelSettings;
@@ -1790,12 +1805,14 @@ mod tests {
         assert_eq!(resolve_provider(&node), Some(SessionProvider::Codex));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn resolve_provider_none_when_unset() {
         let node = NodeDef::action("test", "Test");
         assert_eq!(resolve_provider(&node), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn extract_session_output_finds_last_assistant_message() {
         use chrono::Utc;
@@ -1854,6 +1871,7 @@ mod tests {
         assert_eq!(output.get("_completed"), Some(&Value::Bool(true)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn apply_edge_filter_include() {
         use rsi_graph::format::FilterDef;
@@ -1879,6 +1897,7 @@ mod tests {
         assert!(filtered.get("drop").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn apply_edge_filter_none_passes_through() {
         let mut data = NodeData::new();
@@ -1896,6 +1915,7 @@ mod tests {
     /// MaxIterations(3) produces metadata with scc_regions containing both nodes,
     /// and that topological_layers correctly filters the loop edge from Kahn so it
     /// can produce a valid layer order. (Full round-trip requires #[ignore] AI calls.)
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_runs_simple_loop_to_max_iterations() {
         let nodes = vec![NodeDef::action("a", "A"), NodeDef::action("b", "B")];
@@ -1945,6 +1965,7 @@ mod tests {
     /// test_executor_lead_halt_terminates_loop:
     /// Verify that LeadHalt until_condition is correctly parsed from metadata and that
     /// the UntilCondition::LeadHalt variant round-trips through serde.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_lead_halt_terminates_loop() {
         let until = rsi_common::types::UntilCondition::LeadHalt;
@@ -1966,6 +1987,7 @@ mod tests {
     /// Verify that FailurePolicy::Retry is correctly parsed from metadata.
     /// The bridge serializes via Debug ("Retry"), the parser normalizes to lowercase
     /// for serde_json deserialization ("retry").
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_failure_policy_retry() {
         // Build metadata as bridge would stamp it (Debug format: "Retry").
@@ -1988,6 +2010,7 @@ mod tests {
 
     /// test_executor_failure_policy_skip:
     /// Verify that FailurePolicy::Skip is correctly parsed from metadata.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_failure_policy_skip() {
         let raw: HashMap<String, String> = [("node_b".to_string(), "Skip".to_string())]
@@ -2010,6 +2033,7 @@ mod tests {
     /// test_executor_failure_policy_halt:
     /// Verify that FailurePolicy::Halt is correctly parsed, and that absent entries
     /// (no policy in map) return None (which the executor treats as Halt-equivalent).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_failure_policy_halt() {
         let raw: HashMap<String, String> = [("node_c".to_string(), "Halt".to_string())]
@@ -2037,6 +2061,7 @@ mod tests {
 
     /// Meta-impl topology smoke: ExecuteTopology on the real meta-impl topology.
     /// Marked #[ignore] — requires live daemon and DB.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     #[ignore = "requires live daemon; run manually: cargo test -p rsid -- smoke_meta_impl_topology --ignored"]
     async fn smoke_meta_impl_topology_loop_execution() {
@@ -2059,6 +2084,7 @@ mod tests {
     /// spawned `LaunchConfig`.
     ///
     /// Keep the test as a contract pin so reverting Phase 2 fails compilation.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_executor_threads_parent_id_to_spawned_sessions() {
         use std::sync::Arc;
@@ -2107,6 +2133,7 @@ mod tests {
     /// forever on `Continue`. Bounded by an outer `tokio::time::timeout` so
     /// a regression (reverting the `Lagged` arm to bare `continue` /
     /// unconditional `Continue`) fails this test instead of hanging it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn lagged_recv_rechecks_status_instead_of_looping_forever() {
         use std::sync::atomic::AtomicUsize;

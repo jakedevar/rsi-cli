@@ -7,8 +7,9 @@ use crate::claude_config;
 use crate::modalkit_types::LcAction;
 use crate::model_control_stats::stats_row_action;
 use crate::overlay::{
-    open_budget_policy_form, open_hook_form, open_message_bridge_form, open_provider_form,
-    open_skill_preview, open_text_area_bg_editor,
+    open_budget_policy_form, open_hook_form, open_message_bridge_form,
+    open_provider_credential_form, open_provider_form, open_skill_preview,
+    open_text_area_bg_editor,
 };
 use crate::settings::{
     DaemonFeatureEntry, FORMULATION_ANIM_DURATIONS, MessageBridgeKind, UserSettings, cycle_u64,
@@ -16,7 +17,10 @@ use crate::settings::{
 #[cfg(test)]
 use crate::settings::{DaemonFeatureValue, OBSERVATION_THRESHOLDS};
 use crate::settings_registry::{SETTINGS, SettingId, SettingOwner, SettingSpec, SettingsSection};
-use crate::types::{HookFormEditingTarget, Pane, SettingsFocus, SettingsState};
+use crate::types::{
+    HookFormEditingTarget, Pane, ProviderKeyClearConfirmation, SettingsFocus, SettingsState,
+};
+use rsi_common::provider_credentials::ProviderCredentialSlot;
 use rsi_common::types::SessionProvider;
 
 /// Sections whose rows are entirely fanned out of the flat
@@ -193,7 +197,8 @@ const fn spec_position_for_ui_row(section: SettingsSection, ui_row: usize) -> us
         }
         SettingsSection::ApiProviders
         | SettingsSection::ClaudeHooks
-        | SettingsSection::ClaudeSkills => 0,
+        | SettingsSection::ClaudeSkills
+        | SettingsSection::ProviderKeys => 0,
         _ => ui_row,
     }
 }
@@ -417,6 +422,85 @@ fn delete_selected_budget_policy(app: &mut App) {
         app.pending_lc_actions
             .push(LcAction::DeleteBudgetPolicy(idx));
     }
+}
+
+// --- Provider Keys helpers (#694 K1b) ---------------------------------------
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+/// Arm-then-confirm window for clearing a credential — matches
+/// `app::issues`' `IssueCancelConfirmation` TTL exactly.
+const CLEAR_CONFIRM_TTL_MS: i64 = 2_000;
+
+/// Selected slot for the Provider Keys category's current row.
+/// `ProviderCredentialSlot::ALL` is a fixed, ordered 23-slot enum, so
+/// `selected_index` maps onto it directly — no daemon round trip needed to
+/// know WHICH slot is selected, only to know its current state.
+fn selected_provider_credential_slot(app: &App) -> Option<ProviderCredentialSlot> {
+    ProviderCredentialSlot::ALL
+        .get(app.settings_state.selected_index)
+        .copied()
+}
+
+/// Open the credential form for the selected slot. `rotate` picks
+/// Set (`false`) vs Rotate (`true`) — see the `Enter`/`s`/`r` arms below.
+fn open_provider_credential_form_for_selected(app: &mut App, rotate: bool) {
+    if let Some(slot) = selected_provider_credential_slot(app) {
+        open_provider_credential_form(app, slot, rotate);
+    }
+}
+
+/// `c`: fire an immediate `CheckProviderCredential` for the selected slot.
+fn check_selected_provider_credential(app: &mut App) {
+    if let Some(slot) = selected_provider_credential_slot(app) {
+        app.pending_lc_actions
+            .push(LcAction::CheckProviderCredentialSlot(slot));
+    }
+}
+
+/// `d` on a Provider Keys row: first press arms a "press d again" clear
+/// confirmation for the selected slot; a second `d` on the SAME slot within
+/// `CLEAR_CONFIRM_TTL_MS` enqueues the clear. Mirrors
+/// `app::issues::arm_issue_cancel`/`submit_issue_cancel`'s arm-then-confirm
+/// shape (`IssueCancelConfirmation`) — identity- and TTL-checked at confirm
+/// time rather than cleared on ordinary navigation.
+fn arm_or_confirm_clear_selected_credential(app: &mut App) {
+    let Some(slot) = selected_provider_credential_slot(app) else {
+        return;
+    };
+    let now = now_ms();
+    let confirmed = app
+        .settings_state
+        .provider_key_clear_confirmation
+        .is_some_and(|c| {
+            c.slot == slot && now.saturating_sub(c.armed_at_ms) <= CLEAR_CONFIRM_TTL_MS
+        });
+    if confirmed {
+        app.settings_state.provider_key_clear_confirmation = None;
+        app.pending_lc_actions
+            .push(LcAction::ClearProviderCredentialSlot(slot));
+    } else {
+        app.settings_state.provider_key_clear_confirmation = Some(ProviderKeyClearConfirmation {
+            slot,
+            armed_at_ms: now,
+        });
+        app.notify(format!("Clear {slot} credential? Press d again to confirm"));
+    }
+}
+
+/// `i`: import every importable slot from its legacy env var. Global action
+/// (not scoped to the selected row).
+fn import_provider_credentials_from_env(app: &mut App) {
+    app.pending_lc_actions
+        .push(LcAction::ImportProviderCredentialsFromEnv);
 }
 
 // --- Skills helpers --------------------------------------------------------
@@ -653,6 +737,8 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             } else if section == SettingsSection::Budgets {
                 handle_budgets_enter(app);
+            } else if section == SettingsSection::ProviderKeys {
+                open_provider_credential_form_for_selected(app, false);
             } else if section == SettingsSection::ModelRoles {
                 // All Model Roles items use the model dropdown.
                 if app.settings_state.model_dropdown.open {
@@ -772,6 +858,51 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 && app.settings_state.focus == SettingsFocus::Items =>
         {
             delete_selected_budget_policy(app);
+            true
+        }
+
+        // Provider Keys use one fixed row per masked vault slot.
+        KeyCode::Char('s')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            open_provider_credential_form_for_selected(app, false);
+            true
+        }
+        KeyCode::Char('r')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            open_provider_credential_form_for_selected(app, true);
+            true
+        }
+        KeyCode::Char('c')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            check_selected_provider_credential(app);
+            true
+        }
+        KeyCode::Char('d')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            arm_or_confirm_clear_selected_credential(app);
+            true
+        }
+        KeyCode::Char('i')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            import_provider_credentials_from_env(app);
+            true
+        }
+        KeyCode::Char('R')
+            if app.settings_state.section == SettingsSection::ProviderKeys
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            app.pending_lc_actions
+                .push(LcAction::RefreshProviderCredentials);
             true
         }
 
@@ -965,7 +1096,7 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
     }
     match section {
         SettingsSection::ThemeColors => 20,
-        SettingsSection::Screen => 4,
+        SettingsSection::Screen => 6,
         SettingsSection::TranscriptDefaults => 3,
         SettingsSection::InputPrompts => 3,
         // Each provider is one row; always show at least 1 row (the "[+ add]" hint).
@@ -989,6 +1120,7 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         // live rendering/navigation expands this through
         // `model_control_budgets::budget_row_count`.
         SettingsSection::Budgets => 1,
+        SettingsSection::ProviderKeys => ProviderCredentialSlot::ALL.len(),
         SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
@@ -1100,7 +1232,15 @@ fn maybe_queue_daemon_features_refresh(app: &mut App) {
 fn refresh_entered_settings_section(app: &mut App) {
     maybe_queue_daemon_features_refresh(app);
     maybe_queue_usage_stats_refresh(app);
+    maybe_queue_provider_credentials_refresh(app);
     ensure_claude_caches_for_category(app);
+}
+
+fn maybe_queue_provider_credentials_refresh(app: &mut App) {
+    if app.settings_state.section == SettingsSection::ProviderKeys {
+        app.pending_lc_actions
+            .push(LcAction::RefreshProviderCredentials);
+    }
 }
 
 fn enter_settings_section(app: &mut App, section: SettingsSection, selected_index: usize) {
@@ -1380,11 +1520,17 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
             // Index 1 (text_area_backfill_hex) opens an editor overlay — handled
             // in `handle_settings_key`, not via toggle.
             2 => {
+                settings.formulation_anim_enabled = !settings.formulation_anim_enabled;
+            }
+            3 => {
                 settings.formulation_anim_ms =
                     cycle_u64(settings.formulation_anim_ms, FORMULATION_ANIM_DURATIONS);
             }
-            3 => {
+            4 => {
                 settings.activity_indicator_style = settings.activity_indicator_style.next();
+            }
+            5 => {
+                settings.detail_column_alignment = settings.detail_column_alignment.next();
             }
             _ => {}
         },
@@ -1452,13 +1598,67 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         SettingsSection::Usage => {}
         // Budgets rows are add/edit/delete via dedicated 'a'/'d'/Enter
         // handlers (RPC round-trip); toggle is a no-op here.
-        SettingsSection::Budgets => {}
+        SettingsSection::Budgets | SettingsSection::ProviderKeys => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_keys_actions_target_the_selected_slot() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        app.settings_state.focus = SettingsFocus::Items;
+        let slot = ProviderCredentialSlot::ALL[0];
+
+        for code in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('s')] {
+            assert!(handle_settings_key(&mut app, key(code)));
+            assert!(matches!(
+                app.overlay,
+                crate::types::OverlayState::ProviderCredentialForm {
+                    slot: selected,
+                    rotate: false,
+                    ..
+                } if selected == slot
+            ));
+            app.overlay = crate::types::OverlayState::None;
+        }
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('r'))));
+        assert!(matches!(
+            app.overlay,
+            crate::types::OverlayState::ProviderCredentialForm {
+                slot: selected,
+                rotate: true,
+                ..
+            } if selected == slot
+        ));
+        app.overlay = crate::types::OverlayState::None;
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('c'))));
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::CheckProviderCredentialSlot(slot))
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('i'))));
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::ImportProviderCredentialsFromEnv)
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('d'))));
+        assert_eq!(
+            app.settings_state
+                .provider_key_clear_confirmation
+                .map(|c| c.slot),
+            Some(slot)
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('d'))));
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::ClearProviderCredentialSlot(slot))
+        );
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
@@ -1628,14 +1828,14 @@ mod tests {
     #[test]
     fn test_settings_category_all_count() {
         // Epic M design D.1: 21 sections under 7 rail groups.
-        assert_eq!(SettingsSection::ALL.len(), 21);
+        assert_eq!(SettingsSection::ALL.len(), 22);
     }
 
     #[test]
     fn test_item_count_per_category() {
         let settings = UserSettings::default();
         assert_eq!(item_count(SettingsSection::ThemeColors, &settings), 20);
-        assert_eq!(item_count(SettingsSection::Screen, &settings), 4);
+        assert_eq!(item_count(SettingsSection::Screen, &settings), 6);
         assert_eq!(
             item_count(SettingsSection::TranscriptDefaults, &settings),
             3
@@ -1664,6 +1864,7 @@ mod tests {
             SettingsSection::ModelControl,
             SettingsSection::Budgets,
             SettingsSection::Usage,
+            SettingsSection::ProviderKeys,
             SettingsSection::RetriesRecovery,
             SettingsSection::StallDetection,
             SettingsSection::MemoryDreaming,
@@ -1733,11 +1934,50 @@ mod tests {
     }
 
     #[test]
-    fn test_cycle_activity_indicator_style() {
+    fn formulation_animation_defaults_off_and_toggles() {
+        let mut settings = UserSettings::default();
+        assert!(!settings.formulation_anim_enabled, "animation ships off");
+        let state = SettingsState {
+            section: SettingsSection::Screen,
+            selected_index: 2,
+            focus: SettingsFocus::Items,
+            ..Default::default()
+        };
+        toggle_setting(&mut settings, &state);
+        assert!(settings.formulation_anim_enabled);
+        toggle_setting(&mut settings, &state);
+        assert!(!settings.formulation_anim_enabled);
+    }
+
+    #[test]
+    fn formulation_speed_cycles_presets() {
         let mut settings = UserSettings::default();
         let state = SettingsState {
             section: SettingsSection::Screen,
             selected_index: 3,
+            focus: SettingsFocus::Items,
+            ..Default::default()
+        };
+        let before = settings.formulation_anim_ms;
+        toggle_setting(&mut settings, &state);
+        assert_eq!(
+            settings.formulation_anim_ms,
+            cycle_u64(before, FORMULATION_ANIM_DURATIONS)
+        );
+    }
+
+    #[test]
+    fn formulation_enabled_absent_in_saved_settings_means_off() {
+        let settings: UserSettings = serde_json::from_str("{}").expect("empty settings parse");
+        assert!(!settings.formulation_anim_enabled);
+    }
+
+    #[test]
+    fn test_cycle_activity_indicator_style() {
+        let mut settings = UserSettings::default();
+        let state = SettingsState {
+            section: SettingsSection::Screen,
+            selected_index: 4,
             focus: SettingsFocus::Items,
             ..Default::default()
         };
@@ -1760,6 +2000,38 @@ mod tests {
         assert_eq!(
             settings.activity_indicator_style,
             crate::settings::ActivityIndicatorStyle::Semantic
+        );
+    }
+
+    #[test]
+    fn test_cycle_detail_column_alignment() {
+        use crate::settings::DetailColumnAlignment;
+        let mut settings = UserSettings::default();
+        let state = SettingsState {
+            section: SettingsSection::Screen,
+            selected_index: 5,
+            focus: SettingsFocus::Items,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Center
+        );
+        toggle_setting(&mut settings, &state);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        toggle_setting(&mut settings, &state);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Left
+        );
+        toggle_setting(&mut settings, &state);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Center
         );
     }
 

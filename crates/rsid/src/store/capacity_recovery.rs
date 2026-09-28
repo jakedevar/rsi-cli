@@ -2516,6 +2516,7 @@ mod tests {
     use chrono::TimeZone as _;
     use rsi_common::types::SessionStatus;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn v89_exact_v88_full_catalog_matches_pinned_fingerprint() {
         let store = Store::open_in_memory().expect("open exact V88 derivation fixture");
@@ -2528,6 +2529,7 @@ mod tests {
         assert_eq!(fingerprint, V88_ACCEPTED_FULL_CATALOG_FINGERPRINT);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn v89_deployed_additive_v88_full_catalog_matches_pinned_fingerprint() {
         let directory = tempfile::tempdir().expect("create deployed-additive V88 fixture dir");
@@ -2544,6 +2546,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn v89_pre_antigravity_v88_full_catalog_matches_pinned_fingerprint() {
         let directory = tempfile::tempdir().expect("create pre-Antigravity V88 fixture dir");
@@ -2755,12 +2758,14 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn capacity_backoff_table_is_exact_and_saturating() {
         assert_eq!(BACKOFF_SECONDS, [60, 120, 240, 480, 960, 1920, 3600]);
         assert_eq!(BACKOFF_SECONDS[6], 3600);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn capacity_identities_are_stable_and_epoch_scoped() {
         let guard = Uuid::from_u128(1);
@@ -2770,6 +2775,7 @@ mod tests {
         assert_ne!(wake_id(first), issue_id(first));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn initial_replay_and_eight_distinct_attempts_are_one_bounded_outage() {
         let fixture = fixture(true);
@@ -2836,6 +2842,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn projectless_outage_stays_wake_only_until_a_new_epoch() {
         let fixture = fixture(false);
@@ -2915,6 +2922,7 @@ mod tests {
         assert_eq!(count(&fixture.store, "issues"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn issue_writer_settlement_failpoints_roll_back_wake_issue_incident_event_and_attempt() {
         for fault in [
@@ -3010,6 +3018,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn close_is_forward_only_and_replay_cannot_reopen_or_reschedule() {
         let fixture = fixture(true);
@@ -3083,6 +3092,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn fast_capacity_terminal_rearm_wins_over_stale_scheduler_disable() {
         let fixture = fixture(true);
@@ -3177,6 +3187,7 @@ mod tests {
         assert_eq!(replay.due_slot, advanced.due_slot);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_replay_after_store_reopen_is_a_noop() {
         let directory = tempfile::tempdir().unwrap();
@@ -3258,6 +3269,7 @@ mod tests {
         assert_eq!(wake.next_fire_at, committed.due_slot);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn noncapacity_success_atomically_closes_delivery_receipt_and_resets_epoch() {
         let fixture = fixture(true);
@@ -3360,6 +3372,7 @@ mod tests {
         assert_ne!(attributed_issue(&next), attributed_issue(&opening));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn issue_writer_terminal_capacity_new_replay_and_project_issue_disposition_are_exact() {
         for project_backed in [true, false] {
@@ -3480,6 +3493,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_capacity_fault_seams_roll_back_every_custody_edge() {
         for fault in [
@@ -3533,6 +3547,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_capacity_reopen_replays_without_rearm_for_both_issue_dispositions() {
         for project_backed in [true, false] {
@@ -3584,6 +3599,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_capacity_delivery_receipt_transitions_once_and_replays_exactly() {
         let fixture = fixture(true);
@@ -3684,6 +3700,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn close_lookup_is_lineage_bounded_and_ignores_101_unrelated_incidents() {
         let fixture = fixture(false);
@@ -3732,6 +3749,7 @@ mod tests {
         assert_eq!(exact_stats.controller_index_lookups, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn receipt_free_close_uses_newest_opened_then_incident_id_tie_break() {
         let store = Store::open_in_memory().unwrap();
@@ -3754,6 +3772,7 @@ mod tests {
         assert_eq!(stats.controller_index_lookups, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn close_corruption_matrix_fails_without_custody_mutation() {
         let fixture = fixture(false);

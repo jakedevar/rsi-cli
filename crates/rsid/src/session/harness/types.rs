@@ -8,6 +8,41 @@
 
 use serde::{Deserialize, Serialize};
 
+const TOOL_BLOCKS_PREFIX: &str = "\u{001e}rsi-tool-blocks-v1:";
+
+/// Tool content independent of any provider's request format. Image data is
+/// base64 encoded; callers must apply their own size and media-type limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolContentBlock {
+    Text { text: String },
+    Image { media_type: String, data: String },
+}
+
+fn encode_tool_blocks(blocks: &[ToolContentBlock]) -> String {
+    format!(
+        "{TOOL_BLOCKS_PREFIX}{}",
+        serde_json::to_string(blocks).expect("tool content blocks serialize")
+    )
+}
+
+fn decode_tool_blocks(content: &str) -> Option<Vec<ToolContentBlock>> {
+    content
+        .strip_prefix(TOOL_BLOCKS_PREFIX)
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn visible_tool_text(blocks: &[ToolContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ToolContentBlock::Text { text } => text.clone(),
+            ToolContentBlock::Image { media_type, .. } => format!("[image: {media_type}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Role in a conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,12 +54,15 @@ pub enum MessageRole {
 }
 
 /// A single message in the conversation history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     /// For tool result messages: the ID of the tool call this responds to.
     pub tool_call_id: Option<String>,
+    /// Whether this tool result represents a failed execution.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
     /// Tool calls requested by the assistant (populated when role == Assistant).
     pub tool_calls: Vec<ToolCall>,
 }
@@ -35,6 +73,7 @@ impl ChatMessage {
             role: MessageRole::System,
             content: content.into(),
             tool_call_id: None,
+            is_error: false,
             tool_calls: Vec::new(),
         }
     }
@@ -44,6 +83,7 @@ impl ChatMessage {
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
+            is_error: false,
             tool_calls: Vec::new(),
         }
     }
@@ -53,6 +93,7 @@ impl ChatMessage {
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
+            is_error: false,
             tool_calls: Vec::new(),
         }
     }
@@ -62,8 +103,47 @@ impl ChatMessage {
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(call_id.into()),
+            is_error: false,
             tool_calls: Vec::new(),
         }
+    }
+
+    pub fn tool_error_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            is_error: true,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Preserve the persisted string history shape while carrying typed blocks.
+    /// Legacy tool messages remain ordinary strings and decode as one text block.
+    pub fn tool_result_blocks(
+        call_id: impl Into<String>,
+        blocks: Vec<ToolContentBlock>,
+        is_error: bool,
+    ) -> Self {
+        let mut message = Self::tool_result(call_id, encode_tool_blocks(&blocks));
+        message.is_error = is_error;
+        message
+    }
+
+    pub fn tool_blocks(&self) -> Vec<ToolContentBlock> {
+        decode_tool_blocks(&self.content).unwrap_or_else(|| {
+            vec![ToolContentBlock::Text {
+                text: self.content.clone(),
+            }]
+        })
+    }
+
+    pub fn has_typed_tool_blocks(&self) -> bool {
+        decode_tool_blocks(&self.content).is_some()
+    }
+
+    pub fn visible_tool_text(&self) -> String {
+        visible_tool_text(&self.tool_blocks())
     }
 
     /// Approximate token count using the 4-chars-per-token heuristic.
@@ -149,6 +229,31 @@ pub struct ToolResult {
     pub error_msg: Option<String>,
 }
 
+impl ToolResult {
+    /// Whether tool execution failed. `success` remains the source of truth for
+    /// existing tool implementations while exposing the protocol error flag.
+    pub fn is_error(&self) -> bool {
+        !self.success
+    }
+
+    /// Produce a block result without changing existing text-tool constructors.
+    pub fn from_blocks(blocks: Vec<ToolContentBlock>, is_error: bool) -> Self {
+        Self {
+            success: !is_error,
+            output: encode_tool_blocks(&blocks),
+            error_msg: None,
+        }
+    }
+
+    pub fn has_typed_blocks(&self) -> bool {
+        decode_tool_blocks(&self.output).is_some()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 /// Per-provider quirk flags for compatible providers.
 #[derive(Debug, Clone)]
 pub struct ProviderQuirks {
@@ -195,6 +300,7 @@ pub enum AuthStyle {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn test_chat_message_constructors() {
         let sys = ChatMessage::system("you are helpful");
@@ -213,8 +319,13 @@ mod tests {
         assert_eq!(tool.role, MessageRole::Tool);
         assert_eq!(tool.tool_call_id.as_deref(), Some("call-123"));
         assert_eq!(tool.content, "result data");
+        assert!(!tool.is_error);
+
+        let tool_error = ChatMessage::tool_error_result("call-error", "failed");
+        assert!(tool_error.is_error);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn test_estimated_tokens() {
         let msg = ChatMessage::user("hello world"); // 11 chars -> (11+3)/4 = 3
@@ -224,6 +335,7 @@ mod tests {
         assert_eq!(empty.estimated_tokens(), 0); // (0+3)/4 = 0 (integer division)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn test_message_role_serde() {
         let json = serde_json::to_string(&MessageRole::System).unwrap();
@@ -233,6 +345,7 @@ mod tests {
         assert_eq!(parsed, MessageRole::Assistant);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn test_tool_call_serde() {
         let tc = ToolCall {
@@ -246,6 +359,63 @@ mod tests {
         assert_eq!(parsed.name, "read_file");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn tool_error_history_round_trips_and_success_flag_stays_omitted() {
+        let history = vec![
+            ChatMessage::tool_result("call-ok", "ok"),
+            ChatMessage::tool_error_result("call-error", "failed"),
+        ];
+        let json = serde_json::to_value(&history).unwrap();
+        assert_eq!(json[0].get("is_error"), None);
+        assert_eq!(json[1]["is_error"], true);
+
+        let parsed: Vec<ChatMessage> = serde_json::from_value(json).unwrap();
+        assert!(!parsed[0].is_error);
+        assert!(parsed[1].is_error);
+        assert_eq!(parsed[1].tool_call_id.as_deref(), Some("call-error"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn typed_tool_blocks_round_trip_in_string_history() {
+        let blocks = vec![
+            ToolContentBlock::Text {
+                text: "preview".into(),
+            },
+            ToolContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            },
+        ];
+        let result = ToolResult::from_blocks(blocks.clone(), true);
+        assert!(result.is_error());
+        assert!(result.has_typed_blocks());
+        let message = ChatMessage::tool_result_blocks("call-image", blocks.clone(), true);
+        let stored = serde_json::to_value(&message).unwrap();
+        assert!(stored["content"].is_string());
+        let restored: ChatMessage = serde_json::from_value(stored).unwrap();
+        assert!(restored.is_error);
+        assert_eq!(restored.tool_blocks(), blocks);
+        assert_eq!(restored.visible_tool_text(), "preview\n[image: image/png]");
+
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "content": "plain text",
+            "tool_call_id": "old",
+            "tool_calls": []
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.tool_blocks(),
+            vec![ToolContentBlock::Text {
+                text: "plain text".into()
+            }]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn test_provider_quirks_default() {
         let q = ProviderQuirks::default();

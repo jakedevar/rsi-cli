@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 use rsi_common::harness_manager::{
     AgentManagerWorkViewRequestV1, AgentManagerWorkViewResultV1, HarnessManagerConfigV1,
     MANAGER_WORK_VIEW_MAX_RELAY, ManagerWorkViewOwnershipV1, ManagerWorkViewRelayV1,
-    ManagerWorkViewStageV1, ManagerWorkViewWorkV1,
+    ManagerWorkViewReviewV1, ManagerWorkViewStageV1, ManagerWorkViewWorkV1,
 };
+use rsi_common::harness_manager_v2::ManagerWorkStageV2;
 use rsi_common::types::SessionStatus;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
@@ -194,6 +195,40 @@ impl Store {
                 || source == who.root
                 || self.manager_lineage_root(source).ok() == Some(who.root)
         });
+        let source_acceptance_recorded = work
+            .source_commit
+            .as_deref()
+            .map(|source| self.manager_v2_accepted_source(&who.config, work, source))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let source_accepted = source_acceptance_recorded
+            && self
+                .manager_v2_dependency_blockers(&who.config, key)?
+                .is_empty();
+        let review = self.manager_review_projection(&who.config, work)?;
+        let current_review =
+            serde_json::from_value::<Option<ManagerWorkViewReviewV1>>(review["current"].clone())?;
+        let evidence_state = if review["mode"] == "db_native" {
+            if source_acceptance_recorded {
+                "review_receipt_accepted"
+            } else {
+                "review_receipt_pending"
+            }
+        } else if work
+            .required_gates
+            .iter()
+            .filter(|gate| **gate != ManagerWorkStageV2::Integration)
+            .all(|gate| {
+                work.stages
+                    .iter()
+                    .any(|stage| stage.stage == *gate && stage.admission.is_some())
+            })
+        {
+            "admitted"
+        } else {
+            "unknown"
+        };
         Ok(ManagerWorkViewWorkV1 {
             work_key: key.to_owned(),
             title: work.title.clone(),
@@ -214,8 +249,15 @@ impl Store {
                     })
                 })
                 .collect::<Result<_>>()?,
-            accepted: work.acceptance.is_some(),
-            integrated: work.integration.is_some(),
+            accepted: source_accepted,
+            source_accepted,
+            source_acceptance_recorded,
+            evidence_state: evidence_state.into(),
+            current_review,
+            integrated: source_accepted
+                && work.integration.as_ref().is_some_and(|integration| {
+                    Some(&integration.source_commit) == work.source_commit.as_ref()
+                }),
         })
     }
 

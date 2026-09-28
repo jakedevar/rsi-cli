@@ -180,6 +180,7 @@ mod tests {
         Some(names)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn class_for_query_matches() {
         let mut reg = CommandRegistry::default();
@@ -212,6 +213,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn class_for_query_none_for_free_text() {
         let mut reg = CommandRegistry::default();
@@ -229,6 +231,7 @@ mod tests {
         assert_eq!(reg.class_for_query("/"), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn registry_loads_files_and_skips_malformed() {
         let dir = tempdir().unwrap();
@@ -279,6 +282,7 @@ mod tests {
         assert!(reg.get("worker_preamble").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn registry_load_missing_dir_is_empty() {
         let dir = tempdir().unwrap();
@@ -293,6 +297,7 @@ mod tests {
     /// `.claude/commands` sibling directory is found. Silently skips when the
     /// commands directory is absent (e.g. cross-checkout runs outside the
     /// repo), so the test never becomes a drag on unrelated harnesses.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn registry_loads_all_commands_with_class() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

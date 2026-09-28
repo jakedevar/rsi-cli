@@ -51,6 +51,10 @@ pub mod openrouter;
 pub mod path_safety;
 pub mod pioneer;
 pub(crate) mod process_control;
+// Foundation module is intentionally unwired until the real scope lifecycle
+// gate passes and the provider call sites have separate ownership.
+#[allow(dead_code)]
+pub(crate) mod process_scope;
 pub mod profiling;
 pub(crate) mod program_run_control;
 pub(crate) mod program_run_dispatch;
@@ -65,6 +69,8 @@ pub mod reconciliation;
 pub mod recursive_dag;
 pub mod rpc;
 pub mod sandbox;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod satellite;
 pub mod scheduler;
 pub mod session;
 pub mod stall_classifier;
@@ -75,5 +81,6 @@ pub(crate) mod terminal_output;
 pub mod tool_registry;
 pub(crate) mod topology;
 pub mod turn_controller;
+pub mod vault;
 pub mod watch_service;
 pub mod watchdog;

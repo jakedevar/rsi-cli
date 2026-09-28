@@ -18,7 +18,7 @@ pub(super) fn render_rename_session_overlay(frame: &mut Frame, area: Rect, title
     let block = Block::default()
         .title(" Rename Session ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
+        .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()));
 
     let inner = block.inner(popup_area);

@@ -1,9 +1,9 @@
 //! Git operations tool -- status, diff, log, branch operations.
 
-use super::HarnessTool;
+use super::{HarnessTool, truncation::truncate_text};
 use crate::process_control::{
     CaptureError, CaptureLimits, SESSION_TOOL_MAX_STREAM_BYTES, SESSION_TOOL_TIMEOUT,
-    bounded_lossy_concat, capture_bounded,
+    capture_bounded,
 };
 use crate::session::harness::types::ToolResult;
 use std::path::Path;
@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_GIT_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT_BYTES: usize = SESSION_TOOL_MAX_STREAM_BYTES;
-const OUTPUT_TRUNCATED_MARKER: &str = "\n\n[output truncated at 1 MB]";
 
 fn command_timeout(args: &serde_json::Value, default: Duration) -> Duration {
     args.get("timeout_secs")
@@ -59,7 +58,31 @@ impl GitTool {
         let timeout = command_timeout(&args, self.timeout);
         let parts: Vec<&str> = git_args.split_whitespace().collect();
 
-        let mut command = tokio::process::Command::new("git");
+        let limits = match crate::process_scope::WorkerScopeLimits::from_launcher_snapshot() {
+            Ok(limits) => limits,
+            Err(error) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(error.to_string()),
+                };
+            }
+        };
+        let scoped = crate::process_scope::ScopedWorkerCommand::new(
+            std::ffi::OsStr::new("git"),
+            self.invocation_id.unwrap_or_else(uuid::Uuid::new_v4),
+            limits,
+        );
+        let mut command = match scoped {
+            Ok(scoped) => scoped.into_command(),
+            Err(error) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(error.to_string()),
+                };
+            }
+        };
         command.args(&parts).current_dir(working_dir);
         command.env(
             rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
@@ -75,25 +98,28 @@ impl GitTool {
             );
         }
 
+        // #694 K1: git can run agent-supplied aliases/hooks; no provider key.
+        crate::vault::scrub_credential_env(&mut command);
+
         let mut limits = CaptureLimits::session_tool();
         limits.execution_timeout = timeout;
         match capture_bounded(command, limits, cancel).await {
             Ok(output) => {
-                let mut parts: Vec<&[u8]> = vec![&output.stdout];
+                let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
                 if !output.stderr.is_empty() {
                     if !output.stdout.is_empty() {
-                        parts.push(b"\n");
+                        combined.push('\n');
                     }
-                    parts.push(&output.stderr);
+                    combined.push_str(&String::from_utf8_lossy(&output.stderr));
                 }
                 ToolResult {
                     success: output.status.success(),
-                    output: bounded_lossy_concat(
-                        &parts,
+                    output: truncate_text(
+                        &combined,
                         MAX_OUTPUT_BYTES,
                         output.stdout_truncated || output.stderr_truncated,
-                        OUTPUT_TRUNCATED_MARKER,
-                    ),
+                    )
+                    .content,
                     error_msg: if output.status.success() {
                         None
                     } else {
@@ -161,6 +187,7 @@ impl HarnessTool for GitTool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_git_status_in_repo() {
         // Run git status in the workspace root (which is a git repo)
@@ -183,6 +210,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_git_invalid_command() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -202,6 +230,7 @@ mod tests {
         assert!(result.error_msg.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn test_git_defaults_to_status() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -216,6 +245,7 @@ mod tests {
         assert!(result.success, "{:?}", result.error_msg);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn bound_git_preserves_its_exact_ownership_stamps() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -252,6 +282,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn git_command_has_fixed_timeout() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

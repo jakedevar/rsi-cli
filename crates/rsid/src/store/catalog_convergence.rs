@@ -346,6 +346,7 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn object_name_reads_indexes_and_triggers() {
         assert_eq!(
@@ -363,6 +364,7 @@ pub(crate) mod tests {
         assert_eq!(object_name("SELECT 1").as_deref(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn rebuild_restores_canonical_text_rows_and_attached_objects() {
         let connection = Connection::open_in_memory().unwrap();

@@ -160,6 +160,7 @@ impl HarnessTool for ShellTool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_shell_echo() {
         let tool = ShellTool::default();
@@ -173,6 +174,7 @@ mod tests {
         assert_eq!(result.output.trim(), "hello");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_shell_exit_nonzero() {
         let tool = ShellTool::default();
@@ -184,6 +186,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("Exit code: 1"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_shell_timeout() {
         let tool = ShellTool {
@@ -200,6 +203,7 @@ mod tests {
         assert!(msg.contains("timed out"), "unexpected msg: {msg}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_shell_strips_markdown_fence() {
         let tool = ShellTool::default();
@@ -213,6 +217,7 @@ mod tests {
         assert_eq!(result.output.trim(), "stripped");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_shell_env_scrubbing() {
         // RSI_TEST_SECRET should not be visible to the subprocess

@@ -231,8 +231,54 @@ async fn operator_policy_edits_every_field_and_saves_current_fences() {
     assert!(screen(&mut app).contains("Coordination desk"));
 }
 
+/// #633: the operator grants the topology `Automation` capability from the
+/// policy editor (no raw SQL), and the saved policy carries its wire name.
 #[tokio::test]
-async fn policy_empty_launch_list_displays_any_choice_and_saves_after_last_restriction_removed() {
+async fn operator_policy_grants_topology_automation_capability() {
+    let (mut app, config) = fixture();
+    let mut saved = policy_config(&config);
+    saved.row_version = 3;
+    saved.policy.capabilities = vec![ManagerCapabilityV2::Automation];
+    let (_dir, task) = connect(
+        &mut app,
+        vec![
+            ("GetHarnessManagerPolicy", json!({"result":null})),
+            ("ConfigureHarnessManagerPolicy", json!({"result":saved})),
+        ],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    {
+        let s = policy_mut(&mut app);
+        s.advanced_open = true;
+        let row = s
+            .rows()
+            .into_iter()
+            .find(|row| row.label == "Grant Automation")
+            .expect("Automation capability row");
+        assert_eq!(
+            row.description,
+            "Author, run, interrupt and resolve topologies on scoped Epics"
+        );
+        s.activate(row.field);
+        assert!(
+            s.draft
+                .capabilities
+                .contains(&ManagerCapabilityV2::Automation)
+        );
+    }
+    key(&mut app, KeyCode::Char('s')).await;
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[1]["params"]["policy"]["capabilities"],
+        json!(["automation"])
+    );
+}
+
+#[tokio::test]
+async fn policy_empty_launch_list_shows_intent_hold_and_saves_after_last_restriction_removed() {
     use policy::Field::*;
     let (mut app, config) = fixture();
     let mut restricted = policy_config(&config);
@@ -272,7 +318,7 @@ async fn policy_empty_launch_list_displays_any_choice_and_saves_after_last_restr
         let s = policy_mut(&mut app);
         s.selected = s.rows().iter().position(|r| r.field == AddLaunch).unwrap();
     }
-    assert!(screen(&mut app).contains("Any provider/model/effort"));
+    assert!(screen(&mut app).contains("automatic recovery: held"));
     {
         let s = policy_mut(&mut app);
         s.advanced_open = true;
@@ -286,7 +332,7 @@ async fn policy_empty_launch_list_displays_any_choice_and_saves_after_last_restr
     assert!(screen(&mut app).contains("configured-model"));
     key(&mut app, KeyCode::Char('s')).await;
     policy_mut(&mut app).activate(RemoveLaunch(0));
-    assert!(screen(&mut app).contains("Any provider/model/effort"));
+    assert!(screen(&mut app).contains("automatic recovery: held"));
     key(&mut app, KeyCode::Char('s')).await;
     let requests = finish(task).await;
     assert_eq!(
@@ -302,7 +348,7 @@ async fn policy_empty_launch_list_displays_any_choice_and_saves_after_last_restr
     );
     assert_eq!(policy_mut(&mut app).policy_version, 4);
     assert!(policy_mut(&mut app).draft.allowed_launches.is_empty());
-    assert!(screen(&mut app).contains("Any provider/model/effort"));
+    assert!(screen(&mut app).contains("automatic recovery: held"));
 }
 
 #[tokio::test]
@@ -750,6 +796,81 @@ fn action_rows_distinguish_container_commit_from_provider_launch() {
     assert!(details.contains("Receipt state: queued — admission only; no completion confirmed"));
 }
 
+#[test]
+fn migration_allocation_inspect_section_and_conflict_title_are_visible() {
+    assert!(board::SECTIONS.contains(&ManagerInspectSectionV2::MigrationAllocations));
+    let row = json!({
+        "type":"migration_allocation",
+        "claim_id":Uuid::new_v4(),
+        "work_key":"schema-cutover",
+        "version":144,
+        "state":"active",
+        "conflict":true,
+        "remote_tip":"b".repeat(40),
+        "row_version":3,
+        "source_commit":"a".repeat(40),
+        "expires_at":"2026-09-27T00:00:00.000000000Z"
+    });
+    assert_eq!(
+        board::row_title(&row),
+        "schema v144 · schema-cutover · conflict"
+    );
+    let details = board::row_details(&row).join("\n");
+    assert!(details.contains("claim id"));
+    assert!(details.contains("source commit"));
+    assert!(details.contains("remote tip"));
+    assert!(details.contains("row version"));
+    assert!(details.contains("expires at"));
+}
+
+#[tokio::test]
+async fn migration_allocations_inspect_uses_operator_manager_state_rpc() {
+    let (mut app, config) = fixture();
+    let inspection = page(
+        &config,
+        ManagerInspectSectionV2::MigrationAllocations,
+        vec![json!({
+            "type":"migration_allocation",
+            "key":"00000000000000000001",
+            "sequence":1,
+            "claim_id":Uuid::new_v4(),
+            "work_key":"schema-cutover",
+            "epic_id":config.epic_ids[0],
+            "source_commit":"a".repeat(40),
+            "version":144,
+            "state":"active",
+            "remote_tip":"b".repeat(40),
+            "candidate_commit":null,
+            "row_version":3,
+            "expires_at":"2026-09-27T00:00:00.000000000Z",
+            "conflict":true,
+            "conflict_reason":"remote_tip_changed"
+        })],
+        None,
+    );
+    let (_dir, task) = connect(
+        &mut app,
+        vec![("GetHarnessManagerState", json!({"result":inspection}))],
+    )
+    .await;
+    board::open_section(
+        &mut app,
+        config,
+        "Coordination desk".into(),
+        ManagerSection::Inspect(ManagerInspectSectionV2::MigrationAllocations),
+    )
+    .await
+    .unwrap();
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[0]["params"]["query"]["section"],
+        "migration_allocations"
+    );
+    let text = screen(&mut app);
+    assert!(text.contains("Migration allocations"));
+    assert!(text.contains("schema v144 · schema-cutover · conflict"));
+}
+
 #[tokio::test]
 async fn unresolved_operator_gate_opens_its_exact_session_and_preserves_pending_approval() {
     let (mut app, config) = fixture();
@@ -934,6 +1055,7 @@ fn health_row(epic: Uuid, title: &str) -> Value {
         "lead_state":"current",
         "children":{"live":2},
         "notices":{"to_manager":{"pending":2},"to_lead":{"pending":1}},
+        "reports":{"pending_requests":3,"informational_messages":7},
         "stuck":[{"code":"manager_watch_missing","evidence":[epic]},
                  {"code":"lead_delivery_abandoned","evidence":["job-7"]}],
         "complete":true,"truncated":[]})
@@ -957,16 +1079,20 @@ async fn board_renders_health_band_with_epic_and_its_stuck_codes() {
         .unwrap();
     let requests = finish(task).await;
     assert_eq!(requests[3]["params"]["query"]["section"], "health");
+    assert!(
+        board::band_row_label(board::Band::Health, &health_row(epic, "Fleet health Epic"))
+            .contains("3 pending/7 info")
+    );
     let row = board_state(&app).selected_row().unwrap();
     assert_eq!(
         board::band_row_label(board::Band::Health, row),
-        "Fleet health Epic · stuck manager_watch_missing,lead_delivery_abandoned \
+        "3 pending/7 info · Fleet health Epic · stuck manager_watch_missing,lead_delivery_abandoned \
          · lead Completed 17m · live 2 · notices 3"
     );
     let text = screen(&mut app);
     for value in [
         "HEALTH 1",
-        "Fleet health Epic · stuck manager_watch_missing",
+        "3 pending/7 info · Fleet health Epic",
         "code: lead_delivery_abandoned",
         &format!("epic id: {epic}"),
         "coverage complete",
@@ -1004,17 +1130,17 @@ async fn board_health_band_names_codes_for_a_failed_lead_instead_of_ok() {
     finish(task).await;
     assert_eq!(
         board::band_row_label(board::Band::Health, &failed),
-        "Failed lead Epic · stuck lead_unavailable · lead Failed 5m · live 2 · notices 3"
+        "3 pending/7 info · Failed lead Epic · stuck lead_unavailable · lead Failed 5m · live 2 · notices 3"
     );
     assert_eq!(
         board::band_row_label(board::Band::Health, &quiet),
-        "Interrupted lead Epic · unverified · lead Interrupted 2m · live 2 · notices 3"
+        "3 pending/7 info · Interrupted lead Epic · unverified · lead Interrupted 2m · live 2 · notices 3"
     );
     let text = screen(&mut app);
     for value in [
         "HEALTH 2",
-        "Failed lead Epic · stuck lead_unavailable",
-        "Interrupted lead Epic · unverified",
+        "3 pending/7 info · Failed",
+        "3 pending/7 info · Interrupted",
         "code: lead_unavailable",
     ] {
         assert!(text.contains(value), "{value} missing from board");

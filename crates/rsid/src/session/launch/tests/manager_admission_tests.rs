@@ -101,6 +101,7 @@ async fn stop_scoped_test_process(manager: &SessionManager, id: Uuid) {
     manager.persistence.barrier().await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_agent_child_and_fresh_interleave_one_shared_unpublished_slot() {
     for child_wins in [false, true] {
@@ -234,6 +235,7 @@ async fn manager_v2_agent_child_and_fresh_interleave_one_shared_unpublished_slot
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_v2_agent_child_rechecks_policy_scope_and_reservation_after_preflight() {
     for change in [
@@ -358,6 +360,7 @@ async fn manager_v2_agent_child_rechecks_policy_scope_and_reservation_after_pref
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_strong_successor_reserves_before_publication_without_early_baton_transfer() {
     let (manager, _dir, _sandbox) = manager();
@@ -534,6 +537,7 @@ async fn manager_v2_strong_successor_reserves_before_publication_without_early_b
     stop_scoped_test_process(&manager, id).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_fresh_service_launches_reserve_capacity_before_session_publication() {
     let (manager, dir, _sandbox) = manager();
@@ -574,8 +578,10 @@ async fn manager_v2_fresh_service_launches_reserve_capacity_before_session_publi
         first,
         ControllerCandidateTestPhase::FreshChildAfterAdmission,
     );
-    let first_launch = manager.launch_session(a);
-    let second_launch = manager.launch_session(b);
+    // Both launch futures are large; keep the concurrent fixture within the
+    // default Tokio test worker stack without changing the launch path.
+    let mut first_launch = Box::pin(manager.launch_session(a));
+    let second_launch = Box::pin(manager.launch_session(b));
     let interleave = async {
         a_validated.await.unwrap();
         b_validated.await.unwrap();
@@ -591,7 +597,6 @@ async fn manager_v2_fresh_service_launches_reserve_capacity_before_session_publi
         b_resume.send(()).unwrap();
         // Hold publication until the competing launch has completed admission.
     };
-    tokio::pin!(first_launch);
     let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(30), async {
         let b = async {
             let (outcome, ()) = tokio::join!(second_launch, interleave);
@@ -650,6 +655,7 @@ async fn manager_v2_fresh_service_launches_reserve_capacity_before_session_publi
     .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_v2_fresh_service_pause_after_parent_validation_prevents_provider_spawn() {
     let (manager, dir, _sandbox) = manager();

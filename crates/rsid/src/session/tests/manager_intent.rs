@@ -5,6 +5,7 @@ use crate::session::launch;
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_interrupted_partial_program_keeps_automatic_recovery_held() {
     let p = pilot().await;
@@ -60,6 +61,26 @@ async fn work(p: &Pilot, key: &str) {
         },
     )
     .await;
+}
+
+async fn completed_codex_refusal(p: &Pilot, class: &str) {
+    let store = p.manager.store.lock().await;
+    store
+        .update_session_status(p.lead, SessionStatus::Completed)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET provider='Codex',claude_session_id='torn-thread' WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store.conn.execute(
+        "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,error_class,created_at,completed_at)
+         VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable','admitted','failed','manager-intent-test',?2,?3,?4,?4)",
+        rusqlite::params![Uuid::new_v4().to_string(), p.lead.to_string(), class, stamp],
+    ).unwrap();
 }
 async fn update(p: &Pilot, key: &str, change: ManagerUpdateV2) {
     let policy_version = p
@@ -243,104 +264,33 @@ async fn restart(p: &mut Pilot) {
     p.manager.restore_sessions().await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn manager_intent_empty_launch_list_resumes_current_lead_after_restart_and_obeys_budget() {
+async fn manager_intent_empty_launch_list_holds_without_relaunch_after_restart() {
     let mut p = pilot().await;
-    let receipt = p
-        .admit(
-            "initial-lead",
-            ManagerActionV2::ReplaceLead {
-                epic_id: p.epic,
-                expected: p.fence().await,
-                query: "initial turn".into(),
-                launch: p.policy.allowed_launches[0].clone(),
-            },
-        )
-        .await;
-    p.lead = receipt.target_session_id.unwrap();
-    let first = launch::install_controller_candidate_test_process(p.lead);
-    p.execute().await.unwrap();
-    wait_launch_event(&p, p.lead).await;
-    finish_turn(&p, p.lead, &first).await;
-    let before = p
-        .manager
-        .store
-        .lock()
-        .await
-        .live_custody_for_session(p.lead)
-        .unwrap();
-    std::fs::write(
-        std::path::Path::new(&before.sandbox_root).join("unfinished"),
-        "retain this work",
-    )
-    .unwrap();
-    policy(&p, |policy| {
-        policy.max_recovery_attempts = 1;
-        policy.allowed_launches.clear();
-    })
-    .await;
+    policy(&p, |policy| policy.allowed_launches.clear()).await;
     work(&p, "product").await;
-    assert_eq!(reconcile(&p).await.queued, 1);
-    let id = operation(&p).await;
-    let timestamp = due(&p, id).await;
-    assert_eq!(intent(&p).await["state"], "recovery_action");
-    assert_eq!(p.manager.reconcile_manager_actions_once().await.unwrap(), 0);
+    assert_eq!(reconcile(&p).await.queued, 0);
+    let before = intent(&p).await;
+    assert_eq!(before["state"], "blocked");
+    assert!(
+        before["reason"]
+            .as_str()
+            .unwrap()
+            .contains("manager_v2_intent_launch_allowlist_required")
+    );
+    assert_eq!(count_actions(&p).await, 0);
+    restart(&mut p).await;
     for _ in 0..3 {
         assert_eq!(reconcile(&p).await.queued, 0);
+        assert_eq!(intent(&p).await, before);
     }
-    assert_eq!(count_actions(&p).await, 1);
-    restart(&mut p).await;
-    assert_eq!(due(&p, id).await, timestamp);
-    assert_eq!(reconcile(&p).await.queued, 0);
-    let resumed = launch::install_controller_candidate_test_process(p.lead);
-    wait_due(&p, id).await;
-    settle_action(&p, id).await;
-    assert_eq!(p.receipt(id).await.state, ManagerActionStateV2::Succeeded);
-    assert_eq!(resumed.productive_start_count.load(Ordering::SeqCst), 1);
-    assert_eq!(p.manager.reconcile_manager_actions_once().await.unwrap(), 0);
-    let after = p
-        .manager
-        .store
-        .lock()
-        .await
-        .live_custody_for_session(p.lead)
-        .unwrap();
-    assert_eq!(
-        (after.custody_id, after.generation),
-        (before.custody_id, before.generation)
-    );
-    assert_eq!(
-        std::fs::read_to_string(std::path::Path::new(&after.sandbox_root).join("unfinished"))
-            .unwrap(),
-        "retain this work"
-    );
-    let key: String = p.manager.store.lock().await.conn.query_row(
-        "SELECT m.dedup_key FROM sessions s JOIN model_invocations m ON m.id=s.model_invocation_id WHERE s.id=?1",
-        [p.lead.to_string()], |r| r.get(0)).unwrap();
-    assert_eq!(key, format!("manager.action:{id}"));
-    wait_launch_event(&p, p.lead).await;
-    finish_turn(&p, p.lead, &resumed).await;
-    reconcile(&p).await;
-    assert!(
-        intent(&p).await["reason"]
-            .as_str()
-            .unwrap()
-            .contains("intent_recovery_budget_exhausted")
-    );
-    restart(&mut p).await;
-    reconcile(&p).await;
-    assert_eq!(intent(&p).await["state"], "blocked");
-    assert!(
-        intent(&p).await["reason"]
-            .as_str()
-            .unwrap()
-            .contains("intent_recovery_budget_exhausted")
-    );
-    assert_eq!(count_actions(&p).await, 1);
+    assert_eq!(count_actions(&p).await, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
-async fn manager_intent_empty_launch_list_retries_current_choice_and_requires_known_model() {
+async fn manager_intent_empty_launch_list_is_a_stable_typed_hold() {
     for has_model in [true, false] {
         let p = pilot().await;
         policy(&p, |policy| policy.allowed_launches.clear()).await;
@@ -356,36 +306,392 @@ async fn manager_intent_empty_launch_list_retries_current_choice_and_requires_kn
                 .unwrap();
         }
         let result = reconcile(&p).await;
-        if has_model {
-            assert_eq!(result.queued, 1);
-            let id = operation(&p).await;
-            let row = p
-                .manager
-                .store
-                .lock()
-                .await
-                .manager_action_operation(id)
+        assert_eq!(result.queued, 0);
+        let before = intent(&p).await;
+        assert_eq!(before["state"], "blocked");
+        assert!(
+            before["reason"]
+                .as_str()
                 .unwrap()
-                .unwrap();
-            let choice = p.policy.allowed_launches[0].clone();
-            assert_eq!(row.context.launch, Some(choice.clone()));
-            assert!(matches!(
-                row.context.request.operation,
-                ManagerActionV2::RetryLead { launch: Some(launch), .. } if launch == choice
-            ));
-        } else {
-            assert_eq!(result.queued, 0);
-            assert_eq!(count_actions(&p).await, 0);
-            assert!(
-                intent(&p).await["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("manager_v2_no_admitted_launch_choice")
-            );
+                .contains("manager_v2_intent_launch_allowlist_required")
+        );
+        assert_eq!(count_actions(&p).await, 0);
+        for _ in 0..3 {
+            assert_eq!(reconcile(&p).await.queued, 0);
+            assert_eq!(intent(&p).await, before);
         }
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_nonempty_launch_allowlist_admits_recovery() {
+    let p = pilot().await;
+    work(&p, "product").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(p.lead, SessionStatus::Failed)
+        .unwrap();
+    assert_eq!(reconcile(&p).await.queued, 1);
+    let id = operation(&p).await;
+    let action = p
+        .manager
+        .store
+        .lock()
+        .await
+        .manager_action_operation(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        action.context.launch,
+        Some(p.policy.allowed_launches[0].clone())
+    );
+    assert_eq!(intent(&p).await["state"], "recovery_action");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_torn_tail_queues_guarded_fresh_retry() {
+    let p = pilot().await;
+    work(&p, "torn-tail-product").await;
+    completed_codex_refusal(&p, "codex_resume_rollout_torn_tail").await;
+
+    assert_eq!(reconcile(&p).await.queued, 1);
+    let id = operation(&p).await;
+    let action = p
+        .manager
+        .store
+        .lock()
+        .await
+        .manager_action_operation(id)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        action.context.request.operation,
+        ManagerActionV2::RetryLead { .. }
+    ));
+    assert!(
+        action
+            .receipt
+            .target_session_id
+            .is_some_and(|id| id != p.lead)
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_restart_settles_uncertain_torn_tail_resume_then_admits_one_fresh_retry() {
+    let p = pilot().await;
+    work(&p, "restarted-torn-tail-product").await;
+    let resume = p
+        .admit(
+            "uncertain-torn-tail-resume",
+            ManagerActionV2::ResumeLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "continue after restart".into(),
+            },
+        )
+        .await;
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), resume.operation_id);
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .finish_manager_action(
+                &claim,
+                ManagerActionStateV2::Uncertain,
+                "manager_v2_lifecycle_unconfirmed",
+            )
+            .unwrap();
+        store
+            .update_session_status(p.lead, SessionStatus::Failed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET provider='Codex',claude_session_id='torn-thread' WHERE id=?1",
+                [p.lead.to_string()],
+            )
+            .unwrap();
+        let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,dedup_key,policy_snapshot_json,usage_confidence,error_class,created_at,completed_at)
+                 VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable','admitted','failed','manager-intent-test',?2,?3,'{}','unavailable','codex_resume_rollout_torn_tail',?4,?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    p.lead.to_string(),
+                    format!("manager.action:{}", resume.operation_id),
+                    stamp,
+                ],
+            )
+            .unwrap();
+    }
+
+    let config = Config::from_env();
+    let restarted = SessionManager::new(
+        std::sync::Arc::new(EventBus::new(16)),
+        Store::open(&p._dir.path().join("rsi.db")).unwrap(),
+        false,
+        p._dir.path().join("restarted-daemon.sock"),
+        None,
+        Vec::new(),
+        RuntimeConfig::from_config(&config),
+        p._dir.path().join("restarted-sandboxes"),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            restarted.reconcile_manager_actions_startup().await.unwrap();
+            let state = restarted
+                .store
+                .lock()
+                .await
+                .manager_action_operation(resume.operation_id)
+                .unwrap()
+                .unwrap()
+                .receipt
+                .state;
+            if state == ManagerActionStateV2::Failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = restarted.store.lock().await;
+    let old = store
+        .manager_action_operation(resume.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old.receipt.outcome.as_deref(),
+        Some("manager_v2_recovered_effect_absent")
+    );
+    let first = store.reconcile_manager_intent(p.project, true).unwrap();
+    assert_eq!(first.queued, 1);
+    assert_eq!(
+        store
+            .reconcile_manager_intent(p.project, true)
+            .unwrap()
+            .queued,
+        0
+    );
+    let retries: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND kind='lifecycle_action' AND json_extract(payload_json,'$.origin.origin')='operating_intent'",
+            [p.project.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retries, 1);
+    let retry_id: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM harness_manager_v2_operations WHERE project_id=?1 AND kind='lifecycle_action' AND json_extract(payload_json,'$.origin.origin')='operating_intent'",
+            [p.project.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let retry = store
+        .manager_action_operation(Uuid::parse_str(&retry_id).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        retry.context.request.operation,
+        ManagerActionV2::RetryLead { .. }
+    ));
+    assert_eq!(retry.receipt.state, ManagerActionStateV2::Queued);
+    assert!(
+        retry
+            .receipt
+            .target_session_id
+            .is_some_and(|id| id != p.lead)
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_invalid_tool_history_requires_explicit_recovery() {
+    let p = pilot().await;
+    work(&p, "tool-history-product").await;
+    completed_codex_refusal(&p, "codex_resume_tool_history_invalid").await;
+
+    assert_eq!(reconcile(&p).await.queued, 0);
+    assert!(
+        intent(&p).await["reason"]
+            .as_str()
+            .unwrap()
+            .contains("manager_v2_transcript_manual_recovery_required")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_intent_pause_carries_across_scope_and_manager_change_until_explicit_resume() {
+    let mut p = pilot().await;
+    work(&p, "product").await;
+    let paused_receipt = pause(&p, "pause-before-scope-change").await;
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(paused_receipt.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+
+    let new_manager_id = Uuid::new_v4();
+    let mut new_manager = bare_session(new_manager_id);
+    new_manager.project_id = Some(p.project);
+    new_manager.working_dir = p.repo.clone();
+    p.manager
+        .store
+        .lock()
+        .await
+        .insert_session(&new_manager)
+        .unwrap();
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: p.project,
+                session_id: new_manager_id,
+                epic_ids: Some(vec![p.epic]),
+                group_ids: vec![p.group],
+                expected_row_version: 1,
+            })
+            .unwrap();
+        let grant = store
+            .get_harness_manager_policy(p.project)
+            .unwrap()
+            .unwrap();
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: p.project,
+                expected_scope_version: 2,
+                expected_policy_version: grant.row_version,
+                idempotency_key: "policy-after-manager-change".into(),
+                policy: p.policy.clone(),
+            })
+            .unwrap();
+    }
+    p.owner = new_manager_id;
+
+    for _ in 0..3 {
+        assert_eq!(reconcile(&p).await.queued, 0);
+        assert!(paused(&p).await);
+        assert_eq!(intent(&p).await["state"], "manager_paused");
+        assert_eq!(count_actions(&p).await, 0);
+    }
+
+    let (scope_version, policy_version) = {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        let policy = store
+            .get_harness_manager_policy(p.project)
+            .unwrap()
+            .unwrap();
+        (config.row_version, policy.row_version)
+    };
+    let resume = p
+        .manager
+        .agent_control()
+        .agent_manager_control(
+            new_manager_id,
+            AgentManagerControlRequestV2 {
+                fence: ManagerFenceV2 {
+                    scope_version,
+                    policy_version,
+                },
+                idempotency_key: "current-manager-explicit-resume".into(),
+                operation: ManagerActionV2::ResumeLead {
+                    epic_id: p.epic,
+                    expected: p.fence().await,
+                    message: "explicitly resume after reassignment".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let process = launch::install_controller_candidate_test_process(p.lead);
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(resume.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert!(!paused(&p).await);
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    stop(&p, p.lead).await;
+}
+
+async fn intent_resumed_notice_count(p: &Pilot) -> i64 {
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT count(*) FROM harness_manager_notices
+             WHERE project_id=?1 AND direction='to_manager' AND kind='ledger_change'
+               AND epic_id=?2 AND json_extract(state_json,'$.record_kind')='intent_resumed'",
+            rusqlite::params![p.project.to_string(), p.epic.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_intent_resumed_notice_requires_a_succeeded_effect() {
+    let p = pilot().await;
+    work(&p, "product").await;
+    assert_eq!(reconcile(&p).await.queued, 1);
+    let success = operation(&p).await;
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+    }
+    assert_eq!(intent_resumed_notice_count(&p).await, 0);
+    let process = launch::install_controller_candidate_test_process(p.lead);
+    wait_due(&p, success).await;
+    settle_action(&p, success).await;
+    assert_eq!(
+        p.receipt(success).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+    }
+    assert_eq!(intent_resumed_notice_count(&p).await, 1);
+    stop(&p, p.lead).await;
+
+    let refused = pilot().await;
+    work(&refused, "product").await;
+    assert_eq!(reconcile(&refused).await.queued, 1);
+    let blocked = operation(&refused).await;
+    decision(&refused).await;
+    wait_due(&refused, blocked).await;
+    settle_action(&refused, blocked).await;
+    assert_eq!(
+        refused.receipt(blocked).await.state,
+        ManagerActionStateV2::Blocked
+    );
+    {
+        let store = refused.manager.store.lock().await;
+        let config = store.get_harness_manager(refused.project).unwrap().unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+    }
+    assert_eq!(intent_resumed_notice_count(&refused).await, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_status_and_monitor_preserve_idle_observation_without_execution() {
     for mode in [
@@ -410,6 +716,7 @@ async fn manager_intent_status_and_monitor_preserve_idle_observation_without_exe
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_pause_survives_restart_assignment_and_explicit_manager_resume() {
     let mut p = pilot().await;
@@ -474,6 +781,7 @@ async fn manager_intent_pause_survives_restart_assignment_and_explicit_manager_r
     stop(&p, p.lead).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_human_pause_survives_manager_resume_and_operator_explicitly_releases_both()
 {
@@ -588,6 +896,7 @@ async fn block_dependencies(p: &Pilot) {
     .await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_dependencies_and_decisions_explain_unfinished_idle() {
     for needs_decision in [false, true] {
@@ -617,6 +926,7 @@ async fn manager_intent_dependencies_and_decisions_explain_unfinished_idle() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_live_decision_pause_and_dependency_races_refuse_at_custody_provider_boundary()
  {
@@ -707,6 +1017,7 @@ async fn manager_intent_live_decision_pause_and_dependency_races_refuse_at_custo
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_new_pause_cannot_be_cleared_by_older_explicit_resume() {
     let p = pilot().await;
@@ -759,6 +1070,7 @@ async fn manager_intent_new_pause_cannot_be_cleared_by_older_explicit_resume() {
     assert_eq!(record.payload["paused"], true);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_uncertain_effect_blocks_live_authority_but_survives_explicit_lead_repair_as_evidence()
  {
@@ -832,6 +1144,7 @@ async fn manager_intent_uncertain_effect_blocks_live_authority_but_survives_expl
     stop(&p, p.lead).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_resolved_dependency_reconsiders_blocked_action_once() {
     let p = pilot().await;
@@ -906,6 +1219,7 @@ async fn manager_intent_resolved_dependency_reconsiders_blocked_action_once() {
     stop(&p, p.lead).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_intent_repeated_admission_refusal_keeps_one_semantic_notice_after_restart() {
     let mut p = pilot().await;
@@ -930,7 +1244,7 @@ async fn manager_intent_repeated_admission_refusal_keeps_one_semantic_notice_aft
             .unwrap()
             .contains("creation_limit")
     );
-    async fn snapshot(p: &Pilot) -> (i64, i64, String) {
+    async fn snapshot(p: &Pilot) -> (i64, i64, i64, String) {
         let store = p.manager.store.lock().await;
         let config = store.get_harness_manager(p.project).unwrap().unwrap();
         store.manager_v2_reconcile_notices(&config).unwrap();
@@ -947,10 +1261,21 @@ async fn manager_intent_repeated_admission_refusal_keeps_one_semantic_notice_aft
                 |r| r.get(0),
             )
             .unwrap();
-        let signature:String=store.conn.query_row("SELECT attention_signature FROM harness_manager_watches WHERE project_id=?1 AND direction='to_manager'",[p.project.to_string()],|r|r.get(0)).unwrap();
-        (version, events, signature)
+        let (notice_count, notice_version) = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(subject_version), '')
+             FROM harness_manager_notices
+             WHERE project_id=?1 AND direction='to_manager' AND kind='ledger_change'
+               AND subject_id=?2",
+                rusqlite::params![p.project.to_string(), format!("intent:{}", p.epic)],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        (version, events, notice_count, notice_version)
     }
     let before = snapshot(&p).await;
+    assert_eq!(before.2, 1, "one semantic intent notice");
     for _ in 0..3 {
         assert_eq!(reconcile(&p).await.changed, 0);
         assert_eq!(snapshot(&p).await, before);
@@ -958,8 +1283,8 @@ async fn manager_intent_repeated_admission_refusal_keeps_one_semantic_notice_aft
     let before_payload = intent(&p).await;
     restart(&mut p).await;
     // Restore imports legacy invocation telemetry. Its new unknown-cost
-    // observation may update Resources; the unchanged refusal must retain its
-    // own intent event/version and notice generation.
+    // observation may update Resources and the aggregate watch signature; the
+    // unchanged refusal must retain its own intent event/version and notice.
     assert_eq!(reconcile(&p).await.queued, 0);
     assert_eq!(intent(&p).await, before_payload);
     assert_eq!(snapshot(&p).await, before);
@@ -971,6 +1296,7 @@ async fn manager_intent_repeated_admission_refusal_keeps_one_semantic_notice_aft
     assert_eq!(snapshot(&p).await, after);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_scoped_action_pages_include_unpublished_candidates_and_vacant_assignments()
 {

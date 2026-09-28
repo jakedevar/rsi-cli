@@ -2,9 +2,11 @@ pub mod agent_loop;
 pub mod api_key;
 pub mod compaction;
 pub mod compatible_table;
+pub mod errors;
 mod normalize;
 pub mod provider;
 pub mod providers;
+pub mod retry;
 pub mod sse;
 pub mod tools;
 pub mod types;
@@ -67,17 +69,27 @@ impl HarnessClient {
                 project_id,
                 working_dir,
             ) {
-                for kind in crate::codegraph::NativeCodegraphToolKind::ALL {
-                    if binding.permits(kind) {
-                        tools.register(Arc::new(tools::codegraph::CodegraphTool::new(
-                            kind,
-                            handle.clone(),
-                            Arc::clone(store),
-                            session_id,
-                            binding.clone(),
-                        )));
-                    }
-                }
+                Self::register_resolved_codegraph_tools(tools, handle, store, session_id, binding);
+            }
+        }
+    }
+
+    fn register_resolved_codegraph_tools(
+        tools: &mut HarnessToolRegistry,
+        handle: &crate::codegraph::IndexHandle,
+        store: &Arc<Mutex<Store>>,
+        session_id: uuid::Uuid,
+        binding: crate::codegraph::NativeCodegraphBinding,
+    ) {
+        for kind in crate::codegraph::NativeCodegraphToolKind::ALL {
+            if binding.permits(kind) {
+                tools.register(Arc::new(tools::codegraph::CodegraphTool::new(
+                    kind,
+                    handle.clone(),
+                    Arc::clone(store),
+                    session_id,
+                    binding.clone(),
+                )));
             }
         }
     }
@@ -108,7 +120,43 @@ impl HarnessClient {
         origin_session_id: Option<uuid::Uuid>,
         agent_control: Option<crate::session::agent_verbs::AgentControlHandle>,
     ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)> {
-        let model = config
+        self.launch_with_binding(
+            config,
+            resolved_context_budget,
+            system_prompt,
+            working_dir,
+            conversation_history,
+            initial_admission_permit,
+            memory_handle,
+            project_id,
+            store,
+            event_bus,
+            model_call_settlements,
+            origin_session_id,
+            agent_control,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_with_binding(
+        &self,
+        config: &LaunchConfig,
+        resolved_context_budget: &rsi_common::ResolvedContextBudget,
+        system_prompt: Option<String>,
+        working_dir: &Path,
+        conversation_history: Option<Vec<ChatMessage>>,
+        initial_admission_permit: AdmissionPermit,
+        memory_handle: Option<MemoryHandle>,
+        project_id: Option<uuid::Uuid>,
+        store: Arc<Mutex<Store>>,
+        event_bus: Arc<EventBus>,
+        model_call_settlements: ModelCallSettlementHandle,
+        origin_session_id: Option<uuid::Uuid>,
+        agent_control: Option<crate::session::agent_verbs::AgentControlHandle>,
+        prebound_codegraph: Option<crate::codegraph::NativeCodegraphBinding>,
+    ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)> {
+        let mut model = config
             .model
             .clone()
             .unwrap_or_else(|| "claude-sonnet-5".into());
@@ -116,9 +164,22 @@ impl HarnessClient {
         let base_url = config.openai_base_url.as_deref();
 
         // Resolve provider based on model name
-        let provider_backend = resolve_provider(&model, base_url, api_key)?;
+        let openrouter_route =
+            config.provider == Some(rsi_common::types::SessionProvider::OpenRouter);
+        let provider_backend: Box<dyn provider::ApiProvider> = if openrouter_route {
+            model = crate::openrouter::harness_model_id(&model)
+                .ok_or(crate::error::DaemonError::OpenRouterRoutePreflight {
+                    cause: "unsupported_model",
+                })?
+                .to_string();
+            Box::new(providers::openai_api::OpenAiApiProvider::openrouter()?)
+        } else {
+            resolve_provider(&model, base_url, api_key)?
+        };
         let provider_name = provider_backend.name().to_string();
-        let execution_route = if provider_name == "anthropic" {
+        let execution_route = if openrouter_route {
+            crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
+        } else if provider_name == "anthropic" {
             crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessAnthropicHttp
         } else {
             crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp
@@ -140,13 +201,23 @@ impl HarnessClient {
             agent_control,
             config.execution_scratch.clone(),
         );
-        self.register_codegraph_tools(
-            &mut tools,
-            project_id,
+        if let (Some(binding), Some(handle), Some(session_id)) = (
+            prebound_codegraph,
+            self.codegraph_handle.as_ref(),
             origin_session_id,
-            working_dir,
-            &store,
-        );
+        ) {
+            Self::register_resolved_codegraph_tools(
+                &mut tools, handle, &store, session_id, binding,
+            );
+        } else {
+            self.register_codegraph_tools(
+                &mut tools,
+                project_id,
+                origin_session_id,
+                working_dir,
+                &store,
+            );
+        }
         let tools = Arc::new(tools);
 
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -200,10 +271,24 @@ impl HarnessClient {
             .await;
 
             if let Err(e) = result {
+                let typed = errors::ProviderError::from_daemon_error(&e);
                 let _ = event_tx
                     .send(StreamEvent {
                         event_type: "process_error".into(),
-                        data: serde_json::json!({ "error": e.to_string() }),
+                        data: typed.map_or_else(
+                            || serde_json::json!({ "error": e.to_string() }),
+                            |error| {
+                                serde_json::json!({
+                                    "error": format!("provider_error:{}", error.detail_code),
+                                    "source": "harness",
+                                    "terminal": true,
+                                    "error_class": error.class,
+                                    "http_status": error.http_status,
+                                    "retry_after_ms": error.retry_after_ms,
+                                    "detail_code": error.detail_code,
+                                })
+                            },
+                        ),
                     })
                     .await;
             }
@@ -221,6 +306,74 @@ impl HarnessClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn prebound_ready_codegraph_tools_survive_slot_removal_before_launch() {
+        use crate::codegraph::{
+            IndexPhase, IndexRuntime, NativeCodegraphBinding, NativeCodegraphToolKind,
+        };
+        use rsi_common::types::Project;
+        let root = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn visible() {}\n").unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let project = Project {
+            id: project_id,
+            name: "native tools".into(),
+            path: Some(root.path().to_path_buf()),
+            description: None,
+            color: Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let runtime =
+            IndexRuntime::start(indexes.path().to_path_buf(), vec![project], &[]).unwrap();
+        runtime.handle().set_enabled(true);
+        let workspace_id =
+            rsi_codegraph::CodegraphStore::workspace_id(project_id, "primary").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .handle()
+                    .status(workspace_id)
+                    .is_some_and(|item| item.phase == IndexPhase::Ready)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let binding =
+            NativeCodegraphBinding::for_launch(runtime.handle(), project_id, root.path()).unwrap();
+        runtime.handle().reconcile(Vec::new()).unwrap();
+        let mut tools = HarnessToolRegistry::new();
+        HarnessClient::register_resolved_codegraph_tools(
+            &mut tools,
+            runtime.handle(),
+            &Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+            uuid::Uuid::new_v4(),
+            binding,
+        );
+        let names = tools
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<std::collections::HashSet<_>>();
+        for kind in NativeCodegraphToolKind::ALL {
+            assert!(
+                names.contains(kind.name()),
+                "ready native tool missing: {}",
+                kind.name()
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn harness_compaction_window_stays_distinct_from_injection_allowance() {
         let model = "claude-sonnet-5";

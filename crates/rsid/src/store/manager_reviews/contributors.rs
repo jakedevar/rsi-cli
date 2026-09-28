@@ -726,6 +726,7 @@ mod tests {
         key
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn copied_then_cleared_child_file_keeps_the_child_family() {
         let f = fixture();
@@ -741,6 +742,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn prior_reviewer_family_stays_even_after_an_accepted_verdict_or_cherry_picked_fix() {
         let f = fixture();
@@ -751,6 +753,7 @@ mod tests {
         assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_prelaunch_review_reservations_do_not_block_a_later_family() {
         for (assignment_state, action_state) in [("failed", "blocked"), ("cancelled", "revoked")] {
@@ -777,6 +780,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn missing_reviewer_without_terminal_zero_effect_proof_refuses_traversal() {
         for (action_state, receipt_state) in [
@@ -806,6 +810,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn apparent_prelaunch_failure_with_an_effect_witness_refuses_traversal() {
         let f = fixture();
@@ -826,6 +831,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn terminal_action_with_a_persisted_reviewer_keeps_its_family() {
         let f = fixture();
@@ -836,6 +842,7 @@ mod tests {
         assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn prior_reviewers_follow_assignment_rowid_when_timestamps_reverse() {
         let f = fixture();
@@ -870,6 +877,7 @@ mod tests {
         assert!(check(&f, &set, ReviewModelFamily::ZAi).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn merge_squash_cherry_pick_and_rebase_merge_all_keep_the_spawned_family() {
         let f = fixture();
@@ -880,6 +888,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn exhausted_allowed_launches_refuse_family_exhausted_and_empty_allowed_launches_is_unrestricted()
      {
@@ -914,6 +923,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn contributor_closure_over_bounds_refuses_unbounded() {
         let f = fixture();
@@ -930,6 +940,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn receipt_rechecks_the_reviewer_against_stored_contributors() {
         let f = fixture();
@@ -945,6 +956,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_override_admits_a_family_for_one_revision_but_never_the_lineage_family_and_lead_key_is_ignored()
      {
@@ -1023,6 +1035,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn finite_allowed_list_applies_the_override_before_exhaustion() {
         let f = fixture();
@@ -1096,6 +1109,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn in_flight_legacy_assignment_receipt_recomputes_contributors_across_rollout_with_reversed_timestamps()
      {
@@ -1122,6 +1136,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn legacy_infra_retry_recomputes_contributors_and_fails_closed_with_reversed_timestamps() {
         let f = fixture();

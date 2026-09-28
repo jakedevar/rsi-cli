@@ -130,6 +130,7 @@ fn send(store: &Store, manager: Uuid, epic: Uuid, key: &str) -> HarnessManagerMe
                 epic_id: epic,
                 message: format!("Request {key}"),
                 idempotency_key: key.into(),
+                informational: false,
             },
         )
         .unwrap()
@@ -144,6 +145,7 @@ fn code(result: Result<HarnessManagerMessageReceiptV1>) -> String {
 
 /// Exact #404 shape: appointed project-wide manager, current Epic lead, no
 /// prior request, operator-directed program notification.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notice_reaches_busy_project_manager_without_prior_request() {
     let f = fixture();
@@ -219,12 +221,14 @@ fn lead_notice_reaches_busy_project_manager_without_prior_request() {
                     epic_id: f.epics[1],
                     message: "not a manager".into(),
                     idempotency_key: "x".into(),
+                    informational: false,
                 }
             )
             .is_err()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notice_follows_manager_and_lead_rotation() {
     let f = fixture();
@@ -268,6 +272,7 @@ fn lead_notice_follows_manager_and_lead_rotation() {
     assert_eq!(message.sender_session_id, lead);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notice_refusals_fail_closed_without_persisting_mail() {
     let f = fixture();
@@ -404,6 +409,7 @@ fn lead_notice_refusals_fail_closed_without_persisting_mail() {
 /// Mixed fixture: manager requests, a lead reply and lead notices. Every
 /// manager-request projection keeps its exact prior shape, and no lead notice
 /// is ever a request, a reply target, or pending-budget weight.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notices_leave_manager_request_projections_unchanged() {
     let f = fixture();
@@ -416,6 +422,7 @@ fn lead_notices_leave_manager_request_projections_unchanged() {
                 request_id: r0.message_id,
                 message: "done".into(),
                 idempotency_key: "reply".into(),
+                still_running: false,
             },
         )
         .unwrap();
@@ -478,6 +485,7 @@ fn lead_notices_leave_manager_request_projections_unchanged() {
                 request_id: n0.message_id,
                 message: "reply to self".into(),
                 idempotency_key: "bad".into(),
+                still_running: false,
             },
         )),
         "manager_request_not_in_scope"
@@ -539,6 +547,7 @@ fn lead_notices_leave_manager_request_projections_unchanged() {
 /// Pending request budget counts manager requests only: lead notices never
 /// consume it, and the (#664 per-Epic) budget still refuses at exactly its
 /// limit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notices_do_not_consume_manager_pending_request_budget() {
     let f = fixture();
@@ -552,21 +561,22 @@ fn lead_notices_do_not_consume_manager_pending_request_budget() {
     }
     send(&f.store, f.manager, f.epics[0], "last");
     let before = counts(&f.store);
-    assert_eq!(
-        code(f.store.manager_send(
-            f.manager,
-            &AgentManagerSendRequestV1 {
-                epic_id: f.epics[0],
-                message: "over".into(),
-                idempotency_key: "over".into(),
-            },
-        )),
-        "manager_epic_pending_request_limit: next_action=settle_or_send_notice"
-    );
+    let refusal = code(f.store.manager_send(
+        f.manager,
+        &AgentManagerSendRequestV1 {
+            epic_id: f.epics[0],
+            message: "over".into(),
+            idempotency_key: "over".into(),
+            informational: false,
+        },
+    ));
+    assert!(refusal.starts_with("manager_epic_pending_request_limit: oldest_settleable="));
+    assert!(refusal.ends_with("next_action=settle_or_send_notice"));
     assert_eq!(counts(&f.store), before);
 }
 
 /// Unread lead notices are bounded per Epic; manager retrieval drains them.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_notices_are_bounded_until_the_manager_reads_them() {
     let f = fixture();

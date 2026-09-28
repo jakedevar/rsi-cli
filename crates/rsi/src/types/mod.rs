@@ -200,6 +200,8 @@ pub struct SettingsState {
     pub query: String,
     /// Whether the query line is actively accepting input.
     pub query_active: bool,
+    /// Armed clear of one provider credential slot.
+    pub provider_key_clear_confirmation: Option<ProviderKeyClearConfirmation>,
 }
 
 impl Default for SettingsState {
@@ -212,8 +214,20 @@ impl Default for SettingsState {
             active_dropdown_item: None,
             query: String::new(),
             query_active: false,
+            provider_key_clear_confirmation: None,
         }
     }
+}
+
+/// Armed clear-credential confirmation (Settings -> Provider Keys, `d`).
+///
+/// First `d` arms it (`armed_at_ms`); a second `d` on the SAME slot within
+/// the TTL enqueues `LcAction::ClearProviderCredentialSlot`. Mirrors
+/// `IssueCancelConfirmation` (`crate::types::issues`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderKeyClearConfirmation {
+    pub slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+    pub armed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -660,17 +674,18 @@ pub struct CachedRenderedEvent {
     pub web_links: Vec<WebLinkTarget>,
 }
 
-/// State for the "message formulation" grow animation.
-/// Active while a new renderable event is growing from the loading container's
-/// 3-row footprint to its final height (~200 ms).
+/// State for the opt-in "message formulation" reveal.
+///
+/// Armed when a new renderable event is appended to a live session. The event
+/// renders in place at its final geometry; the renderer overlays a
+/// top-to-bottom wipe on its cells for `UserSettings::formulation_anim_ms`.
+/// Render-only: never affects layout, heights, or the activity indicator.
 #[derive(Debug, Clone, Copy)]
 pub struct FormulationState {
     /// Index into `SessionState.events` of the event being formulated.
     pub event_index: usize,
     /// Wall-clock ms when the animation started (chrono::Utc::now().timestamp_millis()).
     pub started_at_ms: i64,
-    /// Final rendered height the bubble should grow to. 0 = sentinel (resolved on first render frame).
-    pub target_height: u16,
 }
 
 /// Per-session state tracked in the TUI (shared across all panes that view the same session).
@@ -762,8 +777,8 @@ pub struct SessionState {
     /// Computed each frame in `ui/mod.rs::render_pane` to keep click detection in sync
     /// with the actual rendering layout.
     pub last_content_y_offset: u16,
-    /// Raw content strings extracted from `<docregblock>` tags across all events.
-    /// Populated during event updates; consumed by the `Space+x` keybinding.
+    /// Command strings from conversation `<docregblock>` tags or pipeline artifacts.
+    /// Used for command labels, docreg recovery, and handoff replacement planning.
     pub docregblock_contents: Vec<String>,
     /// Cached rendered lines for events, keyed by width/fold/cursor state.
     pub render_cache: HashMap<RenderCacheKey, CachedRenderedEvent>,
@@ -804,8 +819,8 @@ pub struct SessionState {
     /// `session.total_input_tokens` / `context_window` — the daemon's numerator
     /// selection is the single source of truth.
     pub live_context_pct: Option<f64>,
-    /// Memoized recent files (top 5 distinct, newest-first) for the queue zone,
-    /// keyed on `events_generation`. Phase 3 populates / consumes this.
+    /// Memoized recent files (up to nine distinct, newest-first) for `gf1..gf9`,
+    /// keyed on `events_generation`.
     pub recent_files_cache: Option<(u64, Vec<std::path::PathBuf>)>,
     /// Per-session ring buffer of (timestamp, cost_delta) for the cost-burn
     /// sparkline. Capped at 16 entries by the polling loop in Phase 5.
@@ -821,9 +836,8 @@ pub struct SessionState {
     pub last_navigation_time: Option<std::time::Instant>,
 }
 
-/// Cap on the number of recent-files surfaced in the queue zone.
-/// Matches `gf1..gf5` in keybindings (gf6..gf9 are reserved but unbound).
-pub const RECENT_FILES_CAP: usize = 5;
+/// Cap on the number of recent files available through `gf1..gf9`.
+pub const RECENT_FILES_CAP: usize = 9;
 
 /// Pure data computation — walks `events` newest-first and collects the
 /// distinct `tool_input.file_path` values from `Edit`/`MultiEdit`/`Write`/
@@ -922,8 +936,8 @@ impl SessionState {
     /// Returns the cached recent-files list (up to `RECENT_FILES_CAP`),
     /// recomputing if `events_generation` has advanced past the cached
     /// generation. Mutates the cache in place. Returns an owned `Vec`
-    /// because callers (`queue.rs` rendering, `open_recent_file_n` handler)
-    /// need to drop the `&mut self` borrow before continuing.
+    /// because the `open_recent_file_n` handler needs to drop the `&mut self`
+    /// borrow before opening the selected path.
     pub fn cached_recent_files(&mut self) -> Vec<std::path::PathBuf> {
         let current_gen = self.events_generation;
         if let Some((cached_gen, files)) = &self.recent_files_cache {
@@ -1493,16 +1507,23 @@ mod tests {
                 ev_with_path(4, "Write", "/c.rs"),
                 ev_with_path(5, "MultiEdit", "/d.rs"),
                 ev_with_path(6, "Read", "/e.rs"),
-                ev_with_path(7, "Read", "/f.rs"), // 6th distinct — should be cap-trimmed
+                ev_with_path(7, "Read", "/f.rs"),
+                ev_with_path(8, "Read", "/g.rs"),
+                ev_with_path(9, "Read", "/h.rs"),
+                ev_with_path(10, "Read", "/i.rs"),
+                ev_with_path(11, "Read", "/j.rs"),
             ];
             let files = compute_recent_files(&events);
             assert_eq!(files.len(), RECENT_FILES_CAP);
-            // Newest-first traversal: f, e, d, c, a (latest occurrence of /a.rs is seq 3, not 1)
-            assert_eq!(files[0], PathBuf::from("/f.rs"));
-            assert_eq!(files[1], PathBuf::from("/e.rs"));
-            assert_eq!(files[2], PathBuf::from("/d.rs"));
-            assert_eq!(files[3], PathBuf::from("/c.rs"));
-            assert_eq!(files[4], PathBuf::from("/a.rs"));
+            // /a.rs appears once at its latest occurrence (seq 3); /b.rs is
+            // the tenth distinct file and falls beyond the nine bindings.
+            assert_eq!(
+                files,
+                ["j", "i", "h", "g", "f", "e", "d", "c", "a"]
+                    .map(|stem| PathBuf::from(format!("/{stem}.rs")))
+            );
+            assert_eq!(files[5], PathBuf::from("/e.rs")); // gf6
+            assert_eq!(files[8], PathBuf::from("/a.rs")); // gf9
         }
 
         #[test]
@@ -2572,6 +2593,19 @@ pub enum OverlayState {
         /// overwrite ONLY the 9 fields this form exposes and preserve every
         /// other field verbatim. `None` when adding a new policy.
         original: Option<rsi_common::model_control::ModelBudgetPolicy>,
+    },
+    /// Provider-credential set/rotate form (Settings -> Provider Keys,
+    /// #694 K1b). `secret` is rendered FULLY masked (never a partial
+    /// reveal) and is never persisted anywhere else in TUI state; submit
+    /// moves it into the matching `LcAction` and scrubs this buffer in
+    /// place (see `overlay::provider_credential_form`).
+    ProviderCredentialForm {
+        slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+        /// `true` = submit builds `RotateProviderCredentialSecret`;
+        /// `false` = `SetProviderCredentialSecret`.
+        rotate: bool,
+        /// Typed secret buffer. Masked in the renderer; scrubbed on submit.
+        secret: String,
     },
     /// Three-choice confirm modal for external-edit conflicts (Q7).
     HookConflictPrompt {

@@ -13,6 +13,7 @@ mod cohort_settlement;
 pub(crate) mod daemon_config;
 mod navigation;
 mod overlay;
+pub(crate) mod provider_credentials;
 pub(crate) mod session;
 mod window;
 
@@ -101,6 +102,9 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::BlankPrompt
         | LcAction::LaunchBlank(_)
         | LcAction::InterruptSession
+        | LcAction::HardInterruptSession
+        | LcAction::DowngradeOperatorPause
+        | LcAction::ClearOperatorPause
         | LcAction::QuickContinue
         | LcAction::ContinueSession(_)
         | LcAction::OpenQuestionModal
@@ -333,6 +337,24 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         } => {
             daemon_config::submit_model_budget_policy(app, policy, editing_index).await;
         }
+        LcAction::RefreshProviderCredentials => {
+            provider_credentials::refresh_provider_credentials(app).await;
+        }
+        LcAction::SetProviderCredentialSecret { slot, secret } => {
+            provider_credentials::set_provider_credential(app, slot, secret).await;
+        }
+        LcAction::RotateProviderCredentialSecret { slot, secret } => {
+            provider_credentials::rotate_provider_credential(app, slot, secret).await;
+        }
+        LcAction::ClearProviderCredentialSlot(slot) => {
+            provider_credentials::clear_provider_credential(app, slot).await;
+        }
+        LcAction::CheckProviderCredentialSlot(slot) => {
+            provider_credentials::check_provider_credential(app, slot).await;
+        }
+        LcAction::ImportProviderCredentialsFromEnv => {
+            provider_credentials::import_provider_credentials_from_env(app).await;
+        }
     }
 }
 
@@ -430,6 +452,10 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::SettingsDelete
         | ActionId::SettingsEnable
         | ActionId::SettingsRefresh
+        | ActionId::ProviderKeySet
+        | ActionId::ProviderKeyRotate
+        | ActionId::ProviderKeyCheck
+        | ActionId::ProviderKeyImport
         | ActionId::SettingsSearch
         | ActionId::SettingsNextMatch
         | ActionId::SettingsPrevMatch
@@ -445,6 +471,10 @@ pub(crate) async fn dispatch_registered_action(
                 ActionId::SettingsDelete => KeyCode::Char('d'),
                 ActionId::SettingsEnable => KeyCode::Char('e'),
                 ActionId::SettingsRefresh => KeyCode::Char('R'),
+                ActionId::ProviderKeySet => KeyCode::Char('s'),
+                ActionId::ProviderKeyRotate => KeyCode::Char('r'),
+                ActionId::ProviderKeyCheck => KeyCode::Char('c'),
+                ActionId::ProviderKeyImport => KeyCode::Char('i'),
                 ActionId::SettingsSearch => KeyCode::Char('/'),
                 ActionId::SettingsNextMatch => KeyCode::Char('n'),
                 ActionId::SettingsPrevMatch => KeyCode::Char('N'),
@@ -756,6 +786,12 @@ fn dispatch_window(app: &mut App, action: editor_types::WindowAction<LcInfo>) {
 /// Execute a resolved catalog command from any command entry point.
 #[allow(clippy::future_not_send)] // App is owned by the single-threaded event loop.
 pub async fn dispatch_catalog_command(app: &mut App, command: &str) {
+    if let Some(args) = command.trim().strip_prefix("openrouter-route") {
+        if args.is_empty() || args.starts_with(char::is_whitespace) {
+            daemon_config::set_openrouter_model_route(app, args).await;
+            return;
+        }
+    }
     match parse_command(command) {
         CommandResult::LcAction(action) => {
             dispatch_lc_action(app, action).await;

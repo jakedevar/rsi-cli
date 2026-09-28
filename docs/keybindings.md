@@ -6,7 +6,7 @@ For the operating model behind these controls—sessions, providers, projects,
 sandboxes, hierarchy, diagnostics, and capability boundaries—start with the
 [RSI Operator Manual: AI-Agent Harness](agent-harness-operator-manual.md).
 
-**Last Updated**: 2026-09-22
+**Last Updated**: 2026-09-24
 
 ---
 
@@ -59,6 +59,8 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-0` | launch prompt or input modal open | reset the overlay's size and position |
 | `Ctrl-Shift-Right` | normal mode, no overlay | widen the session-list sidebar |
 | `Ctrl-Shift-Left` | normal mode, no overlay | narrow the session-list sidebar |
+| `Ctrl-Left` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column left (snaps to Left Aligned at the edge) |
+| `Ctrl-Right` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column right (unsnaps Left Aligned) |
 | `Ctrl-Left` | normal mode, no overlay, not inserting | focus the pane to the left (zones: gs / gt / gj / ga) |
 | `Ctrl-Right` | normal mode, no overlay, not inserting | focus the pane to the right (zones: gs / gt / gj / ga) |
 | `Shift-Down` | normal mode, no overlay, not inserting | select the next transcript event |
@@ -136,9 +138,11 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>gb` | Open manager board | Opens the harness manager work board. |
 | `<Space>gd` | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `yy` | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
-| `x` | Interrupt running session | Interrupts the selected running session. |
-| `X` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
-| `<Space>c` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
+| `x` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
+| `X` | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
+| `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `U` | Unarchive selected session | Restores the selected archived session to the Main zone. |
@@ -153,9 +157,10 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `ZZ` | Quit | Quits rsi (the daemon and its sessions keep running). |
 | `<Space>p` | Choose project | Opens the project picker. |
 | `<Space>o` | Launch task session | Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly. |
-| `<Space>m` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
+| `Ctrl-N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
+| `<Space>N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `<Space>,` | Open settings | Opens the settings pane. |
-| `<Space>S` | Emergency stop all | Emergency stop: denies new paid work and cancels live model invocations. |
+| `<Space>X` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `<Space>v` | Open graph review | Opens the visual workflow graph review editor. |
 | `gL` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
 | `<Space>q` | Close pane | Closes the focused pane. |
@@ -205,8 +210,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>C` | Change session project | Moves the selected session to another project. |
 | `<Space>r` | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` | Cancel pending retry | Cancels the selected session's pending automatic retry. |
-| `<Space>x` | Run docregblock tags | Launches a session for every docregblock tag in the selected session's output. |
-| `<Space>X` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
+| `<Space>x` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 | `<Space>T` | Open in new tab | Opens the selected session in a new tab. |
 | `<Space>gg` | Git panel (lazygit) | Suspends the TUI and runs lazygit in the session's working directory. |
 | `<Space>e` | File explorer | Toggles the left-anchored file explorer drawer. |
@@ -245,6 +249,7 @@ Reserved sequences: prefixes wait for the next key; no-ops keep retired chords f
 | `gf` | prefix | prefix of gf1..gf9 (Vim's gf would open a file path) |
 | `<Space>gr` | no-op | retired; the label picker is `:group` |
 | `<Space>R` | no-op | retired; the rating overlay is `:rate` |
+| `<Space>S` | no-op | retired emergency-stop chord; use <Space>X |
 | `gm` | no-op | retired merge-queue chord |
 | `g?` | no-op | retired; the dialectic overlay is `:ask` |
 | `gX` | no-op | retired modal launcher; the command moved under <Space>g |
@@ -267,8 +272,14 @@ Normal mode is the default mode for navigation and actions.
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `x` | InterruptSession | Send SIGINT to the focused session (exterminate) |
-| `X` | QuickContinue | Send "continue" to idle session in detail view |
+| `x` | SoftInterruptSession | Request a soft stop (currently SIGINT fallback); mark SOFT so a granted manager can restart it |
+| `X` | HardInterruptSession | Immediately interrupt the focused session; mark HARD so only the operator can clear it |
+| `<Space>X` | EmergencyStopAll | Hard-stop live sessions and deny new paid work; mark interrupted sessions HARD |
+| `<Space>c` | QuickContinue | Send "continue" to the selected idle session |
+| `<Space>hs` / `:pause soft` | DowngradeOperatorPause | Change a selected HARD marker to SOFT |
+| `<Space>hc` / `:pause clear` | ClearOperatorPause | Clear the selected SOFT or HARD marker |
+
+The session row shows `SOFT` or `HARD` while an operator pause is recorded. Older pause markers display as `HARD`. A SOFT pause still leaves pending questions and approvals for the operator.
 | `Enter` | EnterSession | Open the selected session in detail view |
 | `p` | TogglePromptPreview | Preview full prompt of selected session (live updates with j/k) |
 | `i` | EnterInputBarInsert(Insert) | Enter input bar insert mode at cursor |
@@ -391,7 +402,7 @@ rsi ships 14 built-in themes, in picker order. `T` opens the picker with a live 
 | 11 | Diamond |
 | 12 | Ruby |
 | 13 | Saphire |
-| 14 | D. is for Devil |
+| 14 | D. is for Daemon |
 <!-- rsi:generated:end -->
 
 `Transparent` retains its dark readable
@@ -592,12 +603,12 @@ detail view.
 | `<Space>gX` | GoToTrash | Open trash browser overlay — browse soft-deleted sessions |
 | `gr` | OpenRecentCompletions | Toggle recent completions — jump to recently finished sessions |
 
-### DocRegBlock Execution (Detail View)
+### Session Actions (Detail View)
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `<Space>x` | ExecuteDocRegBlocks | Launch new sessions for all `<docregblock>` tags in current session |
-| `<Space>X` | CommitAndPush | Continue session with `/ci_commit` to commit and push changes |
+| `<Space>x` | CommitAndPush | Continue session with `/ci_commit` to commit and push changes |
+| `<Space>X` | EmergencyStopAll | Deny new paid work and cancel live model invocations |
 
 ### Folding (Session List and Detail View)
 
@@ -670,7 +681,7 @@ unchanged.
 | `<Space>i` | `<Space>i` | OpenIssuesWorkspace |
 | `<Space>k` | `<Space>k` | CancelRetry |
 | `<Space>K` | `<Space>K` | OpenScheduleBrowser |
-| `<Space>m` | `<Space>m` | BlankPrompt |
+| `<Space>m` | `<Space>n` | BlankPrompt |
 | `<Space>M` | `<Space>M` | OpenMemorySearch |
 | `<Space>o` | `<Space>o` | TaskRabbitPrompt |
 | `<Space>p` | `<Space>p` | OpenProjectPicker |
@@ -678,14 +689,14 @@ unchanged.
 | `<Space>r` | `<Space>r` | ToggleRotationDisabled |
 | `<Space>R` | `<Space>R` | Reserved no-op |
 | `<Space>s` | `<Space>s` | OpenSortPicker |
-| `<Space>S` | `<Space>S` | EmergencyStopAll |
+| `<Space>S` | — | Unbound |
 | `<Space>t` | `<Space>t` | ToggleTestingNeeded |
 | `<Space>T` | `<Space>T` | OpenSessionInNewTab |
-| `<Space>x` | `<Space>x` | ExecuteDocRegBlocks |
-| `<Space>X` | `<Space>X` | CommitAndPush |
+| `<Space>x` | `<Space>x` | CommitAndPush |
+| `<Space>X` | `<Space>X` | EmergencyStopAll |
 | `gX` | `<Space>gX` | GoToTrash; old `gX` is an inert guard |
 | `gq` | `<Space>gq` | OpenQuestionModal; old `gq` is an inert guard |
-| `gn` | `<Space>n` | ToggleNotifications; old `gn` is an inert guard |
+| `gn` | `<Space>N` | ToggleNotifications; old `gn` is an inert guard |
 | `gc` | `<Space>gc` | OpenEspSquare; old `gc` is an inert guard |
 | `gv` | `<Space>v` | OpenGraphReview; old `gv` is an inert guard |
 | `gp` | `<Space>gP` | OpenPromptCreator; old `gp` is an inert guard (form-local `gp` stays parent picker) |
@@ -906,8 +917,10 @@ arguments open that editor on Enter.
 | `:manager decisions` |  | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `:manager inbox` |  | Open manager inbox | Opens the harness manager inbox of lead requests and replies. |
 | `:manager inspect` |  | Open manager inspect | Opens the harness manager inspect view (workers, work, requests, topology and events). |
-| `:kill` | `:ki` | Interrupt running session | Interrupts the selected running session. |
-| `:continue [arg]` | `:cont [arg]` | Continue selected session | Continues the selected session: opens a continue prompt, or `:continue <text>` sends the text directly. |
+| `:kill` | `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
+| `:pause soft` |  | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
+| `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `:continue [arg]` | `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `:archive` | `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `:rotate` | `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
@@ -924,7 +937,7 @@ arguments open that editor on Enter.
 | `:project-edit [arg]` |  | Edit project | Edits the named or current project. |
 | `:project-delete <arg>` |  | Delete project | Deletes the named project; the name argument is required. |
 | `:set` | `:settings` | Open settings | Opens the settings pane. |
-| `:stopall` | `:stop-all` | Emergency stop all | Emergency stop: denies new paid work and cancels live model invocations. |
+| `:stopall` | `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `:hooks` |  | Open hook settings | Opens settings at the Claude hooks list. |
 | `:skills` |  | Open skill settings | Opens settings at the Claude skills list. |
 | `:group` | `:groups` | Choose group label | Opens the group label picker for the selected session. |
@@ -1124,6 +1137,7 @@ Clipboard paste works from either mode and switches to insert mode automatically
 | `Ctrl+T` | Submit + New Tab | Submit prompt and open session in new tab |
 | `Ctrl+S` | Submit + Split | Submit prompt and open session in new vertical split |
 | `Ctrl+Shift+A` | Open AI Chat | Ask the configured prompt processor about non-empty prompt text |
+| Other Ctrl shortcuts | Textarea editing | Unclaimed Ctrl shortcuts use the textarea's built-in editing bindings, including line/word movement, deletion, and undo/redo |
 | Text keys | Type | Insert text into textarea |
 | `Left` / `Right` | Move Cursor | Move cursor left/right (always available) |
 | `Up` / `Down` | No-op / Suggestions | Navigate suggestions when visible; otherwise silently consumed (no cursor movement, no scroll) |
@@ -1139,11 +1153,11 @@ Clipboard paste works from either mode and switches to insert mode automatically
 | `Up` / `Ctrl+p` | Previous | Move to previous suggestion |
 | `Esc` | Dismiss | Hide suggestions (stay in insert mode) |
 
-#### Normal Mode
+#### Prompt Controls (Available in Either Mode)
 
-Overlay normal mode supports the full vim text editing feature set documented in [Vim Text Editing (Input Bar & Overlay)](#vim-text-editing-input-bar--overlay): motions, counts, operators, text objects, visual mode, dot repeat, and f/t/F/T character search.
+Overlay normal mode supports the full vim text editing feature set documented in [Vim Text Editing (Input Bar & Overlay)](#vim-text-editing-input-bar--overlay): motions, counts, operators, text objects, visual mode, dot repeat, and f/t/F/T character search. Prompt-specific Ctrl controls work in both insert and normal mode.
 
-**Overlay-specific keys** (in addition to the shared vim features):
+**Overlay-specific keys** (in addition to the shared vim and textarea editing features):
 
 | Key | Action | Description |
 |-----|--------|-------------|
@@ -1198,11 +1212,11 @@ When multiple Blank/TaskRabbit input overlays are open simultaneously, use these
 | `Ctrl+J` | Focus Down | Move focus to the next (newer) input overlay |
 | `Ctrl+K` | Focus Up | Move focus to the previous (older) input overlay |
 | `Space+o` | Open TaskRabbit | Open a new TaskRabbit overlay (always opens, stacks below existing) |
-| `Space+m` | Open Blank | Open a new Blank session overlay (always opens, stacks below existing) |
+| `Space+n` | Open Blank | Open a new Blank session overlay (always opens, stacks below existing) |
 
-These keys work in both insert and normal mode within any input overlay. `Space+o` and `Space+m` require normal mode. Overlays stack vertically with the oldest at the top and the newest at the bottom. When more overlays exist than fit on screen, the view scrolls to keep the focused overlay visible.
+These keys work in both insert and normal mode within any input overlay. `Space+o` and `Space+n` require normal mode. Overlays stack vertically with the oldest at the top and the newest at the bottom. When more overlays exist than fit on screen, the view scrolls to keep the focused overlay visible.
 
-`Space+o` and `Space+m` also work while non-text overlays without their own Space binding are active (e.g. GraphReview, ThemePicker, SortPicker, KeybindingsHelp). Pressing `Space` consumes the keypress as a leader; the subsequent `o` or `m` dismisses the current overlay and opens the session modal. Scheduled Jobs uses a single Space to toggle the selected job, and File Explorer uses it to close the tree or type in the finder. This bypass is not active in the Settings pane when items are focused (Space there toggles the selected item).
+`Space+o` and `Space+n` also work while non-text overlays without their own Space binding are active (e.g. GraphReview, ThemePicker, SortPicker, KeybindingsHelp). Pressing `Space` consumes the keypress as a leader; the subsequent `o` or `n` dismisses the current overlay and opens the session modal. Scheduled Jobs uses a single Space to toggle the selected job, and File Explorer uses it to close the tree or type in the finder. This bypass is not active in the Settings pane when items are focused (Space there toggles the selected item).
 
 ### Model Dropdown (Widget)
 
@@ -1472,9 +1486,13 @@ Keys of the settings pane (category rail and items).
 | `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. |
 | `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
-| `d` | Delete item | Deletes the selected item from a settings list. |
+| `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
+| `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
+| `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
+| `c` | Check provider key | Checks the selected provider key slot with its provider. |
+| `i` | Import provider keys | Imports available provider keys from the process environment into vault slots. |
 | `/` | Search settings | Opens an incremental settings query; Enter jumps to the first match at or after the cursor. |
 | `n` | Next settings match | Jumps to the next settings row matching the active query, wrapping with a notice. |
 | `N` | Previous settings match | Jumps to the previous settings row matching the active query, wrapping with a notice. |
@@ -1599,6 +1617,32 @@ Views/adds/edits/deletes `rsi_common::model_control::ModelBudgetPolicy` rows via
 | `Esc` | Cancel | Discard changes and close |
 | Any char | Type | Append to focused text field (numeric fields accept digits only; AlertThresholdRatio also accepts one `.`) |
 | `Backspace` | Delete | Remove last character from focused text field (no-op on the two cycle fields) |
+
+**Provider Keys category** (#694 K1b):
+
+Lists every key-vault credential slot (`rsi_common::provider_credentials::ProviderCredentialSlot` — a fixed 23-slot set, so this category's row count never changes) via the daemon's operator-only `ListProviderCredentials` RPC. Each row shows the slot's state (`vault`/`env_compat`/`generator`/`cleared`/`absent`), fingerprint, last validity/credit check class and age, remaining credit, route (`codex_cli`/`harness`), and CLI exposure (`always`/`on_fallback`/`none`). Rows show a `loading…` placeholder until the first response arrives. The `vault.env_compat` and `vault.check_ttl_secs` daemon settings are **not** in this category — they are two ordinary rows under **Daemon Features**, applied through the existing `UpdateDaemonConfig` path.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Enter` / `Space` / `s` | Set | Open `ProviderCredentialForm` in Set mode for the selected slot |
+| `r` | Rotate | Open `ProviderCredentialForm` in Rotate mode for the selected slot |
+| `c` | Check | Run `CheckProviderCredential` immediately for the selected slot (no form) |
+| `d` | Clear (arm) | First press arms a "press `d` again" confirmation for the selected slot |
+| `d` (again, within 2s, same slot) | Clear (confirm) | Enqueues `ClearProviderCredential` for the selected slot |
+| `i` | Import | Enqueues `ImportProviderCredentialsFromEnv` (imports every importable slot at once; not row-scoped) |
+| `R` | Refresh | Re-fetch the credential list from the daemon |
+
+**Provider Credential Form Overlay** (Set/Rotate — Provider Keys category):
+
+The secret is rendered FULLY masked (every character as `*`, never a partial reveal) and is never echoed anywhere else. On submit the buffer is moved directly into the RPC action and the overlay is dropped in the same step, so no plaintext secret is left in TUI state; on `Esc`-cancel the buffer is explicitly overwritten before being dropped.
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Enter` | Save | Enqueue `SetProviderCredential` / `RotateProviderCredential` (per the mode the form was opened in) and close |
+| `Esc` | Cancel | Scrub the typed buffer and close without sending anything |
+| Any char | Type | Append to the secret buffer |
+| `Backspace` | Delete | Remove the last character from the secret buffer |
+| Paste | Paste | Clipboard paste inserts directly into the secret buffer (masked on render, same as typing) |
 
 ### Keybindings Help Overlay
 
@@ -1905,7 +1949,7 @@ Keys of the theme role editor.
 | `Enter` | Apply sort order |
 | `Esc / q` | Close without changing |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -1920,7 +1964,7 @@ Keys of the theme role editor.
 | `Enter` | Apply theme |
 | `Esc / q` | Revert preview and close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -1938,7 +1982,7 @@ Keys of the theme role editor.
 | `Ctrl-D` | Delete highlighted project |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -1956,7 +2000,7 @@ Keys of the theme role editor.
 | `Ctrl-D` | Delete highlighted label |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -1971,7 +2015,7 @@ Keys of the theme role editor.
 | `Enter` | Set parent |
 | `Esc` | Close picker |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2047,7 +2091,7 @@ Keys of the theme role editor.
 | `Enter` | Open file in viewer |
 | `Esc` | Close telescope |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2152,7 +2196,7 @@ Keys of the theme role editor.
 | `Enter` | Open source session |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2167,7 +2211,7 @@ Keys of the theme role editor.
 | `i` | Return to input bar in insert mode |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2208,7 +2252,7 @@ Keys of the theme role editor.
 | `D` | Purge session permanently |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2224,7 +2268,7 @@ Keys of the theme role editor.
 | `r` | Refresh receipt |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2250,7 +2294,7 @@ Keys of the theme role editor.
 | `c` | Camera follows selection |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2265,7 +2309,7 @@ Keys of the theme role editor.
 | `c` | Camera follows selection |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2289,7 +2333,7 @@ Keys of the theme role editor.
 | `Esc` | Back out of detail |
 | `q` | Close graph review |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2335,7 +2379,7 @@ Keys of the theme role editor.
 | `!` | Reveal control details |
 | `Esc / q` | Close inspector, then browser |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2376,6 +2420,16 @@ Keys of the theme role editor.
 | `h j k l, w b` | Move cursor (normal mode) |
 <!-- rsi:generated:end -->
 
+### Provider Key Form
+
+<!-- rsi:generated:begin overlay-provider-key-form -->
+| Keys | Action |
+| --- | --- |
+| `Type / Backspace` | Edit masked credential |
+| `Enter` | Save credential |
+| `Esc` | Cancel and scrub |
+<!-- rsi:generated:end -->
+
 ### Message Bridge Form
 
 <!-- rsi:generated:begin overlay-message-bridge-form -->
@@ -2409,7 +2463,7 @@ Keys of the theme role editor.
 | `r` | Reload settings from disk |
 | `c / Esc` | Cancel save |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2459,7 +2513,7 @@ Keys of the theme role editor.
 | `Delete` | Reset field to default |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2473,7 +2527,7 @@ Keys of the theme role editor.
 | `Delete` | Clear override |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2488,7 +2542,7 @@ Keys of the theme role editor.
 | `Enter` | Open selected session |
 | `p / Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2502,7 +2556,7 @@ Keys of the theme role editor.
 | `g / Home, G / End` | Jump to top / bottom |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2513,7 +2567,7 @@ Keys of the theme role editor.
 | --- | --- |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2526,7 +2580,7 @@ Keys of the theme role editor.
 | `G` | Edit labels |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2540,7 +2594,7 @@ Keys of the theme role editor.
 | `Enter` | Save rating |
 | `Esc / q` | Close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2602,7 +2656,7 @@ Keys of the theme role editor.
 | `Esc` | Cancel fact edit (editing) |
 | `Esc / q` | Save and close |
 | `Space o` | Close and open a TaskRabbit session prompt |
-| `Space m` | Close and open a blank session prompt |
+| `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
@@ -2693,6 +2747,7 @@ Enter with `i`/`a`/`o`/`O` from normal mode. `Esc` returns to normal mode (sessi
 | `Ctrl+G` | Input Modal | Open quarter-size centered input modal for longer-form editing |
 | `Ctrl+Y` | Compile Prompt | Send draft to LLM for 5-layer prompt compilation (requires `prompt_processor` configured) |
 | `Ctrl+Shift+G` | Fix Grammar | Send draft to LLM for grammar/spelling correction only — no restructuring (requires `prompt_processor` configured) |
+| Other Ctrl shortcuts | Textarea editing | Unclaimed Ctrl shortcuts use the textarea's built-in editing bindings, including line/word movement, deletion, and undo/redo |
 | Text keys | Type | Insert text |
 | `Left` / `Right` | Move Cursor | Move cursor left/right (always available) |
 | `Up` / `Down` | Scroll Detail | Scroll session detail (bypasses textarea; navigates suggestions when visible) |
@@ -2896,7 +2951,7 @@ Dot repeat records the full editing action. If the last change entered insert mo
 |----------------|----------------------|----------------------------------------------------------------------------------------------------|
 | `gf1` … `gf9`  | `OpenRecentFileN`    | Open recent-file slot N in the file viewer. Composable with the existing `g`-prefix grammar. Reuses the per-session `file_viewer_cache` so revisiting a path preserves cursor / fold state. |
 
-The recent-files list is the top 5 distinct file paths from `Edit` / `MultiEdit` / `Write` / `Read` `tool_input.file_path` events for the focused session, newest-first.
+The recent-files list is the top 9 distinct file paths from `Edit` / `MultiEdit` / `Write` / `Read` `tool_input.file_path` events for the focused session, newest-first.
 
 ---
 
@@ -2907,7 +2962,7 @@ The recent-files list is the top 5 distinct file paths from `Edit` / `MultiEdit`
 Most popup modals support **toggle** behavior: the same keybinding that opens a modal will close it when pressed again. This applies to all modals opened from normal mode:
 
 - **TaskRabbitPrompt** (`<Space>o`) — Opens a new TaskRabbit overlay (stacks with existing input overlays; close with `Ctrl+Q` or `Esc` from within)
-- **BlankPrompt** (`<Space>m`) — Opens a new Blank overlay (stacks with existing input overlays; close with `Ctrl+Q` or `Esc` from within)
+- **BlankPrompt** (`Ctrl-N`, `<Space>N`) — Opens a new Blank overlay (stacks with existing input overlays; close with `Ctrl+Q` or `Esc` from within)
 - **ModelDropdown** (`Ctrl+M`) — Press `Ctrl+M` to toggle model dropdown open/close (anchored below the header row or prompt model badge)
 - **ThemePicker** (`T`) — Press `T` to toggle open/close
 - **ProjectPicker** (`<Space>p`) — Press `<Space>p` to toggle open/close

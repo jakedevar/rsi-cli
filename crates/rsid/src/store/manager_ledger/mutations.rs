@@ -1,3 +1,4 @@
+use super::super::migration_allocation::{MigrationAllocationChange, MigrationAllocationRequest};
 use super::*;
 use rsi_common::types::SessionStatus;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +57,9 @@ impl Store {
             }
             ManagerUpdateV2::Ownership { key, .. }
             | ManagerUpdateV2::Migration { key, .. }
+            | ManagerUpdateV2::MigrationSeal { key, .. }
+            | ManagerUpdateV2::MigrationSealRelease { key, .. }
+            | ManagerUpdateV2::MigrationSealTransfer { key, .. }
             | ManagerUpdateV2::MigrationTransfer { key, .. }
             | ManagerUpdateV2::MigrationRelease { key, .. } => {
                 if !authority.is_manager {
@@ -66,10 +70,17 @@ impl Store {
             ManagerUpdateV2::Request {
                 request_id,
                 work_key,
+                state,
                 ..
             } => {
                 if authority.is_manager {
-                    return Err(refused("manager_v2_current_lead_required"));
+                    if !matches!(
+                        state,
+                        ManagerRequestStateV2::Completed | ManagerRequestStateV2::Declined
+                    ) || work_key.is_some()
+                    {
+                        return Err(refused("manager_v2_manager_request_disposition_required"));
+                    }
                 }
                 let epic = self.manager_v2_request_target(&authority, *request_id)?;
                 if let Some(key) = work_key {
@@ -150,6 +161,32 @@ impl Store {
                 self.manager_lead(authority.config.project_id, w.epic_id)
                     .ok()
                     .map(|s| s.id)
+            }
+            ManagerUpdateV2::MigrationSeal { source_commit, .. } => {
+                let w = work
+                    .as_ref()
+                    .ok_or_else(|| refused("manager_v2_work_missing"))?;
+                if w.source_commit.as_deref() != Some(source_commit.as_str()) {
+                    return Err(refused("manager_v2_source_changed"));
+                }
+                Some(
+                    w.source_session_id
+                        .ok_or_else(|| refused("manager_v2_source_custody_required"))?,
+                )
+            }
+            ManagerUpdateV2::MigrationSealTransfer {
+                new_source_commit, ..
+            } => {
+                let w = work
+                    .as_ref()
+                    .ok_or_else(|| refused("manager_v2_work_missing"))?;
+                if w.source_commit.as_deref() != Some(new_source_commit.as_str()) {
+                    return Err(refused("manager_v2_source_changed"));
+                }
+                Some(
+                    w.source_session_id
+                        .ok_or_else(|| refused("manager_v2_source_custody_required"))?,
+                )
             }
             ManagerUpdateV2::RequestReview { .. } => Some(
                 work.as_ref()
@@ -256,6 +293,16 @@ impl Store {
         request: &AgentManagerUpdateRequestV2,
         observed: &LedgerObservation,
     ) -> Result<ManagerMutationReceiptV2> {
+        if matches!(request.change, ManagerUpdateV2::MigrationSeal { .. }) {
+            return self.manager_v2_commit_migration_seal(caller, request, observed);
+        }
+        if matches!(
+            request.change,
+            ManagerUpdateV2::MigrationSealRelease { .. }
+                | ManagerUpdateV2::MigrationSealTransfer { .. }
+        ) {
+            return self.manager_v2_commit_migration_settlement(caller, request, observed);
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let context = self.manager_v2_prepare_update(caller, request)?;
         let a = &context.authority;
@@ -575,6 +622,13 @@ impl Store {
                     serde_json::to_value(m)?,
                 )
             }
+            ManagerUpdateV2::MigrationSeal { .. } => {
+                unreachable!("migration seals return before generic records")
+            }
+            ManagerUpdateV2::MigrationSealRelease { .. }
+            | ManagerUpdateV2::MigrationSealTransfer { .. } => {
+                unreachable!("migration seal settlements return before generic records")
+            }
             ManagerUpdateV2::MigrationTransfer {
                 key,
                 expected_row_version,
@@ -770,7 +824,7 @@ impl Store {
                 let retrieved = self
                     .manager_v2_record(config, "retrieval", &format!("{request_id}:{caller}"))?
                     .is_some();
-                if !retrieved {
+                if !retrieved && !a.is_manager {
                     return Err(refused("manager_v2_request_retrieval_required"));
                 }
                 let old = previous.map_or(
@@ -781,7 +835,9 @@ impl Store {
                     },
                     |r| r.state,
                 );
-                if !request_transition(old, *state) {
+                if (!a.is_manager || is_terminal_request_state(old))
+                    && !request_transition(old, *state)
+                {
                     return Err(refused("manager_v2_request_transition"));
                 }
                 // #664 permanent release: a lead-terminal state frees its
@@ -796,7 +852,9 @@ impl Store {
                 } else if old == ManagerRequestStateV2::Failed {
                     self.manager_v2_release_request(config, caller, epic, *request_id, old)?;
                 }
-                let execution_evidence = if *state == ManagerRequestStateV2::Completed {
+                let execution_evidence = if a.is_manager {
+                    Some(json!({"kind":"manager_disposition","actor":caller,"message":message}))
+                } else if *state == ManagerRequestStateV2::Completed {
                     if let Some(key) = work_key {
                         let (record, work) = self.manager_v2_work(config, key)?;
                         let source = work.source_commit.ok_or_else(|| {
@@ -913,6 +971,282 @@ impl Store {
             config,
             Some(caller),
             a.grant.row_version,
+            "ledger",
+            &request.idempotency_key,
+            &payload,
+            &serde_json::to_value(&receipt)?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// The allocator owns its own immediate transaction and exact-request
+    /// journal. Recording the manager receipt afterwards is restart safe: an
+    /// interrupted retry replays the same allocation before finishing the
+    /// manager ledger event.
+    fn manager_v2_commit_migration_seal(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerUpdateRequestV2,
+        observed: &LedgerObservation,
+    ) -> Result<ManagerMutationReceiptV2> {
+        let ManagerUpdateV2::MigrationSeal {
+            key,
+            expected_row_version,
+            source_commit,
+            expires_at,
+        } = &request.change
+        else {
+            unreachable!("migration seal dispatch")
+        };
+        let context = self.manager_v2_prepare_update(caller, request)?;
+        if context.work_version != *expected_row_version
+            || observed.source_commit.as_deref() != Some(source_commit)
+        {
+            return Err(refused("manager_v2_record_changed"));
+        }
+        let (repository, remote_tip, landed_version, prior_tip, published_sources) = observed
+            .migration_seal
+            .as_ref()
+            .ok_or_else(|| refused("manager_v2_migration_observation_required"))?;
+        for (session, id, generation) in &observed.custody {
+            let current = self.live_custody_for_session(*session)?;
+            if current.custody_id != *id || current.generation != *generation {
+                return Err(refused("manager_v2_evidence_custody_changed"));
+            }
+        }
+        let work = context
+            .work
+            .as_ref()
+            .ok_or_else(|| refused("manager_v2_work_missing"))?;
+        let payload = json!({"actor":caller,"request":request});
+        if let Some(replayed) = self.manager_v2_replay(
+            &context.authority.config,
+            &request.idempotency_key,
+            &payload,
+        )? {
+            return Ok(serde_json::from_value(replayed)?);
+        }
+        if let Some(prior_tip) = prior_tip
+            && prior_tip != remote_tip
+        {
+            self.migration_allocation_apply(&MigrationAllocationRequest {
+                repository: repository.clone(),
+                idempotency_key: fingerprint(&json!({
+                    "operation":"reconcile_for_seal",
+                    "repository":repository,
+                    "prior_tip":prior_tip,
+                    "remote_tip":remote_tip,
+                    "landed_version":landed_version,
+                    "published_sources":published_sources,
+                }))?,
+                change: MigrationAllocationChange::ReconcileHead {
+                    expected_tip: prior_tip.clone(),
+                    observed_tip: remote_tip.clone(),
+                    observed_version: *landed_version,
+                    published_sources: published_sources.clone(),
+                },
+            })?;
+        }
+        let allocation = self.migration_allocation_apply(&MigrationAllocationRequest {
+            repository: repository.clone(),
+            idempotency_key: fingerprint(&payload)?,
+            change: MigrationAllocationChange::Seal {
+                source_commit: source_commit.clone(),
+                work_key: key.clone(),
+                epic_id: work.epic_id,
+                remote_tip: remote_tip.clone(),
+                landed_version: *landed_version,
+                expires_at: *expires_at,
+            },
+        })?;
+        let claim = allocation
+            .claim
+            .ok_or_else(|| refused("manager_v2_migration_claim_missing"))?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let latest = self.manager_v2_prepare_update(caller, request)?;
+        if latest.work_version != *expected_row_version {
+            return Err(refused("manager_v2_record_changed"));
+        }
+        if let Some(replayed) =
+            self.manager_v2_replay(&latest.authority.config, &request.idempotency_key, &payload)?
+        {
+            tx.commit()?;
+            return Ok(serde_json::from_value(replayed)?);
+        }
+        let record_key = format!("migration_allocation:{}", claim.id);
+        let sequence = self.manager_v2_event(
+            &latest.authority.config,
+            Some(caller),
+            "migration_allocation",
+            &record_key,
+            claim.row_version,
+            &json!({
+                "claim":&claim,
+                "source_session_id":work.source_session_id,
+                "custody":&observed.custody,
+            }),
+        )?;
+        let receipt = ManagerMutationReceiptV2 {
+            event_sequence: sequence,
+            key: record_key,
+            row_version: claim.row_version,
+            deduplicated: false,
+        };
+        self.manager_v2_save_receipt(
+            &latest.authority.config,
+            Some(caller),
+            latest.authority.grant.row_version,
+            "ledger",
+            &request.idempotency_key,
+            &payload,
+            &serde_json::to_value(&receipt)?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn manager_v2_commit_migration_settlement(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerUpdateRequestV2,
+        observed: &LedgerObservation,
+    ) -> Result<ManagerMutationReceiptV2> {
+        let context = self.manager_v2_prepare_update(caller, request)?;
+        let config = &context.authority.config;
+        let payload = json!({"actor":caller,"request":request});
+        if let Some(replayed) =
+            self.manager_v2_replay(config, &request.idempotency_key, &payload)?
+        {
+            return Ok(serde_json::from_value(replayed)?);
+        }
+        let (key, claim_id, expected, source_commit) = match &request.change {
+            ManagerUpdateV2::MigrationSealRelease {
+                key,
+                claim_id,
+                expected_row_version,
+                source_commit,
+            }
+            | ManagerUpdateV2::MigrationSealTransfer {
+                key,
+                claim_id,
+                expected_row_version,
+                source_commit,
+                ..
+            } => (key, claim_id, expected_row_version, source_commit),
+            _ => unreachable!("migration settlement dispatch"),
+        };
+        let (repository, old_work, old_epic, old_source, old_version, row_version): (
+            String,
+            String,
+            String,
+            String,
+            u32,
+            i64,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT repository,work_key,epic_id,source_commit,assigned_version,row_version FROM migration_allocation_claims WHERE id=?1",
+                [claim_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| refused("manager_v2_migration_claim_missing"))?;
+        let old_epic = Uuid::parse_str(&old_epic)
+            .map_err(|_| refused("manager_v2_invalid_stored_identity"))?;
+        self.manager_v2_require_epic(&context.authority, old_epic)?;
+        if old_source != *source_commit || row_version != *expected {
+            return Err(refused("manager_v2_migration_claim_changed"));
+        }
+        let work = context
+            .work
+            .as_ref()
+            .ok_or_else(|| refused("manager_v2_work_missing"))?;
+        let change = match &request.change {
+            ManagerUpdateV2::MigrationSealRelease { .. } => {
+                if old_work != *key || old_epic != work.epic_id {
+                    return Err(refused("manager_v2_migration_claim_out_of_scope"));
+                }
+                MigrationAllocationChange::Release {
+                    claim_id: *claim_id,
+                    source_commit: source_commit.clone(),
+                    work_key: old_work,
+                    epic_id: old_epic,
+                    expected_row_version: *expected,
+                }
+            }
+            ManagerUpdateV2::MigrationSealTransfer {
+                new_source_commit,
+                expires_at,
+                ..
+            } => {
+                if observed.source_commit.as_deref() != Some(new_source_commit) {
+                    return Err(refused("manager_v2_migration_observation_required"));
+                }
+                for (session, id, generation) in &observed.custody {
+                    let current = self.live_custody_for_session(*session)?;
+                    if current.custody_id != *id || current.generation != *generation {
+                        return Err(refused("manager_v2_evidence_custody_changed"));
+                    }
+                }
+                MigrationAllocationChange::Transfer {
+                    claim_id: *claim_id,
+                    source_commit: source_commit.clone(),
+                    work_key: old_work,
+                    epic_id: old_epic,
+                    expected_row_version: *expected,
+                    new_source_commit: new_source_commit.clone(),
+                    new_work_key: key.clone(),
+                    new_epic_id: work.epic_id,
+                    expires_at: *expires_at,
+                }
+            }
+            _ => unreachable!("migration settlement dispatch"),
+        };
+        let allocation = self.migration_allocation_apply(&MigrationAllocationRequest {
+            repository,
+            idempotency_key: fingerprint(&payload)?,
+            change,
+        })?;
+        let claim = allocation
+            .claim
+            .ok_or_else(|| refused("manager_v2_migration_claim_missing"))?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let latest = self.manager_v2_prepare_update(caller, request)?;
+        if let Some(replayed) =
+            self.manager_v2_replay(&latest.authority.config, &request.idempotency_key, &payload)?
+        {
+            tx.commit()?;
+            return Ok(serde_json::from_value(replayed)?);
+        }
+        let record_key = format!("migration_allocation:{}", claim.id);
+        let sequence = self.manager_v2_event(
+            &latest.authority.config,
+            Some(caller),
+            "migration_allocation",
+            &record_key,
+            claim.row_version,
+            &json!({"claim":claim,"previous_version":old_version}),
+        )?;
+        let receipt = ManagerMutationReceiptV2 {
+            event_sequence: sequence,
+            key: record_key,
+            row_version: claim.row_version,
+            deduplicated: false,
+        };
+        self.manager_v2_save_receipt(
+            &latest.authority.config,
+            Some(caller),
+            latest.authority.grant.row_version,
             "ledger",
             &request.idempotency_key,
             &payload,
@@ -1060,7 +1394,7 @@ const fn is_terminal_request_state(state: ManagerRequestStateV2) -> bool {
 impl Store {
     /// Append the permanent `request_released` capacity marker once (CAS 0).
     /// Idempotent: an existing marker is never rewritten.
-    fn manager_v2_release_request(
+    pub(crate) fn manager_v2_release_request(
         &self,
         config: &HarnessManagerConfigV1,
         actor: Uuid,

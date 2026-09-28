@@ -290,6 +290,7 @@ mod tests {
     /// narrows, D4-excluded rows are absent from `lifetime_chats`, per-model
     /// GROUP BY sums, and day buckets split correctly.
     /// satisfies: F-004, F-005, F-006, F-015
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_aggregates_and_excludes_per_d4() {
         let store = Store::open_in_memory().unwrap();
@@ -390,6 +391,7 @@ mod tests {
 
     /// `COALESCE(SUM(x), 0)` on an empty table returns 0, not NULL/error.
     /// satisfies: F-006
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_empty_db_coalesces_to_zero() {
         let store = Store::open_in_memory().unwrap();
@@ -401,6 +403,7 @@ mod tests {
         assert!(stats.timeline.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_rolls_linked_ledger_rows_and_background_invocations() {
         let store = Store::open_in_memory().unwrap();
@@ -562,6 +565,7 @@ mod tests {
         assert_eq!(background_model.input_tokens, 30);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_attributes_linked_session_tokens_to_invocation_model() {
         let store = Store::open_in_memory().unwrap();

@@ -218,6 +218,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_canonicalize_working_dir_existing_dir() {
         let tmp = std::env::temp_dir();
@@ -229,6 +230,7 @@ mod tests {
         assert!(canon.is_dir());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_canonicalize_working_dir_nonexistent() {
         let path = Path::new("/nonexistent/directory/that/does/not/exist");
@@ -239,6 +241,7 @@ mod tests {
         assert!(err.contains("not accessible"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_canonicalize_working_dir_file_not_dir() {
         let tmp = std::env::temp_dir().join("rsi_test_path_safety_file");
@@ -250,18 +253,21 @@ mod tests {
         fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_validate_containment_empty_roots_allows_all() {
         let path = Path::new("/any/path/at/all");
         assert!(validate_containment(path, &[]).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_validate_containment_matching_root() {
         let roots = vec![PathBuf::from("/home/user/projects")];
         assert!(validate_containment(Path::new("/home/user/projects/flywheel"), &roots).is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_validate_containment_no_match() {
         let roots = vec![PathBuf::from("/home/user/projects")];
@@ -271,6 +277,7 @@ mod tests {
         assert!(err.contains("outside all allowed workspace roots"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_validate_containment_multiple_roots() {
         let roots = vec![
@@ -284,6 +291,7 @@ mod tests {
         assert!(validate_containment(Path::new("/tmp/scratch"), &roots).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_normal() {
         let wd = std::env::temp_dir();
@@ -292,6 +300,7 @@ mod tests {
         assert!(result.unwrap().starts_with(wd.canonicalize().unwrap()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_traversal_rejected() {
         let wd = std::env::temp_dir().join("rsi_test_sandbox");
@@ -301,6 +310,7 @@ mod tests {
         fs::remove_dir_all(&wd).ok();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_resolve_sandboxed_path_absolute_outside_rejected() {
         let wd = std::env::temp_dir();
@@ -311,6 +321,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_canonicalize_non_strict_existing_path() {
         let tmp = std::env::temp_dir();
@@ -319,6 +330,7 @@ mod tests {
         assert!(result.unwrap().is_absolute());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_canonicalize_non_strict_partially_existing() {
         // /tmp exists, /tmp/flywheel_nonexistent_subdir does not

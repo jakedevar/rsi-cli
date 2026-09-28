@@ -159,11 +159,39 @@ fn cargo_metadata_resolves_workspace_package_target_and_exact_dependency_sites()
 #[test]
 #[allow(clippy::too_many_lines)] // Workspace metadata, invalidation, and publication share one fixture.
 fn current_workspace_dotted_dependencies_map_to_exact_manifest_keys() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/rsi-codegraph\", \"crates/rsid\", \"crates/rsi-common\", \"crates/blake3\"]\nresolver = \"2\"\n[workspace.dependencies]\nblake3 = { path = \"crates/blake3\" }\nrsi-common = { path = \"crates/rsi-common\" }\n",
+    );
+    for name in ["rsi-codegraph", "rsid", "rsi-common", "blake3"] {
+        write(
+            root,
+            &format!("crates/{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        );
+        write(root, &format!("crates/{name}/src/lib.rs"), "");
+    }
+    write(
+        root,
+        "crates/rsi-codegraph/Cargo.toml",
+        "[package]\nname = \"rsi-codegraph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nblake3.workspace = true\n",
+    );
+    write(
+        root,
+        "crates/rsid/Cargo.toml",
+        "[package]\nname = \"rsid\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nrsi-common.workspace = true\n",
+    );
+    assert!(
+        Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success()
+    );
     let metadata = read_workspace(root).unwrap();
     let codegraph = metadata
         .packages

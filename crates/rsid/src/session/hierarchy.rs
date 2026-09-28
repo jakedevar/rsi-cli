@@ -116,6 +116,7 @@ mod tests {
         SessionKind::Research,
     ];
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn containment_matrix_matches_legal_children_for_all_parents() {
         // Parent = None (root)
@@ -141,6 +142,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn root_allows_standard_and_group() {
         assert!(validate_containment(None, SessionKind::Standard).is_ok());
@@ -152,6 +154,7 @@ mod tests {
         assert!(validate_containment(None, SessionKind::TaskRabbit).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn group_allows_standard_and_epic_only() {
         assert!(validate_containment(Some(SessionKind::Group), SessionKind::Standard).is_ok());
@@ -160,6 +163,7 @@ mod tests {
         assert!(validate_containment(Some(SessionKind::Group), SessionKind::Task).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn epic_allows_story_task_bug() {
         assert!(validate_containment(Some(SessionKind::Epic), SessionKind::Story).is_ok());
@@ -170,6 +174,7 @@ mod tests {
         assert!(validate_containment(Some(SessionKind::Epic), SessionKind::Epic).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn leaf_kinds_cannot_contain_anything() {
         for &leaf in &[
@@ -193,6 +198,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn self_cycle_rejected() {
         let a = Uuid::new_v4();
@@ -200,6 +206,7 @@ mod tests {
         assert!(matches!(r, Err(ContainmentError::CycleDetected { .. })));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn two_hop_cycle_rejected() {
         // B -> A already. Moving A under B would create A -> B -> A.
@@ -210,6 +217,7 @@ mod tests {
         assert!(matches!(r, Err(ContainmentError::CycleDetected { .. })));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn three_hop_cycle_rejected() {
         // C -> B -> A already. Moving A under C would create A -> C -> B -> A.
@@ -221,6 +229,7 @@ mod tests {
         assert!(matches!(r, Err(ContainmentError::CycleDetected { .. })));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn non_cycle_accepted() {
         // A and B are siblings; C has no parent. Putting A under C is fine.
@@ -235,6 +244,7 @@ mod tests {
     /// uses to reject container kinds. Keeping the assertion here (rather
     /// than hitting a full SessionManager) exercises the same decision
     /// boundary without the test-harness overhead.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn spawn_gate_rejects_container_kinds() {
         use rsi_common::is_leaf_kind;
@@ -249,6 +259,7 @@ mod tests {
         assert!(!is_leaf_kind(SessionKind::Epic));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn cycle_in_ancestors_does_not_hang() {
         // Pathological: D -> E -> D (pre-existing cycle not involving A).

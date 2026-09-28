@@ -54,11 +54,21 @@ pub const RSID_SCOPE_MEMORY_LIMIT_MIB_MAX: u64 = 1024 * 1024;
 pub const RSID_SCOPE_CPU_WEIGHT_MIN: u32 = 1;
 pub const RSID_SCOPE_CPU_WEIGHT_MAX: u32 = 10_000;
 
+/// Limits on the common worker slice, separate from the daemon scope.
+pub const WORKER_SCOPE_MEMORY_SWAP_MAX_MIB_DEFAULT: u64 = 0;
+/// Maximum accounted bytes retained for completed transcript reads.
+pub const COMPLETED_TRANSCRIPT_CACHE_MAX_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
+pub const SESSION_RETENTION_WINDOW_HOURS_DEFAULT: u64 = 24;
+pub const WORKER_SCOPE_CPU_WEIGHT_DEFAULT: u32 = 20;
+
 /// Runtime config fields whose user-initiated `UpdateDaemonConfig` mutations
 /// are durable daemon settings. Values are stored in SQLite's existing
 /// `daemon_settings` key-value table and re-applied during daemon boot before
 /// startup services are initialized.
 pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
+    "session_retention_enabled",
+    "session_retention_window_hours",
+    "completed_transcript_cache_max_bytes",
     "retry_enabled",
     "retry_max_default",
     "retry_on_stall",
@@ -66,6 +76,9 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "reconciliation_enabled",
     "stall_detection_enabled",
     "context_rotation_enabled",
+    "context_rotation_global_pct",
+    "context_rotation_claude_pct",
+    "context_rotation_codex_pct",
     "memory_enabled",
     "codegraph_indexing_enabled",
     "queue_enabled",
@@ -109,6 +122,8 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // #634 kill switch for the durable topology executor.
     "topology_executor_enabled",
     "topology_max_concurrent_build_nodes",
+    // #633: bulk fan-out rule for agent-authored topologies (plan §5.3).
+    "topology_bulk_fanout_min_openrouter",
     // Issue #35: the operator surface for issue #34's orchestration child-effort
     // ceiling. The field name is deliberately identical to
     // `store::model_control::KEY_ORCHESTRATION_MAX_CHILD_EFFORT`, because the
@@ -122,14 +137,55 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "sandbox_build_cache_reclaim_high_watermark_pct",
     "sandbox_build_cache_reclaim_low_watermark_pct",
     "sandbox_build_cache_reclaim_max_candidates",
+    "agent_build_jobs",
+    "agent_build_line_tables_only",
+    "agent_build_sccache_enabled",
+    "agent_build_sccache_cache_gib",
+    "agent_build_slots",
     "rsid_scope_memory_high_mib",
     "rsid_scope_memory_max_mib",
     "rsid_scope_memory_swap_max_mib",
     "rsid_scope_cpu_weight",
+    "worker_scope_memory_high_mib",
+    "worker_scope_memory_max_mib",
+    "worker_scope_memory_swap_max_mib",
+    "worker_scope_cpu_weight",
+    "vault.env_compat",
+    "vault.check_ttl_secs",
+    "api_route.openrouter",
+    "api_route.fallback",
 ];
 
 pub fn is_persisted_runtime_config_field(field: &str) -> bool {
-    PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field)
+    PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field) || openrouter_model_route_key(field).is_some()
+}
+
+fn openrouter_model_route_key(field: &str) -> Option<&str> {
+    let model = field.strip_prefix("api_route.openrouter.")?;
+    (!model.is_empty() && !model.chars().any(char::is_whitespace)).then_some(model)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRouterRoute {
+    CodexCli,
+    Harness,
+}
+
+impl OpenRouterRoute {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexCli => "codex_cli",
+            Self::Harness => "harness",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "codex_cli" => Some(Self::CodexCli),
+            "harness" => Some(Self::Harness),
+            _ => None,
+        }
+    }
 }
 
 /// Normalize a `system_prompt_preset` value: accepts canonical slugs,
@@ -172,6 +228,23 @@ fn bounded_u64(value: &serde_json::Value, min: u64, max: u64) -> Result<u64, Str
         return Err(format!("expected integer in {min}..={max}"));
     }
     Ok(value)
+}
+
+fn update_rotation_pct(field: &AtomicU8, value: &serde_json::Value) -> Result<(), String> {
+    let pct = if value.is_null() {
+        0
+    } else {
+        bounded_u64(value, 1, 99)? as u8
+    };
+    field.store(pct, Ordering::Relaxed);
+    Ok(())
+}
+
+fn override_json(field: &AtomicU8) -> serde_json::Value {
+    match field.load(Ordering::Relaxed) {
+        0 => serde_json::Value::Null,
+        pct => serde_json::json!(pct),
+    }
 }
 
 fn parse_recursive_dag_bool_env(var_name: &str, raw: String) -> bool {
@@ -332,6 +405,9 @@ pub struct Config {
     pub topology_executor_enabled: bool,
     /// Global cap for concurrently running topology command nodes.
     pub topology_max_concurrent_build_nodes: u32,
+    /// Agent-authored topologies (#633): a layer with at least this many
+    /// same-kind session nodes must run on `OpenRouter`. `0` disables the rule.
+    pub topology_bulk_fanout_min_openrouter: u32,
     /// Recursive DAG scheduler lease TTL for explicit fake scheduler RPCs.
     pub recursive_dag_run_lease_ttl_ms: u64,
     /// Global active recursive DAG scheduler run cap for explicit fake scheduler RPCs.
@@ -374,6 +450,9 @@ pub struct Config {
 /// Initialized from Config at startup, can be updated via UpdateDaemonConfig RPC.
 #[derive(Debug)]
 pub struct RuntimeConfig {
+    pub session_retention_enabled: AtomicBool,
+    pub session_retention_window_hours: AtomicU64,
+    pub completed_transcript_cache_max_bytes: AtomicU64,
     pub retry_enabled: AtomicBool,
     pub retry_max_default: AtomicU8,
     pub retry_on_stall: AtomicBool,
@@ -382,6 +461,10 @@ pub struct RuntimeConfig {
     pub reconciliation_enabled: AtomicBool,
     pub stall_detection_enabled: AtomicBool,
     pub context_rotation_enabled: AtomicBool,
+    /// Zero means no override; valid configured percentages are 1..=99.
+    pub context_rotation_global_pct: AtomicU8,
+    pub context_rotation_claude_pct: AtomicU8,
+    pub context_rotation_codex_pct: AtomicU8,
     pub memory_enabled: AtomicBool,
     /// Operator-owned Codegraph S3 indexing gate. The index manager clones this
     /// flag and observes live RPC updates through the same atomic value.
@@ -461,14 +544,32 @@ pub struct RuntimeConfig {
     /// `AGENT_VERBS`/`READ_VERBS`, so a session-attributed caller is refused by
     /// the pre-dispatch gate and cannot raise its own ceiling.
     pub orchestration_max_child_effort: RwLock<String>,
+    /// #694 K1: operator-only key-vault settings (`vault.env_compat`,
+    /// `vault.check_ttl_secs`), shared with the daemon's `VaultHandle` so an
+    /// `UpdateDaemonConfig` change applies to the next resolution/check.
+    pub vault_settings: Arc<crate::vault::VaultSettings>,
+    pub openrouter_route: RwLock<OpenRouterRoute>,
+    pub openrouter_model_routes: RwLock<std::collections::HashMap<String, OpenRouterRoute>>,
+    pub api_route_fallback: AtomicBool,
     /// Issue #69: operator-owned target-cache lifecycle controls. These
     /// settings never grant worktree or branch deletion authority.
     sandbox_build_cache_reclaim: RwLock<SandboxBuildCacheReclaimConfig>,
+    /// Launch defaults for sandboxed agent builds. Read at each process spawn.
+    pub agent_build_jobs: AtomicU32,
+    pub agent_build_line_tables_only: AtomicBool,
+    pub agent_build_sccache_enabled: AtomicBool,
+    pub agent_build_sccache_cache_gib: AtomicU32,
+    pub agent_build_slots: AtomicU32,
     /// Configured limits for the systemd user scope that launches rsid.
     pub rsid_scope_memory_high_mib: AtomicU64,
     pub rsid_scope_memory_max_mib: AtomicU64,
     pub rsid_scope_memory_swap_max_mib: AtomicU64,
     pub rsid_scope_cpu_weight: AtomicU32,
+    /// Aggregate limits for the worker slice; never substituted for rsid_scope_*.
+    pub worker_scope_memory_high_mib: AtomicU64,
+    pub worker_scope_memory_max_mib: AtomicU64,
+    pub worker_scope_memory_swap_max_mib: AtomicU64,
+    pub worker_scope_cpu_weight: AtomicU32,
     /// Transient high/low hysteresis state. This is telemetry, not a persisted
     /// operator setting, and resets conservatively on daemon restart.
     pub sandbox_build_cache_pressure_active: AtomicBool,
@@ -510,6 +611,8 @@ pub struct RuntimeConfig {
     /// Durable topology executor kill switch (#634). Default: true.
     pub topology_executor_enabled: AtomicBool,
     pub topology_max_concurrent_build_nodes: AtomicU32,
+    /// #633 bulk fan-out rule threshold (0 disables).
+    pub topology_bulk_fanout_min_openrouter: AtomicU32,
     /// Recursive DAG scheduler lease TTL for explicit fake scheduler RPCs.
     pub recursive_dag_run_lease_ttl_ms: AtomicU64,
     /// Global active recursive DAG scheduler run cap for explicit fake scheduler RPCs.
@@ -517,6 +620,28 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// CLI-backed rotation policy. Other provider families retain 65%.
+    pub fn context_rotation_threshold_pct(&self, provider: SessionProvider) -> f64 {
+        let family = match provider {
+            SessionProvider::Claude => Some(&self.context_rotation_claude_pct),
+            SessionProvider::Codex | SessionProvider::Pioneer | SessionProvider::CodexAppServer => {
+                Some(&self.context_rotation_codex_pct)
+            }
+            _ => None,
+        };
+        family
+            .map(|specific| {
+                let global = self.context_rotation_global_pct.load(Ordering::Relaxed);
+                (global != 0)
+                    .then_some(global)
+                    .or_else(|| {
+                        let pct = specific.load(Ordering::Relaxed);
+                        (pct != 0).then_some(pct)
+                    })
+                    .unwrap_or(65) as f64
+            })
+            .unwrap_or(65.0)
+    }
     pub fn from_config(config: &Config) -> Arc<Self> {
         Self::from_config_with_system_prompt_preset(config, "default".to_string())
     }
@@ -533,7 +658,14 @@ impl RuntimeConfig {
         config: &Config,
         system_prompt_preset_seed: String,
     ) -> Arc<Self> {
+        let (worker_memory_high_mib, worker_memory_max_mib) =
+            rsi_common::worker_memory::default_limits_mib();
         Arc::new(Self {
+            session_retention_enabled: AtomicBool::new(true),
+            session_retention_window_hours: AtomicU64::new(SESSION_RETENTION_WINDOW_HOURS_DEFAULT),
+            completed_transcript_cache_max_bytes: AtomicU64::new(
+                COMPLETED_TRANSCRIPT_CACHE_MAX_BYTES_DEFAULT,
+            ),
             retry_enabled: AtomicBool::new(config.retry_max_default > 0),
             retry_max_default: AtomicU8::new(config.retry_max_default),
             retry_on_stall: AtomicBool::new(config.retry_on_stall),
@@ -542,6 +674,9 @@ impl RuntimeConfig {
             reconciliation_enabled: AtomicBool::new(config.reconciliation_enabled),
             stall_detection_enabled: AtomicBool::new(config.stall_detection_enabled),
             context_rotation_enabled: AtomicBool::new(config.context_rotation_enabled),
+            context_rotation_global_pct: AtomicU8::new(0),
+            context_rotation_claude_pct: AtomicU8::new(0),
+            context_rotation_codex_pct: AtomicU8::new(0),
             memory_enabled: AtomicBool::new(config.memory_enabled),
             codegraph_indexing_enabled: Arc::new(AtomicBool::new(false)),
             queue_enabled: AtomicBool::new(config.queue_enabled),
@@ -583,6 +718,10 @@ impl RuntimeConfig {
             orchestration_max_child_effort: RwLock::new(
                 rsi_common::model_control::ORCHESTRATION_MAX_CHILD_EFFORT_UNSET.to_string(),
             ),
+            vault_settings: Arc::new(crate::vault::VaultSettings::default()),
+            openrouter_route: RwLock::new(OpenRouterRoute::CodexCli),
+            openrouter_model_routes: RwLock::new(std::collections::HashMap::new()),
+            api_route_fallback: AtomicBool::new(true),
             sandbox_build_cache_reclaim: RwLock::new(SandboxBuildCacheReclaimConfig {
                 enabled: true,
                 ttl_secs: SANDBOX_BUILD_CACHE_RECLAIM_TTL_SECS_DEFAULT,
@@ -591,10 +730,21 @@ impl RuntimeConfig {
                 low_watermark_pct: SANDBOX_BUILD_CACHE_RECLAIM_LOW_WATERMARK_PCT_DEFAULT,
                 max_candidates: SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_DEFAULT,
             }),
+            agent_build_jobs: AtomicU32::new(4),
+            agent_build_line_tables_only: AtomicBool::new(true),
+            agent_build_sccache_enabled: AtomicBool::new(true),
+            agent_build_sccache_cache_gib: AtomicU32::new(10),
+            agent_build_slots: AtomicU32::new(16),
             rsid_scope_memory_high_mib: AtomicU64::new(RSID_SCOPE_MEMORY_HIGH_MIB_DEFAULT),
             rsid_scope_memory_max_mib: AtomicU64::new(RSID_SCOPE_MEMORY_MAX_MIB_DEFAULT),
             rsid_scope_memory_swap_max_mib: AtomicU64::new(RSID_SCOPE_MEMORY_SWAP_MAX_MIB_DEFAULT),
             rsid_scope_cpu_weight: AtomicU32::new(RSID_SCOPE_CPU_WEIGHT_DEFAULT),
+            worker_scope_memory_high_mib: AtomicU64::new(worker_memory_high_mib),
+            worker_scope_memory_max_mib: AtomicU64::new(worker_memory_max_mib),
+            worker_scope_memory_swap_max_mib: AtomicU64::new(
+                WORKER_SCOPE_MEMORY_SWAP_MAX_MIB_DEFAULT,
+            ),
+            worker_scope_cpu_weight: AtomicU32::new(WORKER_SCOPE_CPU_WEIGHT_DEFAULT),
             sandbox_build_cache_pressure_active: AtomicBool::new(false),
             stall_classifier_enabled: AtomicBool::new(config.stall_classifier_enabled),
             stall_classifier_model: RwLock::new(config.stall_classifier_model.clone()),
@@ -626,6 +776,9 @@ impl RuntimeConfig {
             topology_executor_enabled: AtomicBool::new(config.topology_executor_enabled),
             topology_max_concurrent_build_nodes: AtomicU32::new(
                 config.topology_max_concurrent_build_nodes,
+            ),
+            topology_bulk_fanout_min_openrouter: AtomicU32::new(
+                config.topology_bulk_fanout_min_openrouter,
             ),
             recursive_dag_run_lease_ttl_ms: AtomicU64::new(config.recursive_dag_run_lease_ttl_ms),
             recursive_dag_max_concurrent_graphs: AtomicU32::new(
@@ -680,10 +833,70 @@ impl RuntimeConfig {
         });
         if let serde_json::Value::Object(ref mut map) = value {
             map.insert(
+                "session_retention_enabled".to_string(),
+                self.session_retention_enabled
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "session_retention_window_hours".to_string(),
+                self.session_retention_window_hours
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            for (name, field) in [
+                (
+                    "context_rotation_global_pct",
+                    &self.context_rotation_global_pct,
+                ),
+                (
+                    "context_rotation_claude_pct",
+                    &self.context_rotation_claude_pct,
+                ),
+                (
+                    "context_rotation_codex_pct",
+                    &self.context_rotation_codex_pct,
+                ),
+            ] {
+                map.insert(name.to_string(), override_json(field));
+            }
+            map.insert(
+                "completed_transcript_cache_max_bytes".to_string(),
+                self.completed_transcript_cache_max_bytes
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
                 "rsid_scope_memory_high_mib".to_string(),
                 self.rsid_scope_memory_high_mib
                     .load(Ordering::Relaxed)
                     .into(),
+            );
+            map.insert(
+                "agent_build_jobs".to_string(),
+                self.agent_build_jobs.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "agent_build_line_tables_only".to_string(),
+                self.agent_build_line_tables_only
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "agent_build_sccache_enabled".to_string(),
+                self.agent_build_sccache_enabled
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "agent_build_sccache_cache_gib".to_string(),
+                self.agent_build_sccache_cache_gib
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "agent_build_slots".to_string(),
+                self.agent_build_slots.load(Ordering::Relaxed).into(),
             );
             map.insert(
                 "rsid_scope_memory_max_mib".to_string(),
@@ -700,6 +913,28 @@ impl RuntimeConfig {
             map.insert(
                 "rsid_scope_cpu_weight".to_string(),
                 self.rsid_scope_cpu_weight.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "worker_scope_memory_high_mib".to_string(),
+                self.worker_scope_memory_high_mib
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "worker_scope_memory_max_mib".to_string(),
+                self.worker_scope_memory_max_mib
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "worker_scope_memory_swap_max_mib".to_string(),
+                self.worker_scope_memory_swap_max_mib
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "worker_scope_cpu_weight".to_string(),
+                self.worker_scope_cpu_weight.load(Ordering::Relaxed).into(),
             );
             map.insert(
                 "sandbox_build_cache_reclaim_enabled".to_string(),
@@ -725,6 +960,28 @@ impl RuntimeConfig {
                 "sandbox_build_cache_reclaim_max_candidates".to_string(),
                 reclaim.max_candidates.into(),
             );
+            map.insert(
+                rsi_common::provider_credentials::SETTING_VAULT_ENV_COMPAT.to_string(),
+                self.vault_settings.env_compat().into(),
+            );
+            map.insert(
+                rsi_common::provider_credentials::SETTING_VAULT_CHECK_TTL_SECS.to_string(),
+                self.vault_settings.check_ttl_secs().into(),
+            );
+            map.insert(
+                "api_route.openrouter".to_string(),
+                self.openrouter_route.read().as_str().into(),
+            );
+            map.insert(
+                "api_route.fallback".to_string(),
+                self.api_route_fallback.load(Ordering::Relaxed).into(),
+            );
+            for (model, route) in self.openrouter_model_routes.read().iter() {
+                map.insert(
+                    format!("api_route.openrouter.{model}"),
+                    route.as_str().into(),
+                );
+            }
             map.insert("recursive_dag_inspection".to_string(), true.into());
             map.insert("recursive_dag_run_inspection".to_string(), true.into());
             map.insert("recursive_dag_recovery_status".to_string(), true.into());
@@ -782,6 +1039,12 @@ impl RuntimeConfig {
                     .load(Ordering::Relaxed)
                     .into(),
             );
+            map.insert(
+                "topology_bulk_fanout_min_openrouter".to_string(),
+                self.topology_bulk_fanout_min_openrouter
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
             map.insert("recursive_dag_fake_executor_only".to_string(), true.into());
             map.insert(
                 "recursive_dag_live_executor_enabled".to_string(),
@@ -811,7 +1074,30 @@ impl RuntimeConfig {
         if !is_persisted_runtime_config_field(field) {
             return None;
         }
-        self.to_json().get(field).cloned()
+        Some(
+            self.to_json()
+                .get(field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    pub fn openrouter_route_for(&self, model: &str) -> OpenRouterRoute {
+        let normalized = model.strip_prefix("openrouter/").unwrap_or(model);
+        self.openrouter_model_routes
+            .read()
+            .get(normalized)
+            .copied()
+            .unwrap_or_else(|| *self.openrouter_route.read())
+    }
+
+    pub fn any_openrouter_harness_route(&self) -> bool {
+        *self.openrouter_route.read() == OpenRouterRoute::Harness
+            || self
+                .openrouter_model_routes
+                .read()
+                .values()
+                .any(|route| *route == OpenRouterRoute::Harness)
     }
 
     pub fn sandbox_build_cache_reclaim_snapshot(&self) -> SandboxBuildCacheReclaimConfig {
@@ -877,7 +1163,36 @@ impl RuntimeConfig {
 
     /// Update a single field by name. Returns `Ok(true)` if the field was found and updated.
     pub fn update_field(&self, field: &str, value: &serde_json::Value) -> Result<bool, String> {
+        if let Some(model) = openrouter_model_route_key(field) {
+            if value.is_null() {
+                self.openrouter_model_routes.write().remove(model);
+            } else {
+                let route = OpenRouterRoute::parse(value.as_str().ok_or("expected string")?)
+                    .ok_or("expected harness or codex_cli")?;
+                self.openrouter_model_routes
+                    .write()
+                    .insert(model.to_string(), route);
+            }
+            return Ok(true);
+        }
         match field {
+            "completed_transcript_cache_max_bytes" => {
+                let cap = value.as_u64().ok_or("expected non-negative integer")?;
+                self.completed_transcript_cache_max_bytes
+                    .store(cap, Ordering::Relaxed);
+                Ok(true)
+            }
+            "api_route.openrouter" => {
+                let route = OpenRouterRoute::parse(value.as_str().ok_or("expected string")?)
+                    .ok_or("expected harness or codex_cli")?;
+                *self.openrouter_route.write() = route;
+                Ok(true)
+            }
+            "api_route.fallback" => {
+                self.api_route_fallback
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
             "retry_enabled" => {
                 let v = value.as_bool().ok_or("expected bool")?;
                 self.retry_enabled.store(v, Ordering::Relaxed);
@@ -917,9 +1232,31 @@ impl RuntimeConfig {
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
                 Ok(true)
             }
+            "context_rotation_global_pct" => {
+                update_rotation_pct(&self.context_rotation_global_pct, value)?;
+                Ok(true)
+            }
+            "context_rotation_claude_pct" => {
+                update_rotation_pct(&self.context_rotation_claude_pct, value)?;
+                Ok(true)
+            }
+            "context_rotation_codex_pct" => {
+                update_rotation_pct(&self.context_rotation_codex_pct, value)?;
+                Ok(true)
+            }
             "memory_enabled" => {
                 self.memory_enabled
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "session_retention_enabled" => {
+                self.session_retention_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "session_retention_window_hours" => {
+                self.session_retention_window_hours
+                    .store(bounded_u64(value, 1, 8760)?, Ordering::Relaxed);
                 Ok(true)
             }
             "codegraph_indexing_enabled" => {
@@ -1066,6 +1403,24 @@ impl RuntimeConfig {
                 *self.system_prompt_preset.write() = canonical.to_string();
                 Ok(true)
             }
+            rsi_common::provider_credentials::SETTING_VAULT_ENV_COMPAT => {
+                let enabled = value.as_bool().ok_or("expected bool")?;
+                self.vault_settings
+                    .env_compat
+                    .store(enabled, Ordering::Release);
+                Ok(true)
+            }
+            rsi_common::provider_credentials::SETTING_VAULT_CHECK_TTL_SECS => {
+                let secs = bounded_u64(
+                    value,
+                    rsi_common::provider_credentials::MIN_CHECK_TTL_SECS,
+                    rsi_common::provider_credentials::MAX_CHECK_TTL_SECS,
+                )?;
+                self.vault_settings
+                    .check_ttl_secs
+                    .store(secs, Ordering::Release);
+                Ok(true)
+            }
             "orchestration_max_child_effort" => {
                 // Issue #35 (b). Bounded enum on write. This is the boundary
                 // that makes the R8 LOW-2 read-path degrade unreachable for the
@@ -1171,6 +1526,32 @@ impl RuntimeConfig {
                 *self.stall_classifier_confidence_floor.write() = v;
                 Ok(true)
             }
+            "agent_build_jobs" => {
+                let jobs = bounded_u64(value, 1, 32)? as u32;
+                self.agent_build_jobs.store(jobs, Ordering::Relaxed);
+                Ok(true)
+            }
+            "agent_build_line_tables_only" => {
+                self.agent_build_line_tables_only
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "agent_build_sccache_enabled" => {
+                self.agent_build_sccache_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "agent_build_sccache_cache_gib" => {
+                let gib = bounded_u64(value, 1, 512)? as u32;
+                self.agent_build_sccache_cache_gib
+                    .store(gib, Ordering::Relaxed);
+                Ok(true)
+            }
+            "agent_build_slots" => {
+                let slots = bounded_u64(value, 1, 64)? as u32;
+                self.agent_build_slots.store(slots, Ordering::Relaxed);
+                Ok(true)
+            }
             "rsid_scope_memory_high_mib" => {
                 let v = bounded_u64(
                     value,
@@ -1211,6 +1592,49 @@ impl RuntimeConfig {
                     ));
                 }
                 self.rsid_scope_cpu_weight.store(v, Ordering::Relaxed);
+                Ok(true)
+            }
+            "worker_scope_memory_high_mib" => {
+                let v = bounded_u64(
+                    value,
+                    RSID_SCOPE_MEMORY_LIMIT_MIB_MIN,
+                    RSID_SCOPE_MEMORY_LIMIT_MIB_MAX,
+                )?;
+                if v >= self.worker_scope_memory_max_mib.load(Ordering::Relaxed) {
+                    return Err("MemoryHigh must be below MemoryMax".to_string());
+                }
+                self.worker_scope_memory_high_mib
+                    .store(v, Ordering::Relaxed);
+                Ok(true)
+            }
+            "worker_scope_memory_max_mib" => {
+                let v = bounded_u64(
+                    value,
+                    RSID_SCOPE_MEMORY_LIMIT_MIB_MIN,
+                    RSID_SCOPE_MEMORY_LIMIT_MIB_MAX,
+                )?;
+                if v <= self.worker_scope_memory_high_mib.load(Ordering::Relaxed) {
+                    return Err("MemoryMax must be above MemoryHigh".to_string());
+                }
+                self.worker_scope_memory_max_mib.store(v, Ordering::Relaxed);
+                Ok(true)
+            }
+            "worker_scope_memory_swap_max_mib" => {
+                let v = bounded_u64(value, 0, RSID_SCOPE_MEMORY_LIMIT_MIB_MAX)?;
+                self.worker_scope_memory_swap_max_mib
+                    .store(v, Ordering::Relaxed);
+                Ok(true)
+            }
+            "worker_scope_cpu_weight" => {
+                let v = value.as_u64().ok_or("expected unsigned integer")?;
+                let v = u32::try_from(v).map_err(|_| "value exceeds u32::MAX")?;
+                if !(RSID_SCOPE_CPU_WEIGHT_MIN..=RSID_SCOPE_CPU_WEIGHT_MAX).contains(&v) {
+                    return Err(format!(
+                        "expected integer in {}..={}",
+                        RSID_SCOPE_CPU_WEIGHT_MIN, RSID_SCOPE_CPU_WEIGHT_MAX
+                    ));
+                }
+                self.worker_scope_cpu_weight.store(v, Ordering::Relaxed);
                 Ok(true)
             }
             "recursive_dag_recovery_controls_enabled" => {
@@ -1255,6 +1679,17 @@ impl RuntimeConfig {
                 }
                 let value = u32::try_from(value).map_err(|error| error.to_string())?;
                 self.topology_max_concurrent_build_nodes
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "topology_bulk_fanout_min_openrouter" => {
+                let value = value.as_u64().ok_or("expected number")?;
+                let max = u64::from(crate::topology::agent::BULK_FANOUT_MIN_OPENROUTER_MAX);
+                if value == 1 || value > max {
+                    return Err(format!("expected 0 (off) or a fan-out width in 2..={max}"));
+                }
+                let value = u32::try_from(value).map_err(|error| error.to_string())?;
+                self.topology_bulk_fanout_min_openrouter
                     .store(value, Ordering::Relaxed);
                 Ok(true)
             }
@@ -1393,6 +1828,9 @@ impl Config {
             .load(Ordering::Relaxed);
         self.topology_max_concurrent_build_nodes = runtime_config
             .topology_max_concurrent_build_nodes
+            .load(Ordering::Relaxed);
+        self.topology_bulk_fanout_min_openrouter = runtime_config
+            .topology_bulk_fanout_min_openrouter
             .load(Ordering::Relaxed);
         self.recursive_dag_run_lease_ttl_ms = runtime_config
             .recursive_dag_run_lease_ttl_ms
@@ -1753,6 +2191,8 @@ impl Config {
                 parse_recursive_dag_bool_env("RSI_TOPOLOGY_EXECUTOR_ENABLED", value)
             });
         let topology_max_concurrent_build_nodes = 2;
+        let topology_bulk_fanout_min_openrouter =
+            crate::topology::agent::DEFAULT_BULK_FANOUT_MIN_OPENROUTER;
 
         let recursive_dag_run_lease_ttl_ms = env_var_legacy!("RECURSIVE_DAG_RUN_LEASE_TTL_MS")
             .ok()
@@ -1897,6 +2337,7 @@ impl Config {
             gv_info_dashboard,
             topology_executor_enabled,
             topology_max_concurrent_build_nodes,
+            topology_bulk_fanout_min_openrouter,
             recursive_dag_run_lease_ttl_ms,
             recursive_dag_max_concurrent_graphs,
             stall_classifier_model,
@@ -2111,9 +2552,119 @@ impl Default for Config {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn agent_build_settings_are_bounded_and_visible_to_operator() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(runtime.to_json()["agent_build_jobs"], 4);
+        assert_eq!(runtime.to_json()["agent_build_line_tables_only"], true);
+        assert_eq!(runtime.to_json()["agent_build_sccache_enabled"], true);
+        assert_eq!(runtime.to_json()["agent_build_sccache_cache_gib"], 10);
+        assert_eq!(runtime.to_json()["agent_build_slots"], 16);
+        runtime
+            .update_field("agent_build_jobs", &serde_json::json!(8))
+            .unwrap();
+        runtime
+            .update_field("agent_build_sccache_cache_gib", &serde_json::json!(20))
+            .unwrap();
+        runtime
+            .update_field("agent_build_slots", &serde_json::json!(24))
+            .unwrap();
+        assert_eq!(runtime.to_json()["agent_build_jobs"], 8);
+        assert_eq!(runtime.to_json()["agent_build_sccache_cache_gib"], 20);
+        assert_eq!(runtime.to_json()["agent_build_slots"], 24);
+        assert!(
+            runtime
+                .update_field("agent_build_jobs", &serde_json::json!(0))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field("agent_build_sccache_cache_gib", &serde_json::json!(513))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field("agent_build_slots", &serde_json::json!(0))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field("agent_build_slots", &serde_json::json!(65))
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rotation_threshold_precedence_and_validation() {
+        let config = RuntimeConfig::from_config(&Config::from_env());
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Claude),
+            65.0
+        );
+        config
+            .update_field("context_rotation_claude_pct", &serde_json::json!(72))
+            .unwrap();
+        config
+            .update_field("context_rotation_codex_pct", &serde_json::json!(80))
+            .unwrap();
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Claude),
+            72.0
+        );
+        for provider in [
+            SessionProvider::Codex,
+            SessionProvider::Pioneer,
+            SessionProvider::CodexAppServer,
+        ] {
+            assert_eq!(config.context_rotation_threshold_pct(provider), 80.0);
+        }
+        config
+            .update_field("context_rotation_global_pct", &serde_json::json!(90))
+            .unwrap();
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Claude),
+            90.0
+        );
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Codex),
+            90.0
+        );
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Local),
+            65.0
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(100),
+            serde_json::json!(65.5),
+            serde_json::json!("65"),
+        ] {
+            assert!(
+                config
+                    .update_field("context_rotation_global_pct", &invalid)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Claude),
+            90.0
+        );
+        config
+            .update_field("context_rotation_global_pct", &serde_json::Value::Null)
+            .unwrap();
+        assert!(config.to_json()["context_rotation_global_pct"].is_null());
+        assert_eq!(
+            config.context_rotation_threshold_pct(SessionProvider::Claude),
+            72.0
+        );
+    }
+
     /// T10 (rsid side): every persisted daemon field has exactly one entry in
     /// the shared `rsi_common::daemon_config_catalog`, and the catalog names
     /// no other field (positive set equality).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn persisted_fields_are_catalogued() {
         use std::collections::BTreeSet;
@@ -2130,6 +2681,65 @@ mod tests {
         assert_eq!(catalogued, persisted);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn session_retention_settings_validate_and_round_trip() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["session_retention_enabled"], true);
+        assert_eq!(config.to_json()["session_retention_window_hours"], 24);
+        assert!(
+            config
+                .update_field("session_retention_enabled", &serde_json::json!(false))
+                .is_ok()
+        );
+        assert!(
+            config
+                .update_field("session_retention_window_hours", &serde_json::json!(72))
+                .is_ok()
+        );
+        assert_eq!(
+            config.persisted_field_value("session_retention_window_hours"),
+            Some(serde_json::json!(72))
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(8761),
+            serde_json::json!("24"),
+        ] {
+            assert!(
+                config
+                    .update_field("session_retention_window_hours", &invalid)
+                    .is_err()
+            );
+        }
+        assert_eq!(config.to_json()["session_retention_window_hours"], 72);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn completed_transcript_cache_cap_accepts_zero_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rsi.db");
+        let store = crate::store::Store::open(&path).unwrap();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let field = "completed_transcript_cache_max_bytes";
+        assert_eq!(
+            runtime.to_json()[field],
+            COMPLETED_TRANSCRIPT_CACHE_MAX_BYTES_DEFAULT
+        );
+        assert!(runtime.update_field(field, &serde_json::json!(-1)).is_err());
+        assert!(runtime.update_field(field, &serde_json::json!(0)).unwrap());
+        crate::store::daemon_settings::persist_runtime_config_field(&store, &runtime, field)
+            .unwrap();
+        drop(store);
+        let reopened = crate::store::Store::open(&path).unwrap();
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
+            .unwrap();
+        assert_eq!(restarted.to_json()[field], 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codegraph_indexing_defaults_off_and_validates_rpc_values() {
         let runtime = RuntimeConfig::from_config(&Config::default());
@@ -2163,6 +2773,7 @@ mod tests {
         assert!(!shared.load(Ordering::Relaxed));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codegraph_indexing_persists_through_daemon_restart() {
         let directory = tempfile::tempdir().unwrap();
@@ -2752,6 +3363,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_default_config() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2794,6 +3406,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_env_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2812,6 +3425,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_disabled_by_env() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2822,6 +3436,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_disabled_by_zero() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2831,6 +3446,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_suppress_retry_restore_env_is_default_off() {
         with_clean_env(|| {
@@ -2853,6 +3469,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_suppress_retry_restore_invalid_env_fails_visibly() {
         let message =
@@ -2861,6 +3478,7 @@ mod tests {
         assert!(message.contains("must be a boolean"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_suppress_retry_restore_legacy_env_is_supported() {
         with_clean_env_and(&[("RSI_SMOKE_SUPPRESS_RETRY_RESTORE", "true")], || {
@@ -2885,6 +3503,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_disabled_by_off() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2894,6 +3513,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_enabled_by_default() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2904,6 +3524,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_dir_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2913,6 +3534,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_embedding_model_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2925,6 +3547,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_embedding_url_and_key() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2944,6 +3567,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_config_db_path_suffix() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2956,6 +3580,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_config_inherits_defaults() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2973,6 +3598,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_memory_enabled_explicit_true() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2982,6 +3608,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_stall_timeout_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -2998,6 +3625,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_stall_detection_disabled() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3007,6 +3635,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_stall_detection_disabled_by_zero() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3016,6 +3645,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_stall_detection_enabled_by_default() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3025,6 +3655,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_workspace_roots_default_empty() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3034,6 +3665,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_workspace_roots_with_tmp() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3045,6 +3677,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_workspace_roots_nonexistent_skipped() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3061,6 +3694,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_reconciliation_defaults() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3077,6 +3711,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_reconciliation_disabled_by_env() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3086,6 +3721,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_reconciliation_interval_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3102,6 +3738,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_reconciliation_stall_action_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3118,6 +3755,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_retry_max_default_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3127,6 +3765,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_retry_max_backoff_ms_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3136,6 +3775,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_retry_on_stall_enabled() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3145,6 +3785,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_retry_on_stall_enabled_by_default() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3154,6 +3795,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_dream_disabled_by_env() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3163,6 +3805,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_dream_threshold_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3172,6 +3815,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_dream_model_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3181,6 +3825,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_dream_batch_size_override() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3190,6 +3835,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codex_sandbox_mode_defaults_to_danger_full_access() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3199,6 +3845,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codex_sandbox_mode_parses_env() {
         // env-guard (RSI-020): scrubs FLYWHEEL_* / MOTHERSHIP_* legacy fallbacks before reading config.
@@ -3208,6 +3855,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codex_sandbox_mode_parses_underscore_alias() {
         // CodexSandboxMode::parse normalizes underscores to hyphens (see codex.rs).
@@ -3217,6 +3865,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn codex_sandbox_mode_invalid_env_falls_back() {
         with_clean_env_and(&[("RSI_CODEX_SANDBOX_MODE", "garbage")], || {
@@ -3226,6 +3875,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_startup_recovery_defaults_are_bounded() {
         with_clean_env(|| {
@@ -3256,6 +3906,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_startup_recovery_env_override() {
         with_clean_env_and(
@@ -3280,6 +3931,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_control_env_overrides_are_granular() {
         with_clean_env_and(
@@ -3297,6 +3949,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_control_env_invalid_values_fail_visibly() {
         let message =
@@ -3314,6 +3967,7 @@ mod tests {
         assert!(message.contains("must be an unsigned integer"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_live_scheduler_env_flag_is_explicit_default_false() {
         with_clean_env_and(
@@ -3344,6 +3998,7 @@ mod tests {
         assert!(message.contains("recursive DAG execution is fake-only"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_startup_recovery_zero_max_graphs_falls_back() {
         with_clean_env_and(
@@ -3362,6 +4017,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_build_cache_runtime_config_defaults_and_json_are_complete() {
         with_clean_env(|| {
@@ -3409,6 +4065,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_build_cache_runtime_config_validates_bounds_atomically() {
         with_clean_env(|| {
@@ -3447,6 +4104,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_build_cache_runtime_config_concurrent_watermarks_never_publish_invalid_pair() {
         with_clean_env(|| {
@@ -3477,6 +4135,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_codex_sandbox_mode_valid() {
         with_clean_env(|| {
@@ -3495,6 +4154,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_codex_sandbox_mode_accepts_underscore_alias() {
         with_clean_env(|| {
@@ -3514,6 +4174,7 @@ mod tests {
 
     /// Issue #35 (b). Every legal ceiling round-trips through the operator
     /// write path and lands in `GetDaemonConfig`'s payload.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_orchestration_max_child_effort_accepts_every_choice() {
         with_clean_env(|| {
@@ -3541,6 +4202,7 @@ mod tests {
 
     /// Issue #35 (b). Whitespace/case are normalized, and both `""` and JSON
     /// `null` mean "clear the ceiling".
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_orchestration_max_child_effort_normalizes_and_clears() {
         with_clean_env(|| {
@@ -3567,6 +4229,7 @@ mod tests {
 
     /// Issue #35 (b). The bound is real: out-of-enum values are refused and the
     /// lock is left untouched, so a bad write cannot install a ceiling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_orchestration_max_child_effort_rejects_out_of_enum() {
         with_clean_env(|| {
@@ -3605,6 +4268,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_codex_sandbox_mode_invalid() {
         with_clean_env(|| {
@@ -3623,6 +4287,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_gates_recursive_dag_live_scheduler_and_background_controls() {
         with_clean_env(|| {
@@ -3708,6 +4373,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_recursive_dag_live_and_background_flags_remain_false() {
         with_clean_env(|| {
@@ -3726,6 +4392,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn gv_render_recursive_origin_is_persisted_and_default_false() {
         with_clean_env(|| {
@@ -3756,6 +4423,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn topology_executor_kill_switch_is_persisted_and_default_true() {
@@ -3780,6 +4448,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn topology_build_node_concurrency_is_operator_editable() {
@@ -3814,6 +4483,53 @@ mod tests {
         });
     }
 
+    /// #633: the bulk fan-out threshold is operator-editable through
+    /// `UpdateDaemonConfig`, persisted, defaults to 4 and accepts 0 (off).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn topology_bulk_fanout_min_openrouter_is_operator_editable() {
+        with_clean_env(|| {
+            let config = Config::from_env();
+            assert_eq!(config.topology_bulk_fanout_min_openrouter, 4);
+            let rc = RuntimeConfig::from_config(&config);
+            assert_eq!(rc.to_json()["topology_bulk_fanout_min_openrouter"], 4);
+            assert!(is_persisted_runtime_config_field(
+                "topology_bulk_fanout_min_openrouter"
+            ));
+            for accepted in [0_u32, 2, 6, 64] {
+                assert!(
+                    rc.update_field(
+                        "topology_bulk_fanout_min_openrouter",
+                        &serde_json::json!(accepted)
+                    )
+                    .unwrap()
+                );
+                assert_eq!(
+                    rc.topology_bulk_fanout_min_openrouter
+                        .load(Ordering::Relaxed),
+                    accepted
+                );
+            }
+            for refused in [
+                serde_json::json!(1),
+                serde_json::json!(65),
+                serde_json::json!("4"),
+            ] {
+                assert!(
+                    rc.update_field("topology_bulk_fanout_min_openrouter", &refused)
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                rc.topology_bulk_fanout_min_openrouter
+                    .load(Ordering::Relaxed),
+                64
+            );
+        });
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn gv_info_dashboard_is_persisted_and_default_false() {
         with_clean_env(|| {
@@ -3842,6 +4558,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_codex_sandbox_mode_rejects_non_string() {
         with_clean_env(|| {
@@ -3854,6 +4571,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_codex_sandbox_mode_serializes_in_to_json() {
         with_clean_env_and(&[("RSI_CODEX_SANDBOX_MODE", "read-only")], || {
@@ -3869,6 +4587,7 @@ mod tests {
 
     // --- RSI-026: system_prompt_preset tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn system_prompt_preset_defaults_to_default() {
         with_clean_env(|| {
@@ -3884,6 +4603,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn from_config_with_system_prompt_preset_uses_seed() {
         with_clean_env(|| {
@@ -3896,6 +4616,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_system_prompt_preset_valid() {
         with_clean_env(|| {
@@ -3911,6 +4632,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_system_prompt_preset_accepts_label_alias() {
         with_clean_env(|| {
@@ -3944,6 +4666,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_system_prompt_preset_accepts_underscore_alias() {
         with_clean_env(|| {
@@ -3957,6 +4680,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_system_prompt_preset_invalid() {
         with_clean_env(|| {
@@ -3975,6 +4699,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_system_prompt_preset_rejects_non_string() {
         with_clean_env(|| {
@@ -3987,6 +4712,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_system_prompt_preset_serializes_in_to_json() {
         with_clean_env(|| {
@@ -4005,6 +4731,7 @@ mod tests {
 
     // --- Stall classifier (RSI-0XX) ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn stall_classifier_env_defaults() {
         with_clean_env(|| {
@@ -4024,6 +4751,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn stall_classifier_env_overrides() {
         with_clean_env_and(
@@ -4055,6 +4783,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn stall_classifier_env_confidence_floor_rejects_out_of_range() {
         with_clean_env_and(&[("RSI_STALL_CLASSIFIER_CONFIDENCE_FLOOR", "1.5")], || {
@@ -4064,6 +4793,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_stall_classifier_enabled_round_trip() {
         with_clean_env(|| {
@@ -4086,6 +4816,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_stall_classifier_model_validation() {
         with_clean_env(|| {
@@ -4102,6 +4833,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_stall_classifier_numeric_fields() {
         with_clean_env(|| {
@@ -4145,6 +4877,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_update_confidence_floor_bounds() {
         with_clean_env(|| {
@@ -4178,6 +4911,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_config_to_json_includes_stall_classifier_keys() {
         with_clean_env(|| {
@@ -4200,6 +4934,7 @@ mod tests {
 
     // --- end stall classifier ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn normalize_system_prompt_preset_accepts_all_canonical() {
         for s in ["default", "concise", "code-only", "caveman"] {
@@ -4207,6 +4942,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn normalize_system_prompt_preset_rejects_unknown() {
         assert_eq!(normalize_system_prompt_preset("garbage"), None);
@@ -4214,6 +4950,7 @@ mod tests {
         assert_eq!(normalize_system_prompt_preset("future-variant"), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn normalize_system_prompt_preset_normalizes_label_and_underscore_aliases() {
         assert_eq!(normalize_system_prompt_preset("Default"), Some("default"));
@@ -4236,6 +4973,7 @@ mod tests {
 
     // --- C2 local-tracker: issue_tracker_config() kind selector ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_nothing_set_is_none() {
         // env-guard (RSI-020): scrubs FLYWHEEL_*/MOTHERSHIP_* legacy fallbacks
@@ -4246,6 +4984,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_unset_kind_with_linear_trio_is_linear() {
         with_clean_env_and(
@@ -4268,6 +5007,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_explicit_linear_kind_matches_unset_behavior() {
         with_clean_env_and(
@@ -4289,6 +5029,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_kind_local_needs_working_dir_and_project_id() {
         with_clean_env_and(
@@ -4323,6 +5064,7 @@ mod tests {
 
     /// Review F5b: P-001 precedence — an explicit `kind=local` wins even when
     /// the full Linear credential trio is also present.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_kind_local_wins_over_full_linear_creds() {
         with_clean_env_and(
@@ -4351,6 +5093,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_kind_local_without_working_dir_is_none() {
         with_clean_env_and(&[("RSI_ISSUE_TRACKER_KIND", "local")], || {
@@ -4359,6 +5102,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn issue_tracker_config_unknown_kind_is_none() {
         with_clean_env_and(
@@ -4375,6 +5119,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn rsid_scope_limits_are_persisted_and_validated() {
         let runtime = RuntimeConfig::from_config(&Config::default());
@@ -4446,5 +5191,144 @@ mod tests {
                 .is_err()
         );
         assert_eq!(runtime.to_json()["rsid_scope_cpu_weight"], 35);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn worker_scope_limits_are_independent_and_validated() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let initial = runtime.to_json();
+        let (default_high, default_max) = rsi_common::worker_memory::default_limits_mib();
+        assert_eq!(initial["worker_scope_memory_high_mib"], default_high);
+        assert_eq!(initial["worker_scope_memory_max_mib"], default_max);
+        assert_eq!(initial["worker_scope_memory_swap_max_mib"], 0);
+        assert_eq!(initial["worker_scope_cpu_weight"], 20);
+        for field in [
+            "worker_scope_memory_high_mib",
+            "worker_scope_memory_max_mib",
+            "worker_scope_memory_swap_max_mib",
+            "worker_scope_cpu_weight",
+        ] {
+            assert!(is_persisted_runtime_config_field(field), "{field}");
+        }
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(1_048_576))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_high_mib", &serde_json::json!(7168))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(8192))
+            .unwrap();
+        assert!(
+            runtime
+                .update_field("worker_scope_memory_max_mib", &serde_json::json!(7168))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field("worker_scope_memory_high_mib", &serde_json::json!(8192))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field(
+                    "worker_scope_memory_swap_max_mib",
+                    &serde_json::json!(1_048_577)
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .update_field("worker_scope_cpu_weight", &serde_json::json!(10_001))
+                .is_err()
+        );
+        assert_eq!(runtime.to_json()["rsid_scope_memory_high_mib"], 6144);
+        assert_eq!(runtime.to_json()["worker_scope_memory_high_mib"], 7168);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn openrouter_route_settings_default_override_and_snapshot() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            runtime.openrouter_route_for("qwen/qwen3-coder-next"),
+            OpenRouterRoute::CodexCli
+        );
+        assert!(runtime.api_route_fallback.load(Ordering::Relaxed));
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        runtime
+            .update_field(
+                "api_route.openrouter.qwen/qwen3-coder-next",
+                &serde_json::json!("codex_cli"),
+            )
+            .unwrap();
+        runtime
+            .update_field("api_route.fallback", &serde_json::json!(false))
+            .unwrap();
+        assert_eq!(
+            runtime.openrouter_route_for("deepseek/deepseek-v4.1-flash"),
+            OpenRouterRoute::Harness
+        );
+        assert_eq!(
+            runtime.openrouter_route_for("openrouter/qwen/qwen3-coder-next"),
+            OpenRouterRoute::CodexCli
+        );
+        assert_eq!(
+            runtime.to_json()["api_route.openrouter.qwen/qwen3-coder-next"],
+            "codex_cli"
+        );
+        assert_eq!(runtime.to_json()["api_route.fallback"], false);
+        assert!(is_persisted_runtime_config_field(
+            "api_route.openrouter.qwen/qwen3-coder-next"
+        ));
+        runtime
+            .update_field(
+                "api_route.openrouter.qwen/qwen3-coder-next",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.openrouter_route_for("qwen/qwen3-coder-next"),
+            OpenRouterRoute::Harness
+        );
+        assert!(
+            runtime
+                .update_field("api_route.openrouter", &serde_json::json!("invalid"))
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn openrouter_route_settings_survive_daemon_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&directory.path().join("settings.db")).unwrap();
+        let active = RuntimeConfig::from_config(&Config::default());
+        for (field, value) in [
+            ("api_route.openrouter", serde_json::json!("harness")),
+            (
+                "api_route.openrouter.qwen/qwen3-coder-next",
+                serde_json::json!("codex_cli"),
+            ),
+            ("api_route.fallback", serde_json::json!(false)),
+        ] {
+            active.update_field(field, &value).unwrap();
+            crate::store::daemon_settings::persist_runtime_config_field(&store, &active, field)
+                .unwrap();
+        }
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&store, &restarted).unwrap();
+        assert_eq!(
+            restarted.openrouter_route_for("z-ai/glm-5.3-flashx"),
+            OpenRouterRoute::Harness
+        );
+        assert_eq!(
+            restarted.openrouter_route_for("qwen/qwen3-coder-next"),
+            OpenRouterRoute::CodexCli
+        );
+        assert!(!restarted.api_route_fallback.load(Ordering::Relaxed));
     }
 }

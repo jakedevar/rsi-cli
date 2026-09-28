@@ -179,6 +179,19 @@ pub enum DaemonFeatureValue {
 }
 
 impl DaemonFeatureEntry {
+    fn rotation_threshold(field: &str, label: &str) -> Self {
+        let mut options = vec!["Default".to_string()];
+        options.extend((1..=99).map(|pct| pct.to_string()));
+        Self {
+            field: field.to_string(),
+            label: label.to_string(),
+            value: DaemonFeatureValue::Cycle {
+                options,
+                current: 0,
+            },
+        }
+    }
+
     /// Build the default feature list with unknown/pending state (before RPC fetch).
     pub fn defaults() -> Vec<Self> {
         vec![
@@ -205,6 +218,22 @@ impl DaemonFeatureEntry {
                 field: "retry_enabled".to_string(),
                 label: "Retry on failure".to_string(),
                 value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "session_retention_enabled".to_string(),
+                label: "Automatic session archive".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "session_retention_window_hours".to_string(),
+                label: "Archive after idle (hours)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "6", "12", "24", "48", "72", "168", "720"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
             },
             Self {
                 field: "retry_max_default".to_string(),
@@ -242,6 +271,12 @@ impl DaemonFeatureEntry {
                 label: "Context rotation".to_string(),
                 value: DaemonFeatureValue::Bool(false),
             },
+            Self::rotation_threshold("context_rotation_global_pct", "Rotation threshold (global)"),
+            Self::rotation_threshold(
+                "context_rotation_claude_pct",
+                "Rotation threshold (Claude Code)",
+            ),
+            Self::rotation_threshold("context_rotation_codex_pct", "Rotation threshold (Codex)"),
             Self {
                 field: "memory_enabled".to_string(),
                 label: "Memory system".to_string(),
@@ -403,9 +438,65 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "api_route.openrouter".to_string(),
+                label: "OpenRouter engine".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: vec!["codex_cli".to_string(), "harness".to_string()],
+                    current: 0,
+                },
+            },
+            Self {
+                field: "api_route.fallback".to_string(),
+                label: "API route fallback".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
                 field: "sandbox_build_cache_reclaim_enabled".to_string(),
                 label: "Sandbox cache reclaim".to_string(),
                 value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "agent_build_jobs".to_string(),
+                label: "Agent build jobs".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "4", "8", "16", "32"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "agent_build_line_tables_only".to_string(),
+                label: "Agent line tables".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "agent_build_sccache_enabled".to_string(),
+                label: "Worker sccache".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "agent_build_sccache_cache_gib".to_string(),
+                label: "sccache cap (GiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "5", "10", "20", "50", "100", "200", "512"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "agent_build_slots".to_string(),
+                label: "Machine build slots".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "4", "8", "12", "16", "24", "32", "64"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 5,
+                },
             },
             Self {
                 field: "source_worktree_settlement".to_string(),
@@ -527,6 +618,50 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "worker_scope_memory_high_mib".to_string(),
+                label: "Worker slice MemoryHigh (MiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["2048", "4096", "6144", "8192", "12288", "16384"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "worker_scope_memory_max_mib".to_string(),
+                label: "Worker slice MemoryMax (MiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["4096", "6144", "8192", "12288", "16384", "32768"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "worker_scope_memory_swap_max_mib".to_string(),
+                label: "Worker slice MemorySwapMax (MiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1024", "2048", "4096", "8192", "16384"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "worker_scope_cpu_weight".to_string(),
+                label: "Worker slice CPUWeight".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["10", "20", "50", "100", "200", "500"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 1,
+                },
+            },
+            Self {
                 field: "stall_classifier_enabled".to_string(),
                 label: "Stall classifier".to_string(),
                 value: DaemonFeatureValue::Bool(false),
@@ -633,6 +768,49 @@ impl DaemonFeatureEntry {
                     current: 1,
                 },
             },
+            Self {
+                field: "completed_transcript_cache_max_bytes".to_string(),
+                label: "Completed transcript cache (bytes)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "16777216", "67108864", "134217728", "268435456"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "topology_bulk_fanout_min_openrouter".to_string(),
+                label: "Topology bulk fan-out on OpenRouter (0 off)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: vec![
+                        "0".to_string(),
+                        "2".to_string(),
+                        "3".to_string(),
+                        "4".to_string(),
+                        "6".to_string(),
+                        "8".to_string(),
+                    ],
+                    current: 3,
+                },
+            },
+            Self {
+                field: rsi_common::provider_credentials::SETTING_VAULT_ENV_COMPAT.to_string(),
+                label: "Vault: legacy env fallback".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: rsi_common::provider_credentials::SETTING_VAULT_CHECK_TTL_SECS.to_string(),
+                label: "Vault: check TTL".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["60", "300", "600", "1800", "3600", "86400"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    // "600" — rsi_common::provider_credentials::DEFAULT_CHECK_TTL_SECS.
+                    current: 2,
+                },
+            },
         ]
     }
 
@@ -662,6 +840,7 @@ impl DaemonFeatureEntry {
                             serde_json::Value::String(s) => s.clone(),
                             serde_json::Value::Number(n) => n.to_string(),
                             serde_json::Value::Bool(b) => b.to_string(),
+                            serde_json::Value::Null => "Default".to_string(),
                             _ => String::new(),
                         };
                         let mut options = options.clone();
@@ -978,12 +1157,70 @@ impl ActivityIndicatorStyle {
     }
 }
 
+/// Horizontal placement of the capped session-detail transcript column.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetailColumnAlignment {
+    /// Position set by Ctrl-Left / Ctrl-Right, stored in
+    /// `UserSettings::detail_column_position_pct`.
+    Dynamic,
+    /// Column pinned to the left edge of the detail pane.
+    Left,
+    /// Column centered in the detail pane (the original layout).
+    #[default]
+    Center,
+}
+
+/// Percent of the free gutter moved by one Ctrl-Left / Ctrl-Right press.
+pub const DETAIL_COLUMN_NUDGE_STEP_PCT: u8 = 10;
+/// Dynamic position equal to the centered layout.
+pub const DETAIL_COLUMN_CENTER_PCT: u8 = 50;
+
+impl DetailColumnAlignment {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dynamic => "Dynamic",
+            Self::Left => "Left Aligned",
+            Self::Center => "Center Aligned",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Dynamic => Self::Left,
+            Self::Left => Self::Center,
+            Self::Center => Self::Dynamic,
+        }
+    }
+
+    /// Share of the free gutter placed left of the column (0 = left edge,
+    /// 50 = centered, 100 = right edge).
+    pub fn gutter_pct(self, dynamic_pct: u8) -> u8 {
+        match self {
+            Self::Dynamic => dynamic_pct.min(100),
+            Self::Left => 0,
+            Self::Center => DETAIL_COLUMN_CENTER_PCT,
+        }
+    }
+}
+
+fn default_detail_column_position_pct() -> u8 {
+    DETAIL_COLUMN_CENTER_PCT
+}
+
 /// Centralized user settings persisted across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     /// Active-session indicator style in the session detail pane.
     #[serde(default)]
     pub activity_indicator_style: ActivityIndicatorStyle,
+
+    /// Placement of the session-detail transcript column on wide panes.
+    #[serde(default)]
+    pub detail_column_alignment: DetailColumnAlignment,
+
+    /// Dynamic-mode gutter share (0..=100) left of the detail column.
+    #[serde(default = "default_detail_column_position_pct")]
+    pub detail_column_position_pct: u8,
 
     /// Default: show system events in new sessions.
     #[serde(default)]
@@ -1133,9 +1370,14 @@ pub struct UserSettings {
     #[serde(default)]
     pub text_area_backfill_hex: String,
 
-    /// Duration in milliseconds of the message-formulation grow animation
-    /// (the rainbow-text bubble that appears while a new message is rendering).
-    /// Cycles through `FORMULATION_ANIM_DURATIONS` via Enter in Settings > Display.
+    /// Whether a newly appended live event plays the formulation reveal
+    /// (top-to-bottom wipe over the event's own bubble). Off by default;
+    /// toggled in Settings > Screen.
+    #[serde(default)]
+    pub formulation_anim_enabled: bool,
+
+    /// Duration in milliseconds of the formulation reveal when enabled.
+    /// Cycles through `FORMULATION_ANIM_DURATIONS` via Enter in Settings > Screen.
     #[serde(default = "default_formulation_anim_ms")]
     pub formulation_anim_ms: u64,
 }
@@ -1144,6 +1386,8 @@ impl Default for UserSettings {
     fn default() -> Self {
         Self {
             activity_indicator_style: ActivityIndicatorStyle::default(),
+            detail_column_alignment: DetailColumnAlignment::default(),
+            detail_column_position_pct: DETAIL_COLUMN_CENTER_PCT,
             default_show_system_events: false,
             default_show_thinking_events: false,
             default_hide_tool_results: false,
@@ -1175,6 +1419,7 @@ impl Default for UserSettings {
             memory_owner_migrated: false,
             text_area_backfill_enabled: false,
             text_area_backfill_hex: String::new(),
+            formulation_anim_enabled: false,
             formulation_anim_ms: default_formulation_anim_ms(),
         }
     }
@@ -1238,6 +1483,28 @@ pub fn resolve_text_area_backfill(settings: &UserSettings) -> Option<Option<[u8;
 }
 
 impl UserSettings {
+    /// Move the session-detail column one step left (`direction < 0`) or
+    /// right (`direction > 0`). Reaching the left edge snaps into
+    /// `Left`; moving right out of `Left` (or either way out of `Center`)
+    /// switches to `Dynamic` one step from where the column was.
+    pub fn nudge_detail_column(&mut self, direction: i8) {
+        let current = self
+            .detail_column_alignment
+            .gutter_pct(self.detail_column_position_pct);
+        let step = DETAIL_COLUMN_NUDGE_STEP_PCT;
+        let next = match direction.signum() {
+            -1 => current.saturating_sub(step),
+            1 => current.saturating_add(step).min(100),
+            _ => return,
+        };
+        if next == 0 {
+            self.detail_column_alignment = DetailColumnAlignment::Left;
+        } else {
+            self.detail_column_alignment = DetailColumnAlignment::Dynamic;
+            self.detail_column_position_pct = next;
+        }
+    }
+
     /// Update the cached `system_prompt_preset` from a daemon-supplied
     /// canonical slug (`"default" | "concise" | "code-only" | "caveman"`)
     /// (RSI-026). Unknown slugs fall back to `Default` to keep the cache
@@ -1300,8 +1567,8 @@ pub const OBSERVATION_THRESHOLDS: &[u64] = &[10, 25, 50, 100, 200, 500];
 /// Curated dream cooldown presets (seconds).
 pub const DREAM_COOLDOWNS: &[u64] = &[1800, 3600, 7200, 14400, 28800, 86400];
 
-/// Preset durations (ms) for the formulation grow animation, cycled via Enter
-/// in Settings > Display. Range: 100 ms (snappy) to 2 000 ms (dramatic).
+/// Preset durations (ms) for the formulation reveal, cycled via Enter
+/// in Settings > Screen. Range: 100 ms (snappy) to 2 000 ms (dramatic).
 pub const FORMULATION_ANIM_DURATIONS: &[u64] = &[100, 200, 300, 500, 750, 1000, 1500, 2000];
 
 /// Curated local model options for prompt compilation / grammar fixing.
@@ -1603,6 +1870,102 @@ mod tests {
     }
 
     #[test]
+    fn detail_column_alignment_defaults_to_center_for_legacy_settings() {
+        let legacy: UserSettings = serde_json::from_str(r#"{"show_audio_waveform":false}"#)
+            .expect("legacy settings should deserialize");
+        assert_eq!(
+            legacy.detail_column_alignment,
+            DetailColumnAlignment::Center
+        );
+        assert_eq!(legacy.detail_column_position_pct, DETAIL_COLUMN_CENTER_PCT);
+
+        let mut settings = UserSettings::default();
+        settings.detail_column_alignment = DetailColumnAlignment::Dynamic;
+        settings.detail_column_position_pct = 30;
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let restored: UserSettings =
+            serde_json::from_str(&json).expect("settings should deserialize");
+        assert_eq!(
+            restored.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(restored.detail_column_position_pct, 30);
+    }
+
+    #[test]
+    fn nudging_detail_column_left_snaps_to_left_aligned() {
+        let mut settings = UserSettings::default();
+        settings.nudge_detail_column(-1);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(settings.detail_column_position_pct, 40);
+
+        for _ in 0..3 {
+            settings.nudge_detail_column(-1);
+        }
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(settings.detail_column_position_pct, 10);
+
+        settings.nudge_detail_column(-1);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Left
+        );
+
+        settings.nudge_detail_column(-1);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Left
+        );
+    }
+
+    #[test]
+    fn nudging_right_out_of_left_aligned_unsnaps_toward_center() {
+        let mut settings = UserSettings::default();
+        settings.detail_column_alignment = DetailColumnAlignment::Left;
+        settings.detail_column_position_pct = 80;
+
+        settings.nudge_detail_column(1);
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(
+            settings.detail_column_position_pct,
+            DETAIL_COLUMN_NUDGE_STEP_PCT
+        );
+    }
+
+    #[test]
+    fn nudging_detail_column_right_clamps_at_right_edge() {
+        let mut settings = UserSettings::default();
+        for _ in 0..20 {
+            settings.nudge_detail_column(1);
+        }
+        assert_eq!(
+            settings.detail_column_alignment,
+            DetailColumnAlignment::Dynamic
+        );
+        assert_eq!(settings.detail_column_position_pct, 100);
+    }
+
+    #[test]
+    fn detail_column_alignment_cycles_through_three_modes() {
+        let start = DetailColumnAlignment::Dynamic;
+        assert_eq!(start.next(), DetailColumnAlignment::Left);
+        assert_eq!(start.next().next(), DetailColumnAlignment::Center);
+        assert_eq!(start.next().next().next(), start);
+        assert_eq!(DetailColumnAlignment::Left.label(), "Left Aligned");
+        assert_eq!(DetailColumnAlignment::Center.label(), "Center Aligned");
+        assert_eq!(DetailColumnAlignment::Dynamic.label(), "Dynamic");
+    }
+
+    #[test]
     fn activity_indicator_style_defaults_for_legacy_settings_and_roundtrips() {
         let legacy: UserSettings = serde_json::from_str(r#"{"show_audio_waveform":false}"#)
             .expect("legacy settings should deserialize");
@@ -1843,6 +2206,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rotation_threshold_rows_round_trip_clearable_values() {
+        let mut entries = DaemonFeatureEntry::defaults();
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({
+                "context_rotation_global_pct": 73,
+                "context_rotation_claude_pct": null,
+                "context_rotation_codex_pct": 81
+            }),
+        );
+        for (field, expected) in [
+            ("context_rotation_global_pct", "73"),
+            ("context_rotation_claude_pct", "Default"),
+            ("context_rotation_codex_pct", "81"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.field == field).unwrap();
+            let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+                panic!("threshold must be editable")
+            };
+            assert_eq!(options[*current], expected);
+            assert_eq!(options.len(), 100);
+        }
+    }
+
     /// #634: the durable topology executor kill switch is operator-editable
     /// from the settings pane (AGENTS.md: no SQL-only knobs); it rides the
     /// generic Bool toggle, so presence in `defaults()` is the contract.
@@ -1865,6 +2253,67 @@ mod tests {
             .find(|e| e.field == "topology_executor_enabled")
             .unwrap();
         assert!(matches!(entry.value, DaemonFeatureValue::Bool(false)));
+    }
+
+    /// #633: the bulk fan-out threshold is an operator settings row that
+    /// follows the daemon value (default 4, `0` turns the rule off).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn daemon_feature_defaults_has_topology_bulk_fanout_threshold() {
+        let mut entries = DaemonFeatureEntry::defaults();
+        let entry = entries
+            .iter()
+            .find(|e| e.field == "topology_bulk_fanout_min_openrouter")
+            .unwrap();
+        assert_eq!(entry.label, "Topology bulk fan-out on OpenRouter (0 off)");
+        assert!(matches!(
+            &entry.value,
+            DaemonFeatureValue::Cycle { options, current: 3 } if options[3] == "4"
+        ));
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({ "topology_bulk_fanout_min_openrouter": 0 }),
+        );
+        let entry = entries
+            .iter()
+            .find(|e| e.field == "topology_bulk_fanout_min_openrouter")
+            .unwrap();
+        assert!(matches!(
+            &entry.value,
+            DaemonFeatureValue::Cycle { options, current: 0 } if options[0] == "0"
+        ));
+    }
+
+    #[test]
+    fn topology_bulk_fanout_cycle_preserves_unlisted_values_and_reaches_off() {
+        for value in [5_u64, 64] {
+            let mut entries = DaemonFeatureEntry::defaults();
+            DaemonFeatureEntry::update_from_json(
+                &mut entries,
+                &serde_json::json!({ "topology_bulk_fanout_min_openrouter": value }),
+            );
+            let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.field == "topology_bulk_fanout_min_openrouter")
+            else {
+                panic!("fanout setting must be present");
+            };
+            let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+                panic!("fanout setting must remain a cycle");
+            };
+            assert_eq!(options[*current], value.to_string());
+            assert_eq!(
+                options
+                    .iter()
+                    .filter(|option| **option == value.to_string())
+                    .count(),
+                1
+            );
+            assert_eq!(options[0], "0");
+            assert!(
+                (1..=options.len()).any(|step| options[(*current + step) % options.len()] == "0")
+            );
+        }
     }
 
     #[test]
@@ -1893,6 +2342,10 @@ mod tests {
             "rsid_scope_memory_max_mib",
             "rsid_scope_memory_swap_max_mib",
             "rsid_scope_cpu_weight",
+            "worker_scope_memory_high_mib",
+            "worker_scope_memory_max_mib",
+            "worker_scope_memory_swap_max_mib",
+            "worker_scope_cpu_weight",
         ] {
             assert!(entries.iter().any(|entry| entry.field == field), "{field}");
         }
@@ -1904,6 +2357,10 @@ mod tests {
                 "rsid_scope_memory_max_mib": 12288,
                 "rsid_scope_memory_swap_max_mib": 0,
                 "rsid_scope_cpu_weight": 35,
+                "worker_scope_memory_high_mib": 7168,
+                "worker_scope_memory_max_mib": 12288,
+                "worker_scope_memory_swap_max_mib": 0,
+                "worker_scope_cpu_weight": 35,
             }),
         );
 
@@ -1912,6 +2369,10 @@ mod tests {
             ("rsid_scope_memory_max_mib", "12288"),
             ("rsid_scope_memory_swap_max_mib", "0"),
             ("rsid_scope_cpu_weight", "35"),
+            ("worker_scope_memory_high_mib", "7168"),
+            ("worker_scope_memory_max_mib", "12288"),
+            ("worker_scope_memory_swap_max_mib", "0"),
+            ("worker_scope_cpu_weight", "35"),
         ] {
             let entry = entries.iter().find(|entry| entry.field == field).unwrap();
             assert!(matches!(
@@ -1931,9 +2392,9 @@ mod tests {
         // Issue #69 adds six controls, one status row, and two explicit
         // target-cache actions.
         // Claude project-config isolation (SECURITY) adds one control -> 33.
-        // #634, #635 and Epic M added fifteen daemon controls -> 48.
-        // #647 adds four operator scope controls -> 52.
-        assert_eq!(entries.len(), 52);
+        // Rolling's T4 topology row brings its defaults to 62; #694 adds two
+        // API route controls.
+        assert_eq!(entries.len(), 64);
         let codex = entries
             .iter()
             .find(|e| e.field == "codex_sandbox_mode")
@@ -1982,6 +2443,23 @@ mod tests {
             }
             other => panic!("expected Cycle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn daemon_feature_defaults_expose_openrouter_route_and_fallback() {
+        let entries = DaemonFeatureEntry::defaults();
+        let route = entries
+            .iter()
+            .find(|entry| entry.field == "api_route.openrouter")
+            .unwrap();
+        assert!(
+            matches!(&route.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 0)
+        );
+        let fallback = entries
+            .iter()
+            .find(|entry| entry.field == "api_route.fallback")
+            .unwrap();
+        assert!(matches!(&fallback.value, DaemonFeatureValue::Bool(true)));
     }
 
     #[test]

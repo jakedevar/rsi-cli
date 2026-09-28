@@ -175,7 +175,7 @@ pub struct LaunchSessionParams {
     pub group_id: Option<Uuid>,
     /// Effort level for reasoning-capable sessions.
     /// Claude accepts "low", "medium", "high", "max"; Codex accepts
-    /// "low", "medium", "high", "xhigh", "max", and (on GPT-6 Astra)
+    /// "low", "medium", "high", "xhigh", "max", and (on GPT-6 Astra/Sol)
     /// "ultra" on supported models.
     /// None = provider default.
     #[serde(default)]
@@ -1143,6 +1143,18 @@ pub struct DaemonRestartRecordV1 {
     pub failed_probes: Vec<String>,
 }
 
+/// Aggregate memory pressure of the common worker slice, when cgroup v2 is available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerSliceMemoryPressure {
+    /// Cumulative `memory.events` high counter for the slice.
+    pub high_events: u64,
+    /// Events per minute since the previous monotonic sample; absent on the first read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_events_per_minute: Option<f64>,
+    /// `memory.pressure` full avg60 percentage.
+    pub full_avg60: f64,
+}
+
 /// Response payload for GetHealthStatus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatusResponse {
@@ -1205,6 +1217,9 @@ pub struct HealthStatusResponse {
     /// Most recent durable watchdog restart, when the daemon has imported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_daemon_restart: Option<DaemonRestartRecordV1>,
+    /// Aggregate worker-slice pressure; absent when cgroup telemetry is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_slice_memory_pressure: Option<WorkerSliceMemoryPressure>,
 }
 
 /// One plan window (e.g. the rolling five-hour or seven-day window) and how
@@ -1275,6 +1290,9 @@ pub struct DaemonCapabilities {
     /// Supports `Subscribe` RPC for real-time push notifications over a dedicated connection.
     #[serde(default)]
     pub push_notifications: bool,
+    /// Supports the operator-only bounded satellite session read contract.
+    #[serde(default)]
+    pub satellite_session_read: bool,
     /// Supports memory search, status, index, and read RPC methods.
     #[serde(default)]
     pub memory_search: bool,
@@ -1393,6 +1411,7 @@ impl Default for DaemonCapabilities {
             batch_fetch: true,
             health_status: true,
             push_notifications: true,
+            satellite_session_read: false,
             memory_search: true,
             workflows: true,
             stall_detection: true,
@@ -2026,6 +2045,11 @@ pub struct UpdateTopologyParams {
     pub name: Option<String>,
     #[serde(default)]
     pub definition: Option<TopologyDefinition>,
+    /// Operator-only switch (#633): `true` lets Epic leads (and, for an
+    /// operator topology, the manager) see and execute this operator- or
+    /// manager-owned topology through the agent verbs. May be sent alone.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 /// Parameters for `DeleteTopology` RPC. The daemon rejects when any Epic
@@ -2887,6 +2911,17 @@ mod tests {
     fn test_daemon_capabilities_default_has_memory_search() {
         let caps = DaemonCapabilities::default();
         assert!(caps.memory_search);
+    }
+
+    #[test]
+    fn satellite_session_read_capability_defaults_off_for_older_daemons() {
+        let mut value = serde_json::to_value(DaemonCapabilities::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("satellite_session_read");
+        let decoded: DaemonCapabilities = serde_json::from_value(value).unwrap();
+        assert!(!decoded.satellite_session_read);
     }
 
     #[test]
@@ -4160,5 +4195,34 @@ mod tests {
         };
 
         assert!(!status.provider_pioneer_available);
+        assert!(status.worker_slice_memory_pressure.is_none());
+    }
+
+    #[test]
+    fn health_status_round_trips_worker_slice_memory_pressure() {
+        let mut value = serde_json::json!({
+            "persistence_queue_depth": 0,
+            "persistence_queue_capacity": 1,
+            "last_command_duration_ms": 0,
+            "project_cache_size": 0
+        });
+        value["worker_slice_memory_pressure"] = serde_json::json!({
+            "high_events": 42,
+            "high_events_per_minute": 6.0,
+            "full_avg60": 0.25
+        });
+        let status: HealthStatusResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            status.worker_slice_memory_pressure,
+            Some(WorkerSliceMemoryPressure {
+                high_events: 42,
+                high_events_per_minute: Some(6.0),
+                full_avg60: 0.25,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["worker_slice_memory_pressure"],
+            value["worker_slice_memory_pressure"]
+        );
     }
 }

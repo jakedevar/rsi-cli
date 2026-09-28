@@ -29,7 +29,21 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
         }
 
         LcAction::InterruptSession => {
-            app.interrupt_focused_session().await;
+            app.interrupt_focused_session(false).await;
+        }
+
+        LcAction::HardInterruptSession => {
+            app.interrupt_focused_session(true).await;
+        }
+
+        LcAction::DowngradeOperatorPause => {
+            app.set_focused_operator_pause(crate::client::OperatorPauseLevel::Soft)
+                .await;
+        }
+
+        LcAction::ClearOperatorPause => {
+            app.set_focused_operator_pause(crate::client::OperatorPauseLevel::None)
+                .await;
         }
 
         LcAction::QuickContinue => {

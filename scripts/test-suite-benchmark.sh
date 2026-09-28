@@ -11,7 +11,7 @@ set -euo pipefail
 readonly SCRIPT_NAME="${0##*/}"
 readonly OUTPUT_ROOT="target/test-suite-benchmark"
 readonly SCHEMA_VERSION=2
-readonly RETAINED_CALIBRATION_CASES=141
+readonly RETAINED_CALIBRATION_CASES=144
 readonly CUSTODY_THREAT_STATEMENT="Acceptance proves exact bytes and uninterrupted in-process descriptor custody against hostile inherited environment and concurrent same-UID pathname or configuration mutation after a conforming sterile launch. It does not authenticate the launching principal, resist same-UID ptrace, process-memory, signal/control, namespace-control, or inherited-open-fd compromise, and does not authenticate alteration or forgery after the producer's final reproof and exit. It is not a signature or cryptographic origin attestation."
 REPO_ROOT="" OUTPUT_ROOT_ABS="" CAPTURE_OUT_ABS=""
 CAPTURE_GIT_HEAD="" CAPTURE_GIT_BRANCH=""
@@ -40,9 +40,9 @@ Probes:
   store-fixture      one representative fresh Store fixture test
   v87-matrices       exactly three V87 session-fence predicate matrices
   source-scanner     the protected-DML source scanner test
-  nextest-fast       rsid library tests through the rsid-fast Nextest profile
-  nextest-full       all workspace tests through cargo-nextest
-  rsid-serial        all rsid library tests with one libtest thread
+  nextest-fast       sharded rsid fast lane, including integration, bin, and doctest targets
+  nextest-full       sharded rsid plus the remaining workspace tests and doctests
+  rsid-serial        sharded rsid fast lane with one test worker
   workspace-doctests all workspace doctests
 
 capture refuses a dirty Git tree. Each capture retains a unique private
@@ -50,11 +50,15 @@ workspace. By default it is below the repository's target/test-suite-benchmark/
 directory. The capture-only external option requires Linux and an existing,
 canonical, current-user-owned mode-0700 root outside every Git worktree.
 
-calibrate-baseline is the sole accepted baseline producer. It owns one live,
+calibrate-baseline is the legacy accepted baseline producer. It owns one live,
 resident descriptor-custody lifetime spanning preflight, enumeration, the fast
 and full lanes, store/scanner captures, the 1/8/16/32 thread sweep, selection,
 generation, held-out checks, exclusive publication, and identity-only cleanup.
 It accepts no arguments and will run real tests; do not invoke it accidentally.
+Its fixed single-harness commands cannot represent sharded rsid. On source
+declaring test-shard-mode, calibrate-baseline and attest-preflight refuse before
+Cargo work. The normal make test-benchmark capture remains available; accepted
+sharded baseline publication awaits the dedicated rsi-baseline producer.
 
 attest-preflight is diagnostic-only and produces accepted=false evidence. It runs
 the fixed fact, enumeration, fast-lane, and full-lane commands once, retains
@@ -745,28 +749,33 @@ run_timed() {
 PROBE_COMMAND=() PROBE_WARMUP_COMMAND=() PROBE_WARMUP_KIND=execution PROBE_TEST_IDENTITY=() PROBE_IDENTITY_MODE=descriptive PROBE_RESULT_FORMAT=libtest PROBE_PROFILE=""
 probe_command() {
     local probe="$1" threads="$2"
+    [ -n "$REPO_ROOT" ] || REPO_ROOT="$(git rev-parse --show-toplevel)" || die "cannot locate shard runner"
     PROBE_TEST_IDENTITY=(); PROBE_WARMUP_COMMAND=(); PROBE_IDENTITY_MODE=descriptive; PROBE_WARMUP_KIND=execution; PROBE_RESULT_FORMAT=libtest; PROBE_PROFILE=""
     case "$probe" in
         store-fixture)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("store::tests::load_sessions_survives_legacy_comma_fraction_timestamp")
-            PROBE_COMMAND=(cargo test -p rsid --lib "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
+            PROBE_COMMAND=(cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
         v87-matrices)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("store::tests::h1_v87_session_fence_initial_bind_requires_exact_active_authority" "store::tests::h1_v87_session_fence_provider_live_writes_are_exact_next_sequence" "store::tests::h1_v87_session_fence_finalize_requires_complete_terminal_bundle")
-            PROBE_COMMAND=(bash -c 'set -e; threads=$1; shift; for test_id; do cargo test -p rsid --lib "$test_id" -- --exact --test-threads "$threads"; done' benchmark-v87 "$threads" "${PROBE_TEST_IDENTITY[@]}") ;;
+            PROBE_COMMAND=(bash -c 'set -e; threads=$1; shift; for test_id; do cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "$test_id" -- --exact --test-threads "$threads"; done' benchmark-v87 "$threads" "${PROBE_TEST_IDENTITY[@]}") ;;
         source-scanner)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("session::issue21_phase2_tests::p2_07_gate_permit_spine::exactly_one_production_writer_of_gate_closing_and_effect_permits")
-            PROBE_COMMAND=(cargo test -p rsid --lib "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
+            PROBE_COMMAND=(cargo test -p rsid --lib --no-default-features --features test-shard-session-02 "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
         nextest-fast)
-            PROBE_RESULT_FORMAT=nextest; PROBE_PROFILE=rsid-fast; PROBE_TEST_IDENTITY=("rsid library nextest fast profile"); PROBE_COMMAND=(cargo nextest run --profile rsid-fast -p rsid --lib --status-level all --final-status-level all -j "$threads"); PROBE_WARMUP_COMMAND=(cargo nextest run --profile rsid-fast -p rsid --lib --no-run); PROBE_WARMUP_KIND=artifact-build ;;
+            PROBE_RESULT_FORMAT=nextest; PROBE_PROFILE=rsid-fast; PROBE_TEST_IDENTITY=("sharded rsid fast lane"); PROBE_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" fast --jobs "$threads"); PROBE_WARMUP_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" warmup --profile rsid-fast --jobs "$threads"); PROBE_WARMUP_KIND=artifact-build ;;
         nextest-full)
-            PROBE_RESULT_FORMAT=nextest; PROBE_PROFILE=ci-full; PROBE_TEST_IDENTITY=("workspace nextest full profile"); PROBE_COMMAND=(cargo nextest run --profile ci-full --workspace --status-level all --final-status-level all -j "$threads"); PROBE_WARMUP_COMMAND=(cargo nextest run --profile ci-full --workspace --no-run); PROBE_WARMUP_KIND=artifact-build ;;
+            PROBE_RESULT_FORMAT=nextest; PROBE_PROFILE=ci-full; PROBE_TEST_IDENTITY=("sharded rsid and remaining workspace full lane"); PROBE_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" full --jobs "$threads"); PROBE_WARMUP_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" warmup --profile ci-full --jobs "$threads"); PROBE_WARMUP_KIND=artifact-build ;;
         rsid-serial)
-            [ "$threads" = 1 ] || die "rsid-serial always executes with one thread; use --threads 1"; PROBE_TEST_IDENTITY=("rsid library test binary"); PROBE_COMMAND=(cargo test -p rsid --lib -- --test-threads 1); PROBE_WARMUP_COMMAND=(cargo test -p rsid --lib --no-run); PROBE_WARMUP_KIND=artifact-build ;;
+            [ "$threads" = 1 ] || die "rsid-serial always executes with one thread; use --threads 1"; PROBE_RESULT_FORMAT=nextest; PROBE_PROFILE=rsid-fast; PROBE_TEST_IDENTITY=("sharded rsid fast lane with one test worker"); PROBE_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" fast --jobs 1); PROBE_WARMUP_COMMAND=("$REPO_ROOT/scripts/run-rsid-test-shards.sh" warmup --profile rsid-fast --jobs 1); PROBE_WARMUP_KIND=artifact-build ;;
         workspace-doctests)
             PROBE_TEST_IDENTITY=("workspace doctests"); PROBE_COMMAND=(cargo test --workspace --doc -- --test-threads "$threads") ;;
         *) die "unsupported probe: $probe" ;;
     esac
     [ "${#PROBE_WARMUP_COMMAND[@]}" -gt 0 ] || PROBE_WARMUP_COMMAND=("${PROBE_COMMAND[@]}")
+}
+
+require_complete_shard_gates() {
+    "$REPO_ROOT/scripts/check-rsid-test-shards.py" --require-gates >/dev/null || die "rsid shard gates are incomplete; refusing benchmark Cargo work"
 }
 
 # Emit unique normalized identities for failure and exact-identity evidence.
@@ -878,6 +887,7 @@ capture() {
         require_jq; need_command git; need_command cargo; need_command awk; need_command sed; need_command realpath; need_command sha256sum; need_command stat
         require_clean_tree; capture_source_state
         resolved_threads="$(resolve_threads "$threads")"; probe_command "$probe" "$resolved_threads"
+        require_complete_shard_gates
         umask 077
         prepare_external_output_destination "$external_root" "$out"
         out_dir="$EXTERNAL_PARENT"; workspace="$EXTERNAL_PARENT/$EXTERNAL_WORKSPACE_LEAF"
@@ -887,8 +897,8 @@ capture() {
         validate_external_staging_before_work
         cargo nextest --version >/dev/null 2>&1 || die "cargo-nextest is required; install it with: cargo install cargo-nextest"
     else
-        validate_output_path "$out"; require_jq; need_command git; need_command cargo; need_command awk; need_command sed; need_command realpath; need_command sha256sum; need_command stat; require_clean_tree; capture_source_state; cargo nextest --version >/dev/null 2>&1 || die "cargo-nextest is required; install it with: cargo install cargo-nextest"
-        resolved_threads="$(resolve_threads "$threads")"; probe_command "$probe" "$resolved_threads"; prepare_output_destination "$out"
+        validate_output_path "$out"; require_jq; need_command git; need_command cargo; need_command awk; need_command sed; need_command realpath; need_command sha256sum; need_command stat; require_clean_tree; capture_source_state
+        resolved_threads="$(resolve_threads "$threads")"; probe_command "$probe" "$resolved_threads"; require_complete_shard_gates; cargo nextest --version >/dev/null 2>&1 || die "cargo-nextest is required; install it with: cargo install cargo-nextest"; prepare_output_destination "$out"
         out_dir="$(dirname "$CAPTURE_OUT_ABS")"; umask 077; workspace="$(mktemp -d "$out_dir/.${label}-${probe}.capture.XXXXXX")"; logs_dir="$workspace/logs"; samples_dir="$workspace/samples"; mkdir "$logs_dir" "$samples_dir"; tmp_out="$(mktemp "$out_dir/.capture-json.XXXXXX")"; identity_file="$workspace/identity.json"; samples_file="$workspace/samples.json"; printf '%s\n' "${PROBE_TEST_IDENTITY[@]}" | json_string_array >"$identity_file"; printf '[]\n' >"$samples_file"
     fi
     if [ "$PROBE_RESULT_FORMAT" = nextest ]; then
@@ -1020,7 +1030,7 @@ attest_execute_one() {
         nextest-version) cargo nextest --version ;;
         cargo-metadata) cargo metadata --format-version 1 --no-deps ;;
         nextest-config) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" cargo nextest show-config test-groups ;;
-        nextest-fast-list) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" cargo nextest list --profile rsid-fast -p rsid --lib --message-format json ;;
+        nextest-fast-list) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" cargo nextest list --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --message-format json ;;
         nextest-full-list) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" cargo nextest list --profile ci-full --workspace --message-format json ;;
         make-test-fast) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" /usr/bin/make test-fast "NEXTEST_JOBS=$threads" ;;
         make-test-full) XDG_CONFIG_HOME="$isolated_config" NEXTEST_CONFIG_FILE="$REPO_ROOT/.config/nextest.toml" /usr/bin/make test-full "NEXTEST_JOBS=$threads" ;;
@@ -1089,7 +1099,7 @@ root, repo, threads_text, head, branch, threat_statement = sys.argv[1:]
 threads = int(threads_text)
 names = ["git-head","git-branch","git-status","git-diff-check","snapshots","nproc","uname","lscpu","cargo-version","rustc-version","nextest-version","cargo-metadata","nextest-config","nextest-fast-list","nextest-full-list","make-test-fast","make-test-full"]
 commands = {
-"git-head":"git rev-parse HEAD","git-branch":"git branch --show-current","git-status":"git status --porcelain=v1","git-diff-check":"git diff --check","snapshots":"find . -type f -name '*.snap.new' -print","nproc":"nproc","uname":"uname -a","lscpu":"lscpu","cargo-version":"cargo --version","rustc-version":"rustc --version","nextest-version":"cargo nextest --version","cargo-metadata":"cargo metadata --format-version 1 --no-deps","nextest-config":"cargo nextest show-config test-groups","nextest-fast-list":"cargo nextest list --profile rsid-fast -p rsid --lib --message-format json","nextest-full-list":"cargo nextest list --profile ci-full --workspace --message-format json","make-test-fast":f"make test-fast NEXTEST_JOBS={threads}","make-test-full":f"make test-full NEXTEST_JOBS={threads}"}
+"git-head":"git rev-parse HEAD","git-branch":"git branch --show-current","git-status":"git status --porcelain=v1","git-diff-check":"git diff --check","snapshots":"find . -type f -name '*.snap.new' -print","nproc":"nproc","uname":"uname -a","lscpu":"lscpu","cargo-version":"cargo --version","rustc-version":"rustc --version","nextest-version":"cargo nextest --version","cargo-metadata":"cargo metadata --format-version 1 --no-deps","nextest-config":"cargo nextest show-config test-groups","nextest-fast-list":"cargo nextest list --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --message-format json","nextest-full-list":"cargo nextest list --profile ci-full --workspace --message-format json","make-test-fast":f"make test-fast NEXTEST_JOBS={threads}","make-test-full":f"make test-full NEXTEST_JOBS={threads}"}
 def read(path):
     with open(path, "rb") as stream: return stream.read()
 def sha(path): return hashlib.sha256(read(path)).hexdigest()
@@ -1220,6 +1230,7 @@ attest_preflight() {
         esac
     done
     validate_sterile_launch attest-preflight "$@"
+    reject_legacy_monolithic_calibration "$PWD/crates/rsid/Cargo.toml"
     attest_preflight_impl public "$@"
 }
 
@@ -1782,14 +1793,14 @@ def expected_command(probe, threads):
     if probe == "source-scanner":
         return "cargo test -p rsid --lib session::issue21_phase2_tests::p2_07_gate_permit_spine::exactly_one_production_writer_of_gate_closing_and_effect_permits -- --exact --test-threads 1", "", "execution"
     if probe == "nextest-fast":
-        return f"cargo nextest run --profile rsid-fast -p rsid --lib --status-level all --final-status-level all -j {threads}", "rsid-fast", "artifact-build"
+        return f"cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --status-level all --final-status-level all -j {threads}", "rsid-fast", "artifact-build"
     if probe == "nextest-full":
         return f"cargo nextest run --profile ci-full --workspace --status-level all --final-status-level all -j {threads}", "ci-full", "artifact-build"
     fail(f"unsupported calibration probe: {probe}")
 
 def expected_warmup(probe):
     if probe == "nextest-fast":
-        return "cargo nextest run --profile rsid-fast -p rsid --lib --no-run"
+        return "cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --no-run"
     if probe == "nextest-full":
         return "cargo nextest run --profile ci-full --workspace --no-run"
     return None
@@ -1847,7 +1858,7 @@ expected_static = {
     "nextest-version": "cargo nextest --version",
     "cargo-metadata": "cargo metadata --format-version 1 --no-deps",
     "nextest-config": "cargo nextest show-config test-groups",
-    "nextest-fast-list": "cargo nextest list --profile rsid-fast -p rsid --lib --message-format json",
+    "nextest-fast-list": "cargo nextest list --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --message-format json",
     "nextest-full-list": "cargo nextest list --profile ci-full --workspace --message-format json",
 }
 require(set(by_name) == set(expected_static) | {"make-test-fast", "make-test-full"}, "preflight command set differs")
@@ -2331,9 +2342,24 @@ generate_baseline() {
     generate_baseline_impl public "$@"
 }
 
+# The legacy attestation and baseline engines pin one rsid --lib harness in
+# their custody contract. Issue #764 requires bounded shard binaries. Keep the
+# historical engine intact for old source, but refuse its unsafe current route
+# until the dedicated producer can attest the new shard inventory.
+reject_legacy_monolithic_calibration() {
+    local manifest="$1" line
+    [ -r "$manifest" ] || die "legacy calibration cannot read the rsid Cargo manifest"
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*test-shard-mode[[:space:]]*= ]]; then
+            die "legacy calibration cannot enumerate sharded rsid; use make test-benchmark for bounded capture"
+        fi
+    done < "$manifest"
+}
+
 calibrate_baseline() {
     [ "$#" -eq 0 ] || die "calibrate-baseline accepts no arguments"
     validate_sterile_launch calibrate-baseline
+    reject_legacy_monolithic_calibration "$PWD/crates/rsid/Cargo.toml"
     local repo="$PWD" env_fd bash_fd python_fd script_fd repo_fd
     [[ -L /usr/bin/python3 && "$(/usr/bin/readlink /usr/bin/python3)" = python3.14 && /usr/bin/python3 -ef /usr/bin/python3.14 && -x /usr/bin/python3.14 && ! -L /usr/bin/python3.14 ]] || die "calibrate-baseline cannot authenticate /usr/bin/python3"
     exec {env_fd}</usr/bin/env {bash_fd}</usr/bin/bash {python_fd}</usr/bin/python3.14 {script_fd}<"$0" {repo_fd}<"$repo"
@@ -3771,12 +3797,12 @@ class RunCustody:
         self.reconcile_git_index()
         metadata,doctests=self.cargo_metadata_from_record(fact_records["cargo-metadata"])
         if not doctests: fail("Cargo-derived doctest cardinality is invalid")
-        fast_enum=self.nextest("nextest-fast-list",["list","--profile","rsid-fast","-p","rsid","--lib","--message-format","json"],"enumeration")
+        fast_enum=self.nextest("nextest-fast-list",["list","--profile","rsid-fast","-p","rsid","--lib","--test","store_session_contract","--test","store_public_persistence","--test","session_health","--message-format","json"],"enumeration")
         full_enum=self.nextest("nextest-full-list",["list","--profile","ci-full","--workspace","--message-format","json"],"enumeration")
         identities={"nextest-fast":self.enumerate_identities(fast_enum),"nextest-full":self.enumerate_identities(full_enum)}
         dry_fast=self.make("make-fast-metadata","test-fast",8,"preflight",dry=True); dry_full=self.make("make-full-metadata","test-full",8,"preflight",dry=True)
         dry_fast_text=self.read_log(dry_fast,"stdout").decode("utf-8","strict"); dry_full_text=self.read_log(dry_full,"stdout").decode("utf-8","strict")
-        if dry_fast_text.strip()!="cargo nextest run --profile rsid-fast -p rsid --lib -j 8": fail("held Make fast metadata differs")
+        if dry_fast_text.strip()!="cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health -j 8": fail("held Make fast metadata differs")
         expected_full=("status=0; \\\n"
           "cargo nextest run --profile ci-full --workspace -j 8 || status=$?; \\\n"
           "cargo test --workspace --doc || status=$?; \\\n"
@@ -3805,20 +3831,20 @@ class RunCustody:
         wall={threads:stats([sample["timing"]["wall_seconds"] for sample in samples]) for threads,samples in sweep.items()}
         fastest=min(wall,key=lambda value:(wall[value]["median"],value)); frontier=[value for value in wall if wall[value]["median"]<=wall[fastest]["median"]+wall[fastest]["mad"]]; selected=min(frontier)
         self.boundary("after-thread-selection",selected_threads=selected)
-        self.nextest("selected-fast-warmup",["run","--profile","rsid-fast","-p","rsid","--lib","--test-threads",str(selected),"--no-run"],"selected")
+        self.nextest("selected-fast-warmup",["run","--profile","rsid-fast","-p","rsid","--lib","--test","store_session_contract","--test","store_public_persistence","--test","session_health","--test-threads",str(selected),"--no-run"],"selected")
         fast=[]
         for index in range(3):
-            record=self.nextest(f"selected-fast-sample-{index+1}",["run","--profile","rsid-fast","-p","rsid","--lib","--status-level","all","--final-status-level","all","-j",str(selected)],"selected"); self.nextest_observation(record,identities["nextest-fast"],"rsid library nextest fast profile"); fast.append(record)
+            record=self.nextest(f"selected-fast-sample-{index+1}",["run","--profile","rsid-fast","-p","rsid","--lib","--test","store_session_contract","--test","store_public_persistence","--test","session_health","--status-level","all","--final-status-level","all","-j",str(selected)],"selected"); self.nextest_observation(record,identities["nextest-fast"],"rsid library, store_session_contract, store_public_persistence, and session_health nextest fast profile"); fast.append(record)
         self.boundary("before-held-out")
         held_fast=[]; held_fast_signatures=[]; held_full=[]; held_full_signatures=[]
         for index in range(3):
-            record=self.nextest(f"held-out-fast-{index+1}",["run","--profile","rsid-fast","-p","rsid","--lib","--status-level","all","--final-status-level","all","-j",str(selected)],"held-out")
-            held_fast.append(record); held_fast_signatures.append(self.nextest_observation(record,identities["nextest-fast"],"rsid library nextest fast profile"))
+            record=self.nextest(f"held-out-fast-{index+1}",["run","--profile","rsid-fast","-p","rsid","--lib","--test","store_session_contract","--test","store_public_persistence","--test","session_health","--status-level","all","--final-status-level","all","-j",str(selected)],"held-out")
+            held_fast.append(record); held_fast_signatures.append(self.nextest_observation(record,identities["nextest-fast"],"rsid library, store_session_contract, store_public_persistence, and session_health nextest fast profile"))
         for index in range(3):
             record=self.nextest(f"held-out-full-{index+1}",["run","--profile","ci-full","--workspace","--status-level","all","--final-status-level","all","-j",str(selected)],"held-out")
             held_full.append(record); held_full_signatures.append(self.nextest_observation(record,identities["nextest-full"],"workspace nextest full profile"))
         fast_stats=stats([value["timing"]["wall_seconds"] for value in fast]); full_stats=wall[selected]
-        fast_signatures=[self.nextest_observation(value,identities["nextest-fast"],"rsid library nextest fast profile") for value in fast]
+        fast_signatures=[self.nextest_observation(value,identities["nextest-fast"],"rsid library, store_session_contract, store_public_persistence, and session_health nextest fast profile") for value in fast]
         full_signatures=[self.nextest_observation(value,identities["nextest-full"],"workspace nextest full profile") for value in sweep[selected]]
         logical_cpus=int(self.read_log(fact_records["nproc"],"stdout").decode().strip()); uname=os.uname()
         cpu_text=self.read_log(fact_records["lscpu"],"stdout").decode("utf-8","strict"); cpu_match=re.search(r"^Model name:\s*(.+)$",cpu_text,re.M)
@@ -3831,9 +3857,9 @@ class RunCustody:
         target={"canonical_path":target_path,"device":str(target_node.st_dev),"inode":str(target_node.st_ino)}
         target["fingerprint_sha256"]=sha_bytes("|".join(target[key] for key in ("canonical_path","device","inode")).encode())
         toolchain={"cargo":self.read_log(fact_records["cargo-version"],"stdout").decode().rstrip("\n"),"rustc":self.read_log(fact_records["rustc-version"],"stdout").decode().rstrip("\n"),"rustdoc":self.read_log(fact_records["rustdoc-version"],"stdout").decode().rstrip("\n"),"cargo_nextest":self.read_log(fact_records["nextest-version"],"stdout").decode().rstrip("\n"),"cargo_target_dir":target_path}
-        fast_command=f"cargo nextest run --profile rsid-fast -p rsid --lib --status-level all --final-status-level all -j {selected}"
+        fast_command=f"cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --status-level all --final-status-level all -j {selected}"
         full_command=f"cargo nextest run --profile ci-full --workspace --status-level all --final-status-level all -j {selected}"
-        budgets=[{"probe":"nextest-fast","host_class":host["class"],"expected_repeat":3,"median_wall_seconds":fast_stats["median"],"mad_wall_seconds":fast_stats["mad"],"limit_wall_seconds":fast_stats["median"]+3*fast_stats["mad"],"command":fast_command,"test_identity":["rsid library nextest fast profile"],"resolved_threads":selected,"observed_samples":fast_signatures},
+        budgets=[{"probe":"nextest-fast","host_class":host["class"],"expected_repeat":3,"median_wall_seconds":fast_stats["median"],"mad_wall_seconds":fast_stats["mad"],"limit_wall_seconds":fast_stats["median"]+3*fast_stats["mad"],"command":fast_command,"test_identity":["rsid library, store_session_contract, store_public_persistence, and session_health nextest fast profile"],"resolved_threads":selected,"observed_samples":fast_signatures},
           {"probe":"nextest-full","host_class":host["class"],"expected_repeat":3,"median_wall_seconds":full_stats["median"],"mad_wall_seconds":full_stats["mad"],"limit_wall_seconds":full_stats["median"]+3*full_stats["mad"],"command":full_command,"test_identity":["workspace nextest full profile"],"resolved_threads":selected,"observed_samples":full_signatures}]
         held_out={}
         for lane,samples,signatures,reference,budget in (("fast",held_fast,held_fast_signatures,fast_signatures,budgets[0]),("full",held_full,held_full_signatures,full_signatures,budgets[1])):
@@ -4909,6 +4935,16 @@ self_test() {
     local fixture_head fixture_branch fixture_logical_cpus fixture_target_dir fixture_target_created=0
     local hook_dir hook_stage_fifo hook_continue_fifo hook_status_file hook_sentinel hook_all_cargo_log hook_pid hook_stage hook_out hook_root hook_result
     fixture_dir="$(mktemp -d)"; external_base="$(mktemp -d)"; stub_dir="$fixture_dir/stub"; external_dir="$fixture_dir/external"; mkdir "$stub_dir" "$external_dir"; script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+    printf '[features]\ndefault = []\n' >"$external_base/unsharded.toml"
+    reject_legacy_monolithic_calibration "$external_base/unsharded.toml"
+    printf '[features]\ntest-shard-mode = []' >"$external_base/sharded.toml"
+    if (reject_legacy_monolithic_calibration "$external_base/sharded.toml") >"$external_base/shard-guard.stdout" 2>"$external_base/shard-guard.stderr"; then
+        die "legacy calibration guard accepted sharded source"
+    fi
+    grep -F 'legacy calibration cannot enumerate sharded rsid' "$external_base/shard-guard.stderr" >/dev/null
+    if (reject_legacy_monolithic_calibration "$external_base/missing.toml") >/dev/null 2>&1; then
+        die "legacy calibration guard accepted a missing manifest"
+    fi
     fixture_target_dir="$(realpath -m "${CARGO_TARGET_DIR:-$fixture_dir/target}")"
     if [ ! -d "$fixture_target_dir" ]; then mkdir -p "$fixture_target_dir"; fixture_target_created=1; fi
     trap 'rm -rf "$fixture_dir" "$external_base"; if [ "$fixture_target_created" -eq 1 ]; then rmdir "$fixture_target_dir" 2>/dev/null || true; fi' RETURN
@@ -5485,7 +5521,7 @@ def successful_schema(root, out, baseline, expected_label, expected_outcome,
     }, f"unexpected successful capture metadata fields: {sorted(metadata)}")
     require(expected_outcome in ("green", "warmup-red"), f"invalid expected capture outcome: {expected_outcome}")
     expected_command = (
-        "cargo test -p rsid --lib "
+        "cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "
         "store::tests::load_sessions_survives_legacy_comma_fraction_timestamp "
         "-- --exact --test-threads 1"
     )
@@ -6080,7 +6116,19 @@ fast_suites = {
                 "only::fast": {"ignored": False, "filter-match": {"status": "matches"}},
                 "ignored::fast": {"ignored": True, "filter-match": {"status": "matches"}},
             },
-        }
+        },
+        "store_session_contract": {
+            "binary-id": "store_session_contract",
+            "testcases": {"contract_fixture": {"ignored": False, "filter-match": {"status": "matches"}}},
+        },
+        "store_public_persistence": {
+            "binary-id": "store_public_persistence",
+            "testcases": {"persistence_fixture": {"ignored": False, "filter-match": {"status": "matches"}}},
+        },
+        "session_health": {
+            "binary-id": "session_health",
+            "testcases": {"health_fixture": {"ignored": False, "filter-match": {"status": "matches"}}},
+        },
     }
 }
 full_suites = json.loads(json.dumps(fast_suites))
@@ -6094,10 +6142,10 @@ full_suites["rust-suites"]["binary-b"] = {
 }
 fast_list = write_json("nextest-fast-list.json", fast_suites)
 full_list = write_json("nextest-full-list.json", full_suites)
-fast_runnable = ["binary-a::only::fast", "binary-a::same::name"]
+fast_runnable = sorted(["binary-a::only::fast", "binary-a::same::name", "session_health::health_fixture", "store_public_persistence::persistence_fixture", "store_session_contract::contract_fixture"])
 fast_ignored = ["binary-a::ignored::fast"]
-full_runnable = ["binary-a::only::fast", "binary-a::same::name", "binary-b::only::full", "binary-b::same::name"]
-full_ignored = ["binary-a::ignored::fast", "binary-b::ignored::full"]
+full_runnable = sorted(fast_runnable + ["binary-b::only::full", "binary-b::same::name"])
+full_ignored = sorted(fast_ignored + ["binary-b::ignored::full"])
 
 uname = os.uname()
 uname_stdout = subprocess.run(["uname", "-a"], check=True, text=True, stdout=subprocess.PIPE).stdout
@@ -6150,7 +6198,7 @@ commands = {
     "nextest-version": "cargo nextest --version",
     "cargo-metadata": "cargo metadata --format-version 1 --no-deps",
     "nextest-config": "cargo nextest show-config test-groups",
-    "nextest-fast-list": "cargo nextest list --profile rsid-fast -p rsid --lib --message-format json",
+    "nextest-fast-list": "cargo nextest list --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --message-format json",
     "nextest-full-list": "cargo nextest list --profile ci-full --workspace --message-format json",
     "make-test-fast": "make test-fast NEXTEST_JOBS=8",
     "make-test-full": "make test-full NEXTEST_JOBS=8",
@@ -6179,16 +6227,16 @@ for sequence, (name, command) in enumerate(commands.items(), 1):
         write_text(stdout, content)
     stderr = f"preflight/{name}.stderr"
     stderr_content = ""
-    if name == "make-test-fast": stderr_content = "warning: representative ordinary Cargo output\n    Finished test profile [unoptimized + debuginfo] target(s) in 0.12s\n────────────\nSummary [   0.100s] 3 tests run: 2 passed, 1 skipped\n"
-    elif name == "make-test-full": stderr_content = "    Finished test profile [unoptimized + debuginfo] target(s) in 0.14s\nSummary [   0.120s] 6 tests run: 4 passed, 2 skipped\n   Doc-tests rsi_common\n     Running `target/debug/rsi-model-control-validate --offline`\n     Running `target/debug/rsi-provider-capability-validate --offline`\n"
+    if name == "make-test-fast": stderr_content = "warning: representative ordinary Cargo output\n    Finished test profile [unoptimized + debuginfo] target(s) in 0.12s\n────────────\nSummary [   0.100s] 6 tests run: 5 passed, 1 skipped\n"
+    elif name == "make-test-full": stderr_content = "    Finished test profile [unoptimized + debuginfo] target(s) in 0.14s\nSummary [   0.120s] 9 tests run: 7 passed, 2 skipped\n   Doc-tests rsi_common\n     Running `target/debug/rsi-model-control-validate --offline`\n     Running `target/debug/rsi-provider-capability-validate --offline`\n"
     write_text(stderr, stderr_content)
     status = f"preflight/{name}.status.json"
     components = []
     if name == "make-test-fast":
-        components = [{"name": "nextest", "exit_status": 0, "passed": 2, "failed": 0, "skipped": 1}]
+        components = [{"name": "nextest", "exit_status": 0, "passed": 5, "failed": 0, "skipped": 1}]
     elif name == "make-test-full":
         components = [
-            {"name": "nextest", "exit_status": 0, "passed": 4, "failed": 0, "skipped": 2},
+            {"name": "nextest", "exit_status": 0, "passed": 7, "failed": 0, "skipped": 2},
             {"name": "doctests", "exit_status": 0, "passed": 1, "failed": 0, "skipped": 0},
             {"name": "model-control-validator", "exit_status": 0, "passed": 1, "failed": 0, "skipped": 0},
             {"name": "provider-capability-validator", "exit_status": 0, "passed": 1, "failed": 0, "skipped": 0},
@@ -6260,9 +6308,9 @@ def logs(logical, label, content, wall, user=None, system=0.1, sequence=0):
 def make_capture(relative, probe, threads, walls, runnable=None, ignored=None):
     profile = "rsid-fast" if probe == "nextest-fast" else "ci-full" if probe == "nextest-full" else ""
     if probe == "nextest-fast":
-        command = f"cargo nextest run --profile rsid-fast -p rsid --lib --status-level all --final-status-level all -j {threads}"
-        warmup_command = "cargo nextest run --profile rsid-fast -p rsid --lib --no-run"
-        identity = ["rsid library nextest fast profile"]
+        command = f"cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --status-level all --final-status-level all -j {threads}"
+        warmup_command = "cargo nextest run --profile rsid-fast -p rsid --lib --test store_session_contract --test store_public_persistence --test session_health --no-run"
+        identity = ["rsid library, store_session_contract, store_public_persistence, and session_health nextest fast profile"]
     elif probe == "nextest-full":
         command = f"cargo nextest run --profile ci-full --workspace --status-level all --final-status-level all -j {threads}"
         warmup_command = "cargo nextest run --profile ci-full --workspace --no-run"
@@ -6325,6 +6373,31 @@ make_capture("fast.json", "nextest-fast", 8, [2, 3, 4], fast_runnable, fast_igno
 PY
     }
     git -C "$fixture_dir" init -q; git -C "$fixture_dir" config user.email benchmark@example.invalid; git -C "$fixture_dir" config user.name benchmark; printf '*\n!.gitignore\n!.gitkeep\n' >"$fixture_dir/.gitignore"; touch "$fixture_dir/.gitkeep"; printf original >"$fixture_dir/tracked.txt"; mkdir -p "$fixture_dir/.config"; printf '%s\n' 'nextest-version = { required = "0.9.137" }' '[profile.default]' 'retries = 0' 'fail-fast = false' 'test-threads = 8' '[profile.rsid-fast]' 'inherits = "default"' 'retries = 0' '[profile.ci-full]' 'inherits = "default"' 'retries = 0' >"$fixture_dir/.config/nextest.toml"; git -C "$fixture_dir" add .gitignore .gitkeep; git -C "$fixture_dir" add -f tracked.txt .config/nextest.toml; git -C "$fixture_dir" commit -qm fixture
+    mkdir "$fixture_dir/scripts"
+    cat >"$fixture_dir/scripts/check-rsid-test-shards.py" <<'EOF'
+#!/bin/sh
+[ "${FAKE_SHARD_GATE_FAIL:-0}" != 1 ] || exit 1
+exit 0
+EOF
+    cat >"$fixture_dir/scripts/run-rsid-test-shards.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${FAKE_SHARD_RUNNER_INVOCATIONS:-}" ]; then printf '%q ' "$@" >>"$FAKE_SHARD_RUNNER_INVOCATIONS"; printf '\n' >>"$FAKE_SHARD_RUNNER_INVOCATIONS"; fi
+case "${1:-}" in
+    warmup) echo 'all selected test artifacts built' ;;
+    list) echo 'runtime union: 4937 distinct rsid library tests in 16 shards' ;;
+    fast|full)
+        if [ "${FAKE_SHARD_RUNNER_LARGE_RED:-0}" = 1 ]; then
+            for ((index = 1; index <= 5000; index++)); do printf 'PASS [0.001s] rsid::lib fixture::large::%05d::identity_padding_for_argv_boundary\n' "$index"; done
+            printf 'FAIL [0.001s] rsid::lib fixture::large::failure\nSummary [0.1s] 5001 tests run: 5000 passed, 0 skipped\n'
+            exit 1
+        fi
+        printf 'PASS [0.001s] rsid::lib fixture::test\nSummary [0.1s] 1 test run: 1 passed, 0 skipped\n'
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+    chmod +x "$fixture_dir/scripts/check-rsid-test-shards.py" "$fixture_dir/scripts/run-rsid-test-shards.sh"
     fixture_head="$(git -C "$fixture_dir" rev-parse HEAD)"; fixture_branch="$(git -C "$fixture_dir" branch --show-current)"
     fixture_logical_cpus="$(logical_cpus)"
     baseline="$fixture_dir/base.json"; candidate="$fixture_dir/candidate.json"; budget="$fixture_dir/budget.json"
@@ -6340,8 +6413,8 @@ PY
     printf 'test src/lib.rs - fixture pass (line 1) ... ok\ntest src/lib.rs - fixture failure (line 2) ... FAILED\ntest src/lib.rs - fixture skip (line 3) ... ignored, deliberate\ntest result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n' >"$fixture_dir/cargo-doctest.log"; [ "$(observed_count passed "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ] && [ "$(observed_count failed "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ] && [ "$(observed_count ignored "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ] && [ "$(libtest_summary_count passed "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ] && [ "$(libtest_summary_count failed "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ] && [ "$(libtest_summary_count ignored "$fixture_dir/cargo-doctest.log" /dev/null)" = 1 ]; jq -e '. == ["src/lib.rs - fixture failure (line 2)"]' <<<"$(failure_names "$fixture_dir/cargo-doctest.log" /dev/null)" >/dev/null; jq -e '. == ["src/lib.rs - fixture failure (line 2)", "src/lib.rs - fixture pass (line 1)", "src/lib.rs - fixture skip (line 3)"]' <<<"$(executed_test_names "$fixture_dir/cargo-doctest.log" /dev/null)" >/dev/null
     printf 'test unit::duplicate ... ok\ntest unit::duplicate ... ok\ntest unit::split ... child subprocess output\nok\ntest unit::failure ... FAILED\ntest unit::ignored ... ignored, fixture skip\ntest result: FAILED. 3 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n' >"$fixture_dir/cargo-interleaved.log"; [ "$(libtest_summary_count passed "$fixture_dir/cargo-interleaved.log" /dev/null)" = 3 ] && [ "$(libtest_summary_count failed "$fixture_dir/cargo-interleaved.log" /dev/null)" = 1 ] && [ "$(libtest_summary_count ignored "$fixture_dir/cargo-interleaved.log" /dev/null)" = 1 ] && [ "$(aggregate_count passed "$fixture_dir/cargo-interleaved.log" /dev/null)" = 3 ] && [ "$(aggregate_count failed "$fixture_dir/cargo-interleaved.log" /dev/null)" = 1 ] && [ "$(aggregate_count ignored "$fixture_dir/cargo-interleaved.log" /dev/null)" = 1 ]; jq -e '. == ["unit::duplicate", "unit::failure", "unit::ignored"]' <<<"$(executed_test_names "$fixture_dir/cargo-interleaved.log" /dev/null)" >/dev/null
     printf '  SKIP [         ] (─────────) nextest-fixture tests::skipped\n  PASS [   0.002s] (1/2) nextest-fixture tests::passing\n  FAIL [   0.002s] (2/2) nextest-fixture tests::failing\n  PASS [   0.001s] nextest-fixture tests::passing\n  PASS [   0.001s] nextest-other tests::passing\n  FAIL [   0.002s] nextest-fixture tests::failing\n  SKIP [   0.000s] nextest-fixture tests::skipped\n' >"$fixture_dir/nextest.log"; PROBE_RESULT_FORMAT=nextest; [ "$(aggregate_count passed "$fixture_dir/nextest.log" /dev/null)" = 2 ] && [ "$(aggregate_count failed "$fixture_dir/nextest.log" /dev/null)" = 1 ] && [ "$(aggregate_count ignored "$fixture_dir/nextest.log" /dev/null)" = 1 ]; jq -e '. == ["nextest-fixture::tests::failing"]' <<<"$(failure_names "$fixture_dir/nextest.log" /dev/null)" >/dev/null; jq -e '. == ["nextest-fixture::tests::failing", "nextest-fixture::tests::passing", "nextest-fixture::tests::skipped", "nextest-other::tests::passing"]' <<<"$(executed_test_names "$fixture_dir/nextest.log" /dev/null)" >/dev/null; jq -e '. == ["nextest-fixture::tests::failing", "nextest-fixture::tests::passing", "nextest-other::tests::passing"]' <<<"$(executed_runnable_test_names "$fixture_dir/nextest.log" /dev/null)" >/dev/null; jq -e '. == ["nextest-fixture::tests::skipped"]' <<<"$(ignored_test_names "$fixture_dir/nextest.log" /dev/null)" >/dev/null; [ "$(LC_ALL=C aggregate_count passed "$fixture_dir/nextest.log" /dev/null)" = 2 ] && [ "$(LC_ALL=C aggregate_count failed "$fixture_dir/nextest.log" /dev/null)" = 1 ] && [ "$(LC_ALL=C aggregate_count ignored "$fixture_dir/nextest.log" /dev/null)" = 1 ]; LC_ALL=C jq -e '. == ["nextest-fixture::tests::failing", "nextest-fixture::tests::passing", "nextest-fixture::tests::skipped", "nextest-other::tests::passing"]' <<<"$(LC_ALL=C executed_test_names "$fixture_dir/nextest.log" /dev/null)" >/dev/null
-    probe_command nextest-fast 8; [ "$(join_command "${PROBE_COMMAND[@]}")" = "cargo nextest run --profile rsid-fast -p rsid --lib --status-level all --final-status-level all -j 8" ]; [ "$(join_command "${PROBE_WARMUP_COMMAND[@]}")" = "cargo nextest run --profile rsid-fast -p rsid --lib --no-run" ]; [ "$PROBE_PROFILE" = rsid-fast ] && [ "$PROBE_WARMUP_KIND" = artifact-build ]
-    probe_command nextest-full 8; [ "$(join_command "${PROBE_COMMAND[@]}")" = "cargo nextest run --profile ci-full --workspace --status-level all --final-status-level all -j 8" ]; [ "$(join_command "${PROBE_WARMUP_COMMAND[@]}")" = "cargo nextest run --profile ci-full --workspace --no-run" ]; [ "$PROBE_PROFILE" = ci-full ] && [ "$PROBE_WARMUP_KIND" = artifact-build ]
+    probe_command nextest-fast 8; [ "$(join_command "${PROBE_COMMAND[@]}")" = "$REPO_ROOT/scripts/run-rsid-test-shards.sh fast --jobs 8" ]; [ "$(join_command "${PROBE_WARMUP_COMMAND[@]}")" = "$REPO_ROOT/scripts/run-rsid-test-shards.sh warmup --profile rsid-fast --jobs 8" ]; [ "$PROBE_PROFILE" = rsid-fast ] && [ "$PROBE_WARMUP_KIND" = artifact-build ]
+    probe_command nextest-full 8; [ "$(join_command "${PROBE_COMMAND[@]}")" = "$REPO_ROOT/scripts/run-rsid-test-shards.sh full --jobs 8" ]; [ "$(join_command "${PROBE_WARMUP_COMMAND[@]}")" = "$REPO_ROOT/scripts/run-rsid-test-shards.sh warmup --profile ci-full --jobs 8" ]; [ "$PROBE_PROFILE" = ci-full ] && [ "$PROBE_WARMUP_KIND" = artifact-build ]
     make_fake_cargo "$stub_dir/cargo"; make_fake_rustc "$stub_dir/rustc"
     printf '%s\n' '#!/usr/bin/env bash' 'printf "32\n"' >"$stub_dir/nproc"
     printf '%s\n' '#!/usr/bin/env bash' 'printf "Model name: fixture cpu\n"' >"$stub_dir/lscpu"
@@ -6408,7 +6481,7 @@ PY
       .measurements["store-fixture"].wall_seconds.mad == 1 and
       .measurements["nextest-fast"].max_rss_kib.samples == [null,null,null] and
       .measurements["nextest-fast"].max_rss_kib.disposition == "unavailable_portable_backend" and
-      .enumeration.full.runnable == ["binary-a::only::fast","binary-a::same::name","binary-b::only::full","binary-b::same::name"] and
+      .enumeration.full.runnable == ["binary-a::only::fast","binary-a::same::name","binary-b::only::full","binary-b::same::name","session_health::health_fixture","store_public_persistence::persistence_fixture","store_session_contract::contract_fixture"] and
       .scope_difference.identities == ["binary-b::only::full","binary-b::same::name"] and
       (.provenance.inventory | map(.path)) == (.provenance.inventory | map(.path) | sort | unique) and
       (.provenance.inventory | all(.link_count == 1 and (.path | startswith("/") | not) and (.path | contains("../") | not))) and
@@ -6492,7 +6565,7 @@ PY
         calibration_cases=$((calibration_cases + 1))
     }
     while IFS= read -r override_name; do public_fixture_probe "$override_name"; done < <(generator_override_names)
-    for override_name in S1Q_TEST_FAULT S1Q_TEST_HOOK_STAGE FAKE_CARGO_ALL_INVOCATIONS FAKE_CARGO_CALL_COUNT_FILE FAKE_CARGO_FAIL FAKE_CARGO_FAIL_CALL FAKE_CARGO_INVOCATIONS FAKE_CARGO_LARGE_RED FAKE_CARGO_LOG FAKE_CARGO_METADATA_JSON FAKE_CARGO_MUTATE_TRACKED FAKE_NEXTEST_CONFIG_JSON FAKE_RUSTC_MUTATE_TRACKED; do
+    for override_name in S1Q_TEST_FAULT S1Q_TEST_HOOK_STAGE FAKE_CARGO_ALL_INVOCATIONS FAKE_CARGO_CALL_COUNT_FILE FAKE_CARGO_FAIL FAKE_CARGO_FAIL_CALL FAKE_CARGO_INVOCATIONS FAKE_CARGO_LARGE_RED FAKE_CARGO_LOG FAKE_CARGO_METADATA_JSON FAKE_CARGO_MUTATE_TRACKED FAKE_NEXTEST_CONFIG_JSON FAKE_RUSTC_MUTATE_TRACKED FAKE_SHARD_GATE_FAIL FAKE_SHARD_RUNNER_INVOCATIONS FAKE_SHARD_RUNNER_LARGE_RED; do
         public_fixture_probe "$override_name"
     done
     local former_token="generator-self"'-test-v1' former_variable="S1Q_INTERNAL_SELF_TEST_CAPABILITY" trusted_public_path
@@ -6755,10 +6828,10 @@ PY
     expect_generator_bound S1Q_TEST_MAX_AGGREGATE_BYTES "$aggregate_bound" aggregate-bytes
     expect_generator_bound S1Q_TEST_MAX_JSON_DEPTH "$max_depth" json-depth
     expect_generator_bound S1Q_TEST_MAX_STRING_BYTES "$max_string" string-bytes
-    expect_generator_bound S1Q_TEST_MAX_SUITES 2 suite-count
+    expect_generator_bound S1Q_TEST_MAX_SUITES 5 suite-count
     expect_generator_bound S1Q_TEST_MAX_TESTS 3 testcase-count
     expect_generator_bound S1Q_TEST_MAX_SAMPLES 5 sample-count
-    expect_generator_bound S1Q_TEST_MAX_IDENTITIES 6 identity-count
+    expect_generator_bound S1Q_TEST_MAX_IDENTITIES 9 identity-count
     output_bound=1000000
     for _ in 1 2 3; do
         (cd "$fixture_dir" && S1Q_TEST_MAX_OUTPUT_BYTES="$output_bound" generate_baseline_impl private-self-test --calibration-root "$calibration_rel" --out "$output_probe") >/dev/null 2>&1
@@ -6786,8 +6859,11 @@ PY
     (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_LOG="$fixture_dir/calls" "$script_path" capture --label scanner --probe source-scanner --repeat 1 --threads 1 --out target/test-suite-benchmark/scanner.json); (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_LOG="$fixture_dir/calls" "$script_path" capture --label v87 --probe v87-matrices --repeat 1 --threads 1 --out target/test-suite-benchmark/v87.json)
     jq -e '.samples[0].observed.identity_proof.verified and (.samples[0].observed.identity_proof.executed | length == 1)' "$fixture_dir/target/test-suite-benchmark/scanner.json" >/dev/null; jq -e '.samples[0].observed.identity_proof.verified and (.samples[0].observed.identity_proof.executed | length == 3)' "$fixture_dir/target/test-suite-benchmark/v87.json" >/dev/null
     ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" "$script_path" capture --label serial --probe rsid-serial --repeat 1 --threads 8 --out target/test-suite-benchmark/serial.json) >/dev/null 2>&1; ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_FAIL=1 "$script_path" capture --label warmup --probe store-fixture --repeat 1 --threads 1 --out target/test-suite-benchmark/warmup.json) >/dev/null 2>&1; jq -e '.capture.warmup.exit_status == 1 and (.samples | length == 0) and (.capture.workspace | startswith("/"))' "$fixture_dir/target/test-suite-benchmark/warmup.json" >/dev/null
-    (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_INVOCATIONS="$fixture_dir/serial.calls" "$script_path" capture --label serial-once --probe rsid-serial --repeat 1 --threads 1 --out target/test-suite-benchmark/serial-once.json); [ "$(wc -l <"$fixture_dir/serial.calls")" = 2 ]; grep -Fx 'test -p rsid --lib --no-run ' "$fixture_dir/serial.calls" >/dev/null; grep -Fx 'test -p rsid --lib -- --test-threads 1 ' "$fixture_dir/serial.calls" >/dev/null; jq -e '.capture.warmup.kind == "artifact-build" and (.capture.warmup.command | contains("--no-run")) and (.samples | length == 1)' "$fixture_dir/target/test-suite-benchmark/serial-once.json" >/dev/null
-    ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_LARGE_RED=1 "$script_path" capture --label serial-large-red --probe rsid-serial --repeat 1 --threads 1 --out target/test-suite-benchmark/serial-large-red.json) >/dev/null 2>&1; jq -e '.samples | length == 1 and .[0].execution.exit_status != 0 and .[0].execution.evidence_valid == false and .[0].observed.failure_names == ["fixture::large::failure"] and (. [0].observed.executed_test_names | @json | length > 131072) and (. [0].observed.executed_test_names | length == 5001) and .[0].observed.identity_proof.executed == .[0].observed.executed_test_names' "$fixture_dir/target/test-suite-benchmark/serial-large-red.json" >/dev/null
+    (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_SHARD_RUNNER_INVOCATIONS="$fixture_dir/serial.calls" "$script_path" capture --label serial-once --probe rsid-serial --repeat 1 --threads 1 --out target/test-suite-benchmark/serial-once.json); [ "$(wc -l <"$fixture_dir/serial.calls")" = 2 ]; grep -Fx 'warmup --profile rsid-fast --jobs 1 ' "$fixture_dir/serial.calls" >/dev/null; grep -Fx 'fast --jobs 1 ' "$fixture_dir/serial.calls" >/dev/null; jq -e '.capture.warmup.kind == "artifact-build" and (.capture.warmup.command | contains(" warmup --profile rsid-fast --jobs 1")) and (.samples | length == 1)' "$fixture_dir/target/test-suite-benchmark/serial-once.json" >/dev/null
+    ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_SHARD_RUNNER_LARGE_RED=1 "$script_path" capture --label serial-large-red --probe rsid-serial --repeat 1 --threads 1 --out target/test-suite-benchmark/serial-large-red.json) >/dev/null 2>&1; jq -e '.samples | length == 1 and .[0].execution.exit_status != 0 and .[0].execution.evidence_valid == false and .[0].observed.failure_names == ["rsid::lib::fixture::large::failure"] and (. [0].observed.executed_test_names | @json | length > 131072) and (. [0].observed.executed_test_names | length == 5001) and .[0].observed.identity_proof.executed == .[0].observed.executed_test_names' "$fixture_dir/target/test-suite-benchmark/serial-large-red.json" >/dev/null
+    : >"$fixture_dir/gate-denied.calls"
+    ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_SHARD_GATE_FAIL=1 FAKE_CARGO_ALL_INVOCATIONS="$fixture_dir/gate-denied.calls" "$script_path" capture --label gate-denied --probe nextest-fast --repeat 1 --threads 1 --out target/test-suite-benchmark/gate-denied.json) >/dev/null 2>&1
+    [ ! -s "$fixture_dir/gate-denied.calls" ] && [ ! -e "$fixture_dir/target/test-suite-benchmark/gate-denied.json" ]
     ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_CARGO_MUTATE_TRACKED="$fixture_dir/tracked.txt" "$script_path" capture --label source-race --probe store-fixture --repeat 1 --threads 1 --out target/test-suite-benchmark/source-race.json) >/dev/null 2>&1; [ ! -e "$fixture_dir/target/test-suite-benchmark/source-race.json" ]; [ -n "$(git -C "$fixture_dir" status --porcelain -- tracked.txt)" ]
     git -C "$fixture_dir" restore tracked.txt; rm -f "$fixture_dir/tracked.txt.mutated"; ! (cd "$fixture_dir" && PATH="$stub_dir:$PATH" FAKE_RUSTC_MUTATE_TRACKED="$fixture_dir/tracked.txt" "$script_path" capture --label source-late-race --probe store-fixture --repeat 1 --threads 1 --out target/test-suite-benchmark/source-late-race.json) >/dev/null 2>&1; [ ! -e "$fixture_dir/target/test-suite-benchmark/source-late-race.json" ]; [ -n "$(git -C "$fixture_dir" status --porcelain -- tracked.txt)" ]
     git -C "$fixture_dir" restore tracked.txt; rm -f "$fixture_dir/tracked.txt.mutated"

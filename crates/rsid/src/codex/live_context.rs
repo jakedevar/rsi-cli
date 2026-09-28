@@ -229,6 +229,7 @@ mod tests {
             + "\n"
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn live_context_stdout_wait_polls_usage_and_settles_on_eof() {
         let dir = tempfile::tempdir().unwrap();
@@ -266,6 +267,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_replacement_and_partial_resume_do_not_replay_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -290,6 +292,7 @@ mod tests {
         assert!(resumed.disabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_io_and_memory_stay_bounded_on_large_non_usage_output() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -314,6 +317,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_reads_before_terminal_and_ignores_duplicate_usage() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -332,6 +336,7 @@ mod tests {
         assert!(reader.read_path(file.path(), "thread").unwrap().is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_terminal_recovery_fences_older_cursor_backlog() {
         let mut reader = LiveContextReader::new(&CodexTranscriptBoundary::Fresh);
@@ -351,6 +356,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_handles_partial_oversized_compacted_and_zero_records() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -373,6 +379,7 @@ mod tests {
         assert_eq!(zero.data["info"]["last_token_usage"]["total_tokens"], 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_resume_uses_eof_boundary_and_rejects_rewrite() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -391,6 +398,7 @@ mod tests {
         assert!(resumed.disabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_recorded_manager_trace_preserves_cached_and_compaction_totals() {
         let trace = include_str!(

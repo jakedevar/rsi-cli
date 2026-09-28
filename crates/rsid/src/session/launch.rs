@@ -237,6 +237,90 @@ fn refresh_reclaimable_claims(
 const MAX_QUEUED_RECLAIM_REQUESTS: usize = 16;
 const RECLAIM_STORE_WAIT: Duration = Duration::from_secs(2);
 
+// Admission budgets between indivisible, independently bounded worker passes.
+// A pass already admitted retains its custody/journal completion guarantees.
+const PRESSURE_BURST_PASSES: u32 = 16;
+const PRESSURE_BURST_ROWS: u32 = 256;
+const PRESSURE_BURST_BYTES: u64 = 1024 * 1024 * 1024;
+const PRESSURE_BURST_TIME: Duration = Duration::from_secs(2);
+const PRESSURE_PAGE_DELAY: Duration = Duration::from_millis(25);
+const PRESSURE_BURST_DELAY: Duration = Duration::from_secs(1);
+
+struct PressureReclaimPacing {
+    started: Instant,
+    passes: u32,
+    rows: u32,
+    bytes: u64,
+}
+
+impl Default for PressureReclaimPacing {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            passes: 0,
+            rows: 0,
+            bytes: 0,
+        }
+    }
+}
+
+impl PressureReclaimPacing {
+    // None returns scheduling to the persisted operator interval. Merely
+    // seeing pressure, eligibility, or a free-space fluctuation is insufficient.
+    fn next_delay(&mut self, run: Option<&SandboxReclaimRun>) -> Option<Duration> {
+        let Some(run) = run.filter(|run| pressure_reclaim_progress(run)) else {
+            *self = Self::default();
+            return None;
+        };
+        self.passes = self.passes.saturating_add(1);
+        self.rows = self
+            .rows
+            .saturating_add(run.evidence.inspected_terminal_rows);
+        self.bytes = self
+            .bytes
+            .saturating_add(run.report.staged_bytes)
+            .saturating_add(run.report.recovered_bytes);
+        if self.passes >= PRESSURE_BURST_PASSES
+            || self.rows >= PRESSURE_BURST_ROWS
+            || self.bytes >= PRESSURE_BURST_BYTES
+            || self.started.elapsed() >= PRESSURE_BURST_TIME
+        {
+            *self = Self::default();
+            Some(PRESSURE_BURST_DELAY)
+        } else {
+            Some(PRESSURE_PAGE_DELAY)
+        }
+    }
+}
+
+fn pressure_reclaim_progress(run: &SandboxReclaimRun) -> bool {
+    let report = &run.report;
+    if report.dry_run
+        || !report.enabled
+        || !report.pressure_active_after
+        || report.stopped_at_low_watermark
+        || run.evidence.pass_contention.is_some()
+    {
+        return false;
+    }
+    let Some(sweep) = &run.evidence.candidate_sweep else {
+        return false;
+    };
+    if !sweep.reserved || sweep.wrapped {
+        return false;
+    }
+    let advanced = run.evidence.inspected_terminal_rows > 0
+        && sweep.cursor_after.is_some()
+        && sweep.cursor_after != sweep.cursor_before;
+    let useful = report.fully_removed_count > 0
+        || report.newly_staged_count > 0
+        || run.evidence.recovery_sweep.entries_deleted > 0;
+    // Traversing the finite frozen keyset is progress even when every candidate
+    // is refused. Custody refusals still apply to each candidate; pacing only
+    // admits the next bounded page, with burst limits and a stop at cycle wrap.
+    useful || advanced
+}
+
 struct SandboxReclaimCoordinator {
     sender: std::sync::mpsc::SyncSender<SandboxReclaimJob>,
     state: Arc<SandboxReclaimWorkerState>,
@@ -277,7 +361,6 @@ struct SandboxReclaimRun {
 }
 
 impl SandboxReclaimRun {
-    #[cfg(test)]
     fn without_candidate_sweep(report: SandboxBuildCacheReclaimReport) -> Self {
         Self {
             report,
@@ -511,6 +594,7 @@ fn run_sandbox_reclaim_job(
                 context,
                 dry_run,
                 prepared_only,
+                trigger == "pressure_continuation",
                 manager_key,
                 state,
             ))
@@ -544,8 +628,12 @@ fn run_sandbox_reclaim_job(
             Some(total_elapsed_ms),
         ),
     });
+    let stopped_continuation = trigger == "pressure_continuation"
+        && result
+            .as_ref()
+            .is_ok_and(|run| !run.report.enabled || !run.report.pressure_active_after);
     let _ = result_tx.send(result);
-    if let Some(context) = immediate_recovery_context {
+    if let Some(context) = immediate_recovery_context.filter(|_| !stopped_continuation) {
         let prepared_pending = context.store.try_lock().is_ok_and(|store| {
             store
                 .target_reclaim_intent_counts()
@@ -557,6 +645,7 @@ fn run_sandbox_reclaim_job(
                     context,
                     false,
                     true,
+                    false,
                     manager_key,
                     state,
                 ))
@@ -4651,6 +4740,14 @@ impl SessionManager {
         mut launch_purpose: LaunchPurpose,
         preheld_cwd_admission: Option<super::spawn_single_flight::ProviderCwdAdmissionGuard>,
     ) -> Result<Uuid> {
+        if self
+            .restart_draining
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DaemonError::PolicyDenied(
+                "daemon restart drain is in progress".into(),
+            ));
+        }
         let authenticated_retry = retry_admission.is_some();
         if authenticated_retry && (config.sandbox.is_some() || config.cargo_target_dir.is_some()) {
             return Err(DaemonError::InvalidParam(
@@ -4667,6 +4764,10 @@ impl SessionManager {
                 "Cannot spawn a container-kind session".into(),
             ));
         }
+        // #694 K1: refresh a missing/expired credential check (single-flight,
+        // 5 s timeout) before any lock is taken, so the spawn chokepoint's
+        // admission decides on a current result.
+        crate::vault::warm_launch_check(&config).await;
         // Freeze the live daemon setting for this launch. Later launches observe
         // UpdateDaemonConfig, while this row and its monitor use one value.
         let context_rotation_enabled = self
@@ -4694,6 +4795,30 @@ impl SessionManager {
             .remove(&config.query)
             .unwrap_or(session_id);
 
+        // A lead (including its same-Epic successor) retains incremental
+        // builds; new children, reviewers, and topology workers use sccache.
+        let build_worker = match &launch_purpose {
+            LaunchPurpose::AgentSuccessor(_) | LaunchPurpose::ManagerSuccessor(_) => false,
+            LaunchPurpose::AgentChild(_)
+            | LaunchPurpose::ManagerAction(_)
+            | LaunchPurpose::TopologyNode(_) => true,
+            _ => match config.parent_id {
+                Some(parent_id) => {
+                    self.store
+                        .lock()
+                        .await
+                        .get_session(parent_id)?
+                        .is_some_and(|parent| {
+                            parent.session_kind != SessionKind::Epic
+                                || parent
+                                    .lead_session_id
+                                    .is_some_and(|lead| lead != session_id)
+                        })
+                }
+                None => false,
+            },
+        };
+
         // Single-flight spawn guard (structural). `session_id` is a brand-new
         // UUID, so no concurrent same-id spawn can exist and the adopt branch is
         // skipped; the guard keeps the check -> launch -> active.insert invariant
@@ -4705,6 +4830,14 @@ impl SessionManager {
             Some(guard) => guard,
             None => super::spawn_single_flight::acquire_provider_cwd_admission().await,
         };
+        if self
+            .restart_draining
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DaemonError::PolicyDenied(
+                "daemon restart drain is in progress".into(),
+            ));
+        }
 
         // Reconciliation can revisit the same UUID after admission but before
         // publication. Resolve that exact obligation under single-flight,
@@ -5485,7 +5618,7 @@ impl SessionManager {
             config.execution_scratch = match crate::sandbox::execution_scratch::SandboxExecutionScratch::from_context_permit(
                 &context_permit,
             ) {
-                Ok(scratch) => scratch,
+                Ok(scratch) => scratch.map(|scratch| scratch.with_build_env(&self.runtime_config, build_worker)),
                 Err(error) => {
                     drop(context_permit);
                     if let Err(settlement_error) = self
@@ -5867,7 +6000,10 @@ impl SessionManager {
             None => Ok(None),
         };
         match direct_execution_scratch {
-            Ok(scratch) => config.execution_scratch = scratch,
+            Ok(scratch) => {
+                config.execution_scratch = scratch
+                    .map(|scratch| scratch.with_build_env(&self.runtime_config, build_worker))
+            }
             Err(error) => {
                 drop(direct_context_permit.take());
                 if let Some(admission_permit) = direct_admission.as_ref()
@@ -6581,8 +6717,15 @@ impl SessionManager {
                 Err(error) => {
                     let execution_scratch_failure =
                         matches!(&error, DaemonError::ExecutionScratchUnavailable(_));
+                    let codex_tool_history_failure =
+                        matches!(&error, DaemonError::CodexResumeToolHistory(_));
+                    let codex_torn_tail = matches!(&error, DaemonError::CodexResumeTornTail);
                     let safe_error_class = if execution_scratch_failure {
                         "execution_scratch_unavailable"
+                    } else if codex_torn_tail {
+                        "codex_resume_rollout_torn_tail"
+                    } else if codex_tool_history_failure {
+                        "codex_resume_tool_history_invalid"
                     } else {
                         "provider_spawn_failed"
                     };
@@ -6600,7 +6743,11 @@ impl SessionManager {
                             &self.agent_tokens,
                             session_id,
                             &admission_permit,
-                            if execution_scratch_failure {
+                            if codex_torn_tail {
+                                "Codex rollout torn tail before provider dispatch"
+                            } else if codex_tool_history_failure {
+                                "Codex persisted tool history invalid before provider dispatch"
+                            } else if execution_scratch_failure {
                                 "execution scratch revalidation failed before provider dispatch"
                             } else {
                                 "provider spawn failed before establishment"
@@ -6628,7 +6775,11 @@ impl SessionManager {
                         &admission_permit,
                         InvocationCompletion {
                             error_class: Some(
-                                if execution_scratch_failure {
+                                if codex_torn_tail {
+                                    "codex_resume_rollout_torn_tail"
+                                } else if codex_tool_history_failure {
+                                    "codex_resume_tool_history_invalid"
+                                } else if execution_scratch_failure {
                                     "execution_scratch_unavailable"
                                 } else {
                                     "spawn_failed"
@@ -7585,16 +7736,6 @@ impl SessionManager {
                         .await;
                         let fence = if source_fence.is_err() {
                             source_fence
-                        } else if matches!(
-                            context.claim.action(),
-                            rsi_common::harness_manager_v2::ManagerActionV2::RetryLead { .. }
-                        ) && !runtime_config
-                            .retry_enabled
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            Err(DaemonError::InvalidParam(
-                                "manager_v2_retry_disabled".into(),
-                            ))
                         } else {
                             store
                                 .lock()
@@ -8166,6 +8307,19 @@ impl SessionManager {
             .await?;
 
         let store = self.store.clone();
+        let restart_prepared = tokio::task::spawn_blocking(move || {
+            store.blocking_lock().prepare_restart_intents_for_restore()
+        })
+        .await
+        .map_err(|e| DaemonError::Store(e.to_string()))??;
+        if restart_prepared > 0 {
+            tracing::info!(
+                restart_prepared,
+                "Classified graceful-restart invocations before generic crash reconciliation"
+            );
+        }
+
+        let store = self.store.clone();
         let reconciled_invocations = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
             store.reconcile_running_model_invocations()
@@ -8191,7 +8345,7 @@ impl SessionManager {
         phase_started_at = Instant::now();
 
         let store = self.store.clone();
-        let (sessions, retry_eligible) = tokio::task::spawn_blocking(move || {
+        let (sessions, retry_eligible, restart_owned) = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
             let sessions = store.load_sessions()?;
             // Invalid custody is historical/auditable, not invisible.  Keep
@@ -8202,7 +8356,8 @@ impl SessionManager {
             // corpus; terminal history remains visible in `sessions`, while
             // only executable verified custody enters the retry set.
             let retry_eligible = store.startup_retry_eligible_sessions()?;
-            Ok::<_, DaemonError>((sessions, retry_eligible))
+            let restart_owned = store.restart_owned_session_ids()?;
+            Ok::<_, DaemonError>((sessions, retry_eligible, restart_owned))
         })
         .await
         .map_err(|e| DaemonError::Store(e.to_string()))??;
@@ -8223,37 +8378,42 @@ impl SessionManager {
             ) || (session.status == SessionStatus::WaitingApproval
                 && !waiting_with_question)
             {
-                let old_status = session.status;
-                session.status = SessionStatus::Failed;
-                session.updated_at = chrono::Utc::now();
-                // Pending archive is user cancellation, so its restore path
-                // persists Failed without staging a transient C5 autofile
-                // marker. The ordinary crash path keeps the existing atomic
-                // Failed-plus-marker transition.
-                if !session.pending_archive {
-                    if let Err(e) = self
-                        .persistence
-                        .update_failed_and_stage_autofile(
-                            session.id,
-                            crate::store::daemon_settings::AutofileCause::ProcessDied,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            session_id = %session.id,
-                            error = %e,
-                            "Failed to persist crash-recovered status"
-                        );
+                if restart_owned.contains(&session.id) {
+                    tracing::info!(session_id=%session.id, "Restart journal owns exact session; bypassing crash recovery");
+                    None
+                } else {
+                    let old_status = session.status;
+                    session.status = SessionStatus::Failed;
+                    session.updated_at = chrono::Utc::now();
+                    // Pending archive is user cancellation, so its restore path
+                    // persists Failed without staging a transient C5 autofile
+                    // marker. The ordinary crash path keeps the existing atomic
+                    // Failed-plus-marker transition.
+                    if !session.pending_archive {
+                        if let Err(e) = self
+                            .persistence
+                            .update_failed_and_stage_autofile(
+                                session.id,
+                                crate::store::daemon_settings::AutofileCause::ProcessDied,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "Failed to persist crash-recovered status"
+                            );
+                        }
+                        self.event_bus.publish(DaemonEvent::SessionReconciled {
+                            session_id: session.id,
+                            old_status,
+                            new_status: SessionStatus::Failed,
+                            reason: crate::reconciliation::ReconciliationReason::ProcessDied,
+                        });
                     }
-                    self.event_bus.publish(DaemonEvent::SessionReconciled {
-                        session_id: session.id,
-                        old_status,
-                        new_status: SessionStatus::Failed,
-                        reason: crate::reconciliation::ReconciliationReason::ProcessDied,
-                    });
                     crash_reconciled.push(session.id);
+                    Some(old_status)
                 }
-                Some(old_status)
             } else {
                 None
             };
@@ -8884,6 +9044,60 @@ impl SessionManager {
         Ok(())
     }
 
+    /// One daemon-owned producer, with at most one awaited job in the existing
+    /// worker queue. Aborting this task stops future submissions; accepted jobs
+    /// still settle on the worker under their original custody fences.
+    pub fn start_sandbox_build_cache_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        // Submit synchronously so startup owns the first queue position before
+        // request readiness and before the independent Prepared retry ticker.
+        let first = self.submit_sandbox_build_cache_reclaim(false, false, "startup");
+        if first.is_ok() {
+            tracing::info!(
+                trigger = "startup",
+                lifecycle_phase = "accepted",
+                "Sandbox build-cache reclaim pass accepted for asynchronous startup execution"
+            );
+        }
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut pending = first;
+            let mut pacing = PressureReclaimPacing::default();
+            loop {
+                let result = match pending {
+                    Ok(receiver) => receiver.await.unwrap_or_else(|_| {
+                        Err(DaemonError::Process(
+                            "sandbox reclaim worker disconnected".into(),
+                        ))
+                    }),
+                    Err(error) => Err(error),
+                };
+                let delay = pacing.next_delay(result.as_ref().ok());
+                let config = manager
+                    .runtime_config
+                    .sandbox_build_cache_reclaim_snapshot();
+                let pressure_continuation = delay.is_some() && config.enabled;
+                let delay = if pressure_continuation {
+                    delay.unwrap()
+                } else {
+                    pacing = PressureReclaimPacing::default();
+                    Duration::from_secs(config.interval_secs)
+                };
+                tokio::time::sleep(delay).await;
+                // A changed policy is read again inside the worker. A disabled
+                // continuation returns without recovery or candidate effects.
+                pending = manager.submit_sandbox_build_cache_reclaim(
+                    false,
+                    false,
+                    if pressure_continuation {
+                        "pressure_continuation"
+                    } else {
+                        "periodic"
+                    },
+                );
+            }
+        })
+    }
+
     /// Promptly retry journaled Prepared gates through the same single-flight
     /// worker as ordinary reclaim. The daemon calls this at a one-second
     /// cadence; a full queue is retried on the next tick.
@@ -8910,6 +9124,7 @@ impl SessionManager {
         context: SandboxReclaimContext,
         dry_run: bool,
         prepared_only: bool,
+        pressure_only: bool,
         manager_key: usize,
         worker_state: &SandboxReclaimWorkerState,
     ) -> Result<SandboxReclaimRun> {
@@ -8973,6 +9188,18 @@ impl SessionManager {
             candidate_budget_exhausted: false,
             stop_reason: ReclaimStopReason::Completed,
         };
+
+        // Recheck live policy and actual filesystem pressure on the serialized
+        // worker, after any queue wait. Ordinary periodic recovery remains
+        // allowed while disabled; accelerated continuations do no such work.
+        if pressure_only && (!config.enabled || !pressure_active_after) {
+            report.stop_reason = if config.enabled {
+                ReclaimStopReason::LowWatermark
+            } else {
+                ReclaimStopReason::Disabled
+            };
+            return Ok(SandboxReclaimRun::without_candidate_sweep(report));
+        }
 
         // Registered v3 work is database-scheduled and remains actionable
         // even when reclaim policy is disabled or its former custody owner has
@@ -9732,6 +9959,7 @@ mod tests {
         manager
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn pioneer_launch_default_migrates_retired_router_and_preserves_explicit_model() {
         let mut model = None;
@@ -10318,6 +10546,7 @@ done
         panic!("pending_archive persistence worker did not reach expected state");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn launch_abort_guard_retains_root_registration_ref_and_content() {
         let repo = TempDir::new().expect("repo tempdir");
@@ -10366,6 +10595,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn launch_abort_then_restore_path_only_is_inert() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -10406,6 +10636,7 @@ done
         assert_no_d00_success_events(manager.event_bus(), &mut events);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn startup_row_read_failure_candidate_is_inert() {
         let base = TempDir::new().expect("sandbox tempdir");
@@ -10430,6 +10661,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_ownership_read_failure_is_inert_in_isolated_repository() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -10473,6 +10705,7 @@ done
         assert_no_d00_success_events(manager.event_bus(), &mut events);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_ownership_drift_is_compared_to_post_external_snapshot() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -10517,6 +10750,7 @@ done
         assert_no_d00_success_events(manager.event_bus(), &mut events);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_row_reread_failure_uses_sweep_and_is_inert() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -10581,6 +10815,7 @@ done
         assert_no_d00_success_events(manager.event_bus(), &mut events);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_archive_admission_retains_the_sandbox_in_an_isolated_repository() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -10650,6 +10885,7 @@ done
         assert_no_d00_success_events(manager.event_bus(), &mut events);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_pending_archive_commits_metadata_without_sandbox_cleanup() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -11073,6 +11309,7 @@ done
         panic!("fixture Store selection remained busy across three bounded attempts");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_restore_sessions_retry_matrix_fences_historical_and_invalid_custody() {
         let (mut manager, _db, sandbox_base) = manager();
@@ -11284,12 +11521,23 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_sweeps_only_eligible_terminal_caches() {
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("reclaim-eligible-db");
         let sandbox_base = disk_backed_tempdir("reclaim-eligible-sandbox");
         let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        // Exercise ordinary TTL eligibility independently of host disk pressure.
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
         let repo = TempDir::new().expect("repo dir");
         init_d00_git_repo(repo.path());
 
@@ -11364,6 +11612,8 @@ done
 
         let report = run_build_cache_reclaim_fixture(&manager, false).await;
 
+        assert!(!report.pressure_active_before, "{report:?}");
+        assert!(!report.pressure_active_after, "{report:?}");
         assert_eq!(report.fully_removed_count, 1, "{report:?}");
         assert_eq!(report.newly_staged_count, 1);
         assert!(
@@ -11408,6 +11658,8 @@ done
         );
         // Re-run: idempotent, nothing further to reclaim from the eligible row.
         let second = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert!(!second.pressure_active_before, "{second:?}");
+        assert!(!second.pressure_active_after, "{second:?}");
         assert_eq!(
             second.fully_removed_count, 0,
             "second sweep must remove nothing new"
@@ -11416,6 +11668,7 @@ done
         drop(symlink_row);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_skips_in_memory_active_owner() {
         let _isolation = reclaim_test_isolation();
@@ -11446,6 +11699,7 @@ done
         assert!(cache.exists(), "active owner cache must remain intact");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn build_cache_pressure_state_uses_high_low_hysteresis() {
         assert!(!pressure_state(false, 84, 85, 75));
@@ -11455,6 +11709,7 @@ done
         assert!(!pressure_state(true, 75, 85, 75));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn build_cache_filesystem_measurement_fails_closed_for_missing_base() {
         let parent = TempDir::new().expect("temporary parent");
@@ -11463,6 +11718,7 @@ done
         assert!(error.to_string().contains("sandbox statvfs failed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_dry_run_authenticates_without_mutation() {
         let _isolation = reclaim_test_isolation();
@@ -11505,6 +11761,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_preview_excludes_external_hard_link_from_low_watermark_claim() {
         let _isolation = reclaim_test_isolation();
@@ -11560,6 +11817,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_post_sizing_hard_link_race_claims_no_future_capacity() {
         let _isolation = reclaim_test_isolation();
@@ -11637,6 +11895,7 @@ done
         assert!(!cache.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_preview_counts_cross_candidate_hard_link_once() {
         let _isolation = reclaim_test_isolation();
@@ -11730,6 +11989,7 @@ done
         assert!(after.available_bytes >= before.available_bytes);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_disabled_is_a_reported_noop() {
         let _isolation = reclaim_test_isolation();
@@ -11764,6 +12024,7 @@ done
         assert!(cache.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_is_oldest_first_and_candidate_bounded() {
         let _isolation = reclaim_test_isolation();
@@ -11816,6 +12077,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_pages_past_absent_equal_timestamp_targets() {
         let _isolation = reclaim_test_isolation();
@@ -11919,6 +12181,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_durable_pages_survive_manager_restart() {
         let _isolation = reclaim_test_isolation();
@@ -12012,6 +12275,7 @@ done
         assert!(wrap_sweep.cursor_after.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_durable_crash_reservation_retries_next_cycle() {
         let _isolation = reclaim_test_isolation();
@@ -12093,6 +12357,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_store_busy_selection_is_bounded_and_zero_write() {
         let _isolation = reclaim_test_isolation();
@@ -12145,6 +12410,7 @@ done
         assert!(!cache.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_root_busy_does_not_starve_later_candidate() {
         let _isolation = reclaim_test_isolation();
@@ -12208,6 +12474,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_exact_limit_is_not_exhausted() {
         let _isolation = reclaim_test_isolation();
@@ -12249,6 +12516,7 @@ done
         assert_eq!(durable_state, (0, None), "dry-run must be zero-write");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_zero_candidates_has_typed_stop() {
         let _isolation = reclaim_test_isolation();
@@ -12262,6 +12530,7 @@ done
         assert!(!report.candidate_budget_exhausted);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_waits_for_store_before_candidate_effect() {
         let _isolation = reclaim_test_isolation();
@@ -12333,6 +12602,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_releases_store_during_target_deletion() {
         let _isolation = reclaim_test_isolation();
@@ -12398,6 +12668,7 @@ done
         assert!(!cache.exists(), "the authenticated target is reclaimed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_candidate_store_timeout_is_bounded_and_retryable() {
         let _isolation = reclaim_test_isolation();
@@ -12534,6 +12805,538 @@ done
         }
     }
 
+    fn pressure_pacing_fixture(report: SandboxBuildCacheReclaimReport) -> SandboxReclaimRun {
+        let mut run = SandboxReclaimRun::without_candidate_sweep(report);
+        run.report.dry_run = false;
+        run.report.enabled = true;
+        run.report.pressure_active_after = true;
+        run.report.candidates_considered = 0;
+        run.report.skip_counts.clear();
+        run.evidence.inspected_terminal_rows = 8;
+        run.evidence.candidate_sweep = Some(SandboxTargetReclaimSweepV2 {
+            cycle_before: 0,
+            cycle_after: 1,
+            cursor_before: None,
+            cursor_after: Some(SandboxTargetReclaimKeyV2 {
+                updated_at: "2026-08-01T00:00:00.000000000Z".into(),
+                session_id: Uuid::new_v4(),
+            }),
+            upper_bound: None,
+            page_key_digest: String::new(),
+            reserved: true,
+            wrapped: false,
+        });
+        run
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_pacing_progress_and_backoff() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, _base) = manager();
+        let report = manager.run_sandbox_build_cache_reclaim(true).await.unwrap();
+        let mut run = pressure_pacing_fixture(report);
+        let mut pacing = PressureReclaimPacing::default();
+        assert_eq!(pacing.next_delay(Some(&run)), Some(PRESSURE_PAGE_DELAY));
+        run.report.candidates_considered = 8;
+        run.report.eligible_candidates = 8;
+        assert_eq!(
+            pacing.next_delay(Some(&run)),
+            Some(PRESSURE_PAGE_DELAY),
+            "cursor advance progresses even without target deletion"
+        );
+        run.report.fully_removed_count = 1;
+        assert_eq!(pacing.next_delay(Some(&run)), Some(PRESSURE_PAGE_DELAY));
+        run.report.dry_run = true;
+        assert_eq!(pacing.next_delay(Some(&run)), None);
+        run.report.dry_run = false;
+        run.report.enabled = false;
+        assert_eq!(pacing.next_delay(Some(&run)), None);
+        run.report.enabled = true;
+        run.report.pressure_active_after = false;
+        assert_eq!(pacing.next_delay(Some(&run)), None);
+        run.report.pressure_active_after = true;
+        run.evidence.candidate_sweep.as_mut().unwrap().wrapped = true;
+        assert_eq!(pacing.next_delay(Some(&run)), None);
+        run.evidence.candidate_sweep.as_mut().unwrap().wrapped = false;
+        run.evidence.pass_contention = Some(ReclaimPassContention::StoreBusy);
+        assert_eq!(pacing.next_delay(Some(&run)), None);
+        assert_eq!(
+            pacing.next_delay(None),
+            None,
+            "errors use operator interval"
+        );
+        run.evidence.pass_contention = None;
+        run.report.candidates_considered = 0;
+        run.report.fully_removed_count = 0;
+        let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
+        sweep.cursor_before = sweep.cursor_after.clone();
+        assert_eq!(
+            pacing.next_delay(Some(&run)),
+            None,
+            "unchanged cursor cannot spin"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_pacing_mixed_refusals_advance_until_burst_or_wrap() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, _base) = manager();
+        let report = manager.run_sandbox_build_cache_reclaim(true).await.unwrap();
+        let mut run = pressure_pacing_fixture(report);
+        run.report.candidates_considered = 7;
+        run.report
+            .skip_counts
+            .insert(ReclaimSkipReason::TargetAbsent, 6);
+        run.report
+            .skip_counts
+            .insert(ReclaimSkipReason::TargetIdentityChanged, 1);
+        let mut pacing = PressureReclaimPacing::default();
+        for _ in 1..PRESSURE_BURST_PASSES {
+            assert_eq!(pacing.next_delay(Some(&run)), Some(PRESSURE_PAGE_DELAY));
+        }
+        assert_eq!(pacing.next_delay(Some(&run)), Some(PRESSURE_BURST_DELAY));
+        assert_eq!(pacing.passes, 0, "refused pages consume the burst budget");
+        let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
+        sweep.wrapped = true;
+        assert_eq!(pacing.next_delay(Some(&run)), None, "wrap ends the cycle");
+        let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
+        sweep.wrapped = false;
+        sweep.cursor_before = sweep.cursor_after.clone();
+        assert_eq!(pacing.next_delay(Some(&run)), None, "no cursor progress");
+        let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
+        sweep.cursor_before = None;
+        sweep.reserved = false;
+        assert_eq!(
+            pacing.next_delay(Some(&run)),
+            None,
+            "no durable reservation"
+        );
+        run.evidence.candidate_sweep.as_mut().unwrap().reserved = true;
+        run.evidence.pass_contention = Some(ReclaimPassContention::StoreBusy);
+        assert_eq!(pacing.next_delay(Some(&run)), None, "contention backs off");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_pacing_bounds_each_burst() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, _base) = manager();
+        let report = manager.run_sandbox_build_cache_reclaim(true).await.unwrap();
+        let run = pressure_pacing_fixture(report);
+        for mut pacing in [
+            PressureReclaimPacing {
+                passes: PRESSURE_BURST_PASSES - 1,
+                ..Default::default()
+            },
+            PressureReclaimPacing {
+                rows: PRESSURE_BURST_ROWS - 8,
+                ..Default::default()
+            },
+            PressureReclaimPacing {
+                bytes: PRESSURE_BURST_BYTES,
+                ..Default::default()
+            },
+            PressureReclaimPacing {
+                started: Instant::now() - PRESSURE_BURST_TIME,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(pacing.next_delay(Some(&run)), Some(PRESSURE_BURST_DELAY));
+            assert_eq!(pacing.passes, 0);
+            assert_eq!(pacing.rows, 0);
+            assert_eq!(pacing.bytes, 0);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_continuation_rechecks_disable_and_low_watermark() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, base) = manager();
+        let _stats = install_sandbox_filesystem_stats_override_for_test(
+            base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 99,
+                used_bytes: 1,
+                used_percent: 1,
+            },
+        );
+        for enabled in [false, true] {
+            manager
+                .runtime_config
+                .update_field(
+                    "sandbox_build_cache_reclaim_enabled",
+                    &serde_json::json!(enabled),
+                )
+                .unwrap();
+            let run = manager
+                .run_sandbox_build_cache_reclaim_with_evidence_for_trigger(
+                    false,
+                    "pressure_continuation",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                run.report.stop_reason,
+                if enabled {
+                    ReclaimStopReason::LowWatermark
+                } else {
+                    ReclaimStopReason::Disabled
+                }
+            );
+            assert_eq!(run.evidence.inspected_terminal_rows, 0);
+            assert_eq!(run.report.staged_count, 0);
+            assert_eq!(run.report.recovered_count, 0);
+            assert_eq!(
+                PressureReclaimPacing::default().next_delay(Some(&run)),
+                None
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_maintenance_has_one_pending_job_and_abort_stops_followup() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, base) = manager();
+        let manager = Arc::new(manager);
+        let _stats = install_sandbox_filesystem_stats_override_for_test(
+            base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 1,
+                used_bytes: 99,
+                used_percent: 99,
+            },
+        );
+        manager
+            .runtime_config
+            .update_field(
+                "sandbox_build_cache_reclaim_max_candidates",
+                &serde_json::json!(8),
+            )
+            .unwrap();
+        manager
+            .runtime_config
+            .update_field(
+                "sandbox_build_cache_reclaim_enabled",
+                &serde_json::json!(true),
+            )
+            .unwrap();
+        for index in 0..16 {
+            let mut row = test_session(Uuid::new_v4());
+            row.status = SessionStatus::Completed;
+            row.updated_at =
+                chrono::Utc::now() - chrono::Duration::days(20) + chrono::Duration::seconds(index);
+            manager.store.lock().await.insert_session(&row).unwrap();
+        }
+        manager.persistence.barrier().await.unwrap();
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *reclaim_single_flight_hook().lock().unwrap() = Some(ReclaimSingleFlightHook {
+            manager_key: sandbox_reclaim_manager_key(&manager.store),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let task = manager.start_sandbox_build_cache_maintenance();
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let worker = SandboxReclaimCoordinator::process_wide().unwrap();
+        tokio::time::sleep(PRESSURE_PAGE_DELAY * 4).await;
+        assert_eq!(worker.state.active.load(Ordering::Acquire), 1);
+        assert_eq!(
+            worker.state.queued.load(Ordering::Acquire),
+            0,
+            "producer must await its active pass instead of filling the queue"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        *reclaim_single_flight_hook().lock().unwrap() = None;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.state.active.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let cursor = manager
+            .store
+            .lock()
+            .await
+            .preview_terminal_reclaim_page(8)
+            .unwrap()
+            .evidence
+            .cursor_before;
+        assert!(
+            cursor.is_some(),
+            "accepted pass completes after producer shutdown"
+        );
+        tokio::time::sleep(PRESSURE_PAGE_DELAY * 4).await;
+        let after = manager
+            .store
+            .lock()
+            .await
+            .preview_terminal_reclaim_page(8)
+            .unwrap()
+            .evidence
+            .cursor_before;
+        assert_eq!(after, cursor, "shutdown admits no continuation");
+        assert_eq!(worker.state.queued.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_maintenance_crosses_history_then_shutdown_stops_submission() {
+        let _isolation = reclaim_test_isolation();
+        let db = disk_backed_tempdir("pressure-history-db-");
+        let base = disk_backed_tempdir("pressure-history-base-");
+        let repo = disk_backed_tempdir("pressure-history-repo-");
+        init_d00_git_repo(repo.path());
+        let manager = Arc::new(manager_for_disk_fixture(db.path(), base.path()));
+        let _stats = install_sandbox_filesystem_stats_override_for_test(
+            base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 5,
+                used_bytes: 95,
+                used_percent: 95,
+            },
+        );
+        for (field, value) in [
+            (
+                "sandbox_build_cache_reclaim_enabled",
+                serde_json::json!(true),
+            ),
+            (
+                "sandbox_build_cache_reclaim_max_candidates",
+                serde_json::json!(8),
+            ),
+            (
+                "sandbox_build_cache_reclaim_interval_secs",
+                serde_json::json!(60),
+            ),
+            (
+                "sandbox_build_cache_reclaim_low_watermark_pct",
+                serde_json::json!(80),
+            ),
+            (
+                "sandbox_build_cache_reclaim_high_watermark_pct",
+                serde_json::json!(90),
+            ),
+        ] {
+            manager.runtime_config.update_field(field, &value).unwrap();
+        }
+        let stale = chrono::Utc::now() - chrono::Duration::days(20);
+        // More historical pages than one burst; none has live custody.
+        for index in 0..136 {
+            let mut row = test_session(Uuid::new_v4());
+            row.status = SessionStatus::Completed;
+            row.updated_at = stale + chrono::Duration::seconds(index);
+            manager.store.lock().await.insert_session(&row).unwrap();
+        }
+        let (_, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            base.path(),
+            SessionStatus::Completed,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        let task = manager.start_sandbox_build_cache_maintenance();
+        let converged = tokio::time::timeout(Duration::from_secs(15), async {
+            while cache.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // An accepted job is allowed to finish, but no producer remains to
+        // enqueue its successor. Observe the same global worker/queue.
+        let worker = SandboxReclaimCoordinator::process_wide().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.state.active.load(Ordering::Acquire) != 0
+                || worker.state.queued.load(Ordering::Acquire) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            converged.is_ok(),
+            "history must converge before the 60-second operator interval"
+        );
+        tokio::time::sleep(PRESSURE_BURST_DELAY + PRESSURE_PAGE_DELAY).await;
+        assert_eq!(worker.state.active.load(Ordering::Acquire), 0);
+        assert_eq!(worker.state.queued.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_maintenance_crosses_mixed_refused_page() {
+        let _isolation = reclaim_test_isolation();
+        let db = disk_backed_tempdir("pressure-refused-db-");
+        let base = disk_backed_tempdir("pressure-refused-base-");
+        let repo = disk_backed_tempdir("pressure-refused-repo-");
+        init_d00_git_repo(repo.path());
+        let manager = Arc::new(manager_for_disk_fixture(db.path(), base.path()));
+        let _stats = install_sandbox_filesystem_stats_override_for_test(
+            base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 5,
+                used_bytes: 95,
+                used_percent: 95,
+            },
+        );
+        for (field, value) in [
+            (
+                "sandbox_build_cache_reclaim_enabled",
+                serde_json::json!(true),
+            ),
+            (
+                "sandbox_build_cache_reclaim_max_candidates",
+                serde_json::json!(3),
+            ),
+            (
+                "sandbox_build_cache_reclaim_interval_secs",
+                serde_json::json!(60),
+            ),
+        ] {
+            manager.runtime_config.update_field(field, &value).unwrap();
+        }
+        let stale = chrono::Utc::now() - chrono::Duration::hours(9);
+        let mut rows = Vec::new();
+        for index in 0..4 {
+            rows.push(
+                build_cache_row(
+                    &manager,
+                    repo.path(),
+                    base.path(),
+                    SessionStatus::Completed,
+                    stale + chrono::Duration::seconds(index),
+                )
+                .await,
+            );
+        }
+        for (_, cache) in rows.iter().take(3) {
+            std::fs::remove_dir_all(cache).unwrap();
+        }
+        // A deterministic non-directory refusal exercises mixed-page traversal
+        // without weakening authentication or requiring a filesystem race.
+        let refused_target = &rows[2].1;
+        std::fs::write(refused_target, b"retain refused target").unwrap();
+        manager.persistence.barrier().await.unwrap();
+        let preview = run_build_cache_reclaim_fixture(&manager, true).await;
+        assert_eq!(preview.candidates_considered, 3, "{preview:?}");
+        assert_eq!(
+            preview.skip_counts.get(&ReclaimSkipReason::TargetAbsent),
+            Some(&2)
+        );
+        assert_eq!(
+            preview
+                .skip_counts
+                .get(&ReclaimSkipReason::TargetNotDirectory),
+            Some(&1)
+        );
+        assert_eq!(preview.skip_counts.len(), 2, "{preview:?}");
+        assert_eq!(preview.stop_reason, ReclaimStopReason::CandidateBudget);
+        assert_eq!(
+            manager
+                .store
+                .lock()
+                .await
+                .preview_terminal_reclaim_page(3)
+                .unwrap()
+                .evidence
+                .cursor_before,
+            None,
+            "preview leaves the actual first page unconsumed"
+        );
+
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(1));
+        *reclaim_single_flight_hook().lock().unwrap() = Some(ReclaimSingleFlightHook {
+            manager_key: sandbox_reclaim_manager_key(&manager.store),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let task = manager.start_sandbox_build_cache_maintenance();
+        // Permit the first mixed-refusal pass, then pause the second before it
+        // reserves a page. Reaching it proves automatic pacing beat the 60s interval.
+        let continued = tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..2 {
+                entered.acquire().await.unwrap().forget();
+            }
+        })
+        .await;
+        let cursor = manager
+            .store
+            .lock()
+            .await
+            .preview_terminal_reclaim_page(3)
+            .unwrap()
+            .evidence
+            .cursor_before;
+        // Release any accepted job before assertions, including on timeout.
+        *reclaim_single_flight_hook().lock().unwrap() = None;
+        release.add_permits(2);
+        let converged = if continued.is_ok() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while rows[3].1.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let worker = SandboxReclaimCoordinator::process_wide().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.state.active.load(Ordering::Acquire) != 0
+                || worker.state.queued.load(Ordering::Acquire) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            continued.is_ok(),
+            "mixed refusals must admit the next bounded pass"
+        );
+        let cursor = cursor.expect("actual refused page advances durable cursor");
+        assert_eq!(cursor.session_id, rows[2].0.id);
+        assert_eq!(cursor.updated_at, rows[2].0.updated_at.to_rfc3339());
+        assert!(
+            converged,
+            "later authenticated target is reclaimed before the normal interval"
+        );
+        assert_eq!(
+            std::fs::read(refused_target).unwrap(),
+            b"retain refused target"
+        );
+        for (session, _) in &rows {
+            assert!(
+                session.sandbox_root.as_ref().unwrap().is_dir(),
+                "source root retained"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_logs_zero_startup_and_periodic_summaries() {
         let _isolation = reclaim_test_isolation();
@@ -12572,6 +13375,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_reports_consecutive_store_pressure_stalls() {
         let _isolation = reclaim_test_isolation();
@@ -12619,6 +13423,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_routes_injected_startup_preaccept_failures() {
         let _isolation = reclaim_test_isolation();
@@ -12683,6 +13488,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_startup_submission_returns_while_owned_monitor_waits() {
         let _isolation = reclaim_test_isolation();
@@ -12772,6 +13578,7 @@ done
         assert!(terminal[0].contains("total_elapsed_ms="), "{events:?}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_startup_restore_logs_bounded_monotonic_authority_phases() {
         let _isolation = reclaim_test_isolation();
@@ -12824,6 +13631,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_owned_lifecycle_logs_triggered_error_in_order() {
         let _isolation = reclaim_test_isolation();
@@ -12879,6 +13687,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_supervises_outer_panic_and_continues_in_order() {
         let _isolation = reclaim_test_isolation();
@@ -12940,6 +13749,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_disconnected_worker_is_typed_and_bounded() {
         let _isolation = reclaim_test_isolation();
@@ -13104,6 +13914,7 @@ done
         (first_report, second_report)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_single_flight_serializes_dry_actual_and_actual_actual() {
         let _isolation = reclaim_test_isolation();
@@ -13333,6 +14144,7 @@ done
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_abort_during_recovery_and_candidate_keeps_owned_lifecycle() {
         let _isolation = reclaim_test_isolation();
@@ -13488,6 +14300,7 @@ done
         drop(_db);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn build_cache_reclaim_request_runtime_shutdown_during_recovery_and_candidate_is_safe() {
         let _isolation = reclaim_test_isolation();
@@ -13495,6 +14308,7 @@ done
         assert_request_runtime_shutdown_keeps_reclaim_job(false, false);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn build_cache_reclaim_startup_monitor_runtime_shutdown_has_one_ordered_terminal_record() {
         let _isolation = reclaim_test_isolation();
@@ -13594,6 +14408,7 @@ done
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_coordinator_queue_is_bounded() {
         let _isolation = reclaim_test_isolation();
@@ -13698,6 +14513,7 @@ done
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_recovery_budget_is_independent_and_converges() {
         let _isolation = reclaim_test_isolation();
@@ -13780,6 +14596,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn sandbox_build_cache_reclaim_registered_intent_recovers_disabled_after_restart() {
         let _isolation = reclaim_test_isolation();
@@ -13860,6 +14677,7 @@ done
         assert_eq!(counts.completed, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn prepared_recovery_releases_gate_without_reclaiming_ordinary_candidates() {
         let _isolation = reclaim_test_isolation();
@@ -13957,6 +14775,7 @@ done
         manager.recover_prepared_target_reclaims().await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn registered_publication_replay_blocks_recovery_until_all_barriers_sync() {
         let _isolation = reclaim_test_isolation();
@@ -14152,6 +14971,7 @@ done
         assert_eq!(event_count(&store), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn registered_recovery_survives_custody_lifecycle_matrix() {
         let _isolation = reclaim_test_isolation();
@@ -14313,6 +15133,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn prepared_source_drift_abandons_without_deleting_live_source() {
         let _isolation = reclaim_test_isolation();
@@ -14433,6 +15254,7 @@ done
         assert_eq!(prepared.generation, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn dedicated_prepared_recovery_releases_gate_without_running_candidate_reclaim() {
         let _isolation = reclaim_test_isolation();
@@ -14491,6 +15313,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn dedicated_prepared_recovery_commits_staged_before_deleting_detached_target() {
         let _isolation = reclaim_test_isolation();
@@ -14564,6 +15387,7 @@ done
         store.settle_effect(permit, false).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn build_cache_reclaim_pressure_bypasses_ttl_for_terminal_owner() {
         let _isolation = reclaim_test_isolation();
@@ -14861,6 +15685,7 @@ done
         manager.revoke_agent_token_for_session(session_id).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn scheduled_fresh_pins_effective_standard_kind_against_project_worker_default() {
         let (manager, _dir, _sandbox) = manager();
@@ -14927,6 +15752,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn cross_provider_launch_without_model_uses_target_native_default() {
         let (manager, _dir, _sandbox) = manager();
@@ -15040,6 +15866,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h2_model_durability_persistence_failure_suppresses_live_and_metadata_delta() {
         let (manager, _dir, _sandbox) = manager();
@@ -15158,6 +15985,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn h2_model_durability_parallel_native_default_launches_are_session_isolated() {
         let (manager, _dir, _sandbox) = manager();
@@ -15276,6 +16104,7 @@ done
         second_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn generic_scheduled_fresh_normal_denial_leaves_no_token_or_pre_active_residue() {
         let (manager, _dir, _sandbox) = manager();
@@ -15316,6 +16145,7 @@ done
         assert_eq!(record.owner.scheduled_job_id, Some(scheduled_job_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_fresh_provider_spawn_failure_revokes_prospective_token() {
         let (manager, _dir, _sandbox) = manager();
@@ -15348,9 +16178,26 @@ done
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("count spawn-failure residue");
-        assert_eq!((sessions, bindings), (0, 0));
+        // Provider spawn failed after direct custody binding. Keep the failed
+        // session and invocation for audit while revoking live authority.
+        assert_eq!((sessions, bindings), (1, 1));
+        let (status, stop_reason, execution_state, error_code): (String, String, String, String) =
+            store
+                .conn
+                .query_row(
+                    "SELECT s.status, s.stop_reason, p.execution_state, p.error_code
+                 FROM sessions s JOIN session_execution_projections p ON p.session_id=s.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("failed direct launch remains auditable");
+        assert_eq!(status, "Failed");
+        assert_eq!(stop_reason, "sandbox_custody:provider_spawn_failed");
+        assert_eq!(execution_state, "invalid");
+        assert_eq!(error_code, "provider_spawn_failed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_fresh_exact_replay_uses_one_reservation_and_backend_dispatch() {
         let (manager, _dir, _sandbox) = manager();
@@ -15414,6 +16261,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn developer_instruction_pipeline_covers_every_supported_non_codex_provider() {
         for provider in [
@@ -15542,6 +16390,7 @@ done
             .expect("insert retryable failed session row");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_then_reconcile_repairs_witnessed_completed_and_failed_owners() {
         use rsi_common::agent_coordination::AgentSpawnChildRequestV1;
@@ -15656,6 +16505,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_pending_archive_uses_acknowledged_marker_settlement() {
         let (manager, _dir, _sandbox) = manager();
@@ -15696,6 +16546,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_pending_archive_captures_terminal_notice_before_pointer_clear() {
         let (manager, database_directory, _sandbox) = manager();
@@ -15750,6 +16601,7 @@ done
         assert_eq!(notice.retrieved_at, notice.settled_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_running_pending_archive_captures_failed_notice_before_pointer_clear() {
         let (manager, database_directory, _sandbox) = manager();
@@ -15804,6 +16656,7 @@ done
         assert_eq!(notice.retrieved_at, notice.settled_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_running_pending_archive_terminalization_failure_keeps_route_retryable() {
         let (manager, _database_directory, _sandbox) = manager();
@@ -15883,6 +16736,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn restore_running_pending_archive_capture_failure_keeps_route_retryable() {
         let (manager, _database_directory, _sandbox) = manager();
@@ -15948,6 +16802,7 @@ done
         assert_eq!(notice_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_pending_archive_commits_metadata_without_sandbox_cleanup() {
         let (manager, _db_dir, sandbox_base) = manager();
@@ -16074,6 +16929,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_preserves_waiting_approval_when_pending_question_rehydrates() {
         let (manager, _dir, _sandbox) = manager();
@@ -16099,6 +16955,7 @@ done
         assert_eq!(restored.session.pending_question, session.pending_question);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     async fn restore_startup_adopts_absent_eligible_worktree_before_custody_classification() {
@@ -16216,6 +17073,7 @@ done
         assert_eq!(item, ("absent_adopted".into(), "external_removal".into()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn restore_mutation_order_starts_with_stale_effect_fence() {
         let source = include_str!("launch.rs");
@@ -16265,6 +17123,7 @@ done
     /// live daemon. Complements the store-layer
     /// `work_time_ms_survives_status_flip_and_store_reopen` test in
     /// `store::tests`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_sessions_preserves_work_time_ms_floor() {
         let (manager, _dir, _sandbox) = manager();
@@ -16308,8 +17167,9 @@ done
     /// `completed` with `events: Vec::new()` / `events_hydrated: false`. But
     /// a later read of that session's conversation (the TUI poll path,
     /// `get_conversation`/`get_conversation_since`) must still transparently
-    /// hydrate from SQLite and return the exact durable transcript, with
+    /// load from SQLite and return the exact durable transcript, with
     /// `filter_events_since` incremental semantics unchanged.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_sessions_defers_event_load_and_hydrates_on_conversation_read() {
         let (manager, _dir, _sandbox) = manager();
@@ -16374,18 +17234,21 @@ done
             assert_eq!(fetched_event.content, original.content);
         }
 
-        // Hydration is cached in the map so a repeat poll does not re-hit SQLite.
+        // Read caching is separate from the completed-session ownership map.
         {
             let completed = manager.completed.read().await;
             let restored = completed
                 .get(&session_id)
                 .expect("session still in completed map");
-            assert!(
-                restored.events_hydrated,
-                "first read must cache hydration for subsequent polls"
-            );
-            assert_eq!(restored.events.len(), 3);
+            assert!(!restored.events_hydrated);
+            assert!(restored.events.is_empty());
         }
+        assert!(
+            manager
+                .completed_transcript_cache
+                .contains(session_id)
+                .await
+        );
 
         // Incremental (`since_sequence`) semantics are unaffected by hydration.
         let incremental = manager
@@ -16399,8 +17262,45 @@ done
         );
         assert_eq!(incremental[0].sequence, 1);
         assert_eq!(incremental[1].sequence, 2);
+
+        manager
+            .runtime_config
+            .completed_transcript_cache_max_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(manager.get_conversation(session_id).await.unwrap().len(), 3);
+        assert!(
+            !manager
+                .completed_transcript_cache
+                .contains(session_id)
+                .await
+        );
+        manager
+            .runtime_config
+            .completed_transcript_cache_max_bytes
+            .store(1024 * 1024, std::sync::atomic::Ordering::Relaxed);
+        manager.get_conversation(session_id).await.unwrap();
+        assert!(
+            manager
+                .completed_transcript_cache
+                .contains(session_id)
+                .await
+        );
+        let mut resume_owner = manager.completed.write().await.remove(&session_id).unwrap();
+        manager
+            .hydrate_completed_events(&mut resume_owner)
+            .await
+            .unwrap();
+        assert_eq!(resume_owner.events.len(), 3);
+        assert!(resume_owner.events_hydrated);
+        assert!(
+            !manager
+                .completed_transcript_cache
+                .contains(session_id)
+                .await
+        );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_copied_db_smoke_suppress_retry_restore_does_not_requeue_retryable_sessions()
      {
@@ -16426,6 +17326,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_default_restore_does_not_requeue_retryable_sessions() {
         let (mut manager, _dir, _sandbox) = manager_with_smoke_suppress_retry_restore(false);
@@ -16455,6 +17356,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_requeues_persisted_retry_budgets_only_when_runtime_policy_is_enabled() {
         let (mut manager, _dir, _sandbox) = manager_with_smoke_suppress_retry_restore(false);
@@ -16495,6 +17397,7 @@ done
         assert_eq!(queued, expected);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_obeys_runtime_retry_disabled() {
         let (mut manager, _dir, _sandbox) = manager_with_smoke_suppress_retry_restore(false);
@@ -16527,6 +17430,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_live_durable_wait_times_out_clearly() {
         let (manager, _dir, _sandbox) = manager();
@@ -16547,6 +17451,7 @@ done
         assert!(message.contains("within"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_live_durable_wait_surfaces_store_load_error() {
         let (manager, _dir, _sandbox) = manager();
@@ -16574,6 +17479,7 @@ done
         assert!(message.contains("recursive DAG live launch persistence"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_live_durable_wait_does_not_block_on_store_lock() {
         let (manager, _dir, _sandbox) = manager();
@@ -16601,6 +17507,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dag_live_durable_wait_succeeds_after_row_appears() {
         let (manager, _dir, _sandbox) = manager();
@@ -16696,6 +17603,7 @@ done
         admission
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_retryable_admission_failure_rearms_only_with_the_live_durable_owner() {
         let (manager, _dir, _sandbox) = manager();
@@ -16735,6 +17643,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_retryable_admission_failure_never_rearms_after_durable_suppression_wins() {
         let (manager, _dir, _sandbox) = manager();
@@ -16755,6 +17664,7 @@ done
         assert!(owner.retry_fired_at.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_cancel_retry_committed_suppression_is_truthful_and_keeps_no_marker() {
         let (manager, _dir, _sandbox) = manager();
@@ -16780,6 +17690,7 @@ done
         assert_eq!(state.session.retry_attempt, Some(2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_cancel_retry_store_failure_retains_timer_owner_and_marker() {
         let (manager, _dir, _sandbox) = manager();
@@ -16810,6 +17721,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_cancel_retry_race_has_one_truthful_committed_winner() {
         let (manager, _dir, _sandbox) = manager();
@@ -16844,6 +17756,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_invalid_interrupt_retains_marker_without_suppression() {
         let (manager, _dir, _sandbox) = manager();
@@ -16877,6 +17790,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_interrupt_pending_retry_suppresses_marker_before_timer_consumption() {
         let (manager, _dir, _sandbox) = manager();
@@ -16909,6 +17823,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_continue_suppression_store_failure_retains_completed_timer_and_marker() {
         let (manager, _dir, _sandbox) = manager();
@@ -16944,6 +17859,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_continue_suppresses_before_removing_completed_timer_owner() {
         let (manager, _dir, _sandbox) = manager();
@@ -16975,6 +17891,7 @@ done
         assert_eq!(owner.session.retry_attempt, Some(2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_archive_clears_lead_and_acknowledges_marker_before_evicting_retry_owner() {
         let (manager, _dir, _sandbox) = manager();
@@ -17017,6 +17934,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_archive_lead_cleanup_failure_retains_failed_row_and_marker() {
         let (manager, _dir, _sandbox) = manager();
@@ -17060,6 +17978,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_delete_suppression_survives_delete_failure_for_restart_safety() {
         let (manager, _dir, _sandbox) = manager();
@@ -17097,6 +18016,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn delete_retains_row_when_orphan_proof_fails() {
         let (manager, _dir, _sandbox) = manager();
@@ -17134,6 +18054,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_purge_suppression_survives_purge_failure_for_restart_safety() {
         let (manager, _dir, _sandbox) = manager();
@@ -17171,6 +18092,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn purge_retains_row_when_orphan_proof_fails() {
         let (manager, _dir, _sandbox) = manager();
@@ -17208,6 +18130,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_restore_archive_clears_epic_lead_before_acknowledged_archive() {
         let (manager, _dir, _sandbox) = manager();
@@ -17244,6 +18167,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn c5_restore_lead_cleanup_failure_leaves_pending_archive_unarchived() {
         let (manager, _dir, _sandbox) = manager();
@@ -17302,6 +18226,7 @@ done
         config
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn closure_replay_checks_custody_after_releasing_store_lock() {
         let (manager, _db, _sandbox) = manager();
@@ -17330,6 +18255,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn direct_metadata_failure_settles_without_holding_store_lock() {
         let (manager, _db, _sandbox) = manager();
@@ -17376,6 +18302,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_direct_interactive_ordinary_binds_before_context_provider_or_active() {
         let (manager, _dir, _sandbox) = manager();
@@ -17448,6 +18375,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn codex_config_probe_waits_for_direct_context_and_uses_sandbox_provider_cwd() {
         let (manager, _dir, _sandbox) = manager();
@@ -17527,6 +18455,7 @@ done
         assert_eq!(session.context_window, Some(budget.active_tokens));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_direct_interactive_new_binds_root_event_and_projection_before_effect() {
         let (manager, _dir, _sandbox) = manager();
@@ -17740,6 +18669,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_direct_interactive_atomic_bind_failure_rolls_back_and_settles_admission() {
         let (manager, _dir, sandbox) = manager();
@@ -17830,6 +18760,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_direct_interactive_context_failure_retains_new_root_but_blocks_execution() {
         let (manager, _dir, _sandbox) = manager();
@@ -17895,7 +18826,10 @@ done
             )
             .expect("direct failure Session state");
         assert_eq!(state.0, "Failed");
-        assert_eq!(state.1, "sandbox_custody:context_authorization_failed");
+        assert_eq!(
+            state.1,
+            "sandbox_custody:session_context_authorization_failed"
+        );
         assert_eq!(state.2.as_deref(), Some(root.as_str()));
         assert_eq!(state.3, "GitWorktree");
         assert_eq!(state.4.as_deref(), Some(branch.as_str()));
@@ -17912,7 +18846,7 @@ done
         assert_eq!(projection.2, None);
         assert_eq!(
             projection.3.as_deref(),
-            Some("context_authorization_failed")
+            Some("session_context_authorization_failed")
         );
         let event: (String, String, i64, String, String, Option<i64>, i64, Option<String>, String, Option<String>, Option<String>, Option<String>, String, Option<String>, String) = store.conn.query_row(
             "SELECT event_id,custody_id,sequence,event_kind,cause,from_generation,to_generation,from_owner_session_id,to_owner_session_id,origin_session_id,scheduled_job_id,prior_state,next_state,error_code,occurred_at FROM sandbox_custody_events WHERE custody_id=?1 AND sequence=1",
@@ -17976,6 +18910,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn execution_scratch_descriptor_failure_terminally_settles_bound_fresh_launch() {
         let (manager, _dir, _sandbox) = manager();
@@ -18090,6 +19025,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_direct_interactive_provider_unavailable_retains_bound_new_root() {
         let (manager, _dir, _sandbox) = manager();
@@ -18145,6 +19081,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn retry_admission_keeps_direct_and_successor_boundaries_distinct() {
         let source = include_str!("launch.rs");
@@ -18218,6 +19155,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn scheduled_fresh_rotation_override_is_durable_before_provider_dispatch() {
         let (manager, _dir, _sandbox) = manager();
@@ -18283,6 +19221,7 @@ done
         server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn later_launches_use_live_global_rotation_setting_before_provider_dispatch() {
         let (manager, _dir, _sandbox) = manager();
@@ -18335,6 +19274,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn scheduled_fresh_initial_rotation_disabled_state_is_applied_before_coordinator() {
         use super::super::rotation_coordinator::{RotationAction, RotationEvent};
@@ -18371,6 +19311,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn scheduled_fresh_explicit_rotation_input_isolates_concurrent_and_nested_calls() {
         use super::super::rotation_coordinator::{RotationAction, RotationEvent};
@@ -18424,6 +19365,7 @@ done
         assert!(!production_source.contains("SCHEDULED_FRESH_INITIAL_ROTATION_DISABLED"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn global_rotation_disabled_default_is_persisted_before_active() {
         let (manager, _dir, _sandbox) = manager();
@@ -18523,6 +19465,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn global_rotation_enabled_default_leaves_timestamp_null() {
         let config = LaunchConfig {
@@ -18592,6 +19535,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn explicit_rotation_override_wins_over_global_default() {
         let mut enabled_default = test_session(Uuid::new_v4());
@@ -18614,6 +19558,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_fresh_disabled_persistence_failure_stops_task_before_settlement() {
         let (manager, _dir, _sandbox) = manager();
@@ -18779,6 +19724,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn d03_controller_launch_confirmation_requires_a_live_effective_provider() {
         let alive = Arc::new(AtomicBool::new(true));
@@ -19092,6 +20038,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_d05_controller_launch_interrupt_immediately_before_assignment_releases_reservation()
     -> anyhow::Result<()> {
@@ -19155,6 +20102,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_launch_interrupt_before_confirmation_releases_exact_reservation()
     -> anyhow::Result<()> {
@@ -19235,6 +20183,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_retry_entry_interrupt_after_durable_admission_preserves_parent()
     -> anyhow::Result<()> {
@@ -19312,6 +20261,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_launch_persistence_precedes_interrupt_visibility_and_assignment()
     -> anyhow::Result<()> {
@@ -19378,6 +20328,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_launch_assignment_winner_linearizes_before_interrupt()
     -> anyhow::Result<()> {
@@ -19432,6 +20383,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_fresh_app_server_handshake_installs_confirms_assigns_and_retires_former()
     -> anyhow::Result<()> {
@@ -19667,6 +20619,7 @@ done
             .expect("retry child is durable")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn retry_metadata_failure_settles_without_holding_store_lock() {
         let (manager, _db, _sandbox) = manager();
@@ -19880,6 +20833,7 @@ done
         PostConfirmationCancellation,
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn codex_config_probe_waits_for_retry_context_and_uses_authenticated_provider_cwd() {
         let (manager, _db, _sandbox) = manager();
@@ -19986,6 +20940,7 @@ done
         assert_eq!(session.context_window, Some(budget.active_tokens));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_ordinary_refreshes_full_durable_source() {
         let (manager, _db, sandbox_base) = manager();
@@ -20118,6 +21073,7 @@ done
         drop_controller_candidate_test_stream(child_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_live_transfers_same_dirty_root_once() {
         let (manager, _db, sandbox_base) = manager();
@@ -20258,6 +21214,7 @@ done
         drop_controller_candidate_test_stream(child_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_partial_tuple_refuses_before_child_or_model() {
         let (manager, _db, _sandbox) = manager();
@@ -20333,6 +21290,7 @@ done
         assert!(take_retry_config_observation_for_test(child_id).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_invalid_authority_matrix_has_zero_early_effect() {
         use H1RetryPreauthRefusalCase::*;
@@ -20604,6 +21562,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_live_controller_failures_never_transfer_backward()
     -> anyhow::Result<()> {
@@ -20779,6 +21738,7 @@ done
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_competing_transfer_winner_fails_reserved_child() {
         let (manager, _db, _sandbox) = manager();
@@ -20872,6 +21832,7 @@ done
         assert!(take_retry_config_observation_for_test(child_id).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_post_bind_invalidation_retains_failed_child_owner() {
         let (manager, _db, sandbox_base) = manager();
@@ -20926,6 +21887,7 @@ done
         std::fs::rename(&displaced, &allocation.root).expect("restore retry root fixture");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn automatic_retry_execution_scratch_failure_settles_child_and_invocation() {
         let (manager, _db, _sandbox) = manager();
@@ -20944,7 +21906,6 @@ done
             )
             .expect("allocate descriptor failure retry source");
         let mut source = h1_retry_source(source_id, repo.path());
-        source.parent_id = None;
         let binding = h1_retry_live_binding(&mut source, &allocation);
         arm_h1_retry_source(&manager, &source, binding, source.clone()).await;
         let retry_admission = failed_c5_retry_admission(&manager, source_id).await;
@@ -21039,6 +22000,7 @@ done
         assert!(!allocation.root.join(".rsi-tmp").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_provider_failure_keeps_live_child_owner() {
         let (manager, _db, _sandbox) = manager();
@@ -21089,6 +22051,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_automatic_retry_custody_ordinary_provider_failure_is_auditable()
     -> anyhow::Result<()> {
@@ -21160,6 +22123,7 @@ done
         Ok::<(), anyhow::Error>(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn successor_lead_marks_follow_the_full_authority_sequence() {
         let source = include_str!("launch.rs");
@@ -21189,6 +22153,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn h1_v83_automatic_retry_custody_source_ratchet_pins_forbidden_paths_and_order() {
         let lifecycle = include_str!("lifecycle.rs");
@@ -21451,6 +22416,7 @@ done
             .expect("load child custody root")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_live_emitter_forks_exact_emitter_head_while_canonical_diverges()
      {
@@ -21538,6 +22504,7 @@ done
         emitter_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_ordinary_emitter_authenticated_fork_binds_generation_one_root()
      {
@@ -21602,6 +22569,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_child_execution_scratch_failure_uses_post_bind_settlement_and_retains_root() {
         let (manager, _dir, _sandbox) = manager();
@@ -21848,10 +22816,15 @@ done
         assert_eq!(root_state, "live");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn cli_final_scratch_revalidation_settles_exact_agent_child_state() {
-        let (manager, _dir, _sandbox) = manager();
+        let (mut manager, _dir, _sandbox) = manager();
         let repo = tempfile::tempdir().expect("canonical repo");
+        // The scratch check must run even on hosts without the Claude CLI.
+        manager.claude_client = Some(crate::claude::ClaudeClient::with_binary_path_for_test(
+            repo.path().join("unused-claude"),
+        ));
         init_d00_git_repo(repo.path());
         let canonical = std::fs::canonicalize(repo.path()).expect("canonical path");
         let emitter = h1_7g_ordinary_emitter(&canonical);
@@ -21894,6 +22867,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deferred_app_server_final_scratch_revalidation_settles_exact_agent_child_state() {
         let (manager, dir, _sandbox) = manager();
@@ -21995,6 +22969,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_dirty_live_emitter_refuses_before_any_child_side_effect()
      {
@@ -22043,6 +23018,7 @@ done
         emitter_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_dirty_ordinary_emitter_refuses_before_any_child_side_effect()
      {
@@ -22082,6 +23058,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_unauthenticated_live_emitter_settles_ownership_missing()
      {
@@ -22127,6 +23104,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_spawn_emitter_read_failure_settles_without_holding_store_lock() {
         let (manager, _db, _sandbox) = manager();
@@ -22167,6 +23145,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_allocation_failure_settles_failed_reservation_without_orphans()
      {
@@ -22241,6 +23220,7 @@ done
         child_server.abort();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_replayed_launched_request_returns_original_ids_without_second_allocation()
      {
@@ -22724,6 +23704,7 @@ done
         receipts
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_production_launch_binds_custody_and_can_spawn_child() {
         use crate::session::agent_verbs::AgentSpawnChildOutcome;
@@ -22915,6 +23896,7 @@ done
     /// the wake is refused (retryable, retained with backoff) instead of
     /// restarting the replaced lead, and the next pass delivers it to the
     /// committed successor.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn agent_successor_commit_refuses_racing_predecessor_wake_then_delivers_to_successor() {
@@ -23151,6 +24133,7 @@ done
         drop_controller_candidate_test_stream(candidate_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_successor_projection_failure_uses_durable_agent_spawn_child_authority() {
         use crate::session::agent_verbs::AgentSpawnChildOutcome;
@@ -23386,6 +24369,7 @@ done
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::significant_drop_tightening)]
     async fn agent_successor_inherits_rotation_override_before_provider_effect() {
@@ -23477,6 +24461,7 @@ done
         drop_controller_candidate_test_stream(receipt.candidate_session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_crash_after_durable_pre_effect_boundary_never_dispatches() {
         let (manager, dir, _sandbox) = manager();
@@ -23528,6 +24513,7 @@ done
         drop_controller_candidate_test_process(receipt.candidate_session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_execution_scratch_failure_settles_exact_bound_candidate() {
         let (manager, dir, _sandbox) = manager();
@@ -23651,6 +24637,7 @@ done
         drop_controller_candidate_test_process(receipt.candidate_session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_sync_effect_fence_rejects_post_bind_topology_corruption() {
         for provider in [
@@ -23820,6 +24807,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_cli_crash_after_provider_start_never_dispatches_twice() {
         let (manager, dir, _sandbox) = manager();
@@ -23874,6 +24862,7 @@ done
         drop_controller_candidate_test_stream(receipt.candidate_session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_task_provider_crash_after_start_never_dispatches_twice() {
         for provider in [SessionProvider::Local, SessionProvider::Harness] {
@@ -23938,6 +24927,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_codex_app_server_waits_for_handshake_before_commit() {
         let (manager, dir, _sandbox) = manager();
@@ -23999,6 +24989,7 @@ done
             .expect("stop app-server successor");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_codex_app_server_client_creation_failure_fully_settles() {
         let (manager, dir, _sandbox) = manager();
@@ -24022,6 +25013,7 @@ done
         .await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_codex_app_server_thread_start_failure_fully_settles() {
         let (manager, dir, _sandbox) = manager();
@@ -24094,6 +25086,7 @@ done
         assert_eq!(tokens.get(&predecessor_token), Some(&predecessor_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_interrupt_before_deferred_provider_start_has_zero_effect() {
         let (manager, dir, _sandbox) = manager();
@@ -24227,6 +25220,7 @@ done
         assert_eq!(tokens.get(&predecessor_token), Some(&predecessor_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_deferred_effect_fence_rejects_terminally_settled_witness() {
         let (manager, dir, _sandbox) = manager();
@@ -24379,6 +25373,7 @@ done
         assert_eq!(tokens.get(&predecessor_token), Some(&predecessor_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_codex_app_server_post_start_failure_never_dispatches_twice() {
         let (manager, dir, _sandbox) = manager();
@@ -24476,6 +25471,7 @@ done
         assert_eq!(tokens.get(&predecessor_token), Some(&predecessor_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_successor_reconcile_row_budget_counts_already_pending_rows() {
         let (manager, dir, _sandbox) = manager();
@@ -24499,6 +25495,7 @@ done
         assert!(manager.successor_reconcile_cursor.lock().await.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn agent_successor_reconcile_channel_saturation_stops_pass_with_continuation() {
         let (manager, dir, _sandbox) = manager();
@@ -24555,6 +25552,7 @@ done
         assert!(manager.successor_reconcile_cursor.lock().await.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_uncertain_restart_reuses_stable_launch_identity() {
         let (manager, dir, _sandbox) = manager();
@@ -24638,6 +25636,7 @@ done
         drop_controller_candidate_test_stream(receipt.candidate_session_id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_successor_stale_commit_revokes_and_settles_non_lead_candidate() {
         let (manager, dir, _sandbox) = manager();

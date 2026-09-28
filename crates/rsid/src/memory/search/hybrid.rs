@@ -69,6 +69,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_vector_only() {
         let vector = vec![make_chunk("c1", 0.8, 0.8, 0.0)];
@@ -78,6 +79,7 @@ mod tests {
         assert!((merged[0].score - 0.7 * 0.8).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_keyword_only() {
         let vector = vec![];
@@ -87,6 +89,7 @@ mod tests {
         assert!((merged[0].score - 0.3 * 0.6).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_overlapping_results() {
         let vector = vec![make_chunk("c1", 0.8, 0.8, 0.0)];
@@ -97,6 +100,7 @@ mod tests {
         assert!((merged[0].score - expected).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_disjoint_results() {
         let vector = vec![make_chunk("c1", 0.8, 0.8, 0.0)];
@@ -105,12 +109,14 @@ mod tests {
         assert_eq!(merged.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_empty_both() {
         let merged = merge_hybrid_results(vec![], vec![], 0.7, 0.3);
         assert!(merged.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_score_formula() {
         let vector = vec![make_chunk("c1", 0.0, 0.8, 0.0)];
@@ -120,6 +126,7 @@ mod tests {
         assert!((merged[0].score - expected).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_ordering() {
         let vector = vec![
@@ -131,6 +138,7 @@ mod tests {
         assert!(merged[0].score > merged[1].score);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_tiebreaker_path() {
         let mut c1 = make_chunk("c1", 0.0, 0.5, 0.0);
@@ -142,6 +150,7 @@ mod tests {
         assert_eq!(merged[1].path, "b.md");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_tiebreaker_start_line() {
         let mut c1 = make_chunk("c1", 0.0, 0.5, 0.0);
@@ -155,6 +164,7 @@ mod tests {
         assert_eq!(merged[1].start_line, 20);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_keyword_updates_snippet() {
         let mut v = make_chunk("c1", 0.0, 0.8, 0.0);
@@ -165,6 +175,7 @@ mod tests {
         assert_eq!(merged[0].text, "longer snippet from keyword search");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_custom_weights() {
         let vector = vec![make_chunk("c1", 0.0, 0.8, 0.0)];
@@ -174,6 +185,7 @@ mod tests {
         assert!((merged[0].score - expected).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_zero_vector_weight() {
         let vector = vec![make_chunk("c1", 0.0, 0.8, 0.0)];
@@ -182,6 +194,7 @@ mod tests {
         assert!((merged[0].score - 0.6).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_zero_text_weight() {
         let vector = vec![make_chunk("c1", 0.0, 0.8, 0.0)];

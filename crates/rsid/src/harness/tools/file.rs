@@ -253,6 +253,7 @@ mod tests {
         std::env::temp_dir()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_read_file_missing() {
         let tool = ReadFileTool;
@@ -266,6 +267,7 @@ mod tests {
         assert!(result.error_msg.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_read_file_traversal_rejected() {
         let tool = ReadFileTool;
@@ -275,6 +277,7 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_write_and_read_roundtrip() {
         let wd = std::env::temp_dir();
@@ -301,6 +304,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_edit_file_unique_match() {
         let wd = std::env::temp_dir();
@@ -328,6 +332,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_edit_file_not_found_in_file() {
         let wd = std::env::temp_dir();
@@ -358,6 +363,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_edit_file_non_unique_rejected() {
         let wd = std::env::temp_dir();
@@ -383,6 +389,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_write_blocked_system_path() {
         let tool = WriteFileTool;

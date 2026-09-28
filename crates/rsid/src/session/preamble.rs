@@ -17,7 +17,11 @@
 //!   - other IO error: logged at warn; falls through to base (or returns `None`).
 //!   - `None` is never an error — launch is never aborted by preamble loading.
 
+use super::agent_verbs::agent_authority::AgentAuthorityProjection;
+use crate::error::{DaemonError, Result};
+use rsi_common::agent_control_schema::AgentControlVerbV1 as Verb;
 use rsi_common::types::{Session, SessionKind};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -29,6 +33,164 @@ const BASE_FILENAME: &str = "worker_preamble.md";
 /// This is the "mouth of the pipeline" frame applied to every leaf-kind launch.
 const ORCHESTRATION_ROUTER_FILENAME: &str = "orchestration_router.md";
 const COMMANDS_DIR: &str = ".claude/commands";
+
+/// The shipped contract is compiled into rsid. The source-tree files remain
+/// available as optional project context but are not required at runtime.
+pub(crate) const EMBEDDED_GUIDANCE_VERSION: u32 = 1;
+const EMBEDDED_ROUTER: &str = include_str!("../../../../.claude/commands/orchestration_router.md");
+const EMBEDDED_BASE: &str = include_str!("../../../../.claude/commands/_shared/worker_preamble.md");
+const EMBEDDED_COMMON: &str = include_str!("guidance/common_v1.md");
+const EMBEDDED_WORKER: &str = include_str!("guidance/worker_v1.md");
+const EMBEDDED_EPIC_LEAD: &str = include_str!("guidance/epic_lead_v1.md");
+const EMBEDDED_MANAGER: &str = include_str!("guidance/manager_v1.md");
+const EMBEDDED_REVIEWER: &str = include_str!("guidance/assigned_reviewer_v1.md");
+
+/// A pending initial publication may advertise only the ordinary worker
+/// controls, even if the caller's snapshot was concurrently superseded.
+const PENDING_WORKER_VERBS: &[Verb] = &[
+    Verb::GetProgress,
+    Verb::SendMessage,
+    Verb::GetStatus,
+    Verb::Halt,
+    Verb::ContinueChild,
+    Verb::ScheduleWake,
+    Verb::CreateIssue,
+];
+
+fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
+    match kind {
+        SessionKind::Bug => Some(include_str!(
+            "../../../../.claude/commands/_shared/worker_preamble_bug.md"
+        )),
+        SessionKind::Feature => Some(include_str!(
+            "../../../../.claude/commands/_shared/worker_preamble_feature.md"
+        )),
+        SessionKind::Refactor => Some(include_str!(
+            "../../../../.claude/commands/_shared/worker_preamble_refactor.md"
+        )),
+        SessionKind::Research => Some(include_str!(
+            "../../../../.claude/commands/_shared/worker_preamble_research.md"
+        )),
+        _ => None,
+    }
+}
+
+/// Build one versioned, role-filtered instruction snapshot from the durable
+/// projection. Launch and rotation will consume this after authority publishes;
+/// rendering itself never grants a server-side permission.
+pub(crate) fn render_versioned_guidance(
+    kind: SessionKind,
+    projection: &AgentAuthorityProjection,
+) -> Result<String> {
+    if !rsi_common::is_leaf_kind(kind) {
+        return Err(DaemonError::InvalidParam(
+            "agent_guidance_requires_leaf_session".into(),
+        ));
+    }
+    let mut expected_ids = vec!["common", "worker"];
+    if projection.is_lead {
+        expected_ids.push("epic_lead");
+    }
+    if projection.is_manager {
+        expected_ids.push("manager");
+    }
+    if projection.is_reviewer {
+        expected_ids.push("assigned_reviewer");
+    }
+    if projection.guidance_ids != expected_ids {
+        return Err(DaemonError::Store(
+            "inconsistent agent guidance projection".into(),
+        ));
+    }
+
+    let mut sections = vec![
+        format!(
+            "## RSI embedded guidance v{EMBEDDED_GUIDANCE_VERSION}\n\nAuthority revision: `{}`. This text describes the current snapshot; the daemon checks every call again.",
+            projection.revision
+        ),
+        EMBEDDED_ROUTER.trim().to_string(),
+        EMBEDDED_BASE.trim().to_string(),
+    ];
+    if let Some(kind_text) = embedded_kind_preamble(kind) {
+        sections.push(kind_text.trim().to_string());
+    }
+    sections.extend([
+        EMBEDDED_COMMON.trim().to_string(),
+        EMBEDDED_WORKER.trim().to_string(),
+    ]);
+    if projection.pending {
+        sections.push("Authority publication is pending. Continue with the worker baseline and wait for a refreshed projection before using a role-specific control.".into());
+    } else {
+        for id in &projection.guidance_ids {
+            let text = match *id {
+                "epic_lead" => Some(EMBEDDED_EPIC_LEAD),
+                "manager" => Some(EMBEDDED_MANAGER),
+                "assigned_reviewer" => Some(EMBEDDED_REVIEWER),
+                _ => None,
+            };
+            if let Some(text) = text {
+                sections.push(text.trim().to_string());
+            }
+        }
+    }
+    sections.extend([
+        THOUGHTS_COMMIT_POLICY.trim().to_string(),
+        DAEMON_MESSAGE_CONVENTION.trim().to_string(),
+    ]);
+
+    let mut catalog = String::from(
+        "## Controls in this authority snapshot\n\nUse a native tool when available; `rsi-rpc` supplies the transport token automatically. The token never belongs in request parameters.\n",
+    );
+    for verb in &projection.verbs {
+        if projection.pending && !PENDING_WORKER_VERBS.contains(verb) {
+            continue;
+        }
+        let entry = verb.descriptor();
+        write!(catalog, "\n- `{}`", entry.method).expect("writing to a String cannot fail");
+        if let Some(tool) = entry.native_tool {
+            write!(catalog, " / `{}`", tool.name()).expect("writing to a String cannot fail");
+        }
+        write!(catalog, ": {}", entry.description).expect("writing to a String cannot fail");
+    }
+    if !projection.pending {
+        for (title, values) in [
+            ("AgentManagerUpdate variants", &projection.update_variants),
+            (
+                "AgentManagerPrepareControl actions",
+                &projection.prepared_actions,
+            ),
+            (
+                "Delegated operator methods",
+                &projection.delegated_operator_methods,
+            ),
+        ] {
+            if !values.is_empty() {
+                write!(catalog, "\n\n{title}: {}.", values.join(", "))
+                    .expect("writing to a String cannot fail");
+            }
+        }
+        if !projection.control_actions.is_empty() {
+            let actions = projection
+                .control_actions
+                .iter()
+                .map(|action| {
+                    serde_json::to_value(action)?
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| DaemonError::Store("invalid manager action name".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            write!(
+                catalog,
+                "\n\nAgentManagerControl actions: {}.",
+                actions.join(", ")
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    sections.push(catalog);
+    Ok(sections.join("\n\n"))
+}
 
 /// Returns the variant filename for a kind. Kinds without a dedicated
 /// variant file return `None`, which means "use base".
@@ -149,6 +311,7 @@ control verbs available to you are:
 - `AgentManagerCommitPreparedControl` - commit an exact prepared ID/digest with an idempotency key; the daemon rechecks mutable authority and target state atomically.
 - `AgentManagerGetAction` - read one action receipt within the authenticated current manager's project and logical-manager scope.
 - `AgentManagerWorkView` - read your Epic's live work and granted file ownership as a manager-created worker (read-only).
+- `AgentTopologyUpsert`, `AgentTopologyList`, `AgentTopologyExecute`, `AgentTopologyGetExecution`, `AgentTopologyInterrupt`, and `AgentTopologyResolveAttempt` - author and run daemon-executed deterministic topologies as the current manager with `Automation` or an Epic lead within its Epic.
 
 `AgentSpawnChild` and `rsi_control_spawn` accept optional `provider`, `model`, \
 and `effort` fields. Set `provider` to launch a child on a different backend; \
@@ -214,6 +377,13 @@ active file ownership, pause and unanswered-request delivery state with \
 `after_work_key`, `limit` 1..32). Granted ownership there is authoritative \
 without a relay turn; the view is read-only and grants no write, mail or \
 continuation authority.
+Deterministic topologies: `AgentTopologyUpsert` / `rsi_control_topology_upsert` \
+(`validate_only` reports diagnostics), then `AgentTopologyExecute` with the \
+returned `definition_digest`; read with `AgentTopologyGetExecution`, stop with \
+`AgentTopologyInterrupt`, and settle preserved work with \
+`AgentTopologyResolveAttempt`. Only the current manager holding `Automation` \
+(in-scope Epics) or an Epic lead (its own Epic; never `discard`) may call them. \
+Every session node names an explicit operator-allowed provider/model/effort.
 The manager may request DB-native review with the typed `request_review` update. \
 The assigned reviewer submits `AgentSubmitReviewReceipt` / \
 `rsi_control_submit_review_receipt` during the bound invocation. Do not create a \
@@ -279,6 +449,9 @@ Allowed worker-control surfaces, in order:
 `rsi_control_submit_review_receipt`, `rsi_control_manager_control`, \
 `rsi_control_manager_prepare_control`, `rsi_control_manager_commit_prepared_control`, \
 `rsi_control_manager_get_action`, `rsi_control_manager_work_view`, \
+`rsi_control_topology_upsert`, `rsi_control_topology_list`, \
+`rsi_control_topology_execute`, `rsi_control_topology_get_execution`, \
+`rsi_control_topology_interrupt`, `rsi_control_topology_resolve_attempt`, \
 `schedule_wake`.
 2. RSI agent RPC verbs via `rsi-rpc`: `AgentSpawnChild`, `AgentReserveSuccessor`, `AgentGetProgress`, \
 `AgentSendMessage`, `AgentGetStatus`, `AgentHalt`, `AgentContinueChild`, `AgentArchiveChild`, `AgentScheduleWake`, \
@@ -288,7 +461,8 @@ Allowed worker-control surfaces, in order:
 `AgentManagerProgress`, `AgentManagerInbox`, `AgentManagerSend`, `AgentManagerReply`, `AgentManagerNotify`, \
 `AgentManagerInspect`, `AgentManagerUpdate`, `AgentSubmitReviewReceipt`, `AgentManagerControl`, \
 `AgentManagerPrepareControl`, `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`, \
-`AgentManagerWorkView`.
+`AgentManagerWorkView`, `AgentTopologyUpsert`, `AgentTopologyList`, `AgentTopologyExecute`, \
+`AgentTopologyGetExecution`, `AgentTopologyInterrupt`, `AgentTopologyResolveAttempt`.
 3. The documented RSI directive fallback (`<docregblock>/spawn_child ...</docregblock>` \
 or `<docregblock>/halt</docregblock>`) when neither native tools nor `rsi-rpc` \
 are available.
@@ -476,7 +650,124 @@ pub fn load_orchestration_router() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsi_common::harness_manager_v2::ManagerActionKindV2;
 
+    fn worker_projection() -> AgentAuthorityProjection {
+        AgentAuthorityProjection {
+            revision: "sha256:worker-revision".into(),
+            pending: false,
+            is_lead: false,
+            is_manager: false,
+            is_reviewer: false,
+            verbs: vec![Verb::GetStatus, Verb::CreateIssue],
+            update_variants: Vec::new(),
+            control_actions: Vec::new(),
+            prepared_actions: Vec::new(),
+            delegated_operator_methods: Vec::new(),
+            guidance_ids: vec!["common", "worker"],
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn versioned_guidance_embeds_kind_contract_and_worker_catalog() {
+        let guidance =
+            render_versioned_guidance(SessionKind::Feature, &worker_projection()).unwrap();
+        assert!(guidance.contains("RSI embedded guidance v1"));
+        assert!(guidance.contains("sha256:worker-revision"));
+        assert!(guidance.contains("# Orchestration Router"));
+        assert!(guidance.contains("# Worker preamble — Feature"));
+        assert!(guidance.contains("### Inputs"));
+        assert!(guidance.contains("### Verify"));
+        assert!(guidance.contains("## RSI worker baseline"));
+        assert!(guidance.contains("`AgentGetStatus` / `rsi_control_status`"));
+        assert!(guidance.contains("`AgentCreateIssue` / `rsi_control_create_issue`"));
+        assert!(!guidance.contains("`AgentManagerControl`"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn versioned_guidance_lists_only_projected_manager_variants() {
+        let mut projection = worker_projection();
+        projection.is_manager = true;
+        projection.guidance_ids.push("manager");
+        projection
+            .verbs
+            .extend([Verb::ManagerUpdate, Verb::ManagerControl]);
+        projection.update_variants.push("stage");
+        projection
+            .control_actions
+            .push(ManagerActionKindV2::CreateSession);
+        let guidance = render_versioned_guidance(SessionKind::Standard, &projection).unwrap();
+        assert!(guidance.contains("## Appointed harness manager"));
+        assert!(guidance.contains("`AgentManagerUpdate` / `rsi_control_manager_update`"));
+        assert!(guidance.contains("AgentManagerUpdate variants: stage."));
+        assert!(guidance.contains("AgentManagerControl actions: create_session."));
+        assert!(!guidance.contains("AgentManagerPrepareControl actions:"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn versioned_guidance_embeds_committed_lead_and_active_reviewer_roles() {
+        let mut projection = worker_projection();
+        projection.is_lead = true;
+        projection.is_reviewer = true;
+        projection
+            .guidance_ids
+            .extend(["epic_lead", "assigned_reviewer"]);
+        projection
+            .verbs
+            .extend([Verb::SpawnChild, Verb::SubmitReviewReceipt]);
+        let guidance = render_versioned_guidance(SessionKind::Research, &projection).unwrap();
+        assert!(guidance.contains("# Worker preamble — Research"));
+        assert!(guidance.contains("## Current Epic lead"));
+        assert!(guidance.contains("## Active assigned reviewer"));
+        assert!(guidance.contains("`AgentSpawnChild` / `rsi_control_spawn`"));
+        assert!(
+            guidance.contains("`AgentSubmitReviewReceipt` / `rsi_control_submit_review_receipt`")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn pending_publication_renders_positive_worker_baseline() {
+        let mut projection = worker_projection();
+        projection.pending = true;
+        projection.is_manager = true;
+        projection.guidance_ids.push("manager");
+        projection.verbs.push(Verb::ManagerControl);
+        projection
+            .control_actions
+            .push(ManagerActionKindV2::CreateSession);
+        let guidance = render_versioned_guidance(SessionKind::Standard, &projection).unwrap();
+        assert!(guidance.contains("Authority publication is pending"));
+        assert!(guidance.contains("## RSI worker baseline"));
+        assert!(guidance.contains("`AgentGetStatus` / `rsi_control_status`"));
+        assert!(!guidance.contains("## Appointed harness manager"));
+        assert!(!guidance.contains("`AgentManagerControl`"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn incomplete_or_unknown_guidance_projection_fails_visibly() {
+        let mut projection = worker_projection();
+        projection.guidance_ids = vec!["common"];
+        assert!(
+            render_versioned_guidance(SessionKind::Task, &projection)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent agent guidance projection")
+        );
+        projection.guidance_ids = vec!["common", "worker", "unknown_role"];
+        assert!(
+            render_versioned_guidance(SessionKind::Task, &projection)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent agent guidance projection")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn disk_loader_composes_base_before_variant_and_preserves_variant_only_fallback() {
         let root = tempfile::tempdir().expect("temporary harness root");
@@ -500,6 +791,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn loaded_preamble_carries_agent_discovery_nudge() {
         // The launch path (`session::launch`) pushes `load(kind)` into the
@@ -533,6 +825,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn daemon_message_convention_names_shared_tag() {
         // The convention text and the rsi-common envelope helper must agree
@@ -544,6 +837,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn sandbox_custody_instruction_names_the_authenticated_root_and_branch() {
         let root = Path::new("/tmp/rsi-sandboxes/43ae018b");
@@ -559,6 +853,7 @@ mod tests {
         assert!(instruction.contains("request a session allocated on that branch"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn sandbox_custody_instruction_prepends_without_changing_ordinary_prompts() {
         let caller_prompt = Some("caller instructions stay intact".to_string());
@@ -578,6 +873,7 @@ mod tests {
         assert!(combined.ends_with("caller instructions stay intact"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn rotation_preamble_path_keeps_nudge() {
         // Context rotation (`session::rotation`) rebuilds the child system
@@ -598,6 +894,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn agent_discovery_nudge_advertises_only_agent_verbs() {
         // Advertises the closed Agent* control surface and the tokened
@@ -640,6 +937,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn manager_preamble_preserves_operator_authority_and_inbox_semantics() {
         for requirement in [
@@ -661,6 +959,9 @@ mod tests {
             "rsi_control_manager_commit_prepared_control",
             "rsi_control_manager_get_action",
             "rsi_control_manager_work_view",
+            "rsi_control_topology_upsert",
+            "Only the current manager holding `Automation`",
+            "an Epic lead (its own Epic; never `discard`)",
             "Granted ownership there is authoritative",
             "V2 policy is a separate operator opt-in",
             "unknown evidence stays unknown",
@@ -681,6 +982,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn rsi_backend_policy_forbids_provider_native_delegation() {
         assert!(RSI_BACKEND_POLICY.contains("rsi_control_spawn"));
@@ -692,6 +994,7 @@ mod tests {
         assert!(RSI_BACKEND_POLICY.contains("compile the next worker prompt"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn variant_filename_covers_target_kinds() {
         assert_eq!(
@@ -712,6 +1015,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn variant_filename_none_for_kinds_using_base() {
         for k in [
@@ -730,6 +1034,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn walk_up_finds_repo_root_from_crate_dir() {
         // CARGO_MANIFEST_DIR is crates/rsid; repo root is two levels up.
@@ -744,6 +1049,7 @@ mod tests {
         assert!(found.join(SHARED_DIR).join(BASE_FILENAME).is_file());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn orchestration_router_constants_point_to_canonical_paths() {
         // Anchors the contract: router file lives one directory shallower

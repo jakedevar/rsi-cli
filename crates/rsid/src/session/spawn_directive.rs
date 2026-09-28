@@ -198,6 +198,7 @@ fn parse_kind(s: &str) -> Option<SessionKind> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_minimal() {
         let block = "<docregblock>\n/spawn_child kind=Task\nQUERY:\nimplement X\n</docregblock>";
@@ -213,6 +214,7 @@ mod tests {
         assert!(d.tags.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_with_optional_fields() {
         let block = "<docregblock>\n/spawn_child kind=Story provider=Claude model=claude-opus-4-7 effort=high agent_role=Planner\nQUERY:\nL1\nL2\n</docregblock>";
@@ -225,6 +227,7 @@ mod tests {
         assert_eq!(d.query, "L1\nL2");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_gemini_provider_alias() {
         let block =
@@ -236,6 +239,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_all_leaf_kinds() {
         for (s, expected) in [
@@ -252,6 +256,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn returns_none_for_other_directive() {
         let block = "<docregblock>\n/resume_handoff /tmp/x.md\nQUERY:\n\n</docregblock>";
@@ -260,6 +265,7 @@ mod tests {
         assert!(parsed.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_unknown_kind() {
         let block = "<docregblock>\n/spawn_child kind=Sandwich\nQUERY:\nx\n</docregblock>";
@@ -269,6 +275,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_missing_kind() {
         let block = "<docregblock>\n/spawn_child model=foo\nQUERY:\nx\n</docregblock>";
@@ -278,6 +285,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_unknown_provider() {
         let block = "<docregblock>\n/spawn_child kind=Task provider=not-a-provider\nQUERY:\nx\n</docregblock>";
@@ -287,6 +295,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_missing_query_marker() {
         let block = "<docregblock>\n/spawn_child kind=Task\nbody\n</docregblock>";
@@ -296,6 +305,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_missing_close_tag() {
         let block = "<docregblock>\n/spawn_child kind=Task\nQUERY:\nbody";
@@ -305,6 +315,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_missing_open_tag() {
         let block = "/spawn_child kind=Task\nQUERY:\nbody\n</docregblock>";
@@ -314,6 +325,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn ignores_unknown_header_keys() {
         let block =
@@ -323,6 +335,7 @@ mod tests {
         assert_eq!(d.model.as_deref(), Some("m"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn preserves_multiline_body_with_blank_lines() {
         let block =
@@ -331,6 +344,7 @@ mod tests {
         assert_eq!(d.query, "Line 1\n\nLine 3");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn query_body_excludes_docregblock_wrapper_and_header() {
         let block = "<docregblock>\n/spawn_child kind=Task model=gpt-5-codex\nQUERY:\nOnly this body becomes the child user prompt.\n</docregblock>";
@@ -342,6 +356,7 @@ mod tests {
         assert!(!d.query.contains("</docregblock>"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn regex_extracts_block_from_surrounding_text() {
         use crate::session::types::SPAWN_DIRECTIVE_RE;
@@ -356,6 +371,7 @@ mod tests {
         assert_eq!(d.query, "implement Y");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn regex_finds_multiple_blocks() {
         use crate::session::types::SPAWN_DIRECTIVE_RE;
@@ -364,6 +380,7 @@ mod tests {
         assert_eq!(blocks.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn regex_ignores_non_anchored_directive() {
         use crate::session::types::SPAWN_DIRECTIVE_RE;
@@ -375,6 +392,7 @@ mod tests {
 
     // ─── P1.7 new-key tests ──────────────────────────────────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_topology_node_iteration_tags() {
         let block = "<docregblock>\n/spawn_child kind=Research topology_node=plan_v1 iteration=2 tags=alpha,beta\nQUERY:\nresearch task\n</docregblock>";
@@ -388,6 +406,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_empty_topology_node() {
         let block =
@@ -398,6 +417,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_non_numeric_iteration() {
         let block =
@@ -408,6 +428,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_malformed_tags() {
         // Uppercase + special char fails normalize_tag.
@@ -418,6 +439,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rejects_empty_tags_csv() {
         // Empty value after `tags=` is rejected.
@@ -430,6 +452,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn ignores_unknown_header_keys_with_hyperflux() {
         // Extend the existing forward-compat check with an extra unknown key (hyperflux)
@@ -443,6 +466,7 @@ mod tests {
         assert!(d.tags.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn new_keys_absent_parses_same_as_pre_p17() {
         // A directive identical to the pre-P1.7 baseline parses cleanly
@@ -462,6 +486,7 @@ mod tests {
         assert!(d.tags.is_none(), "tags must default to None");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn parses_inline_and_same_line_layouts() {
         use crate::session::types::SPAWN_DIRECTIVE_RE;
@@ -486,6 +511,7 @@ mod tests {
         assert_eq!(d.query, "PIPELINE MODE: true");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn halt_regex_accepts_inline_and_same_line_layouts() {
         use crate::session::types::HALT_DIRECTIVE_RE;

@@ -148,6 +148,7 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn discovery_ignores_generated_files_and_changes_on_exact_bytes() {
         let root = tempfile::tempdir().unwrap();
@@ -164,6 +165,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn symlinked_source_is_rejected() {
         let root = tempfile::tempdir().unwrap();

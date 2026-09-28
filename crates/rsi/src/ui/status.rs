@@ -12,7 +12,8 @@ pub(crate) fn render_session_meta_segment_for(
 ) -> Option<Vec<Span<'static>>> {
     let session_state = app.sessions.get(&session_id)?;
     let session = &session_state.session;
-    let mut meta_parts: Vec<String> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let metadata_style = Style::default().fg(theme::metadata_text());
 
     // Provider label
     let provider_label = match session.provider {
@@ -27,7 +28,7 @@ pub(crate) fn render_session_meta_segment_for(
         rsi_common::types::SessionProvider::Harness => "Harness",
         _ => "?",
     };
-    meta_parts.push(provider_label.to_string());
+    spans.push(Span::styled(provider_label, metadata_style));
 
     // Show active segment model (if model was switched), else session-level model
     let current_model = session_state
@@ -38,7 +39,25 @@ pub(crate) fn render_session_meta_segment_for(
         .map(|seg| seg.model_id.as_str())
         .or(session.model.as_deref());
     if let Some(model) = current_model {
-        meta_parts.push(crate::ui::session::abbreviate_model_name(model));
+        spans.push(Span::styled("  \u{00B7}  ", metadata_style));
+        spans.push(Span::styled(
+            crate::ui::session::abbreviate_model_name(model),
+            metadata_style,
+        ));
+        if let Some(effort) = session
+            .effort
+            .as_deref()
+            .filter(|effort| rsi_common::model_utils::effort_ladder(model).contains(effort))
+        {
+            spans.extend(crate::ui::session::build_effort_bars(
+                Some(effort),
+                Some(model),
+            ));
+            spans.push(Span::styled(
+                format!(" {effort}"),
+                Style::default().fg(theme::dim_metadata()),
+            ));
+        }
     }
     if matches!(
         session.status,
@@ -52,24 +71,23 @@ pub(crate) fn render_session_meta_segment_for(
             .work_time_ms
             .map(crate::ui::session::format_work_time_ms)
         {
-            meta_parts.push(elapsed);
+            spans.push(Span::styled("  \u{00B7}  ", metadata_style));
+            spans.push(Span::styled(elapsed, metadata_style));
         }
     } else if let Some(duration) = session.duration_ms {
         let secs = duration / 1000;
         if secs >= 60 {
-            meta_parts.push(format!("{}m{}s", secs / 60, secs % 60));
+            spans.push(Span::styled("  \u{00B7}  ", metadata_style));
+            spans.push(Span::styled(
+                format!("{}m{}s", secs / 60, secs % 60),
+                metadata_style,
+            ));
         } else {
-            meta_parts.push(format!("{}s", secs));
+            spans.push(Span::styled("  \u{00B7}  ", metadata_style));
+            spans.push(Span::styled(format!("{}s", secs), metadata_style));
         }
     }
-    if meta_parts.is_empty() {
-        None
-    } else {
-        Some(vec![Span::styled(
-            meta_parts.join("  \u{00B7}  "),
-            Style::default().fg(theme::metadata_text()),
-        )])
-    }
+    Some(spans)
 }
 
 pub(crate) fn render_context_percent_segment_for(
@@ -151,7 +169,7 @@ pub(crate) fn render_rate_limit_segment_for(
 
     Some(vec![Span::styled(
         format!(
-            " {:.0}% {} ",
+            "{:.0}% {}",
             pct,
             rate_limit_window_label(&window.window_key)
         ),

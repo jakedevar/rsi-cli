@@ -165,6 +165,9 @@ pub(crate) struct LedgerObservation {
     pub source_commit: Option<String>,
     pub custody: Vec<(Uuid, Uuid, u64)>,
     pub migration: Option<(String, String)>,
+    /// Repository identity, observed rolling tip, released schema head, and
+    /// the allocator's prior remote tip, and exact sources proved published.
+    pub migration_seal: Option<(String, String, u32, Option<String>, Vec<String>)>,
     pub target_commit: Option<String>,
 }
 

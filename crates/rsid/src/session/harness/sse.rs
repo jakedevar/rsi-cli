@@ -9,6 +9,7 @@
 // Provider layer is built ahead of resolve_provider() wiring (Phase 6+).
 #![allow(dead_code)]
 
+use super::errors::{ProviderError, ProviderErrorClass};
 use super::types::*;
 use crate::error::DaemonError;
 use futures::StreamExt;
@@ -36,6 +37,7 @@ pub async fn read_openai_sse_stream(
     let mut finish_reason: Option<String> = None;
     let mut usage = TokenUsage::default();
     let mut line_buf = String::new();
+    let mut complete = false;
 
     let mut byte_stream = resp.bytes_stream();
 
@@ -49,8 +51,8 @@ pub async fn read_openai_sse_stream(
 
         let chunk = match chunk {
             Some(Ok(bytes)) => bytes,
-            Some(Err(e)) => {
-                return Err(DaemonError::Process(format!("Stream read error: {e}")));
+            Some(Err(_)) => {
+                return Err(stream_disconnect());
             }
             None => break,
         };
@@ -71,6 +73,7 @@ pub async fn read_openai_sse_stream(
             };
 
             if data == "[DONE]" {
+                complete = true;
                 break;
             }
 
@@ -171,6 +174,9 @@ pub async fn read_openai_sse_stream(
         }
     }
 
+    if !complete && finish_reason.is_none() {
+        return Err(stream_disconnect());
+    }
     Ok((content, tool_calls, usage, finish_reason))
 }
 
@@ -193,6 +199,7 @@ pub async fn read_anthropic_sse_stream(
     let mut finish_reason: Option<String> = None;
     let mut usage = TokenUsage::default();
     let mut line_buf = String::new();
+    let mut complete = false;
     let mut current_event_type = String::new();
     // Track which tool call index we're building
     let mut current_tool_idx: Option<usize> = None;
@@ -209,8 +216,8 @@ pub async fn read_anthropic_sse_stream(
 
         let chunk = match chunk {
             Some(Ok(bytes)) => bytes,
-            Some(Err(e)) => {
-                return Err(DaemonError::Process(format!("Stream read error: {e}")));
+            Some(Err(_)) => {
+                return Err(stream_disconnect());
             }
             None => break,
         };
@@ -344,6 +351,7 @@ pub async fn read_anthropic_sse_stream(
                 }
                 "message_stop" => {
                     // Stream complete
+                    complete = true;
                 }
                 _ => {}
             }
@@ -355,7 +363,20 @@ pub async fn read_anthropic_sse_stream(
         + usage.cache_creation_tokens
         + usage.cache_read_tokens;
 
+    if !complete && finish_reason.is_none() {
+        return Err(stream_disconnect());
+    }
     Ok((content, tool_calls, usage, finish_reason))
+}
+
+fn stream_disconnect() -> DaemonError {
+    ProviderError {
+        class: ProviderErrorClass::Transient,
+        http_status: None,
+        retry_after_ms: None,
+        detail_code: "stream_disconnected".into(),
+    }
+    .into_daemon_error()
 }
 
 /// Filter that strips `<think>...</think>` blocks from streaming text.
@@ -412,12 +433,14 @@ impl Default for ThinkStripFilter {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_think_strip_filter_no_tags() {
         let mut f = ThinkStripFilter::new();
         assert_eq!(f.filter("hello world"), "hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_think_strip_filter_strips_block() {
         let mut f = ThinkStripFilter::new();
@@ -427,6 +450,7 @@ mod tests {
         assert!(!result.contains("hidden"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_think_strip_filter_across_chunks() {
         let mut f = ThinkStripFilter::new();

@@ -161,6 +161,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_successful_embed() {
         let mut server = mockito::Server::new_async().await;
@@ -180,6 +181,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_auth_error() {
         let mut server = mockito::Server::new_async().await;
@@ -199,6 +201,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_batch_success() {
         let mut server = mockito::Server::new_async().await;
@@ -217,6 +220,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_out_of_order_indices() {
         let mut server = mockito::Server::new_async().await;
@@ -237,6 +241,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_count_mismatch() {
         let mut server = mockito::Server::new_async().await;
@@ -255,6 +260,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_normalization() {
         let mut server = mockito::Server::new_async().await;
@@ -273,6 +279,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_openai_metadata() {
         let provider = make_provider("http://localhost");
@@ -281,6 +288,7 @@ mod tests {
         assert_eq!(provider.max_input_tokens(), Some(8192));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_openai_known_max_tokens() {
         assert_eq!(known_max_tokens("text-embedding-3-small"), Some(8192));
@@ -289,6 +297,7 @@ mod tests {
         assert_eq!(known_max_tokens("custom-model"), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_openai_bearer_auth_header() {
         let mut server = mockito::Server::new_async().await;

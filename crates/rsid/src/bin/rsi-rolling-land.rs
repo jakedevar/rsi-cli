@@ -5,16 +5,22 @@ use rsid::integration::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 
+#[path = "rsi-rolling-land/base_cache.rs"]
+mod base_cache;
 #[path = "rsi-rolling-land/landing_policy.rs"]
 mod landing_policy;
+#[path = "rsi-rolling-land/remote_gate.rs"]
+mod remote_gate;
 
 const PROVISIONAL_SCRIPT: &str = "tools/rolling-migration-renumber.py";
 
@@ -35,8 +41,51 @@ const REMOTE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(not(test))]
 const REMOTE_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default per-command gate guard.
+const DEFAULT_GUARD_TIMEOUT_SECS: u64 = 20 * 60;
+/// Upper bound for an operator-raised per-command gate guard.
+const MAX_GUARD_TIMEOUT_SECS: u64 = 4 * 60 * 60;
+
+/// Per-command gate guard. A loaded host can raise it with
+/// `RSI_LANDER_GUARD_TIMEOUT_SECS` (clamped to 60..=14400 s); an absent or
+/// unparsable value keeps the 20-minute default. Waiting on the shared base
+/// cache lock counts against this guard, so serialized landers need headroom.
+fn guard_timeout() -> Duration {
+    guard_timeout_from(
+        std::env::var("RSI_LANDER_GUARD_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn guard_timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_GUARD_TIMEOUT_SECS, |secs| {
+            secs.clamp(60, MAX_GUARD_TIMEOUT_SECS)
+        });
+    Duration::from_secs(secs)
+}
 
 const TARGET: &str = "refs/heads/rolling";
+const RSID_SHARDS: &[&str] = &[
+    "memory-01",
+    "memory-02",
+    "other-01",
+    "other-02",
+    "other-03",
+    "other-04",
+    "other-05",
+    "session-01",
+    "session-02",
+    "session-03",
+    "session-04",
+    "session-05",
+    "store-01",
+    "store-02",
+    "store-03",
+    "store-04",
+];
 
 #[derive(Debug, Clone)]
 struct AcceptedPair {
@@ -51,6 +100,10 @@ struct Options {
     remote: String,
     accepted: Vec<AcceptedPair>,
     test_filters: Vec<String>,
+    cargo_build_jobs: u8,
+    remote_gate: Option<remote_gate::Config>,
+    tmpfs_min_free_gb: u64,
+    disk_scratch_shards: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -60,6 +113,105 @@ struct LandReport {
     fetched_tip: String,
     published_tip: String,
     provisional: Vec<ProvisionalLanding>,
+    source_bindings: Vec<landing_policy::SourceBinding>,
+    base_reds: BTreeSet<String>,
+    flakes: BTreeSet<String>,
+    base_reused: BTreeSet<String>,
+    local_base_confirmed: BTreeSet<String>,
+    canary_reused_tree: Option<String>,
+    gate_scratch: String,
+    gate_disk_scratch: BTreeSet<String>,
+    stale_retries: Vec<StaleRetry>,
+}
+
+// A disjoint advance reuses the earlier gate, so losing the publish race to
+// one costs a fetch, a merge and a push. Several landers publishing within
+// seconds of each other is normal, so those retries get a generous budget.
+// An overlapping advance re-runs the whole gate and keeps the tight budget.
+const MAX_STALE_RETRIES: usize = 8;
+const MAX_REGATED_STALE_RETRIES: usize = 2;
+
+/// One lost publish race: the tip this attempt was built on, the newer tip it
+/// was remade on, and whether the remade candidate reused the earlier gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StaleRetry {
+    fetched: String,
+    observed: String,
+    reused_gate: bool,
+}
+
+impl StaleRetry {
+    fn label(&self) -> String {
+        let gate = if self.reused_gate {
+            "gate_reused"
+        } else {
+            "regated"
+        };
+        format!("{}..{}:{gate}", self.fetched, self.observed)
+    }
+}
+
+fn stale_retry_lines(retries: &[StaleRetry]) -> Vec<String> {
+    let mut lines = vec![format!("stale_attempts={}", retries.len())];
+    for (index, retry) in retries.iter().enumerate() {
+        lines.push(format!("stale_retry_{}={}", index + 1, retry.label()));
+    }
+    lines
+}
+
+#[derive(Default)]
+struct TestGate {
+    // An entry is reusable only for this exact rolling commit and command.
+    base_cache: BTreeMap<(String, String), BTreeSet<String>>,
+    // Preserve QA origin when a base result is reused again in this process.
+    qa_cache_provenance: BTreeMap<(String, String), String>,
+    base_reds: BTreeSet<String>,
+    flakes: BTreeSet<String>,
+    base_reused: BTreeSet<String>,
+    local_base_confirmed: BTreeSet<String>,
+    base_worktrees: BTreeMap<String, PathBuf>,
+    cache_root: Option<PathBuf>,
+    skip_tests: bool,
+    remote: Option<Arc<Mutex<remote_gate::Executor>>>,
+    scratch: Option<GateScratch>,
+    disk_scratch_used: BTreeSet<String>,
+}
+
+enum GateScratch {
+    Tmpfs(tempfile::TempDir),
+    Disk(PathBuf),
+}
+
+impl GateScratch {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Tmpfs(dir) => dir.path(),
+            Self::Disk(path) => path,
+        }
+    }
+
+    fn report(&self) -> String {
+        let kind = match self {
+            Self::Tmpfs(_) => "tmpfs",
+            Self::Disk(_) => "disk",
+        };
+        format!("{kind}:{}", self.path().display())
+    }
+}
+
+impl TestGate {
+    fn for_landing() -> Result<Self, String> {
+        // Hermetic binary tests opt in to a temporary cache explicitly.
+        let cache_root = if cfg!(test) {
+            None
+        } else {
+            Some(base_cache::default_root()?)
+        };
+        Ok(Self {
+            cache_root,
+            ..Self::default()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +252,7 @@ struct LandFailure {
     forward_revert_id: Option<String>,
     forward_revert_status: Option<PublicationState>,
     recovery_path: Option<PathBuf>,
+    stale_retries: Vec<StaleRetry>,
     message: String,
 }
 
@@ -116,12 +269,23 @@ impl From<String> for LandFailure {
             forward_revert_id: None,
             forward_revert_status: None,
             recovery_path: None,
+            stale_retries: Vec::new(),
             message,
         }
     }
 }
 
 impl LandFailure {
+    fn interrupted() -> Self {
+        let mut failure = Self::from(
+            "landing interrupted; fetch rolling and check source ancestry before retrying"
+                .to_string(),
+        );
+        // A signal can arrive after a remote push but before its receipt.
+        failure.state = PublicationState::Unknown;
+        failure
+    }
+
     fn candidate(
         state: PublicationState,
         message: impl Into<String>,
@@ -139,6 +303,7 @@ impl LandFailure {
             forward_revert_id: None,
             forward_revert_status: None,
             recovery_path: None,
+            stale_retries: Vec::new(),
             message: message.into(),
         }
     }
@@ -192,6 +357,7 @@ impl LandFailure {
         if let Some(recovery_path) = &self.recovery_path {
             lines.push(format!("recovery_path={}", recovery_path.display()));
         }
+        lines.extend(stale_retry_lines(&self.stale_retries));
         lines
     }
 
@@ -238,7 +404,9 @@ fn main() {
                         "cannot start async runtime: {error}"
                     )))
                 })?;
-            runtime.block_on(land(options)).map_err(Box::new)
+            runtime
+                .block_on(land_with_signals(options))
+                .map_err(Box::new)
         });
     match result {
         Ok(report) => {
@@ -247,6 +415,31 @@ fn main() {
             println!("candidate_kind={:?}", report.kind);
             println!("fetched_target_id={}", report.fetched_tip);
             println!("published_target_id={}", report.published_tip);
+            println!("gate_scratch={}", report.gate_scratch);
+            for entry in &report.gate_disk_scratch {
+                println!("gate_disk_scratch={entry}");
+            }
+            if let Some(tree) = &report.canary_reused_tree {
+                println!("canary: reused gate evidence for tree {tree}");
+            }
+            for name in &report.base_reds {
+                println!("base_red={name}");
+            }
+            for name in &report.flakes {
+                println!("candidate_flake={name}");
+            }
+            for entry in &report.base_reused {
+                println!("base_reused={entry}");
+            }
+            for entry in &report.local_base_confirmed {
+                println!("local_base_confirmed={entry}");
+            }
+            for binding in &report.source_bindings {
+                println!("source_binding={}:{}", binding.source, binding.state);
+            }
+            for line in stale_retry_lines(&report.stale_retries) {
+                println!("{line}");
+            }
             for (index, unit) in report.provisional.iter().enumerate() {
                 println!("migration_{index}_source_id={}", unit.source);
                 println!("migration_{index}_final_version={}", unit.assigned_version);
@@ -264,12 +457,46 @@ fn main() {
     }
 }
 
+async fn land_with_signals(options: Options) -> Result<LandReport, LandFailure> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| {
+        LandFailure::from(format!("cannot watch termination signal: {error}"))
+    })?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| {
+        LandFailure::from(format!("cannot watch interrupt signal: {error}"))
+    })?;
+    land_until_cancelled(options, async move {
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
+    })
+    .await
+}
+
+async fn land_until_cancelled(
+    options: Options,
+    cancellation: impl std::future::Future<Output = ()>,
+) -> Result<LandReport, LandFailure> {
+    tokio::select! {
+        result = land(options) => result,
+        () = cancellation => Err(LandFailure::interrupted()),
+    }
+}
+
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut args = args.into_iter();
     let mut repo = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut remote = "origin".to_string();
     let mut accepted = Vec::new();
     let mut test_filters = Vec::new();
+    let mut remote_host = None;
+    let mut remote_workdir = None;
+    let mut remote_identity = None;
+    let mut remote_run_as = "rsi".to_string();
+    let mut tmpfs_min_free_gb = 12;
+    let mut disk_scratch_shards = BTreeSet::new();
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--repo" => repo = PathBuf::from(next_value(&mut args, "--repo")?),
@@ -286,6 +513,36 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
                 });
             }
             "--test-filter" => test_filters.push(next_value(&mut args, "--test-filter")?),
+            "--remote-gate-host" => {
+                remote_host = Some(next_value(&mut args, "--remote-gate-host")?)
+            }
+            "--remote-gate-dir" => {
+                remote_workdir = Some(next_value(&mut args, "--remote-gate-dir")?)
+            }
+            "--remote-gate-identity" => {
+                remote_identity = Some(PathBuf::from(next_value(
+                    &mut args,
+                    "--remote-gate-identity",
+                )?))
+            }
+            "--remote-gate-run-as" => {
+                remote_run_as = next_value(&mut args, "--remote-gate-run-as")?
+            }
+            "--tmpfs-min-free-gb" => {
+                let value = next_value(&mut args, "--tmpfs-min-free-gb")?;
+                tmpfs_min_free_gb = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| (1..=1024).contains(value))
+                    .ok_or("--tmpfs-min-free-gb expects an integer from 1 to 1024")?;
+            }
+            "--disk-scratch-shard" => {
+                let shard = next_value(&mut args, "--disk-scratch-shard")?;
+                if !RSID_SHARDS.contains(&shard.as_str()) {
+                    return Err(format!("unknown disk scratch shard: {shard}"));
+                }
+                disk_scratch_shards.insert(shard);
+            }
             "--help" | "-h" => return Err(usage().to_string()),
             _ => return Err(format!("unknown argument `{argument}`\n{}", usage())),
         }
@@ -296,12 +553,40 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             usage()
         ));
     }
+    let remote_gate = match (remote_host, remote_workdir, remote_identity) {
+        (None, None, None) if remote_run_as == "rsi" => None,
+        (Some(target), Some(workdir), Some(identity)) => {
+            let config = remote_gate::Config { target, workdir, identity, run_as: remote_run_as };
+            config.validate()?;
+            Some(config)
+        }
+        _ => return Err("remote shard gate requires --remote-gate-host USER@HOST, --remote-gate-dir PATH, and --remote-gate-identity PATH together".into()),
+    };
     Ok(Options {
         repo,
         remote,
         accepted,
         test_filters,
+        cargo_build_jobs: parse_cargo_build_jobs(std::env::var_os("CARGO_BUILD_JOBS").as_deref())?,
+        remote_gate,
+        tmpfs_min_free_gb,
+        disk_scratch_shards,
     })
+}
+
+// Preserve the existing four-job ceiling while allowing central QA to lower it.
+fn parse_cargo_build_jobs(value: Option<&std::ffi::OsStr>) -> Result<u8, String> {
+    let Some(value) = value else {
+        return Ok(4);
+    };
+    value
+        .to_str()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|jobs| (1..=6).contains(jobs))
+        .ok_or_else(|| {
+            "CARGO_BUILD_JOBS must be a positive integer from 1 to 6 (default: 4)".into()
+        })
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -310,19 +595,30 @@ fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
 }
 
 const fn usage() -> &'static str {
-    "usage: rsi-rolling-land [--repo PATH] [--remote NAME] --accepted SOURCE|BASE:SOURCE [--accepted SOURCE|BASE:SOURCE ...] [--test-filter PACKAGE=FILTER ...]\nFor a landing candidate, omitted BASE is merge-base(SOURCE, current landing target tip); an explicit BASE must equal it. Already-integrated sources require the explicit historical BASE."
+    "usage: rsi-rolling-land [--repo PATH] [--remote NAME] --accepted SOURCE|BASE:SOURCE [--accepted SOURCE|BASE:SOURCE ...] [--test-filter PACKAGE=FILTER ...] [--tmpfs-min-free-gb N] [--disk-scratch-shard SHARD ...] [--remote-gate-host USER@HOST --remote-gate-dir PATH --remote-gate-identity PATH [--remote-gate-run-as USER]]\nFor a landing candidate, omitted BASE is merge-base(SOURCE, current landing target tip); an explicit BASE must equal it. Already-integrated sources require the explicit historical BASE.\nAn rsid shard filter is rsid=shard:SHARD[:FILTERSET], for example rsid=shard:session-02:test(manager_recovery_). The full shard inventory is checked before any focused run.\n--tmpfs-min-free-gb requires N GiB free on /dev/shm before private gate TMPDIR is used (default 12); otherwise gates use sandbox target scratch. --disk-scratch-shard gives a named shard disk scratch on both sides.\nRemote shard execution is opt-in and refuses publication on missing evidence or mismatched commit/fingerprint. The SSH host must already be in known_hosts. Only full rsid shards run remotely; local regression comparison and isolated retries are preserved.\nCARGO_BUILD_JOBS: positive integer from 1 to 6; defaults to 4 when unset."
 }
 
 #[allow(clippy::too_many_lines)] // Keeps fetch, preparation, and owned cleanup visibly ordered.
 async fn land(options: Options) -> Result<LandReport, LandFailure> {
+    land_with_gate(options, TestGate::for_landing()?).await
+}
+
+#[allow(clippy::too_many_lines)] // Keeps fetch, preparation, and owned cleanup visibly ordered.
+async fn land_with_gate(
+    options: Options,
+    mut test_gate: TestGate,
+) -> Result<LandReport, LandFailure> {
     let mut options = options;
     let cargo_target_dir = validate_cargo_target_dir()?;
+    let selected_scratch = select_gate_scratch(&cargo_target_dir, options.tmpfs_min_free_gb)?;
+    println!("gate_scratch={}", selected_scratch.report());
+    test_gate.scratch = Some(selected_scratch);
     let repo = options
         .repo
         .canonicalize()
         .map_err(|error| format!("cannot resolve repository: {error}"))?;
     let remote_url = git_text(&repo, &["remote", "get-url", "--push", &options.remote])?;
-    let workspace_parent = landing_workspace_parent(&cargo_target_dir);
+    let workspace_parent = landing_workspace_parent(&repo, &cargo_target_dir)?;
     let temp = tempfile::Builder::new()
         .prefix("rsi-rolling-land-")
         .permissions(std::fs::Permissions::from_mode(0o700))
@@ -416,6 +712,16 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
     let mut candidate: Option<Candidate> = None;
     let mut provisional = Vec::<ProvisionalLanding>::new();
     let guard_options = options.clone();
+    if let Some(config) = options.remote_gate.clone() {
+        // A fingerprint records the toolchain and runner, but does not prove
+        // that a desktop base result and cloud candidate ran under equivalent
+        // host conditions. Compare both sides on this executor.
+        test_gate.cache_root = None;
+        test_gate.remote = Some(Arc::new(Mutex::new(remote_gate::Executor::new(
+            config,
+            private_repo.clone(),
+        )?)));
+    }
     for pair in &mut options.accepted {
         resolve_accepted_base(&private_repo, pair, &expected_tip)?;
         let pair = pair.clone();
@@ -488,7 +794,7 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
                         next.kind = CandidateKind::Merge;
                         Prepared::Candidate(next)
                     }
-                    other => other,
+                    other @ Prepared::AlreadyIntegrated => other,
                 })
             } else {
                 prepare_candidate(
@@ -553,6 +859,7 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
                         None,
                         false,
                         Some(&proof_path),
+                        &mut test_gate,
                     )
                     .await;
                     guard.map(|()| (proof, proof_path))
@@ -566,13 +873,13 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
                     if let Err(cleanup) =
                         discard_candidate(&config, &private_repo, &next.handle).await
                     {
-                        message.push_str(&format!("; candidate cleanup failed: {cleanup}"));
+                        let _ = write!(message, "; candidate cleanup failed: {cleanup}");
                     }
                     if let Some(previous) = candidate.take()
                         && let Err(cleanup) =
                             discard_candidate(&config, &private_repo, &previous.handle).await
                     {
-                        message.push_str(&format!("; prior cleanup failed: {cleanup}"));
+                        let _ = write!(message, "; prior cleanup failed: {cleanup}");
                     }
                     return Err(message.into());
                 }
@@ -648,6 +955,7 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
             Err(cleanup) => format!("{error}; candidate cleanup failed: {cleanup}").into(),
         });
     }
+    let mut stale = Vec::new();
     let result = land_candidate(
         &private_repo,
         &repo,
@@ -656,6 +964,8 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
         &candidate,
         &fetched_tip,
         &provisional,
+        &mut test_gate,
+        &mut stale,
     )
     .await;
     let cleanup = discard_candidate(&config, &private_repo, &candidate.handle).await;
@@ -680,6 +990,11 @@ async fn land(options: Options) -> Result<LandReport, LandFailure> {
             ..error
         }),
     };
+    if let Err(error) = &mut outcome {
+        // Every receipt shows how many publish races were lost, so an
+        // operator can tell exhausted retries from a first-attempt failure.
+        error.stale_retries.clone_from(&stale);
+    }
     if let Err(error) = &mut outcome
         && (error.state == PublicationState::Unknown
             || error
@@ -840,18 +1155,38 @@ fn validate_cargo_target_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn landing_workspace_parent(cargo_target_dir: &Path) -> &Path {
-    // Keep retained recovery custody outside Cargo's cleanable target tree
-    // when the target belongs to an assigned sandbox worktree.
-    if cargo_target_dir
-        .file_name()
-        .is_some_and(|name| name == "target")
-        && let Some(sandbox) = cargo_target_dir.parent()
-        && sandbox.join(".git").exists()
-    {
-        return sandbox;
+fn landing_workspace_parent(repo: &Path, cargo_target_dir: &Path) -> Result<PathBuf, String> {
+    // A sandbox-local target is inside the source worktree. Keep recovery
+    // custody outside Cargo's cleanable target tree and out of git status.
+    if cargo_target_dir.starts_with(repo) {
+        return PathBuf::from(git_text(repo, &["rev-parse", "--absolute-git-dir"])?)
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve repository git directory: {error}"));
     }
-    cargo_target_dir
+    Ok(cargo_target_dir.to_path_buf())
+}
+
+fn select_gate_scratch(cargo_target_dir: &Path, min_free_gb: u64) -> Result<GateScratch, String> {
+    let tmpfs = Path::new("/dev/shm");
+    let enough_space = nix::sys::statvfs::statvfs(tmpfs)
+        .map(|stats| {
+            let free = u128::from(stats.blocks_available())
+                .saturating_mul(u128::from(stats.fragment_size()));
+            free >= u128::from(min_free_gb) * 1024 * 1024 * 1024
+        })
+        .unwrap_or(false);
+    if enough_space
+        && let Ok(dir) = tempfile::Builder::new()
+            .prefix("rsi-landing-gate-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(tmpfs)
+    {
+        return Ok(GateScratch::Tmpfs(dir));
+    }
+    let disk = cargo_target_dir.join(".rsi-tmp");
+    std::fs::create_dir_all(&disk)
+        .map_err(|error| format!("cannot create disk-backed gate scratch: {error}"))?;
+    Ok(GateScratch::Disk(disk))
 }
 
 fn stale_error(error: IntegrationError, fetched_tip: &str) -> String {
@@ -863,7 +1198,7 @@ fn stale_error(error: IntegrationError, fetched_tip: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)] // Keeps published-tip canary and remote settlement in order.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Keeps gate, canary, and remote settlement in order.
 async fn land_candidate(
     repo: &Path,
     source_repo: &Path,
@@ -872,6 +1207,8 @@ async fn land_candidate(
     candidate: &Candidate,
     fetched_tip: &str,
     provisional: &[ProvisionalLanding],
+    test_gate: &mut TestGate,
+    stale: &mut Vec<StaleRetry>,
 ) -> Result<LandReport, LandFailure> {
     for pair in &options.accepted {
         let proof = provisional
@@ -887,6 +1224,7 @@ async fn land_candidate(
             Some(&candidate.handle.worktree),
             false,
             proof,
+            test_gate,
         )
         .await
         .map_err(|error| {
@@ -898,6 +1236,10 @@ async fn land_candidate(
             )
         })?;
     }
+    // A disjoint stale advance may reuse the earlier gate without testing
+    // its new tree. Only a gate executed for this candidate can be reused.
+    let candidate_was_gated = !test_gate.skip_tests;
+    test_gate.skip_tests = false;
 
     verify_remote_binding(source_repo, &options.remote, remote_url).map_err(|error| {
         LandFailure::candidate(
@@ -911,7 +1253,7 @@ async fn land_candidate(
         .iter()
         .map(|unit| unit.assigned_version)
         .collect::<Vec<_>>();
-    landing_policy::check_with_proof(
+    let source_bindings = landing_policy::check_with_proof(
         repo,
         repo,
         fetched_tip,
@@ -920,8 +1262,50 @@ async fn land_candidate(
         &proved_versions,
     )
     .map_err(|error| LandFailure::policy(error, candidate, fetched_tip))?;
-    let published_tip = publish_candidate(repo, candidate, fetched_tip).await?;
+    let published_tip = match publish_candidate(repo, candidate, fetched_tip).await {
+        Ok(tip) => tip,
+        Err(mut error) if error.state == PublicationState::NotPublished => {
+            let Some(observed) = error.observed_tip.clone() else {
+                return Err(error);
+            };
+            if stale.len() >= MAX_STALE_RETRIES {
+                let _ = write!(
+                    error.message,
+                    "; stale retries exhausted after {} attempts",
+                    stale.len()
+                );
+                return Err(error);
+            }
+            return retry_stale_candidate(
+                repo,
+                source_repo,
+                remote_url,
+                options,
+                candidate,
+                fetched_tip,
+                &observed,
+                provisional,
+                test_gate,
+                stale,
+            )
+            .await;
+        }
+        Err(error) => return Err(error),
+    };
+    let candidate_tree = git_text(repo, &["rev-parse", &format!("{}^{{tree}}", candidate.oid)])
+        .map_err(|error| {
+            LandFailure::candidate(PublicationState::Published, error, candidate, fetched_tip)
+        })?;
+    let published_tree = git_text(repo, &["rev-parse", &format!("{published_tip}^{{tree}}")])
+        .map_err(|error| {
+            LandFailure::candidate(PublicationState::Published, error, candidate, fetched_tip)
+        })?;
+    let canary_reused_tree =
+        (candidate_was_gated && candidate_tree == published_tree).then_some(published_tree);
     for pair in &options.accepted {
+        if canary_reused_tree.is_some() {
+            break;
+        }
         let proof = provisional
             .iter()
             .find(|unit| unit.source == pair.source && unit.base == pair.base)
@@ -935,6 +1319,7 @@ async fn land_candidate(
             Some(&candidate.handle.worktree),
             false,
             proof,
+            test_gate,
         )
         .await
         {
@@ -1006,7 +1391,416 @@ async fn land_candidate(
         fetched_tip: fetched_tip.to_string(),
         published_tip,
         provisional: provisional.to_vec(),
+        source_bindings,
+        base_reds: test_gate.base_reds.clone(),
+        flakes: test_gate.flakes.clone(),
+        base_reused: test_gate.base_reused.clone(),
+        local_base_confirmed: test_gate.local_base_confirmed.clone(),
+        canary_reused_tree,
+        gate_scratch: test_gate
+            .scratch
+            .as_ref()
+            .ok_or_else(|| {
+                LandFailure::candidate(
+                    PublicationState::Published,
+                    "gate scratch was not selected",
+                    candidate,
+                    fetched_tip,
+                )
+            })?
+            .report(),
+        gate_disk_scratch: test_gate.disk_scratch_used.clone(),
+        stale_retries: stale.clone(),
     })
+}
+
+fn changed_paths(repo: &Path, from: &str, to: &str) -> Result<BTreeSet<Vec<u8>>, String> {
+    let output = git_output(
+        repo,
+        &["diff", "--name-only", "-z", "--no-renames", from, to, "--"],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot compare stale target paths: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+fn touches_provisional_gate(
+    repo: &Path,
+    options: &Options,
+    fetched_tip: &str,
+    current: &str,
+    incoming_paths: &BTreeSet<Vec<u8>>,
+) -> Result<bool, String> {
+    // Keep the fixed entries aligned with check-released-migrations.py's
+    // tracked_source_paths. Manifest sections supply its remaining paths.
+    let mut surface = BTreeSet::from([
+        b"crates/rsid/src/store/mod.rs".to_vec(),
+        b"crates/rsid/src/store/cohort_settlement.rs".to_vec(),
+        b"crates/rsid/src/store/tests.rs".to_vec(),
+        b"tools/released-migrations.json".to_vec(),
+        b"tools/rolling-migration-renumber.py".to_vec(),
+        b"tools/check-released-migrations.py".to_vec(),
+        b"scripts/rolling-landing-guard.py".to_vec(),
+        b"scripts/run-rsid-test-shards.sh".to_vec(),
+        b"scripts/rolling-shard-fingerprint.py".to_vec(),
+    ]);
+    let revisions = std::iter::once(fetched_tip)
+        .chain(std::iter::once(current))
+        .chain(options.accepted.iter().map(|pair| pair.base.as_str()))
+        .collect::<BTreeSet<_>>();
+    for revision in revisions {
+        let output = git_output(
+            repo,
+            &[
+                "show",
+                &format!("{revision}:tools/released-migrations.json"),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot read provisional gate inventory at {revision}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let manifest: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            format!("invalid provisional gate inventory at {revision}: {error}")
+        })?;
+        let migration_file = manifest["migration_file"].as_str().ok_or_else(|| {
+            format!("provisional gate inventory lacks migration_file at {revision}")
+        })?;
+        surface.insert(migration_file.as_bytes().to_vec());
+        let sections = manifest["protected_sections"].as_object().ok_or_else(|| {
+            format!("provisional gate inventory lacks protected_sections at {revision}")
+        })?;
+        for section in sections.values() {
+            let path = section["path"].as_str().ok_or_else(|| {
+                format!("provisional gate inventory has invalid protected path at {revision}")
+            })?;
+            surface.insert(path.as_bytes().to_vec());
+        }
+    }
+    Ok(incoming_paths
+        .iter()
+        .any(|path| surface.contains(path) || path.starts_with(b"tools/provisional-migrations/")))
+}
+
+async fn remake_stale_provisional(
+    repo: &Path,
+    options: &Options,
+    current: &str,
+    previous: &[ProvisionalLanding],
+    config: &IntegrationConfig,
+    scratch: &Path,
+) -> Result<(Candidate, Vec<ProvisionalLanding>), String> {
+    let mut tip = current.to_owned();
+    let mut candidate: Option<Candidate> = None;
+    let mut provisional = Vec::<ProvisionalLanding>::new();
+    for pair in &options.accepted {
+        if git_is_ancestor(repo, &pair.source, &tip)? {
+            continue;
+        }
+        let step: Result<(Candidate, Option<ProvisionalLanding>), String> = async {
+            let original = previous
+                .iter()
+                .find(|unit| unit.base == pair.base && unit.source == pair.source);
+            let built = if let Some(original) = original {
+                let mut unit = provisional_command(
+                    repo,
+                    &[
+                        "--transform",
+                        "--base",
+                        &pair.base,
+                        "--source",
+                        &pair.source,
+                        "--target",
+                        &tip,
+                    ],
+                )?;
+                let version = provisional_version(&unit, "new_version")?;
+                if version != original.assigned_version {
+                    return Err(format!(
+                        "stale provisional migration version changed from {} to {version}",
+                        original.assigned_version
+                    ));
+                }
+                unit["prior_units"] = Value::Array(
+                    provisional
+                        .iter()
+                        .map(|prior| {
+                            serde_json::json!({
+                                "base": prior.base,
+                                "source": prior.source,
+                                "target": prior.proof["target"],
+                                "unit_candidate": prior.unit_candidate,
+                            })
+                        })
+                        .collect(),
+                );
+                let unit_path =
+                    scratch.join(format!("provisional-unit-{}.json", provisional.len()));
+                std::fs::write(&unit_path, unit.to_string())
+                    .map_err(|error| format!("cannot record stale provisional unit: {error}"))?;
+                let built = provisional_command(
+                    repo,
+                    &[
+                        "--build",
+                        "--unit-file",
+                        &unit_path.to_string_lossy(),
+                        "--scratch",
+                        &scratch.to_string_lossy(),
+                    ],
+                )?;
+                Some((unit_path, provisional_oid(&built, "candidate")?.to_owned()))
+            } else {
+                None
+            };
+            let source = built
+                .as_ref()
+                .map_or(pair.source.as_str(), |(_, oid)| oid.as_str());
+            let next = match prepare_candidate(config, repo, TARGET, &tip, source, scratch).await {
+                Ok(Prepared::Candidate(mut next)) => {
+                    if built.is_some() {
+                        next.kind = CandidateKind::Merge;
+                    }
+                    next
+                }
+                Ok(Prepared::AlreadyIntegrated) => {
+                    return Err("accepted source became integrated during stale retry".into());
+                }
+                Err(error) => return Err(format!("stale target could not merge cleanly: {error}")),
+            };
+            let checked = (|| -> Result<Option<ProvisionalLanding>, String> {
+                let landing = if let Some((unit_path, _)) = built {
+                    let proof_path =
+                        scratch.join(format!("provisional-proof-{}.json", provisional.len()));
+                    let proof = provisional_command(
+                        repo,
+                        &[
+                            "--prove",
+                            "--unit-file",
+                            &unit_path.to_string_lossy(),
+                            "--unit-candidate",
+                            &next.oid,
+                            "--candidate",
+                            &next.oid,
+                        ],
+                    )?;
+                    std::fs::write(&proof_path, proof.to_string()).map_err(|error| {
+                        format!("cannot record stale provisional proof: {error}")
+                    })?;
+                    Some(ProvisionalLanding {
+                        base: pair.base.clone(),
+                        source: pair.source.clone(),
+                        unit_path,
+                        unit_candidate: next.oid.clone(),
+                        proof_path,
+                        assigned_version: original
+                            .expect("built provisional has prior proof")
+                            .assigned_version,
+                        proof,
+                    })
+                } else {
+                    None
+                };
+                git_ok(repo, &["update-ref", TARGET, &next.oid, &tip])?;
+                Ok(landing)
+            })();
+            match checked {
+                Ok(landing) => Ok((next, landing)),
+                Err(error) => {
+                    let cleanup = discard_candidate(config, repo, &next.handle).await;
+                    Err(match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup) => {
+                            format!("{error}; stale candidate cleanup failed: {cleanup}")
+                        }
+                    })
+                }
+            }
+        }
+        .await;
+        let (next, landing) = match step {
+            Ok(step) => step,
+            Err(error) => {
+                if let Some(prior) = candidate.take() {
+                    let cleanup = discard_candidate(config, repo, &prior.handle).await;
+                    return Err(match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup) => {
+                            format!("{error}; prior stale candidate cleanup failed: {cleanup}")
+                        }
+                    });
+                }
+                return Err(error);
+            }
+        };
+        if let Some(prior) = candidate.take()
+            && let Err(error) = discard_candidate(config, repo, &prior.handle).await
+        {
+            let cleanup = discard_candidate(config, repo, &next.handle).await;
+            return Err(match cleanup {
+                Ok(()) => format!("cannot clean superseded stale candidate: {error}"),
+                Err(cleanup) => format!(
+                    "cannot clean superseded stale candidate: {error}; current cleanup failed: {cleanup}"
+                ),
+            });
+        }
+        if let Some(landing) = landing {
+            provisional.push(landing);
+        }
+        tip = next.oid.clone();
+        candidate = Some(next);
+    }
+    let candidate = candidate.ok_or("all accepted sources became integrated during stale retry")?;
+    if let Err(error) = finalize_provisional_proofs(repo, &candidate.oid, &mut provisional) {
+        let cleanup = discard_candidate(config, repo, &candidate.handle).await;
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; stale candidate cleanup failed: {cleanup}"),
+        });
+    }
+    Ok((candidate, provisional))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retry_stale_candidate(
+    repo: &Path,
+    source_repo: &Path,
+    remote_url: &str,
+    options: &Options,
+    candidate: &Candidate,
+    fetched_tip: &str,
+    observed: &str,
+    provisional: &[ProvisionalLanding],
+    test_gate: &mut TestGate,
+    stale: &mut Vec<StaleRetry>,
+) -> Result<LandReport, LandFailure> {
+    let fail = |message: String| {
+        LandFailure::candidate(
+            PublicationState::NotPublished,
+            message,
+            candidate,
+            fetched_tip,
+        )
+    };
+    remote_fetch(repo).await.map_err(fail)?;
+    let current = git_text(
+        repo,
+        &["rev-parse", "--verify", "refs/heads/rolling^{commit}"],
+    )
+    .map_err(fail)?;
+    // Under concurrent landing the remote can advance again between the
+    // observation and this fetch. Any fast-forward of the observed tip is a
+    // valid retry base: disjointness below is computed against `current`.
+    if !git_is_ancestor(repo, observed, &current).map_err(fail)?
+        || !git_is_ancestor(repo, fetched_tip, &current).map_err(fail)?
+    {
+        return Err(fail(format!(
+            "stale target changed during retry: expected descendant {observed}, fetched {current}"
+        )));
+    }
+    let candidate_paths = changed_paths(repo, fetched_tip, &candidate.oid).map_err(fail)?;
+    let incoming_paths = changed_paths(repo, fetched_tip, &current).map_err(fail)?;
+    let disjoint = candidate_paths.is_disjoint(&incoming_paths)
+        && (provisional.is_empty()
+            || !touches_provisional_gate(repo, options, fetched_tip, &current, &incoming_paths)
+                .map_err(fail)?);
+    let regated = stale.iter().filter(|retry| !retry.reused_gate).count();
+    if !disjoint && regated >= MAX_REGATED_STALE_RETRIES {
+        let mut failure = fail(format!(
+            "stale retries exhausted: {current} overlaps the candidate after {regated} re-gated retries ({} total)",
+            stale.len()
+        ));
+        failure.observed_tip = Some(current);
+        return Err(failure);
+    }
+    stale.push(StaleRetry {
+        fetched: fetched_tip.to_string(),
+        observed: current.clone(),
+        reused_gate: disjoint,
+    });
+    let config = IntegrationConfig {
+        allowed_targets: vec![TARGET.to_string()],
+        identity: CommitIdentity {
+            name: "rsi rolling landing".into(),
+            email: "rsi-rolling-land@rsi.invalid".into(),
+        },
+        git_timeout: Duration::from_secs(120),
+    };
+    let scratch = repo
+        .parent()
+        .ok_or_else(|| fail("private repository has no parent".into()))?
+        .join(format!("stale-scratch-{}", stale.len()));
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| fail(format!("cannot create stale scratch: {error}")))?;
+    let (remade, remade_provisional) =
+        if provisional.is_empty() {
+            let remade =
+                match prepare_candidate(&config, repo, TARGET, &current, &candidate.oid, &scratch)
+                    .await
+                {
+                    Ok(Prepared::Candidate(next)) => next,
+                    Ok(Prepared::AlreadyIntegrated) => {
+                        return Err(fail(
+                            "candidate already integrated during stale retry".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(fail(format!(
+                            "stale target could not merge cleanly: {error}"
+                        )));
+                    }
+                };
+            (remade, Vec::new())
+        } else {
+            remake_stale_provisional(repo, options, &current, provisional, &config, &scratch)
+                .await
+                .map_err(fail)?
+        };
+    let previous_skip = test_gate.skip_tests;
+    test_gate.skip_tests = disjoint;
+    let result = Box::pin(land_candidate(
+        repo,
+        source_repo,
+        remote_url,
+        options,
+        &remade,
+        &current,
+        &remade_provisional,
+        test_gate,
+        stale,
+    ))
+    .await;
+    test_gate.skip_tests = previous_skip;
+    let cleanup = discard_candidate(&config, repo, &remade.handle).await;
+    match (result, cleanup) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(report), Err(error)) => {
+            let mut failure = LandFailure::candidate(
+                PublicationState::Published,
+                format!("stale candidate published but cleanup failed: {error}"),
+                &remade,
+                &current,
+            );
+            failure.kind = FailureKind::Cleanup;
+            failure.published_tip = Some(report.published_tip);
+            Err(failure)
+        }
+        (Err(mut error), Err(cleanup)) => {
+            let _ = write!(error.message, "; stale candidate cleanup failed: {cleanup}");
+            Err(error)
+        }
+    }
 }
 
 fn verify_remote_binding(repo: &Path, remote: &str, expected_url: &str) -> Result<(), String> {
@@ -1119,6 +1913,7 @@ async fn run_guard_pair(
     worktree: Option<&Path>,
     allow_lost_hunks: bool,
 ) -> Result<(), String> {
+    let mut test_gate = TestGate::for_landing()?;
     run_guard_pair_with_proof(
         repo,
         options,
@@ -1128,6 +1923,7 @@ async fn run_guard_pair(
         worktree,
         allow_lost_hunks,
         None,
+        &mut test_gate,
     )
     .await
 }
@@ -1142,6 +1938,7 @@ async fn run_guard_pair_with_proof(
     worktree: Option<&Path>,
     allow_lost_hunks: bool,
     proof: Option<&Path>,
+    test_gate: &mut TestGate,
 ) -> Result<(), String> {
     let script = repo.join("scripts/rolling-landing-guard.py");
     if !script.is_file() {
@@ -1210,18 +2007,17 @@ async fn run_guard_pair_with_proof(
             &options.test_filters,
             proof.is_some(),
             &metadata,
+            options.cargo_build_jobs,
         )?;
-        let report = run_guard(worktree, &spec).await;
-        if !report.passed {
-            let failed = report
-                .commands
-                .last()
-                .ok_or("landing guard executed no command")?;
-            return Err(format!(
-                "affected-crate guard failed ({:?}) running {} {:?}: {} {}",
-                failed.status, failed.program, failed.args, failed.stdout_tail, failed.stderr_tail
-            ));
-        }
+        run_affected_gate(
+            repo,
+            worktree,
+            fetched_tip,
+            &spec,
+            test_gate,
+            &options.disk_scratch_shards,
+        )
+        .await?;
     }
     if !plan.lost_hunks.is_empty() && !allow_lost_hunks {
         return Err(format!(
@@ -1243,6 +2039,474 @@ async fn run_guard_pair_with_proof(
     Ok(())
 }
 
+fn test_failure_names(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("test ") {
+                return rest.strip_suffix(" ... FAILED").map(str::to_owned);
+            }
+            // Nextest prints a duration, an ordinal, and the crate before
+            // the test identity. The final token is the exact retry target.
+            line.strip_prefix("FAIL [")
+                .and_then(|_| line.split_whitespace().last())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn observed_test_failures(
+    report: &rsid::integration::GuardCommandReport,
+) -> Result<BTreeSet<String>, String> {
+    use rsid::integration::GuardStatus;
+    if report.output_truncated {
+        return Err(format!(
+            "test output was truncated for {} {:?}",
+            report.program, report.args
+        ));
+    }
+    let names = test_failure_names(&format!("{}\n{}", report.stdout_tail, report.stderr_tail));
+    match &report.status {
+        GuardStatus::Passed if names.is_empty() => Ok(names),
+        GuardStatus::Failed { .. } if !names.is_empty() => Ok(names),
+        _ => Err(format!(
+            "affected-crate guard failed ({:?}) running {} {:?}: {} {}",
+            report.status, report.program, report.args, report.stdout_tail, report.stderr_tail
+        )),
+    }
+}
+
+fn isolated_retry_command(command: &GuardCommand, name: &str) -> Result<GuardCommand, String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+    {
+        return Err(format!("cannot isolate test failure: {name}"));
+    }
+    let mut retry = command.clone();
+    if retry.program == "scripts/run-rsid-test-shards.sh" {
+        let shard = retry.args.get(1).ok_or("rsid shard command has no shard")?;
+        retry.program = "cargo".into();
+        retry.args = vec![
+            "test".into(),
+            "-p".into(),
+            "rsid".into(),
+            "--lib".into(),
+            "--no-default-features".into(),
+            "--features".into(),
+            format!("test-shard-{shard}"),
+            name.into(),
+            "--".into(),
+            "--exact".into(),
+            "--test-threads=4".into(),
+        ];
+    } else if retry.program == "cargo" {
+        let separator = retry
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or("cargo test command has no argument separator")?;
+        if separator < 4 || retry.args.first().is_none_or(|arg| arg != "test") {
+            return Err("unsupported cargo test command for isolated retry".into());
+        }
+        retry.args.truncate(4);
+        retry.args.extend([
+            name.into(),
+            "--".into(),
+            "--exact".into(),
+            "--test-threads=4".into(),
+        ]);
+    } else {
+        return Err("unsupported test command for isolated retry".into());
+    }
+    Ok(retry)
+}
+
+async fn run_one_guard(
+    worktree: &Path,
+    spec: &GuardSpec,
+    command: &GuardCommand,
+) -> Result<rsid::integration::GuardCommandReport, String> {
+    let mut env = spec.env.clone();
+    if command.program == "cargo" || command.program == "scripts/run-rsid-test-shards.sh" {
+        // Cargo fingerprints use file mtimes. A candidate worktree can be
+        // older than artifacts produced by the base run, so sharing one target
+        // may compile candidate rsid against base rsi-common metadata.
+        let parent = worktree.parent().ok_or("guard worktree has no parent")?;
+        let name = worktree
+            .file_name()
+            .ok_or("guard worktree has no file name")?
+            .to_string_lossy();
+        env.insert(
+            "CARGO_TARGET_DIR".into(),
+            parent
+                .join(format!("{name}-cargo-target"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let report = run_guard(
+        worktree,
+        &GuardSpec {
+            commands: vec![command.clone()],
+            env,
+            output_tail_bytes: spec.output_tail_bytes,
+        },
+    )
+    .await;
+    report
+        .commands
+        .into_iter()
+        .next()
+        .ok_or_else(|| "landing guard executed no command".into())
+}
+
+fn full_shard(command: &GuardCommand) -> Option<(&str, u32)> {
+    if command.program != "scripts/run-rsid-test-shards.sh" || command.args.len() != 4 {
+        return None;
+    }
+    let args = &command.args;
+    if args[0] != "shard" || args[2] != "--jobs" || !RSID_SHARDS.contains(&args[1].as_str()) {
+        return None;
+    }
+    Some((&args[1], args[3].parse().ok()?))
+}
+
+fn is_test_guard(command: &GuardCommand) -> bool {
+    (command.program == "cargo" && command.args.first().is_some_and(|arg| arg == "test"))
+        || command.program == "scripts/run-rsid-test-shards.sh"
+}
+
+fn shard_fingerprint(
+    worktree: &Path,
+    base: &str,
+    shard: &str,
+    jobs: u32,
+) -> Result<String, String> {
+    let output = Command::new("python3")
+        .arg(worktree.join("scripts/rolling-shard-fingerprint.py"))
+        .args(["--sha", base, "--shard", shard, "--jobs", &jobs.to_string()])
+        .current_dir(worktree)
+        .output()
+        .map_err(|error| format!("cannot run shard fingerprint: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot fingerprint shard runner: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let fingerprint = String::from_utf8(output.stdout)
+        .map_err(|error| format!("non-UTF8 shard fingerprint: {error}"))?;
+    Ok(fingerprint.trim().to_owned())
+}
+
+async fn run_shard_or_local(
+    worktree: &Path,
+    fingerprint_source: &Path,
+    base_sha: &str,
+    spec: &GuardSpec,
+    command: &GuardCommand,
+    gate: &TestGate,
+) -> Result<rsid::integration::GuardCommandReport, String> {
+    let Some((shard, jobs)) = full_shard(command) else {
+        return run_one_guard(worktree, spec, command).await;
+    };
+    let Some(remote) = gate.remote.clone() else {
+        return run_one_guard(worktree, spec, command).await;
+    };
+    let sha = git_text(worktree, &["rev-parse", "HEAD"])?;
+    let fingerprint_source_sha = git_text(fingerprint_source, &["rev-parse", "HEAD"])?;
+    let shard = shard.to_owned();
+    let command = command.clone();
+    let base_sha = base_sha.to_owned();
+    tokio::task::spawn_blocking(move || {
+        remote
+            .lock()
+            .map_err(|_| "remote_missing_evidence: executor lock poisoned".to_string())?
+            .run_full_shard(
+                &sha,
+                &fingerprint_source_sha,
+                &base_sha,
+                &shard,
+                jobs,
+                &command,
+            )
+    })
+    .await
+    .map_err(|error| format!("remote_missing_evidence: executor task failed: {error}"))?
+}
+
+fn ensure_base_worktree(repo: &Path, base: &str, gate: &mut TestGate) -> Result<PathBuf, String> {
+    if let Some(path) = gate.base_worktrees.get(base) {
+        return Ok(path.clone());
+    }
+    let path = repo
+        .parent()
+        .ok_or("private repository has no parent")?
+        .join(format!("base-{base}"));
+    git_ok(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().ok_or("non-UTF8 base worktree")?,
+            base,
+        ],
+    )?;
+    gate.base_worktrees.insert(base.to_owned(), path.clone());
+    Ok(path)
+}
+
+async fn run_base_guard(
+    repo: &Path,
+    base: &str,
+    spec: &GuardSpec,
+    command: &GuardCommand,
+    gate: &mut TestGate,
+    fingerprint_source: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let base_worktree = ensure_base_worktree(repo, base, gate)?;
+    observed_test_failures(
+        &run_shard_or_local(
+            &base_worktree,
+            fingerprint_source,
+            base,
+            spec,
+            command,
+            gate,
+        )
+        .await?,
+    )
+}
+
+async fn confirm_local_base_failure(
+    repo: &Path,
+    base: &str,
+    spec: &GuardSpec,
+    isolated: &GuardCommand,
+    name: &str,
+    gate: &mut TestGate,
+) -> Result<bool, String> {
+    let base_worktree = ensure_base_worktree(repo, base, gate)?;
+    let report = run_one_guard(&base_worktree, spec, isolated).await?;
+    let output = format!("{}\n{}", report.stdout_tail, report.stderr_tail);
+    if output.contains("running 0 tests") {
+        return Err(format!("local base isolated test did not run {name}"));
+    }
+    let failures = observed_test_failures(&report)?;
+    if failures.contains(name) {
+        if failures.len() != 1 {
+            return Err(format!(
+                "local base isolated test returned extra failures: {failures:?}"
+            ));
+        }
+        return Ok(true);
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "local base isolated test returned another failure: {failures:?}"
+        ));
+    }
+    if !output.contains("running 1 test") && !output.contains(&format!("test {name} ... ok")) {
+        return Err(format!("local base did not prove isolated test {name} ran"));
+    }
+    Ok(false)
+}
+
+fn command_scratch_path(
+    repo: &Path,
+    scratch: &GateScratch,
+    command: &GuardCommand,
+    disk_scratch_shards: &BTreeSet<String>,
+    disk_scratch_used: &mut BTreeSet<String>,
+) -> Result<PathBuf, String> {
+    if command.program != "scripts/run-rsid-test-shards.sh"
+        || !command
+            .args
+            .get(1)
+            .is_some_and(|shard| disk_scratch_shards.contains(shard))
+    {
+        return Ok(scratch.path().to_path_buf());
+    }
+    let shard = command.args.get(1).ok_or("marked shard has no name")?;
+    let path = repo
+        .parent()
+        .ok_or("private repository has no parent")?
+        .join("disk-test-scratch");
+    std::fs::create_dir_all(&path)
+        .map_err(|error| format!("cannot create marked disk scratch: {error}"))?;
+    disk_scratch_used.insert(format!("{shard}:{}", path.display()));
+    Ok(path)
+}
+
+async fn run_affected_gate(
+    repo: &Path,
+    candidate_worktree: &Path,
+    base: &str,
+    spec: &GuardSpec,
+    gate: &mut TestGate,
+    disk_scratch_shards: &BTreeSet<String>,
+) -> Result<(), String> {
+    for command in &spec.commands {
+        let mut scratch_spec = spec.clone();
+        if let Some(scratch) = &gate.scratch {
+            let scratch_path = command_scratch_path(
+                repo,
+                scratch,
+                command,
+                disk_scratch_shards,
+                &mut gate.disk_scratch_used,
+            )?;
+            scratch_spec
+                .env
+                .insert("TMPDIR".into(), scratch_path.to_string_lossy().into_owned());
+        }
+        let is_test = is_test_guard(command);
+        if is_test && gate.skip_tests {
+            continue;
+        }
+        if !is_test {
+            let report = run_one_guard(candidate_worktree, &scratch_spec, command).await?;
+            if report.status != rsid::integration::GuardStatus::Passed {
+                return Err(format!(
+                    "affected-crate guard failed ({:?}) running {} {:?}: {} {}",
+                    report.status,
+                    report.program,
+                    report.args,
+                    report.stdout_tail,
+                    report.stderr_tail
+                ));
+            }
+            continue;
+        }
+        let key = (base.to_owned(), format!("{command:?}"));
+        let base_failures = if let Some(cached) = gate.base_cache.get(&key) {
+            if let Some((shard, _)) = full_shard(command) {
+                gate.base_reused
+                    .insert(format!("{base}:{shard}:in-process"));
+            }
+            cached.clone()
+        } else {
+            let cache_root = if gate.remote.is_some() {
+                None
+            } else {
+                gate.cache_root.clone()
+            };
+            let failures = if let (Some(root), Some((shard, jobs))) =
+                (cache_root.as_deref(), full_shard(command))
+            {
+                let fingerprint = shard_fingerprint(candidate_worktree, base, shard, jobs)?;
+                let slot =
+                    base_cache::BaseShardSlot::acquire(root, base, shard, &fingerprint).await?;
+                if let Some(entry) = slot.read()? {
+                    gate.base_reused
+                        .insert(format!("{base}:{shard}:{}", entry.provenance));
+                    if entry.provenance.starts_with("qa:") {
+                        gate.qa_cache_provenance
+                            .insert(key.clone(), entry.provenance.clone());
+                    }
+                    entry.failures
+                } else {
+                    let failures = run_base_guard(
+                        repo,
+                        base,
+                        &scratch_spec,
+                        command,
+                        gate,
+                        candidate_worktree,
+                    )
+                    .await?;
+                    slot.write(&base_cache::BaseShardEntry::new(
+                        base,
+                        shard,
+                        &fingerprint,
+                        failures.clone(),
+                        "lander",
+                    ))?;
+                    failures
+                }
+            } else {
+                run_base_guard(repo, base, &scratch_spec, command, gate, candidate_worktree).await?
+            };
+            gate.base_cache.insert(key.clone(), failures.clone());
+            failures
+        };
+        gate.base_reds.extend(base_failures.iter().cloned());
+        let report = run_shard_or_local(
+            candidate_worktree,
+            candidate_worktree,
+            base,
+            &scratch_spec,
+            command,
+            gate,
+        )
+        .await?;
+        let candidate_failures = observed_test_failures(&report)?;
+        let new_failures: BTreeSet<_> = candidate_failures
+            .difference(&base_failures)
+            .cloned()
+            .collect();
+        for name in &new_failures {
+            let isolated = isolated_retry_command(command, name)?;
+            let retry = run_one_guard(candidate_worktree, &scratch_spec, &isolated).await?;
+            if retry.stdout_tail.contains("running 0 tests")
+                || retry.stderr_tail.contains("running 0 tests")
+            {
+                return Err(format!("isolated retry did not run {name}"));
+            }
+            let retry_failures = observed_test_failures(&retry)?;
+            let persistent: BTreeSet<_> =
+                retry_failures.difference(&base_failures).cloned().collect();
+            if !persistent.is_empty() {
+                if let Some(provenance) = gate.qa_cache_provenance.get(&key).cloned() {
+                    if persistent.len() != 1 || !persistent.contains(name) {
+                        return Err(format!(
+                            "QA cached base {provenance} has unexpected isolated failures: {persistent:?}"
+                        ));
+                    }
+                    match confirm_local_base_failure(
+                        repo,
+                        base,
+                        &scratch_spec,
+                        &isolated,
+                        name,
+                        gate,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            gate.base_reds.insert(name.clone());
+                            gate.local_base_confirmed
+                                .insert(format!("{base}:{name}:red:{provenance}"));
+                            continue;
+                        }
+                        Ok(false) => {
+                            return Err(format!(
+                                "new test failures relative to rolling {base}: {name}; QA cached base {provenance}; isolated local base passed {name}"
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "QA cached base {provenance}; local base confirmation failed closed for {name}: {error}"
+                            ));
+                        }
+                    }
+                }
+                return Err(format!(
+                    "new test failures relative to rolling {base}: {}; base reds: {}",
+                    persistent.into_iter().collect::<Vec<_>>().join(", "),
+                    base_failures.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            gate.flakes.insert(name.clone());
+        }
+    }
+    Ok(())
+}
+
 fn affected_crate_guard_spec(
     target: &str,
     candidate: &str,
@@ -1250,6 +2514,7 @@ fn affected_crate_guard_spec(
     filters: &[String],
     provisional: bool,
     metadata: &WorkspaceMetadata,
+    cargo_build_jobs: u8,
 ) -> Result<GuardSpec, String> {
     let mut selected: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for filter in filters {
@@ -1279,17 +2544,35 @@ fn affected_crate_guard_spec(
             "store::tests::rewind_tears_down_the_non_idempotent_migration_tail",
             "store::tests::every_recovered_migration_step_actually_executes",
         ] {
-            commands.push(cargo_guard_command("rsid", Some(filter)));
+            commands.push(rsid_shard_guard_command(&format!(
+                "store-01:test({filter})"
+            ))?);
         }
     }
     for package in packages {
-        let package_filters = selected.get(package.as_str());
-        if let Some(package_filters) = package_filters {
-            for filter in package_filters {
-                commands.push(cargo_guard_command(package, Some(filter)));
+        if package == "rsid" {
+            // A focused shard can be unrelated to the changed tests. Without
+            // a proven file-to-shard map, gate all shards for an rsid change.
+            for shard in RSID_SHARDS {
+                commands.push(rsid_shard_guard_command(shard)?);
             }
         } else {
             commands.push(cargo_guard_command(package, None));
+        }
+        if let Some(package_filters) = selected.get(package.as_str()) {
+            for filter in package_filters {
+                let focused = if package == "rsid" {
+                    match filter.strip_prefix("shard:") {
+                        Some(shard) => rsid_shard_guard_command(shard)?,
+                        None => cargo_guard_command(package, Some(filter)),
+                    }
+                } else {
+                    cargo_guard_command(package, Some(filter))
+                };
+                if !commands.contains(&focused) {
+                    commands.push(focused);
+                }
+            }
         }
     }
     for dependent in reverse_workspace_dependents(metadata, packages)? {
@@ -1298,10 +2581,10 @@ fn affected_crate_guard_spec(
     Ok(GuardSpec {
         commands,
         env: BTreeMap::from([
-            ("CARGO_BUILD_JOBS".into(), "4".into()),
+            ("CARGO_BUILD_JOBS".into(), cargo_build_jobs.to_string()),
             ("CARGO_PROFILE_DEV_DEBUG".into(), "line-tables-only".into()),
         ]),
-        output_tail_bytes: 16 * 1024,
+        output_tail_bytes: 8 * 1024 * 1024,
     })
 }
 
@@ -1314,7 +2597,7 @@ fn cargo_check_command(package: &str) -> GuardCommand {
             package.into(),
             "--all-targets".into(),
         ],
-        timeout: Duration::from_secs(20 * 60),
+        timeout: guard_timeout(),
     }
 }
 
@@ -1327,8 +2610,39 @@ fn cargo_guard_command(package: &str, filter: Option<&str>) -> GuardCommand {
     GuardCommand {
         program: "cargo".into(),
         args,
-        timeout: Duration::from_secs(20 * 60),
+        timeout: guard_timeout(),
     }
+}
+
+fn rsid_shard_guard_command(shard: &str) -> Result<GuardCommand, String> {
+    let (shard, filterset) = match shard.split_once(':') {
+        Some((shard, filterset)) if !filterset.is_empty() => (shard, Some(filterset)),
+        Some(_) => return Err(format!("invalid rsid shard test filter: {shard}")),
+        None => (shard, None),
+    };
+    if !RSID_SHARDS.contains(&shard) {
+        return Err(format!("invalid rsid shard test filter: {shard}"));
+    }
+    let mut args = vec!["shard".into(), shard.into(), "--jobs".into(), "4".into()];
+    if let Some(filterset) = filterset {
+        let test_name = filterset
+            .strip_prefix("test(")
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| format!("invalid rsid shard test filter: {filterset}"))?;
+        if test_name.is_empty()
+            || !test_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+        {
+            return Err(format!("invalid rsid shard test filter: {filterset}"));
+        }
+        args.extend(["--filterset".into(), filterset.into()]);
+    }
+    Ok(GuardCommand {
+        program: "scripts/run-rsid-test-shards.sh".into(),
+        args,
+        timeout: guard_timeout(),
+    })
 }
 
 async fn forward_revert_after_canary(
@@ -1605,6 +2919,7 @@ async fn publish_candidate(
     // candidate OID is the source, so no branch name or force refspec is used.
     let refspec = format!("{}:refs/heads/rolling", candidate.oid);
     let mut push = remote_git_command(repo, &["push", "--porcelain", "publish", &refspec]);
+    push.env("RSI_ROLLING_LANDER", "1");
     push.stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -1650,6 +2965,33 @@ async fn confirm_post_push(
             candidate,
             fetched_tip,
         )),
+        Ok(Some(tip)) if !reported_success && tip != fetched_tip => {
+            if remote_fetch(repo).await.is_ok()
+                && git_text(repo, &["rev-parse", "refs/heads/rolling"])
+                    .ok()
+                    .as_deref()
+                    == Some(tip.as_str())
+                && git_is_ancestor(repo, fetched_tip, &tip).unwrap_or(false)
+                && !git_is_ancestor(repo, &candidate.oid, &tip).unwrap_or(true)
+            {
+                let mut failure = LandFailure::candidate(
+                    PublicationState::NotPublished,
+                    format!("{context}; stale target advanced to {tip} before publication"),
+                    candidate,
+                    fetched_tip,
+                );
+                failure.observed_tip = Some(tip);
+                return Err(failure);
+            }
+            let mut failure = LandFailure::candidate(
+                PublicationState::Unknown,
+                format!("{context}; remote rolling advanced to {tip}, publication is unconfirmed"),
+                candidate,
+                fetched_tip,
+            );
+            failure.observed_tip = Some(tip);
+            Err(failure)
+        }
         Ok(observed) => {
             let mut failure = LandFailure::candidate(
                 PublicationState::Unknown,
@@ -1679,7 +3021,7 @@ async fn remote_fetch(repo: &Path) -> Result<(), String> {
             "--no-tags",
             "--no-auto-maintenance",
             "publish",
-            "refs/heads/rolling:refs/heads/rolling",
+            "refs/heads/rolling:refs/remotes/publish/rolling",
         ],
     );
     command
@@ -1691,7 +3033,17 @@ async fn remote_fetch(repo: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot fetch remote rolling: {error}"))?;
     let pid = child_pid(&child, "remote rolling fetch")?;
     match tokio::time::timeout(remote_lookup_timeout(), child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) if status.success() => {
+            let tip = git_text(
+                repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "refs/remotes/publish/rolling^{commit}",
+                ],
+            )?;
+            git_ok(repo, &["update-ref", TARGET, &tip])
+        }
         Ok(Ok(status)) => Err(format!(
             "remote rolling fetch failed (exit {})",
             status_code(status)
@@ -1806,8 +3158,6 @@ fn remote_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
         .args([
             "--no-optional-locks",
             "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
             "commit.gpgsign=false",
             "-c",
             "maintenance.auto=false",
@@ -1818,7 +3168,7 @@ fn remote_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
         ])
         .args(args);
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
+        if key.to_string_lossy().starts_with("GIT_") || key == "RSI_ROLLING_LANDER" {
             command.env_remove(key);
         }
     }
@@ -1970,6 +3320,27 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn guard_timeout_defaults_to_twenty_minutes_and_honours_bounded_override() {
+        assert_eq!(guard_timeout_from(None), Duration::from_secs(20 * 60));
+        assert_eq!(
+            guard_timeout_from(Some("not-a-number")),
+            Duration::from_secs(20 * 60)
+        );
+        assert_eq!(guard_timeout_from(Some("3600")), Duration::from_secs(3600));
+        assert_eq!(
+            guard_timeout_from(Some(" 5400 ")),
+            Duration::from_secs(5400)
+        );
+        assert_eq!(guard_timeout_from(Some("5")), Duration::from_secs(60));
+        assert_eq!(
+            guard_timeout_from(Some("999999")),
+            Duration::from_secs(4 * 60 * 60)
+        );
+        let shard = rsid_shard_guard_command("session-01").expect("known shard");
+        assert!(shard.timeout >= Duration::from_secs(60));
+    }
+
     fn guard_workspace_metadata() -> WorkspaceMetadata {
         fn package(name: &str, dependencies: &[&str]) -> WorkspacePackage {
             WorkspacePackage {
@@ -2009,10 +3380,17 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::from_root(tempfile::tempdir().expect("temp root"))
+        }
+
+        fn new_in(parent: &Path) -> Self {
+            Self::from_root(tempfile::tempdir_in(parent).expect("temp root in Cargo target"))
+        }
+
+        fn from_root(root: TempDir) -> Self {
             let environment_lock = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let root = tempfile::tempdir().expect("temp root");
             let repo = root.path().join("repo");
             let bare = root.path().join("remote.git");
             let bin = root.path().join("bin");
@@ -2039,6 +3417,25 @@ mod tests {
             fs::create_dir_all(repo.join("scripts")).expect("scripts dir");
             fs::copy(source_guard, repo.join("scripts/rolling-landing-guard.py"))
                 .expect("copy current guard");
+            write(
+                &repo,
+                "scripts/rolling-shard-fingerprint.py",
+                "print('sha256:' + 'a' * 64)\n",
+            );
+            write(
+                &repo,
+                "scripts/run-rsid-test-shards.sh",
+                "#!/bin/sh\noid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> \"$RSI_QA899_RUN_LOG\"\nif [ \"$oid\" = \"$RSI_QA899_FAIL_ON_OID\" ]; then echo 'test demo::red ... FAILED'; exit 1; fi\nexit 0\n",
+            );
+            let mut shard_permissions = fs::metadata(repo.join("scripts/run-rsid-test-shards.sh"))
+                .expect("shard script metadata")
+                .permissions();
+            shard_permissions.set_mode(0o755);
+            fs::set_permissions(
+                repo.join("scripts/run-rsid-test-shards.sh"),
+                shard_permissions,
+            )
+            .expect("executable shard script");
             fs::create_dir_all(repo.join("tools")).expect("tools dir");
             fs::copy(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2095,12 +3492,25 @@ mod tests {
         }
 
         fn add_fake_cargo(&self, extra: &str) {
-            let script = format!("#!/bin/sh\n{extra}\nexit 0\n");
+            let metadata = serde_json::json!({
+                "workspace_members": ["demo"],
+                "packages": [{ "id": "demo", "name": "demo", "dependencies": [] }],
+            });
+            let script = format!(
+                "#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '{metadata}'\n  exit 0\nfi\n{extra}\nexit 0\n"
+            );
             let cargo = self.bin.join("cargo");
             fs::write(&cargo, script).expect("fake cargo");
             let mut permissions = fs::metadata(&cargo).expect("metadata").permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(cargo, permissions).expect("chmod fake cargo");
+        }
+
+        fn add_fake_canary_cargo(&self, prepublish_tip: &str, action: &str) {
+            self.add_fake_cargo(&format!(
+                "remote=$(/usr/bin/git --git-dir='{}' rev-parse refs/heads/rolling)\nif [ \"$remote\" != '{}' ]; then\n{}\nfi",
+                self.bare.display(), prepublish_tip, action,
+            ));
         }
 
         fn add_fake_git(&self, ls_remote: &str) {
@@ -2140,10 +3550,24 @@ mod tests {
         fn add_fake_cargo_log(&self) -> PathBuf {
             let args = self.root.path().join("cargo-args.log");
             let env = self.root.path().join("cargo-env.log");
+            // Match the metadata projection consumed by WorkspaceMetadata for
+            // Fixture::new's single demo package, which has no dependencies.
+            let metadata = serde_json::json!({
+                "workspace_members": ["demo"],
+                "packages": [{ "id": "demo", "name": "demo", "dependencies": [] }],
+            });
             let script = format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n%s\\n%s\\n%s\\n' \"$CARGO_TARGET_DIR\" \"$CARGO_BUILD_JOBS\" \"$CARGO_PROFILE_DEV_DEBUG\" \"$(pwd -P)\" >> '{}'\nexit 0\n",
-                args.display(),
-                env.display()
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> '{args}'
+if [ "$1" = metadata ]; then
+    printf '%s\n' '{metadata}'
+    exit 0
+fi
+printf '%s\n%s\n%s\n%s\n%s\n' "$CARGO_TARGET_DIR" "$CARGO_BUILD_JOBS" "$CARGO_PROFILE_DEV_DEBUG" "$(pwd -P)" "$TMPDIR" >> '{env}'
+exit 0
+"#,
+                args = args.display(),
+                env = env.display(),
             );
             let cargo = self.bin.join("cargo");
             fs::write(&cargo, script).expect("fake cargo with invocation log");
@@ -2157,6 +3581,31 @@ mod tests {
             self.land_with_filters(accepted, Vec::new()).await
         }
 
+        // Models the canary branch of a disjoint stale retry: its remade
+        // candidate was published without running its own pre-push tests.
+        async fn land_with_ungated_candidate(
+            &self,
+            accepted: Vec<AcceptedPair>,
+        ) -> Result<LandReport, LandFailure> {
+            land_with_gate(
+                Options {
+                    repo: self.repo.clone(),
+                    remote: "origin".into(),
+                    accepted,
+                    test_filters: Vec::new(),
+                    cargo_build_jobs: 1,
+                    remote_gate: None,
+                    tmpfs_min_free_gb: 12,
+                    disk_scratch_shards: BTreeSet::new(),
+                },
+                TestGate {
+                    skip_tests: true,
+                    ..TestGate::default()
+                },
+            )
+            .await
+        }
+
         async fn land_with_filters(
             &self,
             accepted: Vec<AcceptedPair>,
@@ -2167,6 +3616,10 @@ mod tests {
                 remote: "origin".into(),
                 accepted,
                 test_filters,
+                cargo_build_jobs: 1,
+                remote_gate: None,
+                tmpfs_min_free_gb: 12,
+                disk_scratch_shards: BTreeSet::new(),
             })
             .await
         }
@@ -2217,6 +3670,34 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn assert_source_clean(repo: &Path) {
+        assert_eq!(git_value(repo, &["status", "--porcelain=v1"]), "");
+    }
+
+    struct ScopedCargoTarget(Option<std::ffi::OsString>);
+
+    impl ScopedCargoTarget {
+        fn set(path: &Path) -> Self {
+            let old = std::env::var_os("CARGO_TARGET_DIR");
+            // Fixture tests serialize environment changes through ENV_LOCK.
+            unsafe { std::env::set_var("CARGO_TARGET_DIR", path) };
+            Self(old)
+        }
+    }
+
+    impl Drop for ScopedCargoTarget {
+        fn drop(&mut self) {
+            // Restore before releasing Fixture's ENV_LOCK.
+            unsafe {
+                if let Some(old) = &self.0 {
+                    std::env::set_var("CARGO_TARGET_DIR", old);
+                } else {
+                    std::env::remove_var("CARGO_TARGET_DIR");
+                }
+            }
+        }
+    }
+
     fn use_fake_path(fixture: &Fixture) -> Option<std::ffi::OsString> {
         let old = std::env::var_os("PATH");
         let path = format!(
@@ -2261,6 +3742,1128 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn paired_test_gate_handles_identical_new_fixed_and_flaky_reds() {
+        for scenario in ["identical", "new", "fixed", "flaky"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"candidate\" }\n",
+                "candidate",
+            );
+            let candidate_tree = fixture.root.path().join("candidate-gate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    candidate_tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let log = fixture.root.path().join("gate-runs");
+            let target_log = fixture.root.path().join("gate-targets");
+            let marker = fixture.root.path().join("flaky-first-run");
+            let base_fails = matches!(scenario, "identical" | "fixed");
+            let candidate_fails = matches!(scenario, "identical" | "new" | "flaky");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> '{log}'\nprintf '%s\\t%s\\n' \"$oid\" \"$CARGO_TARGET_DIR\" >> '{target_log}'\nif [ \"$oid\" = '{base}' ] && [ '{base_fails}' = true ]; then echo 'test demo::red ... FAILED'; exit 1; fi\nif [ \"$oid\" = '{candidate}' ] && [ '{candidate_fails}' = true ]; then\n  if [ '{scenario}' = flaky ]; then\n    if [ ! -e '{marker}' ]; then : > '{marker}'; echo 'test demo::red ... FAILED'; exit 1; fi\n  else echo 'test demo::red ... FAILED'; exit 1; fi\nfi",
+                log = log.display(), target_log = target_log.display(), base = fixture.base, candidate = candidate,
+                marker = marker.display(),
+            ));
+            let spec = GuardSpec {
+                commands: vec![cargo_guard_command("demo", None)],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &candidate_tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let lines = fs::read_to_string(log).unwrap();
+            let candidate_runs = lines.lines().filter(|oid| *oid == candidate).count();
+            match scenario {
+                "identical" => {
+                    result.expect("identical baseline red is allowed");
+                    assert!(gate.base_reds.contains("demo::red"));
+                    assert_eq!(candidate_runs, 1);
+                }
+                "new" => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .contains("new test failures relative to rolling")
+                    );
+                    assert_eq!(candidate_runs, 2);
+                }
+                "fixed" => {
+                    result.expect("fixed baseline red is allowed");
+                    assert!(gate.base_reds.contains("demo::red"));
+                    assert_eq!(candidate_runs, 1);
+                }
+                "flaky" => {
+                    result.expect("isolated retry classifies a flake");
+                    assert!(gate.flakes.contains("demo::red"));
+                    assert_eq!(candidate_runs, 2);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(lines.lines().filter(|oid| *oid == fixture.base).count(), 1);
+            let targets = fs::read_to_string(target_log).unwrap();
+            let base_target = targets
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{}\t", fixture.base)))
+                .unwrap();
+            let candidate_target = targets
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{candidate}\t")))
+                .unwrap();
+            assert_ne!(base_target, candidate_target);
+            assert!(base_target.starts_with(fixture.root.path().to_str().unwrap()));
+            assert!(candidate_target.starts_with(fixture.root.path().to_str().unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_base_shard_cache_reuses_lander_and_qa_results() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let candidate_tree = fixture.root.path().join("cache-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let log = fixture.root.path().join("shard-runs.log");
+        let cache_root = fixture.root.path().join("shared-cache");
+        let spec = GuardSpec {
+            commands: vec![rsid_shard_guard_command("store-01").unwrap()],
+            env: BTreeMap::from([
+                ("RSI_QA899_RUN_LOG".into(), log.display().to_string()),
+                ("RSI_QA899_FAIL_ON_OID".into(), "none".into()),
+            ]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let mut first = TestGate {
+            cache_root: Some(cache_root.clone()),
+            ..TestGate::default()
+        };
+        run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &spec,
+            &mut first,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("initial base and candidate run");
+        let first_log = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            first_log.lines().filter(|oid| *oid == fixture.base).count(),
+            1
+        );
+        let mut reused = TestGate {
+            cache_root: Some(cache_root.clone()),
+            ..TestGate::default()
+        };
+        run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &spec,
+            &mut reused,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("reuse cached base");
+        let second_log = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            second_log
+                .lines()
+                .filter(|oid| *oid == fixture.base)
+                .count(),
+            1
+        );
+        assert!(
+            reused
+                .base_reused
+                .contains(&format!("{}:store-01:lander", fixture.base))
+        );
+
+        let fingerprint = "sha256:".to_owned() + &"a".repeat(64);
+        let qa_root = fixture.root.path().join("qa-cache");
+        let slot =
+            base_cache::BaseShardSlot::acquire(&qa_root, &fixture.base, "store-01", &fingerprint)
+                .await
+                .unwrap();
+        slot.write(&base_cache::BaseShardEntry::new(
+            &fixture.base,
+            "store-01",
+            &fingerprint,
+            BTreeSet::new(),
+            "qa:QA.md",
+        ))
+        .unwrap();
+        drop(slot);
+        let mut qa_reused = TestGate {
+            cache_root: Some(qa_root),
+            ..TestGate::default()
+        };
+        run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &spec,
+            &mut qa_reused,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("reuse QA base result");
+        assert!(
+            qa_reused
+                .base_reused
+                .contains(&format!("{}:store-01:qa:QA.md", fixture.base))
+        );
+
+        let mut candidate_red_spec = spec.clone();
+        candidate_red_spec
+            .env
+            .insert("RSI_QA899_FAIL_ON_OID".into(), candidate.clone());
+        fixture.add_fake_cargo(
+            "if [ \"$1\" = test ]; then echo 'test demo::red ... FAILED'; exit 1; fi",
+        );
+        let mut candidate_red = TestGate {
+            cache_root: Some(fixture.root.path().join("shared-cache")),
+            ..TestGate::default()
+        };
+        let old_path = use_fake_path(&fixture);
+        let result = run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &candidate_red_spec,
+            &mut candidate_red,
+            &BTreeSet::new(),
+        )
+        .await;
+        restore_path(old_path);
+        let error = result.expect_err("cached base must not waive a candidate regression");
+        assert!(
+            error.contains("new test failures relative to rolling"),
+            "{error}"
+        );
+        assert!(
+            candidate_red
+                .base_reused
+                .contains(&format!("{}:store-01:lander", fixture.base))
+        );
+
+        let base_tree = first.base_worktrees.get(&fixture.base).unwrap();
+        git_run(
+            &fixture.repo,
+            &["worktree", "remove", base_tree.to_str().unwrap()],
+        );
+        let mismatch = fixture.commit(
+            &candidate,
+            "scripts/rolling-shard-fingerprint.py",
+            "print('sha256:' + 'b' * 64)\n",
+            "different toolchain fingerprint",
+        );
+        let mismatch_tree = fixture.root.path().join("cache-mismatch");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                mismatch_tree.to_str().unwrap(),
+                &mismatch,
+            ],
+        );
+        let mut different = TestGate {
+            cache_root: Some(cache_root),
+            ..TestGate::default()
+        };
+        run_affected_gate(
+            &fixture.repo,
+            &mismatch_tree,
+            &fixture.base,
+            &spec,
+            &mut different,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("different fingerprint recomputes base");
+        let final_log = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            final_log.lines().filter(|oid| *oid == fixture.base).count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_cached_base_confirms_candidate_red_on_local_base() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let candidate_tree = fixture.root.path().join("qa-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let cache_root = fixture.root.path().join("qa-cache");
+        let fingerprint = "sha256:".to_owned() + &"a".repeat(64);
+        let slot = base_cache::BaseShardSlot::acquire(
+            &cache_root,
+            &fixture.base,
+            "store-01",
+            &fingerprint,
+        )
+        .await
+        .unwrap();
+        slot.write(&base_cache::BaseShardEntry::new(
+            &fixture.base,
+            "store-01",
+            &fingerprint,
+            BTreeSet::new(),
+            "qa:same-host:QA.json",
+        ))
+        .unwrap();
+        drop(slot);
+        fixture.add_fake_cargo(
+            "if [ \"$1\" = test ]; then
+  oid=$(/usr/bin/git rev-parse HEAD)
+  printf '%s\\n' \"$oid\" >> \"$RSI_QA_LOCAL_RUN_LOG\"
+  if [ \"$oid\" = \"$RSI_QA_BASE_OID\" ]; then
+    case \"$RSI_QA_CONFIRM_MODE\" in
+      red) echo 'test demo::red ... FAILED'; exit 1;;
+      green) echo 'running 1 test'; echo 'test demo::red ... ok'; exit 0;;
+      broken) echo 'local executor failed' >&2; exit 1;;
+    esac
+  fi
+  echo 'test demo::red ... FAILED'; exit 1
+fi",
+        );
+        let shard_log = fixture.root.path().join("qa-shard-runs.log");
+        let local_log = fixture.root.path().join("qa-local-runs.log");
+        let mut spec = GuardSpec {
+            commands: vec![rsid_shard_guard_command("store-01").unwrap()],
+            env: BTreeMap::from([
+                ("RSI_QA899_RUN_LOG".into(), shard_log.display().to_string()),
+                ("RSI_QA899_FAIL_ON_OID".into(), candidate.clone()),
+                ("RSI_QA_BASE_OID".into(), fixture.base.clone()),
+                (
+                    "RSI_QA_LOCAL_RUN_LOG".into(),
+                    local_log.display().to_string(),
+                ),
+            ]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let mut gate = TestGate {
+            cache_root: Some(cache_root.clone()),
+            ..TestGate::default()
+        };
+        let old_path = use_fake_path(&fixture);
+        for mode in ["red", "green", "broken"] {
+            spec.env.insert("RSI_QA_CONFIRM_MODE".into(), mode.into());
+            let result = run_affected_gate(
+                &fixture.repo,
+                &candidate_tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            match mode {
+                "red" => {
+                    result.expect("local base red waives a QA cache false refusal");
+                    assert!(gate.base_reds.contains("demo::red"));
+                    assert!(gate.local_base_confirmed.contains(&format!(
+                        "{}:demo::red:red:qa:same-host:QA.json",
+                        fixture.base
+                    )));
+                }
+                "green" => {
+                    let error = result.expect_err("local base green keeps candidate refusal");
+                    assert!(
+                        error.contains("isolated local base passed demo::red"),
+                        "{error}"
+                    );
+                    assert!(error.contains("qa:same-host:QA.json"), "{error}");
+                }
+                "broken" => {
+                    let error = result.expect_err("local base execution failure fails closed");
+                    assert!(
+                        error.contains("local base confirmation failed closed"),
+                        "{error}"
+                    );
+                    assert!(error.contains("local executor failed"), "{error}");
+                }
+                _ => unreachable!(),
+            }
+        }
+        restore_path(old_path);
+        assert_eq!(
+            fs::read_to_string(&shard_log)
+                .unwrap()
+                .lines()
+                .filter(|oid| *oid == candidate)
+                .count(),
+            3
+        );
+        assert_eq!(fs::read_to_string(local_log).unwrap().lines().count(), 6);
+        let slot = base_cache::BaseShardSlot::acquire(
+            &cache_root,
+            &fixture.base,
+            "store-01",
+            &fingerprint,
+        )
+        .await
+        .unwrap();
+        assert!(slot.read().unwrap().unwrap().failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn qa_cache_from_another_host_class_is_not_reused() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "scripts/rolling-shard-fingerprint.py",
+            "import os\nclass_name = os.environ.get('RSI_QA_HOST_CLASS')\nprint('sha256:' + ('a' if class_name == 'desktop' else 'b') * 64)\n",
+            "fingerprint by host class",
+        );
+        let candidate_tree = fixture.root.path().join("class-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let cache_root = fixture.root.path().join("qa-cache");
+        let desktop_fingerprint = "sha256:".to_owned() + &"a".repeat(64);
+        let slot = base_cache::BaseShardSlot::acquire(
+            &cache_root,
+            &fixture.base,
+            "store-01",
+            &desktop_fingerprint,
+        )
+        .await
+        .unwrap();
+        slot.write(&base_cache::BaseShardEntry::new(
+            &fixture.base,
+            "store-01",
+            &desktop_fingerprint,
+            BTreeSet::new(),
+            "qa:desktop:QA.json",
+        ))
+        .unwrap();
+        drop(slot);
+        let log = fixture.root.path().join("class-shard-runs.log");
+        let spec = GuardSpec {
+            commands: vec![rsid_shard_guard_command("store-01").unwrap()],
+            env: BTreeMap::from([
+                ("RSI_QA899_RUN_LOG".into(), log.display().to_string()),
+                ("RSI_QA899_FAIL_ON_OID".into(), "none".into()),
+            ]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let previous = std::env::var_os("RSI_QA_HOST_CLASS");
+        unsafe { std::env::set_var("RSI_QA_HOST_CLASS", "desktop") };
+        let mut desktop = TestGate {
+            cache_root: Some(cache_root.clone()),
+            ..TestGate::default()
+        };
+        let first = run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &spec,
+            &mut desktop,
+            &BTreeSet::new(),
+        )
+        .await;
+        unsafe { std::env::set_var("RSI_QA_HOST_CLASS", "cloud") };
+        let mut cloud = TestGate {
+            cache_root: Some(cache_root),
+            ..TestGate::default()
+        };
+        let second = run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &fixture.base,
+            &spec,
+            &mut cloud,
+            &BTreeSet::new(),
+        )
+        .await;
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("RSI_QA_HOST_CLASS", previous);
+            } else {
+                std::env::remove_var("RSI_QA_HOST_CLASS");
+            }
+        }
+        first.expect("same host class may reuse exact QA base");
+        second.expect("different host class recomputes base");
+        assert!(
+            desktop
+                .base_reused
+                .contains(&format!("{}:store-01:qa:desktop:QA.json", fixture.base))
+        );
+        assert!(cloud.base_reused.is_empty());
+        assert_eq!(
+            fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter(|oid| *oid == fixture.base)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_green_filter_cannot_bypass_affected_tests() {
+        let fixture = Fixture::new();
+        let source = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"regression\" }\n",
+            "new regression",
+        );
+        fixture.add_fake_cargo(&format!(
+            "if [ \"$1\" = test ] && [ \"$(/usr/bin/git rev-parse HEAD)\" = '{source}' ]; then\n  case \"$5\" in --|demo::regression) echo 'test demo::regression ... FAILED'; exit 1;; esac\nfi"
+        ));
+        let old_path = use_fake_path(&fixture);
+        let result = fixture
+            .land_with_filters(
+                vec![AcceptedPair {
+                    base: fixture.base.clone(),
+                    source,
+                }],
+                vec!["demo=unrelated_green_test".into()],
+            )
+            .await;
+        restore_path(old_path);
+        let failure = result.expect_err("unrelated filter must not hide a new red");
+        assert_eq!(failure.state, PublicationState::NotPublished);
+        assert!(failure.message.contains("demo::regression"), "{failure:?}");
+        assert_eq!(
+            git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+            fixture.base
+        );
+    }
+
+    #[test]
+    fn nextest_failure_names_are_compared_by_test_identity() {
+        let output = "    FAIL [  0.123s] ( 76/338) rsid store::tests::baseline_red\n    FAIL [  0.456s] (139/338) rsid store::tests::new_red\n";
+        assert_eq!(
+            test_failure_names(output),
+            BTreeSet::from([
+                "store::tests::baseline_red".to_string(),
+                "store::tests::new_red".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn shard_retry_targets_only_the_candidate_failure() {
+        let command = rsid_shard_guard_command("store-01:test(existing_filter)").unwrap();
+        let retry = isolated_retry_command(&command, "store::tests::new_red").unwrap();
+        assert_eq!(retry.program, "cargo");
+        assert_eq!(
+            retry.args,
+            [
+                "test",
+                "-p",
+                "rsid",
+                "--lib",
+                "--no-default-features",
+                "--features",
+                "test-shard-store-01",
+                "store::tests::new_red",
+                "--",
+                "--exact",
+                "--test-threads=4",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_target_reuses_gate_for_disjoint_paths_and_regates_overlap() {
+        for overlapping in [false, true] {
+            let fixture = Fixture::new();
+            let (base, source, incoming) = if overlapping {
+                let original = (1..=20).fold(String::new(), |mut lines, line| {
+                    let _ = writeln!(lines, "line {line}");
+                    lines
+                });
+                let setup = fixture.commit(&fixture.base, "race.txt", &original, "race setup");
+                git_run(
+                    &fixture.repo,
+                    &[
+                        "push",
+                        "-q",
+                        "origin",
+                        &format!("{setup}:refs/heads/rolling"),
+                    ],
+                );
+                let first = fixture.commit(
+                    &setup,
+                    "crates/demo/src/lib.rs",
+                    "pub fn value() -> &'static str { \"source\" }\n",
+                    "source crate",
+                );
+                let source = fixture.commit(
+                    &first,
+                    "race.txt",
+                    &original.replace("line 2\n", "source line 2\n"),
+                    "source race file",
+                );
+                let incoming = fixture.commit(
+                    &setup,
+                    "race.txt",
+                    &original.replace("line 18\n", "incoming line 18\n"),
+                    "incoming race file",
+                );
+                (setup, source, incoming)
+            } else {
+                let source = fixture.commit(
+                    &fixture.base,
+                    "crates/demo/src/lib.rs",
+                    "pub fn value() -> &'static str { \"source\" }\n",
+                    "source crate",
+                );
+                let incoming = fixture.commit(
+                    &fixture.base,
+                    "incoming.txt",
+                    "incoming\n",
+                    "incoming disjoint file",
+                );
+                (fixture.base.clone(), source, incoming)
+            };
+            let marker = fixture.root.path().join("advanced-once");
+            let log = fixture.root.path().join("tested-commits");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> '{log}'\nif [ \"$oid\" = '{source}' ] && [ ! -e '{marker}' ]; then\n  : > '{marker}'\n  /usr/bin/git -C '{repo}' push -q origin '{incoming}:refs/heads/rolling' || exit 43\nfi",
+                log = log.display(), marker = marker.display(), repo = fixture.repo.display(),
+            ));
+            let old_path = use_fake_path(&fixture);
+            let result = fixture
+                .land(vec![AcceptedPair {
+                    base: base.clone(),
+                    source: source.clone(),
+                }])
+                .await;
+            restore_path(old_path);
+            let report = result.expect("stale candidate remade and published");
+            assert_eq!(report.fetched_tip, incoming);
+            assert_eq!(
+                git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+                report.published_tip
+            );
+            let tested = fs::read_to_string(log).unwrap();
+            assert_eq!(tested.lines().filter(|oid| *oid == source).count(), 1);
+            let remade_runs = tested
+                .lines()
+                .filter(|oid| *oid == report.candidate)
+                .count();
+            assert_eq!(remade_runs, 1);
+            assert_eq!(
+                report.canary_reused_tree.is_some(),
+                overlapping,
+                "a disjoint stale retry must execute the canary, while a gated retry reuses it"
+            );
+        }
+    }
+
+    // Stages chained rolling advances on the remote without moving rolling.
+    fn stage_advances(
+        fixture: &Fixture,
+        parent: &str,
+        contents: &[(String, String)],
+    ) -> Vec<String> {
+        let mut parent = parent.to_string();
+        let mut advances = Vec::new();
+        for (index, (file, content)) in contents.iter().enumerate() {
+            let next = fixture.commit(&parent, file, content, "incoming advance");
+            git_run(
+                &fixture.repo,
+                &[
+                    "push",
+                    "-q",
+                    "origin",
+                    &format!("{next}:refs/heads/race-{index}"),
+                ],
+            );
+            advances.push(next.clone());
+            parent = next;
+        }
+        advances
+    }
+
+    fn expected_stale_history(
+        start: &str,
+        advances: &[String],
+        reused_gate: bool,
+    ) -> Vec<StaleRetry> {
+        let mut fetched = start.to_string();
+        advances
+            .iter()
+            .map(|observed| StaleRetry {
+                fetched: std::mem::replace(&mut fetched, observed.clone()),
+                observed: observed.clone(),
+                reused_gate,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn consecutive_disjoint_stale_advances_publish_without_regating() {
+        // Issue #952: landers publishing seconds apart. One advance lands
+        // during the gate; each later one wins the race against our push,
+        // which the remote rejects (`cannot lock ref`). Two push races
+        // exhausted the former two-retry budget and lost a 93-minute gate.
+        for push_races in [1_usize, 2] {
+            let fixture = Fixture::new();
+            let source = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"source\" }\n",
+                "source crate",
+            );
+            let contents = (0..=push_races)
+                .map(|index| (format!("incoming-{index}.txt"), "incoming\n".to_string()))
+                .collect::<Vec<_>>();
+            let advances = stage_advances(&fixture, &fixture.base, &contents);
+            let marker = fixture.root.path().join("advanced-once");
+            let log = fixture.root.path().join("tested-commits");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> '{log}'\nif [ \"$oid\" = '{source}' ] && [ ! -e '{marker}' ]; then\n  : > '{marker}'\n  /usr/bin/git --git-dir='{bare}' update-ref refs/heads/rolling '{first}' || exit 43\nfi",
+                log = log.display(),
+                marker = marker.display(),
+                bare = fixture.bare.display(),
+                first = advances[0],
+            ));
+            let races = fixture.root.path().join("push-races");
+            fs::write(&races, format!("{}\n", advances[1..].join("\n"))).unwrap();
+            fixture.add_fake_git_behaviors(
+                "",
+                &format!(
+                    "next=$(head -n 1 '{races}')\nif [ -n \"$next\" ]; then\n  sed -i 1d '{races}'\n  /usr/bin/git --git-dir='{bare}' update-ref refs/heads/rolling \"$next\" || exit 44\n  echo 'remote rejected: cannot lock ref refs/heads/rolling' >&2\n  exit 1\nfi\nexec /usr/bin/git \"$@\"",
+                    races = races.display(),
+                    bare = fixture.bare.display(),
+                ),
+            );
+            let old_path = use_fake_path(&fixture);
+            let result = fixture
+                .land(vec![AcceptedPair {
+                    base: fixture.base.clone(),
+                    source: source.clone(),
+                }])
+                .await;
+            restore_path(old_path);
+            let report = result.expect("every disjoint stale advance is retried to publication");
+            let last = advances.last().unwrap();
+            assert_eq!(&report.fetched_tip, last);
+            assert_eq!(
+                git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+                report.published_tip
+            );
+            assert_eq!(
+                report.stale_retries,
+                expected_stale_history(&fixture.base, &advances, true)
+            );
+            let receipt = stale_retry_lines(&report.stale_retries);
+            assert_eq!(receipt[0], format!("stale_attempts={}", push_races + 1));
+            assert_eq!(
+                receipt[1],
+                format!(
+                    "stale_retry_1={}..{}:gate_reused",
+                    fixture.base, advances[0]
+                )
+            );
+            let tested = fs::read_to_string(&log).unwrap();
+            assert_eq!(tested.lines().filter(|oid| *oid == source).count(), 1);
+            assert_eq!(
+                tested
+                    .lines()
+                    .filter(|oid| *oid == report.published_tip)
+                    .count(),
+                1,
+                "the published tip runs its canary once"
+            );
+            // Base-side runs test rolling tips; only the intermediate remade
+            // candidates, which were never published, must stay ungated.
+            assert!(
+                tested.lines().all(|oid| oid == source
+                    || oid == report.published_tip
+                    || oid == fixture.base
+                    || advances.iter().any(|advance| advance == oid)),
+                "no remade candidate is re-gated: {tested}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_stale_advances_stop_at_the_regated_budget_with_history() {
+        let fixture = Fixture::new();
+        let original = (1..=20).fold(String::new(), |mut lines, line| {
+            let _ = writeln!(lines, "line {line}");
+            lines
+        });
+        let setup = fixture.commit(&fixture.base, "race.txt", &original, "race setup");
+        git_run(
+            &fixture.repo,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{setup}:refs/heads/rolling"),
+            ],
+        );
+        let first = fixture.commit(
+            &setup,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"source\" }\n",
+            "source crate",
+        );
+        let source = fixture.commit(
+            &first,
+            "race.txt",
+            &original.replace("line 2\n", "source line 2\n"),
+            "source race file",
+        );
+        let mut edited = original.clone();
+        let contents = [8, 13, 18]
+            .iter()
+            .map(|line| {
+                edited = edited.replace(
+                    &format!("line {line}\n"),
+                    &format!("incoming line {line}\n"),
+                );
+                ("race.txt".to_string(), edited.clone())
+            })
+            .collect::<Vec<_>>();
+        let advances = stage_advances(&fixture, &setup, &contents);
+        let pending = fixture.root.path().join("pending-advances");
+        fs::write(&pending, format!("{}\n", advances.join("\n"))).unwrap();
+        // Rolling tips run only as base-side comparisons; mark them seen.
+        let seen = fixture.root.path().join("gated-commits");
+        fs::write(&seen, format!("{setup}\n{}\n", advances.join("\n"))).unwrap();
+        // Every newly gated candidate loses the race to the next advance.
+        fixture.add_fake_cargo(&format!(
+            "oid=$(/usr/bin/git rev-parse HEAD)\nnext=$(head -n 1 '{pending}')\nif [ -n \"$next\" ] && ! grep -qx \"$oid\" '{seen}'; then\n  printf '%s\\n' \"$oid\" >> '{seen}'\n  sed -i 1d '{pending}'\n  /usr/bin/git --git-dir='{bare}' update-ref refs/heads/rolling \"$next\" || exit 43\nfi",
+            pending = pending.display(),
+            seen = seen.display(),
+            bare = fixture.bare.display(),
+        ));
+        let old_path = use_fake_path(&fixture);
+        let result = fixture
+            .land(vec![AcceptedPair {
+                base: setup.clone(),
+                source,
+            }])
+            .await;
+        restore_path(old_path);
+        let failure = result.expect_err("a third overlapping advance exceeds the re-gated budget");
+        assert_eq!(failure.state, PublicationState::NotPublished, "{failure:?}");
+        assert!(
+            failure.message.contains("stale retries exhausted"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.observed_tip.as_deref(),
+            advances.last().map(String::as_str)
+        );
+        assert_eq!(
+            failure.stale_retries,
+            expected_stale_history(&setup, &advances[..2], false)
+        );
+        let evidence = failure.evidence_lines();
+        assert!(
+            evidence.contains(&"stale_attempts=2".to_string()),
+            "{evidence:?}"
+        );
+        assert!(
+            evidence.contains(&format!(
+                "stale_retry_2={}..{}:regated",
+                advances[0], advances[1]
+            )),
+            "{evidence:?}"
+        );
+        assert_eq!(
+            git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+            *advances.last().unwrap()
+        );
+    }
+
+    fn provisional_stale_fixture(
+        fixture: &Fixture,
+        change: &str,
+    ) -> (PathBuf, PathBuf, String, String, String) {
+        let repo = fixture.root.path().join(format!("migration-{change}"));
+        let bare = fixture.root.path().join(format!("migration-{change}.git"));
+        let setup = r#"
+import importlib.util, json, pathlib, shutil, subprocess, sys
+root, destination, bare = map(pathlib.Path, sys.argv[1:4])
+change = sys.argv[4]
+spec = importlib.util.spec_from_file_location('migration_test', root / 'scripts/tests/test_rolling_migration_renumber.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+case = module.ProvisionalMigrationTest('test_two_v130_sources_land_as_v130_v131_with_exact_parents_and_proofs')
+case.setUp()
+repo = case.repo
+for name in ('scripts/rolling-landing-guard.py', 'tools/check-released-migrations.py', 'tools/rolling-migration-renumber.py'):
+    case.write(repo, name, (root / name).read_text())
+case.write(repo, 'Cargo.toml', '[workspace]\nmembers = ["crates/rsid"]\nresolver = "2"\n')
+protected_path = 'crates/rsid/src/store/protected_fixture.rs'
+protected_text = '// RSI-RELEASED-MIGRATION-BEGIN: fixture-section\n// pinned\n// RSI-RELEASED-MIGRATION-END: fixture-section\n'
+case.write(repo, protected_path, protected_text)
+inventory = module.RENUMBER.guard.inventory({
+    module.RENUMBER.STORE: case.base_store(),
+    'crates/rsid/src/store/cohort_settlement.rs': '',
+    'crates/rsid/src/store/tests.rs': case.base_tests(),
+    protected_path: protected_text,
+})
+case.write(repo, module.RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + '\n')
+case.write(repo, 'scripts/run-rsid-test-shards.sh', '''#!/bin/sh
+oid=$(/usr/bin/git rev-parse HEAD)
+printf '%s\\n' "$oid" >> "$LANDER924_LOG"
+if [ "$oid" != "$LANDER924_BASE" ] && [ ! -e "$LANDER924_MARKER" ]; then
+  : > "$LANDER924_MARKER"
+  if [ "$LANDER924_CHANGE" = proof ]; then
+    private=$(/usr/bin/git rev-parse --git-common-dir)
+    printf '%s\\n' 'raise SystemExit(43)' > "${private%/.git}/tools/rolling-migration-renumber.py"
+  fi
+  /usr/bin/git -C "$LANDER924_REPO" push -q origin "$LANDER924_INCOMING:refs/heads/rolling" || exit 43
+fi
+exit 0
+''')
+(repo / 'scripts/run-rsid-test-shards.sh').chmod(0o755)
+case.git(repo, 'add', '.')
+case.git(repo, 'commit', '-q', '-m', 'landing support')
+case.base = case.git(repo, 'rev-parse', 'HEAD')
+source = case.source('alpha')
+case.git(repo, 'update-ref', 'refs/heads/source-for-landing', source)
+if change == 'version':
+    second = case.source('beta')
+    _, incoming = case.candidate(second, case.base)
+else:
+    worktree = pathlib.Path(case.temp.name) / 'incoming'
+    case.git(repo, 'worktree', 'add', '-q', '--detach', str(worktree), case.base)
+    if change == 'store':
+        filename = 'crates/rsid/src/store/mod.rs'
+        (worktree / filename).chmod(0o755)
+    elif change == 'catalog':
+        filename = 'tools/released-migrations.json'
+        (worktree / filename).chmod(0o755)
+    elif change in ('renumber_tool', 'released_tool', 'guard_tool', 'cohort', 'protected'):
+        filename = {
+            'renumber_tool': 'tools/rolling-migration-renumber.py',
+            'released_tool': 'tools/check-released-migrations.py',
+            'guard_tool': 'scripts/rolling-landing-guard.py',
+            'cohort': 'crates/rsid/src/store/cohort_settlement.rs',
+            'protected': protected_path,
+        }[change]
+        comment = '# incoming\n' if change.endswith('tool') else '// incoming\n'
+        case.write(worktree, filename, (worktree / filename).read_text() + comment)
+    else:
+        filename = 'incoming.txt'
+        case.write(worktree, filename, 'incoming\n')
+    case.git(worktree, 'add', filename)
+    case.git(worktree, 'commit', '-q', '-m', 'incoming')
+    incoming = case.git(worktree, 'rev-parse', 'HEAD')
+case.git(repo, 'update-ref', 'refs/heads/incoming-for-landing', incoming)
+subprocess.run(['git', 'init', '--bare', '-q', str(bare)], check=True)
+case.git(repo, 'push', '-q', str(bare), f'{case.base}:refs/heads/rolling')
+subprocess.run(['git', 'clone', '-q', str(repo), str(destination)], check=True)
+case.git(destination, 'remote', 'set-url', 'origin', str(bare))
+print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
+"#;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(setup)
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .arg(&repo)
+            .arg(&bare)
+            .arg(change)
+            .output()
+            .expect("migration fixture script");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let details: Value = serde_json::from_slice(&output.stdout).expect("fixture details");
+        (
+            repo,
+            bare,
+            details["base"].as_str().unwrap().into(),
+            details["source"].as_str().unwrap().into(),
+            details["incoming"].as_str().unwrap().into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn provisional_stale_retry_regenerates_or_refuses_proof() {
+        for change in [
+            "disjoint",
+            "store",
+            "catalog",
+            "renumber_tool",
+            "released_tool",
+            "guard_tool",
+            "cohort",
+            "protected",
+            "version",
+            "proof",
+        ] {
+            let fixture = Fixture::new();
+            let (repo, bare, base, source, incoming) = provisional_stale_fixture(&fixture, change);
+            let work_rows = fixture.root.path().join("work-rows.json");
+            fs::write(
+                &work_rows,
+                serde_json::json!([{
+                    "key": "test-migration", "epic_id": "test-epic",
+                    "source_commit": source, "source_accepted": true,
+                    "migration_reservations": [{
+                        "version": 130, "active": true,
+                        "work_key": "test-migration", "row_version": 1
+                    }]
+                }])
+                .to_string(),
+            )
+            .unwrap();
+            unsafe { std::env::set_var("RSI_LANDER_TEST_WORK_ROWS", &work_rows) };
+            // The source holds the one live V130 seal with no lower predecessor,
+            // so the gate never reaches the caller's live migration ledger.
+            let allocation_rows = fixture.root.path().join("allocation-rows.json");
+            fs::write(
+                &allocation_rows,
+                serde_json::json!([{
+                    "source_commit": source, "version": 130,
+                    "state": "active", "predecessor_sources": []
+                }])
+                .to_string(),
+            )
+            .unwrap();
+            unsafe { std::env::set_var("RSI_LANDER_TEST_ALLOCATION_ROWS", &allocation_rows) };
+            let marker = fixture.root.path().join("advanced-once");
+            let log = fixture.root.path().join("tested-commits");
+            let metadata = serde_json::json!({
+                "workspace_members": ["rsid"],
+                "packages": [{"id":"rsid","name":"rsid","dependencies":[]}],
+            });
+            let cargo = fixture.bin.join("cargo");
+            fs::write(&cargo, format!(
+                "#!/bin/sh\nif [ \"$1\" = metadata ]; then printf '%s\\n' '{metadata}'; exit 0; fi\nexit 0\n",
+            )).unwrap();
+            let mut permissions = fs::metadata(&cargo).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&cargo, permissions).unwrap();
+            for (key, value) in [
+                ("LANDER924_LOG", log.to_string_lossy().into_owned()),
+                ("LANDER924_MARKER", marker.to_string_lossy().into_owned()),
+                ("LANDER924_BASE", base.clone()),
+                ("LANDER924_REPO", repo.to_string_lossy().into_owned()),
+                ("LANDER924_INCOMING", incoming.clone()),
+                ("LANDER924_CHANGE", change.to_owned()),
+            ] {
+                unsafe { std::env::set_var(key, value) };
+            }
+            let old_path = use_fake_path(&fixture);
+            let result = land(Options {
+                repo: repo.clone(),
+                remote: "origin".into(),
+                accepted: vec![AcceptedPair {
+                    base: base.clone(),
+                    source,
+                }],
+                test_filters: Vec::new(),
+                cargo_build_jobs: 1,
+                remote_gate: None,
+                tmpfs_min_free_gb: 12,
+                disk_scratch_shards: BTreeSet::new(),
+            })
+            .await;
+            for key in [
+                "LANDER924_LOG",
+                "LANDER924_MARKER",
+                "LANDER924_BASE",
+                "LANDER924_REPO",
+                "LANDER924_INCOMING",
+                "LANDER924_CHANGE",
+            ] {
+                unsafe { std::env::remove_var(key) };
+            }
+            unsafe { std::env::remove_var("RSI_LANDER_TEST_WORK_ROWS") };
+            unsafe { std::env::remove_var("RSI_LANDER_TEST_ALLOCATION_ROWS") };
+            restore_path(old_path);
+            if change == "version" || change == "proof" {
+                let failure = result.expect_err("stale proof must refuse");
+                assert_eq!(failure.state, PublicationState::NotPublished, "{failure:?}");
+                assert!(
+                    failure.message.contains(if change == "version" {
+                        "version changed"
+                    } else {
+                        "provisional migration refused"
+                    }),
+                    "{failure:?}"
+                );
+                assert_eq!(
+                    git_value(&bare, &["rev-parse", "refs/heads/rolling"]),
+                    incoming
+                );
+            } else {
+                let report = result.expect("stale provisional migration publishes");
+                assert_eq!(report.fetched_tip, incoming);
+                assert_eq!(report.provisional.len(), 1);
+                assert_eq!(report.provisional[0].proof["target"], incoming);
+                assert_eq!(report.canary_reused_tree.is_some(), change != "disjoint");
+                assert_eq!(
+                    git_value(&bare, &["rev-parse", "refs/heads/rolling"]),
+                    report.published_tip
+                );
+            }
+        }
+    }
+
     #[test]
     fn committed_released_guard_replaces_dirty_worktree_copy() {
         let fixture = Fixture::new();
@@ -2276,7 +4879,7 @@ mod tests {
     }
 
     #[test]
-    fn hermetic_hot_file_requires_live_claim_bound_to_accepted_source() {
+    fn hermetic_hot_file_allows_unbound_source_unless_another_work_claims_it() {
         let fixture = Fixture::new();
         let source = fixture.commit(&fixture.base, "AGENTS.md", "policy\n", "hot file");
         let accepted = [AcceptedPair {
@@ -2294,31 +4897,16 @@ mod tests {
             )
         };
         check(vec![policy_work(&source, "AGENTS.md", 125)]).expect("live claim passes");
-        assert!(
-            check(vec![])
-                .unwrap_err()
-                .message
-                .contains("lacks a visible live Work")
-        );
+        check(vec![]).expect("an unbound Tier-0/1 source can publish without a claim");
         let wrong_source = fixture.base.clone();
         assert!(
             check(vec![policy_work(&wrong_source, "AGENTS.md", 125)])
                 .unwrap_err()
                 .message
-                .contains("lacks a visible live Work")
+                .contains("claimed by another live unintegrated Work")
         );
-        assert!(
-            check(vec![policy_work(&source, "other.md", 125)])
-                .unwrap_err()
-                .message
-                .contains("no live exclusive landing ownership")
-        );
-        assert_eq!(
-            check(vec![policy_work(&source, "other.md", 125)])
-                .unwrap_err()
-                .fence,
-            landing_policy::PolicyFence::HotFileUnowned
-        );
+        check(vec![policy_work(&source, "other.md", 125)])
+            .expect("a claim on another path does not block this landing");
     }
 
     #[test]
@@ -2394,6 +4982,137 @@ mod tests {
     }
 
     #[test]
+    fn cargo_build_jobs_defaults_to_four_and_accepts_positive_bounded_values() {
+        assert_eq!(parse_cargo_build_jobs(None).unwrap(), 4);
+        for jobs in 1..=6 {
+            let value = jobs.to_string();
+            assert_eq!(
+                parse_cargo_build_jobs(Some(std::ffi::OsStr::new(&value))).unwrap(),
+                jobs
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_build_jobs_rejects_invalid_values_clearly() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for value in [
+            b"".as_slice(),
+            b"0",
+            b"-1",
+            b"+1",
+            b"7",
+            b"256",
+            b"999999999999999999999999999999",
+            b"1.0",
+            b"auto",
+            b" 1",
+            b"1 ",
+            b"\xff",
+        ] {
+            assert_eq!(
+                parse_cargo_build_jobs(Some(std::ffi::OsStr::from_bytes(value))).unwrap_err(),
+                "CARGO_BUILD_JOBS must be a positive integer from 1 to 6 (default: 4)"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_build_jobs_one_preserves_all_guard_commands() {
+        let metadata = guard_workspace_metadata();
+        for (package, provisional) in [("rsid", false), ("rsi-common", false), ("rsid", true)] {
+            let packages = [package.to_string()];
+            let filters = [format!("{package}=focused_test")];
+            let spec = |jobs| {
+                affected_crate_guard_spec(
+                    "1111111111111111111111111111111111111111",
+                    "2222222222222222222222222222222222222222",
+                    &packages,
+                    &filters,
+                    provisional,
+                    &metadata,
+                    jobs,
+                )
+                .unwrap()
+            };
+            let default = spec(parse_cargo_build_jobs(None).unwrap());
+            let one = spec(parse_cargo_build_jobs(Some(std::ffi::OsStr::new("1"))).unwrap());
+            let mut expected_env = default.env.clone();
+            expected_env.insert("CARGO_BUILD_JOBS".into(), "1".into());
+            assert_eq!(one.env, expected_env);
+            assert_eq!(one.output_tail_bytes, default.output_tail_bytes);
+            assert_eq!(one.commands.len(), default.commands.len());
+            for (actual, expected) in one.commands.iter().zip(&default.commands) {
+                assert_eq!(actual.program, expected.program);
+                assert_eq!(actual.args, expected.args);
+                assert_eq!(actual.timeout, expected.timeout);
+            }
+        }
+    }
+
+    #[test]
+    fn rsid_shard_filter_uses_bounded_harness() {
+        let spec = affected_crate_guard_spec(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            &["rsid".into()],
+            &["rsid=shard:session-01".into()],
+            false,
+            &guard_workspace_metadata(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(spec.commands.len(), 1 + RSID_SHARDS.len());
+        assert!(spec.commands.iter().any(|command| {
+            command.program == "scripts/run-rsid-test-shards.sh"
+                && command.args == ["shard", "session-01", "--jobs", "4"]
+        }));
+        assert!(
+            spec.commands
+                .iter()
+                .any(|command| command.args == ["shard", "store-04", "--jobs", "4"])
+        );
+        assert!(rsid_shard_guard_command("unknown").is_err());
+        assert!(rsid_shard_guard_command("session-02:").is_err());
+        assert!(rsid_shard_guard_command("session-02:test()").is_err());
+        assert!(rsid_shard_guard_command("session-02:test(").is_err());
+        assert!(rsid_shard_guard_command("session-02:not(test(gap))").is_err());
+        let focused = rsid_shard_guard_command("session-02:test(manager_recovery_)").unwrap();
+        assert_eq!(
+            focused.args,
+            [
+                "shard",
+                "session-02",
+                "--jobs",
+                "4",
+                "--filterset",
+                "test(manager_recovery_)"
+            ]
+        );
+    }
+
+    #[test]
+    fn rsid_shard_filter_runner_accepts_lander_arguments() {
+        let guard = rsid_shard_guard_command("session-03:test(event_wake)").unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = Command::new(&guard.program)
+            .args(&guard.args)
+            .arg("--dry-run")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan = String::from_utf8(output.stdout).unwrap();
+        assert!(plan.contains("--runtime-shard session-03"));
+        assert!(plan.contains("--filterset test\\(event_wake\\)"));
+    }
+
+    #[test]
     fn provisional_guard_keeps_rewind_and_replay_tests_with_user_filter() {
         let spec = affected_crate_guard_spec(
             "1111111111111111111111111111111111111111",
@@ -2402,6 +5121,7 @@ mod tests {
             &["rsid=topology_v129".into()],
             true,
             &guard_workspace_metadata(),
+            4,
         )
         .expect("valid affected crate filter");
         assert_eq!(
@@ -2443,6 +5163,7 @@ mod tests {
             &["rsi-common=manager_operator_delegation".into()],
             false,
             &guard_workspace_metadata(),
+            4,
         )
         .expect("valid workspace graph");
         let cargo_commands = spec
@@ -2454,6 +5175,7 @@ mod tests {
         assert_eq!(
             cargo_commands,
             [
+                "test -p rsi-common --lib -- --test-threads=4",
                 "test -p rsi-common --lib manager_operator_delegation -- --test-threads=4",
                 "check -p rsi --all-targets",
                 "check -p rsi-graph --all-targets",
@@ -2468,15 +5190,18 @@ mod tests {
             &[],
             false,
             &guard_workspace_metadata(),
+            4,
         )
         .expect("valid single-crate change");
-        let cargo_commands = direct
+        let shard_commands = direct
             .commands
             .iter()
-            .filter(|command| command.program == "cargo")
-            .map(|command| command.args.join(" "))
+            .filter(|command| command.program == "scripts/run-rsid-test-shards.sh")
             .collect::<Vec<_>>();
-        assert_eq!(cargo_commands, ["test -p rsid --lib -- --test-threads=4"]);
+        assert_eq!(shard_commands.len(), RSID_SHARDS.len());
+        for (command, shard) in shard_commands.iter().zip(RSID_SHARDS) {
+            assert_eq!(command.args, ["shard", *shard, "--jobs", "4"]);
+        }
     }
 
     #[test]
@@ -2829,6 +5554,10 @@ mod tests {
             remote: "origin".into(),
             accepted: vec![pair.clone()],
             test_filters: Vec::new(),
+            cargo_build_jobs: 4,
+            remote_gate: None,
+            tmpfs_min_free_gb: 12,
+            disk_scratch_shards: BTreeSet::new(),
         };
         let error = run_guard_pair(
             &fixture.repo,
@@ -2853,15 +5582,10 @@ mod tests {
             "pub fn value() -> &'static str { \"accepted\" }\n",
             "accepted source",
         );
-        let first_run = fixture.root.path().join("prepublish-guard-passed");
-        fixture.add_fake_cargo(&format!(
-            "if [ -e '{}' ]; then exit 42; fi\n: > '{}'",
-            first_run.display(),
-            first_run.display()
-        ));
+        fixture.add_fake_canary_cargo(&fixture.base, "exit 42");
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
@@ -2915,15 +5639,10 @@ mod tests {
                 &format!("{target}:refs/heads/rolling"),
             ],
         );
-        let first_run = fixture.root.path().join("prepublish-guard-passed");
-        fixture.add_fake_cargo(&format!(
-            "if [ -e '{}' ]; then exit 42; fi\n: > '{}'",
-            first_run.display(),
-            first_run.display()
-        ));
+        fixture.add_fake_canary_cargo(&target, "exit 42");
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
@@ -2960,17 +5679,17 @@ mod tests {
             "accepted source",
         );
         let other = fixture.commit(&source, "other.txt", "later work\n", "concurrent work");
-        let first_run = fixture.root.path().join("prepublish-guard-passed");
-        fixture.add_fake_cargo(&format!(
-            "if [ -e '{}' ]; then /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; exit 42; fi\n: > '{}'",
-            first_run.display(),
-            fixture.repo.display(),
-            other,
-            first_run.display()
-        ));
+        fixture.add_fake_canary_cargo(
+            &fixture.base,
+            &format!(
+                "/usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43\nexit 42",
+                fixture.repo.display(),
+                other,
+            ),
+        );
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
@@ -3006,16 +5725,14 @@ mod tests {
             "accepted source",
         );
         let other = fixture.commit(&source, "other.txt", "later work\n", "concurrent work");
-        let first = fixture.root.path().join("prepublish-guard-passed");
         let second = fixture.root.path().join("red-canary-observed");
-        fixture.add_fake_cargo(&format!(
-            "if [ ! -e '{}' ]; then : > '{}'; exit 0; fi\nif [ ! -e '{}' ]; then /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; : > '{}'; exit 42; fi",
-            first.display(), first.display(), second.display(),
-            fixture.repo.display(), other, second.display()
+        fixture.add_fake_canary_cargo(&fixture.base, &format!(
+            "if [ ! -e '{}' ]; then /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; : > '{}'; exit 42; fi",
+            second.display(), fixture.repo.display(), other, second.display(),
         ));
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
@@ -3063,13 +5780,13 @@ mod tests {
         let other3 = fixture.commit(&other2, "other3.txt", "three\n", "third advance");
         let marker = fixture.root.path().join("guard-run-count");
         fixture.add_fake_cargo(&format!(
-            "count=$(cat '{}' 2>/dev/null || echo 0)\ncount=$((count + 1))\necho \"$count\" > '{}'\ncase $count in\n  2) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; exit 42;;\n  3) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\n  4) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\nesac",
+            "count=$(cat '{}' 2>/dev/null || echo 0)\ncount=$((count + 1))\necho \"$count\" > '{}'\ncase $count in\n  2) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; exit 42;;\n  3) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\n  5) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\nesac",
             marker.display(), marker.display(), fixture.repo.display(), other1,
             fixture.repo.display(), other2, fixture.repo.display(), other3,
         ));
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source,
             }])
@@ -3082,7 +5799,7 @@ mod tests {
         );
         assert_eq!(failure.exit_code(), 5);
         assert_eq!(failure.observed_tip.as_deref(), Some(other3.as_str()));
-        assert_eq!(fs::read_to_string(marker).unwrap().trim(), "4");
+        assert_eq!(fs::read_to_string(marker).unwrap().trim(), "6");
         assert_eq!(
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
             other3
@@ -3102,14 +5819,17 @@ mod tests {
             "accepted source",
         );
         let other = fixture.commit(&source, "other.txt", "later work\n", "concurrent work");
-        let first = fixture.root.path().join("prepublish-guard-passed");
-        fixture.add_fake_cargo(&format!(
-            "if [ -e '{}' ]; then /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; else : > '{}'; fi",
-            first.display(), fixture.repo.display(), other, first.display()
-        ));
+        fixture.add_fake_canary_cargo(
+            &fixture.base,
+            &format!(
+                "/usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43",
+                fixture.repo.display(),
+                other,
+            ),
+        );
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source,
             }])
@@ -3179,17 +5899,17 @@ mod tests {
             fixture.root.path(),
             &["init", "--bare", "-q", other_bare.to_str().unwrap()],
         );
-        let first_run = fixture.root.path().join("prepublish-guard-passed");
-        fixture.add_fake_cargo(&format!(
-            "if [ -e '{}' ]; then /usr/bin/git -C '{}' remote set-url --push origin '{}' || exit 43; exit 42; fi\n: > '{}'",
-            first_run.display(),
-            fixture.repo.display(),
-            other_bare.display(),
-            first_run.display()
-        ));
+        fixture.add_fake_canary_cargo(
+            &fixture.base,
+            &format!(
+                "/usr/bin/git -C '{}' remote set-url --push origin '{}' || exit 43\nexit 42",
+                fixture.repo.display(),
+                other_bare.display(),
+            ),
+        );
         let old_path = use_fake_path(&fixture);
         let result = fixture
-            .land(vec![AcceptedPair {
+            .land_with_ungated_candidate(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
@@ -3215,7 +5935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_filter_is_forwarded_with_exact_cargo_invocation_and_session_target() {
+    async fn identical_published_tree_reuses_candidate_gate_without_extra_cargo() {
         let fixture = Fixture::new();
         let source = fixture.commit(
             &fixture.base,
@@ -3235,10 +5955,27 @@ mod tests {
             )
             .await;
         restore_path(old_path);
-        result.expect("focused landing succeeds");
+        let report = result.expect("focused landing succeeds");
+        assert_eq!(
+            report.canary_reused_tree,
+            Some(git_value(
+                &fixture.repo,
+                &["rev-parse", &format!("{}^{{tree}}", report.candidate)]
+            ))
+        );
+        let expected_pass = concat!(
+            "metadata\n--no-deps\n--format-version\n1\n--offline\n",
+            "test\n-p\ndemo\n--lib\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\n",
+        );
         assert_eq!(
             fs::read_to_string(args_log).expect("cargo args"),
-            "test\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\ntest\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\ntest\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\ntest\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\n"
+            expected_pass,
+            "base and candidate run each focused test; canary reuses exact-base results"
         );
         let env_log = fs::read_to_string(fixture.root.path().join("cargo-env.log"))
             .expect("cargo environment");
@@ -3246,14 +5983,27 @@ mod tests {
         let configured_target =
             std::env::var("CARGO_TARGET_DIR").expect("session target configured");
         let target = validate_cargo_target_dir().expect("session target directory");
-        let workspace_parent = landing_workspace_parent(&target);
-        for _ in 0..4 {
-            assert_eq!(lines.next(), Some(configured_target.as_str()));
-            assert_eq!(lines.next(), Some("4"));
+        let workspace_parent = landing_workspace_parent(&fixture.repo, &target)
+            .expect("selected landing workspace parent");
+        let gate_scratch = report
+            .gate_scratch
+            .split_once(':')
+            .expect("scratch kind and path")
+            .1;
+        for _ in 0..6 {
+            let guard_target = lines.next().expect("isolated guard target");
+            assert_ne!(guard_target, configured_target);
+            assert_eq!(lines.next(), Some("1"));
             assert_eq!(lines.next(), Some("line-tables-only"));
             let guard_worktree = lines.next().expect("guard worktree directory");
+            let worktree = Path::new(guard_worktree);
+            let expected_target = worktree.with_file_name(format!(
+                "{}-cargo-target",
+                worktree.file_name().unwrap().to_string_lossy()
+            ));
+            assert_eq!(Path::new(guard_target), expected_target);
             let relative = Path::new(guard_worktree)
-                .strip_prefix(workspace_parent)
+                .strip_prefix(&workspace_parent)
                 .expect("guard worktree is inside the selected workspace parent");
             let workspace = relative.components().next().expect("private workspace");
             assert!(
@@ -3263,22 +6013,125 @@ mod tests {
                     .starts_with("rsi-rolling-land-"),
                 "guard worktree has no private landing workspace: {guard_worktree}"
             );
+            assert_eq!(lines.next(), Some(gate_scratch));
         }
         assert_eq!(lines.next(), None);
+        if report.gate_scratch.starts_with("tmpfs:") {
+            assert!(!Path::new(gate_scratch).exists(), "private scratch cleaned");
+        }
         assert!(!fixture.repo.join("target").exists());
     }
 
     #[test]
-    fn private_landing_workspace_prefers_sandbox_root_for_recovery() {
+    fn private_landing_workspace_uses_git_dir_for_sandbox_target() {
         let fixture = Fixture::new();
         let sandbox_target = fixture.repo.join("target");
         fs::create_dir(&sandbox_target).expect("sandbox target");
         assert!(fixture.repo.join(".git").exists());
-        assert_eq!(landing_workspace_parent(&sandbox_target), fixture.repo);
+        let git_dir = PathBuf::from(git_value(
+            &fixture.repo,
+            &["rev-parse", "--absolute-git-dir"],
+        ));
+        assert_eq!(
+            landing_workspace_parent(&fixture.repo, &sandbox_target)
+                .expect("sandbox landing parent"),
+            git_dir
+        );
 
         let custom_target = fixture.root.path().join("custom-cargo-target");
         fs::create_dir(&custom_target).expect("custom target");
-        assert_eq!(landing_workspace_parent(&custom_target), custom_target);
+        assert_eq!(
+            landing_workspace_parent(&fixture.repo, &custom_target).expect("custom landing parent"),
+            custom_target
+        );
+    }
+
+    #[test]
+    fn insufficient_tmpfs_uses_sandbox_target_scratch() {
+        let root = tempfile::tempdir().expect("scratch fixture");
+        let target = root.path().join("target");
+        fs::create_dir(&target).expect("target directory");
+        let scratch = select_gate_scratch(&target, 1024).expect("fallback scratch");
+        assert!(matches!(scratch, GateScratch::Disk(_)));
+        assert_eq!(scratch.path(), target.join(".rsi-tmp"));
+        assert!(scratch.path().is_dir());
+    }
+
+    #[tokio::test]
+    async fn marked_shard_uses_same_private_disk_scratch_on_both_sides() {
+        let fixture = Fixture::new();
+        let source = fixture.commit(&fixture.base, "marked.txt", "marked\n", "marked shard");
+        let base_worktree = fixture.root.path().join("marked-base");
+        let candidate_worktree = fixture.root.path().join("marked-candidate");
+        for (path, commit) in [
+            (&base_worktree, &fixture.base),
+            (&candidate_worktree, &source),
+        ] {
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    commit,
+                ],
+            );
+        }
+        let log = fixture.root.path().join("marked-scratch.log");
+        for worktree in [&base_worktree, &candidate_worktree] {
+            let script = worktree.join("scripts/run-rsid-test-shards.sh");
+            write(
+                worktree,
+                "scripts/run-rsid-test-shards.sh",
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$TMPDIR\" >> '{}'\n",
+                    log.display()
+                ),
+            );
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        let target = fixture.root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut gate = TestGate {
+            scratch: Some(select_gate_scratch(&target, 1).unwrap()),
+            ..TestGate::default()
+        };
+        gate.base_worktrees
+            .insert(fixture.base.clone(), base_worktree.clone());
+        let spec = GuardSpec {
+            commands: vec![rsid_shard_guard_command("store-01").unwrap()],
+            env: BTreeMap::new(),
+            output_tail_bytes: 4096,
+        };
+        run_affected_gate(
+            &fixture.repo,
+            &candidate_worktree,
+            &fixture.base,
+            &spec,
+            &mut gate,
+            &BTreeSet::from(["store-01".to_string()]),
+        )
+        .await
+        .expect("marked shard gate");
+        let disk = fixture.root.path().join("disk-test-scratch");
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            format!("{0}\n{0}\n", disk.display())
+        );
+        assert_eq!(gate.disk_scratch_used.len(), 1);
+        for worktree in [&base_worktree, &candidate_worktree] {
+            git_run(
+                worktree,
+                &["restore", "--", "scripts/run-rsid-test-shards.sh"],
+            );
+            git_run(
+                &fixture.repo,
+                &["worktree", "remove", worktree.to_str().unwrap()],
+            );
+        }
     }
 
     #[tokio::test]
@@ -3322,6 +6175,7 @@ mod tests {
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
             report.candidate
         );
+        assert_source_clean(&fixture.repo);
     }
 
     #[tokio::test]
@@ -3372,10 +6226,76 @@ mod tests {
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
             fixture.base
         );
+        assert_source_clean(&fixture.repo);
     }
 
     #[tokio::test]
-    async fn ancestor_remote_advance_during_guard_fails_closed_before_push() {
+    async fn interrupted_landing_cleans_private_workspace_and_source() {
+        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        fs::create_dir_all(&parent).expect("workspace target directory");
+        let parent = parent.canonicalize().expect("canonical workspace target");
+        let fixture = Fixture::new_in(&parent);
+        let target = fixture.repo.join("target");
+        fs::create_dir(&target).expect("sandbox-local Cargo target");
+        let _target_env = ScopedCargoTarget::set(&target);
+        let source = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"interrupted\" }\n",
+            "interrupted source",
+        );
+        let marker = fixture.root.path().join("cargo-started");
+        fixture.add_fake_cargo(&format!("touch '{}'\nsleep 30", marker.display()));
+        let old_path = use_fake_path(&fixture);
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            land_until_cancelled(
+                Options {
+                    repo: fixture.repo.clone(),
+                    remote: "origin".into(),
+                    accepted: vec![AcceptedPair {
+                        base: fixture.base.clone(),
+                        source,
+                    }],
+                    test_filters: Vec::new(),
+                    cargo_build_jobs: 1,
+                    remote_gate: None,
+                    tmpfs_min_free_gb: 12,
+                    disk_scratch_shards: BTreeSet::new(),
+                },
+                async {
+                    while !marker.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                },
+            ),
+        )
+        .await;
+        restore_path(old_path);
+        let result = result.expect("landing reached its interruptible guard");
+        assert_eq!(result.unwrap_err().state, PublicationState::Unknown);
+        assert_source_clean(&fixture.repo);
+        let git_dir = landing_workspace_parent(&fixture.repo, &target)
+            .expect("sandbox landing workspace parent");
+        assert_eq!(
+            fs::read_dir(git_dir)
+                .expect("git metadata directory")
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("rsi-rolling-land-")
+                    })
+                })
+                .count(),
+            0,
+            "interrupt must remove the candidate and scratch workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestor_remote_advance_during_guard_regates_and_publishes() {
         let fixture = Fixture::new();
         let intermediate = fixture.commit(
             &fixture.base,
@@ -3398,9 +6318,10 @@ mod tests {
                 &format!("{intermediate}:refs/heads/intermediate"),
             ],
         );
+        let marker = fixture.root.path().join("advanced-once");
         fixture.add_fake_cargo(&format!(
-            "git --git-dir='{}' update-ref refs/heads/rolling {intermediate}",
-            fixture.bare.display()
+            "if [ ! -e '{}' ]; then /usr/bin/git --git-dir='{}' update-ref refs/heads/rolling {intermediate}; : > '{}'; fi",
+            marker.display(), fixture.bare.display(), marker.display(),
         ));
         let old_path = use_fake_path(&fixture);
         let old_git_dir = std::env::var_os("GIT_DIR");
@@ -3428,8 +6349,8 @@ mod tests {
                 std::env::remove_var("GIT_DIR");
             }
         }
-        let error = result.unwrap_err();
-        assert!(error.message.contains("stale target"), "{error:?}");
+        let report = result.expect("overlapping ancestor advance is regated");
+        assert_eq!(report.fetched_tip, intermediate);
         assert!(
             Command::new("/usr/bin/git")
                 .current_dir(&fixture.repo)
@@ -3440,7 +6361,7 @@ mod tests {
         );
         assert_eq!(
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
-            intermediate
+            report.published_tip
         );
     }
 
@@ -3609,7 +6530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_push_remote_divergence_reports_unknown_with_observed_tip() {
+    async fn rejected_push_with_proven_divergence_remains_unpublished() {
         let fixture = Fixture::new();
         let source = fixture.commit(
             &fixture.base,
@@ -3639,35 +6560,16 @@ mod tests {
             .await;
         restore_path(old_path);
         let error = result.unwrap_err();
-        assert_eq!(error.state, PublicationState::Unknown);
-        assert_eq!(error.exit_code(), 3);
-        let recovery_path = error
-            .recovery_path
-            .as_ref()
-            .expect("private recovery clone");
-        assert!(recovery_path.join("repo/.git").exists());
-        assert_eq!(
-            fs::metadata(recovery_path)
-                .expect("recovery mode")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
+        assert_eq!(error.state, PublicationState::NotPublished);
+        assert_eq!(error.exit_code(), 1);
         assert!(
-            !recovery_path.join("repo/crates/demo/src/lib.rs").exists(),
-            "retained clone has no primary checkout"
-        );
-        assert!(
-            error
-                .evidence_lines()
-                .contains(&format!("observed_target_id={other}"))
+            error.message.contains("remote rolling remained"),
+            "{error:?}"
         );
         assert_eq!(
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
             other
         );
-        fs::remove_dir_all(recovery_path).expect("cleanup private test recovery clone");
     }
 
     #[test]
@@ -3683,6 +6585,7 @@ mod tests {
             forward_revert_id: None,
             forward_revert_status: None,
             recovery_path: None,
+            stale_retries: Vec::new(),
             message: "cleanup failed".into(),
         };
         assert_eq!(error.exit_code(), 2);
@@ -3694,7 +6597,8 @@ mod tests {
                 "exit_code=2",
                 "candidate_id=candidate",
                 "fetched_target_id=old",
-                "published_target_id=candidate"
+                "published_target_id=candidate",
+                "stale_attempts=0"
             ]
         );
     }
@@ -3717,6 +6621,7 @@ mod tests {
                 forward_revert_id: Some("revert".into()),
                 forward_revert_status: Some(status),
                 recovery_path: None,
+                stale_retries: Vec::new(),
                 message: "published-tip canary failed".into(),
             };
             assert_eq!(failure.exit_code(), expected_code);
@@ -3796,11 +6701,59 @@ mod tests {
         assert_eq!(options.accepted[0].source, "source");
         assert_eq!(options.accepted[1].base, "base");
         assert_eq!(options.accepted[1].source, "other");
+        assert_eq!(options.tmpfs_min_free_gb, 12);
+        let configured = parse_args([
+            "--accepted".to_string(),
+            "source".to_string(),
+            "--tmpfs-min-free-gb".to_string(),
+            "24".to_string(),
+            "--disk-scratch-shard".to_string(),
+            "store-01".to_string(),
+        ])
+        .expect("configured minimum");
+        assert_eq!(configured.tmpfs_min_free_gb, 24);
+        assert!(configured.disk_scratch_shards.contains("store-01"));
+        assert!(
+            parse_args([
+                "--accepted".to_string(),
+                "source".to_string(),
+                "--tmpfs-min-free-gb".to_string(),
+                "0".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args([
+                "--accepted".to_string(),
+                "source".to_string(),
+                "--disk-scratch-shard".to_string(),
+                "not-a-shard".to_string(),
+            ])
+            .is_err()
+        );
         for malformed in ["", ":source", "base:", "a:b:c"] {
             assert!(
                 parse_args(["--accepted".to_string(), malformed.to_string()]).is_err(),
                 "{malformed:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn remote_gate_cli_requires_complete_valid_configuration() {
+        let identity = std::env::current_exe().expect("test binary exists");
+        let args = vec![
+            "--accepted".into(),
+            "source".into(),
+            "--remote-gate-host".into(),
+            "ec2-user@example.com".into(),
+            "--remote-gate-dir".into(),
+            "/srv/rsi/gates".into(),
+            "--remote-gate-identity".into(),
+            identity.to_string_lossy().into_owned(),
+        ];
+        let options = parse_args(args.clone()).expect("complete remote configuration");
+        assert_eq!(options.remote_gate.unwrap().target, "ec2-user@example.com");
+        assert!(parse_args(args[..6].to_vec()).is_err());
     }
 }

@@ -541,6 +541,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn persistent_store_timeout_trips_after_grace_and_records_last_health() {
         let started = Utc::now();
@@ -564,6 +565,7 @@ mod tests {
         assert_eq!(trip.last_healthy_at, healthy_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn responsive_store_errors_do_not_trigger_a_restart() {
         let started = Utc::now();
@@ -576,6 +578,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn recovery_resets_failures_and_disabled_loops_are_omitted() {
         let started = Utc::now();
@@ -604,6 +607,7 @@ mod tests {
         assert_eq!(trip.last_healthy_at, recovered_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn stale_scheduler_tick_trips_while_other_probes_answer() {
         let started = Utc::now();
@@ -621,6 +625,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn restart_sidecar_is_atomic_and_roundtrips() {
         let directory = tempfile::tempdir().unwrap();
@@ -647,6 +652,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn malformed_restart_record_remains_for_diagnosis() {
         let directory = tempfile::tempdir().unwrap();
@@ -659,6 +665,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn restart_record_identity_matches_its_sidecar_name() {
         let directory = tempfile::tempdir().unwrap();
@@ -679,6 +686,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn restart_import_retains_invalid_records_and_unlinks_only_after_commit() {
         let directory = tempfile::tempdir().unwrap();
@@ -719,6 +727,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn rpc_challenge_requires_a_matching_response() {
         let directory = tempfile::tempdir().unwrap();
@@ -749,6 +758,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn blocked_store_probe_keeps_one_pending_challenge() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
@@ -794,6 +804,7 @@ mod tests {
         assert_eq!(third, StoreProbeOutcome::Responsive);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn fast_store_write_error_is_reported_without_a_timeout() {
         let directory = tempfile::tempdir().unwrap();

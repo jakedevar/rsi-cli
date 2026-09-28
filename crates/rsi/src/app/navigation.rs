@@ -716,17 +716,26 @@ impl App {
         self.trigger_hierarchy_fetch_immediate(current_parent_id);
     }
 
-    /// Convert all `SessionDetail` panes referencing `session_id` back to `SessionList`.
-    /// Used after delete/archive so stale detail views fall back to the list.
-    pub(crate) fn revert_detail_panes_for(&mut self, session_id: uuid::Uuid) {
-        // Compute fallback session before mutable borrow
+    /// Remove every navigation reference to a removed session. Covers live
+    /// detail panes, the tab-stored single-pane list proxy, jumplist entries,
+    /// and the fallback target used by `i`/input-bar navigation.
+    pub(crate) fn forget_removed_session(&mut self, session_id: uuid::Uuid) {
+        self.clean_jumplist(session_id);
+        if self.last_viewed_session == Some(session_id) {
+            self.last_viewed_session = self
+                .filtered_session_order
+                .first()
+                .or(self.filtered_taskrabbit_order.first())
+                .or(self.filtered_archived_order.first())
+                .copied();
+        }
+
         let first_session = self
             .filtered_session_order
             .first()
             .or(self.filtered_taskrabbit_order.first())
             .or(self.filtered_archived_order.first())
             .copied();
-
         for tab in &mut self.tabs {
             let ids: Vec<PaneId> = tab.layout.leaf_ids();
             for leaf_id in ids {
@@ -743,6 +752,14 @@ impl App {
                         jobs_selected_index: 0,
                     };
                 }
+            }
+
+            if let Pane::SessionList {
+                selected_session, ..
+            } = &mut tab.session_list_state
+                && *selected_session == Some(session_id)
+            {
+                *selected_session = first_session;
             }
         }
     }

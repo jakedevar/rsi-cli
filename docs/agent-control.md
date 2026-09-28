@@ -69,7 +69,7 @@ supplies in `params` can change *which* session it is acting as.
 
 ## The agent verb catalog
 
-These twenty-nine `Agent*` RPC verbs form the closed agent control surface. The
+These thirty-six `Agent*` RPC verbs form the closed agent control surface. The
 separate, narrow read allowlist is unchanged; generic lifecycle and
 configuration methods remain denied to token-attributed callers.
 
@@ -101,6 +101,7 @@ unattributed (operator/TUI) reads are unchanged.
 | `AgentGetStatus` | Read status of the caller or a session it is authorized to observe. | Self, a direct child, a child of an Epic the caller leads, or a session in the current manager's live scope |
 | `AgentHalt` | Interrupt a session under the caller's authority. Omit the target to halt self. | Self, a direct child, a child of an Epic the caller leads, or a manager-scoped leaf under `SessionControl` |
 | `AgentContinueChild` | Continue an exact child session with a new prompt. Wraps the daemon's existing continuation engine; it does not reimplement one. Requires the observed continuation cursor `(expected_tip_session_id, expected_event_sequence, expected_custody_generation)` as an optimistic staleness fence — `Session` carries no `row_version`, so these three are what move when a child advances. The check is not atomic with dispatch and is not an idempotency key: concurrent or rapid sequential requests can both be delivered before either query event advances the cursor, and a query-event persistence failure can leave the cursor reusable. Treat an accepted continuation as delivered; never replay it from the receipt's pre-continuation `observed` cursor. A later stale refusal carries the observed witness to inspect before making a new decision. Bounds failures use `agent_continue_invalid_request`; self-targeting, a resolved `CodexAppServer` tip (it allocates a fresh id on continue), and a stale cursor are also typed refusals. A logical AppServer root that already rotated to an ordinary Codex tip is checked and continued at that effective tip. Continuing a running child interrupts its active turn through the existing continuation engine. A dirty sandbox is NOT a refusal. The caller's terminal watch is re-armed against the logical child, best-effort. RPC-only — no native `rsi_control` tool in slice 1. | A direct child, a child of an Epic the caller leads, or a manager-scoped leaf under `SessionControl`; never self |
+| `AgentArchiveChild` | Archive a terminal child of the Epic the caller currently leads, using the observed continuation cursor as a staleness fence. | Current lead of the child's Epic |
 | `AgentScheduleWake` | Schedule a future wake/callback. The resume target `wake_session_id` is bound to the caller server-side and is not in the JSON schema — it cannot be supplied or spoofed. `mode:"on_terminal"` + `watch_session_id` (A8) arms a daemon-owned [session watch](session-watches.md) on a watched subject scoped like `AgentGetStatus` targets; the wake target remains caller-bound. | Self (resume); watched subject: direct child, child of a led Epic, or a session in the current manager's live scope |
 | `AgentCreateIssue` | Create a durable local issue follow-up. Strict content and idempotency fields only; creator identity is server-bound. | Self |
 | `AgentListIssues` / `AgentGetIssue` | Read bounded project Issue pages or one Issue by ID. | Current lead of one legal owning Epic, or the current appointed manager with the V2 `IssueCoordinate` grant |
@@ -121,6 +122,12 @@ unattributed (operator/TUI) reads are unchanged.
 | `AgentManagerCommitPreparedControl` | Commit an exact prepared ID/digest with an idempotency key. Authority, target state and runtime gates are atomically rechecked before one legacy action-journal operation is queued. | The same current manager that prepared the action |
 | `AgentManagerGetAction` | Read one durable action receipt without widening inspection scope. | Authenticated current manager in the same project and stable logical-manager lineage |
 | `AgentManagerWorkView` | Read-only (#548): the caller's Epic live work (`mine` when its recorded source is the caller's lineage), active granted file ownership (domain/mode/files), pause, and delivery state (queued/retrieved/delivered, `delivery_issue`) of at most 8 unanswered manager requests, without message bodies. `{}` or `work_key`/`after_work_key`/`limit` (1–32). Writes nothing and grants no write, mail or continuation authority. | Live lineage tip of a session the current logical manager created (`create_session`/`retry_lead`/`replace_lead`) at the current scope version, in a live scoped Epic; otherwise `manager_work_view_not_managed`, `…_stale_session` or `…_unsupported_topology`; an exact `work_key` that is no longer live fails `manager_work_view_work_not_live` |
+| `AgentTopologyUpsert` | Create, revise (`expected_revision` CAS) or `validate_only` a scoped deterministic topology; returns `definition_digest` and `diagnostics[]`. Every session node's explicit provider/model/effort must equal an operator `allowed_launches` entry (empty fails closed); a reviewer's vendor family must differ from its author's; wide same-kind layers must be OpenRouter (`topology_bulk_fanout_min_openrouter`). | Current manager with `Automation` (in-scope Epics or manager scope), or an Epic lead for its own Epic (`scope:"epic"` only) |
+| `AgentTopologyList` | Page visible topologies (and, with `include_executions`, the scope's live executions). Operator and manager topologies are visible to leads only when the operator marked them `shared`. | Same |
+| `AgentTopologyExecute` | Start one daemon-run execution fenced by `expected_digest` on an in-scope Epic; policy is rechecked, an identical key replays (`deduplicated`), manager launches charge `max_created_sessions`, and at most 3 session nodes run at once. | Same; a manager also needs Execute mode and no pause |
+| `AgentTopologyGetExecution` | Read one execution's status, `row_version`, node attempts and a page of audit events (no payloads). | Same, for executions under an Epic in scope |
+| `AgentTopologyInterrupt` | Request interruption under a `row_version` CAS; idempotent on the key. Allowed while the manager is paused. | Same |
+| `AgentTopologyResolveAttempt` | Resolve preserved work: `inspect`, `accept`, `retry`, or `discard` with `confirm_preserved_commit` (full 40-hex, required iff discard; mismatch ⇒ `preserved_commit_mismatch`). | Same; `discard` is manager-only (`discard_requires_manager` for a lead) |
 
 Existing child-control scoping: **an Epic-lead may act on its Epic's children; any leaf may
 act on itself and its own direct children.** The current appointed manager may
@@ -237,7 +244,7 @@ entry containing its ID, display number, and status. `blocked_by_truncated` and
 The native roster is construction-bound, not lead-filtered: every established
 Harness/CodexAppServer session gets the same seven Issue tools, and execution
 performs the persisted Issue authority check. Likewise, the CLI advertises the
-same twenty-nine verbs to every tokened session; seeing a verb or tool is never
+same thirty-six verbs to every tokened session; seeing a verb or tool is never
 proof of authority.
 
 | Verb | Example payload | Success |
@@ -279,20 +286,20 @@ They shell out to the `rsi-rpc` CLI, which reads `$RSI_SESSION_TOKEN` from the
 environment and attaches it out-of-band.
 
 - **Discovery.** `rsi-rpc agent` (alias `rsi-rpc list-agent-verbs`) prints the
-  control surface and exits 0. It advertises **only** the twenty-nine `Agent*` verbs —
+  control surface and exits 0. It advertises **only** the thirty-six `Agent*` verbs —
   each with a one-line description — plus the invocation form and the token
   convention. The generic RPC passthrough is never shown to an agent.
 - **Request schemas.** `rsi-rpc <AgentVerb> --schema` prints one deterministic,
   versioned JSON envelope for that verb and exits without resolving a socket,
   reading the authority token, or contacting the daemon. Lookup is exact and
-  case-sensitive and is closed to those same twenty-nine verbs. The schema describes
+  case-sensitive and is closed to those same thirty-six verbs. The schema describes
   the supported request shape only: it omits caller and authority identities and
   does not replace daemon-side parsing, authorization, or runtime validation.
 - **Invocation.** `rsi-rpc <Verb> [--params JSON]`. For multi-line spawn/wake
   payloads, prefer `--params @file` (a `@path` argument is read as a JSON file)
   over inline JSON — and never put the token in `--params`.
 - **Codex CLI nudge.** Because Codex CLI takes its prompt via piped stdin and gets
-  no launch system-prompt, a compact agent-discovery nudge (the same twenty-nine verbs +
+  no launch system-prompt, a compact agent-discovery nudge (the same thirty-six verbs +
   token convention) is prepended to the process stdin on the **first turn only** —
   never on a resume turn, and never mutated into the stored user event.
 
@@ -456,7 +463,7 @@ use JSON-RPC or a native tool for roles containing spaces.
 ## Quick reference
 
 ```bash
-# Discover the agent control surface (only the twenty-nine Agent* verbs)
+# Discover the agent control surface (only the thirty-six Agent* verbs)
 rsi-rpc agent
 
 # Inspect one supported request shape offline (no socket or token required)

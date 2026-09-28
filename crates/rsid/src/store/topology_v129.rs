@@ -253,14 +253,15 @@ mod tests {
 
     /// T2-A8: the V129 catalog is pinned, additive over existing topology
     /// rows, refuses a non-V128 source, and drift refuses reopen.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn t2_a8_v129_is_additive_pinned_and_rejects_drift() {
         let directory = tempfile::tempdir().expect("test directory");
         let database = directory.path().join("v128-to-v129.sqlite");
         {
             let store = Store::open(&database).expect("current database");
-            // V130 (#670) sits above V129; rewind it first so V129 is the head.
-            crate::store::agent_child_relaunch_intents::rewind_v130_fixture_to_v129(&store.conn);
+            // Rewind the current migration tail so V129 can replay from V128.
+            crate::store::tests::rewind_post_v121_tail_to(&store.conn, 129);
             assert_eq!(user_version(&store), 129);
             rewind_v129_fixture_to_v128(&store.conn);
             store

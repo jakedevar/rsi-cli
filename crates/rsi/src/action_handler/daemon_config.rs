@@ -43,6 +43,43 @@ pub async fn refresh_daemon_features(app: &mut App) {
     app.request_storage_status_refresh();
 }
 
+/// Read, set, or clear one `OpenRouter` model's route from the TUI command line.
+/// The model portion is stored verbatim after the daemon's dotted prefix.
+#[allow(clippy::future_not_send)] // App belongs to the single-threaded event loop.
+pub async fn set_openrouter_model_route(app: &mut App, args: &str) {
+    let mut parts = args.split_whitespace();
+    let (Some(model), route, None) = (parts.next(), parts.next(), parts.next()) else {
+        app.notify("Usage: :openrouter-route <model> [codex_cli|harness|default]");
+        return;
+    };
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let field = format!("api_route.openrouter.{model}");
+    let Some(route) = route else {
+        match app.client.get_daemon_config().await {
+            Ok(config) => {
+                let current = config[field.as_str()].as_str().unwrap_or("default");
+                app.notify(format!("OpenRouter route for {model}: {current}"));
+            }
+            Err(error) => app.notify(format!("Failed to read OpenRouter route: {error}")),
+        }
+        return;
+    };
+    let route_value = match route {
+        "codex_cli" | "harness" => serde_json::json!(route),
+        "default" => serde_json::Value::Null,
+        _ => {
+            app.notify("Route must be codex_cli, harness, or default");
+            return;
+        }
+    };
+    match app.client.update_daemon_config(&field, route_value).await {
+        Ok(()) => app.notify_success(format!("OpenRouter route for {model}: {route}")),
+        Err(error) => app.notify(format!("Failed to update OpenRouter route: {error}")),
+    }
+}
+
 /// Refresh the cached lifetime usage aggregate for the Settings -> Stats
 /// category (T8; 1:1 clone of `refresh_daemon_features`). Tab-scoped
 /// per-project filter (D1): reads `app.current_project_id` at fetch time,
@@ -511,7 +548,7 @@ async fn run_sandbox_build_cache_reclaim(app: &mut App, dry_run: bool) {
     }
 }
 
-fn require_authoritative_config(app: &mut App) -> bool {
+pub fn require_authoritative_config(app: &mut App) -> bool {
     if app.authoritative_config_ready() {
         true
     } else {
@@ -606,6 +643,11 @@ pub(crate) async fn emergency_stop_all(app: &mut App) {
         Ok(report) => {
             let cancelled = report.cancelled_invocations.len();
             let interrupted = report.interrupted_sessions.len();
+            for session_id in &report.interrupted_sessions {
+                app.operator_pauses
+                    .insert(*session_id, crate::client::OperatorPauseLevel::Hard);
+            }
+            app.needs_redraw = true;
             app.notify_success(&format!(
                 "Emergency stop applied: {} cancelled, {} interrupted",
                 cancelled, interrupted
@@ -745,7 +787,9 @@ pub(crate) async fn submit_model_budget_policy(
 }
 
 fn daemon_cycle_value_json(new_value: &str) -> serde_json::Value {
-    if let Ok(n) = new_value.parse::<i64>() {
+    if new_value == "Default" {
+        serde_json::Value::Null
+    } else if let Ok(n) = new_value.parse::<i64>() {
         serde_json::json!(n)
     } else if let Ok(f) = new_value.parse::<f64>() {
         serde_json::json!(f)
@@ -761,6 +805,7 @@ mod tests {
         sandbox_cache_reclaim_failure_message, sandbox_cache_reclaim_success_message,
         toggle_daemon_feature,
     };
+    use crate::settings::DaemonFeatureValue;
     use rsi_common::sandbox_storage::{
         SandboxBuildCacheReclaimConfig, SandboxBuildCacheReclaimReport,
         SandboxBuildCacheReclaimStopReason, SandboxFilesystemStats,
@@ -955,6 +1000,40 @@ mod tests {
         assert!(
             !captured_fields.contains(&"retry_max_default"),
             "retry_max_default stays read-only (NotApplied), never toggled"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_transcript_cache_setting_sends_zero_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(respond_to_update_daemon_config(listener, 1));
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = crate::client::DaemonClient::new(socket);
+        app.client.connect().await.unwrap();
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        let index = app
+            .daemon_features
+            .iter()
+            .position(|entry| entry.field == "completed_transcript_cache_max_bytes")
+            .unwrap();
+        if let DaemonFeatureValue::Cycle { options, current } =
+            &mut app.daemon_features[index].value
+        {
+            *current = options.len() - 1;
+        } else {
+            panic!("completed transcript cap has a cycle editor");
+        }
+        toggle_daemon_feature(&mut app, index).await;
+        let captured = server.await.unwrap();
+        assert_eq!(
+            captured,
+            vec![(
+                "completed_transcript_cache_max_bytes".to_string(),
+                serde_json::json!(0)
+            )]
         );
     }
 

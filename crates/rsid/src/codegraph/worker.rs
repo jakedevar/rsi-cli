@@ -550,6 +550,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn disabling_during_staging_prevents_publish_and_preserves_ready_head() {
         let root = tempfile::tempdir().unwrap();
@@ -596,6 +597,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn acknowledged_disable_cannot_precede_a_ready_head_promotion() {
         let root = tempfile::tempdir().unwrap();
@@ -663,6 +665,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn exhausted_physical_budget_preserves_ready_head_and_manifest() {
         let root = tempfile::tempdir().unwrap();
@@ -695,6 +698,7 @@ mod tests {
         assert!(status.metrics.pending_rescan);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn pinned_wal_reader_defers_small_budget_write_without_replacing_ready_head() {
         let root = tempfile::tempdir().unwrap();
@@ -773,6 +777,7 @@ mod tests {
         assert_ne!(successor.ready, ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn durable_run_manifest_survives_failed_successor() {
         let root = tempfile::tempdir().unwrap();
@@ -818,6 +823,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn pruning_preserves_ready_head_and_linked_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -874,6 +880,7 @@ mod tests {
         assert_eq!(violations, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn empty_inventory_is_durable_failure_then_degraded_with_ready_head() {
         let root = tempfile::tempdir().unwrap();
@@ -904,6 +911,7 @@ mod tests {
         assert_eq!(status.ready.unwrap(), ready);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn restored_identical_source_clears_durable_degraded_status() {
         let root = tempfile::tempdir().unwrap();
@@ -936,6 +944,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn bus_hints_follow_durable_building_and_ready_transitions() {
         let root = tempfile::tempdir().unwrap();
@@ -983,6 +992,7 @@ mod tests {
         assert_eq!(status.metrics.overflow_count, 7);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn edits_and_deletes_publish_complete_inventory() {
         let root = tempfile::tempdir().unwrap();
@@ -1010,6 +1020,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn cold_restart_rebuilds_and_preserves_last_ready_on_failure() {
         let root = tempfile::tempdir().unwrap();
@@ -1038,6 +1049,7 @@ mod tests {
         assert_ne!(recovered.snapshot_digest, old.snapshot_digest);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn cold_restart_replaces_unpublished_stage_and_keeps_ready_head() {
         let root = tempfile::tempdir().unwrap();
@@ -1074,6 +1086,7 @@ mod tests {
         assert_eq!(recovered.generation, old.generation + 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn incremental_mutations_match_cold_rebuild() {
         let root = tempfile::tempdir().unwrap();
@@ -1138,6 +1151,7 @@ mod tests {
         compare();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn cargo_manifest_lock_and_rust_target_changes_rebuild_cleanly() {
         let root = tempfile::tempdir().unwrap();

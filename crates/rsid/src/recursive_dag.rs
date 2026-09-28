@@ -1006,6 +1006,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_persisted_vertical_slice_decomposes_retries_integrates() {
         let db = TestDb::new();
@@ -1162,6 +1163,7 @@ mod tests {
             .expect("read model remains valid");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_orders_multiple_runnable_tasks_deterministically() {
         let db = TestDb::new();
@@ -1198,6 +1200,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_skips_quarantined_graph_without_mutation() {
         let db = TestDb::new();
@@ -1241,6 +1244,7 @@ mod tests {
         assert_eq!(runs[0].report_artifact_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_persists_step_limit_stop_and_readback() {
         let db = TestDb::new();
@@ -1306,6 +1310,7 @@ mod tests {
             .expect("step-limit scheduler run releases graph lease");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_graph_cancellation_before_first_step_creates_no_attempts() {
         let db = TestDb::new();
@@ -1387,6 +1392,7 @@ mod tests {
             .expect("cancelled scheduler run releases graph lease");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_graph_cancellation_between_steps_stops_before_next_task() {
         let db = TestDb::new();
@@ -1440,6 +1446,7 @@ mod tests {
         assert_eq!(runs[0].step_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_run_cancellation_stops_run_without_cancelling_graph() {
         let db = TestDb::new();
@@ -1493,6 +1500,7 @@ mod tests {
         assert_eq!(request.run_id, Some(runs[0].id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_run_cancellation_applies_only_to_matching_run() {
         let db = TestDb::new();
@@ -1559,6 +1567,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_task_scoped_cancellation_is_not_executed() {
         let db = TestDb::new();
@@ -1610,6 +1619,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_report_after_partial_failure_is_durable() {
         let db = TestDb::new();
@@ -1662,6 +1672,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_error_after_run_start_records_failed_run() {
         let db = TestDb::new();
@@ -1714,6 +1725,7 @@ mod tests {
             .expect("failed scheduler run releases graph lease");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_persists_fake_artifacts() {
         let db = TestDb::new();
@@ -1745,6 +1757,7 @@ mod tests {
         assert_eq!(artifact.metadata["executor"], "recursive_dag_fake");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_source_does_not_bypass_store_apis() {
         let source = concat!(
@@ -1756,6 +1769,7 @@ mod tests {
         assert!(!source.contains(concat!("execute", "_batch")));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_has_no_live_model_execution_path() {
         let source = concat!(
@@ -1769,6 +1783,7 @@ mod tests {
         assert!(!source.contains(concat!("cod", "ex")));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_resumes_after_store_reopen() {
         let db = TestDb::new();
@@ -1838,6 +1853,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_scheduler_mixed_blocked_cancelled_children_block_parent() {
         let db = TestDb::new();
@@ -1931,6 +1947,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_store_artifact_api_rejects_wrong_task_attempt_pair() {
         let db = TestDb::new();

@@ -58,6 +58,7 @@ mod tests {
         RuntimeConfig::from_config(&config)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn kind_default_max_retries_is_zero_for_every_kind() {
         // Guards against AGENTS.md / code drift: automatic retries are
@@ -79,6 +80,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn kind_table_disables_interactive_defaults() {
         let runtime = runtime(3);
@@ -86,6 +88,7 @@ mod tests {
         assert_eq!(effective_default(&runtime, SessionKind::Standard), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn kind_table_disables_worker_defaults() {
         let runtime = runtime(3);
@@ -102,6 +105,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn disabled_runtime_forces_zero_default() {
         let runtime = runtime(3);
@@ -114,6 +118,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn explicit_session_budget_can_enable_interactive_retry_when_runtime_allows_it() {
         let runtime = runtime(0);

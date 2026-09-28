@@ -2000,7 +2000,8 @@ fn make_session_with_status(status: rsi_common::types::SessionStatus) -> Session
 fn status_push_deleted_removes_session_from_list_cache() {
     let mut app = test_app();
     let mut session = make_session_with_status(rsi_common::types::SessionStatus::Completed);
-    let session_id = session.id;
+    let session_id = uuid::Uuid::new_v4();
+    session.id = session_id;
     session.project_id = Some(uuid::Uuid::new_v4());
     app.current_project_id = session.project_id;
 
@@ -2021,6 +2022,57 @@ fn status_push_deleted_removes_session_from_list_cache() {
     assert!(!app.sessions.contains_key(&session_id));
     assert!(!app.session_order.contains(&session_id));
     assert!(!app.filtered_session_order.contains(&session_id));
+}
+
+#[test]
+fn archived_push_clears_detail_navigation_references() {
+    let mut app = test_app();
+    let session = make_session_with_status(rsi_common::types::SessionStatus::Completed);
+    let session_id = session.id;
+    let replacement = make_session_with_status(rsi_common::types::SessionStatus::Completed);
+    let replacement_id = replacement.id;
+    app.update_sessions(vec![session, replacement]);
+    app.enter_session();
+    assert_eq!(app.selected_session_id(), Some(session_id));
+    assert_eq!(
+        session_list_id(&app.tabs[0].session_list_state),
+        Some(session_id)
+    );
+    assert_eq!(app.last_viewed_session, Some(session_id));
+
+    let redraw = app.apply_push_event(rsi_common::rpc::BusEvent {
+        event_type: "session_status_changed".to_string(),
+        timestamp: chrono::Utc::now(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "new_status": "Archived",
+        }),
+    });
+
+    assert!(redraw);
+    assert!(!app.sessions.contains_key(&session_id));
+    assert!(matches!(
+        app.tabs[0].layout.find_pane(app.tabs[0].focused_pane),
+        Some(crate::types::Pane::SessionList {
+            selected_session: Some(selected_id),
+            ..
+        }) if *selected_id == replacement_id
+    ));
+    assert_eq!(
+        session_list_id(&app.tabs[0].session_list_state),
+        Some(replacement_id)
+    );
+    assert_eq!(app.last_viewed_session, Some(replacement_id));
+    assert!(!app.session_jumplist.contains(&session_id));
+}
+
+fn session_list_id(pane: &crate::types::Pane) -> Option<uuid::Uuid> {
+    match pane {
+        crate::types::Pane::SessionList {
+            selected_session, ..
+        } => *selected_session,
+        _ => None,
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 ---
 name: rsi-agent-control
-description: Full contract for driving the rsi daemon from inside an rsi-managed agent session — the closed 30-verb Agent* RPC surface including guarded V97 Issue control, typed manager preflight, token lifecycle, native rsi_control tools, retry policy, and spawn-directive fallback. Use when spawning, transferring a master baton, monitoring, messaging, managing lead-scoped Issues, scheduling wakes, creating attributed issues, invoking rsi-rpc, or debugging agent authority errors.
+description: Full contract for driving the rsi daemon from inside an rsi-managed agent session — the closed 36-verb Agent* RPC surface including guarded V97 Issue control, typed manager preflight, scoped topology automation, token lifecycle, native rsi_control tools, retry policy, and spawn-directive fallback. Use when spawning, transferring a master baton, monitoring, messaging, managing lead-scoped Issues, authoring or running topologies, scheduling wakes, creating attributed issues, invoking rsi-rpc, or debugging agent authority errors.
 ---
 
 # rsi agent control
@@ -10,7 +10,7 @@ An rsi-managed provider session reaches the daemon through the `rsi-rpc` CLI
 (`crates/rsi-common/src/bin/rsi-rpc.rs`). Two pieces make this self-describing:
 
 - **Discovery.** `rsi-rpc agent` (alias `rsi-rpc list-agent-verbs`) prints the
-  agent control surface and exits 0. It advertises ONLY the closed 30 `Agent*` verbs
+  agent control surface and exits 0. It advertises ONLY the closed 36 `Agent*` verbs
   above — `AgentSpawnChild`, `AgentReserveSuccessor`, `AgentGetProgress`, `AgentSendMessage`,
   `AgentGetStatus`, `AgentHalt`, `AgentContinueChild`, `AgentArchiveChild`, `AgentScheduleWake`, `AgentCreateIssue`,
   `AgentListIssues`, `AgentGetIssue`, `AgentUpdateIssue`,
@@ -19,8 +19,10 @@ An rsi-managed provider session reaches the daemon through the `rsi-rpc` CLI
   `AgentManagerSend`, `AgentManagerReply`, `AgentManagerNotify`,
   `AgentManagerInspect`, `AgentManagerUpdate`, `AgentSubmitReviewReceipt`,
   `AgentManagerControl`, `AgentManagerPrepareControl`,
-  `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`, and
-  `AgentManagerWorkView` —
+  `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`,
+  `AgentManagerWorkView`, `AgentTopologyUpsert`, `AgentTopologyList`,
+  `AgentTopologyExecute`, `AgentTopologyGetExecution`,
+  `AgentTopologyInterrupt`, and `AgentTopologyResolveAttempt` —
   each with a one-line description, plus the invocation form
   (`rsi-rpc <Verb> [--params JSON]`) and the token convention. The generic RPC
   passthrough is never advertised to an agent; an agent should invoke no other
@@ -28,7 +30,7 @@ An rsi-managed provider session reaches the daemon through the `rsi-rpc` CLI
 - **Request-schema discovery.** `rsi-rpc <AgentVerb> --schema` prints one
   deterministic, versioned JSON envelope for the exact, case-sensitive verb and
   exits without resolving a socket, reading the authority token, or contacting
-  the daemon. It is closed to the same 29 verbs. The schema is the supported
+  the daemon. It is closed to the same 36 verbs. The schema is the supported
   request shape only: it omits caller and authority identities and does not
   replace daemon-side parsing, authorization, or runtime validation.
 - **Identity env.** The daemon stamps each provider process with
@@ -37,7 +39,7 @@ An rsi-managed provider session reaches the daemon through the `rsi-rpc` CLI
   stamping). The authority token rides `$RSI_SESSION_TOKEN` as a transport-only
   credential and must NEVER be typed into `--params`.
 
-On the Codex CLI, a compact agent-discovery nudge (the same closed 30 verbs + token
+On the Codex CLI, a compact agent-discovery nudge (the same closed 36 verbs + token
 convention) is prepended to the process stdin on the first turn only — never on
 resume, and never into the stored user event.
 
@@ -69,7 +71,7 @@ arming and restart re-queueing regardless of any session-level budget.
 Cancelling a retry via continue, interrupt, `AgentHalt`, or `CancelRetry`
 persists retry exhaustion so daemon restart cannot resurrect the same row.
 
-**Agent verb catalog (the ONLY agent-facing verbs — default-deny).** These twenty-nine
+**Agent verb catalog (the ONLY agent-facing verbs — default-deny).** These thirty-six
 `Agent*` RPC verbs are the entire authorized surface; every other method is
 denied to an agent. Authority is enforced server-side against the caller session
 resolved from `$RSI_SESSION_TOKEN` — never from anything the agent supplies.
@@ -297,6 +299,64 @@ does not satisfy the landing gate for `crates/rsid/src/rpc.rs`.
   authoritative; you do not need a relay turn. It grants no write, message or
   continuation authority.
 
+### Topology automation (#633)
+
+Six verbs let the current appointed manager (V2 `Automation` grant) or the
+current lead of an Epic fire stored topologies without babysitting them. The
+daemon binds the caller from the token; no request names a caller, lead,
+manager or session. Native names: `rsi_control_topology_upsert`,
+`rsi_control_topology_list`, `rsi_control_topology_execute`,
+`rsi_control_topology_get_execution`, `rsi_control_topology_interrupt`,
+`rsi_control_topology_resolve_attempt`.
+
+- `AgentTopologyUpsert` `{name, definition, scope:"epic"|"manager", epic_id?,
+  expected_revision?, validate_only, idempotency_key}` →
+  `{topology_id, revision, definition_digest, diagnostics[], deduplicated}`.
+  Runs the full static validation (typed steps, custody plan) and the model
+  constraints; `validate_only` reports the same diagnostics without writing. The
+  key binds the first accepted request: an identical replay returns the
+  original receipt (`deduplicated`), changed content under the same key is
+  `idempotency_conflict`, so use a new key per revision. A changed definition
+  needs the current `expected_revision` (`stale_revision`). Names are daemon-unique
+  (`name_conflict`). A lead authors only its own Epic's topologies.
+- `AgentTopologyList` `{scope?, epic_id?, include_executions, cursor?, limit≤32}`
+  → name-ordered page plus, with `include_executions`, the scope's active and
+  blocked executions. Visible: your Epic's topologies (manager: every in-scope
+  Epic's, plus manager-owned); operator and manager topologies only when the
+  operator marked them `shared`.
+- `AgentTopologyExecute` `{topology_id, expected_digest, epic_id, inputs,
+  base_commit?, idempotency_key}` → `{execution_id, accepted_at, base_commit,
+  deduplicated}`. The same key and request replays (`deduplicated: true`); a
+  changed request under the key is `idempotency_conflict`. Node sessions are
+  parented to the Epic, so its active/provider/spend caps apply.
+- `AgentTopologyGetExecution` `{execution_id, after_sequence?, limit≤64}` →
+  `{execution, nodes[], events[], next_sequence}` (events carry kind, node,
+  attempt and actor; payloads are not projected).
+- `AgentTopologyInterrupt` `{execution_id, expected_row_version,
+  idempotency_key}` → `cancelling`; allowed while the manager is paused.
+- `AgentTopologyResolveAttempt` — the operator `ResolveTopologyAttempt` schema
+  (`inspect|accept|retry|discard`, CAS, key, `confirm_preserved_commit` iff
+  discard). A lead may inspect, accept and retry in its own Epic only; `discard`
+  destroys preserved bytes and needs the manager (`discard_requires_manager`).
+
+Policy (plan §5.3): every session node needs an explicit provider, model and
+effort that equals an entry of the operator's `allowed_launches` (an empty list
+fails closed; a lead uses its project's grant), checked at upsert, at execute
+and again at each launch. A layer with at least
+`topology_bulk_fanout_min_openrouter` (operator knob, default 4, 0 off)
+same-kind session nodes must be OpenRouter. At most 3 session nodes of an agent
+execution run at once. Manager-requested launches charge
+`max_created_sessions`; a launch refused by live policy creates no session,
+fails the attempt `policy_refused` and blocks the execution (interrupt it).
+Errors are the redacted `{code, next_action}` envelope; definition refusals add
+`diagnostics[]`. Every call (including reads and refusals) appends one row to
+the append-only `topology_agent_requests` ledger; execution events also land in
+`topology_events` with the actor. Execute re-reads the topology before
+accepting: unshared or revised meanwhile ⇒ `topology_not_visible` /
+`topology_changed`. Operator
+topology verbs (`CreateTopology`, `ExecuteTopology`, `ResolveTopologyAttempt`,
+…) stay operator-only.
+
 The twelve manager tools have native names `rsi_control_manager_progress`,
 `rsi_control_manager_inbox`, `rsi_control_manager_send`, `rsi_control_manager_reply`,
 `rsi_control_manager_notify`, `rsi_control_manager_inspect`, `rsi_control_manager_update`, and
@@ -339,7 +399,7 @@ Registration is not authorization. The seven native Issue tools are registered
 for every construction-bound Harness/CodexAppServer session so their roster is
 stable across fresh launch and rotation. Each invocation still resolves the
 persisted topology and permits execution only for the current lead of exactly
-  one legal owning Epic or for the current `IssueCoordinate` manager. The tokened CLI likewise advertises all twenty-nine verbs to
+  one legal owning Epic or for the current `IssueCoordinate` manager. The tokened CLI likewise advertises all thirty-six verbs to
 every agent while enforcing authority at dispatch.
 
 Concise lead-scoped request/result examples (`<issue>` is a canonical UUID):
@@ -374,7 +434,7 @@ act on itself and its own direct children; the current manager with
 SessionControl may act on Epic leads and descendants in its live scope.
 
 **CLI advertise surface (P1).** `rsi-rpc agent` (alias `rsi-rpc list-agent-verbs`)
-prints exactly the twenty-nine verbs above and exits 0. Invoke a verb as
+prints exactly the thirty-six verbs above and exits 0. Invoke a verb as
 `rsi-rpc <Verb> [--params JSON]`. The generic RPC passthrough is never advertised
 to an agent. The authority token rides `$RSI_SESSION_TOKEN` (transport-only) and
 must NEVER be typed into `--params`. Inspect a supported request shape offline

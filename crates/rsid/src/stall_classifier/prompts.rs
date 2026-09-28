@@ -119,6 +119,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn user_prompt_includes_required_keys() {
         let p = build_user_prompt(&fixture(None, "USER: hi", 0));
@@ -131,6 +132,7 @@ mod tests {
         assert!(p.contains("<none>"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn user_prompt_hoists_pending_question_above_excerpt() {
         let p = build_user_prompt(&fixture(Some("Can I run?"), "USER: noise", 0));
@@ -139,6 +141,7 @@ mod tests {
         assert!(q_pos < e_pos);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn user_prompt_lists_children_when_present() {
         let p = build_user_prompt(&fixture(None, "", 2));
@@ -147,12 +150,14 @@ mod tests {
         assert!(p.contains("status=Running"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn user_prompt_substitutes_empty_excerpt_placeholder() {
         let p = build_user_prompt(&fixture(None, "", 0));
         assert!(p.contains("<no recent events>"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn system_prompt_mentions_all_verdicts_and_json_only_rule() {
         assert!(CLASSIFIER_SYSTEM_PROMPT.contains("Finished"));

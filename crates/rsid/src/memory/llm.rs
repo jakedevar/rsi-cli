@@ -1,5 +1,6 @@
 use crate::bus::EventBus;
 use crate::error::{DaemonError, Result};
+use crate::memory::worker::MemoryWorkContext;
 use crate::model_control::registry::RuntimeExecutionRoute;
 use crate::model_control::{
     AdmissionDecision, AdmissionPermit, CliExecutionCapability, ModelAdmissionRequest,
@@ -168,7 +169,7 @@ fn resolve_target(target: &MemoryLlmTarget) -> Result<ResolvedMemoryLlmTarget> {
     let mut target = target.clone();
     let mut local_env_override = false;
     if target.provider == SessionProvider::Pioneer {
-        let credential = crate::pioneer::pioneer_credential_from_env()
+        let credential = crate::pioneer::pioneer_credential()
             .map_err(|error| DaemonError::Process(error.to_string()))?;
         target.base_url = Some(crate::pioneer::PIONEER_API_BASE_URL.to_string());
         target.api_key = Some(credential.value().to_string());
@@ -264,6 +265,7 @@ pub async fn admit_and_generate_text(
     max_tokens: u32,
     purpose: &str,
 ) -> Result<String> {
+    MemoryWorkContext::check_current()?;
     let resolved = resolve_target(target)?;
     let provider = resolved_provider_label(&resolved);
     let backend = resolved_backend_label(&resolved);
@@ -272,12 +274,17 @@ pub async fn admit_and_generate_text(
     request.backend = Some(backend.to_string());
     let dedup_key = request.dedup_key.clone();
 
-    let permit = match admit_invocation(store, request, event_bus).await? {
+    let permit = match MemoryWorkContext::interruptible(admit_invocation(store, request, event_bus))
+        .await?
+    {
         AdmissionDecision::Admitted(permit) => permit,
         AdmissionDecision::Duplicate { invocation_id } => {
             let duplicate_state = if let Some(key) = dedup_key.as_deref() {
-                let guard = store.lock().await;
-                crate::model_control::lookup_existing_invocation_by_dedup(&guard, key)?
+                MemoryWorkContext::interruptible(async {
+                    let guard = store.lock().await;
+                    crate::model_control::lookup_existing_invocation_by_dedup(&guard, key)
+                })
+                .await?
             } else {
                 None
             };
@@ -294,16 +301,23 @@ pub async fn admit_and_generate_text(
             return Err(DaemonError::PolicyDenied(format!("{detail}")));
         }
     };
+    let cancel = CancellationToken::new();
+    let execution = generate_text_cancellable_resolved(
+        &permit, &resolved, prompt, max_tokens, purpose, &cancel,
+    );
+    settle_memory_execution(store, event_bus, &permit, execution, &cancel, purpose).await
+}
+
+async fn settle_memory_execution<T>(
+    store: &Arc<Mutex<Store>>,
+    event_bus: &Arc<EventBus>,
+    permit: &AdmissionPermit,
+    execution: impl std::future::Future<Output = Result<T>>,
+    cancel: &CancellationToken,
+    purpose: &str,
+) -> Result<T> {
     let started_at = Instant::now();
-    let result = generate_text_cancellable_resolved(
-        &permit,
-        &resolved,
-        prompt,
-        max_tokens,
-        purpose,
-        &CancellationToken::new(),
-    )
-    .await;
+    let result = finish_memory_execution(execution, cancel).await;
     let completion = match &result {
         Ok(_) => completion_with_wall_time(started_at, None, ModelUsageConfidence::Partial),
         Err(error) => completion_with_wall_time(
@@ -312,7 +326,29 @@ pub async fn admit_and_generate_text(
             ModelUsageConfidence::Partial,
         ),
     };
-    settle_result(store, &permit, completion, result, purpose, event_bus).await
+    settle_result(store, permit, completion, result, purpose, event_bus).await
+}
+
+/// Signal cancellation, then await transport cleanup. Dropping this execution
+/// future would skip CLI kill/reap; dropping its caller would skip settlement.
+async fn finish_memory_execution<T>(
+    execution: impl std::future::Future<Output = Result<T>>,
+    cancel: &CancellationToken,
+) -> Result<T> {
+    match MemoryWorkContext::current() {
+        Some(context) => {
+            tokio::pin!(execution);
+            tokio::select! {
+                biased;
+                _ = context.cancelled() => {
+                    cancel.cancel();
+                    execution.await
+                }
+                result = &mut execution => result,
+            }
+        }
+        None => execution.await,
+    }
 }
 
 pub async fn generate_text(
@@ -427,7 +463,11 @@ async fn generate_local_or_custom_api(
         .api_key
         .clone()
         .or_else(|| std::env::var("LOCAL_LLM_API_KEY").ok());
-    let provider = OpenAiApiProvider::with_config(base_url, api_key, ProviderQuirks::default())?;
+    let provider = OpenAiApiProvider::with_config(
+        base_url,
+        crate::session::harness::api_key::ApiCredential::explicit(api_key.as_deref()),
+        ProviderQuirks::default(),
+    )?;
     generate_api(
         Box::new(provider),
         &target.model,
@@ -477,6 +517,15 @@ async fn generate_claude_cli(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let execution = permit.claim_cli_execution(RuntimeExecutionRoute::MemoryCli)?;
+    let command = claude_memory_command(target, prompt);
+    let output = run_cancellable_cli(command, execution, purpose, cancel).await?;
+
+    process_cli_output(output, purpose, "Claude", &target.model)
+}
+
+/// The memory LLM's bypass-permissions Claude child; the shared spawn
+/// boundary (`run_cancellable_cli_with_limits`) scrubs it before spawn.
+fn claude_memory_command(target: &MemoryLlmTarget, prompt: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("claude");
     command.args([
         "-p",
@@ -489,9 +538,7 @@ async fn generate_claude_cli(
         "--permission-mode",
         "bypassPermissions",
     ]);
-    let output = run_cancellable_cli(command, execution, purpose, cancel).await?;
-
-    process_cli_output(output, purpose, "Claude", &target.model)
+    command
 }
 
 async fn generate_codex_cli(
@@ -513,37 +560,81 @@ async fn generate_codex_cli(
         "never",
     ]);
 
-    let model = if target.provider == SessionProvider::Pioneer {
-        let credential = crate::pioneer::pioneer_credential_from_env()
+    let codex_binary = which::which("codex").unwrap_or_else(|_| "codex".into());
+    let model = append_codex_route_credential(
+        &mut command,
+        target,
+        &crate::vault::global(),
+        &codex_binary,
+    )?;
+    command.args(["--model", model, prompt]);
+
+    let output = run_cancellable_cli(command, execution, purpose, cancel).await?;
+    process_cli_output(output, purpose, "Codex", model)
+}
+
+/// Resolve the memory Codex route credential through the vault and inject
+/// exactly one var plus the Codex tool-shell exclude (after which the spawn
+/// boundary scrubs everything else). Returns the model.
+fn append_codex_route_credential<'a>(
+    command: &mut tokio::process::Command,
+    target: &'a MemoryLlmTarget,
+    vault: &crate::vault::VaultHandle,
+    codex_binary: &std::path::Path,
+) -> Result<&'a str> {
+    use crate::vault::Slot;
+    use rsi_common::provider_credentials::{
+        CliExposureConsumer::MemoryCodexCli, CliExposureReason::Memory,
+    };
+    if target.provider == SessionProvider::Pioneer {
+        let credential = crate::pioneer::pioneer_credential_from(vault)
             .map_err(|error| DaemonError::Process(error.to_string()))?;
-        command.env(credential.source().env_name(), credential.value());
         crate::pioneer::PioneerCodexConfigOverrides::new(
             credential.source(),
             crate::pioneer::existing_pioneer_codex_catalog_path().as_deref(),
         )
         .map_err(|error| DaemonError::Process(error.to_string()))?
-        .append_to(&mut command);
-        crate::pioneer::pioneer_launch_model(Some(&target.model))
-    } else {
-        if target.provider == SessionProvider::Bedrock {
-            let credential = crate::bedrock::credential().map_err(DaemonError::Process)?;
-            command.env(crate::bedrock::BEDROCK_ENV, credential);
-            let region = crate::bedrock::region().map_err(DaemonError::Process)?;
-            let binary = which::which("codex").unwrap_or_else(|_| "codex".into());
-            crate::bedrock::CodexOverrides::for_launch(&region, &binary, Some(&target.model))
-                .append_to(&mut command);
-        } else if target.provider == SessionProvider::OpenRouter {
-            let credential = crate::openrouter::openrouter_credential_from_env()
-                .map_err(|error| DaemonError::Process(error.to_string()))?;
-            crate::openrouter::OpenRouterCodexConfigOverrides::new(&credential)
-                .append_to(&mut command);
-        }
-        &target.model
-    };
-    command.args(["--model", model, prompt]);
-
-    let output = run_cancellable_cli(command, execution, purpose, cancel).await?;
-    process_cli_output(output, purpose, "Codex", model)
+        .append_to(command);
+        vault.inject_cli_credential(
+            command,
+            Slot::Pioneer,
+            credential.source().env_name(),
+            &crate::vault::SecretString::new(credential.value().to_owned()),
+            MemoryCodexCli,
+            Memory,
+        );
+        return Ok(crate::pioneer::pioneer_launch_model(Some(&target.model)));
+    }
+    if target.provider == SessionProvider::Bedrock {
+        let credential = crate::bedrock::credential_from(vault).map_err(DaemonError::Process)?;
+        let region = crate::bedrock::region().map_err(DaemonError::Process)?;
+        crate::bedrock::CodexOverrides::for_launch(&region, codex_binary, Some(&target.model))
+            .append_to(command);
+        vault.inject_cli_credential(
+            command,
+            Slot::Bedrock,
+            crate::bedrock::BEDROCK_ENV,
+            &credential.secret,
+            MemoryCodexCli,
+            Memory,
+        );
+    } else if target.provider == SessionProvider::OpenRouter {
+        let credential = crate::openrouter::openrouter_credential_from(vault)
+            .map_err(|error| DaemonError::Process(error.to_string()))?;
+        crate::openrouter::OpenRouterCodexConfigOverrides::new(credential.secret.expose())
+            .append_to(command);
+        // OpenRouter used to rely on an inherited `OPEN_ROUTER`; it is now an
+        // explicit single-var injection.
+        vault.inject_cli_credential(
+            command,
+            Slot::Openrouter,
+            crate::openrouter::OPENROUTER_ENV,
+            &credential.secret,
+            MemoryCodexCli,
+            Memory,
+        );
+    }
+    Ok(&target.model)
 }
 
 async fn generate_agy_cli(
@@ -585,12 +676,16 @@ async fn run_cancellable_cli(
 }
 
 async fn run_cancellable_cli_with_limits(
-    command: tokio::process::Command,
+    mut command: tokio::process::Command,
     execution: CliExecutionCapability,
     purpose: &str,
     cancel: &CancellationToken,
     limits: CaptureLimits,
 ) -> Result<CapturedOutput> {
+    // #694 K1: memory CLIs (Claude, Codex, AGY) are agent-facing and sit
+    // outside the provider stamp chokepoint. Only an explicitly injected
+    // route credential survives the scrub.
+    crate::vault::scrub_credential_env(&mut command);
     // The non-clone capability is consumed at the immediate process boundary;
     // the separate admission permit stays with the caller for settlement after
     // this function has killed, drained, and reaped the owned child.
@@ -641,6 +736,7 @@ fn process_cli_output(
 mod tests {
     use super::*;
     use crate::bus::EventBus;
+    use crate::memory::worker::MemoryWorkContext;
     use crate::model_control::{
         ModelControlRuntime, complete_invocation, request_invocation_cancellation,
     };
@@ -664,6 +760,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn memory_llm_target_debug_redacts_api_credentials() {
         let mut target = target(SessionProvider::Pioneer, "claude-sonnet-5");
@@ -674,6 +771,7 @@ mod tests {
         assert!(!debug.contains("fixture-pioneer-secret"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn infer_execution_path_prefers_explicit_base_url() {
         let mut target = target(SessionProvider::Local, "claude-sonnet-5");
@@ -684,6 +782,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn infer_execution_path_uses_codex_cli_for_codex_backed_models() {
         for provider in [
@@ -699,6 +798,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn infer_execution_path_prefers_model_family_over_local_provider() {
         assert_eq!(
@@ -721,6 +821,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn infer_execution_path_falls_back_to_provider_when_model_is_ambiguous() {
         assert_eq!(
@@ -739,6 +840,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn invalid_base_url_is_rejected() {
         let mut target = target(SessionProvider::Harness, "gpt-5.4");
@@ -752,6 +854,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn loopback_base_url_uses_openai_compatible_transport() {
         let mut target = target(SessionProvider::Harness, "gpt-5.4");
@@ -821,6 +924,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn memory_openai_loopback_reaches_session_harness_route_exactly_once() {
         let server = MockServer::start().await;
@@ -854,6 +958,7 @@ mod tests {
         server.verify().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn memory_anthropic_loopback_reaches_session_harness_route_exactly_once() {
         let server = MockServer::start().await;
@@ -911,6 +1016,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn explicit_remote_local_provider_target_is_denied_by_factory_admission() {
         let target = MemoryLlmTarget {
@@ -927,6 +1033,7 @@ mod tests {
         assert_remote_memory_target_denied(&target).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn environment_remote_local_provider_target_is_denied_by_factory_admission() {
         let target = target(SessionProvider::Local, "qwen-test");
@@ -951,6 +1058,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn pre_cancelled_direct_http_never_claims_or_connects_and_settles_truthfully() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1081,6 +1189,86 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_llm_waits_for_cleanup_before_settlement() {
+        use std::sync::atomic::Ordering;
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let bus = Arc::new(EventBus::new(16));
+        let permit = match admit_invocation(
+            &store,
+            cli_request(
+                ModelInvocationPurpose::SessionLaunchFresh,
+                "memory-off-fake-cleanup",
+            ),
+            &bus,
+        )
+        .await
+        .unwrap()
+        {
+            AdmissionDecision::Admitted(permit) => permit,
+            _ => panic!("unique admission"),
+        };
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let context = MemoryWorkContext::new(Arc::clone(&runtime), CancellationToken::new());
+        let cancel = CancellationToken::new();
+        let started = tokio::sync::Notify::new();
+        let cleaning = tokio::sync::Notify::new();
+        let (release, cleanup) = tokio::sync::oneshot::channel();
+        let invocation = context.scope(settle_memory_execution(
+            &store,
+            &bus,
+            &permit,
+            async {
+                started.notify_one();
+                cancel.cancelled().await;
+                cleaning.notify_one();
+                cleanup.await.unwrap();
+                Err::<(), _>(DaemonError::ChannelClosed)
+            },
+            &cancel,
+            "fake memory cleanup",
+        ));
+        tokio::pin!(invocation);
+        tokio::select! {
+            _ = started.notified() => {},
+            result = &mut invocation => panic!("execution must wait: {result:?}"),
+        }
+        runtime.memory_enabled.store(false, Ordering::Relaxed);
+        tokio::select! {
+            _ = cleaning.notified() => {},
+            result = &mut invocation => panic!("cleanup must be awaited: {result:?}"),
+        }
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .load_model_invocation_record(permit.invocation_id())
+                .unwrap()
+                .unwrap()
+                .status,
+            ModelInvocationStatus::Running
+        );
+        release.send(()).unwrap();
+        assert!(matches!(invocation.await, Err(DaemonError::ChannelClosed)));
+        let guard = store.lock().await;
+        let row = guard
+            .load_model_invocation_record(permit.invocation_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ModelInvocationStatus::Failed);
+        assert_eq!(row.error_class.as_deref(), Some("cancelled"));
+        assert!(
+            guard
+                .build_model_control_status(8)
+                .unwrap()
+                .active_invocations
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
     fn oversized_stub_command(marker: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("sh");
         command
@@ -1103,6 +1291,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn memory_cli_child_receives_exact_durable_invocation_stamp() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1146,6 +1335,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn denied_cli_admission_never_spawns_the_local_stub() {
         let temp = TempDir::new().expect("tempdir");
@@ -1186,6 +1376,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn pre_cancelled_cli_never_spawns_the_local_stub() {
         let temp = TempDir::new().expect("tempdir");
@@ -1226,6 +1417,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn cancellation_drains_reaps_and_settles_cli_stub_once() {
         let temp = TempDir::new().expect("tempdir");
@@ -1331,6 +1523,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn memory_cli_stderr_overflow_is_bounded_reaped_and_truthfully_settled() {
         let temp = TempDir::new().expect("tempdir");
@@ -1406,5 +1599,133 @@ mod tests {
                 .is_empty(),
             "overflow settlement must release active counters"
         );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn memory_vault(slot: crate::vault::Slot, secret: &str) -> crate::vault::VaultHandle {
+        let vault = crate::vault::VaultHandleBuilder::new(std::sync::Arc::new(
+            crate::vault::VaultSettings::default(),
+        ))
+        .env(|_| None)
+        .open()
+        .unwrap();
+        vault.set(slot, secret).unwrap();
+        vault
+            .set(crate::vault::Slot::Anthropic, "sk-test-memory-anthropic")
+            .unwrap();
+        vault
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn assert_memory_route(
+        provider: SessionProvider,
+        slot: crate::vault::Slot,
+        var: &str,
+        secret: &str,
+        model: &str,
+    ) {
+        // Vault-only: no env value exists for any slot.
+        let vault = memory_vault(slot, secret);
+        let target = MemoryLlmTarget {
+            provider,
+            model: model.into(),
+            base_url: None,
+            api_key: None,
+        };
+        let mut command = tokio::process::Command::new("codex");
+        append_codex_route_credential(
+            &mut command,
+            &target,
+            &vault,
+            std::path::Path::new("/nonexistent/rsi-test-codex"),
+        )
+        .unwrap();
+        // `run_cancellable_cli_with_limits` scrubs again before spawn.
+        crate::vault::scrub_credential_env(&mut command);
+        crate::vault::env_scrub::tests::assert_only_injected(&command, Some(var));
+        crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&command, Some(var));
+        let injected = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(var))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(injected.as_deref(), Some(secret));
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&crate::vault::env_scrub::codex_shell_exclude_arg(var)));
+        assert!(!args.join(" ").contains(secret));
+        // The injection is reported as a CLI exposure.
+        assert!(vault.metadata(slot).last_cli_exposure_at.is_some());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn memory_openrouter_cli_injects_explicit_open_router_from_vault() {
+        assert_memory_route(
+            SessionProvider::OpenRouter,
+            crate::vault::Slot::Openrouter,
+            crate::openrouter::OPENROUTER_ENV,
+            "sk-test-memory-openrouter",
+            "vendor/model",
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn memory_pioneer_cli_injects_only_pioneer_var_from_vault() {
+        assert_memory_route(
+            SessionProvider::Pioneer,
+            crate::vault::Slot::Pioneer,
+            crate::pioneer::PIONEER_PRIMARY_ENV,
+            "sk-test-memory-pioneer",
+            "vendor/model",
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn memory_bedrock_cli_injects_only_bedrock_token_from_vault() {
+        temp_env::with_vars([("AWS_REGION", Some("us-west-1"))], || {
+            assert_memory_route(
+                SessionProvider::Bedrock,
+                crate::vault::Slot::Bedrock,
+                crate::bedrock::BEDROCK_ENV,
+                "bedrock-api-key-test-memory",
+                "global.openai.gpt-5.6-sol",
+            );
+        });
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn memory_cli_spawn_boundary_scrubs_credentials() {
+        // Claude and AGY memory CLIs inject nothing; the shared spawn
+        // boundary must scrub every inherited credential.
+        let source = include_str!("llm.rs");
+        let boundary = source
+            .find("async fn run_cancellable_cli_with_limits(")
+            .expect("memory CLI spawn boundary");
+        let body = &source[boundary..boundary + 1200];
+        assert!(body.contains("crate::vault::scrub_credential_env(&mut command);"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn memory_claude_child_suppresses_daemon_keys_and_keeps_ordinary_env() {
+        let target = MemoryLlmTarget {
+            provider: SessionProvider::Claude,
+            model: "claude-sonnet-5".into(),
+            base_url: None,
+            api_key: None,
+        };
+        let mut command = claude_memory_command(&target, "summarize");
+        // What `run_cancellable_cli_with_limits` does before spawning.
+        crate::vault::scrub_credential_env(&mut command);
+        crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&command, None);
     }
 }

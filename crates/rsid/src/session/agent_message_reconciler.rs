@@ -756,6 +756,7 @@ mod tests {
     /// that is what makes "a failing reconciliation pass cannot fail the
     /// daemon's boot" unwriteable-around rather than a convention, because a
     /// caller has no `?` to write.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn reconciliation_is_a_pure_synchronous_function() {
         let pass: fn(&Store, Uuid, ReconciliationPassBudget) -> AgentMessageReconciliationReport =
@@ -780,6 +781,7 @@ mod tests {
     ///
     /// The needles are assembled with `concat!` so this test's own source does
     /// not contain the strings it forbids.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn the_reconciler_cannot_reach_a_provider_effect_at_all() {
         let source = include_str!("agent_message_reconciler.rs");
@@ -817,6 +819,7 @@ mod tests {
     ///
     /// The needles are assembled with `concat!` so this file still contains
     /// none of the strings the test above forbids.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn the_store_guard_is_never_held_across_a_suspension_point() {
         let source = include_str!("mod.rs");
@@ -862,6 +865,7 @@ mod tests {
     ///
     /// The panicking body is injected through the `pass` parameter, so there is
     /// no failpoint and no `#[cfg(test)]` branch in the production path.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn a_panicking_pass_is_contained_counted_and_never_ends_reconciliation() {
         let store = Store::open_in_memory().expect("open V82 store");
@@ -917,6 +921,7 @@ mod tests {
     /// containment and quietly change what a NORMAL pass reports. On an empty
     /// store the wrapper the daemon actually calls must be indistinguishable
     /// from the bare pass.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn containment_does_not_change_what_an_ordinary_pass_reports() {
         let store = Store::open_in_memory().expect("open V82 store");

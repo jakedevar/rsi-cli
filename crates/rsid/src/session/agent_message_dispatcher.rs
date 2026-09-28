@@ -385,6 +385,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn dispatch_tick_planning_is_a_pure_synchronous_function() {
         // Coercing to a `fn` pointer is the compile-time assertion: if
@@ -400,6 +401,7 @@ mod tests {
         assert!(plan.held_back.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn only_the_head_of_each_logical_root_is_granted_and_the_rest_wait() {
         let root = Uuid::new_v4();
@@ -423,6 +425,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn a_root_with_an_outstanding_grant_is_never_granted_again() {
         let root = Uuid::new_v4();
@@ -450,6 +453,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn only_ready_heads_produce_a_grant_request() {
         // Each non-Ready class is carried through with its own typed reason
@@ -475,6 +479,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn a_ready_head_without_delivery_facts_fails_closed() {
         let root = Uuid::new_v4();
@@ -492,6 +497,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn the_tick_grant_budget_is_frozen_and_bounded() {
         let messages: Vec<_> = (0..AGENT_MESSAGE_DISPATCH_MAX_GRANTS_PER_TICK + 3)
@@ -519,6 +525,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn the_grant_request_carries_the_claims_fences_verbatim() {
         let root = Uuid::new_v4();

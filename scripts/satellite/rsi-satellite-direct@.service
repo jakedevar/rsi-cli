@@ -1,0 +1,21 @@
+[Unit]
+Description=RSI satellite direct tunnel (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/rsi/satellites/%i-direct.env
+ExecStartPre=%h/.local/libexec/rsi-satellite/direct.sh --prepare %i
+ExecStart=%h/.local/libexec/rsi-satellite/direct.sh %i
+ExecStartPost=%h/.local/libexec/rsi-satellite/direct.sh --secure %i
+Restart=always
+RestartSec=20s
+TimeoutStartSec=35s
+TimeoutStopSec=5s
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

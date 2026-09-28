@@ -44,9 +44,6 @@ pub const COMPACT_RAINBOW_HEIGHT: u16 = 1;
 /// Title, compact metadata, and divider rows above the transcript.
 pub const SESSION_DETAIL_HEADER_HEIGHT: u16 = 3;
 
-/// Duration in milliseconds of the message-formulation grow animation.
-pub const FORMULATION_ANIMATION_MS: i64 = 500;
-
 /// Shrink an event's full allocated rect down to the rows its card actually
 /// occupies (border + content), excluding the trailing `EVENT_CARD_GAP`
 /// separator row baked into `event_height` by `ui::height::update_event_heights`.
@@ -1067,6 +1064,7 @@ fn render_dense_rows(
     viewed_session_id: Option<uuid::Uuid>,
     focus_index: &HashMap<uuid::Uuid, SessionFocusEntry>,
     manager_ids: &HashSet<uuid::Uuid>,
+    operator_pauses: &HashMap<uuid::Uuid, crate::client::OperatorPauseLevel>,
     _descent_head: Option<uuid::Uuid>,
     bg: Color,
 ) {
@@ -1147,6 +1145,10 @@ fn render_dense_rows(
             focus_index.get(id),
         );
         row.is_manager = manager_ids.contains(id);
+        row.operator_pause = operator_pauses
+            .get(id)
+            .copied()
+            .unwrap_or(crate::client::OperatorPauseLevel::None);
         let is_selected = idx == selected_index;
         let is_viewed = Some(*id) == viewed_session_id;
         let y = area.y + row_offset.saturating_sub(visible_start) as u16;
@@ -1284,12 +1286,29 @@ fn render_navigator_row(
     let column_count = layout.columns.len();
     for (index, cell) in layout.columns.iter().enumerate() {
         if cell.column == navigator_layout::NavigatorColumn::Function {
-            spans.extend(function_cell_spans(
-                row,
-                cell.width,
-                title_style(row, is_selected, row_bg, accent_color),
-                row_bg,
-            ));
+            let (marker, marker_color) = match row.operator_pause {
+                crate::client::OperatorPauseLevel::None => ("", theme::dim_metadata()),
+                crate::client::OperatorPauseLevel::Soft => ("SOFT ", theme::warning_status()),
+                crate::client::OperatorPauseLevel::Hard => ("HARD ", theme::status_interrupted()),
+            };
+            let marker_width = marker.len().min(cell.width);
+            if marker_width > 0 {
+                spans.push(Span::styled(
+                    navigator_layout::span_cells(marker, marker_width),
+                    Style::default()
+                        .fg(marker_color)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if cell.width > marker_width {
+                spans.extend(function_cell_spans(
+                    row,
+                    cell.width - marker_width,
+                    title_style(row, is_selected, row_bg, accent_color),
+                    row_bg,
+                ));
+            }
             if index + 1 < column_count {
                 let next = &layout.columns[index + 1];
                 spans.push(fixed_span(
@@ -1811,14 +1830,18 @@ fn render_session_inspector(
                 .bg(bg),
         )),
     ];
-    lines.extend(inspector_title_lines(inspector, bg));
+    let mut title_lines = inspector_title_lines(inspector, bg);
+    if let Some(execution) = inspector_execution_line(inspector, source_session, bg) {
+        title_lines.insert(1, execution);
+    }
+    lines.extend(title_lines);
     if let Some(chips) = inspector_signal_line(&inspector.signals, bg) {
         lines.push(chips);
     }
     lines.push(Line::default());
 
     render_inspector_body(&mut lines, &inspector.body, width, bg);
-    render_inspector_facts(&mut lines, inspector, source_session, width, bg);
+    render_inspector_facts(&mut lines, inspector, width, bg);
 
     // Blocks are pre-wrapped so glyph gutters and quote rails survive
     // wrapping; the paragraph only wraps lines that are still too long.
@@ -2010,10 +2033,11 @@ fn render_embedded_session_inspector(
     for line in inspector_title_lines(inspector, bg).into_iter().take(1) {
         header.extend(line.spans);
     }
-    let mut lines = vec![Line::from(header), Line::default()];
+    let mut lines = vec![Line::from(header)];
     if let Some(execution) = inspector_execution_line(inspector, source_session, bg) {
         lines.push(execution);
     }
+    lines.push(Line::default());
     push_glyph_block(
         &mut lines,
         glyphs::NEXT,
@@ -2395,7 +2419,6 @@ fn render_inspector_summary_description(
 fn render_inspector_facts(
     lines: &mut Vec<Line<'static>>,
     inspector: &SessionInspectorViewModel,
-    source_session: Option<&Session>,
     width: usize,
     bg: Color,
 ) {
@@ -2403,10 +2426,6 @@ fn render_inspector_facts(
     let glyph_style = Style::default().fg(theme::subtext0()).bg(bg);
     let value_style = Style::default().fg(theme::subtext1()).bg(bg);
     let dim_style = Style::default().fg(theme::dim_metadata()).bg(bg);
-
-    if let Some(execution) = inspector_execution_line(inspector, source_session, bg) {
-        lines.push(execution);
-    }
 
     if runtime.provider.is_some() {
         let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
@@ -2577,7 +2596,7 @@ fn inspector_execution_line(
     Some(Line::from(spans))
 }
 
-/// `◔ ▰▰▰▰▱▱▱▱▱▱ 42%  421k / 1m repository fallback` plus one dim line with
+/// `◔ ▮▮▮▮▯▯▯▯▯▯ 42%  421k / 1m repository fallback` plus one dim line with
 /// the remaining provenance (source, version, freshness, …).
 fn render_inspector_context(
     lines: &mut Vec<Line<'static>>,
@@ -3475,6 +3494,7 @@ pub fn render_session_list(
         viewed_session_id,
         focus_index,
         &manager_ids,
+        &app.operator_pauses,
         descent_head,
         search_active,
         &empty_message,
@@ -3545,6 +3565,7 @@ fn render_zone_table(
     viewed_session_id: Option<uuid::Uuid>,
     focus_index: &HashMap<uuid::Uuid, SessionFocusEntry>,
     manager_ids: &HashSet<uuid::Uuid>,
+    operator_pauses: &HashMap<uuid::Uuid, crate::client::OperatorPauseLevel>,
     descent_head: Option<uuid::Uuid>,
     search_active: bool,
     empty_message: &str,
@@ -3618,6 +3639,7 @@ fn render_zone_table(
             viewed_session_id,
             focus_index,
             manager_ids,
+            operator_pauses,
             descent_head,
             bg,
         );
@@ -4187,11 +4209,7 @@ pub fn render_session_detail(
         session.status,
         SessionStatus::Running | SessionStatus::Starting
     );
-    let formulation_active = state
-        .formulation
-        .map(|f| chrono::Utc::now().timestamp_millis() - f.started_at_ms < FORMULATION_ANIMATION_MS)
-        .unwrap_or(false);
-    let show_loading_bar = is_active && area.height > 5 && !formulation_active;
+    let show_loading_bar = is_active && area.height > 5;
 
     let mut viewport_height = inner.height as usize;
     if show_loading_bar {
@@ -4251,33 +4269,6 @@ pub fn render_session_detail(
         map
     };
 
-    // --- Formulation animation ---
-    // If a grow animation is active for the last event, render it at the bottom
-    // of the inner area and skip it in the main loop below.
-    let formulation_skip_idx: Option<usize> = if let Some(form) = state.formulation {
-        if form.target_height > 0 {
-            let elapsed = chrono::Utc::now().timestamp_millis() - form.started_at_ms;
-            let anim_ms = app.settings.formulation_anim_ms.max(1) as i64;
-            let progress = (elapsed as f32 / anim_ms as f32).clamp(0.0, 1.0);
-            let growth =
-                (form.target_height.saturating_sub(LOADING_CONTAINER_HEIGHT)) as f32 * progress;
-            let current_height = (LOADING_CONTAINER_HEIGHT as f32 + growth).round() as u16;
-            render_formulating_event(
-                frame,
-                inner,
-                state,
-                form.event_index,
-                current_height,
-                progress,
-            );
-            Some(form.event_index)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Render each visible event as its own Paragraph.
     //
     // The loop integrates both core rendering and thinking fold indicators.
@@ -4293,11 +4284,6 @@ pub fn render_session_detail(
         let event_offset = state.event_offsets[event_idx];
         let event = &state.events[event_idx];
         let is_cursor = state.current_event_index == Some(event_idx);
-
-        // Skip the event being rendered by the formulation animation.
-        if Some(event_idx) == formulation_skip_idx {
-            continue;
-        }
 
         // --- Thinking fold indicator ---
         // Must come BEFORE the height-0 guard below.
@@ -4677,6 +4663,45 @@ pub fn render_session_detail(
 
         if event_y + rect_height >= viewport_height {
             break;
+        }
+    }
+
+    // --- Formulation reveal (opt-in) ---
+    // The event already painted in place at its final geometry; overlay the
+    // wipe on whichever of its card rows are on screen.
+    if let Some(form) = state.formulation
+        && let Some(progress) = formulation_progress(
+            form,
+            chrono::Utc::now().timestamp_millis(),
+            app.settings.formulation_anim_enabled,
+            app.settings.formulation_anim_ms,
+        )
+        && let Some(event) = state.events.get(form.event_index)
+        && let (Some(&offset), Some(&height)) = (
+            state.event_offsets.get(form.event_index),
+            state.event_heights.get(form.event_index),
+        )
+    {
+        let card_rows = height.saturating_sub(crate::ui::height::EVENT_CARD_GAP);
+        let top = offset.max(state.scroll_offset);
+        let bottom = (offset + card_rows).min(state.scroll_offset + viewport_height);
+        if bottom > top {
+            let reveal_rect = Rect::new(
+                inner.x,
+                inner.y + (top - state.scroll_offset) as u16,
+                inner.width,
+                (bottom - top) as u16,
+            );
+            let (base, glow) = formulation_colors(event, &app.settings, detail_bg);
+            apply_formulation_reveal(
+                frame.buffer_mut(),
+                reveal_rect,
+                top - offset,
+                card_rows,
+                progress,
+                base,
+                glow,
+            );
         }
     }
 
@@ -5817,128 +5842,105 @@ pub fn render_loading_bar(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the formulating event (last visible event) at a fixed bottom position
-/// with `current_height` rows, growing from the classic loader height to `target_height`.
-///
-/// Phase 2: renders the bubble shape only (no crossfade — Phase 3 adds that).
-/// The bubble is anchored to the bottom of `inner` so it appears to grow upward
-/// from where the loading container sat.
-/// Re-colour every character in `lines` with a cycling rainbow palette.
-///
-/// `tick` is a time-based phase offset (from `timestamp_millis() / 60`) so the
-/// colours scroll left-to-right each render frame, giving a flowing rather than
-/// static rainbow. Characters wrap through the 14-colour palette so all colours
-/// appear as densely as possible regardless of message length.
-fn apply_rainbow_text(
-    lines: Vec<Line<'static>>,
-    tick: usize,
-    palette: &[Color],
-) -> Vec<Line<'static>> {
-    if palette.is_empty() {
-        return lines;
+/// Rows in the accent band that trails the formulation reveal front.
+const FORMULATION_BAND_ROWS: f32 = 3.0;
+/// How far an unrevealed cell's foreground is pushed toward the bubble
+/// background (0 = untouched, 1 = invisible).
+const FORMULATION_GHOST_MIX: f32 = 0.82;
+/// Peak accent tint at the reveal front (0 = none, 1 = pure accent).
+const FORMULATION_GLOW_MIX: f32 = 0.7;
+
+/// Eased progress (`0.0..1.0`) of an armed formulation reveal, or `None` when
+/// the reveal is disabled or finished and should be dropped.
+pub(crate) fn formulation_progress(
+    form: crate::types::FormulationState,
+    now_ms: i64,
+    enabled: bool,
+    duration_ms: u64,
+) -> Option<f32> {
+    if !enabled {
+        return None;
     }
-    let plen = palette.len();
-    let mut char_idx = 0usize;
-    let mut result = Vec::with_capacity(lines.len());
-    for line in lines {
-        let mut new_spans: Vec<Span<'static>> = Vec::new();
-        for span in line.spans {
-            for ch in span.content.chars() {
-                let color = palette[char_idx.wrapping_add(tick) % plen];
-                char_idx = char_idx.wrapping_add(1);
-                new_spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-            }
-        }
-        result.push(Line::from(new_spans));
+    let duration = duration_ms.max(1) as f32;
+    let elapsed = now_ms.saturating_sub(form.started_at_ms).max(0) as f32;
+    if elapsed >= duration {
+        return None;
     }
-    result
+    // Ease-out cubic: most of the text lands fast, the tail settles gently.
+    let t = elapsed / duration;
+    Some(1.0 - (1.0 - t).powi(3))
 }
 
-fn render_formulating_event(
-    frame: &mut Frame,
-    inner: Rect,
-    state: &crate::types::SessionState,
-    event_idx: usize,
-    current_height: u16,
+/// Ghost target and accent for the reveal of `event`: the surface the event
+/// is painted on, and its role colour.
+fn formulation_colors(
+    event: &ConversationEvent,
+    settings: &crate::settings::UserSettings,
+    detail_bg: Color,
+) -> (Color, Color) {
+    match event.event_type {
+        EventType::Message => (
+            detail_bg,
+            match event.role {
+                Some(Role::User) => theme::user_role(),
+                _ => theme::assistant_role(),
+            },
+        ),
+        _ => (
+            event_bubble_bg(event, settings),
+            theme::tool_call_selected_border(),
+        ),
+    }
+}
+
+/// Overlay the formulation reveal on an event already painted into `area`.
+///
+/// A front sweeps from the event's first card row to its last. Rows the front
+/// has passed keep their final colours; a short band just behind it is tinted
+/// toward `glow` and settles into the final colour; rows it has not reached are
+/// ghosted toward `base` (or dimmed when the colours cannot be blended, e.g. a
+/// transparent surface). Only foregrounds change: bubble shape, backgrounds and
+/// layout are the final frame from the first tick.
+///
+/// `first_row` is the event-relative row painted at `area.y` (non-zero when the
+/// event is scrolled partly off the top); `total_rows` is the full card height.
+pub(crate) fn apply_formulation_reveal(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    first_row: usize,
+    total_rows: usize,
     progress: f32,
+    base: Color,
+    glow: Color,
 ) {
-    let Some(event) = state.events.get(event_idx) else {
-        return;
-    };
-    if inner.height < current_height || current_height == 0 {
+    if progress >= 1.0 || total_rows == 0 {
         return;
     }
-
-    // Anchor to the bottom of inner (same y position the loading container occupied).
-    let bubble_y = inner.y + inner.height - current_height;
-    let event_rect = Rect::new(inner.x, bubble_y, inner.width, current_height);
-
-    // Choose border style matching the event type.
-    let is_tool_event = matches!(
-        event.event_type,
-        rsi_common::types::EventType::ToolUse | rsi_common::types::EventType::ToolResult
-    );
-
-    // Blend border color from tool-call-grey toward role border as progress increases.
-    let target_border_color = if is_tool_event {
-        theme::tool_call_border()
-    } else {
-        match event.role {
-            Some(rsi_common::types::Role::User) => theme::user_message_border(),
-            _ => theme::assistant_message_border(),
+    let area = area.intersection(buf.area);
+    let front = progress.clamp(0.0, 1.0) * (total_rows as f32 + FORMULATION_BAND_ROWS);
+    for dy in 0..area.height {
+        let row = (first_row + dy as usize) as f32;
+        // Rows the front has passed by; <= 0 means not yet reached.
+        let behind = front - row;
+        if behind >= FORMULATION_BAND_ROWS {
+            continue;
         }
-    };
-    let start_border_color = theme::tool_call_border();
-    let border_color = theme::lerp_color(start_border_color, target_border_color, progress);
-
-    // Border set: switch from dashed to solid at 50%.
-    let block = if progress < 0.5 {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_set(TOOL_CALL_BORDER)
-            .border_style(Style::default().fg(border_color))
-    } else {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-    };
-
-    let para_rect = block.inner(event_rect);
-    frame.render_widget(block, event_rect);
-
-    // Render event content if we have interior space.
-    if para_rect.height > 0 && para_rect.width > 0 {
-        let render_width = para_rect.width;
-        let lines = if let Some(entry) =
-            crate::ui::height::cached_render_event(state, event_idx, render_width, false)
-        {
-            entry.lines.clone()
-        } else {
-            let is_collapsed = crate::ui::height::is_event_effectively_collapsed(state, event);
-            let model_name = content::model_for_sequence(
-                &state.model_segments,
-                event.sequence,
-                state.session.model.as_deref(),
-            );
-            let ctx = content::EventRenderContext {
-                is_collapsed,
-                is_expanded: state.expanded_events.contains(&event.sequence),
-                is_cursor: false,
-                is_last_event: true,
-                model_name,
-                pipeline_commands: state.docregblock_contents.clone(),
-                max_width: render_width,
-            };
-            content::build_event_lines(event, &ctx)
-        };
-        // Rainbow per-character text: every letter gets a different palette color,
-        // cycling through the full 14-color rainbow. The time tick shifts the
-        // phase each frame so the colors flow visually (not static). The bubble
-        // content is legible from frame 1 — no chevron overlay, no 50% gate.
-        let palette = theme::rainbow_palette();
-        let tick = (chrono::Utc::now().timestamp_millis() / 60) as usize;
-        let rainbow_lines = apply_rainbow_text(lines, tick, &palette);
-        frame.render_widget(Paragraph::new(rainbow_lines), para_rect);
+        for x in area.x..area.right() {
+            let cell = &mut buf[(x, area.y + dy)];
+            if behind <= 0.0 {
+                match theme::blend_rgb(cell.fg, base, FORMULATION_GHOST_MIX) {
+                    Some(color) => cell.fg = color,
+                    None => cell.modifier.insert(Modifier::DIM),
+                }
+            } else {
+                let tint = FORMULATION_GLOW_MIX * (1.0 - behind / FORMULATION_BAND_ROWS);
+                match theme::blend_rgb(cell.fg, glow, tint) {
+                    Some(color) => cell.fg = color,
+                    None if tint >= 0.5 => cell.fg = glow,
+                    None => {}
+                }
+            }
+        }
     }
 }
 
@@ -6085,6 +6087,166 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use rsi_common::types::{ConversationEvent, Role};
+
+    fn reveal_form(started_at_ms: i64) -> crate::types::FormulationState {
+        crate::types::FormulationState {
+            event_index: 0,
+            started_at_ms,
+        }
+    }
+
+    #[test]
+    fn formulation_progress_is_none_when_disabled() {
+        assert_eq!(formulation_progress(reveal_form(0), 10, false, 500), None);
+    }
+
+    #[test]
+    fn formulation_progress_eases_and_expires() {
+        let start = formulation_progress(reveal_form(1_000), 1_000, true, 500)
+            .expect("armed reveal runs at t=0");
+        assert_eq!(start, 0.0);
+        let mid = formulation_progress(reveal_form(1_000), 1_250, true, 500)
+            .expect("reveal still running mid-way");
+        assert!(mid > 0.5, "ease-out is past linear at the midpoint: {mid}");
+        assert_eq!(
+            formulation_progress(reveal_form(1_000), 1_500, true, 500),
+            None
+        );
+        // Clock skew (now before start) clamps to the first frame.
+        assert_eq!(
+            formulation_progress(reveal_form(1_000), 900, true, 500),
+            Some(0.0)
+        );
+    }
+
+    fn reveal_buffer(rows: u16, fg: Color) -> ratatui::buffer::Buffer {
+        let area = Rect::new(0, 0, 4, rows);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for y in 0..rows {
+            for x in 0..4 {
+                buf[(x, y)].set_symbol("x").fg = fg;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn formulation_reveal_ghosts_unreached_rows_and_keeps_passed_rows() {
+        let text = Color::Rgb(200, 200, 200);
+        let base = Color::Rgb(0, 0, 0);
+        let glow = Color::Rgb(0, 0, 255);
+        let mut buf = reveal_buffer(10, text);
+        // front = 0.5 * (10 + 3) = 6.5: rows 0..=3 fully revealed,
+        // rows 4..=6 in the accent band, rows 7..=9 ghosted.
+        apply_formulation_reveal(&mut buf, Rect::new(0, 0, 4, 10), 0, 10, 0.5, base, glow);
+
+        assert_eq!(buf[(0, 0)].fg, text, "passed row keeps its final colour");
+        assert_eq!(buf[(3, 3)].fg, text);
+        let Color::Rgb(_, _, band_blue) = buf[(0, 6)].fg else {
+            panic!("band row blends to RGB: {:?}", buf[(0, 6)].fg);
+        };
+        assert!(band_blue > 200, "band row carries the accent tint");
+        let Color::Rgb(ghost, _, _) = buf[(0, 9)].fg else {
+            panic!("ghost row blends to RGB: {:?}", buf[(0, 9)].fg);
+        };
+        assert!(
+            ghost < 60,
+            "unreached row is ghosted toward the surface: {ghost}"
+        );
+        assert_eq!(
+            buf[(0, 9)].symbol(),
+            "x",
+            "text stays in place (no layout change)"
+        );
+    }
+
+    #[test]
+    fn formulation_reveal_dims_when_colours_cannot_blend() {
+        let mut buf = reveal_buffer(4, Color::Reset);
+        apply_formulation_reveal(
+            &mut buf,
+            Rect::new(0, 0, 4, 4),
+            0,
+            4,
+            0.0,
+            Color::Reset,
+            Color::Rgb(0, 0, 255),
+        );
+        assert!(buf[(0, 3)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(0, 3)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn formulation_reveal_respects_scrolled_first_row() {
+        let text = Color::Rgb(200, 200, 200);
+        let mut buf = reveal_buffer(3, text);
+        // Event is 10 rows, rows 7..=9 on screen; front at 6.5 has not reached
+        // them, so every visible row is still ghosted.
+        apply_formulation_reveal(
+            &mut buf,
+            Rect::new(0, 0, 4, 3),
+            7,
+            10,
+            0.5,
+            Color::Rgb(0, 0, 0),
+            Color::Rgb(0, 0, 255),
+        );
+        let Color::Rgb(ghost, _, _) = buf[(0, 0)].fg else {
+            panic!("ghost row blends to RGB");
+        };
+        assert!(ghost < 60);
+    }
+
+    #[test]
+    fn formulation_reveal_is_a_no_op_when_complete() {
+        let text = Color::Rgb(200, 200, 200);
+        let mut buf = reveal_buffer(4, text);
+        let before = buf.clone();
+        apply_formulation_reveal(
+            &mut buf,
+            Rect::new(0, 0, 4, 4),
+            0,
+            4,
+            1.0,
+            Color::Rgb(0, 0, 0),
+            Color::Rgb(0, 0, 255),
+        );
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn session_row_shows_operator_pause_strength() {
+        let settings = crate::settings::UserSettings::default();
+        for (level, label) in [
+            (crate::client::OperatorPauseLevel::Soft, "SOFT"),
+            (crate::client::OperatorPauseLevel::Hard, "HARD"),
+        ] {
+            let mut row = crate::types::row::SessionRowViewModel::placeholder(uuid::Uuid::new_v4());
+            row.display_title = "Pause target".into();
+            row.operator_pause = level;
+            let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_navigator_row(
+                        frame,
+                        frame.area(),
+                        &row,
+                        None,
+                        &settings,
+                        2,
+                        false,
+                        false,
+                        false,
+                        theme::blue(),
+                        theme::tier_panel(),
+                    );
+                })
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            assert!(text.contains(label), "{level:?}: {text}");
+            assert!(text.contains("Pause target"), "{level:?}: {text}");
+        }
+    }
 
     struct RenderedContainerRow {
         text: String,
@@ -9212,6 +9374,50 @@ mod tests {
     }
 
     #[test]
+    fn selected_inspector_places_model_under_title_and_renders_aligned_context_gauge() {
+        use crate::app::app_test_helpers::{baseline_session, with_session_list};
+        use ratatui::{Terminal, backend::TestBackend};
+        use rsi_common::types::{SessionKind, SessionProvider};
+
+        let mut app = with_session_list(1);
+        let session_id = app.filtered_session_order[0];
+        let mut session = baseline_session(session_id, SessionKind::Task);
+        session.title = Some("Inspector layout probe".to_string());
+        session.short_summary = Some("Visible task summary".to_string());
+        session.provider = SessionProvider::Codex;
+        session.model = Some("gpt-6-luna".to_string());
+        session.effort = Some("max".to_string());
+        session.context_fill_pct = Some(40.0);
+        app.sessions
+            .insert(session_id, crate::types::SessionState::new(session));
+        let inspector = crate::types::compute_session_inspector(&app, session_id, 1)
+            .expect("selected inspector projection");
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("inspector");
+        terminal
+            .draw(|frame| {
+                render_session_inspector(
+                    frame,
+                    Rect::new(0, 0, 120, 32),
+                    Some(&inspector),
+                    app.sessions.get(&session_id).map(|state| &state.session),
+                    theme::tier_panel(),
+                );
+            })
+            .expect("selected inspector render");
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+        let (_, title_y) = buffer_text_position(buffer, "Inspector layout probe").expect(&text);
+        let (_, model_y) = buffer_text_position(buffer, "gpt-6-luna").expect(&text);
+        let (_, summary_y) = buffer_text_position(buffer, "Visible task summary").expect(&text);
+        assert_eq!(model_y, title_y + 1, "model follows title: {text}");
+        assert!(summary_y > model_y, "summary follows model: {text}");
+        assert!(
+            text.contains("▮▮▮▮▯▯▯▯▯▯ 40%"),
+            "aligned context gauge: {text}"
+        );
+    }
+
+    #[test]
     fn t09_selected_session_inspector_renders_positive_summary_and_description_destinations() {
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
@@ -10499,11 +10705,9 @@ mod tests {
             "pending leader state must render a distinct positive mode label after the prefix:\n{pending}"
         );
 
-        // Follow-up key completes the sequence into a real action, clearing
-        // the pending state and restoring the ordinary NORMAL label.
-        // A migrated launcher chord (<Space>n) also completes the leader and
-        // clears the pending indicator.
-        feed_leader_key(&mut app, crossterm::event::KeyCode::Char('n'));
+        // Follow-up key completes a Space leader action, clearing the pending
+        // state and restoring the ordinary NORMAL label.
+        feed_leader_key(&mut app, crossterm::event::KeyCode::Char(';'));
         assert!(
             !app.vim_machine_pending,
             "completing a leader chord must clear the pending vim-machine state"
@@ -10779,6 +10983,94 @@ mod tests {
             selected_fg, unselected_fg,
             "selection should be visible on a borderless message rail"
         );
+    }
+
+    fn render_detail_header_row(app: &App, session_id: uuid::Uuid) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let width = 140;
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_detail(frame, Rect::new(0, 0, width, 20), session_id, true, app);
+            })
+            .expect("session detail render should succeed");
+        (0..width)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn detail_header_renders_effort_and_even_spacing_for_each_plan_window() {
+        let _pinned_theme = theme::pin_theme_state();
+        use crate::app::app_test_helpers;
+        use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
+        use rsi_common::types::SessionProvider;
+
+        for (windows, expected) in [
+            (vec![("five_hour", 0.85)], "85% 5h"),
+            (vec![("seven_day", 0.73)], "73% 7d"),
+            (vec![("five_hour", 0.85), ("seven_day", 0.73)], "85% 5h"),
+            (vec![("five_hour", 0.64), ("seven_day", 0.73)], "73% 7d"),
+        ] {
+            let (mut app, session_id) = app_test_helpers::with_session_detail();
+            let state = app.sessions.get_mut(&session_id).unwrap();
+            state.session.model = Some("claude-opus-5-5".to_string());
+            state.session.effort = Some("max".to_string());
+            state.session.status = SessionStatus::Completed;
+            state.session.duration_ms = Some(155_000);
+            state.session.context_usage_confidence =
+                rsi_common::types::ContextUsageConfidence::Full;
+            state.live_context_pct = Some(47.0);
+            app.provider_rate_limits.insert(
+                SessionProvider::Claude,
+                ProviderRateLimitSnapshot {
+                    provider: SessionProvider::Claude,
+                    status: None,
+                    rate_limit_type: None,
+                    overage_status: None,
+                    is_using_overage: false,
+                    observed_at: Utc::now(),
+                    windows: windows
+                        .into_iter()
+                        .map(|(window_key, utilization)| ProviderRateLimitWindow {
+                            window_key: window_key.to_string(),
+                            utilization,
+                            resets_at_epoch: None,
+                        })
+                        .collect(),
+                },
+            );
+
+            let header = render_detail_header_row(&app, session_id);
+            let expected =
+                format!("Claude  ·  Opus 5.5 (1M)  ▮▮▮▮▮ max  ·  2m35s  ·  47% ctx  ·  {expected}");
+            assert!(header.contains(&expected), "header: {header:?}");
+        }
+    }
+
+    #[test]
+    fn detail_header_without_known_effort_keeps_model_and_duration_adjacent() {
+        let _pinned_theme = theme::pin_theme_state();
+        use crate::app::app_test_helpers;
+
+        for effort in [None, Some("unknown")] {
+            let (mut app, session_id) = app_test_helpers::with_session_detail();
+            let state = app.sessions.get_mut(&session_id).unwrap();
+            state.session.model = Some("claude-opus-5-5".to_string());
+            state.session.effort = effort.map(str::to_string);
+            state.session.status = SessionStatus::Completed;
+            state.session.duration_ms = Some(155_000);
+
+            let header = render_detail_header_row(&app, session_id);
+            assert!(
+                header.contains("Claude  ·  Opus 5.5 (1M)  ·  2m35s"),
+                "header: {header:?}"
+            );
+        }
     }
 }
 

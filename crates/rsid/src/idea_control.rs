@@ -783,6 +783,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn idea_control_binds_operator_and_project_before_store_writes() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("open store")));

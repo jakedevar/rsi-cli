@@ -10,11 +10,158 @@ use crate::store::archive_cleanup::{ArchiveProjectionConsumer, ArchiveProjection
 use rsi_common::types::{ConversationEvent, Observation, ObservationSearchResult};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const MEMORY_QUEUE_CAPACITY: usize = 64;
+// Includes prepared, queued and running extractions, not just active model calls.
+const MAX_OBSERVATION_WORK: usize = 2;
+
+/// Optional capability installed only around Memory-owned operations. Tokio task
+/// locals are not inherited by spawned tasks; each extraction is scoped explicitly.
+/// Shared embedding/observation/LLM callers without this scope retain their behavior.
+#[derive(Clone)]
+pub(crate) struct MemoryWorkContext {
+    runtime: Arc<RuntimeConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
+    cancelled: tokio_util::sync::CancellationToken,
+}
+
+tokio::task_local! {
+    static MEMORY_WORK_CONTEXT: MemoryWorkContext;
+}
+
+const MEMORY_DISABLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl MemoryWorkContext {
+    pub(crate) fn new(
+        runtime: Arc<RuntimeConfig>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            runtime,
+            shutdown,
+            cancelled: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn current() -> Option<Self> {
+        MEMORY_WORK_CONTEXT.try_with(Clone::clone).ok()
+    }
+
+    pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        MEMORY_WORK_CONTEXT.scope(self, future).await
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if !self
+            .runtime
+            .memory_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.shutdown.is_cancelled()
+        {
+            self.cancelled.cancel();
+        }
+        if self.cancelled.is_cancelled() {
+            Err(DaemonError::ChannelClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn check_current() -> Result<()> {
+        Self::current().map_or(Ok(()), |context| context.check())
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.check().is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {},
+                _ = self.cancelled.cancelled() => {},
+                _ = tokio::time::sleep(MEMORY_DISABLE_POLL) => {},
+            }
+        }
+    }
+
+    /// Only for cancellation-safe waits: raw HTTP requests, or admission (whose
+    /// only await precedes the synchronous commit/permit-return in model_control).
+    /// Never wrap a pipeline that owns an unsettled permit or a CLI child.
+    pub(crate) async fn interruptible<T>(
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match Self::current() {
+            Some(context) => {
+                tokio::select! {
+                    biased;
+                    _ = context.cancelled() => Err(DaemonError::ChannelClosed),
+                    result = future => result,
+                }
+            }
+            None => future.await,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MemoryWorkerLifecycle {
+    stopping: tokio_util::sync::CancellationToken,
+    stopped: tokio_util::sync::CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct ObservationPayload {
+    session_id: Uuid,
+    project_id: Option<Uuid>,
+    query: String,
+    events: Vec<ConversationEvent>,
+    work_slot: OwnedSemaphorePermit,
+}
+
+type QueuedObservation = Arc<std::sync::Mutex<Option<ObservationPayload>>>;
+
+#[derive(Default)]
+struct PendingObservations(
+    std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Option<ObservationPayload>>>>>,
+);
+
+impl PendingObservations {
+    fn register(&self, payload: &QueuedObservation) {
+        let mut entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| {
+            entry.upgrade().is_some_and(|payload| {
+                payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+            })
+        });
+        entries.push(Arc::downgrade(payload));
+    }
+
+    fn discard(&self) {
+        let entries = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for entry in entries {
+            if let Some(payload) = entry.upgrade() {
+                payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+    }
+}
 
 /// Commands sent to the memory worker over the mpsc channel.
 #[derive(Debug)]
@@ -61,12 +208,7 @@ pub enum MemoryCommand {
     },
 
     /// Extract observations from a completed session's conversation events.
-    ExtractObservations {
-        session_id: Uuid,
-        project_id: Option<Uuid>,
-        query: String,
-        events: Vec<ConversationEvent>,
-    },
+    ExtractObservations { payload: QueuedObservation },
 
     /// List observations with optional filters.
     ListObservations {
@@ -223,15 +365,82 @@ async fn pause_memory_projection_sync_if_requested(
 #[derive(Clone)]
 pub struct MemoryHandle {
     tx: mpsc::Sender<MemoryCommand>,
+    runtime_config: Option<Arc<RuntimeConfig>>,
+    observation_extraction_enabled: bool,
+    observation_slots: Arc<Semaphore>,
+    pending_observations: Arc<PendingObservations>,
+    lifecycle: Option<Arc<MemoryWorkerLifecycle>>,
+}
+
+/// Capacity is reserved before the producer builds a transcript payload. The
+/// submission can cross the lifecycle's insertion await without a send task.
+#[must_use]
+pub(crate) struct ObservationSubmission {
+    queue_slot: mpsc::OwnedPermit<MemoryCommand>,
+    command: MemoryCommand,
+    runtime_config: Option<Arc<RuntimeConfig>>,
+    lifecycle: Option<Arc<MemoryWorkerLifecycle>>,
+}
+
+impl ObservationSubmission {
+    pub(crate) fn submit(self) {
+        if self
+            .lifecycle
+            .as_ref()
+            .is_none_or(|lifecycle| !lifecycle.stopping.is_cancelled())
+            && self.runtime_config.as_ref().is_none_or(|config| {
+                config
+                    .memory_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        {
+            self.queue_slot.send(self.command);
+        }
+        // Otherwise drop the payload and both reservations immediately.
+    }
 }
 
 impl MemoryHandle {
     pub fn new(tx: mpsc::Sender<MemoryCommand>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            runtime_config: None,
+            observation_extraction_enabled: true,
+            observation_slots: Arc::new(Semaphore::new(MAX_OBSERVATION_WORK)),
+            pending_observations: Arc::new(PendingObservations::default()),
+            lifecycle: None,
+        }
+    }
+
+    fn with_runtime_config(mut self, config: Arc<RuntimeConfig>, extraction_enabled: bool) -> Self {
+        self.runtime_config = Some(config);
+        self.observation_extraction_enabled = extraction_enabled;
+        self
+    }
+
+    fn enabled(&self) -> bool {
+        self.runtime_config.as_ref().is_none_or(|config| {
+            config
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    /// Producers must check before loading or cloning a completed transcript.
+    pub fn accepts_observations(&self) -> bool {
+        self.enabled()
+            && self.observation_extraction_enabled
+            && self
+                .lifecycle
+                .as_ref()
+                .is_none_or(|lifecycle| !lifecycle.stopping.is_cancelled())
     }
 
     /// Trigger an immediate sync.
     pub async fn sync_now(&self, force: bool, reason: &str) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
         self.tx
             .send(MemoryCommand::SyncNow {
                 force,
@@ -243,6 +452,8 @@ impl MemoryHandle {
 
     /// Mark memory files dirty and trigger an incremental sync.
     pub(crate) async fn memory_files_changed(&self) -> Result<()> {
+        // Keep the cheap dirty notification while OFF so re-enabling an
+        // existing worker can catch up with file changes on its next sync.
         self.tx
             .send(MemoryCommand::MemoryFilesChanged)
             .await
@@ -330,23 +541,55 @@ impl MemoryHandle {
         reply_rx.await.map_err(|_| DaemonError::ChannelClosed)?
     }
 
-    /// Trigger observation extraction for a completed session.
-    pub async fn extract_observations(
+    /// Reserve bounded best-effort work before invoking the transcript builder.
+    /// OFF, extraction-disabled and saturation paths never hydrate or clone it.
+    pub(crate) fn prepare_observations(
         &self,
         session_id: Uuid,
         project_id: Option<Uuid>,
-        query: String,
-        events: Vec<ConversationEvent>,
-    ) -> Result<()> {
-        self.tx
-            .send(MemoryCommand::ExtractObservations {
-                session_id,
-                project_id,
-                query,
-                events,
-            })
-            .await
-            .map_err(|_| DaemonError::ChannelClosed)
+        build_payload: impl FnOnce() -> (String, Vec<ConversationEvent>),
+    ) -> Result<Option<ObservationSubmission>> {
+        if !self.accepts_observations() {
+            return Ok(None);
+        }
+        let Ok(work_slot) = Arc::clone(&self.observation_slots).try_acquire_owned() else {
+            debug!(%session_id, "memory extraction capacity reached; skipping best-effort work");
+            return Ok(None);
+        };
+        let queue_slot = match self.tx.clone().try_reserve_owned() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(%session_id, "memory command queue full; skipping best-effort extraction");
+                return Ok(None);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(DaemonError::ChannelClosed),
+        };
+        if !self.accepts_observations() {
+            return Ok(None);
+        }
+        let (query, events) = build_payload();
+        let payload = Arc::new(std::sync::Mutex::new(Some(ObservationPayload {
+            session_id,
+            project_id,
+            query,
+            events,
+            work_slot,
+        })));
+        self.pending_observations.register(&payload);
+        // Close the registration race with OFF/shutdown's payload sweep.
+        if !self.accepts_observations() {
+            payload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            return Ok(None);
+        }
+        Ok(Some(ObservationSubmission {
+            queue_slot,
+            command: MemoryCommand::ExtractObservations { payload },
+            runtime_config: self.runtime_config.clone(),
+            lifecycle: self.lifecycle.clone(),
+        }))
     }
 
     /// List observations with optional filters.
@@ -404,6 +647,15 @@ impl MemoryHandle {
 
     /// Shut down the memory worker gracefully.
     pub async fn shutdown(&self) -> Result<()> {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.stopping.cancel();
+            self.pending_observations.discard();
+            // Production handles have an out-of-band shutdown signal, so a
+            // full command queue cannot delay cancellation or completion.
+            lifecycle.stopped.cancelled().await;
+            return Ok(());
+        }
+        // Channel-only test/compatibility handles do not own worker lifecycle.
         self.tx
             .send(MemoryCommand::Shutdown)
             .await
@@ -418,17 +670,23 @@ pub struct MemoryWorker {
     watcher: Option<MemoryFileWatcher>,
     bus: Arc<EventBus>,
     runtime_config: Arc<RuntimeConfig>,
+    lifecycle: Arc<MemoryWorkerLifecycle>,
+    pending_observations: Arc<PendingObservations>,
+    extractions: tokio::task::JoinSet<()>,
 }
 
 impl MemoryWorker {
     pub fn new(
         rx: mpsc::Receiver<MemoryCommand>,
-        sync_engine: MemorySyncEngine,
+        mut sync_engine: MemorySyncEngine,
         main_store: Arc<tokio::sync::Mutex<crate::store::Store>>,
         watcher: Option<MemoryFileWatcher>,
         bus: Arc<EventBus>,
         runtime_config: Arc<RuntimeConfig>,
     ) -> Self {
+        let lifecycle = Arc::new(MemoryWorkerLifecycle::default());
+        sync_engine.set_runtime_config(Arc::clone(&runtime_config));
+        sync_engine.set_shutdown_token(lifecycle.stopping.clone());
         Self {
             rx,
             sync_engine,
@@ -436,11 +694,47 @@ impl MemoryWorker {
             watcher,
             bus,
             runtime_config,
+            lifecycle,
+            pending_observations: Arc::new(PendingObservations::default()),
+            extractions: tokio::task::JoinSet::new(),
         }
+    }
+
+    fn attach_handle(&self, handle: &mut MemoryHandle) {
+        handle.observation_extraction_enabled =
+            self.sync_engine.config().observation_extraction_enabled;
+        handle.runtime_config = Some(Arc::clone(&self.runtime_config));
+        handle.lifecycle = Some(Arc::clone(&self.lifecycle));
+        handle.pending_observations = Arc::clone(&self.pending_observations);
     }
 
     /// Run the worker loop. Processes commands until Shutdown or channel close.
     pub async fn run(&mut self) {
+        let runtime = Arc::clone(&self.runtime_config);
+        let pending = Arc::clone(&self.pending_observations);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let monitor = async {
+            loop {
+                if !runtime
+                    .memory_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    || lifecycle.stopping.is_cancelled()
+                {
+                    pending.discard();
+                }
+                tokio::time::sleep(MEMORY_DISABLE_POLL).await;
+            }
+        };
+        // This supervisor remains pollable while sync or permit settlement is
+        // waiting. It drops only queued payloads, never active execution futures.
+        tokio::select! {
+            _ = self.run_inner() => {},
+            _ = monitor => unreachable!("memory payload monitor is perpetual"),
+        }
+        lifecycle.stopped.cancel();
+    }
+
+    async fn run_inner(&mut self) {
         // On startup: clean up stale temp files from interrupted reindexes
         if let Err(e) =
             crate::memory::reindex::cleanup_stale_temp_files(self.sync_engine.db_path()).await
@@ -468,7 +762,16 @@ impl MemoryWorker {
         }
 
         loop {
-            let Some(cmd) = self.rx.recv().await else {
+            let cmd = tokio::select! {
+                biased;
+                _ = self.lifecycle.stopping.cancelled() => Some(MemoryCommand::Shutdown),
+                result = self.extractions.join_next(), if !self.extractions.is_empty() => {
+                    if let Some(Err(error)) = result { error!(%error, "memory extraction task failed"); }
+                    continue;
+                }
+                command = self.rx.recv() => command,
+            };
+            let Some(cmd) = cmd else {
                 debug!("memory worker: channel closed, exiting");
                 break;
             };
@@ -479,6 +782,9 @@ impl MemoryWorker {
                     if let Some(watcher) = self.watcher.take() {
                         watcher.stop();
                     }
+                    self.lifecycle.stopping.cancel();
+                    self.pending_observations.discard();
+                    self.rx.close();
                     self.drain_remaining().await;
                     break;
                 }
@@ -527,12 +833,28 @@ impl MemoryWorker {
                         .await;
                     let _ = reply_tx.send(result);
                 }
-                MemoryCommand::ExtractObservations {
-                    session_id,
-                    project_id,
-                    query,
-                    events,
-                } => {
+                MemoryCommand::ExtractObservations { payload } => {
+                    let payload = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let Some(ObservationPayload {
+                        session_id,
+                        project_id,
+                        query,
+                        events,
+                        work_slot,
+                    }) = payload
+                    else {
+                        continue;
+                    };
+                    let context = MemoryWorkContext::new(
+                        Arc::clone(&self.runtime_config),
+                        self.lifecycle.stopping.clone(),
+                    );
+                    if context.check().is_err() {
+                        continue;
+                    }
                     let bus = self.bus.clone();
                     // Degrade this one extraction rather than taking down the
                     // worker: `run()` drives every memory command, and this
@@ -555,7 +877,10 @@ impl MemoryWorker {
                     let config = self.sync_engine.config();
                     let embedding_provider = self.sync_engine.embedding_provider();
                     let runtime_config = Arc::clone(&self.runtime_config);
-                    tokio::spawn(async move {
+                    self.extractions.spawn(context.scope(async move {
+                        // Hold the same producer reservation until every stage
+                        // (including model-control settlement) has returned.
+                        let _work_slot = work_slot;
                         Self::run_observation_extraction(
                             session_id,
                             project_id,
@@ -569,7 +894,7 @@ impl MemoryWorker {
                             runtime_config,
                         )
                         .await;
-                    });
+                    }));
                 }
                 MemoryCommand::ListObservations {
                     session_id,
@@ -595,9 +920,29 @@ impl MemoryWorker {
                 }
             }
         }
+        self.lifecycle.stopping.cancel();
+        self.pending_observations.discard();
+        if let Some(watcher) = self.watcher.take() {
+            watcher.stop();
+        }
+        // Cancellation is cooperative: let provider cleanup and durable permit
+        // settlement finish before releasing work slots or completing shutdown.
+        while let Some(result) = self.extractions.join_next().await {
+            if let Err(error) = result {
+                error!(%error, "memory extraction task failed during shutdown");
+            }
+        }
     }
 
     async fn handle_sync(&mut self, force: bool, reason: &str) {
+        if !self
+            .runtime_config
+            .memory_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.sync_engine.mark_dirty();
+            return;
+        }
         match self.sync_engine.run_sync(reason, force).await {
             Ok(report) => {
                 debug!(
@@ -739,7 +1084,12 @@ impl MemoryWorker {
         bus: Arc<EventBus>,
         runtime_config: Arc<RuntimeConfig>,
     ) {
-        if !config.observation_extraction_enabled {
+        if !config.observation_extraction_enabled
+            || MemoryWorkContext::check_current().is_err()
+            || !runtime_config
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             debug!(
                 session_id = %session_id,
                 "Observation extraction disabled, skipping"
@@ -771,6 +1121,8 @@ impl MemoryWorker {
             }
         };
 
+        drop(events);
+        drop(query);
         if observations.is_empty() {
             debug!(
                 session_id = %session_id,
@@ -779,6 +1131,13 @@ impl MemoryWorker {
             return;
         }
 
+        if MemoryWorkContext::check_current().is_err()
+            || !runtime_config
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         // Compute embeddings for observation content
         let texts: Vec<String> = observations.iter().map(|o| o.content.clone()).collect();
         let embeddings = if let Some(ref provider) = embedding_provider.provider {
@@ -818,6 +1177,13 @@ impl MemoryWorker {
             vec![vec![]; observations.len()]
         };
 
+        if MemoryWorkContext::check_current().is_err()
+            || !runtime_config
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         // Convert to ObservationRows for storage
         let rows: Vec<crate::memory::store::ObservationRow> = observations
             .iter()
@@ -1066,7 +1432,13 @@ pub fn spawn_memory_worker(
     );
 
     // Create the file watcher (sends SyncNow commands through the channel)
-    let watcher_handle = MemoryHandle::new(tx.clone());
+    let mut handle = MemoryHandle::new(tx).with_runtime_config(
+        Arc::clone(&runtime_config),
+        config.observation_extraction_enabled,
+    );
+    let mut worker = MemoryWorker::new(rx, sync_engine, main_store, None, bus, runtime_config);
+    worker.attach_handle(&mut handle);
+    let watcher_handle = handle.clone();
     let watcher = if config.watch_enabled {
         match MemoryFileWatcher::new(memory_dir, config.watch_debounce_ms, watcher_handle) {
             Ok(w) => Some(w),
@@ -1079,12 +1451,12 @@ pub fn spawn_memory_worker(
         None
     };
 
-    let mut worker = MemoryWorker::new(rx, sync_engine, main_store, watcher, bus, runtime_config);
+    worker.watcher = watcher;
     tokio::spawn(async move {
         worker.run().await;
     });
 
-    MemoryHandle::new(tx)
+    handle
 }
 
 #[cfg(test)]
@@ -1142,6 +1514,527 @@ mod tests {
         (rx, sync_engine, main_store, bus, tx)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test]
+    async fn live_memory_off_handle_skips_full_queue_and_keeps_shutdown() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let handle = MemoryHandle::new(tx).with_runtime_config(Arc::clone(&runtime), true);
+        assert!(handle.accepts_observations());
+        handle.sync_now(false, "queued before OFF").await.unwrap();
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!handle.accepts_observations());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(
+                handle
+                    .prepare_observations(Uuid::new_v4(), None, || {
+                        panic!("OFF must not build a transcript")
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            handle.sync_now(true, "disabled").await.unwrap();
+        })
+        .await
+        .expect("disabled work must not wait for queue capacity");
+        assert!(matches!(
+            rx.recv().await,
+            Some(MemoryCommand::SyncNow { .. })
+        ));
+        handle.shutdown().await.unwrap();
+        assert!(matches!(rx.recv().await, Some(MemoryCommand::Shutdown)));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test]
+    async fn live_memory_off_reservations_bound_queued_and_running_payloads() {
+        let (tx, mut rx) = mpsc::channel(MEMORY_QUEUE_CAPACITY);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let handle = MemoryHandle::new(tx).with_runtime_config(Arc::clone(&runtime), true);
+        for _ in 0..MAX_OBSERVATION_WORK {
+            handle
+                .prepare_observations(Uuid::new_v4(), None, || ("queued".into(), vec![]))
+                .unwrap()
+                .unwrap()
+                .submit();
+        }
+        // Dequeue one command but keep its work permit, just like an active
+        // extraction. Dequeueing alone must not release transcript capacity.
+        let running = rx.recv().await.unwrap();
+        assert!(
+            handle
+                .prepare_observations(Uuid::new_v4(), None, || {
+                    panic!("saturation must not clone a transcript")
+                })
+                .unwrap()
+                .is_none()
+        );
+        drop(running);
+        let prepared = handle
+            .prepare_observations(Uuid::new_v4(), None, || ("prepared".into(), vec![]))
+            .unwrap()
+            .unwrap();
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        prepared.submit(); // OFF during lifecycle insertion drops both reservations.
+        drop(rx.recv().await.unwrap());
+        assert_eq!(
+            handle.observation_slots.available_permits(),
+            MAX_OBSERVATION_WORK
+        );
+        assert_eq!(rx.len(), 0);
+        assert_eq!(handle.tx.capacity(), MEMORY_QUEUE_CAPACITY);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[test]
+    fn live_memory_off_full_command_queue_skips_payload_builder() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(MemoryCommand::MemoryFilesChanged).unwrap();
+        let handle = MemoryHandle::new(tx);
+        assert!(
+            handle
+                .prepare_observations(Uuid::new_v4(), None, || {
+                    panic!("a full command queue must not clone a transcript")
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            handle.observation_slots.available_permits(),
+            MAX_OBSERVATION_WORK
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test]
+    async fn live_memory_off_worker_drops_queued_work_and_serves_reads() {
+        let dir = TempDir::new().unwrap();
+        let (rx, sync_engine, main_store, bus, tx) = setup_worker_parts(&dir);
+        std::fs::write(dir.path().join("memory/readable.md"), "still readable").unwrap();
+        let handle = MemoryHandle::new(tx.clone());
+        handle
+            .prepare_observations(Uuid::new_v4(), None, || ("queued".into(), vec![]))
+            .unwrap()
+            .unwrap()
+            .submit();
+        handle.sync_now(true, "queued before OFF").await.unwrap();
+        handle.memory_files_changed().await.unwrap();
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut worker = MemoryWorker::new(rx, sync_engine, main_store, None, bus, runtime);
+        let task = tokio::spawn(async move { worker.run().await });
+        // A FIFO status reply proves all three preceding commands were consumed.
+        let status = handle.status().await.unwrap();
+        assert_eq!(status.file_count, 0);
+        assert_eq!(status.observation_count, 0);
+        assert_eq!(
+            handle.observation_slots.available_permits(),
+            MAX_OBSERVATION_WORK
+        );
+        assert_eq!(
+            handle
+                .read_file("memory/readable.md", None, None)
+                .await
+                .unwrap(),
+            "still readable"
+        );
+        assert_eq!(handle.observation_count().await.unwrap(), 0);
+        let error = handle
+            .sync_archive_projection(Uuid::new_v4(), "missing projection")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("consumer is missing"),
+            "OFF must retain archive validation and explicit error replies"
+        );
+        handle.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    // Build durable projection state through the real store journal APIs, as
+    // store migration fixtures do. No Git commands or cleanup filesystem effects.
+    fn settled_memory_projection(store: &mut crate::store::Store, root: &std::path::Path) -> Uuid {
+        use crate::store::archive_cleanup::{
+            NewArchiveCleanupIntent, archive_topology_digest, digest_field,
+        };
+        use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
+        use rsi_common::archive_cleanup::{ArchiveCleanupPhaseV1, ArchivePreservationClassV1};
+        use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionKind, SessionStatus};
+        let mut session = crate::store::tests::make_test_session();
+        session.project_id = None;
+        session.session_kind = SessionKind::Task;
+        session.status = SessionStatus::Completed;
+        session.working_dir = root.join("repository");
+        session.sandbox_kind = Some(SandboxKind::GitWorktree);
+        session.sandbox_root = Some(root.join("sandbox"));
+        session.sandbox_branch = Some("rsi/memory-projection-fixture".into());
+        session.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+        let custody_id = Uuid::new_v4();
+        let source_oid = "a".repeat(40);
+        store
+            .insert_session_with_custody(
+                &session,
+                SessionCustodyBinding::New(NewCustodyRoot {
+                    custody_id,
+                    canonical_repo_dir: session.working_dir.display().to_string(),
+                    sandbox_root: session.sandbox_root.as_ref().unwrap().display().to_string(),
+                    sandbox_branch: session.sandbox_branch.clone().unwrap(),
+                    repository_identity: "repo:memory-projection-fixture".into(),
+                    source_commit: source_oid.clone(),
+                    cause: CustodyCause::FreshLaunch,
+                }),
+            )
+            .unwrap();
+        let updated: String = store
+            .conn
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id=?1",
+                [session.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let topology_digest = archive_topology_digest(
+            session.id,
+            "Task",
+            "Completed",
+            &updated,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let run_id = Uuid::new_v4();
+        let digest = digest_field("memory-projection-fixture", "evidence");
+        let intent = NewArchiveCleanupIntent {
+            run_id,
+            session_id: session.id,
+            custody_id,
+            custody_generation: 1,
+            session_kind: "Task".into(),
+            session_status: "Completed".into(),
+            session_updated_at: updated,
+            parent_id: None,
+            continued_from: None,
+            topology_digest,
+            repository_identity: "repo:memory-projection-fixture".into(),
+            canonical_repo_dir: session.working_dir.display().to_string(),
+            original_root: session.sandbox_root.as_ref().unwrap().display().to_string(),
+            quarantine_root: root.join("quarantine").display().to_string(),
+            root_device: 1,
+            root_inode: 2,
+            git_common_dir: session.working_dir.join(".git").display().to_string(),
+            git_admin_dir: session
+                .working_dir
+                .join(".git/worktrees/fixture")
+                .display()
+                .to_string(),
+            git_admin_id: "fixture".into(),
+            source_ref: format!("refs/heads/{}", session.sandbox_branch.as_ref().unwrap()),
+            source_oid,
+            preservation_class: ArchivePreservationClassV1::NoOutput,
+            target_ref: None,
+            target_oid: None,
+            clean_state_digest: digest.clone(),
+            tree_digest: digest.clone(),
+            dependency_digest: digest.clone(),
+            holder_digest: digest.clone(),
+            evidence_digest: digest,
+        };
+        let mut run = store.insert_archive_cleanup_intent(&intent).unwrap();
+        let marker = serde_json::json!({"version": 1, "run_id": run_id,
+            "source_ref": intent.source_ref, "source_oid": intent.source_oid,
+            "branch_preserved": true})
+        .to_string();
+        let marker_digest = digest_field("archive-removal-authority-v1", &marker);
+        for phase in [
+            ArchiveCleanupPhaseV1::Quarantined,
+            ArchiveCleanupPhaseV1::RemovalAuthorized,
+            ArchiveCleanupPhaseV1::WorktreeRemoved,
+        ] {
+            let authority = (phase == ArchiveCleanupPhaseV1::RemovalAuthorized)
+                .then_some((marker.as_str(), marker_digest.as_str()));
+            run = store
+                .advance_archive_cleanup_phase(
+                    run_id,
+                    run.phase,
+                    run.row_version,
+                    phase,
+                    "memory_projection_fixture",
+                    authority,
+                )
+                .unwrap();
+        }
+        store
+            .finalize_archive_cleanup(run_id, run.row_version)
+            .unwrap();
+        crate::store::archive_cleanup::archive_projection_id(run_id)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test]
+    async fn live_memory_off_archive_projection_retries_and_acknowledges_once() {
+        let dir = TempDir::new().unwrap();
+        let (rx, sync_engine, main_store, bus, tx) = setup_worker_parts(&dir);
+        let projection_id = {
+            let mut store = main_store.lock().await;
+            let id = settled_memory_projection(&mut store, dir.path());
+            assert!(
+                store
+                    .begin_archive_cleanup_projection_consumer(
+                        id,
+                        ArchiveProjectionConsumer::Memory
+                    )
+                    .unwrap()
+            );
+            id
+        };
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let handle = MemoryHandle::new(tx);
+        let mut worker = MemoryWorker::new(
+            rx,
+            sync_engine,
+            Arc::clone(&main_store),
+            None,
+            bus,
+            Arc::clone(&runtime),
+        );
+        let task = tokio::spawn(async move { worker.run().await });
+        assert!(matches!(
+            handle.sync_archive_projection(projection_id, "OFF").await,
+            Err(DaemonError::PolicyDenied(_))
+        ));
+        // Reopen the on-disk store: failure must remain durably retryable.
+        let mut reopened = crate::store::Store::open(&dir.path().join("flywheel.db")).unwrap();
+        assert_eq!(
+            reopened
+                .archive_cleanup_projection_consumer_state(
+                    projection_id,
+                    ArchiveProjectionConsumer::Memory
+                )
+                .unwrap(),
+            Some(ArchiveProjectionConsumerState::Delivering)
+        );
+        assert!(
+            reopened
+                .begin_archive_cleanup_projection_consumer(
+                    projection_id,
+                    ArchiveProjectionConsumer::Memory
+                )
+                .unwrap()
+        );
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let completion = handle
+            .sync_archive_projection(projection_id, "retry")
+            .await
+            .unwrap();
+        assert_eq!(completion.projection_id, projection_id);
+        assert_eq!(
+            completion.disposition,
+            MemoryProjectionSyncDisposition::Applied
+        );
+        assert_eq!(
+            reopened
+                .archive_cleanup_projection_consumer_state(
+                    projection_id,
+                    ArchiveProjectionConsumer::Memory
+                )
+                .unwrap(),
+            Some(ArchiveProjectionConsumerState::Delivered)
+        );
+        let version = || {
+            reopened.conn.query_row(
+            "SELECT row_version FROM archive_cleanup_projection_consumers WHERE projection_id=?1 AND consumer_kind='memory'",
+            [projection_id.to_string()], |row| row.get::<_, i64>(0)).unwrap()
+        };
+        let delivered_version = version();
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            handle
+                .sync_archive_projection(projection_id, "OFF replay")
+                .await
+                .unwrap()
+                .disposition,
+            MemoryProjectionSyncDisposition::AlreadyDelivered
+        );
+        assert_eq!(
+            version(),
+            delivered_version,
+            "replay must not acknowledge a second time"
+        );
+        handle.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_drops_queued_payloads_while_worker_is_waiting() {
+        use std::sync::atomic::Ordering;
+        let dir = TempDir::new().unwrap();
+        let (rx, engine, store, bus, tx) = setup_worker_parts(&dir);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let mut handle = MemoryHandle::new(tx);
+        let mut worker = MemoryWorker::new(
+            rx,
+            engine,
+            Arc::clone(&store),
+            None,
+            bus,
+            Arc::clone(&runtime),
+        );
+        worker.attach_handle(&mut handle);
+        let task = tokio::spawn(async move { worker.run().await });
+        handle.status().await.unwrap();
+        // An archive command holds the serial worker behind the main store lock.
+        // The monitor must still discard queued extraction without touching its reply.
+        let guard = store.lock().await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .tx
+            .send(MemoryCommand::SyncArchiveProjection {
+                projection_id: Uuid::new_v4(),
+                reason: "blocked fixture".into(),
+                reply_tx,
+            })
+            .await
+            .unwrap();
+        for _ in 0..MAX_OBSERVATION_WORK {
+            handle
+                .prepare_observations(Uuid::new_v4(), None, || ("payload".repeat(1024), vec![]))
+                .unwrap()
+                .unwrap()
+                .submit();
+        }
+        assert_eq!(handle.observation_slots.available_permits(), 0);
+        runtime.memory_enabled.store(false, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while handle.observation_slots.available_permits() != MAX_OBSERVATION_WORK {
+                tokio::time::sleep(MEMORY_DISABLE_POLL).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            handle.observation_slots.available_permits(),
+            MAX_OBSERVATION_WORK
+        );
+        drop(guard);
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "projection failure must still reply"
+        );
+        handle.status().await.unwrap();
+        handle.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_shutdown_waits_for_tracked_execution_and_settlement() {
+        use crate::memory::embedding::batch::live_memory_test_support::BlockingProvider;
+        use crate::memory::embedding::batch::{EmbeddingControl, embed_text_batch};
+        use std::sync::atomic::Ordering;
+        let dir = TempDir::new().unwrap();
+        let (rx, engine, store, bus, tx) = setup_worker_parts(&dir);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let mut handle = MemoryHandle::new(tx);
+        let mut worker = MemoryWorker::new(
+            rx,
+            engine,
+            Arc::clone(&store),
+            None,
+            Arc::clone(&bus),
+            Arc::clone(&runtime),
+        );
+        worker.attach_handle(&mut handle);
+        let provider = Arc::new(BlockingProvider::default());
+        let context = MemoryWorkContext::new(runtime, worker.lifecycle.stopping.clone());
+        let control = EmbeddingControl {
+            store: Arc::clone(&store),
+            event_bus: bus,
+            owner: Default::default(),
+            provider: "Local".into(),
+            backend: "mock".into(),
+            model: "mock-model".into(),
+            base_url: Some("http://localhost".into()),
+            trigger: "shutdown-test".into(),
+            dedup_namespace: "shutdown-test".into(),
+        };
+        let slot = Arc::clone(&handle.observation_slots)
+            .try_acquire_owned()
+            .unwrap();
+        let fake = Arc::clone(&provider);
+        let (settled_tx, settled_rx) = oneshot::channel();
+        let (release, cleanup) = oneshot::channel();
+        worker.extractions.spawn(context.scope(async move {
+            let _slot = slot;
+            assert!(matches!(
+                embed_text_batch(fake.as_ref(), &["active".into()], Some(&control)).await,
+                Err(DaemonError::ChannelClosed)
+            ));
+            settled_tx.send(()).unwrap();
+            cleanup.await.unwrap();
+        }));
+        let task = tokio::spawn(async move { worker.run().await });
+        provider.started.notified().await;
+        let shutdown = handle.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = settled_rx => {},
+            result = &mut shutdown => panic!("shutdown returned before cleanup: {result:?}"),
+        }
+        assert!(provider.dropped.load(Ordering::SeqCst));
+        {
+            let guard = store.lock().await;
+            let state: (String, String) = guard.conn.query_row(
+                "SELECT status,error_class FROM model_invocations WHERE trigger_source='shutdown-test'",
+                [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(state, ("failed".into(), "cancelled".into()));
+            assert!(
+                guard
+                    .build_model_control_status(8)
+                    .unwrap()
+                    .active_invocations
+                    .is_empty()
+            );
+        }
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            handle.observation_slots.available_permits(),
+            MAX_OBSERVATION_WORK
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_sync_now() {
         let dir = TempDir::new().unwrap();
@@ -1157,6 +2050,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_file_change_reindexes_after_startup() {
         let dir = TempDir::new().unwrap();
@@ -1194,6 +2088,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_shutdown() {
         let dir = TempDir::new().unwrap();
@@ -1208,6 +2103,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_status() {
         let dir = TempDir::new().unwrap();
@@ -1225,6 +2121,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_read_file_valid() {
         let dir = TempDir::new().unwrap();
@@ -1249,6 +2146,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_read_file_invalid_path() {
         let dir = TempDir::new().unwrap();
@@ -1266,6 +2164,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_search_returns_empty() {
         let dir = TempDir::new().unwrap();
@@ -1283,6 +2182,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_memory_handle_clone_sends_to_same_worker() {
         let dir = TempDir::new().unwrap();
@@ -1303,6 +2203,7 @@ mod tests {
         worker_task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_spawn_memory_worker_returns_handle() {
         let dir = TempDir::new().unwrap();

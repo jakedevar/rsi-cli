@@ -104,6 +104,8 @@ const LIVE: ApplyClass = ApplyClass::Live;
 /// One entry per persisted daemon runtime-config field, in the order of
 /// `rsid::config::PERSISTED_RUNTIME_CONFIG_FIELDS`.
 pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
+    page("session_retention_enabled", LIVE),
+    page("session_retention_window_hours", LIVE),
     // S-038, verify-settings-page.md.
     page("retry_enabled", LIVE),
     // Not applied: rsid session/retry_policy.rs:14-18 `kind_default_max_retries`
@@ -121,6 +123,11 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("stall_detection_enabled", DaemonRestart),
     // S-043.
     page("context_rotation_enabled", PartialLive),
+    // Read from RuntimeConfig on every context usage update, including active sessions.
+    page("context_rotation_global_pct", LIVE),
+    page("context_rotation_claude_pct", LIVE),
+    page("context_rotation_codex_pct", LIVE),
+    page("completed_transcript_cache_max_bytes", LIVE),
     // S-044.
     page("memory_enabled", DaemonRestart),
     // Epic L CG-S3: the indexer shares the runtime `Arc<AtomicBool>` (rsid
@@ -196,6 +203,8 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // rsid session/graph_executions.rs build_node_cap() loads the atomic
     // per scheduling decision.
     page("topology_max_concurrent_build_nodes", LIVE),
+    // T4: read when topology fan-out is planned.
+    page("topology_bulk_fanout_min_openrouter", LIVE),
     // rsid store/model_control.rs:4678 reads the ceiling per admission.
     page("orchestration_max_child_effort", LIVE),
     // S-052, S-054 .. S-058.
@@ -205,12 +214,27 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("sandbox_build_cache_reclaim_high_watermark_pct", LIVE),
     page("sandbox_build_cache_reclaim_low_watermark_pct", LIVE),
     page("sandbox_build_cache_reclaim_max_candidates", LIVE),
+    page("agent_build_jobs", NextSpawn),
+    page("agent_build_line_tables_only", NextSpawn),
+    page("agent_build_sccache_enabled", NextSpawn),
+    page("agent_build_sccache_cache_gib", NextSpawn),
+    page("agent_build_slots", NextSpawn),
     // Issue #647 systemd scope limits are read by the install/restart path and
     // become effective when the rsid scope is next launched.
     page("rsid_scope_memory_high_mib", DaemonRestart),
     page("rsid_scope_memory_max_mib", DaemonRestart),
     page("rsid_scope_memory_swap_max_mib", DaemonRestart),
     page("rsid_scope_cpu_weight", DaemonRestart),
+    // Aggregate worker slice limits are provisioned by the supported launcher.
+    page("worker_scope_memory_high_mib", DaemonRestart),
+    page("worker_scope_memory_max_mib", DaemonRestart),
+    page("worker_scope_memory_swap_max_mib", DaemonRestart),
+    page("worker_scope_cpu_weight", DaemonRestart),
+    page("vault.env_compat", LIVE),
+    page("vault.check_ttl_secs", LIVE),
+    // #694: dispatch reads these when an OpenRouter session starts.
+    page("api_route.openrouter", NextSpawn),
+    page("api_route.fallback", NextSpawn),
 ];
 
 /// The catalog entry for `field`, if any.

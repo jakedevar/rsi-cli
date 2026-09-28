@@ -129,6 +129,7 @@ fn parse_pattern_line(line: &str) -> Option<(String, ObservationConfidence, Vec<
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_pattern_line_low_confidence() {
         let id1 = Uuid::new_v4();
@@ -141,6 +142,7 @@ mod tests {
         assert_eq!(sources.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_pattern_line_medium_confidence() {
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
@@ -155,6 +157,7 @@ mod tests {
         assert_eq!(sources.len(), 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_pattern_line_high_confidence() {
         let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
@@ -168,18 +171,21 @@ mod tests {
         assert_eq!(sources.len(), 8);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_pattern_line_empty_content() {
         let line = "PATTERN:  CONFIDENCE: LOW SOURCES: some-id";
         assert!(parse_pattern_line(line).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_pattern_line_missing_confidence() {
         let line = "PATTERN: Some observation";
         assert!(parse_pattern_line(line).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_response_multiple_patterns() {
         let id1 = Uuid::new_v4();
@@ -206,6 +212,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_parse_response_empty() {
         let result = InductionSpecialist::parse_response("", None);

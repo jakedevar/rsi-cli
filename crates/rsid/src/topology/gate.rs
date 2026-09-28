@@ -95,6 +95,7 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn closed_ast_evaluates_and_type_errors_fail() {
         let nodes = nodes();

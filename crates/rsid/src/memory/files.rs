@@ -177,6 +177,7 @@ mod tests {
 
     // --- hash_text tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_hash_text_empty() {
         assert_eq!(
@@ -185,6 +186,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_hash_text_hello() {
         // SHA-256 of "hello"
@@ -194,6 +196,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_hash_text_unicode() {
         let hash = hash_text("こんにちは🌍");
@@ -202,6 +205,7 @@ mod tests {
         assert_eq!(hash, hash_text("こんにちは🌍"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_hash_text_deterministic() {
         let a = hash_text("test content");
@@ -211,61 +215,73 @@ mod tests {
 
     // --- is_memory_path tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_root_memory() {
         assert!(is_memory_path("MEMORY.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_alt_memory() {
         assert!(is_memory_path("memory.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_subdir() {
         assert!(is_memory_path("memory/2026-02-28.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_nested_subdir() {
         assert!(is_memory_path("memory/topic/notes.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_leading_dot_slash() {
         assert!(is_memory_path("./MEMORY.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_leading_slash() {
         assert!(is_memory_path("/MEMORY.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_wrong_case() {
         assert!(!is_memory_path("Memory.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_empty() {
         assert!(!is_memory_path(""));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_random_file() {
         assert!(!is_memory_path("src/main.rs"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_memory_no_slash() {
         assert!(!is_memory_path("memory"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_is_memory_path_backslash() {
         assert!(is_memory_path("memory\\notes.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_normalize_rel_path_various() {
         assert_eq!(normalize_rel_path("./foo.md"), "foo.md");
@@ -278,6 +294,7 @@ mod tests {
 
     // --- list_memory_files tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -285,6 +302,7 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_memory_md() {
         let dir = tempfile::tempdir().unwrap();
@@ -294,6 +312,7 @@ mod tests {
         assert!(files[0].ends_with("MEMORY.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_both_roots() {
         let dir = tempfile::tempdir().unwrap();
@@ -303,6 +322,7 @@ mod tests {
         assert_eq!(files.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_subdir() {
         let dir = tempfile::tempdir().unwrap();
@@ -313,6 +333,7 @@ mod tests {
         assert!(files[0].ends_with("notes.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_nested() {
         let dir = tempfile::tempdir().unwrap();
@@ -322,6 +343,7 @@ mod tests {
         assert_eq!(files.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_non_md_skipped() {
         let dir = tempfile::tempdir().unwrap();
@@ -331,6 +353,7 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_dedup() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,6 +367,7 @@ mod tests {
         assert_eq!(files.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_list_memory_files_nonexistent_dir() {
         let files = list_memory_files(Path::new("/nonexistent/path/12345")).unwrap();
@@ -352,6 +376,7 @@ mod tests {
 
     // --- build_file_entry tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_file_entry_basic() {
         let dir = tempfile::tempdir().unwrap();
@@ -366,6 +391,7 @@ mod tests {
         assert_eq!(entry.source, MemorySource::Memory);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_file_entry_missing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -373,6 +399,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_file_entry_relative_path() {
         let dir = tempfile::tempdir().unwrap();

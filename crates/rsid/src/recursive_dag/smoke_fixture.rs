@@ -1671,6 +1671,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_refuses_default_db_path() {
         let Some(default_db) = default_home_db_path() else {
@@ -1688,6 +1689,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_refuses_existing_unmarked_output_db() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1708,6 +1710,7 @@ mod tests {
         assert_eq!(std::fs::metadata(output_db).expect("metadata").len(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_generates_store_readbacks_and_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1863,6 +1866,7 @@ mod tests {
         assert_eq!(launched_live_attempts, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_can_opt_into_live_dogfood_graph() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1925,6 +1929,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_can_upgrade_marked_fixture_with_live_dogfood_graph() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1964,6 +1969,7 @@ mod tests {
         assert_eq!(rerun.ids.live_dogfood_graph_id, Some(live_graph_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_copies_source_without_mutating_it() {
         let source_dir = tempfile::tempdir().expect("source tempdir");
@@ -1987,6 +1993,7 @@ mod tests {
         assert!(output_dir.path().join("fixture.db").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn recursive_dag_smoke_fixture_rehomes_copied_existing_fixture_summary() {
         let source_dir = tempfile::tempdir().expect("source tempdir");

@@ -97,6 +97,15 @@ fn registered_normal_effect(
         ActionId::InterruptSession => {
             RegisteredNormalEffect::Application(LcAction::InterruptSession)
         }
+        ActionId::HardInterruptSession => {
+            RegisteredNormalEffect::Application(LcAction::HardInterruptSession)
+        }
+        ActionId::DowngradeOperatorPause => {
+            RegisteredNormalEffect::Application(LcAction::DowngradeOperatorPause)
+        }
+        ActionId::ClearOperatorPause => {
+            RegisteredNormalEffect::Application(LcAction::ClearOperatorPause)
+        }
         ActionId::ContinueSession => RegisteredNormalEffect::Application(LcAction::QuickContinue),
         ActionId::TogglePin => RegisteredNormalEffect::Application(LcAction::TogglePinSession),
         ActionId::ArchiveSession => RegisteredNormalEffect::Application(LcAction::ArchiveSession),
@@ -195,9 +204,6 @@ fn registered_normal_effect(
             RegisteredNormalEffect::Application(LcAction::ToggleRotationDisabled)
         }
         ActionId::CancelRetry => RegisteredNormalEffect::Application(LcAction::CancelRetry),
-        ActionId::ExecuteDocRegBlocks => {
-            RegisteredNormalEffect::Application(LcAction::ExecuteDocRegBlocks)
-        }
         ActionId::CommitAndPush => RegisteredNormalEffect::Application(LcAction::CommitAndPush),
         ActionId::OpenSessionInNewTab => {
             RegisteredNormalEffect::Application(LcAction::OpenSessionInNewTab)
@@ -286,6 +292,7 @@ fn named_normal_key(sequence: &str) -> Option<KeyEvent> {
         "F2" => (KeyCode::F(2), KeyModifiers::NONE),
         "F3" => (KeyCode::F(3), KeyModifiers::NONE),
         "Ctrl-M" => (KeyCode::Char('m'), KeyModifiers::CONTROL),
+        "Ctrl-N" => (KeyCode::Char('n'), KeyModifiers::CONTROL),
         _ => return None,
     };
     Some(KeyEvent::new(code, modifiers))
@@ -481,11 +488,39 @@ mod tests {
     }
 
     #[test]
-    fn pre_remap_space_sequence_inventory_is_preserved() {
+    fn interrupt_strength_and_continue_keys_are_distinct() {
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char('x')]),
+            vec![LcAction::InterruptSession]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char('X')]),
+            vec![LcAction::HardInterruptSession]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('c')]),
+            vec![LcAction::QuickContinue]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('X')]),
+            vec![LcAction::EmergencyStopAll]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('h'), KeyCode::Char('s')]),
+            vec![LcAction::DowngradeOperatorPause]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('h'), KeyCode::Char('c')]),
+            vec![LcAction::ClearOperatorPause]
+        );
+    }
+
+    #[test]
+    fn space_sequence_inventory_tracks_issue_724_remap() {
         use LcAction::*;
 
-        // Pin each installed Space sequence before the #552 remap. Keep these
-        // rows explicit so a later binding cannot silently claim an old slot.
+        // Pin every Space sequence, including the vacated S slot, so a later
+        // binding cannot silently reclaim an old action.
         let cases: &[(&str, &[LcAction])] = &[
             ("<Space>", &[]),
             ("<Space> ", &[OpenTelescope]),
@@ -511,21 +546,26 @@ mod tests {
             ("<Space>gd", &[OpenHarnessManagerDecisions]),
             ("<Space>gp", &[EditHarnessManagerPolicy]),
             ("<Space>gr", &[]),
+            ("<Space>h", &[]),
+            ("<Space>hc", &[ClearOperatorPause]),
+            ("<Space>hs", &[DowngradeOperatorPause]),
             ("<Space>i", &[OpenIssuesWorkspace]),
             ("<Space>k", &[CancelRetry]),
-            ("<Space>m", &[BlankPrompt]),
+            ("<Space>m", &[]),
             ("<Space>M", &[OpenMemorySearch]),
+            ("<Space>n", &[ToggleNotifications]),
+            ("<Space>N", &[BlankPrompt]),
             ("<Space>o", &[TaskRabbitPrompt]),
             ("<Space>p", &[OpenProjectPicker]),
             ("<Space>q", &[CloseFocusedPane]),
             ("<Space>r", &[ToggleRotationDisabled]),
             ("<Space>R", &[]),
             ("<Space>s", &[OpenSortPicker]),
-            ("<Space>S", &[EmergencyStopAll]),
+            ("<Space>S", &[]),
             ("<Space>t", &[ToggleTestingNeeded]),
             ("<Space>T", &[OpenSessionInNewTab]),
-            ("<Space>x", &[ExecuteDocRegBlocks]),
-            ("<Space>X", &[CommitAndPush]),
+            ("<Space>x", &[CommitAndPush]),
+            ("<Space>X", &[EmergencyStopAll]),
         ];
 
         for (sequence, expected) in cases {
@@ -534,7 +574,7 @@ mod tests {
             assert_eq!(
                 application_actions_for(&keys),
                 *expected,
-                "pre-remap Space effect changed for {sequence}"
+                "Space effect changed for {sequence}"
             );
         }
     }
@@ -728,14 +768,14 @@ mod tests {
         );
     }
 
-    /// Parse a pinned Normal sequence, including the non-character keys the
-    /// hand-installed mappings used (`<BS>`, `<F2>`, `<F3>`, `<C-m>`).
+    /// Parse a pinned Normal sequence, including named and modified keys.
     fn pinned_sequence_events(sequence: &str) -> Vec<KeyEvent> {
         match sequence {
             "<BS>" => vec![KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)],
             "<F2>" => vec![KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)],
             "<F3>" => vec![KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)],
             "<C-m>" => vec![KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)],
+            "Ctrl-N" => vec![KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)],
             other => normal_sequence_keys(other)
                 .unwrap_or_else(|| panic!("invalid pinned sequence: {other}"))
                 .into_iter()
@@ -836,8 +876,8 @@ mod tests {
             ("gj", Dispatch(GoToJobsZone)),
             ("<Space>gq", Dispatch(OpenQuestionModal)),
             ("gr", Dispatch(OpenRecentCompletions)),
-            ("<Space>x", Dispatch(ExecuteDocRegBlocks)),
-            ("<Space>X", Dispatch(CommitAndPush)),
+            ("<Space>x", Dispatch(CommitAndPush)),
+            ("<Space>X", Dispatch(EmergencyStopAll)),
             ("l", Dispatch(NavigateRight)),
             ("H", Dispatch(AscendContainer)),
             ("L", Dispatch(EnterSession)),
@@ -851,10 +891,11 @@ mod tests {
             ("<Space>M", Dispatch(OpenMemorySearch)),
             ("<Space>K", Dispatch(OpenScheduleBrowser)),
             ("<Space>o", Dispatch(TaskRabbitPrompt)),
-            ("<Space>m", Dispatch(BlankPrompt)),
+            ("Ctrl-N", Dispatch(BlankPrompt)),
+            ("<Space>N", Dispatch(BlankPrompt)),
             ("<Space>r", Dispatch(ToggleRotationDisabled)),
             ("<Space>k", Dispatch(CancelRetry)),
-            ("<Space>S", Dispatch(EmergencyStopAll)),
+            ("<Space>S", Inert),
             ("<Space>T", Dispatch(OpenSessionInNewTab)),
             ("<Space>q", Dispatch(CloseFocusedPane)),
             ("<Space>,", Dispatch(OpenSettings)),
@@ -899,9 +940,10 @@ mod tests {
             cases.push((format!("<Space>{n}"), Dispatch(JumpAttentionN(n))));
         }
 
+        // Blank launches from both `Ctrl-N` and `<Space>N`.
         // The four retired mini-DAG chords are excluded from the old 92-call
         // inventory; the three loops expand to 12 + 9 + 9 mappings.
-        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4);
+        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4 + 1);
 
         for (sequence, pin) in &cases {
             let actions = all_actions_for_events(&pinned_sequence_events(sequence));
@@ -1071,6 +1113,17 @@ mod tests {
             vec![LcAction::ToggleModelDropdown]
         );
         assert!(application_actions_for(&[KeyCode::Char('M')]).is_empty());
+    }
+
+    #[test]
+    fn blank_prompt_uses_ctrl_n() {
+        assert_eq!(
+            application_actions_for_events(&[KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+            )]),
+            vec![LcAction::BlankPrompt]
+        );
     }
 
     #[test]

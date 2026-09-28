@@ -76,7 +76,7 @@ pub(crate) fn resolve_provider(
     {
         return Ok(Box::new(OpenAiApiProvider::with_config(
             url,
-            None,
+            super::api_key::ApiCredential::None,
             ProviderQuirks {
                 native_tools: true,
                 auth_style: super::types::AuthStyle::None,
@@ -88,7 +88,7 @@ pub(crate) fn resolve_provider(
     if let Some(url) = base_url {
         return Ok(Box::new(OpenAiApiProvider::with_config(
             url.to_string(),
-            api_key.map(String::from),
+            super::api_key::ApiCredential::explicit(api_key),
             ProviderQuirks {
                 native_tools: true,
                 ..Default::default()
@@ -109,10 +109,14 @@ pub(crate) fn resolve_provider(
     }
 
     if let Some(entry) = super::compatible_table::lookup(model) {
-        let key = super::api_key::resolve_api_key(api_key, entry.env_vars);
+        // Resolved per request, so a vault rotation reaches a live session.
+        let credential = super::api_key::ApiCredential::for_slot(
+            api_key,
+            crate::vault::slots::slot_for_compatible_entry(entry.name),
+        );
         return Ok(Box::new(OpenAiApiProvider::with_config(
             entry.base_url.to_string(),
-            key,
+            credential,
             entry.quirks.clone(),
         )?));
     }
@@ -146,6 +150,7 @@ pub(crate) fn install_test_openai_compatible_route(model: &str, base_url: &str) 
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn resolves_mercury_to_openai_compatible_provider() {
         let provider = resolve_provider("mercury-2", None, Some("test-key")).unwrap();
@@ -153,6 +158,7 @@ mod tests {
         assert!(provider.supports_native_tools());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn rejects_unknown_model_without_explicit_route() {
         let err = match resolve_provider("mystery-model", None, None) {

@@ -202,6 +202,7 @@ fn refusal<T: std::fmt::Debug>(result: Result<T>) -> Refusal {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn fast_forward_publishes_source_as_target() {
     let fixture = Fixture::new(false);
@@ -231,6 +232,7 @@ async fn fast_forward_publishes_source_as_target() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn diverged_histories_publish_a_two_parent_merge() {
     let fixture = Fixture::new(false);
@@ -269,6 +271,7 @@ async fn diverged_histories_publish_a_two_parent_merge() {
     assert!(fixture.is_ancestor(&source, &target));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn already_integrated_source_leaves_target_unchanged() {
     let fixture = Fixture::new(false);
@@ -281,6 +284,7 @@ async fn already_integrated_source_leaves_target_unchanged() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn conflicting_merge_reports_paths_and_cleans_up() {
     let fixture = Fixture::new(false);
@@ -300,6 +304,7 @@ async fn conflicting_merge_reports_paths_and_cleans_up() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn stale_tip_at_prepare_is_refused() {
     let fixture = Fixture::new(false);
@@ -318,6 +323,7 @@ async fn stale_tip_at_prepare_is_refused() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn stale_tip_at_publish_keeps_concurrent_writer() {
     let fixture = Fixture::new(false);
@@ -337,6 +343,7 @@ async fn stale_tip_at_publish_keeps_concurrent_writer() {
     assert_eq!(fixture.resolve(TARGET), concurrent);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn non_descendant_candidate_is_not_fast_forward() {
     let fixture = Fixture::new(false);
@@ -349,6 +356,7 @@ async fn non_descendant_candidate_is_not_fast_forward() {
     assert_eq!(fixture.resolve(TARGET), tip);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_clean_target_advances_in_place() {
     let fixture = Fixture::new(true);
@@ -371,6 +379,7 @@ async fn held_clean_target_advances_in_place() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_dirty_target_is_refused_and_preserved() {
     let fixture = Fixture::new(true);
@@ -392,6 +401,7 @@ async fn held_dirty_target_is_refused_and_preserved() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_target_with_colliding_untracked_file_is_refused_and_preserved() {
     let fixture = Fixture::new(true);
@@ -410,6 +420,7 @@ async fn held_target_with_colliding_untracked_file_is_refused_and_preserved() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_target_with_non_colliding_untracked_file_is_refused_and_preserved() {
     let fixture = Fixture::new(true);
@@ -428,6 +439,7 @@ async fn held_target_with_non_colliding_untracked_file_is_refused_and_preserved(
     assert_eq!(std::fs::read_to_string(&untracked).unwrap(), "untracked\n");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_target_mid_rebase_is_refused_and_preserved() {
     let fixture = Fixture::new(true);
@@ -463,6 +475,7 @@ async fn held_target_mid_rebase_is_refused_and_preserved() {
     assert_eq!(fixture.resolve(TARGET), tip);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn protected_targets_are_denied_even_when_allowlisted() {
     let fixture = Fixture::new(false);
@@ -501,6 +514,7 @@ async fn protected_targets_are_denied_even_when_allowlisted() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn target_outside_the_allowlist_is_denied() {
     let fixture = Fixture::new(false);
@@ -519,6 +533,7 @@ async fn target_outside_the_allowlist_is_denied() {
     assert_eq!(fixture.resolve("refs/heads/other"), fixture.base);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn source_that_is_not_a_commit_is_refused() {
     let fixture = Fixture::new(false);
@@ -541,6 +556,7 @@ async fn source_that_is_not_a_commit_is_refused() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn discard_refuses_worktrees_the_engine_did_not_create() {
     let fixture = Fixture::new(false);
@@ -613,6 +629,7 @@ fn spec(commands: Vec<GuardCommand>) -> GuardSpec {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_passes_only_when_every_command_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -637,6 +654,7 @@ async fn guard_passes_only_when_every_command_passes() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_failure_carries_status_and_output_and_stops_the_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -659,6 +677,7 @@ async fn guard_failure_carries_status_and_output_and_stops_the_run() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_timeout_fails_and_reaps_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -691,6 +710,7 @@ async fn guard_timeout_fails_and_reaps_the_process_group() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_timeout_preserves_output_emitted_before_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
@@ -711,6 +731,7 @@ async fn guard_timeout_preserves_output_emitted_before_the_deadline() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_over_bound_output_retains_the_true_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -734,6 +755,7 @@ async fn guard_over_bound_output_retains_the_true_tail() {
     assert!(report.commands[0].output_truncated);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_reports_an_unstartable_command_as_unavailable() {
     let dir = tempfile::tempdir().unwrap();
@@ -751,9 +773,16 @@ async fn guard_reports_an_unstartable_command_as_unavailable() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[test]
 fn guard_withholds_daemon_authority_and_repository_overrides() {
-    for key in ["RSI_SESSION_TOKEN", "RSI_DB", "GIT_DIR", "GIT_WORK_TREE"] {
+    for key in [
+        "RSI_SESSION_TOKEN",
+        "RSI_MEMORY_ENABLED",
+        "RSI_DB",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+    ] {
         assert!(super::guard::scrubbed(key), "{key} must be withheld");
     }
     for key in ["PATH", "HOME", "CARGO_TARGET_DIR", "GUARD_VALUE"] {
@@ -761,6 +790,7 @@ fn guard_withholds_daemon_authority_and_repository_overrides() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[test]
 fn target_authorization_is_fail_closed() {
     let settings = config(&[TARGET, "refs/heads/-option", "refs/tags/rolling", "rolling"]);
@@ -782,6 +812,7 @@ fn target_authorization_is_fail_closed() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_custody_blocks_raw_checkout_and_abort_releases_it() {
     let fixture = Fixture::new(true);
@@ -870,6 +901,7 @@ async fn held_custody_blocks_raw_checkout_and_abort_releases_it() {
     assert_eq!(fixture.resolve(TARGET), fixture.base);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_custody_blocks_raw_rebase_and_abort_starts_it() {
     let fixture = Fixture::new(true);
@@ -928,6 +960,7 @@ async fn held_custody_blocks_raw_rebase_and_abort_starts_it() {
     assert_eq!(git(&fixture.repo, &["status", "--porcelain"]), "");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn unheld_custody_registers_engine_worktree_and_abort_removes_it() {
     let fixture = Fixture::new(false);
@@ -1033,6 +1066,7 @@ fn assert_no_custody_artifacts(repo: &Path, operation_id: Uuid) {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn held_custody_prepare_and_publish_lands_the_candidate_and_cleans() {
     let fixture = Fixture::new(true);
@@ -1110,6 +1144,7 @@ async fn held_custody_prepare_and_publish_lands_the_candidate_and_cleans() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn unheld_custody_publish_removes_the_engine_holder_after_publication() {
     let fixture = Fixture::new(false);
@@ -1174,6 +1209,7 @@ async fn unheld_custody_publish_removes_the_engine_holder_after_publication() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn prepared_custody_still_refuses_raw_checkout_and_rebase() {
     let fixture = Fixture::new(true);
@@ -1239,6 +1275,7 @@ async fn prepared_custody_still_refuses_raw_checkout_and_rebase() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn injected_transaction_abort_after_application_restores_expected_and_cleans() {
     let fixture = Fixture::new(true);
@@ -1299,6 +1336,7 @@ async fn injected_transaction_abort_after_application_restores_expected_and_clea
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn lost_acknowledgement_reconciles_record_only_to_published_and_cleans() {
     let fixture = Fixture::new(true);
@@ -1367,6 +1405,7 @@ async fn lost_acknowledgement_reconciles_record_only_to_published_and_cleans() {
     assert_eq!(fixture.scratch_entries(), 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn missing_marker_settles_terminal_held_and_engine_owned_outcomes() {
     for held in [true, false] {
@@ -1426,6 +1465,7 @@ async fn missing_marker_settles_terminal_held_and_engine_owned_outcomes() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn missing_marker_other_tip_is_uncertain_and_keeps_remaining_artifacts() {
     let fixture = Fixture::new(true);
@@ -1453,6 +1493,7 @@ async fn missing_marker_other_tip_is_uncertain_and_keeps_remaining_artifacts() {
     assert!(record.git_dir.join("index.lock").exists());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn missing_lock_recovery_resumes_staged_prepared_and_linked_prefixes() {
     for prefix in ["staged", "installed"] {
@@ -1533,6 +1574,7 @@ async fn missing_lock_recovery_resumes_staged_prepared_and_linked_prefixes() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn unbound_recovery_proof_prefix_is_preserved_without_lock_mutation() {
     let fixture = Fixture::new(true);
@@ -1566,6 +1608,7 @@ async fn unbound_recovery_proof_prefix_is_preserved_without_lock_mutation() {
     assert!(!lock.exists());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn replaced_missing_lock_is_uncertain_and_preserves_foreign_lock() {
     let fixture = Fixture::new(true);
@@ -1624,6 +1667,7 @@ async fn replaced_missing_lock_is_uncertain_and_preserves_foreign_lock() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn mismatched_or_malformed_marker_is_uncertain_and_preserves_proof() {
     let fixture = Fixture::new(true);
@@ -1691,6 +1735,7 @@ async fn mismatched_or_malformed_marker_is_uncertain_and_preserves_proof() {
     assert!(git(&fixture.repo, &["status", "--porcelain"]).is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn acquired_cleanup_foreign_proof_entry_preserves_all_owned_artifacts() {
     let fixture = Fixture::new(true);
@@ -1733,6 +1778,7 @@ async fn acquired_cleanup_foreign_proof_entry_preserves_all_owned_artifacts() {
     assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn prepared_manifest_binds_create_once_artifacts_and_preserves_tamper_evidence() {
     for case in ["immutable-bytes", "mutable-inode", "symlink"] {
@@ -1804,6 +1850,7 @@ async fn prepared_manifest_binds_create_once_artifacts_and_preserves_tamper_evid
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn candidate_transition_preserves_add_delete_mode_and_symlink_tree_shape() {
     use std::os::unix::fs::{PermissionsExt, symlink};

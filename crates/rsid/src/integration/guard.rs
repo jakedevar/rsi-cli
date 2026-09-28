@@ -108,6 +108,8 @@ async fn run_command(
             command.env_remove(&key);
         }
     }
+    // #694 K1: guarded suites run worktree-authored code; no provider key.
+    crate::vault::scrub_credential_env(&mut command);
     command.envs(&spec.env);
 
     let limits = CaptureLimits::new(

@@ -399,9 +399,17 @@ impl Store {
         };
         let active = count(manager_request_unanswered_sql())?;
         let pending = count(manager_request_open_sql())?;
+        let informational: i64 = self.conn.query_row(
+            "SELECT count(*) FROM harness_manager_messages m WHERE m.project_id=?1
+             AND m.scope_version=?2 AND m.manager_session_id=?3 AND m.epic_id=?4
+             AND m.request_id IS NULL AND m.request_fingerprint GLOB 'manager-info:*'",
+            params![row.project, row.config.row_version, row.manager, row.epic],
+            |record| record.get(0),
+        )?;
         Ok((
             json!({"latest":latest,"unanswered_requests":unanswered,
-                "active_requests":active,"pending_requests":pending}),
+                "active_requests":active,"pending_requests":pending,
+                "informational_messages":informational}),
             lead_changed,
         ))
     }

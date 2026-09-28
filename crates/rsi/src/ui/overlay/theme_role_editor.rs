@@ -23,7 +23,7 @@ pub fn render_theme_role_editor(
         Block::default()
             .title(format!(" {} ", role.label()))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::focused_border()))
+            .border_style(Style::default().fg(theme::overlay_border()))
             .style(Style::default().bg(theme::semantic_color(
                 crate::ui::theme_roles::ThemeRole::ElevatedSurface,
             ))),

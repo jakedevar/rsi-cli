@@ -657,7 +657,7 @@ async fn explicit_purge_is_blocked_and_dependent_state_survives() {
 
     assert_blocked(
         fix.manager.purge_session(session_id).await,
-        "missing_independently_verified_proof",
+        "this session owns a retained sandbox",
     );
 
     assert_eq!(snapshot(&fix, session_id, &root, epic_id), before);

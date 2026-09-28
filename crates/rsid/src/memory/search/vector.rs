@@ -241,6 +241,7 @@ mod tests {
         store
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_empty_query_vec() {
         let store = setup_vector_store(&[]);
@@ -248,6 +249,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_zero_limit() {
         let store = setup_vector_store(&[]);
@@ -255,6 +257,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_basic() {
         let store = setup_vector_store(&[
@@ -288,6 +291,7 @@ mod tests {
         assert!(results[0].text.contains("rust"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_ordering() {
         let store = setup_vector_store(&[
@@ -330,6 +334,7 @@ mod tests {
         assert!(results[1].score > results[2].score);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_limit() {
         let store = setup_vector_store(&[
@@ -343,6 +348,7 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_empty_embeddings() {
         let store = setup_vector_store(&[
@@ -365,6 +371,7 @@ mod tests {
         assert!(results[0].text.contains("has embedding"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_no_chunks() {
         let store = setup_vector_store(&[]);
@@ -373,6 +380,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_embedding_json_valid() {
         assert_eq!(
@@ -381,16 +389,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_embedding_json_empty() {
         assert_eq!(parse_embedding_json(""), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_embedding_json_malformed() {
         assert_eq!(parse_embedding_json("not json"), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_query_vec_to_blob() {
         let vec = [1.0f32, 2.0f32];
@@ -401,6 +412,7 @@ mod tests {
         assert_eq!(&blob[4..8], &2.0f32.to_le_bytes());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_model_filter() {
         let store = setup_vector_store(&[
@@ -452,6 +464,7 @@ mod tests {
         store
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_vector_cosine_fallback_project_filter() {
         let store = setup_vector_store_with_project(&[

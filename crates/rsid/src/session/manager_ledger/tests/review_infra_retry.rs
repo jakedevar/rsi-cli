@@ -60,6 +60,7 @@ fn fail_allocation_action(store: &Store, assignment_id: Uuid) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn retry_uses_commit_bound_seal_after_notes_only_commit() {
     let f = fixture().await;
@@ -84,6 +85,7 @@ async fn retry_uses_commit_bound_seal_after_notes_only_commit() {
     assert_eq!(review_row(&store, next).0, "allocating");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn retry_uses_rotation_tip_as_source_holder() {
     let f = fixture().await;
@@ -131,6 +133,7 @@ async fn retry_uses_rotation_tip_as_source_holder() {
     assert_eq!(context["source"]["commit"], json!(f.source_head));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn rotated_relaunch_crosses_the_pending_acceptance_gate() {
     let f = fixture().await;
@@ -208,6 +211,7 @@ fn assert_same_review(store: &Store, old: Uuid, next: Uuid, source: &str) {
     assert_eq!(retry_of, old.to_string());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn each_infrastructure_cause_launches_same_source_and_family_successor() {
     for cause in ["interrupted", "provider_failed", "allocation_failed"] {
@@ -246,6 +250,7 @@ async fn each_infrastructure_cause_launches_same_source_and_family_successor() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn infrastructure_retry_chain_stops_after_two_relaunches() {
     let f = fixture().await;
@@ -275,6 +280,7 @@ async fn infrastructure_retry_chain_stops_after_two_relaunches() {
     assert!(!store.refresh_manager_review_assignment(current).unwrap());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn final_tool_denial_and_budget_endings_do_not_relaunch() {
     for (status, error_class, tool_denials, code) in [
@@ -327,6 +333,7 @@ async fn final_tool_denial_and_budget_endings_do_not_relaunch() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn later_code_commit_reserves_retry_at_the_exact_sealed_sha() {
     let f = fixture().await;
@@ -347,6 +354,7 @@ async fn later_code_commit_reserves_retry_at_the_exact_sealed_sha() {
     assert_eq!(assignment_count(&store), 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn non_ancestor_seal_still_refuses_infrastructure_retry() {
     let f = fixture().await;
@@ -372,6 +380,7 @@ async fn non_ancestor_seal_still_refuses_infrastructure_retry() {
 /// A relaunch the policy refuses fails typed and does not loop. The refusal is
 /// a revoked SessionCreate capability: since #674 K15a the lifetime creation
 /// limit no longer charges DB-native review launches, so it cannot refuse one.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn refused_relaunch_fails_typed_without_loop() {
     let f = fixture().await;
@@ -407,6 +416,7 @@ async fn refused_relaunch_fails_typed_without_loop() {
 /// #674 K15a: an infrastructure relaunch is a DB-native review launch, so an
 /// exhausted lifetime creation budget does not refuse it; it is journaled and
 /// linked like the first allocation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn creation_limit_does_not_refuse_review_relaunch() {
     let f = fixture().await;

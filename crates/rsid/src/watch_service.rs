@@ -284,6 +284,7 @@ mod tests {
 
     /// Watched child hits a terminal status on the bus → `TriggerNow(job)`.
     /// Covers T-4's service half via `SessionQuestionRaised` below.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn watched_terminal_event_triggers_job() {
         let mut fx = fixture().await;
@@ -308,6 +309,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn watch_service_triggers_ancestor_watch_on_successor_terminal() {
         let mut fx = fixture().await;
@@ -336,6 +338,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn queued_manager_notice_triggers_its_exact_job_without_a_scan() {
         let mut fx = fixture().await;
@@ -350,6 +353,7 @@ mod tests {
 
     /// A bypass-flip shape (`SessionReconciled` only, no status event) still
     /// accelerates — the service maps the reconciled variant too (F-003/4).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn reconciled_terminal_event_triggers_job() {
         let mut fx = fixture().await;
@@ -376,6 +380,7 @@ mod tests {
 
     /// T-4 (service half, D5): a raised question on a watched child triggers
     /// immediate evaluation.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn question_raised_triggers_job() {
         let mut fx = fixture().await;
@@ -401,6 +406,7 @@ mod tests {
     /// T-9: terminal events for sessions nobody watches produce no scheduler
     /// traffic; non-terminal transitions of a watched child are ignored;
     /// disabled watch rows never trigger.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn non_watched_terminal_session_fires_nothing() {
         let mut fx = fixture().await;
@@ -439,6 +445,7 @@ mod tests {
 
     /// Issue #627: a manager recipient going idle re-evaluates each exact
     /// manager-notice transport routed to it, not only the due list.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn manager_recipient_going_idle_triggers_its_notice_transports() {
         let mut fx = fixture().await;
@@ -473,6 +480,7 @@ mod tests {
 
     /// Master-idle acceleration: the wake TARGET of a pending watch going
     /// terminal yields `CheckNow` (deliver queued wakes now, not next tick).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn master_going_idle_checks_now() {
         let mut fx = fixture().await;

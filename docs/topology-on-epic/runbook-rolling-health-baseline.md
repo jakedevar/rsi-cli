@@ -22,8 +22,13 @@ crate, with its daemon-owned offline settings and `--test-threads=8`.
 
 ## Upsert and execute
 
-Today, topology writes are operator RPCs; agent topology verbs are a T4
-follow-up. Start from the repository root:
+The operator uses the operator RPCs below. An Epic lead (in its own Epic) or
+the appointed manager holding `Automation` uses the agent verbs instead (#633):
+`AgentTopologyUpsert` with the file's `name` and `definition` and
+`"scope":"epic"`, then `AgentTopologyExecute` with the returned `topology_id`,
+`definition_digest` as `expected_digest`, the `epic_id` and an
+`idempotency_key`. Every session node's provider/model/effort must be in the
+operator's `allowed_launches`. From the repository root, as the operator:
 
 ```bash
 rpc CreateTopology --params "$(jq -c '{name,definition}' docs/topology-on-epic/topologies/rolling-health-baseline.json)"

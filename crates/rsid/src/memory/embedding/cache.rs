@@ -205,6 +205,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_disabled() {
         let cache = make_cache(false);
@@ -215,6 +216,7 @@ mod tests {
         assert!(result.embeddings[0].is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_empty_chunks() {
         let cache = make_cache(true);
@@ -224,6 +226,7 @@ mod tests {
         assert!(result.embeddings.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_all_miss() {
         let cache = make_cache(true);
@@ -234,6 +237,7 @@ mod tests {
         assert!(!result.all_cached());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_store_and_retrieve() {
         let cache = make_cache(true);
@@ -253,6 +257,7 @@ mod tests {
         assert_eq!(result.embeddings[0].as_ref().unwrap(), &embedding);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_partial_hit() {
         let cache = make_cache(true);
@@ -273,6 +278,7 @@ mod tests {
         assert!(result.embeddings[1].is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_provider_namespace_isolation() {
         let cache1 = EmbeddingCache {
@@ -303,6 +309,7 @@ mod tests {
         assert!(!result.all_cached());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_model_namespace_isolation() {
         let cache1 = EmbeddingCache {
@@ -331,6 +338,7 @@ mod tests {
         assert!(!result.all_cached());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_prune_over_limit() {
         let cache = EmbeddingCache {
@@ -357,6 +365,7 @@ mod tests {
         // (exact count depends on prune implementation)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_prune_disabled() {
         let cache = make_cache(false);
@@ -365,6 +374,7 @@ mod tests {
         cache.prune_if_needed(&store).unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_cache_empty_hash_skip() {
         let cache = make_cache(true);
@@ -381,6 +391,7 @@ mod tests {
         assert_eq!(result.missing_indices, vec![0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_merge_computed() {
         let mut result = CacheLookupResult {
@@ -393,6 +404,7 @@ mod tests {
         assert_eq!(result.embeddings[2].as_ref().unwrap(), &vec![3.0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_into_embeddings_lossy() {
         let result = CacheLookupResult {
@@ -405,6 +417,7 @@ mod tests {
         assert_eq!(vecs[2], vec![3.0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_provider_key_stability() {
         use crate::memory::embedding::mock::MockEmbeddingProvider;
@@ -414,6 +427,7 @@ mod tests {
         assert_eq!(key1, key2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_provider_key_differs_by_model() {
         use crate::memory::embedding::mock::MockEmbeddingProvider;
@@ -425,6 +439,7 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_provider_key_includes_url() {
         use crate::memory::embedding::mock::MockEmbeddingProvider;

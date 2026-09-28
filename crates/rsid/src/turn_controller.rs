@@ -60,6 +60,7 @@ impl TurnController {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_single_policy_turn_completed_returns_false() {
         let mut ctrl = TurnController::new(ContinuationPolicy::Single);
@@ -67,6 +68,7 @@ mod tests {
         assert!(!ctrl.turn_completed());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_max_turns_3_returns_true_for_turns_1_and_2_false_for_3() {
         let mut ctrl = TurnController::new(ContinuationPolicy::MaxTurns(3));
@@ -78,6 +80,7 @@ mod tests {
         assert!(!ctrl.turn_completed());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_current_turn_tracks_correctly() {
         let mut ctrl = TurnController::new(ContinuationPolicy::MaxTurns(5));
@@ -88,6 +91,7 @@ mod tests {
         assert_eq!(ctrl.current_turn(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_max_turns_1_behaves_like_single() {
         let mut ctrl = TurnController::new(ContinuationPolicy::MaxTurns(1));
@@ -95,6 +99,7 @@ mod tests {
         assert!(!ctrl.turn_completed());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_max_turns_5_allows_five_turns() {
         let mut ctrl = TurnController::new(ContinuationPolicy::MaxTurns(5));

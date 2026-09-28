@@ -526,6 +526,7 @@ mod tests {
             .active_tokens
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_assistant_with_full_usage() {
         let event = StreamEvent {
@@ -551,6 +552,7 @@ mod tests {
         assert_eq!(usage.confidence, ContextUsageConfidence::Full);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_assistant_partial() {
         let event = StreamEvent {
@@ -571,6 +573,7 @@ mod tests {
         assert_eq!(usage.cache_read, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_non_assistant_returns_none() {
         let event = StreamEvent {
@@ -581,6 +584,7 @@ mod tests {
         assert!(extract_token_usage(&event).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_no_usage_block() {
         let event = StreamEvent {
@@ -597,6 +601,7 @@ mod tests {
         assert_eq!(usage.total_input, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_with_stop_reason() {
         let event = StreamEvent {
@@ -616,6 +621,7 @@ mod tests {
         assert_eq!(usage.stop_reason, Some("end_turn".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_turn_completed_event() {
         let event = StreamEvent {
@@ -639,6 +645,7 @@ mod tests {
         assert_eq!(usage.stop_reason, Some("max_context".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_token_usage_turn_completed_without_usage() {
         let event = StreamEvent {
@@ -653,6 +660,7 @@ mod tests {
         assert_eq!(usage.confidence, ContextUsageConfidence::Missing);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_codex_context_usage_uses_last_total_tokens() {
         let event = StreamEvent {
@@ -678,6 +686,7 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(20_000));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_codex_context_distinguishes_true_zero_from_missing() {
         let mut event = StreamEvent {
@@ -693,6 +702,7 @@ mod tests {
         assert!(extract_codex_context_usage(&event).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_build_turn_metric() {
         let session_id = Uuid::new_v4();
@@ -732,6 +742,7 @@ mod tests {
         assert_eq!(metric.tool_count, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_build_turn_metric_no_tools() {
         let usage = TokenUsage {
@@ -753,6 +764,7 @@ mod tests {
         assert_eq!(metric.tool_count, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_result_metadata() {
         let event = StreamEvent {
@@ -786,6 +798,7 @@ mod tests {
         assert_eq!(meta.stop_reason, Some("success".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_result_metadata_ignores_turn_completed_subtype() {
         let event = StreamEvent {
@@ -805,6 +818,7 @@ mod tests {
         assert_eq!(meta.final_output_tokens, Some(250));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_extract_result_metadata_minimal() {
         let event = StreamEvent {
@@ -823,6 +837,7 @@ mod tests {
 
     /// G-005/F-151: a multi-model `modelUsage` map must resolve to the
     /// SESSION's window, not to whichever entry the CLI serialized first.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_picks_the_sessions_model_usage_entry() {
         // Observed shape: the map key carries a variant suffix while
@@ -862,6 +877,7 @@ mod tests {
 
     /// Older payloads carry no `canonicalModel`; the `<model>[variant]` key
     /// shape still resolves to the session's own entry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_matches_variant_suffixed_keys_without_canonical_model() {
         let event = StreamEvent {
@@ -883,6 +899,7 @@ mod tests {
     /// No match (unknown session model, or a model absent from the payload)
     /// keeps the previous first-entry behavior rather than dropping the
     /// authoritative window entirely.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_falls_back_to_the_first_entry_when_nothing_matches() {
         let event = StreamEvent {
@@ -923,6 +940,7 @@ mod tests {
     // The test name is scoped to `resume_fixture` to make the provenance
     // obvious in CI output.
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_resume_fixture_cumulative_watermark_rises() {
         // Simulate: prior assistant chunk reported total_input=30_000 →
@@ -950,6 +968,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_resume_fixture_delta_watermark_holds() {
         // Simulate: live_input_tokens = 48_000 from a prior chunk. A subsequent
@@ -978,6 +997,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn context_usage_bus_payload_carries_the_exact_resolved_budget() {
         let event_bus = Arc::new(EventBus::new(1));
@@ -1030,6 +1050,7 @@ mod tests {
         event_bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_context_window_for_model() {
         // Opus 5's complete model ID is a single version component.
@@ -1108,6 +1129,7 @@ mod tests {
     /// matched neither the catalog (exact) nor any of the 61 substring patterns
     /// (there is no `opus-5` row), and resolved to 128_000 for a 1_000_000 window:
     /// a 7.8x overstatement of context fill, persisted from the first event.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_context_window_ignores_variant_suffix() {
         // The suffixed id and the bare id must agree.
@@ -1194,6 +1216,7 @@ mod tests {
 
     /// V99/P1-C. The counters below are the ones RSI previously discarded:
     /// the CLI reported ~12 usage fields and RSI persisted four of them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_captures_v99_usage_counters() {
         let meta = extract_result_metadata(&observed_result_event(), Some("claude-opus-5"));
@@ -1218,6 +1241,7 @@ mod tests {
 
     /// Pre-existing counters must be unchanged by the V99 additions: this
     /// phase is additive telemetry, not a reinterpretation of existing fields.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_preserves_existing_counter_semantics() {
         let meta = extract_result_metadata(&observed_result_event(), Some("claude-opus-5"));
@@ -1234,6 +1258,7 @@ mod tests {
     /// A `result` with no `usage` key must leave every new field `None` rather
     /// than writing a synthetic zero — "unmeasured" and "measured as 0" are
     /// different facts and downstream analytics rely on the distinction.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn extract_result_metadata_without_usage_yields_none_not_zero() {
         let event = StreamEvent {
@@ -1254,6 +1279,7 @@ mod tests {
 
     /// The denial count is the array LENGTH; the element shape is unobserved
     /// and deliberately not modelled (P2-DENIALS).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn permission_denial_count_is_the_array_length() {
         let mut event = observed_result_event();
@@ -1269,6 +1295,7 @@ mod tests {
     /// The per-turn path reads the same counters off the same `usage` object.
     /// The 1h/5m split is the point of the item: it is what makes an account's
     /// prompt-cache TTL transition observable rather than a mystery cost jump.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn turn_usage_captures_the_cache_ttl_split() {
         let event = StreamEvent {
@@ -1312,6 +1339,7 @@ mod tests {
 
     /// A usage object with no cache/thinking detail must yield zeros, not a
     /// panic — older CLIs and other providers omit these sub-objects.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn turn_usage_without_detail_objects_is_zero_not_a_panic() {
         let event = StreamEvent {
@@ -1329,6 +1357,7 @@ mod tests {
 
     /// The strip must not turn a miss into a hit: an unrecognized model keeps
     /// the 128k fallback whether or not it carries a variant tag.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn test_variant_suffix_strip_preserves_fallback_behaviour() {
         assert_eq!(

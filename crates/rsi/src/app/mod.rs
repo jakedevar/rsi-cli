@@ -135,8 +135,8 @@ pub const CODEX_MODELS: &[(&str, &str)] = &[
 /// the live account catalog; no vendor model list is baked into the TUI.
 pub const PIONEER_MODELS: &[(&str, &str)] = &[("claude-sonnet-5", "Claude Sonnet 5")];
 
-/// Minimal offline fallback for OpenRouter. Model IDs use OpenRouter's
-/// provider/model namespace and live discovery can replace this list.
+/// Minimal offline fallback for Bedrock. Explicit discovery replaces it with
+/// all active GPT Responses inference profiles in the configured AWS region.
 pub const BEDROCK_MODELS: &[(&str, &str)] =
     &[("global.openai.gpt-5.6-sol", "GPT-5.6 Sol (Global)")];
 
@@ -408,6 +408,9 @@ pub struct App {
     /// Sessions indexed by ID, with ordered list of IDs
     pub sessions: HashMap<Uuid, SessionState>,
     pub session_order: Vec<Uuid>,
+    /// Persisted operator pause markers read separately from Session snapshots.
+    pub operator_pauses: HashMap<Uuid, crate::client::OperatorPauseLevel>,
+    pub(crate) operator_pause_probe_cursor: usize,
 
     /// Index from `parent_id` -> ordered list of direct children. Key `None`
     /// means top-level sessions (no parent); key `Some(uuid)` means children
@@ -598,6 +601,12 @@ pub struct App {
     /// `provider_rate_limit_updated` push event — the push path is what makes
     /// this live, since health status is only fetched at connect time.
     pub provider_rate_limits: HashMap<SessionProvider, ProviderRateLimitSnapshot>,
+    /// Latest bounded background Health read for the aggregate worker slice.
+    pub(crate) worker_slice_memory_pressure: Option<rsi_common::rpc::WorkerSliceMemoryPressure>,
+    pub(crate) worker_pressure_refresh_handle: Option<
+        tokio::task::JoinHandle<Result<Option<rsi_common::rpc::WorkerSliceMemoryPressure>, String>>,
+    >,
+    pub(crate) worker_pressure_next_refresh_at: std::time::Instant,
 
     /// Dynamically discovered models (model_id, display_name) for selected provider.
     /// Falls back to provider-specific static model lists if discovery fails.
@@ -881,6 +890,14 @@ pub struct App {
     /// Cached model-control/operator status for Settings -> Stats and
     /// Settings -> Daemon Features live controls.
     pub cached_model_control_status: Option<rsi_common::model_control::ModelControlStatusReport>,
+
+    /// Cached key-vault credential list for Settings -> Provider Keys
+    /// (#694 K1b). Populated on first entry to the category and on every
+    /// `RefreshProviderCredentials`/Set/Rotate/Clear/Check/Import round-trip
+    /// (same shape as `cached_model_control_status`). Never carries a secret
+    /// — `ListProviderCredentialsResult` is metadata-only by construction.
+    pub cached_provider_credentials:
+        Option<rsi_common::provider_credentials::ListProviderCredentialsResult>,
 }
 
 /// Replace any `Pane::Settings` leaves with `SessionList` so settings panes
@@ -952,6 +969,9 @@ pub(crate) fn replace_node(
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(handle) = self.worker_pressure_refresh_handle.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.conversation_poll_handle.take() {
             handle.abort();
         }
@@ -1164,6 +1184,8 @@ impl App {
                 crate::ui::theme_roles::TerminalColorCapability::from_launch_environment(),
             sessions: HashMap::new(),
             session_order: Vec::new(),
+            operator_pauses: HashMap::new(),
+            operator_pause_probe_cursor: 0,
             workflows: HashMap::new(),
             recursive_graphs: Vec::new(),
             graph_drafts: restored_graph_drafts,
@@ -1223,6 +1245,9 @@ impl App {
             custom_provider_index: None,
             provider_availability,
             provider_rate_limits: HashMap::new(),
+            worker_slice_memory_pressure: None,
+            worker_pressure_refresh_handle: None,
+            worker_pressure_next_refresh_at: std::time::Instant::now(),
             available_models: models_for_provider(selected_provider),
             local_models: models_for_provider(SessionProvider::Local),
             model_dropdown: crate::types::ModelDropdownState::default(),
@@ -1294,6 +1319,7 @@ impl App {
             cached_user_skills: None,
             cached_usage_stats: None,
             cached_model_control_status: None,
+            cached_provider_credentials: None,
             children_by_parent: HashMap::new(),
             focus_fetch_inflight: HashSet::new(),
             focus_fetch_tx,
@@ -1737,8 +1763,9 @@ impl App {
             state.last_sequence = state.events.last().map(|e| e.sequence);
         }
 
-        // Trigger formulation grow animation when a new renderable event
-        // arrives while the session is active (Running/Starting).
+        // Arm the formulation reveal when a new renderable event arrives while
+        // the session is active (Running/Starting). The renderer drops it
+        // unplayed when `UserSettings::formulation_anim_enabled` is off.
         if changed && matches!(mode, EventApplyMode::Append) {
             let is_active = matches!(
                 state.session.status,
@@ -1757,7 +1784,6 @@ impl App {
                         state.formulation = Some(crate::types::FormulationState {
                             event_index: idx,
                             started_at_ms: chrono::Utc::now().timestamp_millis(),
-                            target_height: 0,
                         });
                     }
                 }

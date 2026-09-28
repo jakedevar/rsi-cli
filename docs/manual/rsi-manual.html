@@ -28,7 +28,7 @@
 </nav>
 <section class="chapter" id="getting-started">
 <h2>1. Getting started</h2>
-<p>rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start the daemon, then the TUI. Press <code>?</code> for help on the focused view, <code>:</code> or <code>&lt;Space&gt;;</code> for the command palette, and <code>&lt;Space&gt;</code> as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.</p>
+<p>rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start <code>rsi</code>; on Linux and macOS it starts <code>rsid</code> if no daemon is accepting connections and the daemon binary is available. Press <code>?</code> for help on the focused view, <code>:</code> or <code>&lt;Space&gt;;</code> for the command palette, and <code>&lt;Space&gt;</code> as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.</p>
 <h3>Discovery</h3>
 <table>
 <thead><tr><th>Keys</th><th>Command</th><th>Action</th><th>What it does</th></tr></thead>
@@ -244,8 +244,11 @@
 <thead><tr><th>Keys</th><th>Command</th><th>Action</th><th>What it does</th></tr></thead>
 <tbody>
 <tr><td><code>yy</code></td><td></td><td>Copy Session UUID</td><td>Copies the selected session's UUID; in a transcript <code>yy</code> copies the selected event's content instead.</td></tr>
-<tr><td><code>x</code></td><td><code>:kill</code> <code>:ki</code></td><td>Interrupt running session</td><td>Interrupts the selected running session.</td></tr>
-<tr><td><code>X</code> <code>&lt;Space&gt;c</code></td><td><code>:continue [arg]</code> <code>:cont [arg]</code></td><td>Continue selected session</td><td>Continues the selected session: opens a continue prompt, or <code>:continue &lt;text&gt;</code> sends the text directly.</td></tr>
+<tr><td><code>x</code></td><td><code>:kill</code> <code>:ki</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
+<tr><td><code>X</code></td><td></td><td>Hard interrupt running session</td><td>Immediately interrupts the selected session and marks it HARD; only the operator may clear it.</td></tr>
+<tr><td><code>&lt;Space&gt;hs</code></td><td><code>:pause soft</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
+<tr><td><code>&lt;Space&gt;hc</code></td><td><code>:pause clear</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker.</td></tr>
+<tr><td><code>&lt;Space&gt;c</code></td><td><code>:continue [arg]</code> <code>:cont [arg]</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>P</code></td><td></td><td>Pin or unpin selected session</td><td>Pins or unpins the selected session at the top of the list.</td></tr>
 <tr><td><code>&lt;Space&gt;a</code></td><td><code>:archive</code> <code>:arc</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
 <tr><td><code>U</code></td><td></td><td>Unarchive selected session</td><td>Restores the selected archived session to the Main zone.</td></tr>
@@ -254,8 +257,8 @@
 <tr><td><code>R</code></td><td><code>:rotate</code> <code>:rot</code></td><td>Rotate session context</td><td>Rotates the selected session into a fresh context, carrying a handoff forward.</td></tr>
 <tr><td></td><td><code>:model [arg]</code> <code>:mod [arg]</code></td><td>Choose model</td><td>Opens the model picker, or <code>:model &lt;name&gt;</code> selects a model for new launches.</td></tr>
 <tr><td><code>&lt;Space&gt;o</code></td><td><code>:task [arg]</code> <code>:ta [arg]</code></td><td>Launch task session</td><td>Opens the TaskRabbit one-shot prompt; <code>:task &lt;text&gt;</code> launches it directly.</td></tr>
-<tr><td><code>&lt;Space&gt;m</code></td><td><code>:blank [arg]</code> <code>:bl [arg]</code></td><td>Launch blank session</td><td>Opens the blank general-purpose session prompt; <code>:blank &lt;text&gt;</code> launches it directly.</td></tr>
-<tr><td><code>&lt;Space&gt;S</code></td><td><code>:stopall</code> <code>:stop-all</code></td><td>Emergency stop all</td><td>Emergency stop: denies new paid work and cancels live model invocations.</td></tr>
+<tr><td><code>Ctrl-N</code> <code>&lt;Space&gt;N</code></td><td><code>:blank [arg]</code> <code>:bl [arg]</code></td><td>Launch blank session</td><td>Opens the blank general-purpose session prompt; <code>:blank &lt;text&gt;</code> launches it directly.</td></tr>
+<tr><td><code>&lt;Space&gt;X</code></td><td><code>:stopall</code> <code>:stop-all</code></td><td>Emergency stop all</td><td>Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD.</td></tr>
 <tr><td></td><td><code>:group</code> <code>:groups</code></td><td>Choose group label</td><td>Opens the group label picker for the selected session.</td></tr>
 <tr><td></td><td><code>:context [arg]</code> <code>:ctx [arg]</code></td><td>Set active task context</td><td>Sets or clears the active task context for new launches.</td></tr>
 <tr><td></td><td><code>:rate [arg]</code> <code>:r [arg]</code></td><td>Rate selected session</td><td>Rates the selected session 1-10: <code>:rate &lt;n&gt;</code>, or opens the rating overlay (digits 1-9, 0 = 10).</td></tr>
@@ -263,8 +266,7 @@
 <tr><td><code>Ctrl-M</code></td><td></td><td>Model dropdown</td><td>Opens or closes the model dropdown for the next launch (plain <code>M</code> stays free for text surfaces).</td></tr>
 <tr><td><code>&lt;Space&gt;r</code></td><td></td><td>Toggle auto-rotation</td><td>Disables or re-enables automatic context rotation for the selected session.</td></tr>
 <tr><td><code>&lt;Space&gt;k</code></td><td></td><td>Cancel pending retry</td><td>Cancels the selected session's pending automatic retry.</td></tr>
-<tr><td><code>&lt;Space&gt;x</code></td><td></td><td>Run docregblock tags</td><td>Launches a session for every docregblock tag in the selected session's output.</td></tr>
-<tr><td><code>&lt;Space&gt;X</code></td><td></td><td>Commit and push</td><td>Continues the selected session with <code>/ci_commit</code> to commit and push its work.</td></tr>
+<tr><td><code>&lt;Space&gt;x</code></td><td></td><td>Commit and push</td><td>Continues the selected session with <code>/ci_commit</code> to commit and push its work.</td></tr>
 </tbody>
 </table>
 <h3>Window</h3>
@@ -325,7 +327,7 @@
 <tr><td>11</td><td>Diamond</td></tr>
 <tr><td>12</td><td>Ruby</td></tr>
 <tr><td>13</td><td>Saphire</td></tr>
-<tr><td>14</td><td>D. is for Devil</td></tr>
+<tr><td>14</td><td>D. is for Daemon</td></tr>
 </tbody>
 </table>
 </div>
@@ -358,9 +360,13 @@
 <tr><td>Settings: <code>l</code> <code>Right</code></td><td></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items.</td></tr>
 <tr><td>Settings: <code>Space</code></td><td></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, or activates the selected settings row.</td></tr>
 <tr><td>Settings: <code>a</code></td><td></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
-<tr><td>Settings: <code>d</code></td><td></td><td>Delete item</td><td>Deletes the selected item from a settings list.</td></tr>
+<tr><td>Settings: <code>d</code></td><td></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td>Settings: <code>e</code></td><td></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
 <tr><td>Settings: <code>R</code></td><td></td><td>Refresh daemon-backed state</td><td>Re-reads daemon-backed settings state (config, hooks, skills, storage).</td></tr>
+<tr><td>Settings: <code>s</code></td><td></td><td>Set provider key</td><td>Opens the masked Set form for the selected provider key slot.</td></tr>
+<tr><td>Settings: <code>r</code></td><td></td><td>Rotate provider key</td><td>Opens the masked Rotate form for the selected provider key slot.</td></tr>
+<tr><td>Settings: <code>c</code></td><td></td><td>Check provider key</td><td>Checks the selected provider key slot with its provider.</td></tr>
+<tr><td>Settings: <code>i</code></td><td></td><td>Import provider keys</td><td>Imports available provider keys from the process environment into vault slots.</td></tr>
 <tr><td>Settings: <code>/</code></td><td></td><td>Search settings</td><td>Opens an incremental settings query; Enter jumps to the first match at or after the cursor.</td></tr>
 <tr><td>Settings: <code>n</code></td><td></td><td>Next settings match</td><td>Jumps to the next settings row matching the active query, wrapping with a notice.</td></tr>
 <tr><td>Settings: <code>N</code></td><td></td><td>Previous settings match</td><td>Jumps to the previous settings row matching the active query, wrapping with a notice.</td></tr>
@@ -382,14 +388,16 @@
 </tbody>
 </table>
 <h4>Screen</h4>
-<p>Text-area background and animation styles.</p>
+<p>Text-area background, animation styles and detail column placement.</p>
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
 <tr><td>Text area background</td><td>Paints the configured background color behind text-entry surfaces.</td><td>toggle</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Background color</td><td>Sets the hex color used when the text area background is on.</td><td>edit</td><td>TUI (state.json)</td><td>immediately</td></tr>
-<tr><td>Formulation animation</td><td>Sets how long the in-progress message grow animation runs.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Formulation animation</td><td>Reveals each new live message with a top-to-bottom wipe. Off by default.</td><td>toggle</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Formulation speed</td><td>Sets how long the formulation reveal runs when the animation is on.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Activity indicator</td><td>Chooses the working-indicator style: Semantic, Rainbow Classic or Rainbow Compact.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Detail column</td><td>Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 </tbody>
 </table>
 <h3>WORKSPACE — What do I see in the list and a new transcript?</h3>
@@ -401,6 +409,8 @@
 <tr><td>Navigator preset</td><td>Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Navigator optional columns</td><td>Turns individual optional navigator columns on or off. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. Required columns cannot be hidden.</td><td>list</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Card fields</td><td>Chooses which facts render on session-list cards. Card fields: Context bar, Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date.</td><td>list</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Automatic session archive</td><td>Archives delivered or issue-filed terminal sessions after an idle window.</td><td>toggle</td><td>daemon field <code>session_retention_enabled</code></td><td>immediately</td></tr>
+<tr><td>Archive idle hours</td><td>Idle hours before an eligible terminal session is archived.</td><td>choice</td><td>daemon field <code>session_retention_window_hours</code></td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>Transcript Defaults</h4>
@@ -481,6 +491,14 @@
 <tr><td>Stop-all and cancel</td><td>Destructive actions from the stats view: emergency stop-all and cancel a live invocation. <strong>Destructive.</strong></td><td>action</td><td>daemon (model control)</td><td>immediately</td></tr>
 </tbody>
 </table>
+<h4>Provider Keys</h4>
+<p>Manage provider credentials stored in the key vault.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>Provider credential slots</td><td>Twenty-three masked vault slots; s sets, r rotates, c checks, d clears after confirmation, and i imports from environment.</td><td>list</td><td>daemon (key vault)</td><td>immediately</td></tr>
+</tbody>
+</table>
 <h3>AGENT AUTOMATION — What does the daemon do on its own when agents fail?</h3>
 <h4>Retries &amp; Recovery</h4>
 <p>What the daemon does when a session fails.</p>
@@ -493,6 +511,9 @@
 <tr><td>Retry on stall</td><td>Runs the stall-retry handler that relaunches stalled sessions.</td><td>toggle</td><td>daemon field <code>retry_on_stall</code></td><td>after daemon restart</td></tr>
 <tr><td>Reconciliation loop</td><td>Runs the background loop that reconciles session liveness and consistency.</td><td>toggle</td><td>daemon field <code>reconciliation_enabled</code></td><td>after daemon restart</td></tr>
 <tr><td>Context rotation</td><td>Rotates a session into a fresh context near its limit, carrying a handoff forward.</td><td>toggle</td><td>daemon field <code>context_rotation_enabled</code></td><td>new launches now · resumed sessions after restart</td></tr>
+<tr><td>Context rotation threshold (global)</td><td>Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_global_pct</code></td><td>immediately</td></tr>
+<tr><td>Context rotation threshold (Claude Code)</td><td>Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_claude_pct</code></td><td>immediately</td></tr>
+<tr><td>Context rotation threshold (Codex)</td><td>Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_codex_pct</code></td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>Stall Detection</h4>
@@ -514,7 +535,7 @@
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
-<tr><td>Memory system</td><td>Enables the daemon memory subsystem (observation extraction and search).</td><td>toggle</td><td>daemon field <code>memory_enabled</code></td><td>after daemon restart</td></tr>
+<tr><td>Memory system</td><td>OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync.</td><td>toggle</td><td>daemon field <code>memory_enabled</code></td><td>after daemon restart</td></tr>
 <tr><td>Dream consolidation</td><td>Enables periodic memory consolidation (dreaming).</td><td>toggle</td><td>daemon field <code>dream_enabled</code></td><td>immediately</td></tr>
 <tr><td>Observation threshold</td><td>Number of new observations that triggers a consolidation cycle.</td><td>edit</td><td>daemon field <code>dream_observation_threshold</code></td><td>after daemon restart</td></tr>
 <tr><td>Dream cooldown</td><td>Minimum seconds between consolidation cycles.</td><td>edit</td><td>daemon field <code>dream_cooldown_secs</code></td><td>after daemon restart</td></tr>
@@ -538,6 +559,16 @@
 <tr><td>Graph overlay: info dashboard</td><td>Shows the info dashboard panel in the graph overlay (:dag).</td><td>toggle</td><td>daemon field <code>gv_info_dashboard</code></td><td>immediately</td></tr>
 <tr><td>Durable topology executor</td><td>Kill switch for the durable topology executor (#634); off, no durable execution advances or recovers and live topology runs use the legacy in-memory runner.</td><td>toggle</td><td>daemon field <code>topology_executor_enabled</code></td><td>immediately</td></tr>
 <tr><td>Topology build nodes</td><td>Most topology build nodes the durable executor runs at once (1-16; the page cycles 1-4).</td><td>choice</td><td>daemon field <code>topology_max_concurrent_build_nodes</code></td><td>immediately</td></tr>
+<tr><td>Topology bulk fan-out on OpenRouter (0 off)</td><td>Minimum leaf count for OpenRouter topology bulk fan-out; 0 disables it.</td><td>choice</td><td>daemon field <code>topology_bulk_fanout_min_openrouter</code></td><td>immediately</td></tr>
+<tr><td>Completed transcript cache (bytes)</td><td>Daemon RAM limit for completed transcript reads; 0 disables retention.</td><td>choice</td><td>daemon field <code>completed_transcript_cache_max_bytes</code></td><td>immediately</td></tr>
+<tr><td>rsid MemoryHigh (MiB)</td><td>Systemd memory pressure threshold for the rsid daemon scope; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>rsid_scope_memory_high_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>rsid MemoryMax (MiB)</td><td>Hard systemd memory ceiling for the rsid daemon scope; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>rsid_scope_memory_max_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>rsid MemorySwapMax (MiB)</td><td>Swap ceiling for the rsid daemon systemd scope; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>rsid_scope_memory_swap_max_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>rsid CPUWeight</td><td>Relative CPU weight of the rsid daemon systemd scope; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>rsid_scope_cpu_weight</code></td><td>after daemon restart</td></tr>
+<tr><td>Worker slice MemoryHigh (MiB)</td><td>Aggregate worker MemoryHigh, initially 55% of host RAM; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_high_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>Worker slice MemoryMax (MiB)</td><td>Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_max_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>Worker slice MemorySwapMax (MiB)</td><td>Aggregate worker swap ceiling; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_swap_max_mib</code></td><td>after daemon restart</td></tr>
+<tr><td>Worker slice CPUWeight</td><td>Relative CPU weight of the aggregate worker slice; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_cpu_weight</code></td><td>after daemon restart</td></tr>
 </tbody>
 </table>
 <h4>Code Intelligence</h4>
@@ -556,6 +587,10 @@
 <tbody>
 <tr><td>Codex sandbox</td><td>Sandbox policy for new Codex processes: read-only, workspace-write or danger-full-access.</td><td>choice</td><td>daemon field <code>codex_sandbox_mode</code></td><td>next spawn</td></tr>
 <tr><td>Claude project config isolation</td><td>Isolation of Claude project config for new Claude processes: off, settings or strict.</td><td>choice</td><td>daemon field <code>claude_config_isolation</code></td><td>next spawn</td></tr>
+<tr><td>Vault: legacy env fallback</td><td>Allow provider keys from legacy environment variables when no vault credential exists.</td><td>toggle</td><td>daemon field <code>vault.env_compat</code></td><td>immediately</td></tr>
+<tr><td>Vault: check TTL</td><td>Cache provider key check results for this many seconds.</td><td>choice</td><td>daemon field <code>vault.check_ttl_secs</code></td><td>immediately</td></tr>
+<tr><td>OpenRouter engine</td><td>Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route &lt;model&gt; [codex_cli|harness|default].</td><td>choice</td><td>daemon field <code>api_route.openrouter</code></td><td>next spawn</td></tr>
+<tr><td>API route fallback</td><td>Allow a failed Harness preflight to launch OpenRouter through Codex CLI.</td><td>toggle</td><td>daemon field <code>api_route.fallback</code></td><td>next spawn</td></tr>
 </tbody>
 </table>
 <h4>Sandbox Storage</h4>
@@ -570,6 +605,11 @@
 <tr><td>Cache pressure high</td><td>Disk-use percent that arms reclaim pressure.</td><td>edit</td><td>daemon field <code>sandbox_build_cache_reclaim_high_watermark_pct</code></td><td>immediately</td></tr>
 <tr><td>Cache pressure low</td><td>Disk-use percent that clears reclaim pressure.</td><td>edit</td><td>daemon field <code>sandbox_build_cache_reclaim_low_watermark_pct</code></td><td>immediately</td></tr>
 <tr><td>Cache reclaim pass limit</td><td>Maximum caches deleted in one reclaim pass.</td><td>edit</td><td>daemon field <code>sandbox_build_cache_reclaim_max_candidates</code></td><td>immediately</td></tr>
+<tr><td>Agent build jobs</td><td>Cargo jobs per build in a sandboxed session.</td><td>edit</td><td>daemon field <code>agent_build_jobs</code></td><td>next spawn</td></tr>
+<tr><td>Agent line tables</td><td>Use line-tables-only debuginfo for sandbox builds.</td><td>toggle</td><td>daemon field <code>agent_build_line_tables_only</code></td><td>next spawn</td></tr>
+<tr><td>Worker sccache</td><td>Use sccache and disable incremental builds for fresh workers.</td><td>toggle</td><td>daemon field <code>agent_build_sccache_enabled</code></td><td>next spawn</td></tr>
+<tr><td>sccache cap (GiB)</td><td>Machine local sccache disk cap for new worker processes.</td><td>edit</td><td>daemon field <code>agent_build_sccache_cache_gib</code></td><td>next spawn</td></tr>
+<tr><td>Machine build slots</td><td>Maximum concurrent compiler processes across agent sandboxes.</td><td>edit</td><td>daemon field <code>agent_build_slots</code></td><td>next spawn</td></tr>
 <tr><td>Preview cache reclaim</td><td>Runs a dry-run reclaim pass and reports what it would free.</td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Reclaim sandbox caches now</td><td>Runs a real reclaim pass now and reports the result. <strong>Destructive.</strong></td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Source-worktree settlement</td><td>Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. <strong>Destructive.</strong></td><td>action</td><td>daemon (source-worktree settlement)</td><td>immediately</td></tr>
@@ -628,8 +668,10 @@
 <tr><td><code>:manager decisions</code></td><td></td><td>Open manager decisions</td><td>Opens the harness manager decisions queue awaiting the operator.</td></tr>
 <tr><td><code>:manager inbox</code></td><td></td><td>Open manager inbox</td><td>Opens the harness manager inbox of lead requests and replies.</td></tr>
 <tr><td><code>:manager inspect</code></td><td></td><td>Open manager inspect</td><td>Opens the harness manager inspect view (workers, work, requests, topology and events).</td></tr>
-<tr><td><code>:kill</code></td><td><code>:ki</code></td><td>Interrupt running session</td><td>Interrupts the selected running session.</td></tr>
-<tr><td><code>:continue [arg]</code></td><td><code>:cont [arg]</code></td><td>Continue selected session</td><td>Continues the selected session: opens a continue prompt, or <code>:continue &lt;text&gt;</code> sends the text directly.</td></tr>
+<tr><td><code>:kill</code></td><td><code>:ki</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
+<tr><td><code>:pause soft</code></td><td></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
+<tr><td><code>:pause clear</code></td><td></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker.</td></tr>
+<tr><td><code>:continue [arg]</code></td><td><code>:cont [arg]</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>:archive</code></td><td><code>:arc</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
 <tr><td><code>:delete</code></td><td><code>:del</code></td><td>Delete selected session</td><td>Deletes the selected session after the double-tap <code>DD</code> (moves it to the trash).</td></tr>
 <tr><td><code>:rotate</code></td><td><code>:rot</code></td><td>Rotate session context</td><td>Rotates the selected session into a fresh context, carrying a handoff forward.</td></tr>
@@ -646,7 +688,7 @@
 <tr><td><code>:project-edit [arg]</code></td><td></td><td>Edit project</td><td>Edits the named or current project.</td></tr>
 <tr><td><code>:project-delete &lt;arg&gt;</code></td><td></td><td>Delete project</td><td>Deletes the named project; the name argument is required.</td></tr>
 <tr><td><code>:set</code></td><td><code>:settings</code></td><td>Open settings</td><td>Opens the settings pane.</td></tr>
-<tr><td><code>:stopall</code></td><td><code>:stop-all</code></td><td>Emergency stop all</td><td>Emergency stop: denies new paid work and cancels live model invocations.</td></tr>
+<tr><td><code>:stopall</code></td><td><code>:stop-all</code></td><td>Emergency stop all</td><td>Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD.</td></tr>
 <tr><td><code>:hooks</code></td><td></td><td>Open hook settings</td><td>Opens settings at the Claude hooks list.</td></tr>
 <tr><td><code>:skills</code></td><td></td><td>Open skill settings</td><td>Opens settings at the Claude skills list.</td></tr>
 <tr><td><code>:group</code></td><td><code>:groups</code></td><td>Choose group label</td><td>Opens the group label picker for the selected session.</td></tr>
@@ -702,9 +744,11 @@
 <tr><td><code>&lt;Space&gt;gb</code></td><td>Open manager board</td><td>Opens the harness manager work board.</td></tr>
 <tr><td><code>&lt;Space&gt;gd</code></td><td>Open manager decisions</td><td>Opens the harness manager decisions queue awaiting the operator.</td></tr>
 <tr><td><code>yy</code></td><td>Copy Session UUID</td><td>Copies the selected session's UUID; in a transcript <code>yy</code> copies the selected event's content instead.</td></tr>
-<tr><td><code>x</code></td><td>Interrupt running session</td><td>Interrupts the selected running session.</td></tr>
-<tr><td><code>X</code></td><td>Continue selected session</td><td>Continues the selected session: opens a continue prompt, or <code>:continue &lt;text&gt;</code> sends the text directly.</td></tr>
-<tr><td><code>&lt;Space&gt;c</code></td><td>Continue selected session</td><td>Continues the selected session: opens a continue prompt, or <code>:continue &lt;text&gt;</code> sends the text directly.</td></tr>
+<tr><td><code>x</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
+<tr><td><code>X</code></td><td>Hard interrupt running session</td><td>Immediately interrupts the selected session and marks it HARD; only the operator may clear it.</td></tr>
+<tr><td><code>&lt;Space&gt;hs</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
+<tr><td><code>&lt;Space&gt;hc</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker.</td></tr>
+<tr><td><code>&lt;Space&gt;c</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>P</code></td><td>Pin or unpin selected session</td><td>Pins or unpins the selected session at the top of the list.</td></tr>
 <tr><td><code>&lt;Space&gt;a</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
 <tr><td><code>U</code></td><td>Unarchive selected session</td><td>Restores the selected archived session to the Main zone.</td></tr>
@@ -719,9 +763,10 @@
 <tr><td><code>ZZ</code></td><td>Quit</td><td>Quits rsi (the daemon and its sessions keep running).</td></tr>
 <tr><td><code>&lt;Space&gt;p</code></td><td>Choose project</td><td>Opens the project picker.</td></tr>
 <tr><td><code>&lt;Space&gt;o</code></td><td>Launch task session</td><td>Opens the TaskRabbit one-shot prompt; <code>:task &lt;text&gt;</code> launches it directly.</td></tr>
-<tr><td><code>&lt;Space&gt;m</code></td><td>Launch blank session</td><td>Opens the blank general-purpose session prompt; <code>:blank &lt;text&gt;</code> launches it directly.</td></tr>
+<tr><td><code>Ctrl-N</code></td><td>Launch blank session</td><td>Opens the blank general-purpose session prompt; <code>:blank &lt;text&gt;</code> launches it directly.</td></tr>
+<tr><td><code>&lt;Space&gt;N</code></td><td>Launch blank session</td><td>Opens the blank general-purpose session prompt; <code>:blank &lt;text&gt;</code> launches it directly.</td></tr>
 <tr><td><code>&lt;Space&gt;,</code></td><td>Open settings</td><td>Opens the settings pane.</td></tr>
-<tr><td><code>&lt;Space&gt;S</code></td><td>Emergency stop all</td><td>Emergency stop: denies new paid work and cancels live model invocations.</td></tr>
+<tr><td><code>&lt;Space&gt;X</code></td><td>Emergency stop all</td><td>Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD.</td></tr>
 <tr><td><code>&lt;Space&gt;v</code></td><td>Open graph review</td><td>Opens the visual workflow graph review editor.</td></tr>
 <tr><td><code>gL</code></td><td>Set Epic lead</td><td>Sets the focused leaf session as the lead of its parent Epic.</td></tr>
 <tr><td><code>&lt;Space&gt;q</code></td><td>Close pane</td><td>Closes the focused pane.</td></tr>
@@ -771,8 +816,7 @@
 <tr><td><code>&lt;Space&gt;C</code></td><td>Change session project</td><td>Moves the selected session to another project.</td></tr>
 <tr><td><code>&lt;Space&gt;r</code></td><td>Toggle auto-rotation</td><td>Disables or re-enables automatic context rotation for the selected session.</td></tr>
 <tr><td><code>&lt;Space&gt;k</code></td><td>Cancel pending retry</td><td>Cancels the selected session's pending automatic retry.</td></tr>
-<tr><td><code>&lt;Space&gt;x</code></td><td>Run docregblock tags</td><td>Launches a session for every docregblock tag in the selected session's output.</td></tr>
-<tr><td><code>&lt;Space&gt;X</code></td><td>Commit and push</td><td>Continues the selected session with <code>/ci_commit</code> to commit and push its work.</td></tr>
+<tr><td><code>&lt;Space&gt;x</code></td><td>Commit and push</td><td>Continues the selected session with <code>/ci_commit</code> to commit and push its work.</td></tr>
 <tr><td><code>&lt;Space&gt;T</code></td><td>Open in new tab</td><td>Opens the selected session in a new tab.</td></tr>
 <tr><td><code>&lt;Space&gt;gg</code></td><td>Git panel (lazygit)</td><td>Suspends the TUI and runs lazygit in the session's working directory.</td></tr>
 <tr><td><code>&lt;Space&gt;e</code></td><td>File explorer</td><td>Toggles the left-anchored file explorer drawer.</td></tr>
@@ -812,6 +856,7 @@
 <tr><td><code>gf</code></td><td>prefix</td><td>prefix of gf1..gf9 (Vim's gf would open a file path)</td></tr>
 <tr><td><code>&lt;Space&gt;gr</code></td><td>no-op</td><td>retired; the label picker is <code>:group</code></td></tr>
 <tr><td><code>&lt;Space&gt;R</code></td><td>no-op</td><td>retired; the rating overlay is <code>:rate</code></td></tr>
+<tr><td><code>&lt;Space&gt;S</code></td><td>no-op</td><td>retired emergency-stop chord; use &lt;Space&gt;X</td></tr>
 <tr><td><code>gm</code></td><td>no-op</td><td>retired merge-queue chord</td></tr>
 <tr><td><code>g?</code></td><td>no-op</td><td>retired; the dialectic overlay is <code>:ask</code></td></tr>
 <tr><td><code>gX</code></td><td>no-op</td><td>retired modal launcher; the command moved under &lt;Space&gt;g</td></tr>
@@ -847,9 +892,13 @@
 <tr><td><code>Right</code></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items.</td></tr>
 <tr><td><code>Space</code></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, or activates the selected settings row.</td></tr>
 <tr><td><code>a</code></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
-<tr><td><code>d</code></td><td>Delete item</td><td>Deletes the selected item from a settings list.</td></tr>
+<tr><td><code>d</code></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td><code>e</code></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
 <tr><td><code>R</code></td><td>Refresh daemon-backed state</td><td>Re-reads daemon-backed settings state (config, hooks, skills, storage).</td></tr>
+<tr><td><code>s</code></td><td>Set provider key</td><td>Opens the masked Set form for the selected provider key slot.</td></tr>
+<tr><td><code>r</code></td><td>Rotate provider key</td><td>Opens the masked Rotate form for the selected provider key slot.</td></tr>
+<tr><td><code>c</code></td><td>Check provider key</td><td>Checks the selected provider key slot with its provider.</td></tr>
+<tr><td><code>i</code></td><td>Import provider keys</td><td>Imports available provider keys from the process environment into vault slots.</td></tr>
 <tr><td><code>/</code></td><td>Search settings</td><td>Opens an incremental settings query; Enter jumps to the first match at or after the cursor.</td></tr>
 <tr><td><code>n</code></td><td>Next settings match</td><td>Jumps to the next settings row matching the active query, wrapping with a notice.</td></tr>
 <tr><td><code>N</code></td><td>Previous settings match</td><td>Jumps to the previous settings row matching the active query, wrapping with a notice.</td></tr>
@@ -991,6 +1040,8 @@
 <tr><td><code>Ctrl-0</code></td><td>launch prompt or input modal open</td><td>reset the overlay's size and position</td></tr>
 <tr><td><code>Ctrl-Shift-Right</code></td><td>normal mode, no overlay</td><td>widen the session-list sidebar</td></tr>
 <tr><td><code>Ctrl-Shift-Left</code></td><td>normal mode, no overlay</td><td>narrow the session-list sidebar</td></tr>
+<tr><td><code>Ctrl-Left</code></td><td>session detail focused (normal mode, no overlay, not inserting)</td><td>move the transcript column left (snaps to Left Aligned at the edge)</td></tr>
+<tr><td><code>Ctrl-Right</code></td><td>session detail focused (normal mode, no overlay, not inserting)</td><td>move the transcript column right (unsnaps Left Aligned)</td></tr>
 <tr><td><code>Ctrl-Left</code></td><td>normal mode, no overlay, not inserting</td><td>focus the pane to the left (zones: gs / gt / gj / ga)</td></tr>
 <tr><td><code>Ctrl-Right</code></td><td>normal mode, no overlay, not inserting</td><td>focus the pane to the right (zones: gs / gt / gj / ga)</td></tr>
 <tr><td><code>Shift-Down</code></td><td>normal mode, no overlay, not inserting</td><td>select the next transcript event</td></tr>
@@ -1074,7 +1125,7 @@
 <tr><td><code>Enter</code></td><td>Apply sort order</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close without changing</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1091,7 +1142,7 @@
 <tr><td><code>Enter</code></td><td>Open source session</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1107,7 +1158,7 @@
 <tr><td><code>i</code></td><td>Return to input bar in insert mode</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1123,7 +1174,7 @@
 <tr><td><code>D</code></td><td>Purge session permanently</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1191,7 +1242,7 @@
 <tr><td><code>G</code></td><td>Edit labels</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1206,7 +1257,7 @@
 <tr><td><code>Enter</code></td><td>Save rating</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1330,7 +1381,7 @@
 <tr><td><code>Enter</code></td><td>Open file in viewer</td></tr>
 <tr><td><code>Esc</code></td><td>Close telescope</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1346,7 +1397,7 @@
 <tr><td><code>Enter</code></td><td>Open selected session</td></tr>
 <tr><td><code>p / Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1431,7 +1482,7 @@
 <tr><td><code>Ctrl-D</code></td><td>Delete highlighted project</td></tr>
 <tr><td><code>Esc</code></td><td>Close picker</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1450,7 +1501,7 @@
 <tr><td><code>Ctrl-D</code></td><td>Delete highlighted label</td></tr>
 <tr><td><code>Esc</code></td><td>Close picker</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1466,7 +1517,7 @@
 <tr><td><code>Enter</code></td><td>Set parent</td></tr>
 <tr><td><code>Esc</code></td><td>Close picker</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1513,7 +1564,7 @@
 <tr><td><code>Esc</code></td><td>Cancel fact edit (editing)</td></tr>
 <tr><td><code>Esc / q</code></td><td>Save and close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1641,7 +1692,7 @@
 <tr><td><code>r</code></td><td>Refresh receipt</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1680,7 +1731,7 @@
 <tr><td><code>c</code></td><td>Camera follows selection</td></tr>
 <tr><td><code>q</code></td><td>Close graph review</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1696,7 +1747,7 @@
 <tr><td><code>c</code></td><td>Camera follows selection</td></tr>
 <tr><td><code>q</code></td><td>Close graph review</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1721,7 +1772,7 @@
 <tr><td><code>Esc</code></td><td>Back out of detail</td></tr>
 <tr><td><code>q</code></td><td>Close graph review</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1770,7 +1821,7 @@
 <tr><td><code>!</code></td><td>Reveal control details</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close inspector, then browser</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1782,7 +1833,7 @@
 <tbody>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1823,7 +1874,7 @@
 <tr><td><code>Enter</code></td><td>Apply theme</td></tr>
 <tr><td><code>Esc / q</code></td><td>Revert preview and close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1840,7 +1891,7 @@
 <tr><td><code>Delete</code></td><td>Reset field to default</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1855,7 +1906,7 @@
 <tr><td><code>Delete</code></td><td>Clear override</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1872,6 +1923,17 @@
 <tr><td><code>i / a / o</code></td><td>Enter insert mode (normal mode)</td></tr>
 <tr><td><code>Esc</code></td><td>Return to normal mode (insert mode)</td></tr>
 <tr><td><code>h j k l, w b</code></td><td>Move cursor (normal mode)</td></tr>
+</tbody>
+</table>
+</div>
+<h4>Provider Key Form</h4>
+<div class="region" id="overlay-provider-key-form">
+<table>
+<thead><tr><th>Keys</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Type / Backspace</code></td><td>Edit masked credential</td></tr>
+<tr><td><code>Enter</code></td><td>Save credential</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel and scrub</td></tr>
 </tbody>
 </table>
 </div>
@@ -1910,7 +1972,7 @@
 <tr><td><code>r</code></td><td>Reload settings from disk</td></tr>
 <tr><td><code>c / Esc</code></td><td>Cancel save</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>
@@ -1938,7 +2000,7 @@
 <tr><td><code>g / Home, G / End</code></td><td>Jump to top / bottom</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
-<tr><td><code>Space m</code></td><td>Close and open a blank session prompt</td></tr>
+<tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
 </tbody>
 </table>

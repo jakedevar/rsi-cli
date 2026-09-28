@@ -123,6 +123,7 @@ impl World {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_concurrent_occurrences_are_actionable_in_both_orders_and_id_types() {
     for ids in [
@@ -176,6 +177,7 @@ async fn appserver_approval_concurrent_occurrences_are_actionable_in_both_orders
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_closure_before_answer_invalidates_exact_gate_without_fabricating_acceptance()
  {
@@ -221,6 +223,7 @@ async fn appserver_approval_closure_before_answer_invalidates_exact_gate_without
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_closure_while_answer_queued_prevents_effect_and_preserves_other_gate() {
     let mut w = World::new().await;
@@ -254,6 +257,7 @@ async fn appserver_approval_closure_while_answer_queued_prevents_effect_and_pres
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_resolved_after_uncertain_enqueue_keeps_uncertainty_across_reopen() {
     let mut w = World::new().await;
@@ -301,6 +305,7 @@ async fn appserver_approval_resolved_after_uncertain_enqueue_keeps_uncertainty_a
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_ordered_close_then_same_id_new_occurrence_retains_ambiguous_late_closure()
  {
@@ -339,6 +344,7 @@ async fn appserver_approval_ordered_close_then_same_id_new_occurrence_retains_am
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_closure_failure_retains_witness_and_retries_only_persistence() {
     let mut w = World::new().await;
@@ -373,6 +379,7 @@ async fn appserver_approval_closure_failure_retains_witness_and_retries_only_per
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_concurrent_reopen_preserves_each_identity_as_unavailable_without_writer()
  {
@@ -546,6 +553,7 @@ impl World {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_new_writer_same_id_fences_old_lease_and_old_operator_answer() {
     let mut w = World::new().await;
@@ -599,6 +607,7 @@ async fn appserver_approval_new_writer_same_id_fences_old_lease_and_old_operator
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_failed_closure_persistence_reopen_retains_exact_uncertainty() {
     let mut w = World::new().await;
@@ -637,6 +646,7 @@ async fn appserver_approval_failed_closure_persistence_reopen_retains_exact_unce
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_wrong_thread_and_duplicate_resolution_leave_other_requests_actionable()
 {
@@ -678,6 +688,7 @@ async fn appserver_approval_wrong_thread_and_duplicate_resolution_leave_other_re
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn appserver_approval_active_limit_retains_all_gates_and_explicit_overflow_before_checked_stop()
  {
@@ -751,6 +762,7 @@ async fn appserver_approval_active_limit_retains_all_gates_and_explicit_overflow
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[test]
 fn appserver_approval_resolution_queue_overflow_is_loss_sensitive_and_preserves_prior_frame() {
     let (events, mut rx) = mpsc::channel(1);

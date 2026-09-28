@@ -480,6 +480,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_empty_rejected() {
         let (manager, _dir) = manager();
@@ -493,6 +494,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_replaces_full_set() {
         let (manager, _dir) = manager();
@@ -512,6 +514,7 @@ mod tests {
         assert_eq!(tags, vec!["gamma"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_normalizes_each_input() {
         let (manager, _dir) = manager();
@@ -527,6 +530,7 @@ mod tests {
         assert_eq!(tags, vec!["bar-baz", "foo"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_dedupes() {
         let (manager, _dir) = manager();
@@ -545,6 +549,7 @@ mod tests {
         assert_eq!(tags, vec!["foo"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_malformed_atomic_reject() {
         let (manager, _dir) = manager();
@@ -568,6 +573,7 @@ mod tests {
         assert_eq!(tags, vec!["good"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_session_tags_syncs_legacy_tag_column() {
         let (manager, _dir) = manager();
@@ -583,6 +589,7 @@ mod tests {
         assert_eq!(legacy, "apple"); // "apple" < "zebra" alphabetically
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_add_session_tag_idempotent() {
         let (manager, _dir) = manager();
@@ -602,6 +609,7 @@ mod tests {
         assert_eq!(tags, vec!["foo"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_remove_session_tag_idempotent_when_absent() {
         let (manager, _dir) = manager();
@@ -618,6 +626,7 @@ mod tests {
         assert!(tags.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_remove_session_tag_recomputes_legacy_column() {
         let (manager, _dir) = manager();
@@ -638,6 +647,7 @@ mod tests {
         assert_eq!(legacy, "zebra");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_remove_last_session_tag_clears_legacy_column() {
         let (manager, _dir) = manager();
@@ -657,6 +667,7 @@ mod tests {
         assert_eq!(legacy, "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_list_tags_orders_by_count_desc() {
         let (manager, _dir) = manager();
@@ -695,6 +706,7 @@ mod tests {
         assert_eq!(tags[2].count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_list_tags_filters_by_prefix() {
         let (manager, _dir) = manager();
@@ -719,6 +731,7 @@ mod tests {
         assert_eq!(tags.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_list_tags_filters_by_project() {
         let (manager, _dir) = manager();

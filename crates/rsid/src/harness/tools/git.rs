@@ -114,6 +114,7 @@ impl HarnessTool for GitTool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_git_status_in_repo() {
         // Run git status in the workspace root (which is a git repo)
@@ -136,6 +137,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_git_invalid_command() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -155,6 +157,7 @@ mod tests {
         assert!(result.error_msg.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn test_git_defaults_to_status() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

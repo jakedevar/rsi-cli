@@ -807,10 +807,16 @@ impl RecursiveDagLiveSessionLauncher for RecursiveDagLiveSessionManagerBinding {
         _envelope: RecursiveDagLiveLaunchEnvelope,
         config: LaunchConfig,
     ) -> Result<RecursiveDagLiveLaunchedSession> {
-        let session_id = self
-            .manager
-            .launch_session_with_durable_store_row(config)
-            .await?;
+        // Launch on a separate task so the deep session/model admission path
+        // does not share the RPC scheduler's polling stack. Tokio worker
+        // threads have the same small stack budget as the test thread.
+        let manager = Arc::clone(&self.manager);
+        let launch = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            manager.launch_session_with_durable_store_row(config).await
+        }));
+        let session_id = launch.await.map_err(|error| {
+            DaemonError::Process(format!("recursive live launch task failed: {error}"))
+        })??;
         Ok(RecursiveDagLiveLaunchedSession::new(session_id))
     }
 }
@@ -2759,6 +2765,7 @@ mod tests {
             .expect("validation count")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_executor_enabled_fake_launch_creates_correlation_and_attaches_session() {
         let fixture = live_fixture();
@@ -2922,6 +2929,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_dag_child_is_parented_to_owning_epic_group() {
         // P1-1 / TND#29 regression: a live recursive-DAG child must attach under the
@@ -2969,6 +2977,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_executor_launch_failure_marks_live_attempt_failed_with_reason() {
         let fixture = live_fixture();
@@ -3016,6 +3025,7 @@ mod tests {
         assert_eq!(launcher.model_call_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_executor_missing_persisted_session_fails_without_attach() {
         let fixture = live_fixture();
@@ -3084,6 +3094,7 @@ mod tests {
         assert_eq!(launcher.model_call_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_executor_duplicate_session_attach_is_recorded_without_second_link() {
         let fixture = live_fixture();
@@ -3195,6 +3206,7 @@ mod tests {
         assert_eq!(launcher.model_call_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_attached_attempt_calls_fake_interrupter_once() {
         let fixture = live_fixture();
@@ -3240,6 +3252,7 @@ mod tests {
         assert_eq!(interrupts[0].id, interrupt.id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_duplicate_request_is_idempotent_without_second_call() {
         let fixture = live_fixture();
@@ -3275,6 +3288,7 @@ mod tests {
         assert_eq!(interrupts.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_missing_cancellation_request_id_rejects_before_mutation_or_fake_call() {
         let fixture = live_fixture();
@@ -3310,6 +3324,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_missing_session_records_failure_without_fake_call() {
         let fixture = live_fixture();
@@ -3363,6 +3378,7 @@ mod tests {
         assert!(interrupter.calls().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_terminal_attempt_is_rejected_without_fake_call() {
         let fixture = live_fixture();
@@ -3417,6 +3433,7 @@ mod tests {
         assert_eq!(live.summary.status, RecursiveLiveAttemptStatus::Succeeded);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_failure_records_durable_failed_interrupt() {
         let fixture = live_fixture();
@@ -3462,6 +3479,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_duplicate_after_failed_interrupt_returns_existing_without_second_call()
     {
@@ -3501,6 +3519,7 @@ mod tests {
         assert_eq!(live.summary.status, RecursiveLiveAttemptStatus::Running);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_links_cancellation_request_id() {
         let fixture = live_fixture();
@@ -3558,6 +3577,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_interrupt_rejects_task_scoped_cancellation_without_fake_call() {
         let fixture = live_fixture();
@@ -3615,6 +3635,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn disabled_live_executor_rejects_interrupt_before_mutation_or_fake_call() {
         let fixture = live_fixture();
@@ -3645,6 +3666,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn live_executor_heartbeat_methods_wrap_store_without_launching() {
         let fixture = live_fixture();
@@ -3718,6 +3740,7 @@ mod tests {
         assert!(launcher.calls().is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn disabled_live_executor_rejects_heartbeat_before_mutation_or_fake_call() {
         let fixture = live_fixture();
@@ -3751,6 +3774,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn disabled_live_executor_rejects_before_mutation_or_launch() {
         let fixture = live_fixture();
@@ -3778,6 +3802,7 @@ mod tests {
         assert_eq!(launcher.model_call_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn session_manager_binding_builds_disabled_driver_and_rejects_before_mutation() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -3823,6 +3848,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_captures_final_json_and_commits_state() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -3894,6 +3920,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_does_not_rewrite_wrong_session_id() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -3956,6 +3983,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_restart_output_recovery_commits_recovery_pending_completed_session()
     {
@@ -4013,6 +4041,7 @@ mod tests {
         assert_eq!(attempt.status, RecursiveAttemptStatus::Succeeded);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_persists_malformed_output_as_failed_attempt() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -4060,6 +4089,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_counts_prior_interrupted_retry() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -4119,6 +4149,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_rejects_duplicate_commit_without_new_rows() {
         let (manager, _db_dir, _sandbox_base) = session_manager_for_live_binding();
@@ -4158,6 +4189,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_output_committer_reports_not_ready_for_missing_or_running_session()
     {
@@ -4311,6 +4343,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_driver_creates_live_run_and_attaches_fake_session() {
         let fixture = live_scheduler_fixture();
@@ -4421,6 +4454,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_driver_replays_existing_live_attempt_without_relaunch() {
         let fixture = live_scheduler_fixture();
@@ -4485,6 +4519,7 @@ mod tests {
         assert_eq!(store.load_sessions().expect("load sessions").len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn recursive_dag_live_scheduler_driver_launch_failure_is_durable() {
         let fixture = live_scheduler_fixture();
@@ -4562,6 +4597,7 @@ mod tests {
         assert!(store.load_sessions().expect("load sessions").is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn live_scheduler_driver_is_internal_and_not_session_manager_wired() {
         let source = include_str!("live.rs");
@@ -4582,6 +4618,7 @@ mod tests {
         assert!(!driver_source.contains("tokio::process"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn fake_scheduler_source_does_not_reference_live_executor() {
         let source = concat!(
@@ -4602,6 +4639,7 @@ mod tests {
         assert!(!source.contains("live::"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn production_launcher_contract_is_documented_and_enforced_without_launching_subprocesses() {
         let source = include_str!("live.rs");
@@ -4637,6 +4675,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn production_session_manager_binding_builds_only_disabled_live_components() {
         let source = include_str!("live.rs");
@@ -4670,6 +4709,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn production_interrupter_delegates_to_existing_session_interrupt_path() {
         let source = include_str!("live.rs");
@@ -4698,6 +4738,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn rpc_dispatch_does_not_expose_recursive_live_interrupt() {
         let source = include_str!("../rpc.rs");
@@ -4714,6 +4755,7 @@ mod tests {
         assert!(!source.contains("RecursiveLiveAttemptRecovery"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn fake_scheduler_remains_fake_only_and_does_not_create_live_attempts() {
         let (_dir, store) = test_store();

@@ -1,6 +1,6 @@
 //! Closed, versioned request-schema catalog for the agent-control surface.
 //!
-//! This module describes only the supported JSON request shape of the thirty
+//! This module describes only the supported JSON request shape of the thirty-six
 //! attributed `Agent*` RPC verbs. It is not an authorization registry and it
 //! does not replace DTO deserialization or runtime validation. In particular,
 //! topology, lead scope, UUID non-nilness, provider/model availability, Issue
@@ -49,6 +49,12 @@ pub enum AgentControlVerbV1 {
     ManagerCommitPreparedControl,
     ManagerGetAction,
     ManagerWorkView,
+    TopologyUpsert,
+    TopologyList,
+    TopologyExecute,
+    TopologyGetExecution,
+    TopologyInterrupt,
+    TopologyResolveAttempt,
 }
 
 /// Native tool whose advertised input is the same request schema as one
@@ -83,6 +89,12 @@ pub enum NativeAgentControlToolV1 {
     RsiControlManagerCommitPreparedControl,
     RsiControlManagerGetAction,
     RsiControlManagerWorkView,
+    RsiControlTopologyUpsert,
+    RsiControlTopologyList,
+    RsiControlTopologyExecute,
+    RsiControlTopologyGetExecution,
+    RsiControlTopologyInterrupt,
+    RsiControlTopologyResolveAttempt,
 }
 
 impl NativeAgentControlToolV1 {
@@ -119,6 +131,12 @@ impl NativeAgentControlToolV1 {
             }
             Self::RsiControlManagerGetAction => "rsi_control_manager_get_action",
             Self::RsiControlManagerWorkView => "rsi_control_manager_work_view",
+            Self::RsiControlTopologyUpsert => "rsi_control_topology_upsert",
+            Self::RsiControlTopologyList => "rsi_control_topology_list",
+            Self::RsiControlTopologyExecute => "rsi_control_topology_execute",
+            Self::RsiControlTopologyGetExecution => "rsi_control_topology_get_execution",
+            Self::RsiControlTopologyInterrupt => "rsi_control_topology_interrupt",
+            Self::RsiControlTopologyResolveAttempt => "rsi_control_topology_resolve_attempt",
         }
     }
 
@@ -156,6 +174,12 @@ impl NativeAgentControlToolV1 {
             }
             Self::RsiControlManagerGetAction => AgentControlVerbV1::ManagerGetAction,
             Self::RsiControlManagerWorkView => AgentControlVerbV1::ManagerWorkView,
+            Self::RsiControlTopologyUpsert => AgentControlVerbV1::TopologyUpsert,
+            Self::RsiControlTopologyList => AgentControlVerbV1::TopologyList,
+            Self::RsiControlTopologyExecute => AgentControlVerbV1::TopologyExecute,
+            Self::RsiControlTopologyGetExecution => AgentControlVerbV1::TopologyGetExecution,
+            Self::RsiControlTopologyInterrupt => AgentControlVerbV1::TopologyInterrupt,
+            Self::RsiControlTopologyResolveAttempt => AgentControlVerbV1::TopologyResolveAttempt,
         }
     }
 }
@@ -358,6 +382,34 @@ impl AgentControlVerbV1 {
                 crate::harness_manager::AgentManagerWorkViewRequestV1,
                 |r: &crate::harness_manager::AgentManagerWorkViewRequestV1| r.validate()
             ),
+            Self::TopologyUpsert => decode!(
+                crate::topology_agent::AgentTopologyUpsertRequestV1,
+                |r: &crate::topology_agent::AgentTopologyUpsertRequestV1| r.validate()
+            ),
+            Self::TopologyList => decode!(
+                crate::topology_agent::AgentTopologyListRequestV1,
+                |r: &crate::topology_agent::AgentTopologyListRequestV1| r
+                    .validated_limit()
+                    .map(drop)
+            ),
+            Self::TopologyExecute => decode!(
+                crate::topology_agent::AgentTopologyExecuteRequestV1,
+                |r: &crate::topology_agent::AgentTopologyExecuteRequestV1| r.validate()
+            ),
+            Self::TopologyGetExecution => decode!(
+                crate::topology_agent::AgentTopologyGetExecutionRequestV1,
+                |r: &crate::topology_agent::AgentTopologyGetExecutionRequestV1| r
+                    .validated_limit()
+                    .map(drop)
+            ),
+            Self::TopologyInterrupt => decode!(
+                crate::topology_agent::AgentTopologyInterruptRequestV1,
+                |r: &crate::topology_agent::AgentTopologyInterruptRequestV1| r.validate()
+            ),
+            Self::TopologyResolveAttempt => decode!(
+                crate::rpc::ResolveTopologyAttemptParams,
+                crate::topology_agent::validate_resolve_attempt
+            ),
         }
     }
 }
@@ -508,13 +560,20 @@ const ARCHIVE_CHILD_SCHEMA: &str = r#"{"type":"object","additionalProperties":fa
 
 const MANAGER_PROGRESS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"after_epic_id":{"type":["string","null"],"format":"uuid","description":"Continue after next_after_epic_id from the previous page."},"limit":{"type":["integer","null"],"minimum":1,"maximum":64,"default":32}}}"#;
 const MANAGER_INBOX_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"after_sequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32,"default":32},"request_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Optional recorded request to read within your live manager or feature-lead scope"}}}"#;
-const MANAGER_SEND_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["epic_id","message","idempotency_key"],"properties":{"epic_id":{"type":"string","format":"uuid","description":"An Epic in your operator-appointed manager scope; the daemon resolves its current lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Nonblank request, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
-const MANAGER_REPLY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["request_id","message","idempotency_key"],"properties":{"request_id":{"type":"string","format":"uuid","description":"Recorded request addressed to the Epic you currently lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Explicit reply with evidence or a blocker, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
+const MANAGER_SEND_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["epic_id","message","idempotency_key"],"properties":{"epic_id":{"type":"string","format":"uuid","description":"An Epic in your operator-appointed manager scope; the daemon resolves its current lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Nonblank request, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"},"informational":{"type":"boolean","default":false,"description":"Deliver auditable information without reserving a pending request slot or requiring a reply"}}}"#;
+const MANAGER_REPLY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["request_id","message","idempotency_key"],"properties":{"request_id":{"type":"string","format":"uuid","description":"Recorded request addressed to the Epic you currently lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Explicit reply with evidence or a blocker, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"},"still_running":{"type":"boolean","default":false,"description":"Keep the request active after this reply; omit or false to settle it"}}}"#;
 const MANAGER_NOTIFY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","idempotency_key"],"properties":{"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Nonblank informational notice to your current appointed manager, at most 8192 UTF-8 bytes, without NUL; not a request, approval or acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
 
 const MANAGER_WORK_VIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"work_key":{"type":["string","null"],"minLength":1,"maxLength":256,"default":null,"description":"Optional exact work key in your Epic"},"after_work_key":{"type":["string","null"],"minLength":1,"maxLength":256,"default":null,"description":"Continue after next_after_work_key from the previous page"},"limit":{"type":"integer","minimum":1,"maximum":32,"default":32}}}"#;
 
-static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 30]> = LazyLock::new(|| {
+const TOPOLOGY_UPSERT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["name","definition","scope","idempotency_key"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128,"description":"Topology name, unique per owner"},"definition":{"type":"object","required":["nodes","edges"],"properties":{"nodes":{"type":"array","items":{"type":"object"}},"edges":{"type":"array","items":{"type":"object"}},"until":{"type":["object","null"]}},"description":"TopologyDefinition: nodes (id, kind, label, prereqs, params incl. typed step, custody, explicit provider/model/effort), edges, until; the daemon validates it and returns diagnostics"},"scope":{"type":"string","enum":["epic","manager"],"description":"epic: owned by one Epic (leads may only use this); manager: owned by the current manager"},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Target Epic for a manager epic-scoped upsert; a lead's Epic is daemon-derived and, if given, must match"},"expected_revision":{"type":["integer","null"],"minimum":1,"default":null,"description":"CAS fence to revise an existing topology; omit to create"},"validate_only":{"type":"boolean","default":false,"description":"Report diagnostics without writing"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
+const TOPOLOGY_LIST_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"scope":{"type":["string","null"],"enum":["epic","manager",null],"default":null},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Narrow to one Epic in your scope"},"include_executions":{"type":"boolean","default":false},"cursor":{"type":["string","null"],"maxLength":128,"default":null,"description":"next_cursor from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":32,"default":null}}}"#;
+const TOPOLOGY_EXECUTE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["topology_id","expected_digest","epic_id","idempotency_key"],"properties":{"topology_id":{"type":"string","format":"uuid"},"expected_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$","description":"definition_digest returned by list or upsert"},"epic_id":{"type":"string","format":"uuid","description":"Epic the execution runs under; must be in your scope"},"inputs":{"type":["object","null"],"default":null},"base_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex base; omitted resolves origin/rolling once at acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; a replay returns deduplicated=true"}}}"#;
+const TOPOLOGY_GET_EXECUTION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id"],"properties":{"execution_id":{"type":"string","format":"uuid"},"after_sequence":{"type":["integer","null"],"minimum":0,"default":null,"description":"next_sequence from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":64,"default":null}}}"#;
+const TOPOLOGY_INTERRUPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"expected_row_version":{"type":"integer","minimum":1,"description":"row_version observed via get_execution; refresh after stale_version"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
+const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","attempt_id","action","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"attempt_id":{"type":"string","format":"uuid","description":"Attempt blocked on preserved work"},"action":{"type":"string","enum":["inspect","accept","retry","discard"],"description":"discard is manager (Automation) only; a lead is refused"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"confirm_preserved_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex preserved_commit; required iff action=discard, refused otherwise"}}}"#;
+
+static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 36]> = LazyLock::new(|| {
     [
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SpawnChild,
@@ -731,6 +790,48 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 30]> = Lazy
             parameters_json: MANAGER_WORK_VIEW_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerWorkView),
         },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyUpsert,
+            method: "AgentTopologyUpsert",
+            description: "Create, revise or validate a scoped deterministic topology (current manager with Automation, or an Epic lead for its own Epic). Every session/review triple must be explicit and operator-allowed; returns the definition digest and diagnostics.",
+            parameters_json: TOPOLOGY_UPSERT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyUpsert),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyList,
+            method: "AgentTopologyList",
+            description: "Page the topologies (and optionally executions) visible in your manager or Epic-lead scope.",
+            parameters_json: TOPOLOGY_LIST_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyList),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyExecute,
+            method: "AgentTopologyExecute",
+            description: "Start one daemon-run execution of a visible topology on an Epic in your scope, fenced by its definition digest; policy is rechecked and created sessions are charged. Idempotent on the key.",
+            parameters_json: TOPOLOGY_EXECUTE_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyExecute),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyGetExecution,
+            method: "AgentTopologyGetExecution",
+            description: "Read one execution in your scope: status, row_version, node attempts and a page of audit events.",
+            parameters_json: TOPOLOGY_GET_EXECUTION_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyGetExecution),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyInterrupt,
+            method: "AgentTopologyInterrupt",
+            description: "Request interruption of one execution in your scope under a row-version CAS; running node sessions are interrupted and the execution settles.",
+            parameters_json: TOPOLOGY_INTERRUPT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyInterrupt),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyResolveAttempt,
+            method: "AgentTopologyResolveAttempt",
+            description: "Resolve an attempt blocked on preserved work: inspect, accept or retry (manager or Epic lead in scope); discard needs the manager with Automation and the exact preserved commit.",
+            parameters_json: TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyResolveAttempt),
+        },
     ]
 });
 
@@ -753,10 +854,15 @@ mod tests {
         HARNESS_MANAGER_MAX_INBOX_PAGE, HARNESS_MANAGER_MAX_MESSAGE_BYTES,
         validate_manager_message,
     };
+    use crate::rpc::ResolveTopologyAttemptParams;
     use crate::rpc::{
         AgentArchiveIssueRequestV1, AgentCreateIssueParams, AgentGetIssueRequestV1,
         AgentListIssuesRequestV1, AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1,
         AgentUpdateIssueStatusRequestV1,
+    };
+    use crate::topology_agent::{
+        AgentTopologyExecuteRequestV1, AgentTopologyGetExecutionRequestV1,
+        AgentTopologyInterruptRequestV1, AgentTopologyListRequestV1, AgentTopologyUpsertRequestV1,
     };
     use crate::types::IssueEventPageRequestV1;
     use std::collections::BTreeSet;
@@ -839,16 +945,40 @@ mod tests {
                 "after_sequence": 0, "limit": 32, "request_id": issue
             }),
             AgentControlVerbV1::ManagerSend => serde_json::json!({
-                "epic_id": issue, "message": "Evidence?", "idempotency_key": "manager-send-v1"
+                "epic_id": issue, "message": "Evidence?", "idempotency_key": "manager-send-v1", "informational": true
             }),
             AgentControlVerbV1::ManagerReply => serde_json::json!({
-                "request_id": issue, "message": "Tests passed", "idempotency_key": "manager-reply-v1"
+                "request_id": issue, "message": "Tests passed", "idempotency_key": "manager-reply-v1", "still_running": true
             }),
             AgentControlVerbV1::ManagerNotify => serde_json::json!({
                 "message": "Checks passed", "idempotency_key": "manager-notify-v1"
             }),
             AgentControlVerbV1::ManagerWorkView => serde_json::json!({
                 "work_key": null, "after_work_key": "alpha", "limit": 8
+            }),
+            AgentControlVerbV1::TopologyUpsert => serde_json::json!({
+                "name": "review-loop", "scope": "epic", "epic_id": issue,
+                "definition": {"nodes": [{"id": "a", "kind": "Task", "label": "A"}], "edges": []},
+                "expected_revision": null, "validate_only": true, "idempotency_key": "upsert-v1"
+            }),
+            AgentControlVerbV1::TopologyList => serde_json::json!({
+                "scope": "epic", "epic_id": issue, "include_executions": true,
+                "cursor": null, "limit": 8
+            }),
+            AgentControlVerbV1::TopologyExecute => serde_json::json!({
+                "topology_id": issue, "expected_digest": format!("sha256:{}", "a".repeat(64)),
+                "epic_id": issue, "inputs": {}, "base_commit": null, "idempotency_key": "run-v1"
+            }),
+            AgentControlVerbV1::TopologyGetExecution => serde_json::json!({
+                "execution_id": issue, "after_sequence": 0, "limit": 64
+            }),
+            AgentControlVerbV1::TopologyInterrupt => serde_json::json!({
+                "execution_id": issue, "expected_row_version": 2, "idempotency_key": "stop-v1"
+            }),
+            AgentControlVerbV1::TopologyResolveAttempt => serde_json::json!({
+                "execution_id": issue, "attempt_id": issue, "action": "discard",
+                "expected_row_version": 3, "idempotency_key": "discard-v1",
+                "confirm_preserved_commit": "0123456789abcdef0123456789abcdef01234567"
             }),
         }
     }
@@ -950,13 +1080,31 @@ mod tests {
             AgentControlVerbV1::ManagerWorkView => {
                 serde_json::from_value::<AgentManagerWorkViewRequestV1>(value).map(drop)
             }
+            AgentControlVerbV1::TopologyUpsert => {
+                serde_json::from_value::<AgentTopologyUpsertRequestV1>(value).map(drop)
+            }
+            AgentControlVerbV1::TopologyList => {
+                serde_json::from_value::<AgentTopologyListRequestV1>(value).map(drop)
+            }
+            AgentControlVerbV1::TopologyExecute => {
+                serde_json::from_value::<AgentTopologyExecuteRequestV1>(value).map(drop)
+            }
+            AgentControlVerbV1::TopologyGetExecution => {
+                serde_json::from_value::<AgentTopologyGetExecutionRequestV1>(value).map(drop)
+            }
+            AgentControlVerbV1::TopologyInterrupt => {
+                serde_json::from_value::<AgentTopologyInterruptRequestV1>(value).map(drop)
+            }
+            AgentControlVerbV1::TopologyResolveAttempt => {
+                serde_json::from_value::<ResolveTopologyAttemptParams>(value).map(drop)
+            }
         }
     }
 
     #[test]
     fn catalog_is_closed_ordered_unique_and_valid() {
         let catalog = agent_control_catalog_v1();
-        assert_eq!(catalog.len(), 30);
+        assert_eq!(catalog.len(), 36);
         assert_eq!(
             catalog.iter().map(|entry| entry.method).collect::<Vec<_>>(),
             [
@@ -990,6 +1138,12 @@ mod tests {
                 "AgentManagerCommitPreparedControl",
                 "AgentManagerGetAction",
                 "AgentManagerWorkView",
+                "AgentTopologyUpsert",
+                "AgentTopologyList",
+                "AgentTopologyExecute",
+                "AgentTopologyGetExecution",
+                "AgentTopologyInterrupt",
+                "AgentTopologyResolveAttempt",
             ]
         );
         let names = catalog
@@ -1154,7 +1308,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn fixed_schema_contract_fixtures_pin_all_thirty_verbs() {
+    fn fixed_schema_contract_fixtures_pin_all_thirty_six_verbs() {
         let shapes: &[(AgentControlVerbV1, &[&str], &[&str])] = &[
             (
                 AgentControlVerbV1::SpawnChild,
@@ -1318,12 +1472,12 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ManagerSend,
-                &["epic_id", "idempotency_key", "message"],
+                &["epic_id", "idempotency_key", "informational", "message"],
                 &["epic_id", "message", "idempotency_key"],
             ),
             (
                 AgentControlVerbV1::ManagerReply,
-                &["idempotency_key", "message", "request_id"],
+                &["idempotency_key", "message", "request_id", "still_running"],
                 &["request_id", "message", "idempotency_key"],
             ),
             (
@@ -1370,6 +1524,69 @@ mod tests {
                 AgentControlVerbV1::ManagerWorkView,
                 &["after_work_key", "limit", "work_key"],
                 &[],
+            ),
+            (
+                AgentControlVerbV1::TopologyUpsert,
+                &[
+                    "definition",
+                    "epic_id",
+                    "expected_revision",
+                    "idempotency_key",
+                    "name",
+                    "scope",
+                    "validate_only",
+                ],
+                &["name", "definition", "scope", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::TopologyList,
+                &["cursor", "epic_id", "include_executions", "limit", "scope"],
+                &[],
+            ),
+            (
+                AgentControlVerbV1::TopologyExecute,
+                &[
+                    "base_commit",
+                    "epic_id",
+                    "expected_digest",
+                    "idempotency_key",
+                    "inputs",
+                    "topology_id",
+                ],
+                &[
+                    "topology_id",
+                    "expected_digest",
+                    "epic_id",
+                    "idempotency_key",
+                ],
+            ),
+            (
+                AgentControlVerbV1::TopologyGetExecution,
+                &["after_sequence", "execution_id", "limit"],
+                &["execution_id"],
+            ),
+            (
+                AgentControlVerbV1::TopologyInterrupt,
+                &["execution_id", "expected_row_version", "idempotency_key"],
+                &["execution_id", "expected_row_version", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::TopologyResolveAttempt,
+                &[
+                    "action",
+                    "attempt_id",
+                    "confirm_preserved_commit",
+                    "execution_id",
+                    "expected_row_version",
+                    "idempotency_key",
+                ],
+                &[
+                    "execution_id",
+                    "attempt_id",
+                    "action",
+                    "expected_row_version",
+                    "idempotency_key",
+                ],
             ),
         ];
 
@@ -1585,11 +1802,17 @@ mod tests {
             let schema = descriptor.parameters();
             let encoded = schema.to_string();
             // Manager send names a routing target, never the caller's owning Epic.
+            // Topology verbs name a target Epic that the daemon checks
+            // against the caller's live scope.
             assert_eq!(
                 schema["properties"].get("epic_id").is_some(),
                 matches!(
                     descriptor.verb,
-                    AgentControlVerbV1::ManagerSend | AgentControlVerbV1::ManagerInspect
+                    AgentControlVerbV1::ManagerSend
+                        | AgentControlVerbV1::ManagerInspect
+                        | AgentControlVerbV1::TopologyUpsert
+                        | AgentControlVerbV1::TopologyList
+                        | AgentControlVerbV1::TopologyExecute
                 )
             );
             for field in forbidden {
@@ -1603,6 +1826,9 @@ mod tests {
                             | AgentControlVerbV1::ManagerUpdate
                             | AgentControlVerbV1::ManagerControl
                             | AgentControlVerbV1::ManagerPrepareControl
+                            | AgentControlVerbV1::TopologyUpsert
+                            | AgentControlVerbV1::TopologyList
+                            | AgentControlVerbV1::TopologyExecute
                     )
                 {
                     continue;
@@ -1780,6 +2006,103 @@ mod tests {
             );
             assert!(serde_json::from_value::<AgentManagerNotifyRequestV1>(forged).is_err());
         }
+    }
+
+    /// Issue #633 (T4-A7): the six scoped topology verbs are catalogued with
+    /// native tools, the operator topology family stays out of the agent
+    /// catalog, and the resolution schema carries the discard confirmation
+    /// rule (plan §3.4, R4-1).
+    #[test]
+    fn topology_verbs_are_catalogued_and_operator_topology_verbs_stay_operator_only() {
+        let topology = agent_control_catalog_v1()
+            .iter()
+            .filter(|descriptor| descriptor.method.starts_with("AgentTopology"))
+            .map(|descriptor| {
+                (
+                    descriptor.method,
+                    descriptor.native_tool.map(NativeAgentControlToolV1::name),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            topology,
+            [
+                ("AgentTopologyUpsert", Some("rsi_control_topology_upsert")),
+                ("AgentTopologyList", Some("rsi_control_topology_list")),
+                ("AgentTopologyExecute", Some("rsi_control_topology_execute")),
+                (
+                    "AgentTopologyGetExecution",
+                    Some("rsi_control_topology_get_execution")
+                ),
+                (
+                    "AgentTopologyInterrupt",
+                    Some("rsi_control_topology_interrupt")
+                ),
+                (
+                    "AgentTopologyResolveAttempt",
+                    Some("rsi_control_topology_resolve_attempt")
+                ),
+            ]
+        );
+        for operator in [
+            "CreateTopology",
+            "UpdateTopology",
+            "ListTopologies",
+            "ExecuteTopology",
+            "GetWorkflowExecution",
+            "InterruptWorkflowExecution",
+            "ResolveTopologyAttempt",
+        ] {
+            assert_eq!(AgentControlVerbV1::from_method_name(operator), None);
+        }
+
+        let resolve = AgentControlVerbV1::TopologyResolveAttempt;
+        let id = "5d73c05d-1040-49f7-92ab-0123456789ab";
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let request = |action: &str, confirm: Option<&str>| {
+            serde_json::json!({
+                "execution_id": id, "attempt_id": id, "action": action,
+                "expected_row_version": 1, "idempotency_key": "k",
+                "confirm_preserved_commit": confirm,
+            })
+        };
+        assert_eq!(resolve.validate_params(&request("inspect", None)), Ok(()));
+        assert_eq!(
+            resolve.validate_params(&request("discard", Some(commit))),
+            Ok(())
+        );
+        for invalid in [
+            request("discard", None),
+            request("discard", Some("abc")),
+            request("retry", Some(commit)),
+        ] {
+            assert_eq!(
+                resolve.validate_params(&invalid),
+                Err(AgentControlParamErrorV1::params()),
+                "{invalid}"
+            );
+        }
+        let execute = AgentControlVerbV1::TopologyExecute;
+        let mut spoof = fixture(execute);
+        spoof["requested_by_session_id"] = serde_json::json!(id);
+        assert_eq!(
+            execute.validate_params(&spoof),
+            Err(AgentControlParamErrorV1::params())
+        );
+        let mut digest = fixture(execute);
+        digest["expected_digest"] = serde_json::json!("sha256:ABC");
+        assert_eq!(
+            execute.validate_params(&digest),
+            Err(AgentControlParamErrorV1::params())
+        );
+        assert_eq!(
+            AgentControlVerbV1::TopologyList.validate_params(&serde_json::json!({})),
+            Ok(())
+        );
+        assert_eq!(
+            AgentControlVerbV1::TopologyList.validate_params(&serde_json::json!({"limit": 33})),
+            Err(AgentControlParamErrorV1::params())
+        );
     }
 
     #[test]

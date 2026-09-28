@@ -86,6 +86,7 @@ pub(in crate::store) fn apply_v123_migration(store: &Store) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v123_refuses_v121_without_changing_catalog_or_version() {
         let store = Store::open_in_memory().expect("current store");
@@ -116,6 +117,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v123_index_keys_historical_watch_lookup() {
         let store = Store::open_in_memory().expect("current store");
@@ -150,6 +152,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v121_upgrade_reaches_v123_and_reopen_rejects_catalog_drift() {
         let directory = tempfile::tempdir().expect("test directory");
@@ -192,6 +195,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v123_reopen_rejects_witness_catalog_drift() {
         let directory = tempfile::tempdir().expect("test directory");

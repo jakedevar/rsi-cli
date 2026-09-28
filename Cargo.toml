@@ -84,7 +84,6 @@ fuzzy-matcher = "0.3"
 ignore = "0.4"
 rand = "0.8"
 regex = "1"
-pipewire = "0.8"
 
 # Tree-sitter syntax highlighting (file viewer)
 tree-sitter = "0.25"

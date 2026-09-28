@@ -73,6 +73,7 @@ fn enable_review_policy(f: &Fixture) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn premature_accept_refuses_without_creating_an_operator_decision() {
     let f = fixture();
@@ -107,6 +108,7 @@ fn premature_accept_refuses_without_creating_an_operator_decision() {
     assert!(same_work.acceptance.is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn review_request_distinguishes_work_version_from_source_change() {
     let f = fixture();
@@ -146,6 +148,7 @@ fn review_request_distinguishes_work_version_from_source_change() {
     assert!(moved.to_string().contains("manager_review_source_changed"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn review_reservation_requires_a_known_different_recorded_family() {
     let f = fixture();
@@ -222,6 +225,7 @@ fn review_reservation_requires_a_known_different_recorded_family() {
     assert_eq!(count, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn review_author_family_falls_back_to_latest_recorded_invocation() {
     let f = fixture();
@@ -462,6 +466,7 @@ const SONNET: &str = "claude-sonnet-5";
 const OPUS: &str = "claude-opus-5-5";
 const GLM: &str = "z-ai/glm-5.3-flashx";
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn review_round_budget_counts_three_non_superseded_assignments_per_revision() {
     let f = fixture();
@@ -483,6 +488,7 @@ fn review_round_budget_counts_three_non_superseded_assignments_per_revision() {
 
 /// #599 A1 test 1: S2's same-SHA exemption is withdrawn; a re-request of a
 /// launched review at capacity is a fourth attempt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn same_sha_rerequest_at_capacity_is_refused() {
     let f = fixture();
@@ -515,6 +521,7 @@ fn same_sha_rerequest_at_capacity_is_refused() {
 }
 
 /// #599 A1 test 2.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn supersede_churn_cannot_exceed_three_attempts() {
     let f = fixture();
@@ -532,6 +539,7 @@ fn supersede_churn_cannot_exceed_three_attempts() {
 
 /// #599 A1 test 3: a chain that failed without a receipt, infra-retry
 /// successors, and a replacement superseded before launch spend no budget.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn failed_without_receipt_and_infra_retries_do_not_spend_budget() {
     let f = fixture();
@@ -580,6 +588,7 @@ fn failed_without_receipt_and_infra_retries_do_not_spend_budget() {
 }
 
 /// #599 A1 test 4.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn closure_specialist_rejects_a_model_used_by_a_superseded_round() {
     let f = fixture();
@@ -602,6 +611,7 @@ fn closure_specialist_rejects_a_model_used_by_a_superseded_round() {
 }
 
 /// #599 A1 test 5.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn lead_cannot_supersede_a_manager_requested_assignment() {
     let f = fixture();
@@ -645,6 +655,7 @@ fn lead_cannot_supersede_a_manager_requested_assignment() {
     assert_eq!(review_rows(&f, "owned"), (4, 2));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn pending_acceptance_allows_only_the_bound_reviewer_action_to_cross_decision_gate() {
     let f = fixture();
@@ -752,6 +763,7 @@ fn pending_acceptance_allows_only_the_bound_reviewer_action_to_cross_decision_ga
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn ordinary_accept_succeeds_only_after_an_eligible_db_review_receipt() {
     let mut f = fixture();

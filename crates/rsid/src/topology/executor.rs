@@ -634,8 +634,24 @@ impl<E: NodeEffects> Executor<E> {
         if ready.is_empty() {
             return Ok(Some(waiting));
         }
-        self.reserve_ready(execution, &shape, &index, &progress, ready)
-            .await?;
+        let in_flight_sessions = attempts
+            .iter()
+            .filter(|attempt| attempt.status.in_flight() && attempt.node_kind == "session")
+            .count();
+        if !self
+            .reserve_ready(
+                execution,
+                &shape,
+                &index,
+                &progress,
+                ready,
+                in_flight_sessions,
+            )
+            .await?
+        {
+            // Every ready instance waits for a parallel slot (#633).
+            return Ok(Some(waiting));
+        }
         Ok(None)
     }
 
@@ -670,6 +686,8 @@ impl<E: NodeEffects> Executor<E> {
         .await
     }
 
+    /// Returns whether any row was written; `false` only when every ready
+    /// instance is deferred by the agent parallel-node cap.
     async fn reserve_ready(
         &self,
         execution: &ExecutionRow,
@@ -677,7 +695,8 @@ impl<E: NodeEffects> Executor<E> {
         index: &AttemptIndex<'_>,
         progress: &[RegionProgress],
         ready: Vec<(String, u32, bool)>,
-    ) -> Result<()> {
+        in_flight_sessions: usize,
+    ) -> Result<bool> {
         let mut reservations = Vec::with_capacity(ready.len());
         let mut settled = Vec::new();
         let mut refused = Vec::new();
@@ -722,6 +741,22 @@ impl<E: NodeEffects> Executor<E> {
                 Err(error) => refused.push((node, iteration, error.to_string())),
             }
         }
+        if execution.agent_requested() {
+            // Plan §5.3: at most `AGENT_MAX_PARALLEL_NODES` session nodes of
+            // an agent-requested execution are in flight; the rest stay
+            // ready and are reserved as slots free up.
+            let mut free =
+                crate::topology::agent::AGENT_MAX_PARALLEL_NODES.saturating_sub(in_flight_sessions);
+            reservations.retain(|reservation| {
+                if reservation.node_kind != "session" {
+                    return true;
+                }
+                let keep = free > 0;
+                free = free.saturating_sub(1);
+                keep
+            });
+        }
+        let wrote = !reservations.is_empty() || !settled.is_empty() || !refused.is_empty();
         if !refused.is_empty() {
             self.refuse_instances(execution, refused).await?;
         }
@@ -733,22 +768,22 @@ impl<E: NodeEffects> Executor<E> {
             match updates {
                 Ok(updates) => self.publish(updates),
                 Err(DaemonError::PolicyDenied(message)) => {
-                    return self
-                        .transition(
-                            execution,
-                            &[ExecutionStatus::Running],
-                            ExecutionStatus::Failed,
-                            Some(message),
-                            None,
-                            None,
-                        )
-                        .await;
+                    self.transition(
+                        execution,
+                        &[ExecutionStatus::Running],
+                        ExecutionStatus::Failed,
+                        Some(message),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    return Ok(true);
                 }
                 Err(error) => return Err(error),
             }
         }
         self.reserve(execution, &reservations).await?;
-        Ok(())
+        Ok(wrote)
     }
 
     /// A gate is pure: evaluate its condition over the typed outputs of the
@@ -1165,6 +1200,26 @@ impl<E: NodeEffects> Executor<E> {
                     Settlement {
                         failure_class: Some(failure::LOST_BEFORE_SESSION),
                         error: Some("admitted launch produced no session".into()),
+                        ..Settlement::default()
+                    },
+                )
+                .await?;
+                return Ok(true);
+            }
+            // #633 (plan §5.3): an agent-requested launch re-checks live
+            // manager policy and charges `max_created_sessions`; a refusal
+            // creates no session and blocks the execution.
+            if execution.agent_requested()
+                && let Some(code) = crate::topology::agent::launch_gate(&store, execution, attempt)?
+            {
+                drop(store);
+                self.settle(
+                    execution,
+                    attempt,
+                    AttemptStatus::Blocked,
+                    Settlement {
+                        failure_class: Some(failure::POLICY_REFUSED),
+                        error: Some(code.to_owned()),
                         ..Settlement::default()
                     },
                 )

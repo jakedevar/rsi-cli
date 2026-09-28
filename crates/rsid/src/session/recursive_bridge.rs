@@ -445,6 +445,7 @@ mod tests {
     // ── Structural preconditions for layout_workflow_graph ─────────────────
 
     /// Assertion 1: ≥1 node and node count == input count (no drop, no synthesis).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_node_count_matches_input() {
         let (mgr, _dir) = manager();
@@ -455,6 +456,7 @@ mod tests {
     }
 
     /// Assertion 2: node ids are unique (layout keys `node_index_by_id` on id).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_node_ids_unique() {
         let (mgr, _dir) = manager();
@@ -467,6 +469,7 @@ mod tests {
 
     /// Assertion 3: every edge endpoint references an existing node id
     /// (layout silently drops dangling endpoints).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_edge_endpoints_reference_existing_nodes() {
         let (mgr, _dir) = manager();
@@ -490,6 +493,7 @@ mod tests {
 
     /// Assertion 4: `NodeDef.id` == `RecursiveTaskId` verbatim (load-bearing V0
     /// invariant; the V5 node→attempt join depends on it).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_node_id_verbatim() {
         let (mgr, _dir) = manager();
@@ -507,6 +511,7 @@ mod tests {
     // ── Metadata sidecar + provenance ──────────────────────────────────────
 
     /// Assertion 5: `recursive_edge_kinds` sidecar with `snake_case` bare-string kinds.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_recursive_edge_kinds_sidecar() {
         let (mgr, _dir) = manager();
@@ -529,6 +534,7 @@ mod tests {
     }
 
     /// `recursive_edge_kinds` is always present, even for an empty edge set ("[]").
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_recursive_edge_kinds_always_present_when_empty() {
         let (mgr, _dir) = manager();
@@ -544,6 +550,7 @@ mod tests {
     }
 
     /// Assertion 6: provenance stamps + conditional origin pointers.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_provenance_and_conditional_origin_stamps() {
         let (mgr, _dir) = manager();
@@ -562,6 +569,7 @@ mod tests {
     }
 
     /// Assertion 7: per-node depth / scope / acceptance tags.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_node_tags() {
         let (mgr, _dir) = manager();
@@ -589,6 +597,7 @@ mod tests {
     }
 
     /// Assertion e: bridge stamps recursive_node_locks correctly.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_bridge_stamps_recursive_node_locks() {
         let (mgr, _dir) = manager();

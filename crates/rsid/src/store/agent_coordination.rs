@@ -19,13 +19,13 @@ use chrono::{DateTime, Utc};
 use rsi_common::agent_coordination::{
     AGENT_MESSAGE_MAX_CANONICAL_JSONRPC_ID_BYTES, AGENT_MESSAGE_MAX_CAPABILITY_ID_BYTES,
     AGENT_MESSAGE_MAX_ENUM_BYTES, AGENT_MESSAGE_MAX_ERROR_CLASS_BYTES,
-    AGENT_MESSAGE_MAX_IDEMPOTENCY_KEY_BYTES, AGENT_MESSAGE_MAX_METHOD_BYTES,
-    AGENT_MESSAGE_MAX_PAYLOAD_BYTES, AGENT_MESSAGE_MAX_PENDING_PER_OWNER,
-    AGENT_MESSAGE_MAX_PENDING_PER_TARGET, AGENT_MESSAGE_MAX_PROVIDER_TURN_BYTES,
-    AGENT_MESSAGE_QUARANTINE_MAX_ATTEMPTS, AGENT_PROGRESS_MAX_COHORT, AgentContinuationCursorV1,
-    AgentGetProgressResultV1, AgentMessageAckCursorV1, AgentMessageCountsV1,
-    AgentMessageErrorCodeV1, AgentMessageQueueSummaryV1, AgentMessageStateV1,
-    AgentProgressCursorV1, AgentProgressFreshnessV1, AgentProgressObligationV1, AgentProgressRowV1,
+    AGENT_MESSAGE_MAX_METHOD_BYTES, AGENT_MESSAGE_MAX_PAYLOAD_BYTES,
+    AGENT_MESSAGE_MAX_PENDING_PER_OWNER, AGENT_MESSAGE_MAX_PENDING_PER_TARGET,
+    AGENT_MESSAGE_MAX_PROVIDER_TURN_BYTES, AGENT_MESSAGE_QUARANTINE_MAX_ATTEMPTS,
+    AGENT_PROGRESS_MAX_COHORT, AgentContinuationCursorV1, AgentGetProgressResultV1,
+    AgentMessageAckCursorV1, AgentMessageCountsV1, AgentMessageErrorCodeV1,
+    AgentMessageQueueSummaryV1, AgentMessageStateV1, AgentProgressCursorV1,
+    AgentProgressFreshnessV1, AgentProgressObligationV1, AgentProgressRowV1,
     AgentProgressStatusCountsV1, AgentProgressStatusV1, AgentSendMessageRequestV1,
     AgentSendMessageResultV1, AgentSpawnChildRequestV1, AgentSpawnStateV1, AgentWatchStateV1,
     AttemptStateV1, AttemptTerminalDispositionV1, BoundaryAdmissionV1, BoundaryCapabilityKindV1,
@@ -34,8 +34,8 @@ use rsi_common::agent_coordination::{
     agent_message_payload_digest, agent_message_request_fingerprint,
 };
 use rsi_common::types::{
-    ConversationEvent, Recurrence, Role, SandboxCustodyErrorCodeV1, ScheduleSpec, Session,
-    SessionKind, SessionStatus,
+    ConversationEvent, EventType, Recurrence, Role, SandboxCustodyErrorCodeV1, ScheduleSpec,
+    Session, SessionKind, SessionStatus,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
@@ -471,6 +471,78 @@ fn get_spawn_request_by_owner_digest(
             map_spawn_request_row,
         )
         .optional()?)
+}
+
+impl Store {
+    /// Preserve the final worktree observation in the existing event stream.
+    /// Recording `None` is significant: a failed probe must supersede an older
+    /// dirty observation after a later terminal invocation.
+    pub(crate) fn record_terminal_sandbox_worktree(
+        &self,
+        session_id: Uuid,
+        dirty: Option<bool>,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let next_sequence: i32 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM conversation_events WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let content = match dirty {
+            Some(true) => "Terminal sandbox has uncommitted tracked or untracked work",
+            Some(false) => "Terminal sandbox worktree is clean",
+            None => "Terminal sandbox worktree status could not be read",
+        };
+        Self::insert_event_in_transaction(
+            &tx,
+            &ConversationEvent {
+                id: 0,
+                session_id,
+                sequence: next_sequence,
+                event_type: EventType::System,
+                role: None,
+                content: content.into(),
+                tool_name: None,
+                tool_input: None,
+                tool_use_id: None,
+                offload_id: None,
+                metadata: Some(Box::new(serde_json::json!({
+                    "terminal_sandbox_worktree_dirty": dirty
+                }))),
+                created_at: Utc::now(),
+            },
+            None,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read only a terminal session's latest persisted sandbox observation.
+    pub(crate) fn terminal_sandbox_worktree_dirty(&self, session_id: Uuid) -> Result<Option<bool>> {
+        terminal_sandbox_worktree_dirty_on(&self.conn, session_id)
+    }
+}
+
+fn terminal_sandbox_worktree_dirty_on(
+    conn: &rusqlite::Connection,
+    session_id: Uuid,
+) -> Result<Option<bool>> {
+    let observed: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT (SELECT json_extract(e.metadata, '$.terminal_sandbox_worktree_dirty')
+                     FROM conversation_events e
+                     WHERE e.session_id=s.id
+                       AND e.event_type='System'
+                       AND json_type(e.metadata, '$.terminal_sandbox_worktree_dirty') IS NOT NULL
+                     ORDER BY e.id DESC LIMIT 1)
+             FROM sessions s
+             WHERE s.id=?1 AND s.sandbox_root IS NOT NULL
+               AND s.status IN ('Completed','Failed','Interrupted','Archived')",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(observed.flatten().map(|value| value != 0))
 }
 
 impl Store {
@@ -5732,6 +5804,7 @@ fn progress_row(
             .as_ref()
             .and_then(|request| request.safe_error_class.clone()),
         base_commit,
+        sandbox_worktree_dirty: terminal_sandbox_worktree_dirty_on(tx, lineage_tip_id)?,
         cursor: AgentProgressCursorV1 {
             session_id,
             lineage_tip_id,
@@ -6241,6 +6314,7 @@ mod tests {
     use super::*;
     use crate::session::agent_verbs::tests::test_session;
     use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot};
+    use rsi_common::agent_coordination::AGENT_MESSAGE_MAX_IDEMPOTENCY_KEY_BYTES;
     use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionKind, SessionStatus};
 
     #[allow(clippy::expect_used)]
@@ -6276,6 +6350,7 @@ mod tests {
         fingerprint.expect("compute accepted V82 mailbox fingerprint")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v80_catalog_fingerprint_is_pinned() {
         // The accepted V80 fingerprint constant is PRESERVED verbatim and is
@@ -6343,6 +6418,7 @@ mod tests {
     /// `AGENT_MESSAGE_V81_TABLES.len() == 6` only restates the literal. This
     /// counts `sqlite_master` at the V82 head instead, so a rebuild that
     /// silently dropped an index or left a scratch relation behind is caught.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v82_catalog_inventory_is_unchanged_and_recounted() {
         let store = Store::open_in_memory().unwrap();
@@ -6430,6 +6506,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v81_catalog_fingerprint_is_pinned_and_rejects_the_rejected_digest() {
         let store = Store::open_in_memory().unwrap();
@@ -6661,6 +6738,7 @@ mod tests {
     /// no sealed disposition anywhere — uncertainty erasure, the exact failure
     /// class Phase 2 exists to prevent, unguarded in the layer the plan
     /// designates as its guard (plan `:2202-2209`).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn a_terminal_aggregate_state_requires_a_sealed_matching_attempt_disposition() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6747,6 +6825,7 @@ mod tests {
     /// `(message_id, state_version, from_state, to_state)`, never on
     /// `attempt_number`, so a transition could name a different attempt than
     /// the aggregate's current pointer and still satisfy the CAS.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn a_transition_naming_a_different_attempt_than_the_current_pointer_is_refused() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6808,6 +6887,7 @@ mod tests {
     /// trigger's must-name-an-attempt list, so an uncertainty edge could be
     /// recorded without naming the attempt whose effect is in doubt — which is
     /// the only custody that state exists to carry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn an_uncertain_transition_must_name_its_exact_attempt() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6830,6 +6910,7 @@ mod tests {
             .expect("an attempt-linked uncertainty edge is well-formed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn acceptance_inserts_the_aggregate_and_its_immutable_version_zero_edge() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6889,6 +6970,7 @@ mod tests {
         assert_eq!(attempts, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn exact_replay_returns_the_original_receipt_and_writes_nothing_new() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6935,6 +7017,7 @@ mod tests {
         assert_eq!(edges, 1, "a replay must not author a second transition");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn omitted_message_expiry_is_finite_and_keeps_the_original_request_fingerprint() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -6978,6 +7061,7 @@ mod tests {
         assert_eq!(replayed.receipt().expires_at, receipt.expires_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn default_deadline_expires_queued_mail_while_target_recovery_is_pending() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7097,6 +7181,7 @@ mod tests {
         assert_eq!(replayed.receipt().expires_at, original_deadline);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn explicit_message_expiries_are_preserved_on_both_sides_of_the_default() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7122,6 +7207,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn the_same_key_with_changed_target_payload_or_expiry_conflicts() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7187,6 +7273,7 @@ mod tests {
         assert_eq!(messages, 1, "a conflicting send must not insert a message");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn acceptance_enforces_the_frozen_per_target_pending_cap() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7215,6 +7302,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn acceptance_enforces_the_frozen_per_owner_pending_cap() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7260,6 +7348,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn the_stable_message_uuid_is_deterministic_and_binds_exactly_caller_and_key() {
         let owner = Uuid::from_u128(1);
@@ -7273,6 +7362,7 @@ mod tests {
         assert!(!base.is_nil());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn a_bounded_utf8_payload_and_128_byte_key_are_accepted_verbatim() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -7298,6 +7388,55 @@ mod tests {
         assert_eq!(stored, payload, "the payload persists byte-exact");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn terminal_sandbox_observation_survives_progress_reads_and_supersedes_prior_turn() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let db = dir.path().join("rsi.db");
+        let store = Store::open(&db).expect("open store");
+        let owner = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut owner_row = test_session(owner, "/tmp".into());
+        owner_row.session_kind = SessionKind::Task;
+        store.insert_session(&owner_row).expect("insert owner");
+        let mut child_row = test_session(child, "/tmp".into());
+        child_row.parent_id = Some(owner);
+        child_row.session_kind = SessionKind::Task;
+        child_row.status = SessionStatus::Completed;
+        child_row.sandbox_root = Some("/tmp/terminal-child".into());
+        child_row.sandbox_kind = Some(rsi_common::types::SandboxKind::GitWorktree);
+        store.insert_session(&child_row).expect("insert child");
+
+        store
+            .record_terminal_sandbox_worktree(child, Some(true))
+            .expect("persist dirty observation");
+        drop(store);
+        let store = Store::open(&db).expect("reopen persisted store");
+        assert_eq!(
+            store.terminal_sandbox_worktree_dirty(child).unwrap(),
+            Some(true)
+        );
+        let progress = store.agent_get_progress_snapshot(owner, &[child]).unwrap();
+        assert_eq!(progress.rows[0].sandbox_worktree_dirty, Some(true));
+
+        store
+            .record_terminal_sandbox_worktree(child, Some(false))
+            .expect("persist later clean observation");
+        assert_eq!(
+            store
+                .agent_get_progress_snapshot(owner, &[child])
+                .unwrap()
+                .rows[0]
+                .sandbox_worktree_dirty,
+            Some(false)
+        );
+        store
+            .record_terminal_sandbox_worktree(child, None)
+            .expect("persist failed probe");
+        assert_eq!(store.terminal_sandbox_worktree_dirty(child).unwrap(), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_get_progress_one_64_256_and_typed_overload() {
         let store = Store::open_in_memory().expect("open V80 store");
@@ -7352,6 +7491,7 @@ mod tests {
         assert_eq!(data["max_cohort_size"], 256);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_get_progress_resolves_rotation_tip_and_event_cursor() {
         let store = Store::open_in_memory().expect("open V80 store");
@@ -7391,6 +7531,7 @@ mod tests {
         assert_eq!(cursor.status, AgentProgressStatusV1::Running);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_get_progress_projects_immutable_sandbox_base_commit() {
         let mut store = Store::open_in_memory().expect("open V80 store");
@@ -7514,6 +7655,7 @@ mod tests {
     /// Before this fix the snapshot omitted the generation entirely while
     /// `AgentContinueChild` fenced on it, so the advertised one-round-trip
     /// path could only ever be walked by a caller that guessed absence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_get_progress_publishes_the_continuation_custody_generation() {
         let mut store = Store::open_in_memory().expect("open V80 store");
@@ -7628,6 +7770,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_get_progress_reports_failed_pre_session_spawn_as_failed() {
         let store = Store::open_in_memory().expect("open V80 store");
@@ -7690,6 +7833,7 @@ mod tests {
         assert_eq!(result.status_counts.reserved, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn agent_get_progress_marks_failed_and_interrupted_children_as_harvest_obligations() {
@@ -7734,6 +7878,7 @@ mod tests {
         assert_eq!(interrupted.unhandled_terminal_children, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn agent_get_progress_failed_reservation_reports_spawn_failed_without_obligation_count() {
@@ -7807,6 +7952,7 @@ mod tests {
         assert_eq!(result.unhandled_terminal_children, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn agent_get_progress_archived_child_reports_archived_status_and_zero_unhandled() {
@@ -7825,6 +7971,7 @@ mod tests {
         assert_eq!(result.unhandled_terminal_children, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn agent_get_progress_relaunched_child_reports_running_and_zero_unhandled() {
@@ -7840,6 +7987,7 @@ mod tests {
         assert_eq!(result.unhandled_terminal_children, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     #[allow(clippy::expect_used, clippy::items_after_statements)]
     fn agent_get_progress_snapshot_without_terminal_children_is_byte_identical() {
@@ -7902,6 +8050,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn agent_spawn_child_admission_commits_child_and_settlement_atomically() {
         let store = Store::open_in_memory().expect("open V80 store");
@@ -8086,6 +8235,7 @@ mod tests {
         assert_eq!(rolled_back_witnesses, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn post_bind_agent_child_failure_fences_exact_launch_and_retains_owned_root() {
         let mut store = Store::open_in_memory().expect("open store");
@@ -8280,6 +8430,7 @@ mod tests {
     /// while the durable rows were untouched. Acceptance stores
     /// `target_session_id` exactly as the owner named it, so the tip is by
     /// construction the wrong key.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn progress_counts_mail_against_the_logical_root_not_the_rotation_tip() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -8338,6 +8489,7 @@ mod tests {
 
     /// A target with no mail reports no summary at all, so accepted Phase 1
     /// progress snapshots are byte-identical.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn progress_omits_the_mailbox_summary_when_a_target_has_no_mail() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -8364,6 +8516,7 @@ mod tests {
     /// The summary reports queue age, the latest state/version, and an absent
     /// acknowledgement cursor before any delivery attempt exists — and it
     /// never loads a payload.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn progress_summary_reports_queue_age_and_latest_state_without_loading_payloads() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -8785,6 +8938,7 @@ mod tests {
         /// The scaffold itself is the first assertion: a legitimate world must
         /// be constructible through the live trigger set. If any trigger
         /// over-refuses, this fails before a single negative test runs.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_a_fully_legitimate_v81_world_is_admitted_end_to_end() {
             let store = Store::open_in_memory().unwrap();
@@ -8858,6 +9012,7 @@ mod tests {
         // ==================================================================
 
         /// Trigger 1/32 — `agent_messages_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -8891,6 +9046,7 @@ mod tests {
         /// an exact live reservation tuple) in the allowed direction, plus the
         /// unknown target, the wrong-owner reservation, and the acceptance
         /// shape clause in the refused direction.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_target_custody() {
             let store = Store::open_in_memory().unwrap();
@@ -9084,6 +9240,7 @@ mod tests {
         }
 
         /// Trigger 3/32 — `agent_messages_v81_identity_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -9141,6 +9298,7 @@ mod tests {
         /// object. Because SQLite leaves multi-trigger firing order undefined,
         /// that isolation — not source order — is what makes this assertion
         /// pin the intended trigger.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_state_forward() {
             let store = Store::open_in_memory().unwrap();
@@ -9215,6 +9373,7 @@ mod tests {
         /// and `a_transition_naming_a_different_attempt_than_the_current_pointer_is_refused`
         /// tests pin the terminal pointer/disposition join. This adds the
         /// version-arithmetic and required-transition-row halves.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_cas_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -9320,6 +9479,7 @@ mod tests {
         /// passes by refusing everything is not a guard. They pin the exact
         /// scope -- the dispatcher path and the pre-marker reconciler path both
         /// still work.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p206d_v82_reconciler_no_effect_backstop_refuses_only_the_reconciler() {
             let store = Store::open_in_memory().unwrap();
@@ -9544,6 +9704,7 @@ mod tests {
         /// obvious positive reading -- would have refused BOTH admitted cases
         /// below, and `not_applicable` is EVERY non-AppServer provider in the
         /// system. That trap was verified real by R7.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p206d_v82_sealed_live_uncertain_attempt_can_never_be_acknowledged() {
             // ADMITTED: every non-AppServer provider. Permanently
@@ -9565,6 +9726,7 @@ mod tests {
         }
 
         /// Trigger 6/32 — `agent_messages_v81_requeue_requires_no_effect`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_messages_v81_requeue_requires_no_effect() {
             let store = Store::open_in_memory().unwrap();
@@ -9662,6 +9824,7 @@ mod tests {
         }
 
         /// Trigger 7/32 — `agent_message_attempts_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -9698,6 +9861,7 @@ mod tests {
         }
 
         /// Trigger 8/32 — `agent_message_attempts_v81_identity_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -9873,6 +10037,7 @@ mod tests {
         /// * a rewind out of `dispatching` would let an attempt that may have
         ///   sent look like one that provably did not, which is exactly the
         ///   redelivery this slice exists to prevent.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_dispatching_marker_is_durable() {
             let store = Store::open_in_memory().unwrap();
@@ -9961,6 +10126,7 @@ mod tests {
         /// must make the retry an error rather than a silent no-op — a no-op
         /// would let a caller believe it had freshly marked an attempt that had
         /// in fact already been handed to the provider.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn the_pre_dispatch_marker_opens_its_window_exactly_once() {
             let store = Store::open_in_memory().unwrap();
@@ -10016,6 +10182,7 @@ mod tests {
         ///      `Uncertain`, and
         ///   2. the requeue WRITER must REFUSE the row even when called
         ///      directly, so a widened classifier still cannot requeue it.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn a_dispatching_row_with_a_foreign_boot_is_uncertain_and_never_requeues() {
             let store = Store::open_in_memory().unwrap();
@@ -10163,6 +10330,7 @@ mod tests {
         ///   2. an attempt on a FOREIGN boot is still admitted — proving the
         ///      change is a strict NARROWING and not a refuse-everything
         ///      "fix" that would make crash recovery useless.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn the_uncertainty_writer_refuses_an_attempt_the_live_incarnation_owns() {
             let store = Store::open_in_memory().unwrap();
@@ -10313,6 +10481,7 @@ mod tests {
         ///
         /// Without this, the rule could be "corrected" by refusing everything,
         /// which is safe but useless.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn a_claimed_row_with_a_foreign_boot_proves_no_effect_and_requeues() {
             let store = Store::open_in_memory().unwrap();
@@ -10403,6 +10572,7 @@ mod tests {
         ///
         /// Without this the recovery would requeue attempts belonging to the
         /// running incarnation, racing the live dispatcher.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn a_live_boot_attempt_is_never_offered_to_crash_recovery() {
             let store = Store::open_in_memory().unwrap();
@@ -10449,6 +10619,7 @@ mod tests {
         ///
         /// The population is deliberately one MORE than a page, so a
         /// re-introduced silent cap cannot pass by accident.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn a_population_larger_than_one_page_is_fully_drained_by_the_cursor() {
             let store = Store::open_in_memory().unwrap();
@@ -10609,6 +10780,7 @@ mod tests {
         /// pointer, while a requeued one still points at its sealed
         /// `proved_no_effect_requeue` attempt, and that historical pointer must
         /// SURVIVE the expiry rather than be cleared to make the write easier.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn a_durably_expired_queued_message_expires_with_a_null_attempt() {
             let store = Store::open_in_memory().unwrap();
@@ -10755,6 +10927,7 @@ mod tests {
         /// dispatcher holding the provider's own rejected-before-effect answer
         /// (`record_agent_message_admission` + `NoEffectDisposition::Expired`).
         /// The reconciler holds no such answer and must never reach that edge.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn the_expiry_reconciler_refuses_every_message_with_a_live_attempt() {
             let store = Store::open_in_memory().unwrap();
@@ -10831,6 +11004,7 @@ mod tests {
         /// Mirrors the identical guard already enforced by
         /// `record_agent_message_admission`. Without it the reconciler could
         /// expire live mail on a scheduling accident.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn the_expiry_reconciler_refuses_a_deadline_that_has_not_passed() {
             let store = Store::open_in_memory().unwrap();
@@ -10868,6 +11042,7 @@ mod tests {
         }
 
         /// Trigger 9/32 — `agent_message_attempts_v81_evidence_monotonic`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_evidence_monotonic() {
             let store = Store::open_in_memory().unwrap();
@@ -10957,6 +11132,7 @@ mod tests {
         }
 
         /// Trigger 10/32 — `agent_message_attempts_v81_correlation_coherence`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_correlation_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -11050,6 +11226,7 @@ mod tests {
         /// production shape -- attempts are inserted at claim time with a null
         /// triple and acknowledged later by update -- and it is asserted here
         /// rather than assumed.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_ack_event_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -11144,6 +11321,7 @@ mod tests {
         }
 
         /// Trigger 12/32 — `agent_message_attempts_v81_terminal_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_attempts_v81_terminal_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -11220,6 +11398,7 @@ mod tests {
         }
 
         /// Trigger 13/32 — `agent_message_transitions_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_transitions_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -11262,6 +11441,7 @@ mod tests {
         /// The non-refusal direction is covered by the INSERT path instead --
         /// appending new rows must still work, which is asserted here so the
         /// trigger cannot be silently over-scoped to block inserts too.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_transitions_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -11316,6 +11496,7 @@ mod tests {
         }
 
         /// Trigger 15/32 — `agent_message_transitions_v81_coherence`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_transitions_v81_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -11476,6 +11657,7 @@ mod tests {
         }
 
         /// Trigger 16/32 — `agent_message_request_effects_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -11502,6 +11684,7 @@ mod tests {
         }
 
         /// Trigger 17/32 — `agent_message_request_effects_v81_identity_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -11553,6 +11736,7 @@ mod tests {
         }
 
         /// Trigger 18/32 — `agent_message_request_effects_v81_evidence_coherence`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_evidence_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -11686,6 +11870,7 @@ mod tests {
         }
 
         /// Trigger 19/32 — `agent_message_request_effects_v81_handler_forward`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_handler_forward() {
             let store = Store::open_in_memory().unwrap();
@@ -11739,6 +11924,7 @@ mod tests {
         /// approval ID, a pending decision, or a recorded decision at all. That
         /// layering is why this test builds its own request row rather than
         /// reusing the scaffold's.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_approval_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -11892,6 +12078,7 @@ mod tests {
         }
 
         /// Trigger 21/32 — `agent_message_request_effects_v81_reply_forward`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_reply_forward() {
             let store = Store::open_in_memory().unwrap();
@@ -11987,6 +12174,7 @@ mod tests {
         /// layer down by the named CHECK `v81_terminal_fence_matches_request`,
         /// asserted by
         /// `p202_provider_terminal_fence_must_be_the_requests_own_invocation_and_turn`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_terminal_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -12069,6 +12257,7 @@ mod tests {
         }
 
         /// Trigger 23/32 — `agent_message_request_effects_v81_permit_coherence`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_request_effects_v81_permit_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -12171,6 +12360,7 @@ mod tests {
         /// `live` birth -- objects first, and the coupled `live`/all-or-none
         /// CHECKs independently forbid any INSERT from carrying a fence at all.
         /// Both are asserted by their own refusals below.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_provider_terminal_fence_must_be_the_requests_own_invocation_and_turn() {
             let store = Store::open_in_memory().unwrap();
@@ -12397,6 +12587,7 @@ mod tests {
         }
 
         /// Trigger 24/32 — `agent_message_turn_gates_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_turn_gates_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -12423,6 +12614,7 @@ mod tests {
         }
 
         /// Trigger 25/32 — `agent_message_turn_gates_v81_identity_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_turn_gates_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -12463,6 +12655,7 @@ mod tests {
         }
 
         /// Trigger 26/32 — `agent_message_turn_gates_v81_forward`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_turn_gates_v81_forward() {
             let store = Store::open_in_memory().unwrap();
@@ -12526,6 +12719,7 @@ mod tests {
         /// are monotonic, and they may advance ONLY while the gate is open, so
         /// `closing` blocks every later request insert, capability mint, and
         /// effect start.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_turn_gates_v81_admission_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -12578,6 +12772,7 @@ mod tests {
         }
 
         /// Trigger 28/32 — `agent_message_turn_gates_v81_close_requires_settled_permits`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_turn_gates_v81_close_requires_settled_permits() {
             let store = Store::open_in_memory().unwrap();
@@ -12667,6 +12862,7 @@ mod tests {
         }
 
         /// Trigger 29/32 — `agent_message_effect_permits_v81_no_delete`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_effect_permits_v81_no_delete() {
             let store = Store::open_in_memory().unwrap();
@@ -12693,6 +12889,7 @@ mod tests {
         }
 
         /// Trigger 30/32 — `agent_message_effect_permits_v81_identity_immutable`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_effect_permits_v81_identity_immutable() {
             let store = Store::open_in_memory().unwrap();
@@ -12787,6 +12984,7 @@ mod tests {
         /// conjunction. That is NOT a defect — SQL binds `AND` tighter than
         /// `OR`, so it groups as `(A AND B) OR (C AND D)` exactly as intended.
         /// The runtime behaviour asserted below is what proves it.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_effect_permits_v81_forward() {
             let store = Store::open_in_memory().unwrap();
@@ -12882,6 +13080,7 @@ mod tests {
         }
 
         /// Trigger 32/32 — `agent_message_effect_permits_v81_evidence_coherence`.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_agent_message_effect_permits_v81_evidence_coherence() {
             let store = Store::open_in_memory().unwrap();
@@ -13004,6 +13203,7 @@ mod tests {
         /// Phase 2 tables must survive a real close/reopen byte-identically,
         /// with the catalog fingerprint and `user_version` unmoved and
         /// referential integrity still clean.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_full_world_survives_production_reopen_with_identical_catalog_data_and_version() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -13145,6 +13345,7 @@ mod tests {
         /// something the frozen V81 catalog delivers.
         ///
         /// Asserted here so the boundary is explicit rather than assumed.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
         #[test]
         fn p202_finding_gate_counters_are_not_reconciled_against_permit_rows() {
             let store = Store::open_in_memory().unwrap();
@@ -13254,6 +13455,7 @@ mod tests {
     /// The headline C-P2-18 property: a permanently failed reservation leaves
     /// NO message queued behind it, and every settled row carries a real
     /// `spawn_settlement` transition rather than a silent aggregate rewrite.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn spawn_settlement_fails_queued_mail_and_leaves_nothing_behind_a_dead_reservation() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -13333,6 +13535,7 @@ mod tests {
     /// of effect, so settlement must NOT hand it a clean `failed`. It becomes
     /// `uncertain` with conservative effect-possible evidence and retained
     /// invocation custody.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn spawn_settlement_never_downgrades_an_unprovable_attempt_to_a_clean_failure() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -13450,6 +13653,7 @@ mod tests {
 
     /// Exact replay is read-only: a second settlement of an already-failed
     /// reservation settles nothing and rewrites no evidence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn spawn_settlement_replay_is_read_only_and_settles_nothing_twice() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -13491,6 +13695,7 @@ mod tests {
 
     /// A launched child is a live session, not a reserved failure. This writer
     /// must never be the thing that tears one down.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn spawn_settlement_refuses_a_launched_reservation() {
         let store = Store::open_in_memory().expect("open V81 store");
@@ -15653,7 +15858,7 @@ fn copy_v80_messages_into_v81(tx: &Transaction<'_>) -> Result<()> {
 pub(crate) fn v81_schema_fingerprint(connection: &rusqlite::Connection) -> Result<String> {
     let mut hasher = Sha256::new();
 
-    let mut absorb = |hasher: &mut Sha256, value: &str| {
+    let absorb = |hasher: &mut Sha256, value: &str| {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     };

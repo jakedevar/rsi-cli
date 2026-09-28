@@ -1810,6 +1810,7 @@ mod tests {
 
     // -- JsonRpcId ----------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_canonical_form_matches_the_sql_checker_and_round_trips() {
         let cases = vec![
@@ -1837,6 +1838,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_number_and_string_never_alias() {
         let numeric = JsonRpcId::Number(7).to_canonical();
@@ -1846,6 +1848,7 @@ mod tests {
         assert_eq!(textual, "s:\"7\"");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_rejects_the_forbidden_zero_alias() {
         assert_eq!(
@@ -1863,6 +1866,7 @@ mod tests {
         assert!(!is_canonical_jsonrpc_id("n:0"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_from_json_fails_closed_on_every_non_exact_type() {
         assert_eq!(
@@ -1894,6 +1898,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_rejects_oversized_strings_at_the_frozen_ceiling() {
         let at_limit = "x".repeat(APP_SERVER_MAX_JSONRPC_STRING_ID_BYTES);
@@ -1905,6 +1910,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_from_canonical_rejects_non_canonical_spellings() {
         for bad in [
@@ -1932,6 +1938,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn jsonrpc_id_reconstructs_the_original_json_type() {
         assert_eq!(JsonRpcId::Number(7).to_json(), Value::Number(7.into()));
@@ -1943,6 +1950,7 @@ mod tests {
 
     // -- writer -------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn writer_result_treats_only_a_flushed_write_as_delivery_proof() {
         assert!(WriterOperationResult::WriteFlushed.proves_delivery());
@@ -1961,6 +1969,7 @@ mod tests {
         assert!(!WriterOperationResult::WriteFailed.proves_no_effect());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn writer_receipt_reaches_the_plane_even_when_the_caller_oneshot_is_dropped() {
         let plane = AppServerControlPlane::new();
@@ -1982,6 +1991,7 @@ mod tests {
 
     // -- capabilities --------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn handler_capability_is_consumed_only_by_its_matching_durable_cas() {
         let capability_id = Uuid::from_u128(1);
@@ -2002,6 +2012,7 @@ mod tests {
         assert_eq!(consumed.gate_generation, 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn reply_capability_is_consumed_only_by_its_matching_durable_cas() {
         let capability_id = Uuid::from_u128(3);
@@ -2020,6 +2031,7 @@ mod tests {
         assert_eq!(consumed.provider_request_id, JsonRpcId::Number(11));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn capability_ids_fit_the_frozen_persistence_ceiling() {
         assert_eq!(
@@ -2030,6 +2042,7 @@ mod tests {
 
     // -- fenced request ------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn fenced_request_never_accepts_a_continuation_token_as_a_turn_id() {
         let error = FencedAppServerProviderRequest::new(
@@ -2045,6 +2058,7 @@ mod tests {
         assert_eq!(error, FencedRequestError::NotAGenuineTurnId);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn fenced_request_bounds_every_scalar() {
         let base = |method: &str, digest: &str, turn: Option<String>| {
@@ -2088,6 +2102,7 @@ mod tests {
 
     // -- lifecycle signals ---------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn lifecycle_signal_bounds_scalars_and_rejects_non_turn_tokens() {
         let signal = |turn: Option<&str>, status: Option<&str>, class: Option<&str>| {
@@ -2141,6 +2156,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn usage_evidence_can_never_block_lifecycle_settlement() {
         let mut signal = ProviderLifecycleSignal {
@@ -2164,6 +2180,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn only_eof_and_confirmed_death_settle_retained_custody() {
         assert!(ProviderLifecycleKind::ReaderEof.settles_custody());
@@ -2184,6 +2201,7 @@ mod tests {
 
     // -- response correlation ------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn responses_route_only_by_exact_registered_id_with_no_fallback() {
         let plane = AppServerControlPlane::new();
@@ -2210,6 +2228,7 @@ mod tests {
         assert_eq!(plane.registered_waiter_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn duplicate_response_registration_fails_closed() {
         let plane = AppServerControlPlane::new();
@@ -2231,6 +2250,7 @@ mod tests {
 
     // -- registration and capacity ------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn attempt_registry_enforces_the_frozen_global_cap() {
         let plane = AppServerControlPlane::new();
@@ -2258,6 +2278,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn exact_reregistration_is_idempotent() {
         let plane = AppServerControlPlane::new();
@@ -2276,6 +2297,7 @@ mod tests {
 
     // -- quarantine ----------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn quarantine_seals_at_the_frozen_per_attempt_event_ceiling() {
         let plane = AppServerControlPlane::new();
@@ -2301,6 +2323,7 @@ mod tests {
         assert!(plane.is_sealed(key));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn quarantine_seals_at_the_frozen_per_attempt_byte_ceiling() {
         let plane = AppServerControlPlane::new();
@@ -2321,6 +2344,7 @@ mod tests {
         assert!(plane.is_sealed(key));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_sealed_attempt_never_seals_twice_and_admits_no_further_evidence() {
         let plane = AppServerControlPlane::new();
@@ -2345,6 +2369,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn quarantine_seals_on_the_frozen_five_second_timeout() {
         let plane = AppServerControlPlane::new();
@@ -2362,6 +2387,7 @@ mod tests {
         assert!(plane.is_sealed(key));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn control_worker_sweep_seals_every_timed_out_attempt_exactly_once() {
         let plane = AppServerControlPlane::new();
@@ -2386,6 +2412,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn releasing_an_attempt_returns_its_budget_to_the_global_pool() {
         let plane = AppServerControlPlane::new();
@@ -2404,6 +2431,7 @@ mod tests {
 
     // -- correlation custody -------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_genuine_turn_id_fills_once_and_only_while_correlation_is_pending() {
         let plane = AppServerControlPlane::new();
@@ -2421,6 +2449,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_sealed_attempt_rejects_a_late_turn_fill() {
         let plane = AppServerControlPlane::new();
@@ -2441,6 +2470,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_continuation_token_is_never_accepted_as_a_turn_fill() {
         let plane = AppServerControlPlane::new();
@@ -2457,6 +2487,7 @@ mod tests {
 
     // -- latches -------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn lifecycle_latches_coalesce_and_never_downgrade_a_stronger_fact() {
         let plane = AppServerControlPlane::new();
@@ -2507,6 +2538,7 @@ mod tests {
         assert!(plane.provider_death_observed());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_latch_stays_dirty_until_its_exact_store_cas_commits() {
         let plane = AppServerControlPlane::new();
@@ -2549,6 +2581,7 @@ mod tests {
     /// forever and the suffix would never be seen at all. Resuming after the
     /// last key examined must reach EVERY latch within a finite number of
     /// ticks.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn the_resumable_cursor_reaches_every_latch_and_never_starves_a_suffix() {
         let plane = AppServerControlPlane::new();
@@ -2600,6 +2633,7 @@ mod tests {
 
     /// The cursor wraps, so a sweep that starts mid-registry still terminates
     /// and still visits the keys before its start position on a later tick.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn the_resumable_cursor_wraps_instead_of_running_off_the_end() {
         let plane = AppServerControlPlane::new();
@@ -2635,6 +2669,7 @@ mod tests {
 
     /// An empty registry must cost nothing and reset the cursor, so an idle
     /// daemon neither scans nor busy-loops.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn an_empty_latch_set_yields_an_empty_sweep_and_resets_the_cursor() {
         let plane = AppServerControlPlane::new();
@@ -2652,6 +2687,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn the_control_worker_drain_respects_the_frozen_latch_budget() {
         let plane = AppServerControlPlane::new();
@@ -2681,6 +2717,7 @@ mod tests {
 
     // -- writer admission and reconciliation ---------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn writer_admission_is_disabled_until_startup_reconciliation_completes() {
         let plane = AppServerControlPlane::new();
@@ -2693,6 +2730,7 @@ mod tests {
         assert_eq!(plane.writer_admission(), WriterAdmission::Admitted);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn reconciliation_registers_durable_attempts_and_seals_lost_evidence_once() {
         let plane = AppServerControlPlane::new();
@@ -2718,6 +2756,7 @@ mod tests {
         assert_eq!(plane.registered_attempt_count(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn restart_cannot_reset_capacity_or_admit_a_duplicate_turn() {
         let plane = AppServerControlPlane::new();
@@ -2737,6 +2776,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn reconciliation_refuses_beyond_the_global_cap_rather_than_overcommitting() {
         let plane = AppServerControlPlane::new();
@@ -2755,6 +2795,7 @@ mod tests {
 
     // -- effect tasks --------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn effect_task_join_handles_are_retained_independently_of_the_monitor() {
         let plane = AppServerControlPlane::new();
@@ -2775,6 +2816,7 @@ mod tests {
 
     // -- ingress classification (C-P2-15) ------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn only_structurally_proven_ordinary_notifications_may_drop_without_a_seal() {
         // The ONE droppable class: a notification with no `id` whose method is
@@ -2832,6 +2874,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_terminal_looking_substring_or_nested_key_is_never_lifecycle_authority() {
         // C-P2-15: lifecycle authority comes from an EXACT top-level method
@@ -2881,6 +2924,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn malformed_and_conflicting_frame_identity_fails_closed_as_ambiguous() {
         let cases = [
@@ -2932,6 +2976,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn a_string_id_response_routes_by_exact_identity_and_never_aliases_a_number() {
         let numeric = serde_json::json!({"id": 4, "result": {}});

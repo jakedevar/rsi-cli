@@ -12,7 +12,7 @@
 //! project's indexed memory; when the host session has no project, the tool
 //! degrades to global search (matches manual TUI behavior).
 
-use super::HarnessTool;
+use super::{HarnessTool, truncation::truncate_text};
 use crate::memory::worker::MemoryHandle;
 use crate::session::harness::types::ToolResult;
 use std::path::Path;
@@ -79,7 +79,7 @@ impl HarnessTool for MemorySearchTool {
                     output: if output.is_empty() {
                         "No results found.".into()
                     } else {
-                        output
+                        truncate_text(&output, 100_000, false).content
                     },
                     error_msg: None,
                 }

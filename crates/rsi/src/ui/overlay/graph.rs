@@ -1182,7 +1182,7 @@ pub(crate) fn render_picker_panel(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::surface1()))
+        .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()))
         .title(Span::styled(
             format!(" {} Picker ", kind.label()),

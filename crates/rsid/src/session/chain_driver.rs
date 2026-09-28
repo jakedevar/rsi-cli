@@ -630,6 +630,7 @@ fn artifact_path(chain_id: Uuid, iteration_index: u32) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn iteration_entry_carries_goal_without_requesting_a_restatement() {
         let workflow = build_starter_workflow("master_improve").unwrap();
@@ -651,6 +652,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_proceed_done() {
         let v = parse_verdict_from_str("PROCEED: judge=DONE")
@@ -659,6 +661,7 @@ mod tests {
         assert!(matches!(v, BudgetVerdict::ProceedDone));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_proceed_continue_short() {
         let v = parse_verdict_from_str("PROCEED: judge=CONTINUE refined_goal=fix the regression")
@@ -672,6 +675,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_proceed_continue_artifact_placeholder_returns_none() {
         // When budget output uses the artifact placeholder, parser falls back to disk.
@@ -681,6 +685,7 @@ mod tests {
         assert!(v.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_halt_regression() {
         let v = parse_verdict_from_str("HALT: regression pre=3 post=7")
@@ -695,12 +700,14 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_halt_stop_file() {
         let v = parse_verdict_from_str("HALT: stop-file").unwrap().unwrap();
         assert!(matches!(v, BudgetVerdict::Halt(HaltReason::StopFile)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_halt_judge_blocked() {
         let v = parse_verdict_from_str("HALT: judge-blocked plan doc not found")
@@ -714,6 +721,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_halt_judge_malformed() {
         let v = parse_verdict_from_str("HALT: judge-malformed")
@@ -722,6 +730,7 @@ mod tests {
         assert!(matches!(v, BudgetVerdict::Halt(HaltReason::JudgeMalformed)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_halt_error() {
         let v = parse_verdict_from_str("HALT: error cargo test panic")
@@ -735,6 +744,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn parse_unknown_returns_none() {
         let v = parse_verdict_from_str("garbage").unwrap();

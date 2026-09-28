@@ -430,6 +430,7 @@ pub(super) mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_unknown_spend_blocks_finite_cap_and_stays_unknown_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -471,6 +472,7 @@ pub(super) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_counts_whole_epic_and_admits_replacement_of_own_slot() {
         let store = Store::open_in_memory().unwrap();
@@ -500,6 +502,7 @@ pub(super) mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_enforces_cap_in_actual_model_admission_and_releases_capacity() {
         use crate::model_control::{ExpectedUsage, ModelAdmissionRequest};
@@ -582,6 +585,7 @@ pub(super) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_repeated_question_text_has_distinct_exact_target() {
         let store = Store::open_in_memory().unwrap();
@@ -627,6 +631,7 @@ pub(super) mod tests {
         assert_eq!(next.payload["status"], "pending");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_malformed_question_becomes_explicit_blocker() {
         let store = Store::open_in_memory().unwrap();
@@ -650,6 +655,7 @@ pub(super) mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_coordinator_meaningful_events_coalesce_and_scope_change_starts_new_projection() {
         let store = Store::open_in_memory().unwrap();

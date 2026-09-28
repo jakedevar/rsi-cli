@@ -121,20 +121,37 @@ impl Store {
         Ok(())
     }
 
-    /// Bounded daemon reconciliation input: uncertain actions whose only
-    /// possible uncertain effect was interrupting their exact predecessor.
+    /// Bounded daemon reconciliation input. Prefilter resumes with a keyed
+    /// pre-spawn refusal so older unobservable actions cannot fill the batch;
+    /// the target guard and full witness check still decide settlement.
     pub(crate) fn uncertain_manager_recovery_candidates(
         &self,
     ) -> Result<Vec<ManagerActionOperationV2>> {
         let ids: Vec<String> = {
             let mut statement = self.conn.prepare(
-                "SELECT id FROM harness_manager_v2_operations
-                 WHERE kind=?1 AND state='uncertain'
-                   AND json_extract(payload_json,'$.request.operation.action') IN ('pause_lead','assign_lead')
-                 ORDER BY updated_at,id LIMIT ?2",
+                "SELECT o.id FROM harness_manager_v2_operations o
+                 WHERE o.kind=?1 AND o.state='uncertain'
+                   AND (json_extract(o.payload_json,'$.request.operation.action') IN ('pause_lead','assign_lead')
+                     OR (json_extract(o.payload_json,'$.request.operation.action')='resume_lead'
+                       AND EXISTS (SELECT 1 FROM model_invocations i
+                         WHERE i.dedup_key='manager.action:' || o.id
+                           AND i.status='failed' AND i.error_class IN (?3,?4)
+                           AND i.input_tokens IS NULL AND i.output_tokens IS NULL
+                           AND i.cache_creation_tokens IS NULL AND i.cache_read_tokens IS NULL
+                           AND i.reasoning_tokens IS NULL AND i.wall_time_ms IS NULL
+                           AND i.estimated_cost_usd IS NULL AND i.usage_confidence='unavailable')))
+                 ORDER BY o.updated_at,o.id LIMIT ?2",
             )?;
             statement
-                .query_map(params![ACTION_KIND, UNCERTAIN_RECOVERY_BATCH], |r| r.get(0))?
+                .query_map(
+                    params![
+                        ACTION_KIND,
+                        UNCERTAIN_RECOVERY_BATCH,
+                        "codex_resume_rollout_torn_tail",
+                        crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS,
+                    ],
+                    |r| r.get(0),
+                )?
                 .collect::<std::result::Result<_, _>>()?
         };
         let mut operations = Vec::with_capacity(ids.len());

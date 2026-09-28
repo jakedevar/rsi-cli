@@ -110,6 +110,7 @@ fn request(change: ManagerUpdateV2, key: &str) -> AgentManagerUpdateRequestV2 {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn overview_pages_include_the_current_root_manager_succession_fence() {
     let f = fixture();
@@ -186,6 +187,7 @@ fn overview_pages_include_the_current_root_manager_succession_fence() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn manager_overview_includes_its_project_metadata() {
@@ -212,6 +214,7 @@ fn manager_overview_includes_its_project_metadata() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn archive_pages_scoped_retired_containers_with_restore_fences() {
@@ -341,6 +344,7 @@ fn grant_topology(f: &Fixture) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn archive_project_scope_lists_only_its_project_containers() {
@@ -389,6 +393,7 @@ fn archive_project_scope_lists_only_its_project_containers() {
     assert_eq!(rows[0]["id"], json!(local.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn archive_explicit_epic_scope_lists_selected_epic() {
@@ -422,6 +427,7 @@ fn archive_explicit_epic_scope_lists_selected_epic() {
     assert_eq!(ids, std::collections::HashSet::from([f.epic.to_string()]));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn archive_entity_scope_expires_on_narrowed_reappointment() {
@@ -520,6 +526,7 @@ fn archive_entity_scope_expires_on_narrowed_reappointment() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn archive_restorable_fence_admits_restore_container() {
@@ -577,6 +584,7 @@ fn archive_restorable_fence_admits_restore_container() {
     assert_eq!(receipt.state, ManagerActionStateV2::Queued);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn overview_returns_actionable_preflight_for_an_appointed_non_root_manager() {
     let f = fixture();
@@ -668,6 +676,199 @@ fn inspect(f: &Fixture, section: ManagerInspectSectionV2) -> ManagerInspectionV2
         )
         .unwrap()
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn migration_allocations_inspect_is_scoped_ordered_and_marks_competing_versions() {
+    let f = fixture();
+    let custody_id = Uuid::new_v4();
+    let repo = "/workspace/delivery";
+    let timestamp = "2026-09-27T00:00:00.000000000Z";
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO sandbox_custody_roots
+             (custody_id,canonical_repo_dir,sandbox_root,sandbox_branch,repository_identity,
+              source_commit,state,owner_session_id,generation,event_sequence,validation_state,
+              validated_generation,validated_at,created_at,updated_at)
+             VALUES(?1,?2,'/workspace/delivery/.sandbox','feature/test',?2,?3,'live',?4,1,1,
+                    'verified',1,?5,?5,?5)",
+            params![
+                custody_id.to_string(),
+                repo,
+                "a".repeat(40),
+                f.lead.to_string(),
+                timestamp,
+            ],
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE sessions SET sandbox_custody_id=?2 WHERE id=?1",
+            params![f.lead.to_string(), custody_id.to_string()],
+        )
+        .unwrap();
+
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    for key in ["migration-a", "migration-b"] {
+        work(&f, key);
+        let (record_row, mut record) = f.store.manager_v2_work(&config, key).unwrap();
+        record.source_session_id = Some(f.lead);
+        record.source_commit = Some("a".repeat(40));
+        f.store
+            .manager_v2_put_record(
+                &config,
+                "work",
+                key,
+                Some(f.epic),
+                record_row.row_version,
+                &json!(record),
+            )
+            .unwrap();
+    }
+
+    f.store
+        .conn
+        .execute_batch(
+            "INSERT INTO migration_allocation_repositories
+                VALUES('/workspace/delivery','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',140,1,
+                       '2026-09-27T00:00:00.000000000Z');",
+        )
+        .unwrap();
+    let other_epic = Uuid::new_v4();
+    for (work_key, epic_id, version, state, source_commit, remote_tip) in [
+        (
+            "migration-a",
+            f.epic,
+            141,
+            "active",
+            "a".repeat(40),
+            "c".repeat(40),
+        ),
+        (
+            "migration-b",
+            f.epic,
+            142,
+            "publishing",
+            "b".repeat(40),
+            "b".repeat(40),
+        ),
+        (
+            "outside-scope",
+            other_epic,
+            143,
+            "active",
+            "c".repeat(40),
+            "b".repeat(40),
+        ),
+    ] {
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO migration_allocation_claims
+                 (id,repository,source_commit,work_key,epic_id,assigned_version,state,remote_tip,
+                  candidate_commit,expires_at,row_version,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,1,?9,?9)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    repo,
+                    source_commit,
+                    work_key,
+                    epic_id.to_string(),
+                    version,
+                    state,
+                    remote_tip,
+                    timestamp,
+                ],
+            )
+            .unwrap();
+    }
+
+    let query = AgentManagerInspectRequestV2 {
+        section: ManagerInspectSectionV2::MigrationAllocations,
+        limit: 1,
+        ..Default::default()
+    };
+    let operator_page = f
+        .store
+        .manager_v2_inspect_operator(f.project, &query)
+        .unwrap();
+    let first = &operator_page.rows[0];
+    assert_eq!(first["work_key"], "migration-a");
+    assert_eq!(first["sequence"], 1);
+    assert_eq!(first["version"], 141);
+    assert!(first["claim_id"].as_str().is_some());
+    assert_eq!(first["remote_tip"], "c".repeat(40));
+    assert_eq!(first["row_version"], 1);
+    assert_eq!(first["state"], "active");
+    assert_eq!(first["expires_at"], timestamp);
+    assert_eq!(first["source_commit"], "a".repeat(40));
+    assert_eq!(first["conflict"], true);
+    assert_eq!(first["conflict_reason"], "remote_tip_changed");
+    assert_eq!(first["predecessor_sources"], json!([]));
+    assert!(operator_page.next_cursor.is_some());
+
+    let lead_page = f
+        .store
+        .manager_v2_inspect(
+            f.lead,
+            &AgentManagerInspectRequestV2 {
+                limit: 10,
+                ..query.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(lead_page.rows.len(), 2);
+    assert!(
+        lead_page
+            .rows
+            .iter()
+            .all(|row| row["epic_id"] == f.epic.to_string())
+    );
+    assert!(
+        !lead_page
+            .rows
+            .iter()
+            .any(|row| row["work_key"] == "outside-scope")
+    );
+
+    let next = f
+        .store
+        .manager_v2_inspect_operator(
+            f.project,
+            &AgentManagerInspectRequestV2 {
+                cursor: operator_page.next_cursor,
+                ..query
+            },
+        )
+        .unwrap();
+    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows[0]["work_key"], "migration-b");
+    assert_eq!(next.rows[0]["version"], 142);
+    assert_eq!(next.rows[0]["state"], "publishing");
+    assert_eq!(next.rows[0]["predecessor_sources"], json!(["a".repeat(40)]));
+    assert_eq!(next.rows[0]["conflict"], false);
+    assert!(next.complete);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn migration_allocations_report_missing_table_as_partial_coverage() {
+    let f = fixture();
+    f.store
+        .conn
+        .execute_batch(
+            "ALTER TABLE migration_allocation_claims RENAME TO migration_allocation_claims_unavailable",
+        )
+        .unwrap();
+    let page = inspect(&f, ManagerInspectSectionV2::MigrationAllocations);
+    assert!(!page.complete);
+    assert_eq!(page.rows[0]["state"], "unavailable");
+    assert_eq!(page.rows[0]["type"], "migration_allocation_source");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn reported_pass_and_completed_session_keep_partial_product_visible_without_acceptance() {
     let f = fixture();
@@ -736,6 +937,7 @@ fn reported_pass_and_completed_session_keep_partial_product_visible_without_acce
     assert_eq!(product["weight_denominator"], 2);
     assert_eq!(product["accepted"], 0);
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn dependencies_reject_cycles_and_compute_ready_from_current_records() {
     let f = fixture();
@@ -781,6 +983,7 @@ fn dependencies_reject_cycles_and_compute_ready_from_current_records() {
         json!(["a"])
     );
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn semantic_domains_conflict_while_shared_files_remain_concurrent() {
     let f = fixture();
@@ -820,6 +1023,7 @@ fn semantic_domains_conflict_while_shared_files_remain_concurrent() {
             .contains("domain_conflict")
     );
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn live_scope_and_target_are_checked_before_replay() {
     let f = fixture();
@@ -860,6 +1064,7 @@ fn live_scope_and_target_are_checked_before_replay() {
             .is_err()
     );
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() {
     let f = fixture();
@@ -871,6 +1076,7 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
                 epic_id: f.epic,
                 message: "First request".into(),
                 idempotency_key: "msg1".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -882,6 +1088,7 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
                 epic_id: f.epic,
                 message: "Second request".into(),
                 idempotency_key: "msg2".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -977,6 +1184,7 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
                 request_id: first.message_id,
                 message: "Status report delivered; implementation still pending".into(),
                 idempotency_key: "status-reply".into(),
+                still_running: true,
             },
         )
         .unwrap();
@@ -989,7 +1197,14 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
         "running"
     );
     f.store
-        .manager_v2_commit_update(f.lead, &completion, &LedgerObservation::default())
+        .manager_v2_commit_update(
+            f.lead,
+            &request(
+                transition(ManagerRequestStateV2::Completed, 3),
+                "request-complete-after-reply",
+            ),
+            &LedgerObservation::default(),
+        )
         .unwrap();
     let rows = inspect(&f, ManagerInspectSectionV2::Requests).rows;
     let row = rows
@@ -1015,6 +1230,7 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn settled_bookkeeping_history_does_not_exhaust_coordination_or_new_receipts() {
     let f = fixture();
@@ -1041,6 +1257,7 @@ fn settled_bookkeeping_history_does_not_exhaust_coordination_or_new_receipts() {
                 epic_id: f.epic,
                 message: "Budget receipt".into(),
                 idempotency_key: "budget-receipt".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -1084,6 +1301,7 @@ fn settled_bookkeeping_history_does_not_exhaust_coordination_or_new_receipts() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn live_bookkeeping_classes_refuse_their_own_typed_limits() {
     for (kind, code) in [
@@ -1116,6 +1334,7 @@ fn live_bookkeeping_classes_refuse_their_own_typed_limits() {
         assert!(read_error.to_string().contains(code), "{read_error}");
     }
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn descendant_pages_preserve_parent_and_worker_names() {
     let f = fixture();
@@ -1151,6 +1370,7 @@ fn descendant_pages_preserve_parent_and_worker_names() {
     }
     assert_eq!(names.len(), 4);
 }
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn operator_retains_bounded_state_when_manager_is_unavailable() {
     let f = fixture();
@@ -1180,6 +1400,7 @@ fn operator_retains_bounded_state_when_manager_is_unavailable() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn migration_reservations_refuse_released_versions_and_duplicate_claims() {
     let f = fixture();
@@ -1236,6 +1457,157 @@ fn migration_reservations_refuse_released_versions_and_duplicate_claims() {
     assert_eq!(a["migration_reservations"][0]["row_version"], 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn migration_seal_allocates_from_exact_work_source_and_release_is_idempotent() {
+    let f = fixture();
+    work(&f, "sealed");
+    let source = "1".repeat(40);
+    f.store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_work_facts SET payload_json=json_set(payload_json,'$.source_session_id',?1,'$.source_commit',?2) WHERE project_id=?3 AND kind='work' AND record_key='sealed'",
+            params![f.lead.to_string(), source, f.project.to_string()],
+        )
+        .unwrap();
+    let source = "1".repeat(40);
+    let seal = request(
+        ManagerUpdateV2::MigrationSeal {
+            key: "sealed".into(),
+            expected_row_version: 1,
+            source_commit: source.clone(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        },
+        "seal-claim",
+    );
+    let observed = LedgerObservation {
+        source_commit: Some(source.clone()),
+        migration_seal: Some((
+            "repo".into(),
+            "a".repeat(40),
+            crate::store::LATEST_SCHEMA_VERSION as u32,
+            None,
+            vec![],
+        )),
+        ..Default::default()
+    };
+    let issued = f
+        .store
+        .manager_v2_commit_update(f.manager, &seal, &observed)
+        .unwrap();
+    assert_eq!(issued.row_version, 1);
+    assert!(
+        f.store
+            .manager_v2_commit_update(f.manager, &seal, &observed)
+            .unwrap()
+            .deduplicated
+    );
+    let (_, claims) = f.store.migration_allocation_view("repo").unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].assigned_version,
+        crate::store::LATEST_SCHEMA_VERSION as u32 + 1
+    );
+    assert_eq!(claims[0].source_commit, source);
+    let release = request(
+        ManagerUpdateV2::MigrationSealRelease {
+            key: "sealed".into(),
+            claim_id: claims[0].id,
+            expected_row_version: claims[0].row_version,
+            source_commit: source.clone(),
+        },
+        "release-claim",
+    );
+    let released = f
+        .store
+        .manager_v2_commit_update(f.manager, &release, &LedgerObservation::default())
+        .unwrap();
+    assert!(
+        f.store
+            .manager_v2_commit_update(f.manager, &release, &LedgerObservation::default())
+            .unwrap()
+            .deduplicated
+    );
+    assert!(released.row_version > issued.row_version);
+    assert_eq!(
+        f.store.migration_allocation_view("repo").unwrap().1[0].state,
+        "released"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn migration_seal_transfer_keeps_version_and_changes_exact_source() {
+    let f = fixture();
+    work(&f, "old");
+    work(&f, "replacement");
+    let old_source = "1".repeat(40);
+    let new_source = "2".repeat(40);
+    for (key, source) in [("old", &old_source), ("replacement", &new_source)] {
+        f.store
+            .conn
+            .execute(
+                "UPDATE harness_manager_v2_work_facts SET payload_json=json_set(payload_json,'$.source_session_id',?1,'$.source_commit',?2) WHERE project_id=?3 AND kind='work' AND record_key=?4",
+                params![f.lead.to_string(), source, f.project.to_string(), key],
+            )
+            .unwrap();
+    }
+    let seal = request(
+        ManagerUpdateV2::MigrationSeal {
+            key: "old".into(),
+            expected_row_version: 1,
+            source_commit: old_source.clone(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        },
+        "old-seal",
+    );
+    let observed = LedgerObservation {
+        source_commit: Some(old_source.clone()),
+        migration_seal: Some((
+            "repo".into(),
+            "a".repeat(40),
+            crate::store::LATEST_SCHEMA_VERSION as u32,
+            None,
+            vec![],
+        )),
+        ..Default::default()
+    };
+    f.store
+        .manager_v2_commit_update(f.manager, &seal, &observed)
+        .unwrap();
+    let (_, claims) = f.store.migration_allocation_view("repo").unwrap();
+    let before = &claims[0];
+    let transfer = request(
+        ManagerUpdateV2::MigrationSealTransfer {
+            key: "replacement".into(),
+            claim_id: before.id,
+            expected_row_version: before.row_version,
+            source_commit: old_source,
+            new_source_commit: new_source.clone(),
+            expires_at: Utc::now() + chrono::Duration::hours(2),
+        },
+        "transfer-seal",
+    );
+    let observed = LedgerObservation {
+        source_commit: Some(new_source.clone()),
+        ..Default::default()
+    };
+    f.store
+        .manager_v2_commit_update(f.manager, &transfer, &observed)
+        .unwrap();
+    let (_, claims) = f.store.migration_allocation_view("repo").unwrap();
+    assert_eq!(claims[0].assigned_version, before.assigned_version);
+    assert_eq!(claims[0].source_commit, new_source);
+    assert_eq!(claims[0].work_key, "replacement");
+    assert!(
+        f.store
+            .manager_v2_commit_update(f.manager, &transfer, &observed)
+            .unwrap()
+            .deduplicated
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn migration_reservation_transfer_and_release_are_fenced() {
     let f = fixture();
@@ -1325,6 +1697,7 @@ fn migration_reservation_transfer_and_release_are_fenced() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn consumed_migration_reservation_remains_visible_and_cannot_move() {
     let f = fixture();
@@ -1366,6 +1739,7 @@ fn consumed_migration_reservation_remains_visible_and_cannot_move() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn a_plan_revision_preserves_partial_source_and_reopens_acceptance() {
     let f = fixture();
@@ -1420,6 +1794,7 @@ fn a_plan_revision_preserves_partial_source_and_reopens_acceptance() {
     assert_eq!(row["evidence_state"], "unknown");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn agent_decisions_cannot_replace_exact_operator_acceptance_gates() {
     let f = fixture();
@@ -1473,6 +1848,7 @@ fn agent_decisions_cannot_replace_exact_operator_acceptance_gates() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn descendant_live_cursor_tolerates_noise_and_refreshes_later_insertions() {
     let f = fixture();
@@ -1549,6 +1925,7 @@ fn descendant_live_cursor_tolerates_noise_and_refreshes_later_insertions() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn a_legal_epic_over_1024_workers_returns_every_identity_and_operator_topology() {
     let f = fixture();
@@ -1649,6 +2026,7 @@ fn add_worker(f: &Fixture, epic: Uuid, title: &str) -> Uuid {
     s.id
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn live_keyset_reparenting_never_repeats_rows_and_logical_removal_retains_identity() {
     let f = fixture();
@@ -1734,6 +2112,7 @@ fn live_keyset_reparenting_never_repeats_rows_and_logical_removal_retains_identi
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn leaf_cursor_rechecks_scope_anchor_policy_and_container_structure() {
     for change in ["scope", "anchor", "section", "epic", "policy", "container"] {
@@ -1812,6 +2191,7 @@ fn leaf_cursor_rechecks_scope_anchor_policy_and_container_structure() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn pending_reservations_page_past_1024_and_survive_rotation_and_publication() {
     let f = fixture();
@@ -1906,6 +2286,7 @@ fn pending_reservations_page_past_1024_and_survive_rotation_and_publication() {
     assert_eq!(rotated["continued_from"], f.lead.to_string());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn sparse_reservation_pages_advance_without_widening_epic_scope() {
     let f = fixture();
@@ -1963,6 +2344,7 @@ fn sparse_reservation_pages_advance_without_widening_epic_scope() {
     assert_eq!(third.rows[0]["title"], "Reserved page item 260");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn page_queries_seek_existing_indexes_instead_of_sorting_whole_epics() {
     let f = fixture();
@@ -2001,6 +2383,7 @@ fn page_queries_seek_existing_indexes_instead_of_sorting_whole_epics() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn forged_leaf_cursor_cannot_enter_manager_owned_container_pages() {
     let f = fixture();
@@ -2036,6 +2419,7 @@ fn forged_leaf_cursor_cannot_enter_manager_owned_container_pages() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn operator_request_audit_survives_unavailable_manager_lineage() {
     let f = fixture();
@@ -2047,6 +2431,7 @@ fn operator_request_audit_survives_unavailable_manager_lineage() {
                 epic_id: f.epic,
                 message: "Retained request audit".into(),
                 idempotency_key: "audit".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -2069,6 +2454,7 @@ fn operator_request_audit_survives_unavailable_manager_lineage() {
     assert_eq!(result.rows[0]["delivery_issue"], "lead_changed");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn operator_topology_pages_every_owned_container_and_keeps_retired_titles() {
     let f = fixture();
@@ -2136,6 +2522,7 @@ fn operator_topology_pages_every_owned_container_and_keeps_retired_titles() {
     assert_eq!(seen, expected);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn unsupported_nested_hierarchy_retains_parent_identity_and_reports_unknown_coverage() {
     let f = fixture();
@@ -2167,6 +2554,7 @@ fn unsupported_nested_hierarchy_retains_parent_identity_and_reports_unknown_cove
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn dependency_readiness_and_handoff_are_rehydrated_after_reopen() {
     let dir = tempfile::Builder::new()
@@ -2235,6 +2623,7 @@ fn dependency_readiness_and_handoff_are_rehydrated_after_reopen() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn request_cursor_detects_new_mail_and_lead_action_pages_include_its_work_updates() {
     let f = fixture();
@@ -2246,6 +2635,7 @@ fn request_cursor_detects_new_mail_and_lead_action_pages_include_its_work_update
                     epic_id: f.epic,
                     message: format!("Request {index}"),
                     idempotency_key: format!("mail{index}"),
+                    informational: false,
                 },
             )
             .unwrap();
@@ -2263,6 +2653,7 @@ fn request_cursor_detects_new_mail_and_lead_action_pages_include_its_work_update
                 epic_id: f.epic,
                 message: "Another request".into(),
                 idempotency_key: "new-mail".into(),
+                informational: false,
             },
         )
         .unwrap();
@@ -2315,6 +2706,7 @@ fn request_cursor_detects_new_mail_and_lead_action_pages_include_its_work_update
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn an_explicit_stage_blocker_owns_unfinished_work_until_it_is_cleared() {
     let f = fixture();
@@ -2345,6 +2737,7 @@ fn an_explicit_stage_blocker_owns_unfinished_work_until_it_is_cleared() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn harness_manager_empty_group_scope_is_visible_and_topology_requires_policy() {
     let f = fixture();

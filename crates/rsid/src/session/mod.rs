@@ -22,10 +22,11 @@ mod archive_cleanup;
 mod cards;
 pub mod chain_driver;
 mod cohort_settlement;
+mod completed_transcript_cache;
 mod context_pipeline;
 mod delegated_operator;
 mod esp_games;
-mod graph_executions;
+pub(crate) mod graph_executions;
 pub(crate) mod graph_runner;
 pub(crate) mod harness;
 pub(crate) mod harness_hash;
@@ -50,8 +51,11 @@ mod provider_spawn;
 mod queries;
 pub(crate) mod question;
 mod reaper;
+pub mod retention;
 #[cfg(test)]
 pub(crate) use reaper::fail_runtime_orphan_reap_for_test;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use reaper::scoped_archive_cleanup_test_proc;
 pub(crate) mod recursive_bridge;
 pub(crate) mod retry_policy;
 mod rotation;
@@ -63,6 +67,7 @@ pub(crate) use spawn_single_flight::RotationPublicationGuards;
 mod summarizer;
 pub(crate) mod tag_ops;
 pub(crate) mod title;
+pub(crate) mod topology_agent_verbs;
 pub(crate) mod topology_bridge;
 pub(crate) mod topology_ops;
 pub mod types;
@@ -236,9 +241,15 @@ pub async fn run_bounded_retry_dispatch<F, Fut>(
     }
 }
 
+/// Weak self-reference shared with every `AgentControlHandle` (#633).
+pub(crate) type TopologyAgentSelf = Arc<std::sync::OnceLock<std::sync::Weak<SessionManager>>>;
+
 pub struct SessionManager {
+    /// Set before the graceful restart drain; no new provider turn may start.
+    pub(super) restart_draining: std::sync::atomic::AtomicBool,
     pub(super) active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     pub(super) completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+    completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache,
     pub(super) event_bus: Arc<EventBus>,
     pub(super) claude_client: Option<ClaudeClient>,
     pub(super) codex_client: Option<CodexClient>,
@@ -273,6 +284,10 @@ pub struct SessionManager {
     workflow_executions: Arc<std::sync::Mutex<graph_executions::WorkflowExecutionRegistry>>,
     /// One live driver per durable topology execution (#634).
     pub(crate) topology_drivers: Arc<crate::topology::executor::DriverRegistry>,
+    /// Installed by `start_topology_executor` once the manager is shared;
+    /// native `rsi_control_topology_*` tools reach the executor through it
+    /// (#633). Unset before startup: those tools refuse instead of acting.
+    pub(crate) topology_agent_self: TopologyAgentSelf,
     /// Optional background task queue handle for enqueuing deferred work.
     pub(crate) queue_handle: Option<crate::queue::worker::QueueHandle>,
     /// In-memory cache of parsed RSI.md configs per project.
@@ -578,8 +593,10 @@ impl SessionManager {
         }
 
         Ok(Self {
+            restart_draining: std::sync::atomic::AtomicBool::new(false),
             active: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
+            completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache::new(),
             event_bus,
             claude_client,
             codex_client,
@@ -606,6 +623,7 @@ impl SessionManager {
                 graph_executions::WorkflowExecutionRegistry::default(),
             )),
             topology_drivers: Arc::default(),
+            topology_agent_self: Arc::default(),
             queue_handle: None,
             workflow_config_cache,
             workspace_roots,
@@ -1391,6 +1409,7 @@ fn compose_watch_line(
     session: &rsi_common::types::Session,
     retry_eligible: Option<bool>,
     question_pending: bool,
+    sandbox_worktree_dirty: Option<bool>,
     arm_message: &str,
 ) -> String {
     let id_str = session.id.to_string();
@@ -1402,6 +1421,9 @@ fn compose_watch_line(
     }
     if question_pending {
         annotations.push("question-pending: true".to_string());
+    }
+    if sandbox_worktree_dirty == Some(true) {
+        annotations.push("sandbox-worktree-dirty: true".to_string());
     }
     let ann = if annotations.is_empty() {
         String::new()
@@ -1554,6 +1576,20 @@ impl SessionManager {
         } else {
             false
         };
+        // The manager-scoped event transport watches the manager lineage
+        // anchor itself. Its terminal status must not turn each new subject
+        // into another continuation while a prior wake still awaits Inbox.
+        if durable_manager_notice
+            && manager_route.is_some_and(|(source, target)| source == target)
+            && self
+                .store
+                .lock()
+                .await
+                .manager_notice_first_wake_pending(job.id)?
+                .is_none()
+        {
+            return Ok(WatchFirePlan::NotReady);
+        }
 
         // 1. Predicate on the watched lineage tip for ordinary watches (F3
         //    INV-4); manager-routed watches keep the exact watched session.
@@ -1671,8 +1707,18 @@ impl SessionManager {
         let mut lines = if durable_manager_notice {
             vec![job.message.clone()]
         } else {
-            let mut line =
-                compose_watch_line(&primary_row, retry_eligible, question_pending, &job.message);
+            let dirty = self
+                .store
+                .lock()
+                .await
+                .terminal_sandbox_worktree_dirty(primary_row.id)?;
+            let mut line = compose_watch_line(
+                &primary_row,
+                retry_eligible,
+                question_pending,
+                dirty,
+                &job.message,
+            );
             if watched != subject {
                 line.push_str(" — lineage: ");
                 line.push_str(&watched.to_string());
@@ -1790,8 +1836,18 @@ impl SessionManager {
                 if durable_manager_notice {
                     lines.push(sibling.message.clone());
                 } else {
-                    let mut line =
-                        compose_watch_line(&sib_row, sib_retry, sib_question, &sibling.message);
+                    let dirty = self
+                        .store
+                        .lock()
+                        .await
+                        .terminal_sandbox_worktree_dirty(sib_row.id)?;
+                    let mut line = compose_watch_line(
+                        &sib_row,
+                        sib_retry,
+                        sib_question,
+                        dirty,
+                        &sibling.message,
+                    );
                     if sib_watched != sib_subject {
                         line.push_str(" — lineage: ");
                         line.push_str(&sib_watched.to_string());

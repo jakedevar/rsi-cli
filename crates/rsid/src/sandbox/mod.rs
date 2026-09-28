@@ -291,6 +291,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_allocate_happy_path() {
         let repo = tempdir().unwrap();
@@ -313,6 +314,7 @@ mod tests {
         assert!(branch.starts_with("rsi/"), "branch should be rsi/<short>");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_allocation_honors_explicit_commit_and_branch_policy() {
         let repo = tempdir().unwrap();
@@ -381,6 +383,7 @@ mod tests {
         dir
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_allocate_non_git_rejected() {
         let base = tempdir().unwrap();
@@ -400,6 +403,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_destroy_removes_worktree_and_branch() {
         let repo = tempdir().unwrap();
@@ -433,6 +437,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_destroy_idempotent() {
         let repo = tempdir().unwrap();
@@ -451,6 +456,7 @@ mod tests {
             .expect("second destroy must be idempotent");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_destroy_by_path_is_confined_to_isolated_unit_fixture() {
         let base = tempdir().unwrap();
@@ -466,6 +472,7 @@ mod tests {
         assert!(!root.exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn sandbox_list_on_disk_missing_base_returns_empty() {
         let base = tempdir().unwrap();
@@ -482,6 +489,7 @@ mod tests {
     /// the absence of an allocation must produce all-None columns. This
     /// test guards that mapping so a future refactor that accidentally
     /// drops the branch or mis-maps the kind is caught by the unit suite.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn launch_sandbox_columns_populated() {
         use rsi_common::types::{SandboxCleanupState, SandboxKind};

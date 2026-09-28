@@ -100,6 +100,7 @@ async fn wait_for_watch(
     .expect("watch state persisted")
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_settling_watch_delivers_once_per_child_epoch_and_preserves_rearm() {
     let (manager, _dir) = manager();

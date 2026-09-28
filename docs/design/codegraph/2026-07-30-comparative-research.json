@@ -1,0 +1,233 @@
+{
+  "version": 2,
+  "research_question": "How should RSI design a deterministic, revision-aware structural codegraph and safely federate it with episodic knowledge?",
+  "areas": [
+    "current RSI truth",
+    "Graphify v0.9.25 comparison",
+    "storage ownership",
+    "Rust extraction and traversal",
+    "federation",
+    "authorization and operations",
+    "verification"
+  ],
+  "findings": [
+    {
+      "id": "F-001",
+      "summary": "D5 is an unsliced benchmark-gated codegraph idea that this design must refine.",
+      "file_ref": "thoughts/shared/orchestration/2026-07-02-pending-slices-board.md:327",
+      "confidence": "high"
+    },
+    {
+      "id": "F-002",
+      "summary": "The May 11 project-scoped memory plan is implemented history, not active planning.",
+      "file_ref": "thoughts/shared/plans/2026-05-11-project-scoped-agent-memory-retrieval.md:3",
+      "confidence": "high"
+    },
+    {
+      "id": "F-003",
+      "summary": "Workflow DAGs, episodic memory, and structural code truth require separate models and lifecycles.",
+      "file_ref": "crates/rsi-graph/src/lib.rs:1",
+      "confidence": "high"
+    },
+    {
+      "id": "F-004",
+      "summary": "Effective sandbox or worktree identity determines the source structure visible to a session.",
+      "file_ref": "crates/rsid/src/session/launch.rs:546",
+      "confidence": "high"
+    },
+    {
+      "id": "F-005",
+      "summary": "Deterministic tree-sitter extraction is valuable, but RSI needs exact spans and versioned rules.",
+      "file_ref": "graphify/extractors/rust.py:61",
+      "confidence": "high"
+    },
+    {
+      "id": "F-006",
+      "summary": "Dictionary and JSON graph storage weakens typing, parallel-edge preservation, and multi-evidence fidelity.",
+      "file_ref": "graphify/build.py:274",
+      "confidence": "high"
+    },
+    {
+      "id": "F-007",
+      "summary": "Structural facts need explicit provenance, numeric confidence, producer identity, and source evidence.",
+      "file_ref": "docs/how-it-works.md:34",
+      "confidence": "high"
+    },
+    {
+      "id": "F-008",
+      "summary": "Changed and deleted file contributions require transactional replacement and stale-edge elimination.",
+      "file_ref": "graphify/build.py:1044",
+      "confidence": "high"
+    },
+    {
+      "id": "F-009",
+      "summary": "Every graph query requires uniform count, depth, time, memory, and token budgets.",
+      "file_ref": "graphify/serve.py:796",
+      "confidence": "high"
+    },
+    {
+      "id": "F-010",
+      "summary": "Deterministic document markers belong in structure while LLM rationale belongs in evidence-labelled federation.",
+      "file_ref": "graphify/extractors/markdown.py:53",
+      "confidence": "high"
+    },
+    {
+      "id": "F-011",
+      "summary": "Node summaries are derived model output requiring provenance and invalidation, not structural truth.",
+      "file_ref": "docs/node-summaries-rfc.md:1",
+      "confidence": "high"
+    },
+    {
+      "id": "F-012",
+      "summary": "A dense native inspector has MVP value; broad visualization and export should follow demand.",
+      "file_ref": "graphify/export.py:232",
+      "confidence": "medium"
+    },
+    {
+      "id": "F-013",
+      "summary": "Work-memory overlays must remain separate from structure and become governed federation links.",
+      "file_ref": "graphify/reflect.py:613",
+      "confidence": "high"
+    },
+    {
+      "id": "F-014",
+      "summary": "Multi-repository graphs require namespaced identity, authorized scope, and explicit cross-repository evidence.",
+      "file_ref": "graphify/global_graph.py:10",
+      "confidence": "high"
+    },
+    {
+      "id": "F-015",
+      "summary": "Later upstream fixes reinforce identity, staleness, ambiguity, direction, and scope as invariants.",
+      "file_ref": "docs/design/codegraph/2026-07-30-comparative-research.md:217",
+      "confidence": "high"
+    },
+    {
+      "id": "F-016",
+      "summary": "Per-workspace SQLite structure plus durable main-database links best balances churn, recovery, and knowledge durability.",
+      "file_ref": "docs/memory-architecture.md:143",
+      "confidence": "high"
+    },
+    {
+      "id": "F-017",
+      "summary": "Tree-sitter plus Cargo metadata is the lowest-risk Rust, Cargo, and Markdown MVP base.",
+      "file_ref": "Cargo.toml:85",
+      "confidence": "high"
+    },
+    {
+      "id": "F-018",
+      "summary": "rust-analyzer and SCIP should be optional measured precision augmentations, not MVP coupling.",
+      "file_ref": "graphify/scip_ingest.py:1",
+      "confidence": "medium"
+    },
+    {
+      "id": "F-019",
+      "summary": "Bounded SQL plus bounded in-memory snapshots is the appropriate traversal split.",
+      "file_ref": "docs/design/codegraph/2026-07-30-comparative-research.md:302",
+      "confidence": "medium"
+    },
+    {
+      "id": "F-020",
+      "summary": "Community detection should be a later derived benchmark rather than an MVP dependency.",
+      "file_ref": "graphify/cluster.py:1",
+      "confidence": "high"
+    },
+    {
+      "id": "F-021",
+      "summary": "Dreamer source_ids must remain observation lineage; cross-domain relationships need a separate ledger.",
+      "file_ref": "crates/rsi-common/src/types.rs:1526",
+      "confidence": "high"
+    },
+    {
+      "id": "F-022",
+      "summary": "Native tool registries already demonstrate server-bound project and caller authorization.",
+      "file_ref": "crates/rsid/src/session/harness/tools/mod.rs:21",
+      "confidence": "high"
+    },
+    {
+      "id": "F-023",
+      "summary": "Dormant FileIndex and RetrievalBackend concepts provide an integration seam without model collapse.",
+      "file_ref": "crates/rsi-graph/src/context.rs:8",
+      "confidence": "high"
+    },
+    {
+      "id": "F-024",
+      "summary": "Codegraph retrieval should be on demand rather than unconditionally injected into session context.",
+      "file_ref": "crates/rsid/src/session/context_pipeline.rs:45",
+      "confidence": "high"
+    },
+    {
+      "id": "F-025",
+      "summary": "Daemon indexing requires bounded queues, debounce, cancellation, backpressure, reconciliation, and health.",
+      "file_ref": "crates/rsid/src/memory/worker.rs:16",
+      "confidence": "high"
+    },
+    {
+      "id": "F-026",
+      "summary": "Existing dense navigator and inspector overlays provide an appropriate native TUI grammar.",
+      "file_ref": "crates/rsi/src/ui/session.rs:300",
+      "confidence": "high"
+    },
+    {
+      "id": "F-027",
+      "summary": "Before-and-after benchmarks and evidence-correct golden questions must gate expansion beyond dogfood.",
+      "file_ref": "thoughts/shared/orchestration/2026-07-02-pending-slices-board.md:327",
+      "confidence": "high"
+    }
+  ],
+  "file_refs": [
+    {
+      "path": "thoughts/shared/orchestration/2026-07-02-pending-slices-board.md",
+      "lines": [324, 327]
+    },
+    {
+      "path": "thoughts/shared/plans/2026-05-11-project-scoped-agent-memory-retrieval.md",
+      "lines": [2, 7]
+    },
+    {
+      "path": "docs/memory-architecture.md",
+      "lines": [143, 203]
+    },
+    {
+      "path": "crates/rsid/src/session/launch.rs",
+      "lines": [490, 584]
+    },
+    {
+      "path": "crates/rsid/src/memory/worker.rs",
+      "lines": [16, 85]
+    },
+    {
+      "path": "crates/rsid/src/memory/sync.rs",
+      "lines": [153, 253]
+    },
+    {
+      "path": "crates/rsi-graph/src/context.rs",
+      "lines": [8, 30]
+    },
+    {
+      "path": "crates/rsi-graph/src/retrieval.rs",
+      "lines": [37, 70]
+    },
+    {
+      "path": "crates/rsi-common/src/types.rs",
+      "lines": [1495, 1537]
+    }
+  ],
+  "open_questions": [
+    {
+      "summary": "Should initial indexing be explicit opt-in or automatic only for the RSI dogfood repository?",
+      "blocks_planning": true
+    },
+    {
+      "summary": "What clean and dirty snapshot retention limits should apply per worktree?",
+      "blocks_planning": true
+    },
+    {
+      "summary": "May a future slice add the durable federation ledger to main rsi.db?",
+      "blocks_planning": true
+    },
+    {
+      "summary": "Should the first implementation slice include TUI inspection or daemon and native tools only?",
+      "blocks_planning": true
+    }
+  ]
+}

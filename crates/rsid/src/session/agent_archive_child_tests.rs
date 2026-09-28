@@ -501,6 +501,7 @@ fn assert_refused(
 
 // --- Logical archive, sandbox retention, C5 marker ------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_logically_archives_failed_child_and_keeps_sandbox() {
     let fx = Fx::new().await;
@@ -535,6 +536,7 @@ async fn archive_child_logically_archives_failed_child_and_keeps_sandbox() {
     assert!(!fx.manager.completed.read().await.contains_key(&fx.child));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_never_enters_cleanup_saga() {
     let fx = Fx::new().await;
@@ -573,6 +575,7 @@ async fn archive_child_never_enters_cleanup_saga() {
     assert!(sandbox.is_dir());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_settles_pending_c5_marker_atomically() {
     let fx = Fx::new().await;
@@ -583,6 +586,7 @@ async fn archive_child_settles_pending_c5_marker_atomically() {
     assert!(!fx.c5_marker(fx.child).await);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_c5_marker_survives_refused_archive() {
     let fx = Fx::new().await;
@@ -598,6 +602,7 @@ async fn archive_child_c5_marker_survives_refused_archive() {
     assert!(fx.c5_marker(fx.child).await);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_capacity_owned_failure() {
     let fx = Fx::new().await;
@@ -628,6 +633,7 @@ async fn archive_child_refuses_capacity_owned_failure() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_operator_pause() {
     let fx = Fx::new().await;
@@ -646,6 +652,7 @@ async fn archive_child_refuses_operator_pause() {
 
 // --- Manager-mode parity (recovery_owner_gate extraction) -----------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_action_human_gate_still_holds_on_c5_marker() {
     let fx = Fx::new().await;
@@ -666,6 +673,7 @@ async fn manager_action_human_gate_still_holds_on_c5_marker() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn manager_action_human_gate_still_refuses_program_human_gate() {
     let fx = Fx::new().await;
@@ -686,6 +694,7 @@ async fn manager_action_human_gate_still_refuses_program_human_gate() {
 
 // --- Program gate in agent-archive mode -----------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_program_human_gate_outcome() {
     let fx = Fx::new().await;
@@ -701,6 +710,7 @@ async fn archive_child_refuses_program_human_gate_outcome() {
     assert!(fx.c5_marker(fx.child).await);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_unknown_program_evidence() {
     let fx = Fx::new().await;
@@ -715,6 +725,7 @@ async fn archive_child_refuses_unknown_program_evidence() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_allows_program_terminal_allowed_outcome() {
     let fx = Fx::new().await;
@@ -729,6 +740,7 @@ async fn archive_child_allows_program_terminal_allowed_outcome() {
 
 // --- Authority -------------------------------------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_allows_current_epic_lead() {
     let fx = Fx::new().await;
@@ -740,6 +752,7 @@ async fn archive_child_allows_current_epic_lead() {
 /// Decision A (review a755d660): archive authority is the current Epic lead
 /// only. A leaf that spawned the child holds no archive authority; the lead
 /// does.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_non_lead_spawn_owner_current_lead_only() {
     let fx = Fx::new().await;
@@ -762,6 +775,7 @@ async fn archive_child_refuses_non_lead_spawn_owner_current_lead_only() {
 /// Review round 2 (`former-lead-spawn-owner`): the lead that spawned a child
 /// keeps its launched reservation after a handoff, but a lead's authority is
 /// only the current-lead branch.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_former_lead_spawn_owner_after_handoff() {
     let fx = Fx::new().await;
@@ -783,6 +797,7 @@ async fn archive_child_refuses_former_lead_spawn_owner_after_handoff() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Archived);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_former_lead_spawn_owner_dedup_replay() {
     let fx = Fx::new().await;
@@ -806,6 +821,7 @@ async fn archive_child_refuses_former_lead_spawn_owner_dedup_replay() {
     assert_eq!(count_archived(&mut events, fx.child), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_direct_parent_that_is_not_owner() {
     let fx = Fx::new().await;
@@ -823,6 +839,7 @@ async fn archive_child_refuses_direct_parent_that_is_not_owner() {
     assert_eq!(fx.status(nested).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_manager_session_control() {
     use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
@@ -906,6 +923,7 @@ async fn archive_child_refuses_manager_session_control() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_former_lead_after_handoff() {
     let fx = Fx::new().await;
@@ -930,6 +948,7 @@ async fn archive_child_refuses_former_lead_after_handoff() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_tip_under_other_epic() {
     let fx = Fx::new().await;
@@ -956,6 +975,7 @@ async fn archive_child_refuses_tip_under_other_epic() {
 
 // --- Target-shape and live-continuation refusals --------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_self() {
     let fx = Fx::new().await;
@@ -967,6 +987,7 @@ async fn archive_child_refuses_self() {
     assert_eq!(fx.status(fx.lead).await, SessionStatus::Running);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_running_target() {
     let fx = Fx::new().await;
@@ -983,6 +1004,7 @@ async fn archive_child_refuses_running_target() {
 
 /// A container can never be a child of the lead's Epic (illegal topology),
 /// so it is refused at authority before any shape check runs.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_container() {
     let fx = Fx::new().await;
@@ -994,6 +1016,7 @@ async fn archive_child_refuses_container() {
     assert_eq!(fx.status(fx.epic).await, SessionStatus::Running);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_epic_lead_target() {
     let fx = Fx::new().await;
@@ -1012,6 +1035,7 @@ async fn archive_child_refuses_epic_lead_target() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_running_successor() {
     let fx = Fx::new().await;
@@ -1030,6 +1054,7 @@ async fn archive_child_refuses_running_successor() {
 
 /// The retained recovery-owner clause (an enabled non-sentinel resume wake)
 /// runs before the live-continuation probes, so it is the refusing owner.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_enabled_resume_wake() {
     let fx = Fx::new().await;
@@ -1043,6 +1068,7 @@ async fn archive_child_refuses_enabled_resume_wake() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_live_retry_timer() {
     let fx = Fx::new().await;
@@ -1061,6 +1087,7 @@ async fn archive_child_refuses_live_retry_timer() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_fresh_relaunch_intent() {
     use crate::store::agent_child_relaunch_intents::{RelaunchIntentRow, RelaunchState};
@@ -1097,6 +1124,7 @@ async fn archive_child_refuses_fresh_relaunch_intent() {
 /// Review a6423c3f `archive_pending_mail_coverage`: every pending mailbox
 /// state targeting the child's lineage refuses the archive, and the mail stays
 /// pending for its delivery owner.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_pending_mail_keeps_child_failed_and_mail_pending() {
     for state in ["queued", "claimed", "injected", "uncertain"] {
@@ -1132,6 +1160,7 @@ async fn archive_child_refuses_pending_mail_keeps_child_failed_and_mail_pending(
 
 /// Review a6423c3f `archive_successor_reservation_coverage`: a live successor
 /// reservation for the child refuses the archive and is left untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_live_successor_reservation_keeps_reservation() {
     for state in ["reserved", "launching", "uncertain"] {
@@ -1165,6 +1194,7 @@ async fn archive_child_refuses_live_successor_reservation_keeps_reservation() {
 
 // --- Review source --------------------------------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_open_review_assignment() {
     let fx = Fx::new().await;
@@ -1178,6 +1208,7 @@ async fn archive_child_refuses_open_review_assignment() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_refuses_unverdicted_review_source() {
     let fx = Fx::new().await;
@@ -1190,6 +1221,7 @@ async fn archive_child_refuses_unverdicted_review_source() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_allows_review_source_after_verdict() {
     let fx = Fx::new().await;
@@ -1221,6 +1253,7 @@ async fn archive_child_allows_review_source_after_verdict() {
 
 // --- Cursor, dedup and replay authority -----------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_stale_cursor_returns_observed_witness() {
     let fx = Fx::new().await;
@@ -1242,6 +1275,7 @@ async fn archive_child_stale_cursor_returns_observed_witness() {
     assert_eq!(fx.status(fx.child).await, SessionStatus::Failed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_replay_is_deduplicated() {
     let fx = Fx::new().await;
@@ -1256,6 +1290,7 @@ async fn archive_child_replay_is_deduplicated() {
     assert_eq!(count_archived(&mut events, fx.child), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_replay_after_lead_handoff() {
     let fx = Fx::new().await;
@@ -1278,6 +1313,7 @@ async fn archive_child_replay_after_lead_handoff() {
     assert_eq!(count_archived(&mut events, fx.child), 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_dedup_replay_rechecks_authority_inside_transaction() {
     let fx = Fx::new().await;
@@ -1307,6 +1343,7 @@ async fn archive_child_dedup_replay_rechecks_authority_inside_transaction() {
 
 // --- Watches and serialization --------------------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_consumes_caller_watch_without_second_delivery() {
     let fx = Fx::new().await;
@@ -1336,6 +1373,7 @@ async fn archive_child_consumes_caller_watch_without_second_delivery() {
     assert_eq!(witness, "consumed");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_leaves_other_owner_watch_enabled() {
     let fx = Fx::new().await;
@@ -1350,6 +1388,7 @@ async fn archive_child_leaves_other_owner_watch_enabled() {
     assert!(fx.job_enabled(foreign.id).await);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn archive_child_serializes_with_inflight_continue() {
     let fx = Arc::new(Fx::new().await);

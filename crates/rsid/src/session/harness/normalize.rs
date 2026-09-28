@@ -1,7 +1,7 @@
 //! Repair incomplete tool exchanges before sending conversation history to a provider.
 
 use super::types::{ChatMessage, MessageRole};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct RepairCount {
@@ -36,33 +36,34 @@ pub(super) fn normalize_history(history: &mut Vec<ChatMessage>) -> RepairCount {
         filtered.push(message);
     }
 
-    let mut repaired = Vec::with_capacity(filtered.len());
-    let mut messages = filtered.into_iter().peekable();
-    while let Some(message) = messages.next() {
-        let missing: Vec<String> = if message.role == MessageRole::Assistant {
+    let mut results: HashMap<String, ChatMessage> = filtered
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .filter_map(|message| {
             message
-                .tool_calls
-                .iter()
-                .filter(|call| !seen_results.contains(&call.id))
-                .map(|call| call.id.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        repaired.push(message);
-        if !missing.is_empty() {
-            // Keep all real sibling results in their original order, then append repairs.
-            while matches!(messages.peek(), Some(next) if next.role == MessageRole::Tool) {
-                if let Some(result) = messages.next() {
+                .tool_call_id
+                .as_ref()
+                .map(|call_id| (call_id.clone(), message.clone()))
+        })
+        .collect();
+    let mut repaired = Vec::with_capacity(filtered.len());
+    for message in filtered {
+        if message.role == MessageRole::Tool {
+            continue;
+        }
+        if message.role == MessageRole::Assistant {
+            let calls = message.tool_calls.clone();
+            repaired.push(message);
+            for call in calls {
+                if let Some(result) = results.remove(&call.id) {
                     repaired.push(result);
-                }
-            }
-            for call_id in missing {
-                if seen_results.insert(call_id.clone()) {
-                    repaired.push(ChatMessage::tool_result(call_id, "aborted"));
+                } else {
+                    repaired.push(ChatMessage::tool_error_result(call.id, "aborted"));
                     counts.synthesized += 1;
                 }
             }
+        } else {
+            repaired.push(message);
         }
     }
     *history = repaired;
@@ -94,15 +95,18 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn orphan_call_gets_aborted_result_after_assistant() {
         let mut history = vec![assistant(&["a"]), ChatMessage::user("next")];
         assert_eq!(normalize_history(&mut history).synthesized, 1);
         assert_eq!(history[1].tool_call_id.as_deref(), Some("a"));
         assert_eq!(history[1].content, "aborted");
+        assert!(history[1].is_error);
         assert_eq!(history[2].content, "next");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn orphan_result_is_dropped() {
         let mut history = vec![ChatMessage::tool_result("lost", "output")];
@@ -110,18 +114,21 @@ mod tests {
         assert!(history.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
-    fn parallel_calls_keep_real_result_before_missing_result() {
+    fn parallel_calls_keep_call_order_with_missing_result() {
         let mut history = vec![
             assistant(&["a", "b"]),
             ChatMessage::tool_result("b", "real"),
         ];
         assert_eq!(normalize_history(&mut history).synthesized, 1);
-        assert_eq!(history[1].content, "real");
-        assert_eq!(history[2].tool_call_id.as_deref(), Some("a"));
-        assert_eq!(history[2].content, "aborted");
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(history[1].content, "aborted");
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("b"));
+        assert_eq!(history[2].content, "real");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn duplicate_result_keeps_first() {
         let mut history = vec![
@@ -134,6 +141,7 @@ mod tests {
         assert_eq!(history[1].content, "first");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn normalization_is_idempotent() {
         let mut history = vec![
@@ -147,8 +155,23 @@ mod tests {
         assert_eq!(signature(&history), once);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
-    fn mixed_interleaving_preserves_real_message_order() {
+    fn late_error_result_is_relocated_with_error_flag() {
+        let mut result = ChatMessage::tool_error_result("a", "failed");
+        result.is_error = true;
+        let mut history = vec![assistant(&["a"]), ChatMessage::user("middle"), result];
+
+        normalize_history(&mut history);
+
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("a"));
+        assert!(history[1].is_error);
+        assert_eq!(history[2].content, "middle");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[test]
+    fn mixed_interleaving_moves_late_result_after_call_block() {
         let mut history = vec![
             ChatMessage::system("system"),
             assistant(&["a", "b"]),
@@ -158,13 +181,15 @@ mod tests {
             assistant(&["c"]),
             ChatMessage::user("end"),
         ];
-        let original = signature(&history);
         assert_eq!(normalize_history(&mut history).synthesized, 1);
-        let real_after: Vec<_> = signature(&history)
-            .into_iter()
-            .filter(|(_, content, _)| content != "aborted")
-            .collect();
-        assert_eq!(real_after, original);
+        assert_eq!(history[0].content, "system");
+        assert_eq!(history[1].role, MessageRole::Assistant);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(history[2].content, "a real");
+        assert_eq!(history[3].tool_call_id.as_deref(), Some("b"));
+        assert_eq!(history[3].content, "b real");
+        assert_eq!(history[4].content, "middle");
         assert_eq!(history[6].tool_call_id.as_deref(), Some("c"));
+        assert_eq!(history[7].content, "end");
     }
 }

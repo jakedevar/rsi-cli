@@ -371,6 +371,15 @@ enum StoreChannelAdmissionOutcome {
 }
 
 impl AdmissionPermit {
+    #[cfg(test)]
+    pub(crate) fn for_route_dispatch_test() -> Self {
+        Self {
+            invocation_id: Uuid::new_v4(),
+            purpose: ModelInvocationPurpose::SessionLaunchFresh,
+            model_tier: ModelTier::Standard,
+            execution_claimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
     pub fn invocation_id(&self) -> Uuid {
         self.invocation_id
     }
@@ -665,11 +674,14 @@ pub fn classify_error_class(error: &DaemonError) -> String {
     match error {
         DaemonError::ChannelClosed | DaemonError::CancellationCleanup(_) => "cancelled".to_string(),
         DaemonError::InvalidParam(_) => "input".to_string(),
+        DaemonError::OpenRouterRoutePreflight { .. } => "openrouter_route_preflight".to_string(),
         DaemonError::OpenAiApiError(_) => "api".to_string(),
         DaemonError::PolicyDenied(_) => "policy_denied".to_string(),
         DaemonError::ExecutionScratchUnavailable(_) => "execution_scratch_unavailable".to_string(),
         DaemonError::StreamFallbackRequired(_) => "stream_fallback_required".to_string(),
         DaemonError::Process(_) => "process".to_string(),
+        DaemonError::CodexResumeToolHistory(_) => "codex_resume_tool_history_invalid".to_string(),
+        DaemonError::CodexResumeTornTail => "codex_resume_rollout_torn_tail".to_string(),
         DaemonError::StartupProviderInventory(_) => "startup_provider_inventory".to_string(),
         DaemonError::Rpc(_) | DaemonError::StructuredRpc { .. } => "rpc".to_string(),
         DaemonError::Store(_) | DaemonError::Database(_) => "store".to_string(),
@@ -1545,6 +1557,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn reserved_closure_launch_resumes_only_pre_session_exact_admission() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1580,6 +1593,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_loads_persisted_stop_all_before_services_start() {
         let store = Store::open_in_memory().expect("store");
@@ -1592,6 +1606,7 @@ mod tests {
         assert!(signal.fault.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_fails_closed_when_durable_mode_is_corrupt() {
         let store = Store::open_in_memory().expect("store");
@@ -1609,6 +1624,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn catalog_only_purpose_cannot_acquire_an_admission_permit() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1623,6 +1639,7 @@ mod tests {
         assert!(error.to_string().contains("non-invocation"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn missing_expected_usage_is_denied_before_admission() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1637,6 +1654,7 @@ mod tests {
         assert!(error.to_string().contains("missing expected_usage"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn paid_cache_capable_reservations_include_cache_read_capacity() {
         let usage = explicit_expected_usage(
@@ -1648,6 +1666,7 @@ mod tests {
         assert!(usage.cache_read_tokens > 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn paid_background_is_denied_by_default() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1685,6 +1704,7 @@ mod tests {
         assert!(matches!(error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn local_background_is_admitted_in_normal_mode() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1725,6 +1745,7 @@ mod tests {
         assert_eq!(permit.model_tier, ModelTier::Local);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn request_fingerprint_is_hashed() {
         let fingerprint =
@@ -1733,6 +1754,7 @@ mod tests {
         assert!(!fingerprint.contains("plain prompt"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn remote_model_with_colon_is_not_treated_as_local() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1773,6 +1795,7 @@ mod tests {
         assert_ne!(permit.model_tier, ModelTier::Local);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn concurrent_child_admissions_respect_explicit_tree_bounds() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1967,6 +1990,7 @@ mod tests {
         assert_eq!(denied_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_cancellation_invokes_registered_callback_once() {
         let runtime = ModelControlRuntime::default_normal();
@@ -1993,6 +2017,7 @@ mod tests {
         assert_eq!(second.mechanism, "fake_background");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn runtime_publish_signal_notifies_subscribers() {
         let runtime = ModelControlRuntime::default_normal();
@@ -2011,6 +2036,7 @@ mod tests {
         assert_eq!(signal.updated_at.as_deref(), Some("2026-07-15T00:00:00Z"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn duplicate_admission_and_completion_emit_once() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2058,6 +2084,7 @@ mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn cancellation_request_emits_bus_event_and_signal_once() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2175,6 +2202,7 @@ mod tests {
         bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn concurrent_cloned_permits_claim_exactly_one_cli_execution() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2223,6 +2251,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn one_admission_cannot_cross_or_repeat_execution_boundaries() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2299,6 +2328,7 @@ mod tests {
         assert!(matches!(app_server_error, DaemonError::PolicyDenied(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn purpose_rejects_an_unregistered_runtime_route_before_consumption() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2327,6 +2357,7 @@ mod tests {
             .expect("wrong-route rejection must not consume the one-use capability");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn claimed_cli_route_cannot_cross_to_another_registered_cli_sink() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -2357,6 +2388,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn admitted_cli_spawn_centrally_stamps_invocation_and_daemon_namespace() {
         let route = registry::RuntimeExecutionRoute::ClaudeCli;

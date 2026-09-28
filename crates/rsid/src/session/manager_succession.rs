@@ -125,7 +125,14 @@ impl SessionManager {
                 return Err(refused("manager_succession_predecessor_unsettled"));
             }
         }
-        if !self.context_rotation_enabled {
+        // UpdateDaemonConfig publishes to RuntimeConfig before persisting the
+        // setting. Match the live value used by launch_session; the Store still
+        // rechecks the persisted gate before effects and authority publication.
+        if !self
+            .runtime_config
+            .context_rotation_enabled
+            .load(Ordering::Relaxed)
+        {
             return Err(refused("manager_succession_rotation_disabled"));
         }
         tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor))

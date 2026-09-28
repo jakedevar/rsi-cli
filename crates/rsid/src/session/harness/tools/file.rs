@@ -3,7 +3,7 @@
 //! All paths resolved through path_safety::resolve_sandboxed_path
 //! and checked against the system blocklist.
 
-use super::{HarnessTool, is_system_blocked};
+use super::{HarnessTool, ToolExecutionMode, is_system_blocked, truncation::truncate_text};
 use crate::path_safety::resolve_sandboxed_path;
 use crate::session::harness::types::ToolResult;
 use std::path::Path;
@@ -16,6 +16,10 @@ pub struct ReadFileTool;
 impl HarnessTool for ReadFileTool {
     fn name(&self) -> &str {
         "read_file"
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::ParallelSafe
     }
 
     fn description(&self) -> &str {
@@ -54,16 +58,7 @@ impl HarnessTool for ReadFileTool {
 
         match tokio::fs::read_to_string(&resolved).await {
             Ok(content) => {
-                let output = if content.len() > MAX_READ_BYTES {
-                    format!(
-                        "{}...\n\n[truncated at {} bytes, file is {} bytes total]",
-                        &content[..MAX_READ_BYTES],
-                        MAX_READ_BYTES,
-                        content.len()
-                    )
-                } else {
-                    content
-                };
+                let output = truncate_text(&content, MAX_READ_BYTES, false).content;
                 ToolResult {
                     success: true,
                     output,
@@ -253,6 +248,7 @@ mod tests {
         std::env::temp_dir()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_read_file_missing() {
         let tool = ReadFileTool;
@@ -266,6 +262,7 @@ mod tests {
         assert!(result.error_msg.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_read_file_traversal_rejected() {
         let tool = ReadFileTool;
@@ -275,6 +272,29 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn test_read_file_truncation_preserves_lines_and_utf8() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let content = format!("first line\n{}é\nlast line", "x".repeat(MAX_READ_BYTES));
+        tokio::fs::write(temp.path().join("large.txt"), &content)
+            .await
+            .unwrap();
+
+        let result = ReadFileTool
+            .execute(serde_json::json!({"path": "large.txt"}), temp.path())
+            .await;
+        assert!(result.success, "{:?}", result.error_msg);
+        assert!(result.output.starts_with("first line\n[truncated:"));
+        assert!(
+            result
+                .output
+                .contains(&format!("{} bytes total", content.len()))
+        );
+        assert!(result.output.len() <= MAX_READ_BYTES);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_write_and_read_roundtrip() {
         let wd = std::env::temp_dir();
@@ -301,6 +321,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_edit_file_unique_match() {
         let wd = std::env::temp_dir();
@@ -328,6 +349,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_edit_file_not_found_in_file() {
         let wd = std::env::temp_dir();
@@ -358,6 +380,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_edit_file_non_unique_rejected() {
         let wd = std::env::temp_dir();
@@ -383,6 +406,7 @@ mod tests {
         let _ = tokio::fs::remove_file(wd.join(filename)).await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn test_write_blocked_system_path() {
         let tool = WriteFileTool;

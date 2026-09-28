@@ -112,6 +112,7 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_exact_match() {
         let dir = make_real_dir("exact_match");
@@ -123,6 +124,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_prefix_match() {
         let dir = make_real_dir("prefix_match");
@@ -137,6 +139,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_no_match() {
         let dir = make_real_dir("no_match");
@@ -150,6 +153,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_path_boundary_no_false_prefix_match() {
         // dir must NOT match dir + "bar" suffix
@@ -171,6 +175,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_longest_prefix_wins() {
         let parent_dir = make_real_dir("longest_prefix_parent");
@@ -195,6 +200,7 @@ mod tests {
         cleanup(&parent_dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_projects_without_path_excluded() {
         let dir = make_real_dir("no_path_excluded");
@@ -208,6 +214,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_invalidate_rebuilds() {
         let dir1 = make_real_dir("invalidate_old");
@@ -226,6 +233,7 @@ mod tests {
         cleanup(&dir2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_empty_index() {
         let index = ProjectIndex::new(vec![]);
@@ -234,6 +242,7 @@ mod tests {
         assert_eq!(index.find_project_for_path(Path::new("/any/path")), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn test_concurrent_invalidation_and_lookup() {
         use std::sync::Arc;
@@ -279,6 +288,7 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_multiple_projects_ordering() {
         let a = make_real_dir("ordering_a");
@@ -303,6 +313,7 @@ mod tests {
         cleanup(&a);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_canonicalization_in_index() {
         // Create a real temp dir so canonicalize works
@@ -317,6 +328,7 @@ mod tests {
         cleanup(&tmp);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_nonexistent_project_path_excluded_from_index() {
         let p = make_project(

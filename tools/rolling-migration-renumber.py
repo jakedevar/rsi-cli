@@ -588,12 +588,16 @@ def build_candidate(repo: Path, unit: dict, scratch: Path) -> dict:
         run(repo, "worktree", "add", "--detach", "--quiet", str(worktree), unit["target"])
         error = None
         outcome = None
+        env = {"GIT_AUTHOR_NAME": "rsi rolling landing",
+               "GIT_AUTHOR_EMAIL": "rsi-rolling-land@rsi.invalid",
+               "GIT_COMMITTER_NAME": "rsi rolling landing",
+               "GIT_COMMITTER_EMAIL": "rsi-rolling-land@rsi.invalid"}
         try:
             merge = subprocess.run(
                 git_argv(worktree, "-c", "merge.conflictStyle=diff3", "merge", "--no-ff",
                          "--no-commit", "--no-stat", "-q", unit["transformed_source"]),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=safe_env(), check=False,
+                env={**safe_env(), **env}, check=False,
             )
             if merge.returncode != 0:
                 unmerged = run(worktree, "diff", "--name-only", "--diff-filter=U", "-z")
@@ -601,10 +605,6 @@ def build_candidate(repo: Path, unit: dict, scratch: Path) -> dict:
                     raise Refusal(f"provisional merge refused: {merge.stderr.decode(errors='replace').strip()}")
             resolution = resolve(repo, worktree, unit)
             tree = run(worktree, "write-tree").decode().strip()
-            env = {"GIT_AUTHOR_NAME": "rsi rolling landing",
-                   "GIT_AUTHOR_EMAIL": "rsi-rolling-land@rsi.invalid",
-                   "GIT_COMMITTER_NAME": "rsi rolling landing",
-                   "GIT_COMMITTER_EMAIL": "rsi-rolling-land@rsi.invalid"}
             candidate = run(repo, "commit-tree", tree, "-p", unit["target"],
                             "-p", unit["source"], "-m",
                             "rsi landing: renumber provisional migration", env=env).decode().strip()

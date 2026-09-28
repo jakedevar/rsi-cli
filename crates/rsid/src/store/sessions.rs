@@ -106,8 +106,330 @@ pub(crate) fn resolve_owning_epic_topology_tx(
 }
 
 const ARCHIVED_SESSION_LOOKBACK_DAYS: i64 = 7;
+pub(crate) const CODEGRAPH_CUSTODY_PAGE_MAX: usize = 128;
+const CODEGRAPH_READ_FENCE_MAX_ROWS: usize = 65_536;
+const CODEGRAPH_READ_FENCE_MAX_TIME: Duration = Duration::from_secs(30);
+pub(crate) type CodegraphCustodyRow = (Uuid, Uuid, PathBuf, PathBuf, i64);
+
+pub(crate) struct CodegraphReadFence {
+    local_changes: i64,
+    external_version: i64,
+    registry_digest: blake3::Hash,
+}
 
 impl Store {
+    fn codegraph_change_counters(&self) -> Result<(i64, i64)> {
+        let local_changes = self
+            .conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))?;
+        let external_version = self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok((local_changes, external_version))
+    }
+
+    /// Hash only the Store fields that authorize Codegraph project and custody
+    /// reads. Session events and accounting do not revoke a dormant read.
+    fn codegraph_registry_digest(&self) -> Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        let started = Instant::now();
+        let mut scanned = 0usize;
+        for (domain, sql, columns) in [
+            (
+                b"projects".as_slice(),
+                "SELECT id,path FROM projects ORDER BY id",
+                2,
+            ),
+            (
+                b"custody".as_slice(),
+                "SELECT r.custody_id,r.owner_session_id,r.canonical_repo_dir,r.sandbox_root,
+                        r.state,r.validation_state,CAST(r.generation AS TEXT),
+                        CAST(r.validated_generation AS TEXT),s.sandbox_custody_id,
+                        s.sandbox_cleanup_state,s.sandbox_root,s.status
+                 FROM sandbox_custody_roots r LEFT JOIN sessions s ON s.id=r.owner_session_id
+                 ORDER BY r.custody_id",
+                12,
+            ),
+        ] {
+            hasher.update(domain);
+            let mut statement = self.conn.prepare(sql)?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                scanned += 1;
+                if scanned > CODEGRAPH_READ_FENCE_MAX_ROWS
+                    || started.elapsed() > CODEGRAPH_READ_FENCE_MAX_TIME
+                {
+                    return Err(DaemonError::Store(
+                        "Codegraph authorization digest limit exceeded".into(),
+                    ));
+                }
+                for column in 0..columns {
+                    let value: Option<String> = row.get(column)?;
+                    if let Some(value) = value {
+                        hasher.update(&[1]);
+                        hasher.update(&(value.len() as u64).to_be_bytes());
+                        hasher.update(value.as_bytes());
+                    } else {
+                        hasher.update(&[0]);
+                    }
+                }
+            }
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// Detect concurrent authorization changes while Codegraph validates
+    /// filesystem identity outside the shared Store lock.
+    pub(crate) fn codegraph_read_fence(&self) -> Result<CodegraphReadFence> {
+        for _ in 0..3 {
+            let before = self.codegraph_change_counters()?;
+            let registry_digest = self.codegraph_registry_digest()?;
+            if self.codegraph_change_counters()? == before {
+                return Ok(CodegraphReadFence {
+                    local_changes: before.0,
+                    external_version: before.1,
+                    registry_digest,
+                });
+            }
+        }
+        Err(DaemonError::Store(
+            "Codegraph authorization changed while establishing read fence".into(),
+        ))
+    }
+
+    pub(crate) fn codegraph_read_fence_matches(
+        &self,
+        fence: &mut CodegraphReadFence,
+    ) -> Result<bool> {
+        self.codegraph_read_fence_matches_with(fence, Self::codegraph_registry_digest)
+    }
+
+    fn codegraph_read_fence_matches_with(
+        &self,
+        fence: &mut CodegraphReadFence,
+        mut digest: impl FnMut(&Self) -> Result<blake3::Hash>,
+    ) -> Result<bool> {
+        for _ in 0..3 {
+            let before = self.codegraph_change_counters()?;
+            if before == (fence.local_changes, fence.external_version) {
+                return Ok(true);
+            }
+            let current_digest = digest(self)?;
+            if self.codegraph_change_counters()? != before {
+                continue;
+            }
+            if current_digest != fence.registry_digest {
+                return Ok(false);
+            }
+            fence.local_changes = before.0;
+            fence.external_version = before.1;
+            return Ok(true);
+        }
+        Err(DaemonError::Store(
+            "Codegraph authorization changed while checking read fence".into(),
+        ))
+    }
+
+    /// Page verified, live custody without allowing terminal history to occupy
+    /// active indexing slots. A caller that needs history passes `false` and
+    /// traverses the same custody identities on demand.
+    pub(crate) fn codegraph_custody_page(
+        &self,
+        after: Option<Uuid>,
+        active_only: bool,
+        limit: usize,
+    ) -> Result<Vec<CodegraphCustodyRow>> {
+        if !(1..=CODEGRAPH_CUSTODY_PAGE_MAX).contains(&limit) {
+            return Err(DaemonError::InvalidParam(
+                "invalid Codegraph custody page size".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT r.custody_id, r.owner_session_id, r.canonical_repo_dir, r.sandbox_root, r.generation
+             FROM sandbox_custody_roots r
+             JOIN sessions s ON s.id=r.owner_session_id
+               AND s.sandbox_custody_id=r.custody_id
+             WHERE r.state='live' AND r.validation_state='verified'
+               AND r.validated_generation=r.generation
+               AND s.sandbox_cleanup_state='Live'
+               AND s.sandbox_root=r.sandbox_root
+               AND (?1 IS NULL OR r.custody_id>?1)
+               AND (?2=0 OR s.status IN ('Starting','Running','WaitingApproval'))
+             ORDER BY r.custody_id LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    after.map(|id| id.to_string()),
+                    i64::from(active_only),
+                    limit as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(custody_id, owner_session_id, repo, root, generation)| {
+                Ok((
+                    Uuid::parse_str(&custody_id).map_err(|error| {
+                        DaemonError::Store(format!("invalid Codegraph custody UUID: {error}"))
+                    })?,
+                    Uuid::parse_str(&owner_session_id).map_err(|error| {
+                        DaemonError::Store(format!("invalid Codegraph custody owner UUID: {error}"))
+                    })?,
+                    PathBuf::from(repo),
+                    PathBuf::from(root),
+                    generation,
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_codegraph_custody_fixture(
+        &self,
+        custody_id: Uuid,
+        owner_session_id: Uuid,
+        repo: &Path,
+        root: &Path,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.conn.execute(
+            "INSERT INTO sandbox_custody_roots
+             (custody_id,allocation_id,canonical_repo_dir,sandbox_root,sandbox_branch,
+              repository_identity,source_commit,state,owner_session_id,generation,
+              event_sequence,validation_state,validated_generation,validated_at,created_at,updated_at)
+             VALUES (?1,?1,?2,?3,'rsi/test','repo',
+                     '0000000000000000000000000000000000000000',
+                     'live',?4,1,1,'verified',1,?5,?5,?5)",
+            params![custody_id.to_string(), repo.to_string_lossy(), root.to_string_lossy(), owner_session_id.to_string(), now],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET sandbox_custody_id=?1,sandbox_kind='GitWorktree',
+             sandbox_root=?2,sandbox_branch='rsi/test',sandbox_cleanup_state='Live' WHERE id=?3",
+            params![
+                custody_id.to_string(),
+                root.to_string_lossy(),
+                owner_session_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a single verified custody identity for construction-time native
+    /// tool binding; session status intentionally does not gate historical reads.
+    pub(crate) fn codegraph_custody_by_id(&self, id: Uuid) -> Result<Option<CodegraphCustodyRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT r.owner_session_id, r.canonical_repo_dir, r.sandbox_root, r.generation
+             FROM sandbox_custody_roots r
+             JOIN sessions s ON s.id=r.owner_session_id
+               AND s.sandbox_custody_id=r.custody_id
+             WHERE r.custody_id=?1
+               AND r.state='live' AND r.validation_state='verified'
+               AND r.validated_generation=r.generation
+               AND s.sandbox_cleanup_state='Live'
+               AND s.sandbox_root=r.sandbox_root",
+                [id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(owner, repo, root, generation)| {
+            Ok((
+                id,
+                Uuid::parse_str(&owner).map_err(|error| {
+                    DaemonError::Store(format!("invalid Codegraph custody owner UUID: {error}"))
+                })?,
+                PathBuf::from(repo),
+                PathBuf::from(root),
+                generation,
+            ))
+        })
+        .transpose()
+    }
+
+    pub(crate) fn codegraph_custody_by_root(
+        &self,
+        root: &Path,
+    ) -> Result<Option<CodegraphCustodyRow>> {
+        let Some(root) = root.to_str() else {
+            return Ok(None);
+        };
+        let custody_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT custody_id FROM sandbox_custody_roots WHERE sandbox_root=?1",
+                [root],
+                |row| row.get(0),
+            )
+            .optional()?;
+        custody_id
+            .map(|id| {
+                let id = Uuid::parse_str(&id).map_err(|error| {
+                    DaemonError::Store(format!("invalid Codegraph custody UUID: {error}"))
+                })?;
+                self.codegraph_custody_by_id(id)
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// An RSI-owned path never gets a second DetachedRootHash identity, even
+    /// after its custody becomes terminal or is tombstoned.
+    pub(crate) fn is_known_codegraph_custody_root(&self, root: &Path) -> Result<bool> {
+        let Some(root) = root.to_str() else {
+            return Ok(false);
+        };
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots WHERE sandbox_root=?1)",
+            [root],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Custody roots are immutable and never deleted; rowid paging lets the
+    /// registry cache exclusions without re-reading all historical paths on
+    /// every refresh.
+    pub(crate) fn codegraph_known_roots_since(
+        &self,
+        after_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, PathBuf)>> {
+        if !(1..=CODEGRAPH_CUSTODY_PAGE_MAX).contains(&limit) || after_rowid < 0 {
+            return Err(DaemonError::InvalidParam(
+                "invalid Codegraph known-root page".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid,sandbox_root FROM sandbox_custody_roots
+             WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after_rowid, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Trusted, currently verified sandbox worktrees for codegraph indexing.
     /// Custody IDs survive session rotation; session IDs and branch names do not.
     pub fn list_codegraph_sandbox_registrations(&self) -> Result<Vec<(Uuid, PathBuf, PathBuf)>> {
@@ -2582,6 +2904,532 @@ mod active_session_inventory_tests {
     use super::*;
     use crate::store::tests::make_test_session;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn codegraph_read_fence_ignores_unrelated_session_writes_but_detects_project_change() {
+        let store = Store::open_in_memory().unwrap();
+        let mut fence = store.codegraph_read_fence().unwrap();
+        store.insert_session(&make_test_session()).unwrap();
+        assert!(store.codegraph_read_fence_matches(&mut fence).unwrap());
+        let root = tempfile::tempdir().unwrap();
+        store
+            .insert_project(&rsi_common::types::Project {
+                id: Uuid::new_v4(),
+                name: "new project".into(),
+                path: Some(root.path().to_path_buf()),
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert!(!store.codegraph_read_fence_matches(&mut fence).unwrap());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn codegraph_read_fence_retries_change_during_digest_before_accepting() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("rsi.db");
+        let store = Store::open(&database).unwrap();
+        let external = rusqlite::Connection::open(&database).unwrap();
+        let project_id = Uuid::new_v4();
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        store
+            .insert_project(&rsi_common::types::Project {
+                id: project_id,
+                name: "changing project".into(),
+                path: Some(first_root.path().to_path_buf()),
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let mut fence = store.codegraph_read_fence().unwrap();
+        store.insert_session(&make_test_session()).unwrap();
+        let mut changed = false;
+        let mut digest_calls = 0;
+        let matches = store
+            .codegraph_read_fence_matches_with(&mut fence, |store| {
+                digest_calls += 1;
+                let digest = store.codegraph_registry_digest()?;
+                if !changed {
+                    external.execute(
+                        "UPDATE projects SET path=?1 WHERE id=?2",
+                        params![second_root.path().to_string_lossy(), project_id.to_string()],
+                    )?;
+                    changed = true;
+                }
+                Ok(digest)
+            })
+            .unwrap();
+        assert!(changed);
+        assert!(digest_calls >= 2);
+        assert!(!matches);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn codegraph_workspace_cursor_covers_more_than_128_dormant_custodies() {
+        use crate::codegraph::{
+            CodegraphReadService, CodegraphServiceError, IndexManager, RegisteredWorkspace,
+        };
+        use rsi_common::codegraph::CodegraphWorkspacePageRequestV1;
+
+        let repo = tempfile::tempdir().unwrap();
+        let checkouts = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let project_id = Uuid::new_v4();
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        {
+            let guard = store.blocking_lock();
+            guard
+                .insert_project(&rsi_common::types::Project {
+                    id: project_id,
+                    name: "dormant".into(),
+                    path: Some(repo.path().to_path_buf()),
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+            for ordinal in 0..130_u128 {
+                let root = checkouts.path().join(format!("checkout-{ordinal:03}"));
+                std::fs::create_dir(&root).unwrap();
+                std::fs::write(
+                    root.join(".git"),
+                    format!("gitdir: {}\n", repo.path().join(".git").display()),
+                )
+                .unwrap();
+                let mut session = make_test_session();
+                session.id = Uuid::from_u128(ordinal + 1);
+                session.project_id = Some(project_id);
+                session.status = SessionStatus::Completed;
+                session.working_dir = root.clone();
+                guard.insert_session(&session).unwrap();
+                let custody_id = Uuid::from_u128(ordinal + 1000);
+                guard.conn.execute(
+                    "INSERT INTO sandbox_custody_roots
+                     (custody_id,allocation_id,canonical_repo_dir,sandbox_root,sandbox_branch,
+                      repository_identity,source_commit,state,owner_session_id,generation,
+                      event_sequence,validation_state,validated_generation,validated_at,created_at,updated_at)
+                     VALUES (?1,?1,?2,?3,'rsi/history','repo',
+                             '0000000000000000000000000000000000000000',
+                             'live',?4,1,1,'verified',1,?5,?5,?5)",
+                    params![custody_id.to_string(), repo.path().to_str().unwrap(), root.to_str().unwrap(), session.id.to_string(), now],
+                ).unwrap();
+                guard.conn.execute(
+                    "UPDATE sessions SET sandbox_custody_id=?1,sandbox_kind='GitWorktree',
+                     sandbox_root=?2,sandbox_branch='rsi/history',sandbox_cleanup_state='Live' WHERE id=?3",
+                    params![custody_id.to_string(), root.to_str().unwrap(), session.id.to_string()],
+                ).unwrap();
+            }
+        }
+        let primary = RegisteredWorkspace::primary(project_id, repo.path()).unwrap();
+        let (_manager, handle) =
+            IndexManager::new(indexes.path().to_path_buf(), vec![primary]).unwrap();
+        let service = CodegraphReadService::with_store(&handle, store.clone());
+        let first = service
+            .list_workspaces(CodegraphWorkspacePageRequestV1 {
+                project_id,
+                cursor: None,
+                limit: 32,
+            })
+            .unwrap();
+        let old_cursor = first.next_cursor.clone().unwrap();
+        let mut seen = first
+            .workspaces
+            .iter()
+            .map(|entry| entry.workspace_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut cursor = first.next_cursor;
+        while let Some(next) = cursor {
+            let page = service
+                .list_workspaces(CodegraphWorkspacePageRequestV1 {
+                    project_id,
+                    cursor: Some(next),
+                    limit: 32,
+                })
+                .unwrap();
+            seen.extend(page.workspaces.iter().map(|entry| entry.workspace_id));
+            cursor = page.next_cursor;
+        }
+        assert_eq!(seen.len(), 131);
+        let later = (0..130_u128)
+            .map(|ordinal| Uuid::from_u128(ordinal + 1000))
+            .find(|custody_id| {
+                let id = rsi_codegraph::CodegraphStore::workspace_id(
+                    project_id,
+                    &format!("rsi-sandbox:{custody_id}"),
+                )
+                .unwrap();
+                !first
+                    .workspaces
+                    .iter()
+                    .any(|entry| entry.workspace_id == id)
+            })
+            .unwrap();
+        store.blocking_lock().conn.execute(
+            "UPDATE sandbox_custody_roots SET generation=2,validated_generation=2 WHERE custody_id=?1",
+            [later.to_string()],
+        ).unwrap();
+        assert!(matches!(
+            service.list_workspaces(CodegraphWorkspacePageRequestV1 {
+                project_id,
+                cursor: Some(old_cursor.clone()),
+                limit: 32,
+            }),
+            Err(CodegraphServiceError::CursorExpired)
+        ));
+        store.blocking_lock().conn.execute(
+            "UPDATE sandbox_custody_roots SET validation_state='unverified',validated_generation=NULL,validated_at=NULL WHERE custody_id=?1",
+            [later.to_string()],
+        ).unwrap();
+        assert!(matches!(
+            service.list_workspaces(CodegraphWorkspacePageRequestV1 {
+                project_id,
+                cursor: Some(old_cursor),
+                limit: 32,
+            }),
+            Err(CodegraphServiceError::CursorExpired)
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[tokio::test]
+    async fn terminal_custody_keeps_snapshot_reads_and_resume_tools_before_starting() {
+        use crate::codegraph::{BoundCodegraphScope, CodegraphReadService, CodegraphServiceError};
+        use crate::codegraph::{
+            IndexPhase, IndexRuntime, NativeCodegraphBinding, NativeCodegraphToolKind,
+            RegisteredWorkspace,
+        };
+        use rsi_common::codegraph::{
+            CodegraphFilterV1, CodegraphOperatorReadV1, CodegraphQueryLimitsV1, CodegraphReadV1,
+            CodegraphScopeV1, CodegraphSearchModeV1, CodegraphSnapshotPageRequestV1,
+            CodegraphWorkspacePageRequestV1,
+        };
+
+        let repo = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            checkout.path().join(".git"),
+            format!("gitdir: {}\n", repo.path().join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("lib.rs"), "pub fn primary() {}\n").unwrap();
+        std::fs::write(checkout.path().join("lib.rs"), "pub fn historic() {}\n").unwrap();
+        let project_id = Uuid::new_v4();
+        let project = rsi_common::types::Project {
+            id: project_id,
+            name: "history".into(),
+            path: Some(repo.path().to_path_buf()),
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store.insert_project(&project).unwrap();
+        let mut session = make_test_session();
+        session.project_id = Some(project_id);
+        session.status = SessionStatus::Completed;
+        session.working_dir = checkout.path().to_path_buf();
+        store.insert_session(&session).unwrap();
+        let custody_id = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store.conn.execute(
+            "INSERT INTO sandbox_custody_roots
+             (custody_id,allocation_id,canonical_repo_dir,sandbox_root,sandbox_branch,
+              repository_identity,source_commit,state,owner_session_id,generation,
+              event_sequence,validation_state,validated_generation,validated_at,created_at,updated_at)
+             VALUES (?1,?1,?2,?3,'rsi/history','repo',
+                     '0000000000000000000000000000000000000000',
+                     'live',?4,1,1,'verified',1,?5,?5,?5)",
+            params![custody_id.to_string(), repo.path().to_str().unwrap(),
+                checkout.path().to_str().unwrap(), session.id.to_string(), now],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_custody_id=?1,sandbox_kind='GitWorktree',
+             sandbox_root=?2,sandbox_branch='rsi/history',sandbox_cleanup_state='Live'
+             WHERE id=?3",
+                params![
+                    custody_id.to_string(),
+                    checkout.path().to_str().unwrap(),
+                    session.id.to_string()
+                ],
+            )
+            .unwrap();
+        let workspace = RegisteredWorkspace::registered_checkout(
+            project_id,
+            repo.path(),
+            checkout.path(),
+            rsi_codegraph::WorkspaceInstanceKey::RsiSandbox(custody_id),
+        )
+        .unwrap();
+        let original_id = workspace.workspace_id();
+        let runtime = IndexRuntime::start_with_registrations(
+            indexes.path().to_path_buf(),
+            vec![project],
+            vec![(
+                custody_id,
+                repo.path().to_path_buf(),
+                checkout.path().to_path_buf(),
+            )],
+            &[],
+        )
+        .unwrap();
+        runtime.handle().set_enabled(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .handle()
+                    .status(original_id)
+                    .is_some_and(|item| item.phase == IndexPhase::Ready)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_generation = runtime
+            .handle()
+            .status(original_id)
+            .unwrap()
+            .ready
+            .unwrap()
+            .generation;
+        std::fs::write(
+            checkout.path().join("lib.rs"),
+            "pub fn historic() {}\npub fn newer() {}\n",
+        )
+        .unwrap();
+        runtime.handle().force_rescan(original_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .handle()
+                    .status(original_id)
+                    .and_then(|item| item.ready)
+                    .is_some_and(|ready| ready.generation > first_generation)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        let changed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            changed.path().join(".git"),
+            format!("gitdir: {}\n", repo.path().join(".git").display()),
+        )
+        .unwrap();
+        let substituted = RegisteredWorkspace::registered_checkout(
+            project_id,
+            repo.path(),
+            changed.path(),
+            rsi_codegraph::WorkspaceInstanceKey::RsiSandbox(custody_id),
+        )
+        .unwrap();
+        assert_eq!(substituted.workspace_id(), original_id);
+        let (_substituted_manager, stale_handle) = crate::codegraph::IndexManager::new(
+            indexes.path().join("substituted"),
+            vec![
+                RegisteredWorkspace::primary(project_id, repo.path()).unwrap(),
+                substituted,
+            ],
+        )
+        .unwrap();
+        let stale_store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            let service = CodegraphReadService::with_store(&stale_handle, stale_store);
+            assert!(matches!(
+                service.resolve_operator_scope(
+                    CodegraphScopeV1 {
+                        project_id,
+                        workspace_id: Some(original_id),
+                    },
+                    true
+                ),
+                Err(CodegraphServiceError::ScopeDenied)
+            ));
+        })
+        .await
+        .unwrap();
+        runtime
+            .handle()
+            .reconcile(vec![
+                RegisteredWorkspace::primary(project_id, repo.path()).unwrap(),
+            ])
+            .unwrap();
+        assert!(
+            runtime
+                .handle()
+                .registered_workspace(original_id)
+                .unwrap()
+                .is_none()
+        );
+        let handle = runtime.handle().clone();
+        let read_store = store.clone();
+        let owner = session.id;
+        let root = checkout.path().to_path_buf();
+        let page_cursor = tokio::task::spawn_blocking(move || {
+            let service = CodegraphReadService::with_store(&handle, read_store.clone());
+            let scope = CodegraphScopeV1 {
+                project_id,
+                workspace_id: Some(original_id),
+            };
+            let bound = service.resolve_operator_scope(scope.clone(), true).unwrap();
+            let status = service.status(&bound).unwrap();
+            assert_eq!(status.ready.as_ref().unwrap().workspace_id, original_id);
+            let page = service
+                .list_workspaces(CodegraphWorkspacePageRequestV1 {
+                    project_id,
+                    cursor: None,
+                    limit: 32,
+                })
+                .unwrap();
+            assert!(
+                page.workspaces
+                    .iter()
+                    .any(|entry| entry.workspace_id == original_id)
+            );
+            let page_cursor = service
+                .list_workspaces(CodegraphWorkspacePageRequestV1 {
+                    project_id,
+                    cursor: None,
+                    limit: 1,
+                })
+                .unwrap()
+                .next_cursor
+                .unwrap();
+            let history = service
+                .list_snapshots(CodegraphSnapshotPageRequestV1 {
+                    scope: scope.clone(),
+                    cursor: None,
+                    limit: 32,
+                })
+                .unwrap();
+            let generation = history.snapshots[0].generation;
+            assert_eq!(
+                service
+                    .snapshot_at(scope.clone(), generation)
+                    .unwrap()
+                    .snapshot
+                    .workspace_id,
+                original_id
+            );
+            let search = service
+                .read_operator(
+                    CodegraphOperatorReadV1 {
+                        scope: scope.clone(),
+                        read: CodegraphReadV1::Search {
+                            mode: CodegraphSearchModeV1::ExactName,
+                            query: "historic".into(),
+                            node_kinds: vec![],
+                            path_prefix: None,
+                        },
+                        filter: CodegraphFilterV1::default(),
+                        limits: CodegraphQueryLimitsV1::default(),
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(search.meta.snapshot.workspace_id, original_id);
+            let diff = service
+                .read_operator(
+                    CodegraphOperatorReadV1 {
+                        scope: scope.clone(),
+                        read: CodegraphReadV1::Diff {
+                            baseline_generation: None,
+                        },
+                        filter: CodegraphFilterV1::default(),
+                        limits: CodegraphQueryLimitsV1::default(),
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(diff.meta.snapshot.workspace_id, original_id);
+            let resumed = NativeCodegraphBinding::for_resumed_launch(
+                &handle,
+                read_store.clone(),
+                project_id,
+                owner,
+                &root,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(resumed.permits(NativeCodegraphToolKind::Status));
+            assert!(resumed.permits(NativeCodegraphToolKind::Search));
+            assert!(resumed.permits(NativeCodegraphToolKind::Diff));
+            let foreign =
+                BoundCodegraphScope::from_daemon_identity(Uuid::new_v4(), original_id, true);
+            assert!(matches!(
+                service.status(&foreign),
+                Err(CodegraphServiceError::ScopeDenied)
+            ));
+            page_cursor
+        })
+        .await
+        .unwrap();
+        store.lock().await.conn.execute("UPDATE sandbox_custody_roots SET validation_state='unverified',validated_generation=NULL,validated_at=NULL WHERE custody_id=?1", [custody_id.to_string()]).unwrap();
+        let handle = runtime.handle().clone();
+        tokio::task::spawn_blocking(move || {
+            let service = CodegraphReadService::with_store(&handle, store.clone());
+            let denied = service.resolve_operator_scope(
+                CodegraphScopeV1 {
+                    project_id,
+                    workspace_id: Some(original_id),
+                },
+                true,
+            );
+            assert!(matches!(denied, Err(CodegraphServiceError::ScopeDenied)));
+            assert!(matches!(
+                service.list_workspaces(CodegraphWorkspacePageRequestV1 {
+                    project_id,
+                    cursor: Some(page_cursor),
+                    limit: 1,
+                }),
+                Err(CodegraphServiceError::CursorExpired)
+            ));
+            store
+                .blocking_lock()
+                .conn
+                .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE sandbox_custody_roots")
+                .unwrap();
+            assert!(
+                NativeCodegraphBinding::for_resumed_launch(
+                    &handle,
+                    store,
+                    project_id,
+                    owner,
+                    checkout.path(),
+                )
+                .is_err()
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn codegraph_registry_reads_only_verified_current_custody() {
         let store = Store::open_in_memory().unwrap();
@@ -2652,6 +3500,145 @@ mod active_session_inventory_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[tokio::test]
+    async fn codegraph_custody_pages_keep_historical_reads_and_find_later_active_owner() {
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut active_custody = None;
+        for ordinal in 0..131_u128 {
+            let mut session = make_test_session();
+            session.id = Uuid::from_u128(ordinal + 1);
+            session.status = if ordinal == 130 {
+                SessionStatus::Running
+            } else {
+                SessionStatus::Completed
+            };
+            store.insert_session(&session).unwrap();
+            let custody_id = Uuid::from_u128(ordinal + 1000);
+            let root = format!("/tmp/codegraph-registry-page-{custody_id}");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sandbox_custody_roots
+                 (custody_id,allocation_id,canonical_repo_dir,sandbox_root,sandbox_branch,
+                  repository_identity,source_commit,state,owner_session_id,generation,
+                  event_sequence,validation_state,validated_generation,validated_at,
+                  created_at,updated_at)
+                 VALUES (?1,?1,'/tmp/codegraph-repo',?2,'rsi/test','repo',
+                         '0000000000000000000000000000000000000000',
+                         'live',?3,1,1,'verified',1,?4,?4,?4)",
+                    params![custody_id.to_string(), root, session.id.to_string(), now],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET sandbox_custody_id=?1,sandbox_kind='GitWorktree',
+                 sandbox_root=?2,sandbox_branch='rsi/test',sandbox_cleanup_state='Live'
+                 WHERE id=?3",
+                    params![custody_id.to_string(), root, session.id.to_string()],
+                )
+                .unwrap();
+            if ordinal == 130 {
+                active_custody = Some((custody_id, session.id, PathBuf::from(root)));
+            }
+        }
+
+        let (active_id, active_owner, active_root) = active_custody.unwrap();
+        let mut historical = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store.codegraph_custody_page(after, false, 64).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|row| row.0);
+            historical.extend(page);
+        }
+        assert_eq!(historical.len(), 131);
+        assert_eq!(historical.last().unwrap().0, active_id);
+        assert_eq!(
+            store.codegraph_custody_page(None, true, 64).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.codegraph_custody_by_id(active_id).unwrap().unwrap().1,
+            active_owner
+        );
+        assert!(store.is_known_codegraph_custody_root(&active_root).unwrap());
+
+        let resumed = historical[0].1;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Starting' WHERE id=?1",
+                [resumed.to_string()],
+            )
+            .unwrap();
+        let active = store.codegraph_custody_page(None, true, 64).unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].0, historical[0].0);
+        assert_eq!(active[1].0, active_id);
+
+        let first_root = tempfile::tempdir().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let first_project = rsi_common::types::Project {
+            id: Uuid::new_v4(),
+            name: "first".into(),
+            path: Some(first_root.path().to_path_buf()),
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.insert_project(&first_project).unwrap();
+        let mut runtime = crate::codegraph::IndexRuntime::start_from_store(
+            index_root.path().to_path_buf(),
+            &store,
+            &[],
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .handle()
+                .registered_project_workspaces(first_project.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        runtime.attach_registry(std::sync::Arc::clone(&store), Vec::new());
+        let second_root = tempfile::tempdir().unwrap();
+        let second_project = rsi_common::types::Project {
+            id: Uuid::new_v4(),
+            name: "second".into(),
+            path: Some(second_root.path().to_path_buf()),
+            ..first_project
+        };
+        store.lock().await.insert_project(&second_project).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(7), async {
+            loop {
+                if runtime
+                    .handle()
+                    .registered_project_workspaces(second_project.id)
+                    .unwrap()
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn active_session_inventory_rejects_limit_plus_one_without_unbounded_collection() {
         let store = Store::open_in_memory().expect("open in-memory store");
@@ -2671,6 +3658,7 @@ mod active_session_inventory_tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn startup_process_authorization_uses_one_snapshot_and_restores_busy_timeout() {
         let store = Store::open_in_memory().expect("open in-memory store");
@@ -2708,6 +3696,7 @@ mod active_session_inventory_tests {
         assert_eq!(busy_timeout_ms, 10_000);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn startup_process_authorization_refuses_an_expired_deadline_without_querying() {
         let store = Store::open_in_memory().expect("open in-memory store");
@@ -2721,6 +3710,7 @@ mod active_session_inventory_tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn startup_process_authorization_enforces_remaining_deadline_under_database_lock() {
         let directory = tempfile::tempdir().expect("create Store directory");
@@ -2770,6 +3760,7 @@ mod active_session_inventory_tests {
         assert_eq!(persisted_status, "Completed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn startup_process_authorization_sql_keeps_pre_row_and_immutable_owners() {
         let source = include_str!("sessions.rs");
@@ -2893,6 +3884,7 @@ mod rotation_publication_tests {
             .await
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[tokio::test]
     async fn publish_rotation_successor_moves_lead_generation_and_tip_in_one_commit() {
         let store = Store::open_in_memory().expect("store");
@@ -2957,6 +3949,7 @@ mod rotation_publication_tests {
         assert_eq!(observe(&store, &lineage).2, generation + 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn published_successor_lookup_ignores_failed_legacy_row() {
         let store = Store::open_in_memory().expect("store");

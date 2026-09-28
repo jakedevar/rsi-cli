@@ -182,6 +182,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_successful_single_embed() {
         let mut server = mockito::Server::new_async().await;
@@ -210,6 +211,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_successful_batch_embed() {
         let mut server = mockito::Server::new_async().await;
@@ -236,6 +238,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_server_error() {
         let mut server = mockito::Server::new_async().await;
@@ -260,6 +263,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_empty_response() {
         let mut server = mockito::Server::new_async().await;
@@ -285,6 +289,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_malformed_json() {
         let mut server = mockito::Server::new_async().await;
@@ -310,6 +315,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_count_mismatch() {
         let mut server = mockito::Server::new_async().await;
@@ -336,6 +342,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_normalization_check() {
         let mut server = mockito::Server::new_async().await;
@@ -362,6 +369,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_ollama_id_model() {
         let provider = OllamaEmbeddingProvider::new(
@@ -374,6 +382,7 @@ mod tests {
         assert_eq!(provider.max_input_tokens(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_ollama_connection_refused() {
         let provider = OllamaEmbeddingProvider::new(

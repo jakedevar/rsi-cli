@@ -337,6 +337,7 @@ mod tests {
         assert!(body.get("keep_alive").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn body_matches_title_helper() {
         let opts = GenerateOptions {
@@ -349,6 +350,7 @@ mod tests {
         assert_body_shape(&body, "qwen3:14b", "TEST PROMPT", 512);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn body_matches_summarizer_helper() {
         let opts = GenerateOptions {
@@ -361,6 +363,7 @@ mod tests {
         assert_body_shape(&body, "qwen3:14b", "SUMMARIZE", 1024);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn body_matches_extractor_helper() {
         let opts = GenerateOptions {
@@ -373,6 +376,7 @@ mod tests {
         assert_body_shape(&body, "qwen3:14b", "EXTRACT", 1024);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn body_includes_system_when_provided() {
         let opts = GenerateOptions::default();
@@ -381,6 +385,7 @@ mod tests {
         assert_eq!(body["stream"], serde_json::json!(true));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn body_includes_keep_alive_when_provided() {
         let opts = GenerateOptions {
@@ -393,6 +398,7 @@ mod tests {
         assert_eq!(body["keep_alive"], serde_json::json!("60m"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn native_ollama_url_rejects_remote_hosts_before_io() {
         let error = validate_loopback_ollama_url("https://example.com/api/generate")
@@ -400,6 +406,7 @@ mod tests {
         assert!(matches!(error, OllamaError::NonLoopback(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn native_ollama_url_accepts_ipv4_ipv6_and_localhost_loopback() {
         for url in [
@@ -411,6 +418,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn remote_native_ollama_generate_is_rejected_before_transport() {
         let _lock = TEST_OLLAMA_URL_LOCK.lock();
@@ -428,6 +436,7 @@ mod tests {
         assert!(matches!(error, OllamaError::NonLoopback(_)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn loopback_native_ollama_generate_remains_operational() {
         let _lock = TEST_OLLAMA_URL_LOCK.lock();

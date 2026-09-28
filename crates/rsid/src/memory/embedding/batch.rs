@@ -3,6 +3,7 @@ use crate::error::{DaemonError, Result};
 use crate::memory::embedding::cache::{CacheLookupResult, EmbeddingCache};
 use crate::memory::store::MemoryStore;
 use crate::memory::types::{EmbeddingProvider, MemoryChunk};
+use crate::memory::worker::MemoryWorkContext;
 use crate::model_control::retry::classify_error_message;
 use crate::model_control::{
     AdmissionDecision, InvocationCompletion, ModelAdmissionRequest, admit_invocation,
@@ -70,6 +71,7 @@ pub async fn embed_chunks_in_batches(
     store: &MemoryStore,
     control: Option<&EmbeddingControl>,
 ) -> Result<Vec<Vec<f32>>> {
+    MemoryWorkContext::check_current()?;
     if chunks.is_empty() {
         return Ok(vec![]);
     }
@@ -91,6 +93,7 @@ pub async fn embed_chunks_in_batches(
     let mut to_cache: Vec<(String, Vec<f32>)> = Vec::new();
 
     for batch_indices in &batches {
+        MemoryWorkContext::check_current()?;
         let texts: Vec<String> = batch_indices
             .iter()
             .map(|&i| missing_chunks[i].text.clone())
@@ -108,6 +111,7 @@ pub async fn embed_chunks_in_batches(
         }
     }
 
+    MemoryWorkContext::check_current()?;
     // 4. Store in cache
     cache.store_embeddings(store, &to_cache)?;
 
@@ -126,6 +130,7 @@ pub async fn embed_query_with_timeout(
     text: &str,
     control: Option<&EmbeddingControl>,
 ) -> Result<Vec<f32>> {
+    MemoryWorkContext::check_current()?;
     let timeout = resolve_query_timeout(provider);
     match control {
         Some(control) => {
@@ -161,7 +166,12 @@ pub async fn embed_query_with_timeout(
                 baseline_embedding_input_count: 0,
                 baseline_wall_time_ms: 0,
             };
-            let permit = match admit_invocation(&control.store, request, &control.event_bus).await?
+            let permit = match MemoryWorkContext::interruptible(admit_invocation(
+                &control.store,
+                request,
+                &control.event_bus,
+            ))
+            .await?
             {
                 AdmissionDecision::Admitted(permit) => permit,
                 AdmissionDecision::Duplicate { invocation_id } => {
@@ -170,24 +180,31 @@ pub async fn embed_query_with_timeout(
                     )));
                 }
             };
-            let execution = permit.claim_embedding_execution(if provider.id() == "ollama" {
-                crate::model_control::registry::RuntimeExecutionRoute::OllamaEmbeddingQueryHttp
-            } else {
-                crate::model_control::registry::RuntimeExecutionRoute::OpenAiEmbeddingHttp
-            })?;
             let started_at = std::time::Instant::now();
-            let result = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout),
-                provider.embed_query(text, execution),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(DaemonError::Process(format!(
-                    "Embedding query timed out after {}ms",
-                    timeout
-                ))),
-            };
+            // Claim errors and cancellation after admission also require settlement.
+            let result = async {
+                MemoryWorkContext::check_current()?;
+                let execution = permit.claim_embedding_execution(if provider.id() == "ollama" {
+                    crate::model_control::registry::RuntimeExecutionRoute::OllamaEmbeddingQueryHttp
+                } else {
+                    crate::model_control::registry::RuntimeExecutionRoute::OpenAiEmbeddingHttp
+                })?;
+                MemoryWorkContext::interruptible(async {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout),
+                        provider.embed_query(text, execution),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(DaemonError::Process(format!(
+                            "Embedding query timed out after {timeout}ms"
+                        ))),
+                    }
+                })
+                .await
+            }
+            .await;
             let completion = embedding_completion(started_at, 1, &result);
             settle_result(
                 &control.store,
@@ -261,6 +278,7 @@ async fn embed_batch_with_retry(
     texts: &[String],
     control: Option<&EmbeddingControl>,
 ) -> Result<Vec<Vec<f32>>> {
+    MemoryWorkContext::check_current()?;
     if let Some(control) = control {
         return embed_batch_with_admission(provider, texts, control).await;
     }
@@ -363,21 +381,23 @@ async fn embed_batch_with_admission(
     let mut dedup_key = primary_dedup_key;
     let mut generation: u32 = 0;
     let permit = loop {
-        let decision = admit_invocation(
+        MemoryWorkContext::check_current()?;
+        let decision = MemoryWorkContext::interruptible(admit_invocation(
             &control.store,
             make_request(dedup_key.clone()),
             &control.event_bus,
-        )
+        ))
         .await?;
         match decision {
             AdmissionDecision::Admitted(permit) => break permit,
             AdmissionDecision::Duplicate { invocation_id } => {
-                let prior_status = {
+                let prior_status = MemoryWorkContext::interruptible(async {
                     let guard = control.store.lock().await;
-                    guard
+                    Ok(guard
                         .load_model_invocation_record(invocation_id)?
-                        .map(|r| r.status)
-                };
+                        .map(|r| r.status))
+                })
+                .await?;
                 if prior_status != Some(ModelInvocationStatus::Completed) {
                     return Err(DaemonError::PolicyDenied(format!(
                         "duplicate embedding batch suppressed ({invocation_id})"
@@ -403,13 +423,17 @@ async fn embed_batch_with_admission(
             }
         }
     };
-    let execution = permit.claim_embedding_execution(if provider.id() == "ollama" {
-        crate::model_control::registry::RuntimeExecutionRoute::OllamaEmbeddingBatchHttp
-    } else {
-        crate::model_control::registry::RuntimeExecutionRoute::OpenAiEmbeddingHttp
-    })?;
     let started_at = std::time::Instant::now();
-    let result = run_batch_once(provider, texts, execution).await;
+    let result = async {
+        MemoryWorkContext::check_current()?;
+        let execution = permit.claim_embedding_execution(if provider.id() == "ollama" {
+            crate::model_control::registry::RuntimeExecutionRoute::OllamaEmbeddingBatchHttp
+        } else {
+            crate::model_control::registry::RuntimeExecutionRoute::OpenAiEmbeddingHttp
+        })?;
+        MemoryWorkContext::interruptible(run_batch_once(provider, texts, execution)).await
+    }
+    .await;
     let completion = embedding_completion(started_at, texts.len() as u64, &result);
     settle_result(
         &control.store,
@@ -491,6 +515,59 @@ fn resolve_batch_timeout(provider: &dyn EmbeddingProvider) -> u64 {
         BATCH_TIMEOUT_LOCAL_MS
     } else {
         BATCH_TIMEOUT_REMOTE_MS
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod live_memory_test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct BlockingProvider {
+        pub started: tokio::sync::Notify,
+        pub calls: AtomicUsize,
+        pub dropped: AtomicBool,
+    }
+
+    struct ExecutionDrop<'a>(&'a AtomicBool);
+    impl Drop for ExecutionDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for BlockingProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+        fn max_input_tokens(&self) -> Option<u32> {
+            None
+        }
+        async fn embed_query(
+            &self,
+            _text: &str,
+            _execution: crate::model_control::AdmittedEmbeddingExecution,
+        ) -> Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _drop = ExecutionDrop(&self.dropped);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        async fn embed_batch(
+            &self,
+            _texts: &[String],
+            _execution: crate::model_control::AdmittedEmbeddingExecution,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _drop = ExecutionDrop(&self.dropped);
+            self.started.notify_one();
+            std::future::pending().await
+        }
     }
 }
 
@@ -641,14 +718,167 @@ mod tests {
             .expect("latest model invocation")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_cancels_embedding_and_settles_each_permit() {
+        use super::live_memory_test_support::BlockingProvider;
+        for query in [false, true] {
+            let control = make_local_test_control();
+            let provider = BlockingProvider::default();
+            let runtime =
+                crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+            runtime.memory_enabled.store(true, Ordering::Relaxed);
+            let context = MemoryWorkContext::new(
+                Arc::clone(&runtime),
+                tokio_util::sync::CancellationToken::new(),
+            );
+            let execution = context.scope(async {
+                if query {
+                    embed_query_with_timeout(&provider, "query", Some(&control))
+                        .await
+                        .map(|_| ())
+                } else {
+                    embed_text_batch(&provider, &["batch".into()], Some(&control))
+                        .await
+                        .map(|_| ())
+                }
+            });
+            tokio::pin!(execution);
+            tokio::select! {
+                _ = provider.started.notified() => {},
+                result = &mut execution => panic!("provider must start and block: {result:?}"),
+            }
+            assert_eq!(latest_invocation_state(&control.store).await.0, "running");
+            runtime.memory_enabled.store(false, Ordering::Relaxed);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(DaemonError::ChannelClosed)));
+            assert!(provider.dropped.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(invocation_row_count(&control.store).await, 1);
+            assert_eq!(
+                latest_invocation_state(&control.store).await,
+                ("failed".into(), Some("cancelled".into()))
+            );
+            assert!(
+                control
+                    .store
+                    .lock()
+                    .await
+                    .build_model_control_status(8)
+                    .unwrap()
+                    .active_invocations
+                    .is_empty()
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_cancels_waiting_admission_without_a_row() {
+        let control = make_local_test_control();
+        let provider = CountingProvider::new("mock");
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let context = MemoryWorkContext::new(
+            Arc::clone(&runtime),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let guard = control.store.lock().await;
+        let texts = vec!["waiting for admission".into()];
+        let execution = context.scope(embed_text_batch(&provider, &texts, Some(&control)));
+        tokio::pin!(execution);
+        std::future::poll_fn(|cx| {
+            assert!(execution.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        runtime.memory_enabled.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+                .await
+                .unwrap(),
+            Err(DaemonError::ChannelClosed)
+        ));
+        drop(guard);
+        assert_eq!(invocation_row_count(&control.store).await, 0);
+        assert_eq!(provider.batch_calls.load(Ordering::Relaxed), 0);
+        // An explicit unscoped caller still works while Memory is OFF.
+        embed_text_batch(&provider, &texts, Some(&control))
+            .await
+            .unwrap();
+        assert_eq!(provider.batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(invocation_row_count(&control.store).await, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
+    #[tokio::test]
+    async fn live_memory_off_stops_before_the_next_batch_admission() {
+        struct DisableAfterBatch(Arc<crate::config::RuntimeConfig>, AtomicU32);
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for DisableAfterBatch {
+            fn id(&self) -> &str {
+                "mock"
+            }
+            fn model(&self) -> &str {
+                "mock-model"
+            }
+            fn max_input_tokens(&self) -> Option<u32> {
+                None
+            }
+            async fn embed_query(
+                &self,
+                _: &str,
+                _: crate::model_control::AdmittedEmbeddingExecution,
+            ) -> Result<Vec<f32>> {
+                unreachable!()
+            }
+            async fn embed_batch(
+                &self,
+                texts: &[String],
+                _: crate::model_control::AdmittedEmbeddingExecution,
+            ) -> Result<Vec<Vec<f32>>> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.memory_enabled.store(false, Ordering::Relaxed);
+                Ok(texts.iter().map(|_| vec![1.0; 4]).collect())
+            }
+        }
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let provider = DisableAfterBatch(Arc::clone(&runtime), AtomicU32::new(0));
+        let chunks = vec![
+            make_chunk(&"a".repeat(BATCH_MAX_TOKENS * 4 + 1)),
+            make_chunk("second batch"),
+        ];
+        let control = make_local_test_control();
+        let cache = make_cache();
+        let store = MemoryStore::open_in_memory().unwrap();
+        let result = MemoryWorkContext::new(runtime, tokio_util::sync::CancellationToken::new())
+            .scope(embed_chunks_in_batches(
+                &provider,
+                &chunks,
+                &cache,
+                &store,
+                Some(&control),
+            ))
+            .await;
+        assert!(matches!(result, Err(DaemonError::ChannelClosed)));
+        assert_eq!(provider.1.load(Ordering::Relaxed), 1);
+        assert_eq!(invocation_row_count(&control.store).await, 1);
+        assert_eq!(latest_invocation_state(&control.store).await.0, "completed");
+    }
+
     // --- build_batches tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_batches_empty() {
         let batches = build_batches(&[]);
         assert!(batches.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_batches_single_small() {
         let chunk = make_chunk("hello");
@@ -657,6 +887,7 @@ mod tests {
         assert_eq!(batches[0], vec![0]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_batches_multiple_fit_one() {
         let c1 = make_chunk("hello");
@@ -666,6 +897,7 @@ mod tests {
         assert_eq!(batches[0], vec![0, 1]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_batches_oversized_solo() {
         let big_text = "x".repeat(BATCH_MAX_TOKENS * 4 + 1);
@@ -683,6 +915,7 @@ mod tests {
         assert_eq!(big_batch.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_build_batches_split_by_budget() {
         // Create chunks that together exceed the budget
@@ -711,6 +944,7 @@ mod tests {
 
     // --- embed_chunks_in_batches tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_embed_chunks_empty() {
         let provider = MockEmbeddingProvider::new(4);
@@ -722,6 +956,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_embed_chunks_basic() {
         let provider = MockEmbeddingProvider::new(4);
@@ -736,6 +971,7 @@ mod tests {
         assert_eq!(result[0].len(), 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_embed_chunks_uses_cache() {
         let provider = MockEmbeddingProvider::new(4);
@@ -760,6 +996,7 @@ mod tests {
         assert_eq!(result1, result2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_embed_chunks_partial_cache() {
         let provider = MockEmbeddingProvider::new(4);
@@ -784,6 +1021,7 @@ mod tests {
 
     // --- is_retryable_error tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_retryable_rate_limit() {
         assert!(classify_error_message("rate limit exceeded").retryable());
@@ -791,6 +1029,7 @@ mod tests {
         assert!(classify_error_message("too many requests").retryable());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_retryable_server_errors() {
         assert!(classify_error_message("server returned 500").retryable());
@@ -799,11 +1038,13 @@ mod tests {
         assert!(classify_error_message("504 gateway timeout").retryable());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_retryable_cloudflare() {
         assert!(classify_error_message("cloudflare error").retryable());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_not_retryable() {
         assert!(!classify_error_message("invalid api key").retryable());
@@ -813,12 +1054,14 @@ mod tests {
 
     // --- timeout resolver tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_query_timeout_ollama() {
         let provider = MockEmbeddingProvider::new(4);
         assert_eq!(resolve_query_timeout(&provider), QUERY_TIMEOUT_REMOTE_MS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_query_timeout_remote() {
         let provider = MockEmbeddingProvider::new(4);
@@ -826,6 +1069,7 @@ mod tests {
         assert_eq!(resolve_query_timeout(&provider), QUERY_TIMEOUT_REMOTE_MS);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_batch_timeout_remote() {
         let provider = MockEmbeddingProvider::new(4);
@@ -834,6 +1078,7 @@ mod tests {
 
     // --- embed_query_with_timeout test ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_embed_query_with_timeout_success() {
         let provider = MockEmbeddingProvider::new(4);
@@ -844,6 +1089,7 @@ mod tests {
         assert_eq!(result.len(), 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn denied_embedding_query_does_not_execute_provider_future() {
         let provider = CountingProvider::new("remote-test");
@@ -865,6 +1111,7 @@ mod tests {
         assert_eq!(invocation_row_count(&store).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn successful_embedding_batch_settles_one_completed_row() {
         let provider = CountingProvider::new("ollama");
@@ -890,6 +1137,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn identical_content_embeds_twice_after_completed_duplicate() {
         // Regression test for the Duplicate-as-fatal bug: a second admission
@@ -930,6 +1178,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn two_consecutive_cache_loss_cycles_both_reembed_successfully() {
         // Regression test for the bug in c15b0450's fix: that fix salted the
@@ -985,6 +1234,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn duplicate_while_prior_attempt_still_running_stays_suppressed() {
         // A Duplicate against a non-terminal prior attempt (running /
@@ -1061,6 +1311,7 @@ mod tests {
         assert_eq!(invocation_row_count(&store).await, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn full_reindex_over_already_embedded_content_indexes_nonzero() {
         // Simulates a full reindex: the memory index (and its embedding
@@ -1119,6 +1370,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn embedding_retry_budget_defaults_to_single_attempt() {
         let provider = CountingProvider::with_batch_error("ollama", "server returned 500");

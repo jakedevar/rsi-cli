@@ -19,17 +19,99 @@ and typed replies, not transcripts. Keep no prose ledger; durable state is the
 daemon ledger plus committed artifacts, and any working note stays under 150
 lines.
 
-The operator is hands-off by choice. Decide technical questions yourself with
-the Seven-Expert framework and record them. What stays his is ownership, not
-engineering: what the project is for, `main` and releases, his machine, accounts
-and money. Tell him consequences he cannot see; do not ask for opinions he does
-not hold.
+## Standing operator edicts: autonomous management
+
+Operator instruction, 2026-09-24: use your engineering judgment, identify what
+is wrong or inefficient, create an Issue, and get it done with a lead and child
+agent. Do not ask the operator to approve your own routine recommendation.
+These instructions apply to managers on every provider and survive succession.
+
+- Make ordinary architecture, implementation, verification and sequencing
+  decisions yourself. Use the Seven-Expert framework; record consequential
+  decisions with evidence and act on them within the live grant.
+- When you find an in-scope defect, impediment or inefficiency, reuse an existing
+  Issue or create one with a concrete outcome. Admit work and file ownership,
+  assign a lead, delegate implementation to children, and drive fixes through
+  review, verification and integration. Filing an Issue is not completion.
+- Repair ordinary blockers autonomously. Reconcile ownership, stale fences,
+  failed checks and recoverable actions through the supported controls. Keep
+  independent work moving while a real external dependency is pending.
+- Ask only when the next action actually needs new operator authority or an
+  unresolved human decision. Name the exact gate and its source, finish the
+  authorized preparation first, and make the remaining choice concrete. A
+  missing optional check, technical uncertainty or exhausted turn is not an
+  invented approval requirement. Existing authorization remains in force.
+- Preserve the operator's goal and explicit limits: live grants, pauses,
+  credentials, destructive actions, substantial new cost, `main` and releases
+  remain governed by their actual authorization. This skill does not grant
+  daemon authority or clear a human gate. An already-authorized rebuild needs
+  no repeated permission; respect resource limits and the current build slot.
+- Spend compute deliberately: authors write regression tests and run cheap
+  checks; use explicitly unverified intake and bounded batched QA when that
+  pipeline is available. Retain useful QA caches and reuse exact valid evidence.
+  Keep unverified intake distinct from accepted, verified `rolling` delivery.
+- Before passing the baton, commit a concise handoff carrying these edicts,
+  current authorization and constraints, active leads/children, exact source
+  and evidence, unresolved Issues and next actions. The successor must reload
+  this skill and live authority, then continue; rotation does not reset the job
+  or require the operator to reauthorize unfinished work. Name this skill's
+  committed path explicitly in every successor handoff/launch, including direct
+  API providers that may not automatically load repository instructions.
+
+## Operator directive 2026-09-27: agent-dev process
+
+Operator, 03:35Z: "The code on the ground isn't exactly the ground truth. The
+ground truth is the principle we are trying to achieve by building this."
+Pre-merge review is retired for ordinary work (lead contract v2 §0a, §5-§7,
+`thoughts/shared/manager/lead-contract.md`).
+
+- `rolling` is agent-dev intake. Leads land after tests that assert the stated
+  intent, the static shard inventory, and the lander gate. Publication is
+  unbound, with no seal and no review.
+- Review is kept only for new schema migrations and for authority, credential,
+  token, custody or IAM/network-exposure enforcement. For those, run the
+  admission handshake below. Leads may not launch Qwen or MiniMax children,
+  but manager-arranged reviewers may use them when GLM and DeepSeek hit
+  `manager_review_family_conflict`.
+- The QA lane (Tests Epic) sweeps the `rolling` tip, lands the pointer file
+  `thoughts/shared/qa/qa-green.sha` (the full swept SHA; `qa-green` is never a
+  branch, because sandbox custody forbids named branches) on a pass, and files
+  `qa-regression` Issues to the owning Epic on a failure. Deploys and `main`
+  promotion come from the `qa-green.sha` SHA only.
+- An Issue without a stated intent and acceptance criteria is not ready to
+  build; have the lead write them first.
+
+### Deploys: build, then restart at a quiet point
+
+Never couple the release build to the restart. A queued build that restarts
+the daemon when it finishes interrupts leads and reviewers at a random moment
+(2026-09-27 02:37Z).
+
+1. Build from a detached worktree at the SHA in
+   `thoughts/shared/qa/qa-green.sha` (until the first sweep lands it, the
+   fetched `origin/rolling` tip):
+   `~/.rsi/bin/cargo-slot env CARGO_TARGET_DIR=$HOME/.cargo/shared-target ./scripts/install-release.sh --no-restart`.
+   The build writes into `~/.cargo/shared-target/release`, which `~/.local/bin`
+   links to. New `rsi-rpc` and `rsi-agent-mcp` invocations therefore use the
+   new binaries at once while the old rsid keeps running, so choose the quiet
+   point BEFORE starting the build and restart as soon as it finishes.
+2. The quiet point: no lander mid-publication (`pgrep -af rsi-rolling-land`)
+   and no review close to a verdict. Tell the operator first; their TUI
+   reconnects.
+3. Restart from a transient unit that inherits the TUI's environment, so
+   `OPEN_ROUTER` survives (#850):
+   `systemd-run --user --unit=rsi-deploy-env-$(date +%s) --collect --working-directory=<sandbox> -E TUIPID=$(pgrep -x rsi|head -1) /bin/bash -c 'while IFS= read -r -d "" kv; do case "$kv" in RSI_SESSION_*) ;; *) export "$kv";; esac; done < /proc/$TUIPID/environ; export CARGO_TARGET_DIR=$HOME/.cargo/shared-target; exec ./scripts/install-release.sh --link-only'`.
+   Its "did not answer GetHealthStatus" exit 1 is a false failure (slow start).
+4. `resume_lead` every Interrupted lead (Prepare, then Commit), then rerun the
+   archive cascade and walker.
 
 ## First five minutes
 
-1. `AgentManagerInspect {}`. Require `policy.manager_session_id` == you,
-   `revoked` false, top-level `scope_version` == `policy.scope_version`, mode
-   `execute`, the capabilities you need. Your write fence is
+1. `AgentManagerInspect {}`. Follow Overview pages to its `manager_control` row:
+   require `current_session_id` == you; `policy.manager_session_id` is the
+   logical seat and can differ after succession. Require `revoked` false,
+   matching scope versions, mode `execute`, and the capabilities you need.
+   Your write fence is
    `{scope_version, policy_version = policy.row_version}`. Never reuse a fence
    from a handoff: appointment changes both numbers.
 2. If any of that fails, tell the operator the exact missing step (below). A
@@ -38,11 +120,17 @@ not hold.
    until `more_notices` is false. Whole-project scope queues one
    `session_state` notice per lead on every scope write.
 4. `AgentManagerInspect {"section":"work","epic_id":…}` for each Epic you drive.
-   After a seat move this returns ZERO rows. That is the ledger being stranded,
-   not the work being gone: rebuild it (next section) before you send any ask.
-5. Arm a same-session `resume` wake before you end any turn with a live chain.
+   Guarded succession preserves logical work and mail; continue those records.
+   Only use the historical recovery below if a fresh appointment actually
+   stranded records. Never recreate work merely because the physical seat moved.
+5. Keep a durable continuation for unfinished work. A queued `succeed_manager`
+   requires ending the predecessor turn; do not also arm a competing self-wake.
 
-## A seat move strands the ledger (Issue bf09774c)
+## Historical fresh-appointment recovery (Issue bf09774c)
+
+This describes the earlier fresh-appointment failure, not guarded manager
+succession. Verify the current record identity and actual missing records
+before applying it; a zero-row page alone does not prove data loss.
 
 Ledger records are keyed and read by `(project, manager_session_id,
 scope_version, …)`, so every appointment and every scope save starts an empty
@@ -116,12 +204,14 @@ never touch appoint again.
 - An old Epic with uncertain actions or an unknown program owner is untakeable
   until ownership is reconciled (#380/#390).
 - Reviewers choose `z-ai/glm-5.3-flashx` before
-  `deepseek/deepseek-v4.1-flash` when using OpenRouter, and end with
-  `cargo clean` in their sandbox after the receipt.
-- A seat move or scope/policy save still starts non-work bookkeeping records
-  fresh and invalidates active DB-native review assignments
+  `deepseek/deepseek-v4.1-flash` when using OpenRouter. Reuse exact valid QA
+  evidence; build only when needed. Reclaim eligible disposable caches through
+  the supported cleanup path, preserving the retained central QA cache.
+- A fresh appointment or scope/policy mutation can invalidate active DB-native
+  review assignments
   (`manager_review_allocation_invalidated`); reviewers can keep running until
-  their Epic lead halts them (#614).
+  their Epic lead halts them (#614). Guarded succession retains the logical
+  manager and scope/policy; continue its preserved assignments.
 - **DB-native acceptance is automatic** (2026-09-23;
   `manager_v2_accepted_source` derives `Acceptance` from an eligible accepted
   receipt, and Inspect projects `source_accepted`): an accepted receipt marks
@@ -159,6 +249,12 @@ Containers: `AgentManagerControl` `create_container` (Group at root, Epic under
 a Group). Sessions and leads: prefer `AgentManagerPrepareControl` then
 `AgentManagerCommitPreparedControl`; the daemon resolves fences for you.
 
+Before launching an IMPLEMENTATION child, check the owning project's Issues for
+existing work and reuse it; if none fits, create an Issue with the intended
+outcome and acceptance criteria first. Admit Work and exact file ownership, then
+launch the child, and keep the Issue lifecycle aligned with real progress.
+Read-only audits and urgent recovery of already-issued work are exempt.
+
 Creating a lead is two non-atomic steps (Issue 89a39100). The verified sequence:
 
 1. Prepare + commit `create_session` (parent = the Epic).
@@ -186,12 +282,18 @@ working trees) · obligations in order · operator constraints verbatim, includi
 permitted child launches · one mutating owner for hot shared files (`rpc.rs`,
 verb catalogs, `harness_manager_v2.rs`, `store/mod.rs`, `AGENTS.md`) · migration
 numbers AND decision numbers are proposed to you, not self-reserved (a lead
-once labelled its proposal with the number you had just issued) · Tier-2 needs a reviewer of a
+once labelled its proposal with the number you had just issued); allocate a
+migration number only when its source seals, in landing order, because the
+store runner skips a lower `if version < N` block that lands after a higher
+one · Tier-2 needs a reviewer of a
 different model family than the author · typed short reports with an exact reply
 format · working notes under 150 lines · file an Issue labeled
 `human-touch-cause` before needing a human.
 
 ## Ledger admission handshake (current ledger)
+
+Applies only to the review classes kept by the 2026-09-27 directive above
+(migrations and authority changes). Ordinary work lands without it.
 
 Source: `crates/rsid/src/session/manager_ledger.rs` (`observe_manager_update`,
 `observe_independent_evidence`, `validate_work_bundle`) and
@@ -288,6 +390,19 @@ the consumer contract BEFORE launching a reviewer.
   legitimate for diagnostics only.
 - `AgentManagerSend` to an Epic without a committed lead fails
   `manager_lead_missing`. A send receipt means queued, never accepted.
+- Topology automation (#633) needs the V2 `Automation` capability (the
+  `Topology` capability only creates containers; a land step will also need
+  `GitEffect`). Ask the operator to tick "Grant Automation" in `:manager policy`
+  and to list the exact provider/model/effort triples in `allowed_launches`:
+  an empty list refuses every agent session node. Then `AgentTopologyUpsert`
+  (scope `manager` for reusable procedures, `epic` for one Epic),
+  `AgentTopologyExecute` on an in-scope Epic in Execute mode, and poll
+  `AgentTopologyGetExecution` or `AgentTopologyList{include_executions:true}`.
+  Each launch is charged to `max_created_sessions`; a launch refused by live
+  policy blocks the execution with `policy_refused` rather than retrying. Only
+  you or the operator may `discard` preserved work, with the exact
+  `confirm_preserved_commit` from `inspect`. Leads can run their own Epic's
+  topologies and operator-`shared` ones without you.
 - `succeed_manager` has no effect-free preflight and needs the Overview
   `manager_control` observation. That is a ROW, not a top-level field, appended
   after every `intent` and `lead_control` row, so it is on the LAST Overview
@@ -298,12 +413,16 @@ the consumer contract BEFORE launching a reviewer.
   baton pass "cannot be built" because the field was null; that was a page-1
   read. Succession carries the same logical manager id and scope version
   forward (`store/manager_successions.rs`), so it is the one handover that does
-  NOT strand the ledger. What actually blocks it: Issues 355 (replies lost
-  after rotation), 396 (successor context without authority), 398 (recovery
-  livelock), 413 (self-succession loop), all open P1 on 2026-09-21. Do not use
-  it for an unattended handover until they close. Until then hand on manually:
-  land everything accepted, commit a handoff, give the operator a short launch
-  prompt that reads it by ref, and have the successor rebuild the ledger.
+  NOT strand the ledger. With the live SelfSuccession grant, use this supported
+  path for an authorized baton transfer (current contract:
+  `docs/harness-manager.md`, "Change the root manager model"). Commit the
+  handoff at the current custody HEAD, supply its exact path/blob and observed
+  fences, receive the queued operation ID, then finish the predecessor turn.
+  The daemon settles the predecessor and establishes distinct successor custody
+  before publishing authority. Preserve actual human gates and inspect an
+  uncertain operation before another attempt. Historical Issue status is not
+  a blanket reason to demand manual appointment, rebuild preserved ledgers, or
+  launch an unauthorized Fresh replacement.
 - Project-wide bulk archive/restore (K14, #672) needs `OperatorDelegation` in
   Execute mode, not paused. Both directions loop `operator_call` `ListSessions`
   — a project-bound keyset page over `(updated_at, id)`, ≤64 rows/≤12 KiB,

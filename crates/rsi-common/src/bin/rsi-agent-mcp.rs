@@ -160,6 +160,12 @@ mod tests {
             "rsi_control_manager_prepare_control",
             "rsi_control_manager_commit_prepared_control",
             "rsi_control_manager_get_action",
+            "rsi_control_topology_upsert",
+            "rsi_control_topology_list",
+            "rsi_control_topology_execute",
+            "rsi_control_topology_get_execution",
+            "rsi_control_topology_interrupt",
+            "rsi_control_topology_resolve_attempt",
         ] {
             assert!(names.contains(&prepared_tool));
         }

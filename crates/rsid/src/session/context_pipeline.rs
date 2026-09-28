@@ -697,6 +697,7 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(store))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn context_injection_allowance_is_bounded_and_distinct() {
         assert_eq!(context_injection_allowance(1_000_000), 20_000);
@@ -704,6 +705,7 @@ mod tests {
         assert_eq!(context_injection_allowance(1), 200);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_no_sources_returns_none() {
         let counter = Arc::new(TokenCounter::new());
@@ -727,6 +729,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_active_task_only() {
         let counter = Arc::new(TokenCounter::new());
@@ -755,6 +758,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_zero_budget_returns_none() {
         let counter = Arc::new(TokenCounter::new());
@@ -766,6 +770,7 @@ mod tests {
         assert!(result.is_none(), "Zero budget should return None");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_budget_truncation() {
         let counter = Arc::new(TokenCounter::new());
@@ -789,6 +794,7 @@ mod tests {
         assert!(output.contains("[Active Task]"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_git_log_in_git_repo() {
         let counter = Arc::new(TokenCounter::new());
@@ -809,6 +815,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_project_context_files() {
         let counter = Arc::new(TokenCounter::new());
@@ -853,6 +860,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_workflow_content() {
         let counter = Arc::new(TokenCounter::new());
@@ -940,6 +948,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn test_layer_telemetry_pinning() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -1113,6 +1122,7 @@ mod tests {
         assert_eq!(Layer::L4.uncounted_status(), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn test_pipeline_workflow_priority_ordering() {
         let counter = Arc::new(TokenCounter::new());

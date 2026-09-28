@@ -1,4 +1,5 @@
 use crate::bus::EventBus;
+use crate::config::RuntimeConfig;
 use crate::error::Result;
 use crate::memory::chunking::{chunk_markdown, enforce_max_input_tokens, remap_chunk_lines};
 use crate::memory::embedding::EmbeddingProviderResult;
@@ -12,6 +13,7 @@ use crate::memory::types::{
     MemoryChunk, MemoryConfig, MemoryFileEntry, MemoryProviderStatus, MemorySearchResult,
     MemorySource,
 };
+use crate::memory::worker::MemoryWorkContext;
 use crate::store::Store;
 use rsi_common::model_control::InvocationOwner;
 use std::collections::HashSet;
@@ -50,6 +52,8 @@ pub struct MemorySyncEngine {
     db_path: PathBuf,
     /// Set to true when the file watcher detects changes.
     dirty: bool,
+    runtime_config: Option<Arc<RuntimeConfig>>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl MemorySyncEngine {
@@ -73,6 +77,37 @@ impl MemorySyncEngine {
             memory_dir,
             db_path,
             dirty: true, // start dirty to trigger initial sync
+            runtime_config: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn set_runtime_config(&mut self, config: Arc<RuntimeConfig>) {
+        self.runtime_config = Some(config);
+    }
+
+    pub(crate) fn set_shutdown_token(&mut self, shutdown: tokio_util::sync::CancellationToken) {
+        self.shutdown = shutdown;
+    }
+
+    fn enabled(&self) -> bool {
+        self.runtime_config.as_ref().is_none_or(|config| {
+            config
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    fn ensure_enabled(&self) -> Result<()> {
+        if self.enabled() {
+            if self.shutdown.is_cancelled() {
+                return Err(crate::error::DaemonError::ChannelClosed);
+            }
+            MemoryWorkContext::check_current()
+        } else {
+            Err(crate::error::DaemonError::PolicyDenied(
+                "memory is disabled".into(),
+            ))
         }
     }
 
@@ -105,6 +140,18 @@ impl MemorySyncEngine {
     /// Main sync entry point. Checks reindex conditions, then performs
     /// either a full reindex or an incremental sync.
     pub async fn run_sync(&mut self, reason: &str, force: bool) -> Result<SyncReport> {
+        match self.runtime_config.clone() {
+            Some(runtime) => {
+                MemoryWorkContext::new(runtime, self.shutdown.clone())
+                    .scope(self.run_sync_inner(reason, force))
+                    .await
+            }
+            None => self.run_sync_inner(reason, force).await,
+        }
+    }
+
+    async fn run_sync_inner(&mut self, reason: &str, force: bool) -> Result<SyncReport> {
+        self.ensure_enabled()?;
         debug!(reason, force, "memory sync: starting");
 
         let meta = self.memory_store.load_index_meta()?;
@@ -139,13 +186,14 @@ impl MemorySyncEngine {
         let mut report = SyncReport::default();
 
         if self.dirty || reason == "startup" {
-            self.dirty = false;
             self.sync_memory_files(&mut report).await?;
+            self.dirty = false;
         }
 
         self.sync_session_transcripts(&mut report).await?;
 
         // Update meta after successful sync
+        self.ensure_enabled()?;
         self.write_current_meta()?;
 
         Ok(report)
@@ -170,11 +218,15 @@ impl MemorySyncEngine {
             temp_path.clone(),
         );
 
+        temp_engine.runtime_config = self.runtime_config.clone();
+        temp_engine.shutdown = self.shutdown.clone();
+
         // Run a full sync into the temp database
         let mut report = SyncReport::default();
         match async {
             temp_engine.sync_memory_files(&mut report).await?;
             temp_engine.sync_session_transcripts(&mut report).await?;
+            temp_engine.ensure_enabled()?;
             temp_engine.write_current_meta()?;
             Ok::<(), crate::error::DaemonError>(())
         }
@@ -208,6 +260,7 @@ impl MemorySyncEngine {
     /// Sync memory files from disk. Compares hashes against stored records,
     /// re-indexes changed files, and prunes deleted file records.
     async fn sync_memory_files(&mut self, report: &mut SyncReport) -> Result<()> {
+        self.ensure_enabled()?;
         // list_memory_files expects the workspace root (parent of memory/),
         // not the memory directory itself.
         let workspace_dir = self
@@ -218,6 +271,8 @@ impl MemorySyncEngine {
         let files = list_memory_files(&workspace_dir)?;
         let mut file_entries = Vec::new();
         for file_path in &files {
+            tokio::task::yield_now().await;
+            self.ensure_enabled()?;
             match build_file_entry(file_path, &workspace_dir)? {
                 Some(entry) => file_entries.push(entry),
                 None => continue,
@@ -227,6 +282,8 @@ impl MemorySyncEngine {
         let active_paths: HashSet<String> = file_entries.iter().map(|e| e.path.clone()).collect();
 
         for entry in &file_entries {
+            tokio::task::yield_now().await;
+            self.ensure_enabled()?;
             let stored = self.memory_store.get_file(&entry.path)?;
             let stored_hash = stored.as_ref().map(|f| f.hash.as_str());
 
@@ -248,6 +305,7 @@ impl MemorySyncEngine {
         // Prune stale records (files that no longer exist on disk)
         let stored_files = self.memory_store.list_files()?;
         for stored in &stored_files {
+            self.ensure_enabled()?;
             if stored.source == MemorySource::Memory && !active_paths.contains(&stored.path) {
                 self.memory_store
                     .delete_chunks_for_file(&stored.path, MemorySource::Memory)?;
@@ -262,6 +320,7 @@ impl MemorySyncEngine {
     /// Sync session transcripts. Reads conversation events from the main store,
     /// extracts text, and indexes changed sessions.
     async fn sync_session_transcripts(&mut self, report: &mut SyncReport) -> Result<()> {
+        self.ensure_enabled()?;
         // Open a fresh read-only connection to the main store
         let main_store = match self.open_main_store() {
             Ok(s) => s,
@@ -301,6 +360,8 @@ impl MemorySyncEngine {
             .collect();
 
         for session in &sessions_to_index {
+            tokio::task::yield_now().await;
+            self.ensure_enabled()?;
             let path = format!("sessions/{}", session.id);
             let stored = self.memory_store.get_file(&path)?;
             let stored_project_id = stored.as_ref().and_then(|f| f.project_id);
@@ -320,6 +381,7 @@ impl MemorySyncEngine {
                 continue; // unchanged — events never loaded
             }
 
+            self.ensure_enabled()?;
             let events = main_store.load_events(session.id)?;
             // Carry the session's project scope into the memory index so the
             // search path can filter agent-facing memory by project without
@@ -369,6 +431,7 @@ impl MemorySyncEngine {
                     error = %e,
                     "memory sync: failed to index session transcript; skipping"
                 );
+                self.ensure_enabled()?;
                 report.sessions_failed += 1;
                 continue;
             }
@@ -378,6 +441,7 @@ impl MemorySyncEngine {
         // Prune stale session records
         let stored_files = self.memory_store.list_files()?;
         for stored in &stored_files {
+            self.ensure_enabled()?;
             if stored.source == MemorySource::Sessions && !active_paths.contains(&stored.path) {
                 self.memory_store
                     .delete_chunks_for_file(&stored.path, MemorySource::Sessions)?;
@@ -398,6 +462,7 @@ impl MemorySyncEngine {
         content: &str,
         line_map: Option<&[u32]>,
     ) -> Result<()> {
+        self.ensure_enabled()?;
         // 1. Chunk the content
         let mut chunks =
             chunk_markdown(content, self.config.chunk_tokens, self.config.chunk_overlap);
@@ -419,6 +484,7 @@ impl MemorySyncEngine {
             remap_chunk_lines(&mut chunks, lm);
         }
 
+        self.ensure_enabled()?;
         // 4. Embed chunks (if provider available)
         let embeddings = match self.embedding_provider.provider.as_ref() {
             Some(_) => {
@@ -452,6 +518,7 @@ impl MemorySyncEngine {
             }
         };
 
+        self.ensure_enabled()?;
         // 5. Determine vector dimensions and ensure vector table exists
         let vector_dims = embeddings.iter().find(|e| !e.is_empty()).map(|e| e.len());
         if let Some(dims) = vector_dims {
@@ -506,10 +573,12 @@ impl MemorySyncEngine {
         }
 
         let pid_string = project_id.map(|p| p.to_string());
-        let search_control = self
+        let provider = self
             .embedding_provider
             .provider
-            .as_ref()
+            .as_deref()
+            .filter(|_| self.enabled());
+        let search_control = provider
             .map(|_| {
                 Ok::<EmbeddingControl, crate::error::DaemonError>(EmbeddingControl {
                     store: Arc::new(tokio::sync::Mutex::new(self.open_main_store()?)),
@@ -531,15 +600,22 @@ impl MemorySyncEngine {
                 })
             })
             .transpose()?;
-        crate::memory::search::search(
+        let search = crate::memory::search::search(
             &self.memory_store,
-            self.embedding_provider.provider.as_deref(),
+            provider,
             query,
             &search_config,
             pid_string.as_deref(),
             search_control.as_ref(),
-        )
-        .await
+        );
+        match self.runtime_config.clone() {
+            Some(runtime) => {
+                MemoryWorkContext::new(runtime, self.shutdown.clone())
+                    .scope(search)
+                    .await
+            }
+            None => search.await,
+        }
     }
 
     /// Build a status report of the memory system.
@@ -739,6 +815,7 @@ mod tests {
     /// `JoinHandle` is dropped, that panic killed the worker outright and
     /// silently disabled memory, search, and observations for the remaining
     /// lifetime of the daemon — with nothing logged to say why.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn store_handle_returns_err_instead_of_panicking_when_db_cannot_be_opened() {
         let dir = TempDir::new().unwrap();
@@ -778,6 +855,147 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn live_memory_off_preserves_index_reads_and_dirty_retry() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        engine.set_runtime_config(Arc::clone(&runtime));
+        let file = dir.path().join("memory/retained.md");
+        std::fs::write(&file, "# Retained\nretainedmemoryalpha").unwrap();
+        engine.run_sync("startup", false).await.unwrap();
+        let initial = engine.status();
+        assert_eq!(initial.file_count, 1);
+
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(&file, "# Updated\nupdatedmemorybeta").unwrap();
+        engine.mark_dirty();
+        for force in [false, true] {
+            assert!(matches!(
+                engine.run_sync("test", force).await,
+                Err(crate::error::DaemonError::PolicyDenied(_))
+            ));
+        }
+        assert!(
+            engine.status().dirty,
+            "OFF must preserve a retryable file scan"
+        );
+        assert_eq!(engine.status().chunk_count, initial.chunk_count);
+        let original_provider = Arc::clone(&engine.embedding_provider);
+        engine.embedding_provider = Arc::new(EmbeddingProviderResult {
+            provider: Some(Box::new(
+                crate::memory::embedding::mock::MockEmbeddingProvider::new(4),
+            )),
+            requested: "mock".into(),
+            provider_label: "Local".into(),
+            backend: "mock".into(),
+            base_url: Some("http://localhost".into()),
+            fallback_reason: None,
+            unavailable_reason: None,
+        });
+        let hits = engine
+            .search("retainedmemoryalpha", None, Some(0.0), None)
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit.path == "memory/retained.md"));
+        let invocations: i64 = engine
+            .open_main_store()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM model_invocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            invocations, 0,
+            "OFF search must not attempt embedding admission"
+        );
+        engine.embedding_provider = original_provider;
+        assert_eq!(
+            engine
+                .read_file("memory/retained.md", None, None)
+                .await
+                .unwrap(),
+            "# Updated\nupdatedmemorybeta"
+        );
+
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.run_sync("retry", false).await.unwrap().files_indexed,
+            1
+        );
+        assert!(!engine.status().dirty);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn live_memory_off_stops_full_reindex_before_swap() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        engine.set_runtime_config(Arc::clone(&runtime));
+        std::fs::write(
+            dir.path().join("memory/retained.md"),
+            "# Retained\nOriginal",
+        )
+        .unwrap();
+        engine.run_sync("startup", false).await.unwrap();
+        let before = engine.status();
+        std::fs::write(
+            dir.path().join("memory/retained.md"),
+            "# Replacement\nChanged",
+        )
+        .unwrap();
+
+        // Poll the real reindex until its first cooperative file boundary,
+        // then flip OFF in the same task. No wall-clock race or network.
+        let mut reindex = Box::pin(engine.run_sync("forced", true));
+        std::future::poll_fn(|cx| {
+            assert!(reindex.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        runtime
+            .memory_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            reindex.await,
+            Err(crate::error::DaemonError::PolicyDenied(_))
+        ));
+        assert_eq!(engine.status().file_count, before.file_count);
+        assert_eq!(engine.status().chunk_count, before.chunk_count);
+        assert!(
+            engine
+                .search("Original", None, Some(0.0), None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|hit| hit.path == "memory/retained.md")
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-")
+            }),
+            "cancelled reindex must remove its temporary database"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_empty_directory() {
         let dir = TempDir::new().unwrap();
@@ -788,6 +1006,7 @@ mod tests {
         assert_eq!(report.files_deleted, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_single_memory_file() {
         let dir = TempDir::new().unwrap();
@@ -800,6 +1019,7 @@ mod tests {
         assert_eq!(report.files_indexed, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_unchanged_file_skipped() {
         let dir = TempDir::new().unwrap();
@@ -816,6 +1036,7 @@ mod tests {
         assert_eq!(r2.files_unchanged, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_changed_file_reindexed() {
         let dir = TempDir::new().unwrap();
@@ -831,6 +1052,7 @@ mod tests {
         assert_eq!(r2.files_indexed, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_deleted_file_pruned() {
         let dir = TempDir::new().unwrap();
@@ -846,6 +1068,7 @@ mod tests {
         assert_eq!(r2.files_deleted, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_multiple_files() {
         let dir = TempDir::new().unwrap();
@@ -860,6 +1083,7 @@ mod tests {
         assert_eq!(report.files_indexed, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_read_file_valid_path() {
         let dir = TempDir::new().unwrap();
@@ -874,6 +1098,7 @@ mod tests {
         assert_eq!(content, "line1\nline2\nline3");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_read_file_invalid_scope() {
         let dir = TempDir::new().unwrap();
@@ -883,6 +1108,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_read_file_with_line_range() {
         let dir = TempDir::new().unwrap();
@@ -901,6 +1127,7 @@ mod tests {
         assert_eq!(content, "line1\nline2");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_status_reports_correct_counts() {
         let dir = TempDir::new().unwrap();
@@ -917,6 +1144,7 @@ mod tests {
         assert!(status.chunk_count > 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_sync_marks_dirty_false() {
         let dir = TempDir::new().unwrap();
@@ -932,6 +1160,7 @@ mod tests {
         // This is a direct call, it always runs. The dirty flag is checked in run_sync.
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_search_returns_empty() {
         let dir = TempDir::new().unwrap();

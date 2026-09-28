@@ -20,11 +20,7 @@ pub(super) fn render_ai_command(frame: &mut Frame, area: Rect, command: &str, in
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if in_flight {
-            theme::status_waiting()
-        } else {
-            theme::accent()
-        }))
+        .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()));
 
     let inner = block.inner(popup_area);

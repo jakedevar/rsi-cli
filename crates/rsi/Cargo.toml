@@ -43,7 +43,6 @@ tui-textarea = { workspace = true }
 fuzzy-matcher = { workspace = true }
 ignore = { workspace = true }
 which = { workspace = true }
-pipewire = { workspace = true, optional = true }
 rand = { workspace = true }
 arboard = { workspace = true }
 image = { workspace = true }
@@ -81,10 +80,6 @@ harness = false
 [[bench]]
 name = "ui_height"
 harness = false
-
-[features]
-default = []
-pipewire-audio = ["dep:pipewire"]
 
 [lints]
 workspace = true

@@ -336,17 +336,20 @@ pub(super) fn approx_token_count(text: &str) -> u32 {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_below_threshold() {
         assert_eq!(should_summarize(10, None, None), SummarizeAction::None,);
         assert_eq!(should_summarize(19, None, None), SummarizeAction::None,);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_short_at_threshold() {
         assert_eq!(should_summarize(20, None, None), SummarizeAction::Short,);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_short_after_previous() {
         // Had a short at count=20, now at 40 -> should trigger again
@@ -355,18 +358,21 @@ mod tests {
         assert_eq!(should_summarize(39, Some(20), None), SummarizeAction::None,);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_both_at_long_threshold() {
         // At 60, both short and long are due
         assert_eq!(should_summarize(60, Some(40), None), SummarizeAction::Both,);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_long_only() {
         // Short was just done at 59, but long is due at 60
         assert_eq!(should_summarize(60, Some(59), None), SummarizeAction::Long,);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_should_summarize_rolling() {
         // After short at 20, long at 60: next short at 80
@@ -381,18 +387,21 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_approx_token_count() {
         assert_eq!(approx_token_count("hello world"), 2); // 11 chars / 4 = 2
         assert_eq!(approx_token_count(""), 1); // min 1
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_truncate_str() {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello world", 5), "hello");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_format_events_for_prompt_empty() {
         let events: Vec<ConversationEvent> = vec![];
@@ -400,6 +409,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn test_format_events_for_prompt_filters_non_messages() {
         let events = vec![
@@ -452,6 +462,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn summarizer_short_body_matches_pinned_snapshot() {
         // 128 is representative of short-summary call sites.
@@ -480,6 +491,7 @@ mod tests {
         assert!(body.get("keep_alive").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn summarizer_long_body_matches_pinned_snapshot() {
         // 1024 is representative of long-summary call sites.
@@ -519,6 +531,7 @@ mod http_tests {
     // `TEST_OLLAMA_URL_LOCK` is intentionally held across awaits — it exists to
     // serialise env-var mutation across this binary's HTTP tests.
     #[allow(clippy::await_holding_lock)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn summarizer_generate_ollama_posts_expected_body_shape() {
         let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();

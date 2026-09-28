@@ -145,6 +145,7 @@ impl Pilot {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_380_uncertain_pause_settles_and_unfences_exact_resume() {
     let p = pilot().await;
@@ -194,7 +195,19 @@ async fn manager_recovery_380_uncertain_pause_settles_and_unfences_exact_resume(
     .unwrap();
     // The interrupt was delivered but settlement timed out (#380): the lead
     // is now durably Interrupted, yet the pause stayed uncertain.
+    let before_stop = p.fence().await.event_sequence;
     p.stop_session(lead).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            p.manager.persistence.barrier().await.unwrap();
+            if p.fence().await.event_sequence > before_stop {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("interruption event is durable before pause admission");
     let (pause, uncertain_version) = p
         .uncertain(
             "pause",
@@ -255,6 +268,7 @@ async fn manager_recovery_380_uncertain_pause_settles_and_unfences_exact_resume(
     super::super::launch::drop_controller_candidate_test_stream(lead);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_settle_proven_absent_and_unobservable() {
     let p = pilot().await;
@@ -376,6 +390,7 @@ async fn manager_recovery_settle_proven_absent_and_unobservable() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn manager_recovery_settle_refuses_foreign_revoked_and_missing_capability() {
     let p = pilot().await;
@@ -574,6 +589,7 @@ async fn manager_recovery_settle_refuses_foreign_revoked_and_missing_capability(
 /// Completed predecessor + agent-declared human_gate + disabled guard +
 /// enabled resume wake: assign is blocked until the manager retires the
 /// stale continuations; then a live Epic worker becomes the single lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_390_retire_then_assign_live_worker_single_lead() {
     let p = pilot().await;
@@ -731,6 +747,136 @@ async fn manager_recovery_390_retire_then_assign_live_worker_single_lead() {
     super::super::launch::drop_controller_candidate_test_stream(worker_id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_recovery_retirement_admission_pauses_intent_until_explicit_resume() {
+    let p = pilot().await;
+    let policy_version = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_harness_manager_policy(p.project)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    p.manager
+        .agent_control()
+        .agent_manager_update(
+            p.owner,
+            AgentManagerUpdateRequestV2 {
+                fence: ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version,
+                },
+                idempotency_key: "retirement-gap-work".into(),
+                change: ManagerUpdateV2::Work {
+                    key: "retirement-gap-work".into(),
+                    expected_row_version: 0,
+                    epic_id: p.epic,
+                    title: "unfinished retirement-gap work".into(),
+                    kind: ManagerWorkKindV2::Product,
+                    priority: 1,
+                    weight: 1,
+                    required_gates: vec![
+                        ManagerWorkStageV2::Implementation,
+                        ManagerWorkStageV2::Review,
+                        ManagerWorkStageV2::Verification,
+                    ],
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    manager_program_status(&p, SessionStatus::Failed).await;
+    let sentinel = manager_program_job(&p, "program_guard", false);
+    let wake = manager_program_job(&p, "resume", true);
+    {
+        let store = p.manager.store.lock().await;
+        store.insert_scheduled_job(&sentinel).unwrap();
+        store.insert_scheduled_job(&wake).unwrap();
+    }
+    p.append_lead_output(Role::User, "Continue the authorized program.")
+        .await;
+    p.append_lead_output(Role::Assistant, HUMAN_GATE_OUTCOME)
+        .await;
+
+    // Retirement admission establishes the durable pause before its queued
+    // effect runs, closing the window in which Execute intent could recover.
+    let retire = p.retire("retire-with-gap-pause").await.unwrap();
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+    }
+    let intent = p
+        .manager
+        .store
+        .lock()
+        .await
+        .reconcile_manager_intent(p.project, true)
+        .unwrap();
+    assert_eq!(intent.queued, 0);
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        let intent = store
+            .manager_v2_record(&config, "intent", &p.epic.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.payload["state"], "manager_paused");
+        let recovery_actions: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND kind='lifecycle_action' AND json_extract(payload_json,'$.origin.origin')='operating_intent'",
+                [p.project.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_actions, 0);
+    }
+
+    p.execute().await.unwrap();
+    let retired = p.receipt(retire.operation_id).await;
+    assert_eq!(retired.state, ManagerActionStateV2::Succeeded);
+    assert_eq!(
+        retired.result,
+        Some(ManagerActionResultV2::LeadContinuationsRetired)
+    );
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        assert!(store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+        store.manager_action_human_gate(p.lead).unwrap();
+    }
+
+    let resume = p
+        .admit(
+            "explicit-resume-after-retirement",
+            ManagerActionV2::ResumeLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "manager explicitly resumes after retirement".into(),
+            },
+        )
+        .await;
+    let process = super::super::launch::install_controller_candidate_test_process(p.lead);
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(resume.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        assert!(!store.manager_v2_lead_pause(&config, p.epic).unwrap().1);
+    }
+    p.stop_session(p.lead).await;
+    drop(process);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn manager_recovery_retire_resolves_unknown_program_evidence() {
     let p = pilot().await;
@@ -804,6 +950,7 @@ async fn manager_recovery_retire_resolves_unknown_program_evidence() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn manager_recovery_retire_refuses_genuine_operator_gates() {
     for case in ["question", "approval", "operator_pause"] {
@@ -889,6 +1036,7 @@ async fn manager_recovery_retire_refuses_genuine_operator_gates() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn manager_recovery_evidence_survives_reopen_and_replays() {
     let p = pilot().await;
@@ -961,6 +1109,7 @@ async fn manager_recovery_evidence_survives_reopen_and_replays() {
 /// Review (a): a Resume wake captured by the scheduler before retirement
 /// commits is revalidated under the lead's spawn guard and cannot restart the
 /// retired lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_retired_resume_snapshot_cannot_restart_lead() {
     use crate::issue_tracker::poller::SessionLauncher;
@@ -1015,6 +1164,7 @@ async fn manager_recovery_retired_resume_snapshot_cannot_restart_lead() {
 /// Review (b): an agent-armed child watch owned by the old lead is retired
 /// with it; the child terminating afterwards does not wake the old lead, even
 /// from a watch snapshot captured before the retirement.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_retired_child_watch_does_not_wake_old_lead() {
     use crate::issue_tracker::poller::WatchFireOutcome;
@@ -1085,6 +1235,7 @@ async fn manager_recovery_retired_child_watch_does_not_wake_old_lead() {
 
 /// Review (c): settling a settlement resolves the nested operation and
 /// checks it against the current manager scope before admission.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn manager_recovery_nested_settlement_is_scope_checked() {
     let p = pilot().await;
@@ -1179,6 +1330,7 @@ async fn manager_recovery_nested_settlement_is_scope_checked() {
 /// Review round 2: a wake armed by a rotation predecessor resolves through
 /// the lineage chase to the retired lead and must not restart it after the
 /// manager assigned a replacement. The scheduler settles the job as usual.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_recovery_predecessor_wake_cannot_restart_retired_lineage_tip() {
     use crate::issue_tracker::poller::SessionLauncher;
@@ -1281,4 +1433,255 @@ async fn manager_recovery_predecessor_wake_cannot_restart_retired_lineage_tip() 
     }
     super::super::launch::drop_controller_candidate_test_process(successor);
     drop(dir);
+}
+
+impl Pilot {
+    /// Record the keyed invocation of an uncertain lifecycle action exactly as
+    /// launch settlement leaves it: failed, admitted, with the given class and
+    /// optional provider usage (tokens and wall time) evidence.
+    async fn failed_action_invocation(&self, id: Uuid, error_class: &str, usage: Option<i64>) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.manager.store.lock().await.conn.execute(
+            "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,dedup_key,policy_snapshot_json,usage_confidence,error_class,input_tokens,output_tokens,wall_time_ms,created_at,completed_at)
+             VALUES(?1,'session_continue','session_lifecycle','foreground','paid_capable','admitted','failed','manager-recovery-test',?2,?3,'{}',?4,?5,?6,?6,?6,?7,?7)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                self.lead.to_string(),
+                format!("manager.action:{id}"),
+                if usage.is_some() { "partial" } else { "unavailable" },
+                error_class,
+                usage,
+                now,
+            ],
+        ).unwrap();
+    }
+
+    /// Uncertain resume of the idle lead, then a queued fresh-boundary retry
+    /// for the same Epic that is past its delay but fenced by the resume.
+    async fn uncertain_resume_with_fenced_retry(
+        &self,
+        error_class: Option<&str>,
+        usage: Option<i64>,
+    ) -> (Uuid, i64, Uuid) {
+        let (resume, version) = self
+            .uncertain(
+                "resume",
+                ManagerActionV2::ResumeLead {
+                    epic_id: self.epic,
+                    expected: self.fence().await,
+                    message: "continue after reboot".into(),
+                },
+                "manager_v2_lifecycle_unconfirmed",
+            )
+            .await;
+        if let Some(error_class) = error_class {
+            self.failed_action_invocation(resume, error_class, usage)
+                .await;
+        }
+        super::manager_program_status(self, SessionStatus::Failed).await;
+        let retry = self
+            .admit(
+                "retry",
+                ManagerActionV2::RetryLead {
+                    epic_id: self.epic,
+                    expected: self.fence().await,
+                    message: "retry from a fresh boundary".into(),
+                    launch: None,
+                },
+            )
+            .await;
+        assert_eq!(retry.state, ManagerActionStateV2::Queued);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let fenced = self
+            .manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action(self.manager.program_run_boot_id)
+            .unwrap();
+        assert!(fenced.is_none(), "uncertain resume must fence the retry");
+        (resume, version, retry.operation_id)
+    }
+
+    async fn claim_retry_and_release(&self, retry: Uuid) {
+        let claim = self.claim().await;
+        assert_eq!(claim.id(), retry);
+        self.manager
+            .store
+            .lock()
+            .await
+            .finish_manager_action(&claim, ManagerActionStateV2::Blocked, "test_settled")
+            .unwrap();
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn manager_recovery_prespawn_refused_resume_settles_absent_via_settle_action() {
+    let p = pilot().await;
+    let (resume, version, retry) = p
+        .uncertain_resume_with_fenced_retry(
+            Some(crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS),
+            None,
+        )
+        .await;
+    let settle = p
+        .admit(
+            "settle-resume",
+            ManagerActionV2::SettleUncertainAction {
+                operation_id: resume,
+                expected_row_version: version,
+            },
+        )
+        .await;
+    p.execute().await.unwrap();
+    let own = p.receipt(settle.operation_id).await;
+    assert_eq!(own.state, ManagerActionStateV2::Succeeded, "{own:?}");
+    let settled = p.receipt(resume).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Failed);
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_recovered_effect_absent")
+    );
+    let evidence = p.settled_evidence(resume).await;
+    assert_eq!(
+        evidence["witness"]["error_class"],
+        crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS
+    );
+    assert_eq!(evidence["witness"]["provider_started"], false);
+    assert_eq!(
+        evidence["settled_by_operation_id"],
+        serde_json::json!(settle.operation_id)
+    );
+    p.claim_retry_and_release(retry).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn manager_recovery_keyed_tool_history_refusal_auto_settles_and_unfences_retry() {
+    let p = pilot().await;
+    let (resume, version, retry) = p
+        .uncertain_resume_with_fenced_retry(
+            Some(crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS),
+            None,
+        )
+        .await;
+    p.manager.reconcile_uncertain_lead_actions().await.unwrap();
+    let settled = p.receipt(resume).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Failed);
+    assert_eq!(settled.row_version, version + 1);
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_recovered_effect_absent")
+    );
+    let evidence = p.settled_evidence(resume).await;
+    assert_eq!(evidence["witness"]["reconciled_by"], "daemon");
+    assert_eq!(
+        evidence["witness"]["error_class"],
+        crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS
+    );
+    p.claim_retry_and_release(retry).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn manager_recovery_resume_without_keyed_invocation_waits_for_explicit_settlement() {
+    let p = pilot().await;
+    let (resume, version, retry) = p.uncertain_resume_with_fenced_retry(None, None).await;
+    // A missing invocation is not enough for automatic absence after restart.
+    p.manager.reconcile_uncertain_lead_actions().await.unwrap();
+    let still = p.receipt(resume).await;
+    assert_eq!(still.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(still.row_version, version);
+    let settle = p
+        .admit(
+            "settle-resume",
+            ManagerActionV2::SettleUncertainAction {
+                operation_id: resume,
+                expected_row_version: version,
+            },
+        )
+        .await;
+    p.execute().await.unwrap();
+    assert_eq!(
+        p.receipt(settle.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    let settled = p.receipt(resume).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Failed);
+    assert_eq!(settled.row_version, version + 1);
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_recovered_effect_absent")
+    );
+    let evidence = p.settled_evidence(resume).await;
+    assert!(evidence["witness"]["invocation"].is_null());
+    p.claim_retry_and_release(retry).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn manager_recovery_resume_that_reached_provider_stays_unobservable() {
+    let p = pilot().await;
+    // The provider ran and the session exit settled the invocation.
+    let (resume, version, _retry) = p
+        .uncertain_resume_with_fenced_retry(Some("failed"), Some(7))
+        .await;
+    p.manager.reconcile_uncertain_lead_actions().await.unwrap();
+    let still = p.receipt(resume).await;
+    assert_eq!(still.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(still.row_version, version);
+    // A pre-spawn class with provider usage evidence is not proof of absence.
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE model_invocations SET error_class=?2 WHERE dedup_key=?1",
+            rusqlite::params![
+                format!("manager.action:{resume}"),
+                crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS
+            ],
+        )
+        .unwrap();
+    p.manager.reconcile_uncertain_lead_actions().await.unwrap();
+    let still = p.receipt(resume).await;
+    assert_eq!(still.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(still.row_version, version);
+    // Wall time alone is also evidence that provider work may have started.
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE model_invocations SET input_tokens=NULL,output_tokens=NULL,usage_confidence='unavailable' WHERE dedup_key=?1",
+            [format!("manager.action:{resume}")],
+        )
+        .unwrap();
+    p.manager.reconcile_uncertain_lead_actions().await.unwrap();
+    let still = p.receipt(resume).await;
+    assert_eq!(still.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(still.row_version, version);
+    let refused = p
+        .admit(
+            "settle-reached-provider",
+            ManagerActionV2::SettleUncertainAction {
+                operation_id: resume,
+                expected_row_version: version,
+            },
+        )
+        .await;
+    p.reconcile_until_claimed(refused.operation_id).await;
+    let refused = p.receipt(refused.operation_id).await;
+    assert_eq!(refused.state, ManagerActionStateV2::Blocked);
+    assert_eq!(
+        refused.outcome.as_deref(),
+        Some("manager_v2_effect_unobservable")
+    );
+    assert_eq!(
+        p.receipt(resume).await.state,
+        ManagerActionStateV2::Uncertain
+    );
 }

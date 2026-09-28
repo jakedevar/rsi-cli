@@ -162,6 +162,7 @@ fn test_health_status_response_format() {
         queue_failed: 1,
         rate_limits: Vec::new(),
         latest_daemon_restart: None,
+        worker_slice_memory_pressure: None,
     };
 
     let json = serde_json::to_value(&response).expect("serialize HealthStatusResponse");

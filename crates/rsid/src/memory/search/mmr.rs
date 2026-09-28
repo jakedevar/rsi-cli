@@ -161,6 +161,7 @@ mod tests {
 
     // --- Jaccard tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_both_empty() {
         let a = HashSet::new();
@@ -168,6 +169,7 @@ mod tests {
         assert!((jaccard_similarity(&a, &b) - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_one_empty() {
         let a: HashSet<String> = ["hello".to_string()].into();
@@ -175,6 +177,7 @@ mod tests {
         assert!(jaccard_similarity(&a, &b).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_identical() {
         let a: HashSet<String> = ["hello".to_string(), "world".to_string()].into();
@@ -182,6 +185,7 @@ mod tests {
         assert!((jaccard_similarity(&a, &b) - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_disjoint() {
         let a: HashSet<String> = ["hello".to_string()].into();
@@ -189,6 +193,7 @@ mod tests {
         assert!(jaccard_similarity(&a, &b).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_partial_overlap() {
         let a: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
@@ -197,6 +202,7 @@ mod tests {
         assert!((jaccard_similarity(&a, &b) - 0.5).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_jaccard_subset() {
         let a: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
@@ -207,6 +213,7 @@ mod tests {
 
     // --- tokenize_for_jaccard tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_tokenize_for_jaccard_basic() {
         let tokens = tokenize_for_jaccard("hello world");
@@ -215,6 +222,7 @@ mod tests {
         assert_eq!(tokens.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_tokenize_for_jaccard_lowercased() {
         let tokens = tokenize_for_jaccard("Hello WORLD");
@@ -222,6 +230,7 @@ mod tests {
         assert!(tokens.contains("world"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_tokenize_for_jaccard_punctuation() {
         let tokens = tokenize_for_jaccard("foo.bar,baz");
@@ -230,11 +239,13 @@ mod tests {
         assert!(tokens.contains("baz"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_tokenize_for_jaccard_empty() {
         assert!(tokenize_for_jaccard("").is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_tokenize_for_jaccard_dedup() {
         let tokens = tokenize_for_jaccard("hello hello");
@@ -244,12 +255,14 @@ mod tests {
 
     // --- MMR tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_empty() {
         let result = mmr_rerank(vec![], 0.7);
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_single() {
         let input = vec![make_chunk("c1", 0.9, "hello world")];
@@ -258,6 +271,7 @@ mod tests {
         assert_eq!(result[0].id, "c1");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_lambda_one() {
         let input = vec![
@@ -271,6 +285,7 @@ mod tests {
         assert_eq!(result[2].id, "c1"); // lowest score
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_identical_content() {
         let input = vec![
@@ -284,6 +299,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_diverse_content() {
         let input = vec![
@@ -297,6 +313,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_mixed() {
         let input = vec![
@@ -310,6 +327,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_lambda_zero() {
         let input = vec![
@@ -321,6 +339,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_preserves_all_items() {
         let input = vec![
@@ -333,6 +352,7 @@ mod tests {
         assert_eq!(result.len(), 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_mmr_rerank_tiebreaker() {
         let input = vec![
@@ -346,6 +366,7 @@ mod tests {
 
     // --- compute_mmr_score tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_compute_mmr_score_basic() {
         let score = compute_mmr_score(0.8, 0.5, 0.7);
@@ -353,6 +374,7 @@ mod tests {
         assert!((score - expected).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_compute_mmr_score_zero_similarity() {
         let score = compute_mmr_score(0.8, 0.0, 0.7);
@@ -360,6 +382,7 @@ mod tests {
         assert!((score - expected).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_compute_mmr_score_max_similarity() {
         let score = compute_mmr_score(0.8, 1.0, 0.7);

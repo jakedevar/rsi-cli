@@ -809,6 +809,7 @@ mod content_staleness_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn node_content_hash_changes_with_content() {
         let gid = graph_id();
@@ -831,6 +832,7 @@ mod content_staleness_tests {
     /// Pinning gate (scheduler level): changing an upstream input's content
     /// marks ONLY its downstream node stale (must re-run) while a sibling whose
     /// upstream is unchanged stays fresh (hits the cache) — downstream-only.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn stale_upstream_forces_only_its_downstream_to_rerun() {
         let gid = graph_id();
@@ -913,6 +915,7 @@ mod content_staleness_tests {
         assert!(dependencies_satisfied(&statuses, &det, d2, &empty));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn missing_or_unchanged_baseline_is_fresh() {
         let gid = graph_id();

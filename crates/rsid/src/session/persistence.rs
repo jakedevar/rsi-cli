@@ -1569,6 +1569,7 @@ mod tests {
         (store, dir, session)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn c4a_context_tuple_compare_and_swap_reports_closed_queue() {
         let (store, _dir, original) = store_with_session().await;
@@ -1610,6 +1611,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn c4a_context_tuple_compare_and_swap_rejects_stale_generation() {
         let (store, _dir, original) = store_with_session().await;
@@ -1659,6 +1661,7 @@ mod tests {
         assert_eq!(persisted.resolved_context_budget, Some(runtime));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn c4a_context_tuple_write_failure_rolls_back_value_and_provenance() {
         let (store, _dir, original) = store_with_session().await;
@@ -1707,6 +1710,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn failed_metadata_write_fails_its_ack_and_next_barrier_then_allows_recovery() {
         let (store, _dir, original) = store_with_session().await;
@@ -1760,6 +1764,7 @@ mod tests {
         assert_eq!(persisted.permission_denial_count, Some(4));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn metadata_failures_do_not_poison_unrelated_barriers_or_sessions() {
         let (store, _dir, original) = store_with_session().await;
@@ -1807,6 +1812,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn c4a_runtime_context_tuple_survives_database_reopen() {
         let directory = tempfile::tempdir().expect("create reopen directory");
@@ -1840,6 +1846,7 @@ mod tests {
         assert_eq!(loaded.resolved_context_budget, Some(runtime));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn configured_raw_window_survives_runtime_cas_and_database_reopen() {
         let directory = tempfile::tempdir().expect("create configured reopen directory");
@@ -1889,6 +1896,7 @@ mod tests {
         assert_eq!(loaded.resolved_context_budget, Some(runtime));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn diagnostic_recording_uses_ordered_persistence_worker() {
         let store = Store::open_in_memory().expect("open store");

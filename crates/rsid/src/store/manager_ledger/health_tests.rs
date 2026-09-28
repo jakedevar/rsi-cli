@@ -284,6 +284,7 @@ fn without_ages(value: &Value) -> Value {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn health_pages_exactly_the_scoped_epics_by_id_with_cursor_and_complete() {
     let h = health_fixture();
@@ -334,6 +335,7 @@ fn health_pages_exactly_the_scoped_epics_by_id_with_cursor_and_complete() {
     assert!(refused.to_string().contains("manager_v2_epic_out_of_scope"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn healthy_epic_reports_every_count_and_an_empty_stuck_list() {
     let h = health_fixture();
@@ -370,6 +372,7 @@ fn healthy_epic_reports_every_count_and_an_empty_stuck_list() {
     assert_eq!(row["facts"]["requests_lead_changed"], json!([]));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn health_row_includes_latest_durable_watchdog_restart() {
     let fixture = health_fixture();
@@ -393,6 +396,7 @@ fn health_row_includes_latest_durable_watchdog_restart() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn operator_health_returns_the_manager_rows_without_caller_scoping() {
     let h = health_fixture();
@@ -415,6 +419,7 @@ fn operator_health_returns_the_manager_rows_without_caller_scoping() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn idle_lead_with_a_live_child_and_no_watch_is_manager_watch_missing() {
     let h = health_fixture();
@@ -435,6 +440,7 @@ fn idle_lead_with_a_live_child_and_no_watch_is_manager_watch_missing() {
     assert_eq!(row["stuck"], json!([]));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn pending_notice_on_a_disabled_watch_is_transport_stalled() {
     let h = health_fixture();
@@ -458,6 +464,7 @@ fn pending_notice_on_a_disabled_watch_is_transport_stalled() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn delivered_notice_unretrieved_past_the_threshold_is_unread() {
     let h = health_fixture();
@@ -484,6 +491,7 @@ fn delivered_notice_unretrieved_past_the_threshold_is_unread() {
     let _ = fresh;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn uncertain_successor_reservation_is_reported_with_its_id() {
     let h = health_fixture();
@@ -524,6 +532,7 @@ fn uncertain_successor_reservation_is_reported_with_its_id() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn failed_review_assignment_surfaces_its_existing_failure_code() {
     let h = health_fixture();
@@ -571,6 +580,7 @@ fn failed_review_assignment_surfaces_its_existing_failure_code() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn delivery_abandoned_fact_newer_than_provider_output_is_stuck_until_output_follows() {
     let h = health_fixture();
@@ -606,6 +616,7 @@ fn delivery_abandoned_fact_newer_than_provider_output_is_stuck_until_output_foll
     assert_eq!(row["stuck"], json!([]));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn open_request_to_a_replaced_lead_is_request_lead_changed() {
     let h = health_fixture();
@@ -650,6 +661,7 @@ fn replace_lead(h: &Health, index: usize) -> Uuid {
     new_lead.id
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn settled_or_released_orphan_is_not_request_lead_changed() {
     // Review 7c6df190: Health must share the #664 open predicate, so an orphan
@@ -707,6 +719,7 @@ fn settled_or_released_orphan_is_not_request_lead_changed() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn more_than_the_bound_of_settled_orphans_cannot_hide_a_later_open_request() {
     // Review 7c6df190: closed rows are filtered before the LIMIT, so 33
@@ -739,6 +752,7 @@ fn more_than_the_bound_of_settled_orphans_cannot_hide_a_later_open_request() {
     assert_eq!(row["complete"], true);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn reaching_an_aggregate_bound_marks_the_row_and_page_incomplete() {
     let h = health_fixture();
@@ -773,6 +787,7 @@ fn set_status(h: &Health, session: Uuid, status: &str) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn lead_rotation_refused_reports_evidence_until_a_later_completed_rotation() {
     let h = health_fixture();
@@ -799,6 +814,7 @@ fn lead_rotation_refused_reports_evidence_until_a_later_completed_rotation() {
     assert_eq!(row["facts"]["rotation_refused"], Value::Null);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn failed_or_interrupted_lead_is_lead_unavailable() {
     let h = health_fixture();
@@ -814,6 +830,7 @@ fn failed_or_interrupted_lead_is_lead_unavailable() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn failed_lead_with_an_open_capacity_incident_stays_unavailable_with_owner_evidence() {
     let h = health_fixture();
@@ -870,6 +887,7 @@ fn plan(h: &Health, sql: &str) -> Vec<String> {
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn per_epic_successor_and_report_reads_seek_by_the_epic_children() {
     use super::super::inspect::health::{LATEST_REPORT_SQL, UNCERTAIN_SUCCESSOR_SQL};

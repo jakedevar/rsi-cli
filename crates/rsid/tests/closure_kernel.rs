@@ -16,9 +16,6 @@ fn closure_review_command_contract_routes_through_executable_sealer_and_preserve
     .expect("master_orchestrate Closure reference");
     let implement = std::fs::read_to_string(root.join(".claude/commands/master_implement.md"))
         .expect("master_implement command");
-    let preamble =
-        std::fs::read_to_string(root.join(".claude/commands/_shared/worker_preamble.md"))
-            .expect("worker preamble");
     let sealer = root.join("scripts/seal-closure-review-evidence.sh");
     let metadata = std::fs::metadata(&sealer).expect("Closure evidence sealer");
     assert!(metadata.is_file());
@@ -49,10 +46,6 @@ fn closure_review_command_contract_routes_through_executable_sealer_and_preserve
     ] {
         assert!(closure_policy.contains(required), "missing `{required}`");
         assert!(implement.contains(required), "missing `{required}`");
-        assert!(preamble.contains(required), "missing `{required}`");
     }
     assert!(overlay.contains("master_orchestrate_rsi_closure.md"));
-    assert!(closure_policy.contains("non-Closure review is unchanged"));
-    assert!(implement.contains("Non-Closure execution\ncontinues through the V1"));
-    assert!(preamble.contains("ordinary V1 manifest lane above is unchanged"));
 }

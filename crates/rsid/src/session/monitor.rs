@@ -1072,9 +1072,32 @@ async fn advance_context_rotation_threshold(
     session_id: Uuid,
     pct: f64,
     persistence: &PersistenceHandle,
+    runtime_config: &crate::config::RuntimeConfig,
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    event_bus: &Arc<crate::bus::EventBus>,
 ) {
-    let pct = rotation_context_pct(tracked, pct);
-    let action = context_rotation_threshold_action(tracked, pct);
+    let threshold_pct = runtime_config.context_rotation_threshold_pct(tracked.session.provider);
+    if pct >= threshold_pct
+        && tracked.authorizes_threshold_rotation()
+        && matches!(tracked.rotation.state(), RotationState::Idle)
+    {
+        match store.lock().await.automatic_rotation_protection(session_id) {
+            Ok(Some(reason)) => {
+                tracing::info!(%session_id, reason, "Automatic context rotation deferred");
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%session_id, %error, "Automatic context rotation protection read failed; deferring");
+                event_bus.publish(DaemonEvent::SystemMessage {
+                    level: "error".into(),
+                    message: format!("Automatic context rotation deferred for {session_id}: protection read failed: {error}"),
+                });
+                return;
+            }
+        }
+    }
+    let action = context_rotation_threshold_action(tracked, pct, threshold_pct);
     if matches!(action, RotationAction::InterruptForRotation) {
         let depth = tracked.session.rotation_depth;
         let rid = tracked
@@ -1103,7 +1126,11 @@ async fn advance_context_rotation_threshold(
     }
 }
 
-fn context_rotation_threshold_action(tracked: &mut TrackedSession, pct: f64) -> RotationAction {
+fn context_rotation_threshold_action(
+    tracked: &mut TrackedSession,
+    pct: f64,
+    threshold_pct: f64,
+) -> RotationAction {
     // Catalog, repository, and legacy sources are descriptive/degraded and
     // must never trigger threshold rotation.
     if !tracked.authorizes_threshold_rotation() {
@@ -1112,7 +1139,7 @@ fn context_rotation_threshold_action(tracked: &mut TrackedSession, pct: f64) -> 
 
     tracked
         .rotation
-        .advance(RotationEvent::ThresholdCheck { pct })
+        .advance(RotationEvent::ThresholdCheckConfigured { pct, threshold_pct })
 }
 
 fn inactive_rotation_deadline() -> tokio::time::Instant {
@@ -1375,6 +1402,31 @@ pub(super) fn terminal_decision(evidence: TerminalEvidence) -> TerminalDecision 
     TerminalDecision::Finalize(TerminalFinalizeDecision::failed(
         AutofileCause::OtherTerminalFailure,
     ))
+}
+
+/// Keep the immediate-exit cause on a failed child even when the provider
+/// never emitted a terminal error event. Stderr remains in the transcript;
+/// the bounded stop reason carries the process outcome for progress readers.
+fn provider_launch_failure_stop_reason(
+    evidence: TerminalEvidence,
+    decision: TerminalFinalizeDecision,
+) -> Option<String> {
+    if decision.status != SessionStatus::Failed
+        || evidence.received_meaningful_output
+        || evidence.prior_meaningful_output
+        || evidence.interrupt_requested
+        || evidence.stall_interrupted
+        || matches!(evidence.break_reason, MonitorBreakReason::StallTimeout)
+    {
+        return None;
+    }
+    if let Some(code) = evidence.exit_code.filter(|code| *code != 0) {
+        return Some(format!("provider_launch_error:exit_code:{code}"));
+    }
+    if matches!(evidence.current_result, TerminalResult::ProviderError) {
+        return Some("provider_launch_error:provider_error".to_string());
+    }
+    (!evidence.received_any_event).then(|| "provider_launch_error:no_events".to_string())
 }
 
 /// A malformed handoff attempt still becomes stale after later tool activity,
@@ -2597,6 +2649,9 @@ impl SessionManager {
                                                 session_id,
                                                 pct,
                                                 &persistence,
+                                                &runtime_config,
+                                                &store,
+                                                &event_bus,
                                             )
                                             .await;
 
@@ -2768,6 +2823,9 @@ impl SessionManager {
                                             session_id,
                                             pct,
                                             &persistence,
+                                            &runtime_config,
+                                            &store,
+                                            &event_bus,
                                         )
                                         .await;
                                         Some((
@@ -3635,6 +3693,9 @@ impl SessionManager {
                                                 session_id,
                                                 pct,
                                                 &persistence,
+                                                &runtime_config,
+                                                &store,
+                                                &event_bus,
                                             )
                                             .await;
                                             Some((
@@ -4099,7 +4160,12 @@ impl SessionManager {
                 if tracked.spawn_generation != expected_generation {
                     return;
                 }
-                apply_terminal_handoff_order(decision, evidence, tracked)
+                let decision = apply_terminal_handoff_order(decision, evidence, tracked);
+                if tracked.session.stop_reason.is_none() {
+                    tracked.session.stop_reason =
+                        provider_launch_failure_stop_reason(evidence, decision);
+                }
+                decision
             }
         };
         let Some(finalized_decision) = Self::finalize_session(
@@ -4281,7 +4347,7 @@ impl SessionManager {
         // leaves deferred journal rows intact.
         let control = crate::session::agent_verbs::AgentControlHandle::new(
             active,
-            completed,
+            completed.clone(),
             store,
             event_bus,
             spawn_coordinator,
@@ -4311,6 +4377,14 @@ impl SessionManager {
             control
                 .maybe_autofile_terminal_failure(session_id, c5_disposition)
                 .await;
+        }
+        // Retry classification, rotation, memory extraction and no-idle have
+        // finished consuming the just-finalized vector. SQLite is durable;
+        // leave a placeholder so historical reads use the bounded cache.
+        if let Some(terminal) = completed.write().await.get_mut(&session_id) {
+            terminal.events.clear();
+            terminal.events.shrink_to_fit();
+            terminal.events_hydrated = false;
         }
     }
 
@@ -5014,6 +5088,7 @@ mod terminal_decision_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn issue_97_post_handoff_tool_requires_corrected_terminal_handoff() {
         let mut events = vec![
@@ -5183,6 +5258,44 @@ mod terminal_decision_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn immediate_provider_exit_has_durable_cause_without_turn_output() {
+        let mut early_exit = evidence();
+        early_exit.received_any_event = false;
+        early_exit.received_meaningful_output = false;
+        early_exit.exit_code = Some(42);
+        let TerminalDecision::Finalize(decision) = terminal_decision(early_exit) else {
+            panic!("settled provider exit must finalize");
+        };
+        assert_eq!(decision.status, SessionStatus::Failed);
+        assert_eq!(
+            provider_launch_failure_stop_reason(early_exit, decision).as_deref(),
+            Some("provider_launch_error:exit_code:42")
+        );
+
+        early_exit.exit_code = None;
+        assert_eq!(
+            provider_launch_failure_stop_reason(early_exit, decision).as_deref(),
+            Some("provider_launch_error:no_events")
+        );
+        early_exit.current_result = TerminalResult::ProviderError;
+        assert_eq!(
+            provider_launch_failure_stop_reason(early_exit, decision).as_deref(),
+            Some("provider_launch_error:provider_error")
+        );
+
+        early_exit.received_meaningful_output = true;
+        assert!(provider_launch_failure_stop_reason(early_exit, decision).is_none());
+        early_exit.received_meaningful_output = false;
+        early_exit.interrupt_requested = true;
+        assert!(provider_launch_failure_stop_reason(early_exit, decision).is_none());
+        early_exit.interrupt_requested = false;
+        early_exit.break_reason = MonitorBreakReason::StallTimeout;
+        assert!(provider_launch_failure_stop_reason(early_exit, decision).is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn terminal_decision_matrix_is_exhaustive_and_ordered() {
         let completed = TerminalDecision::Finalize(TerminalFinalizeDecision::completed());
@@ -5284,6 +5397,7 @@ mod terminal_decision_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn terminal_decision_result_truth_is_not_carried_stop_reason_metadata() {
         let mut no_current_result = evidence();
@@ -5307,6 +5421,7 @@ mod terminal_decision_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn terminal_decision_none_exit_and_turn_ownership_cases() {
         let mut live = evidence();
@@ -5363,6 +5478,7 @@ mod settlement_owner_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn settlement_owner_observes_panic_and_cancellation_without_wedging() {
         let mut panicked = SettlementTaskOwner {
@@ -5395,6 +5511,7 @@ mod settlement_owner_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn monitor_shutdown_drop_aborts_owned_settlement_task() {
         struct AbortMarker(Arc<AtomicBool>);
@@ -5439,6 +5556,7 @@ mod handoff_path_detection_tests {
     const OLD_HANDOFF: &str = "thoughts/shared/handoffs/ENG-general/2026-04-05_21-43-02_old.md";
     const NEW_HANDOFF: &str = "thoughts/shared/handoffs/general/2026-05-23_23-55-15_new.md";
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn shell_read_of_existing_handoff_is_not_creation_signal() {
         let data = json!({
@@ -5453,6 +5571,7 @@ mod handoff_path_detection_tests {
         assert!(!tool_use_can_create_path(&data, OLD_HANDOFF));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn shell_write_to_handoff_is_creation_signal() {
         let data = json!({
@@ -5467,6 +5586,7 @@ mod handoff_path_detection_tests {
         assert!(tool_use_can_create_path(&data, NEW_HANDOFF));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn shell_stderr_redirect_read_is_not_creation_signal() {
         for verb in ["sed -n 1p", "cat", "head -n 1", "rg marker", "grep marker"] {
@@ -5480,12 +5600,14 @@ mod handoff_path_detection_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn assistant_doc_path_declares_handoff() {
         let text = format!("doc_path: /home/jakedevar/rsi/{NEW_HANDOFF}\nstatus: complete");
         assert!(assistant_text_declares_handoff_path(&text, NEW_HANDOFF));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn assistant_listing_handoff_paths_is_not_declaration() {
         let text = format!("{OLD_HANDOFF}\nthoughts/shared/handoffs/general/other.md");
@@ -5509,6 +5631,7 @@ mod model_update_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn init_event_can_replace_existing_model_with_provider_reported_model() {
         let event = StreamEvent {
@@ -5525,6 +5648,7 @@ mod model_update_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn non_init_event_cannot_clobber_existing_model() {
         let event = StreamEvent {
@@ -5544,6 +5668,7 @@ mod model_update_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn first_reported_model_is_accepted_when_session_model_missing() {
         let event = StreamEvent {
@@ -5559,6 +5684,7 @@ mod model_update_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_initial_local_default_sets_missing_context_window() {
         let candidate = authoritative_model_candidate(
@@ -5578,6 +5704,7 @@ mod model_update_tests {
         assert!(candidate.model_changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_init_replacement_resets_context_fallback() {
         let candidate = authoritative_model_candidate(
@@ -5597,6 +5724,7 @@ mod model_update_tests {
         assert!(candidate.model_changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_model_change_preserves_unprojected_configured_authority() {
         let configured = rsi_common::ResolvedContextBudget::new(
@@ -5631,6 +5759,7 @@ mod model_update_tests {
         assert!(candidate.tuple_changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_same_model_backfills_missing_context_without_model_delta() {
         let candidate = authoritative_model_candidate(
@@ -5647,6 +5776,7 @@ mod model_update_tests {
         assert!(!candidate.model_changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_exact_tuple_is_a_noop() {
         let budget = crate::provider_capabilities::resolve_fresh_context_budget(
@@ -5667,6 +5797,7 @@ mod model_update_tests {
         assert!(!candidate.model_changed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn exact_init_capability_mismatch_warns_once_without_a_tuple_change() {
         let session_id = Uuid::new_v4();
@@ -5722,6 +5853,7 @@ mod model_update_tests {
         event_bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn candidate_rejects_auxiliary_non_init_model() {
         let event = StreamEvent {
@@ -5741,6 +5873,7 @@ mod model_update_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn runtime_resolution_rejects_zero_and_pins_incarnation_catalog_evidence() {
         let prior = rsi_common::ResolvedContextBudget::new(
@@ -5850,6 +5983,7 @@ mod model_update_tests {
 mod unrecognized_stream_event_tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn converter_reports_an_unrecognized_type_as_none() {
         // `None` is what makes the diagnostic possible at all: the caller can
@@ -5871,6 +6005,7 @@ mod unrecognized_stream_event_tests {
         assert_eq!(sequence, 0, "an unrecognized event consumes no sequence");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn converter_reports_a_recognized_but_empty_type_as_some() {
         // `result` is handled by the stream loop separately and yields no
@@ -5889,6 +6024,7 @@ mod unrecognized_stream_event_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn a_content_less_system_event_is_recognized_and_dropped() {
         // The Claude CLI emits these around every tool call. Persisted, they
@@ -5909,6 +6045,7 @@ mod unrecognized_stream_event_tests {
         assert_eq!(sequence, 7, "a dropped event must not consume a sequence");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn a_system_event_with_content_is_still_persisted() {
         let real = StreamEvent {
@@ -5925,6 +6062,7 @@ mod unrecognized_stream_event_tests {
         assert_eq!(sequence, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn a_distinct_unknown_type_is_reported_exactly_once() {
         let mut gate = UnrecognizedStreamEvents::default();
@@ -5946,6 +6084,7 @@ mod unrecognized_stream_event_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn types_the_stream_loop_consumes_elsewhere_stay_silent() {
         // These reach the converter and produce no conversation event by
@@ -5961,6 +6100,7 @@ mod unrecognized_stream_event_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn distinct_type_diagnostics_are_capped_and_announce_the_ceiling() {
         let mut gate = UnrecognizedStreamEvents::default();
@@ -6032,6 +6172,7 @@ mod provider_telemetry_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn init_handshake_captures_version_and_capabilities() {
         let handshake = provider_handshake(&observed_init_event()).expect("init yields handshake");
@@ -6046,6 +6187,7 @@ mod provider_telemetry_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn handshake_is_only_read_from_system_init() {
         // A non-init system event, and a non-system event, must both be
@@ -6063,6 +6205,7 @@ mod provider_telemetry_tests {
         assert_eq!(provider_handshake(&not_system), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn handshake_advertising_nothing_is_not_persisted() {
         // An init with neither fact gives us nothing to record, so it must not
@@ -6074,6 +6217,7 @@ mod provider_telemetry_tests {
         assert_eq!(provider_handshake(&bare_init), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn handshake_tolerates_a_partial_advertisement() {
         // Version but no capabilities is a real shape for an older CLI.
@@ -6086,6 +6230,7 @@ mod provider_telemetry_tests {
         assert!(handshake.capabilities.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rate_limit_event_yields_both_observed_windows() {
         let snapshot =
@@ -6116,6 +6261,7 @@ mod provider_telemetry_tests {
         assert_eq!(seven_day.resets_at_epoch, Some(1_788_883_200));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rate_limit_windows_are_iterated_not_hardcoded() {
         // A provider adding a third window must have it captured. Hardcoding
@@ -6135,6 +6281,7 @@ mod provider_telemetry_tests {
         assert_eq!(thirty_day.utilization, 0.02);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn peak_window_selects_the_most_consumed() {
         // The status bar shows one window; it must be the one that throttles
@@ -6147,6 +6294,7 @@ mod provider_telemetry_tests {
         assert_eq!(peak.utilization, 0.27);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn non_rate_limit_events_and_empty_windows_are_ignored() {
         let other = StreamEvent {
@@ -6166,6 +6314,7 @@ mod provider_telemetry_tests {
         assert!(parse_rate_limit_event(SessionProvider::Claude, &no_info).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn snapshot_provider_follows_the_reporting_session() {
         // The table is keyed by provider so a second CLI reporting windows
@@ -6349,6 +6498,7 @@ mod live_context_state_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn spawn_child_persists_handoff_filepath_on_predecessor() {
@@ -6397,6 +6547,7 @@ mod live_context_state_tests {
 
     /// Claude with API data: numerator is exactly `live_input_tokens` —
     /// daemon_delta is NOT added even when daemon counts are nonzero.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_claude_api_primary_no_delta() {
         let tracked = build_tracked(
@@ -6418,6 +6569,7 @@ mod live_context_state_tests {
 
     /// Codex with token-count data: context fill ignores cumulative
     /// `turn.completed` usage and uses the current-window token-count value.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codex_token_count_primary() {
         let mut tracked = build_tracked(
@@ -6441,6 +6593,7 @@ mod live_context_state_tests {
         assert!(matches!(confidence, ContextUsageConfidence::Full));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn codex_cache_read_accounting_stays_separate_from_context_numerator() {
         let mut tracked = build_tracked(
@@ -6481,6 +6634,7 @@ mod live_context_state_tests {
         assert_eq!(tracked.codex_context_tokens, 100_000);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn cache_read_only_change_requests_session_metadata_persistence() {
         assert!(cache_read_metadata_changed(Some(381_888), Some(300_000)));
@@ -6488,6 +6642,7 @@ mod live_context_state_tests {
         assert!(!cache_read_metadata_changed(None, None));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_pioneer_uses_codex_token_count_primary() {
         let mut tracked = build_tracked(
@@ -6509,6 +6664,7 @@ mod live_context_state_tests {
     }
 
     /// Display keeps the last provider observation; rotation retains its estimator.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codex_keeps_provider_reading_between_reports() {
         let mut tracked = build_tracked(
@@ -6529,6 +6685,7 @@ mod live_context_state_tests {
         assert!(matches!(confidence, ContextUsageConfidence::Full));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codex_without_token_count_reports_missing() {
         let mut tracked = build_tracked(
@@ -6549,6 +6706,7 @@ mod live_context_state_tests {
     }
 
     /// Keep descriptive capability metadata without inventing observed capacity.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codex_retains_fallback_budget_but_reports_unknown_pct() {
         let mut tracked = build_tracked(
@@ -6576,6 +6734,7 @@ mod live_context_state_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn live_gpt56_uses_authoritative_runtime_context_window() {
         let mut tracked = build_tracked(
@@ -6597,6 +6756,7 @@ mod live_context_state_tests {
         assert!((pct - 34_000.0 * 100.0 / 258_400.0).abs() < 1e-9);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn runtime_258400_controls_threshold_rotation() {
         let mut tracked = build_tracked(
@@ -6619,11 +6779,129 @@ mod live_context_state_tests {
         assert_eq!(rotation_pct, 68.0);
         assert!(tracked.authorizes_threshold_rotation());
         assert!(matches!(
-            context_rotation_threshold_action(&mut tracked, rotation_pct),
+            context_rotation_threshold_action(&mut tracked, rotation_pct, 65.0),
             RotationAction::InterruptForRotation
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn automatic_rotation_threshold_protects_reviewer_and_defers_read_error() {
+        let mut tracked = build_tracked(
+            SessionProvider::Codex,
+            180_000,
+            0,
+            0,
+            0,
+            ContextUsageConfidence::Full,
+            Some(258_400),
+        );
+        tracked.session.model = Some("gpt-6-astra".into());
+        tracked.codex_context_tokens = 180_000;
+        tracked.rotation.set_enabled(true);
+        let session_id = tracked.session.id;
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        {
+            let guard = store.lock().await;
+            guard.insert_session(&tracked.session).unwrap();
+            guard.conn.execute_batch(
+                "CREATE TEMP TABLE manager_review_assignments(reviewer_session_id TEXT,state TEXT);
+                 INSERT INTO manager_review_assignments VALUES('placeholder','allocating');",
+            ).unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE manager_review_assignments SET reviewer_session_id=?1",
+                    [session_id.to_string()],
+                )
+                .unwrap();
+        }
+        let persistence = PersistenceHandle::new(store.clone());
+        let event_bus = Arc::new(crate::bus::EventBus::new(16));
+        let runtime_config =
+            crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime_config
+            .context_rotation_global_pct
+            .store(65, std::sync::atomic::Ordering::Relaxed);
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            68.0,
+            &persistence,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute_batch("UPDATE manager_review_assignments SET state='active'")
+                .unwrap();
+        }
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            68.0,
+            &persistence,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute_batch(
+                    "DROP TABLE temp.manager_review_assignments;
+                 CREATE TEMP VIEW manager_review_assignments AS SELECT 1 AS missing_column;",
+                )
+                .unwrap();
+        }
+        let mut events = event_bus.subscribe();
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            68.0,
+            &persistence,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        assert!(
+            matches!(events.try_recv().unwrap().as_ref(), DaemonEvent::SystemMessage { level, message }
+            if level == "error" && message.contains("protection read failed"))
+        );
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute_batch("DROP VIEW temp.manager_review_assignments")
+                .unwrap();
+        }
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            68.0,
+            &persistence,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(
+            tracked.rotation.state(),
+            RotationState::PendingInterrupt { .. }
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn descriptive_and_degraded_budgets_never_trigger_threshold_rotation() {
         for (source, confidence) in [
@@ -6669,13 +6947,14 @@ mod live_context_state_tests {
 
             assert!(!tracked.authorizes_threshold_rotation());
             assert!(matches!(
-                context_rotation_threshold_action(&mut tracked, 68.0),
+                context_rotation_threshold_action(&mut tracked, 68.0, 65.0),
                 RotationAction::NoOp
             ));
             assert!(matches!(tracked.rotation.state(), RotationState::Idle));
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn runtime_context_write_failure_preserves_live_and_durable_tuple() {
         let mut tracked = build_tracked(
@@ -6755,6 +7034,7 @@ mod live_context_state_tests {
         assert_eq!(durable_budget.evidence, prior_budget.evidence);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codex_includes_system_and_tool_baseline() {
         let mut tracked = build_tracked(
@@ -6776,6 +7056,7 @@ mod live_context_state_tests {
         assert_eq!(rotation_context_pct(&tracked, pct), 0.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_context_fill_pct_for_tracked_includes_codex_baseline() {
         let mut tracked = build_tracked(
@@ -6797,6 +7078,7 @@ mod live_context_state_tests {
     }
 
     /// API Harness sessions consume the exact typed budget selected at launch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_harness_uses_typed_budget() {
         let mut tracked = build_tracked(
@@ -6816,6 +7098,7 @@ mod live_context_state_tests {
     }
 
     /// Antigravity: same delta-estimator behavior as Codex.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_antigravity_api_primary_with_delta() {
         let tracked = build_tracked(
@@ -6834,6 +7117,7 @@ mod live_context_state_tests {
 
     /// CodexAppServer uses the same native current-window telemetry as Codex
     /// once it receives a `thread/tokenUsage/updated` notification.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_codexappserver_uses_current_window_usage() {
         let mut tracked = build_tracked(
@@ -6857,6 +7141,7 @@ mod live_context_state_tests {
     }
 
     /// Harness: named-variant guard.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_harness_preserves_existing_behavior() {
         let tracked = build_tracked(
@@ -6873,6 +7158,7 @@ mod live_context_state_tests {
     }
 
     /// Local: BPE-primary — ignores `live_input_tokens`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_local_bpe_primary() {
         let tracked = build_tracked(
@@ -6890,6 +7176,7 @@ mod live_context_state_tests {
     }
 
     /// Claude pre-first-turn (no API data yet): falls back to BPE.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_claude_bpe_fallback_before_first_turn() {
         let tracked = build_tracked(
@@ -6907,6 +7194,7 @@ mod live_context_state_tests {
     }
 
     /// No API data, no daemon counts: (0, Missing).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_missing_when_nothing_reported() {
         let tracked = build_tracked(
@@ -6926,6 +7214,7 @@ mod live_context_state_tests {
 
     /// Claude consumes the exact typed active-session budget without a second
     /// model lookup at the percentage boundary.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_claude_uses_typed_200k_budget() {
         let mut tracked = build_tracked(
@@ -6950,6 +7239,7 @@ mod live_context_state_tests {
     /// Claude with stale daemon snapshot: snapshot value doesn't leak into
     /// the numerator. Guards against regression where Claude reads
     /// daemon_tokens_at_last_api_update.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_live_context_state_claude_ignores_daemon_snapshot() {
         let tracked = build_tracked(
@@ -6982,6 +7272,7 @@ mod live_context_state_tests {
     /// Claude + Running: once >60s has elapsed since the last API usage
     /// update, confidence flips `Full` → `Stale` but the numerator remains
     /// pinned to the last API-reported `live_input_tokens`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_stale_confidence_after_60s() {
         let mut tracked = build_tracked(
@@ -7012,6 +7303,7 @@ mod live_context_state_tests {
 
     /// Within the 60s window, a Claude+Running session preserves the
     /// `Full`/`Partial` confidence and the API numerator.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_no_stale_within_window() {
         let mut tracked = build_tracked(
@@ -7033,6 +7325,7 @@ mod live_context_state_tests {
     }
 
     /// Other BPE/estimator providers never flip to `Stale` regardless of idle time.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_no_stale_for_other_estimator_providers() {
         for provider in [
@@ -7064,6 +7357,7 @@ mod live_context_state_tests {
     /// Claude but status != Running: stale downgrade does NOT fire. A
     /// Completed session with an hour-old last-usage is done, not stale —
     /// signaling it would be visual noise.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_no_stale_for_non_running() {
         let mut tracked = build_tracked(
@@ -7090,6 +7384,7 @@ mod live_context_state_tests {
     /// `Stale` downgrade is applied — the existing `Missing`→`daemon_total`
     /// fallback path still covers cold-start because we never had API data to
     /// go stale on.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_no_stale_pre_first_usage() {
         let tracked = build_tracked(
@@ -7120,6 +7415,7 @@ mod live_context_state_tests {
     /// `Partial` confidence is eligible for the `Stale` downgrade on the
     /// same rules as `Full` — both represent API-reported data, both should
     /// be marked stale if the API goes quiet.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_stale_downgrades_partial_too() {
         let mut tracked = build_tracked(
@@ -7177,6 +7473,7 @@ mod live_context_state_tests {
         session
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn formula_claude_200k_vs_1m() {
         // Same numerator, different windows → different pct (no Codex baseline).
@@ -7184,12 +7481,14 @@ mod live_context_state_tests {
         assert_eq!(context_fill_pct_formula(500_000, 1_000_000), Some(50.0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn formula_100_pct_clamp() {
         // Numerator exceeding the window cannot publish >100%.
         assert_eq!(context_fill_pct_formula(2_000_000, 1_000_000), Some(100.0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn formula_zero_is_measured_but_unknown_window_is_none() {
         // Presence is independent of the well-defined raw ratio for measured zero.
@@ -7198,6 +7497,7 @@ mod live_context_state_tests {
         assert_eq!(context_fill_pct_formula(0, 0), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn live_context_codex_zero_fraction_stale_and_persisted_parity() {
         let mut tracked = build_tracked(
@@ -7235,6 +7535,7 @@ mod live_context_state_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn live_context_rollout_age_survives_late_ingestion() {
         let event = StreamEvent {
@@ -7244,6 +7545,7 @@ mod live_context_state_tests {
         assert!(codex_usage_observed_instant(&event).elapsed() > USAGE_STALENESS_WINDOW);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn formula_codex_baseline_subtraction() {
         // Codex curve subtracts the 12k baseline from both numerator and window;
@@ -7258,6 +7560,7 @@ mod live_context_state_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn typed_legacy_scalar_is_preserved_without_inventing_repository_origin() {
         let session = persisted_session(
@@ -7280,6 +7583,7 @@ mod live_context_state_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn persisted_idle_legacy_window_remains_exact_but_degraded() {
         // C3 backfilled this scalar with explicit legacy-unverified provenance.
@@ -7295,6 +7599,7 @@ mod live_context_state_tests {
         assert_eq!(context_fill_pct_from_persisted(&session), Some(100.0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn persisted_idle_completed_with_no_tokens_is_none() {
         let session = persisted_session(
@@ -7308,6 +7613,7 @@ mod live_context_state_tests {
         assert_eq!(context_fill_pct_from_persisted(&session), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn persisted_idle_falls_back_to_daemon_bpe_total() {
         let session = persisted_session(
@@ -7322,6 +7628,7 @@ mod live_context_state_tests {
         assert_eq!(context_fill_pct_from_persisted(&session), Some(50.0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn persisted_idle_codex_billing_and_fallback_budget_are_unknown() {
         // A billing total and fallback capacity cannot establish raw occupancy.
@@ -7341,6 +7648,7 @@ mod live_context_state_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn persisted_idle_codex_prefers_current_context_tokens_over_cumulative_total() {
         let mut session = persisted_session(
@@ -7371,6 +7679,7 @@ mod live_context_state_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn for_tracked_matches_live_pct_and_blanks_when_no_numerator() {
         let tracked = build_tracked(
@@ -7502,6 +7811,7 @@ mod retry_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_backoff_ms_default_cap() {
         let cap = 120_000;
@@ -7514,6 +7824,7 @@ mod retry_tests {
         assert_eq!(backoff_ms(0, cap), 10_000); // edge case: attempt 0 treated as 1
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_backoff_ms_custom_cap() {
         // Lower cap: backoff should never exceed 30s
@@ -7526,6 +7837,7 @@ mod retry_tests {
         assert_eq!(backoff_ms(6, 300_000), 300_000); // capped at 5min
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn terminal_monitor_wires_no_idle_after_retry_decision_before_c5() {
         let source = include_str!("monitor.rs");
@@ -7542,6 +7854,7 @@ mod retry_tests {
         assert!(no_idle < c5, "liveness recovery must precede C5 filing");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn retry_timer_sets_fired_marker_before_enqueue() {
         let session_id = Uuid::new_v4();
@@ -7577,6 +7890,7 @@ mod retry_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_classify_retry_zero_events() {
         let result = classify_retry_eligibility(
@@ -7590,6 +7904,7 @@ mod retry_tests {
         assert!(result.unwrap().contains("zero events"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_classify_retry_interrupted_not_retryable() {
         let result =
@@ -7597,6 +7912,7 @@ mod retry_tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_classify_retry_clean_completion_not_retryable() {
         let result =
@@ -7604,6 +7920,7 @@ mod retry_tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_classify_retry_stall_timeout_always_retryable() {
         // StallTimeout is retryable regardless of output/events
@@ -7794,6 +8111,7 @@ mod pending_question_producer_tests {
             .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn pending_question_producer_new_same_text_event_blocks_old_answer_before_persistence() {
         let (manager, _dir, config, session) = fixture().await;
@@ -7875,6 +8193,7 @@ mod pending_question_producer_tests {
         assert_ne!(current["event_id"], old.target["event_id"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn pending_question_producer_failed_insert_and_quiescent_cache_never_reuse_old_identity()
     {
@@ -7930,6 +8249,7 @@ mod pending_question_producer_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn pending_question_producer_current_answer_resume_clears_before_new_monitor_question() {
         let (manager, _dir, config, session) = fixture().await;

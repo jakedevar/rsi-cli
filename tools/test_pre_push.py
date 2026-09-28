@@ -11,12 +11,19 @@ HOOKS = Path(__file__).resolve().parent / "git-hooks"
 AGENT_MARKERS = ("RSI_SESSION_ID", "RSI_SESSION_TOKEN", "CLAUDE_AGENT_ROLE")
 
 
-def git(cwd: Path, *args: str, agent_marker: str | None = None) -> subprocess.CompletedProcess[str]:
+def git(
+    cwd: Path,
+    *args: str,
+    agent_marker: str | None = None,
+    lander_marker: bool = False,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for marker in AGENT_MARKERS:
         env.pop(marker, None)
     if agent_marker:
         env[agent_marker] = "test-session"
+    if lander_marker:
+        env["RSI_ROLLING_LANDER"] = "1"
     return subprocess.run(
         ["git", *args], cwd=cwd, env=env, text=True, capture_output=True, check=False
     )
@@ -65,6 +72,30 @@ class PrePushTest(unittest.TestCase):
                 self.assertIn(f"refs/heads/{ref}", result.stderr)
                 self.assertIn("land with rsi-rolling-land after an ACCEPTED review", result.stderr)
                 self.assertEqual(self.remote_ref(f"refs/heads/{ref}"), "")
+
+    def test_lander_marker_allows_rolling_but_never_main(self) -> None:
+        rolling = git(
+            self.repo,
+            "push",
+            "publish",
+            "HEAD:refs/heads/rolling",
+            agent_marker="RSI_SESSION_ID",
+            lander_marker=True,
+        )
+        self.assertEqual(rolling.returncode, 0, rolling.stderr)
+        source = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), source)
+
+        main = git(
+            self.repo,
+            "push",
+            "publish",
+            "HEAD:refs/heads/main",
+            agent_marker="RSI_SESSION_ID",
+            lander_marker=True,
+        )
+        self.assertNotEqual(main.returncode, 0)
+        self.assertEqual(self.remote_ref("refs/heads/main"), "")
 
     def test_agent_unprotected_ref_and_operator_protected_ref_succeed(self) -> None:
         agent = git(
@@ -117,7 +148,7 @@ class PrePushTest(unittest.TestCase):
         self.assertEqual(self.remote_ref("refs/heads/main"), "")
         self.assertEqual(self.remote_ref("refs/heads/feature"), "")
 
-    def test_private_landing_clone_can_publish_with_agent_environment(self) -> None:
+    def test_private_landing_clone_lander_marker_can_publish_with_agent_environment(self) -> None:
         private = self.root / "landing-clone"
         self.assert_git(
             self.root, "clone", "--shared", "--no-checkout", "-q", str(self.repo), str(private)
@@ -130,6 +161,7 @@ class PrePushTest(unittest.TestCase):
             "publish",
             "HEAD:refs/heads/rolling",
             agent_marker="RSI_SESSION_ID",
+            lander_marker=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.remote_ref("refs/heads/rolling"), git(private, "rev-parse", "HEAD").stdout.strip())

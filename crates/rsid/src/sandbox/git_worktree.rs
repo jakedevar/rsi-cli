@@ -55,7 +55,7 @@ const MAX_GIT_RECORD_BYTES: usize = 16 * 1024;
 const MAX_GIT_WORKTREE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GIT_WORKTREE_RECORDS: usize = 262_144;
 const MAX_GIT_WORKTREE_RECORD_BYTES: usize = 16 * 1024;
-const MAX_GIT_WORKTREE_ENTRIES: usize = 65_536;
+pub(crate) const MAX_GIT_WORKTREE_ENTRIES: usize = 65_536;
 const MAX_GIT_STDIN_BYTES: usize = 32 * 1024;
 const GIT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROLLING_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1351,6 +1351,51 @@ pub(crate) fn observe_clean_head_bounded(cwd: &Path) -> Result<(bool, String)> {
         "inspect child-fork source cleanliness",
     )?;
     Ok((status.is_empty(), observe_head_bounded(cwd)?))
+}
+
+/// Logical archive may retain a live worktree only when tracked files are clean
+/// and Git has no unfinished operation. The bounded runner disables optional
+/// locks and fsmonitor; this observation never cleans or moves the worktree.
+pub fn observe_tracked_clean_idle(cwd: &Path) -> Result<bool> {
+    let top_level = run_git_text(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        "inspect archive worktree root",
+    )?;
+    if std::fs::canonicalize(cwd)? != std::fs::canonicalize(top_level)? {
+        return Ok(false);
+    }
+    let git_dir = run_git_text(
+        cwd,
+        &["rev-parse", "--absolute-git-dir"],
+        "inspect archive worktree Git directory",
+    )?;
+    let git_dir = Path::new(&git_dir);
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        if git_dir.join(marker).try_exists()? {
+            return Ok(false);
+        }
+    }
+    let status = run_git_bytes(
+        cwd,
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ],
+        "inspect archive tracked worktree status",
+    )?;
+    Ok(status.is_empty())
 }
 
 /// Read HEAD through the bounded Git runner without inspecting dirty files.
@@ -2883,6 +2928,7 @@ fn list_worktrees_locked(origin: &Path) -> Result<Vec<RegisteredWorktree>> {
 pub(crate) fn discover_registered_worktree_roots(
     origin: &Path,
     max_entries: usize,
+    excluded_roots: &HashSet<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let expected_common = repository_identity_path(origin)?;
     let entries = list_worktrees_with_limit_locked(origin, max_entries)?;
@@ -2904,6 +2950,12 @@ pub(crate) fn discover_registered_worktree_roots(
             return Err(DaemonError::InvalidParam(
                 "Git worktree list contains duplicate canonical roots".into(),
             ));
+        }
+        // An RSI custody root keeps its custody-derived Codegraph identity even
+        // when its owning session is terminal. Skip it before the per-root Git
+        // probe, which would otherwise repeat for every historical sandbox.
+        if excluded_roots.contains(&canonical) {
+            continue;
         }
         if repository_identity_path(&canonical).ok().as_ref() != Some(&expected_common) {
             continue;
@@ -4234,6 +4286,7 @@ mod tests {
         (temp, remote, checkout, sandboxes, stale)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_allocates_from_remote_without_moving_checkout_refs() {
         let (_temp, remote, checkout, sandboxes, stale) = rolling_fixture();
@@ -4266,6 +4319,7 @@ mod tests {
         assert_eq!(git(&fork.root, &["rev-parse", "HEAD"]), stale);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_preserves_strictly_ahead_local_rolling() {
         let (_temp, remote, checkout, sandboxes, _stale) = rolling_fixture();
@@ -4306,6 +4360,7 @@ mod tests {
         assert!(git(&checkout, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_fetch_failure_falls_back_and_cleans_private_ref() {
         let (_temp, _remote, checkout, sandboxes, stale) = rolling_fixture();
@@ -4328,6 +4383,7 @@ mod tests {
         assert!(git(&checkout, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_preserves_local_only_successor_source() {
         let (_temp, remote, checkout, sandboxes, _stale) = rolling_fixture();
@@ -4365,6 +4421,7 @@ mod tests {
         assert!(git(&checkout, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_cleans_ref_after_allocation_failure() {
         let (_temp, remote, checkout, _sandboxes, stale) = rolling_fixture();
@@ -4385,6 +4442,7 @@ mod tests {
         assert!(git(&checkout, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn fresh_rolling_base_ref_deletion_failure_refuses_allocation() {
         let (_temp, _remote, checkout, sandboxes, stale) = rolling_fixture();
@@ -4406,6 +4464,7 @@ mod tests {
         std::fs::remove_file(lock).expect("remove fixture lock");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     #[allow(clippy::expect_used)]
     fn review_seal_holds_across_later_commits_and_reports_git_failure_distinctly() {
@@ -4439,6 +4498,7 @@ mod tests {
             .expect("a later code commit keeps the sealed object");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn default_branch_uses_full_canonical_session_uuid() {
         let session_id = Uuid::parse_str("b85caa0d-e1ed-4dbd-b9ca-5e0f49c6e53d")
@@ -4450,6 +4510,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn default_allocations_with_same_eight_hex_prefix_use_distinct_branches() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -4497,6 +4558,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn registered_worktree_proof_is_exact_clean_and_read_only() {
         let temp = tempfile::tempdir().expect("registered proof fixture");
@@ -4553,6 +4615,7 @@ mod tests {
         .expect("dirty refusal preserves the branch");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_path_is_deterministic_private_and_collision_safe() {
         let temp = tempfile::tempdir().expect("quarantine fixture root");
@@ -4621,6 +4684,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_move_is_inode_bound_and_preserves_old_path_injection() {
         let temp = tempfile::tempdir().expect("quarantine move fixture");
@@ -4713,6 +4777,7 @@ mod tests {
         .expect("quarantine move and non-force removal");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_sentinel_blocks_add_and_removes_dangling_non_force() {
         let temp = tempfile::tempdir().expect("branch-first fixture");
@@ -4849,6 +4914,7 @@ mod tests {
         .expect("branch-first removal and replay");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_lost_ack_rejects_stale_missing_source_lock() {
         let temp = tempfile::tempdir().expect("stale source-lock fixture");
@@ -4918,6 +4984,7 @@ mod tests {
         .expect("stale source lock is rejected after an unacknowledged effect");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_removed_replay_rejects_stale_source_lock() {
         let temp = tempfile::tempdir().expect("removed replay stale-lock fixture");
@@ -4972,6 +5039,7 @@ mod tests {
         .expect("removed replay rejects a stale source lock");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_ref_restore_replay_rejects_stale_source_lock() {
         let temp = tempfile::tempdir().expect("source replay stale-lock fixture");
@@ -4999,6 +5067,7 @@ mod tests {
         .expect("source replay rejects a stale ref lock");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn source_ref_restore_is_missing_only_and_target_independent() {
         let temp = tempfile::tempdir().expect("source restore fixture");
@@ -5067,6 +5136,7 @@ mod tests {
         .expect("exact source restoration");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_missing_quarantine_recovery_is_atomic_and_replayable() {
         for intermediate in ["symbolic-missing", "detached-missing"] {
@@ -5166,6 +5236,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn reattached_quarantine_replay_rejects_stale_source_lock() {
         let temp = tempfile::tempdir().expect("reattached replay stale-lock fixture");
@@ -5237,6 +5308,7 @@ mod tests {
         .expect("reattached replay rejects a stale ref lock");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn recovery_redispatches_same_oid_recreation_before_state_proof() {
         for intermediate in ["symbolic-missing", "detached-missing"] {
@@ -5312,6 +5384,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_recovery_replays_same_oid_source_race_and_lost_ack() {
         let temp = tempfile::tempdir().expect("same-OID recovery race fixture");
@@ -5388,6 +5461,7 @@ mod tests {
         .expect("same-OID source race recovers under the exact ref lock");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_missing_recovery_refuses_source_create_collision() {
         let temp = tempfile::tempdir().expect("detached collision fixture");
@@ -5457,6 +5531,7 @@ mod tests {
         .expect("collision retains exact external ref");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn non_force_remove_rejects_dangling_and_unreadable_residue() {
         for residue in ["dangling", "unreadable"] {
@@ -5532,6 +5607,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn exact_repair_recovers_only_the_renamed_worktree() {
         let temp = tempfile::tempdir().expect("quarantine repair fixture");
@@ -5600,9 +5676,13 @@ mod tests {
         .expect("repair exact partial move");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_tree_proof_rejects_mounts_hardlinks_specials_and_bounds() {
-        let temp = tempfile::tempdir().expect("quarantine tree fixture");
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in("/tmp")
+            .expect("quarantine tree fixture");
         let root = temp.path().join("quarantine");
         std::fs::create_dir(&root).expect("quarantine root");
         let mountinfo = temp.path().join("mountinfo");
@@ -5714,6 +5794,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_git_effects_have_no_force_prune_or_recursive_fallback() {
         let source = include_str!("git_worktree.rs");
@@ -5855,6 +5936,7 @@ esac
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     #[ignore = "subprocess-only no-escape syscall fixture"]
     fn no_escape_syscall_helper() {
@@ -5889,6 +5971,7 @@ esac
         std::fs::write(survived, "survived process-group cleanup\n").expect("survival marker");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn reserved_closure_allocation_restarts_by_adopting_only_exact_identity() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -5923,6 +6006,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn worktree_allocation_keeps_repository_hooks_enabled() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -5965,6 +6049,7 @@ esac
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn worktree_allocation_hooks_run_but_cannot_create_new_sessions() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6009,6 +6094,7 @@ esac
         assert!(!escaped.exists(), "post-checkout hook escaped its PGID");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn direct_ref_observation_distinguishes_valid_dangling_and_missing_symrefs() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6048,6 +6134,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn direct_ref_empty_lookup_post_probe_catches_valid_and_dangling_symref_races() {
         for target in ["refs/heads/main", "refs/heads/rsi/missing-target"] {
@@ -6070,6 +6157,7 @@ esac
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_ref_observation_rejects_symrefs_and_never_deletes_their_targets() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6127,6 +6215,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn atomic_ref_transaction_deletes_only_the_exact_source() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6155,6 +6244,7 @@ esac
         .expect("atomic source deletion");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn atomic_ref_transaction_leaves_source_when_target_is_stale() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6189,6 +6279,7 @@ esac
         .expect("stale target fails without source mutation");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn atomic_ref_transaction_closes_the_post_precheck_target_race() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6241,6 +6332,7 @@ esac
         .expect("raced target leaves source untouched");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn atomic_ref_transaction_refuses_equal_oid_target_to_source_symref_race() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6291,6 +6383,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn atomic_ref_transaction_disables_reference_transaction_hooks() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6340,6 +6433,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_proofs_ignore_replace_refs() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6391,6 +6485,7 @@ esac
         .expect("replace refs cannot manufacture settlement ancestry");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_proofs_ignore_legacy_grafts_with_a_positive_control() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6424,6 +6519,7 @@ esac
         .expect("legacy grafts cannot manufacture settlement ancestry");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_cleanliness_includes_ignored_content() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6448,6 +6544,7 @@ esac
         .expect("observe ignored content");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_cleanliness_rejects_assume_unchanged_content() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6478,6 +6575,7 @@ esac
         assert!(repository.join("tracked").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn cleanliness_observation_bypasses_a_lying_fsmonitor() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6542,6 +6640,7 @@ esac
         .expect("fsmonitor-independent settlement observation");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn worktree_observation_accepts_a_repo_scale_index_stream() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6568,6 +6667,7 @@ esac
         .expect("repo-scale index stream stays within the record work budget");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn worktree_list_stream_accepts_repository_output_above_capture_limit() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -6613,6 +6713,7 @@ esac
         }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn worktree_list_parser_enforces_its_entry_cap() {
         let mut parser = WorktreeListParser::new(1);
@@ -6629,6 +6730,7 @@ esac
         assert!(error.to_string().contains("entry count exceeded bound"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_accepts_each_stream_at_the_exact_cap() {
         let mut command = Command::new("sh");
@@ -6641,6 +6743,7 @@ esac
         assert_eq!(output.stderr.len(), MAX_GIT_OUTPUT_BYTES);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_rejects_either_stream_above_the_cap() {
         for script in ["head -c 65537 /dev/zero", "head -c 65537 /dev/zero >&2"] {
@@ -6652,6 +6755,7 @@ esac
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_record_stream_accepts_many_small_records_above_capture_limit() {
         let mut command = Command::new("sh");
@@ -6678,6 +6782,7 @@ esac
         assert!(bytes > MAX_GIT_OUTPUT_BYTES);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_record_stream_refuses_byte_and_record_work_budget_overruns() {
         let mut byte_command = Command::new("sh");
@@ -6725,6 +6830,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_record_modes_reject_newline_and_nul_free_overbound_records() {
         for (label, delimiter) in [("newline record", b'\n'), ("NUL record", b'\0')] {
@@ -6749,6 +6855,7 @@ esac
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_kills_a_hung_direct_child_at_the_execution_deadline() {
         let temp = tempfile::tempdir().expect("PID marker directory");
@@ -6783,6 +6890,7 @@ esac
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_kills_descendants_that_inherit_both_pipes() {
         let temp = tempfile::tempdir().expect("marker directory");
@@ -6798,6 +6906,7 @@ esac
         assert!(!marker.exists(), "descendant survived process-group kill");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_kills_quiet_descendant_pipe_holders_after_parent_exit() {
         let temp = tempfile::tempdir().expect("marker directory");
@@ -6816,6 +6925,7 @@ esac
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_runner_contains_setsids_across_success_error_and_timeout() {
         let temp = tempfile::tempdir().expect("no-escape fixture directory");

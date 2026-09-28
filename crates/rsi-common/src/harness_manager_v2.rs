@@ -45,6 +45,11 @@ pub enum ManagerCapabilityV2 {
     /// (`DELEGABLE_OPERATOR_METHODS_V1`) through the audited `operator_call`
     /// manager action, bound to the manager's project.
     OperatorDelegation,
+    /// Author, execute, inspect, interrupt and resolve durable topologies on
+    /// in-scope Epics through the `AgentTopology*` verbs (#633). Distinct
+    /// from `Topology`, which creates containers. A land step additionally
+    /// needs `GitEffect`.
+    Automation,
 }
 
 /// Upper bound on distinct grants in one policy; well above the variant count
@@ -250,6 +255,8 @@ pub enum ManagerInspectSectionV2 {
     Archive,
     /// One bounded fleet-health row per scoped Epic (#627).
     Health,
+    /// Durable SQLite migration-version allocations and competing claims.
+    MigrationAllocations,
 }
 
 const fn page_limit() -> u16 {
@@ -1473,6 +1480,30 @@ pub enum ManagerUpdateV2 {
         baseline_commit: String,
         inventory_digest: String,
     },
+    /// Seal an exact Work source; the daemon chooses its landing-order version.
+    MigrationSeal {
+        key: String,
+        expected_row_version: i64,
+        source_commit: String,
+        expires_at: DateTime<Utc>,
+    },
+    /// Withdraw an unlanded exact-source seal. The claim row version is its
+    /// staleness fence; the allocator compacts later versions in seal order.
+    MigrationSealRelease {
+        key: String,
+        claim_id: Uuid,
+        expected_row_version: i64,
+        source_commit: String,
+    },
+    /// Transfer one unlanded claim to a replacement Work source.
+    MigrationSealTransfer {
+        key: String,
+        claim_id: Uuid,
+        expected_row_version: i64,
+        source_commit: String,
+        new_source_commit: String,
+        expires_at: DateTime<Utc>,
+    },
     MigrationTransfer {
         key: String,
         expected_row_version: i64,
@@ -1520,6 +1551,13 @@ pub enum ManagerUpdateV2 {
         summary: String,
         next_actions: Vec<String>,
     },
+}
+
+fn migration_source_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1599,6 +1637,44 @@ impl AgentManagerUpdateRequestV2 {
                 text(key, 256)?;
                 text(baseline_commit, 128)?;
                 text(inventory_digest, 128)?;
+            }
+            ManagerUpdateV2::MigrationSeal {
+                key, source_commit, ..
+            } => {
+                text(key, 256)?;
+                if source_commit.len() != 40
+                    || !source_commit
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("manager_v2_invalid_source_commit");
+                }
+            }
+            ManagerUpdateV2::MigrationSealRelease {
+                key,
+                claim_id,
+                source_commit,
+                ..
+            } => {
+                text(key, 256)?;
+                if claim_id.is_nil() || !migration_source_sha(source_commit) {
+                    return Err("manager_v2_invalid_migration_claim");
+                }
+            }
+            ManagerUpdateV2::MigrationSealTransfer {
+                key,
+                claim_id,
+                source_commit,
+                new_source_commit,
+                ..
+            } => {
+                text(key, 256)?;
+                if claim_id.is_nil()
+                    || !migration_source_sha(source_commit)
+                    || !migration_source_sha(new_source_commit)
+                {
+                    return Err("manager_v2_invalid_migration_claim");
+                }
             }
             ManagerUpdateV2::MigrationTransfer { key, .. }
             | ManagerUpdateV2::MigrationRelease { key, .. } => text(key, 256)?,
@@ -1879,6 +1955,30 @@ mod tests {
             .capabilities
             .push(ManagerCapabilityV2::SessionControl);
         assert_eq!(duplicate.validate(), Err("manager_v2_invalid_policy"));
+    }
+
+    /// #633: `Automation` is additive; older stored policies (without it)
+    /// still decode, and the new grant has a stable wire name.
+    #[test]
+    fn manager_v2_automation_grant_is_additive_with_stable_wire_name() {
+        let legacy: ManagerPolicyV2 =
+            serde_json::from_value(json!({"mode":"execute","capabilities":["work_plan"]})).unwrap();
+        assert_eq!(legacy.capabilities, vec![ManagerCapabilityV2::WorkPlan]);
+        let policy: ManagerPolicyV2 = serde_json::from_value(json!({
+            "mode":"execute",
+            "capabilities":["topology","git_effect","automation"]
+        }))
+        .unwrap();
+        assert_eq!(policy.validate(), Ok(()));
+        assert!(
+            policy
+                .capabilities
+                .contains(&ManagerCapabilityV2::Automation)
+        );
+        assert_eq!(
+            serde_json::to_value(ManagerCapabilityV2::Automation).unwrap(),
+            json!("automation")
+        );
     }
 
     #[test]

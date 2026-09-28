@@ -170,6 +170,34 @@ worker unavailability fails explicitly. Disabling reclamation prevents
 selection of new targets but does not strand an already-authorized staged
 target: recovery still runs first.
 
+Under sustained disk pressure, the startup/periodic producer can continue the
+terminal-history sweep without sleeping the full operator interval between
+pages. It awaits each result on the same serialized worker before submitting
+another job; it adds no queue, worker, RPC, setting, or deletion authority.
+An advancing reserved cursor through an empty historical page counts as useful
+scan progress. Actual removals, new staging, or recovery deletions also permit
+continuation. Eligibility alone, a refused candidate page without useful work,
+Store contention, errors, an unchanged cursor, and a completed sweep wrap return
+to the persisted operator interval. Dry-run and operator requests remain single
+passes and never start automatic continuations.
+
+Continuations yield 25 ms between passes. A burst pauses for one second after
+16 passes, 256 inspected terminal rows, two seconds elapsed, or 1 GiB of reported
+staged/recovered byte observations, whichever threshold is reached first.
+These are admission budgets checked at pass boundaries: the last admitted pass
+can cross a threshold and retains its existing independent row, filesystem,
+byte, and duration ceilings. They do not interrupt a custody/journal operation
+or promise a precise amount of reclaimed capacity. This bounded pause repeats
+while progress continues; it does not reset the durable sweep cursor.
+
+Every continuation reads fresh policy and filesystem pressure on the worker
+after its queue wait. Disable or the low watermark stops accelerated work before
+recovery or candidate selection. Ordinary interval-based recovery of previously
+staged targets remains available while disabled. Shutdown aborts the producer
+before awaiting other services, preventing future submissions while already
+accepted worker jobs finish under their original fences. Outside pressure the
+saved operator interval governs scheduling; no persisted policy is rewritten.
+
 Reclaim lifecycle logs include bounded monotonic `queue_wait_ms`,
 `run_duration_ms`, and `total_elapsed_ms` fields while retaining trigger,
 dry-run, cancellation, count, stop, and error details. Startup restore also

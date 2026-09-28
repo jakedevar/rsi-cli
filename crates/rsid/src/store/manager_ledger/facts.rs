@@ -38,17 +38,22 @@ pub(crate) enum FactReach {
 
 type FactRow = (String, String, i64, String, bool, String, String);
 
-/// SQL predicate (fact alias `f`) for a LIVE fact: not archived, and its work
-/// (the work row itself for `kind='work'`, whose `work_key` is its own key) is
-/// neither archived nor integrated. The work payload has no cancelled state;
-/// every Stage or Work revision clears `integration`, so a present integration
-/// always means delivered at the current source. Terminal facts stay readable
-/// by key (landed work is never re-admitted) but no longer count against the
-/// budget or feed project-wide gates, so history cannot exhaust a project.
-const LIVE_FACT: &str = "f.archived=0 AND NOT EXISTS(
+/// SQL predicate (fact alias `f`) for a LIVE fact: not archived, its owning
+/// Epic still exists and is not Archived/Deleted, and its Work (the work row
+/// itself for `kind='work'`) exists and is neither archived nor integrated.
+/// The work payload has no cancelled state; every Stage or Work revision clears
+/// `integration`, so a present integration always means delivered at the
+/// current source. Terminal facts stay readable by key (landed work is never
+/// re-admitted) but no longer count against budgets or feed project-wide gates.
+const LIVE_FACT: &str = "f.archived=0 AND EXISTS(
+    SELECT 1 FROM sessions e
+     WHERE e.id=f.epic_id AND e.project_id=f.project_id
+       AND e.status NOT IN ('Archived','Deleted')) AND EXISTS(
     SELECT 1 FROM harness_manager_v2_work_facts w
-     WHERE w.project_id=f.project_id AND w.kind='work' AND w.record_key=f.work_key
-       AND (w.archived=1 OR json_type(w.payload_json,'$.integration')='object'))";
+     WHERE w.project_id=f.project_id AND w.kind='work'
+       AND w.record_key=CASE WHEN f.kind='work' THEN f.record_key ELSE f.work_key END
+       AND w.epic_id=f.epic_id
+       AND w.archived=0 AND json_type(w.payload_json,'$.integration') IS NOT 'object')";
 
 /// Durable fact budget per project, as an SQL integer.
 fn fact_budget() -> i64 {

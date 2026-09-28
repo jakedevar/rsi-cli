@@ -160,6 +160,18 @@ impl Store {
             .map_err(DaemonError::Database)
     }
 
+    /// Read the raw enablement bit even when another column makes the row
+    /// undecodable. Terminal repair must never re-arm a closed sentinel.
+    pub(crate) fn enabled_scheduled_job_exists(&self, id: &Uuid) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scheduled_jobs WHERE id = ?1 AND enabled = 1)",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(DaemonError::Database)
+    }
+
     /// Resolve daemon-owned program identity from the deterministic job id,
     /// independently of every mutable field in the scheduled-job row.
     ///
@@ -1004,6 +1016,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn d05_program_run_wake_job_insert_or_replay_is_exact() {
         let store = Store::open_in_memory().expect("in-memory store");
@@ -1083,6 +1096,7 @@ mod tests {
     /// pin); recognized malformed tokens are row errors, not silent Fresh.
     /// (A8.1 F-6: the drop is unchanged but now leaves a `tracing::warn!`
     /// per dropped row — see `keep_readable_row`.)
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn wake_mode_agent_fresh_roundtrips_and_invalid_origin_fails_closed() {
         let store = Store::open_in_memory().expect("in-memory store");
@@ -1174,6 +1188,7 @@ mod tests {
 
     /// The due-jobs query surfaces an armed watch row exactly like any other
     /// enabled job (the scheduler's poll IS the reconcile tick).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn on_terminal_job_is_due_listed() {
         let store = Store::open_in_memory().expect("in-memory store");

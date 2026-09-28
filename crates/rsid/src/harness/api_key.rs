@@ -62,6 +62,7 @@ pub const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY", "GROK_API_KEY"];
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_explicit_key_takes_priority() {
         assert_eq!(
@@ -70,11 +71,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_empty_explicit_falls_through() {
         assert_eq!(resolve_api_key(Some(""), &["NONEXISTENT_VAR"]), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_none_explicit_falls_through() {
         assert_eq!(resolve_api_key(None, &["NONEXISTENT_VAR"]), None);

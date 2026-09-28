@@ -993,6 +993,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn special_sources_are_always_blocked_without_observation() {
         let sid = Uuid::new_v4();
@@ -1040,6 +1041,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn dirty_unreadable_missing_and_changed_identity_are_blocked() {
         for expected in [
@@ -1063,6 +1065,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn target_proof_mapping_and_verification_diagnostics_never_authorize() {
         let cases = [
@@ -1237,6 +1240,7 @@ mod tests {
         ]
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn shared_boundary_adverse_rows_use_isolated_full_snapshots() {
         for (name, diagnostics, expected, setup, inject_unreadable) in adverse_matrix_cases() {
@@ -1296,6 +1300,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn shared_unreadable_and_changed_ownership_are_blocked() {
         let cases = [
@@ -1330,6 +1335,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn barrier_controlled_identity_drift_is_blocked_without_sleeping() {
         let before = Arc::new(Barrier::new(2));
@@ -1360,6 +1366,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn real_ref_drift_is_barrier_controlled_and_classifier_is_inert() {
         let mut fixture = MatrixFixture::new();
@@ -1435,6 +1442,7 @@ mod tests {
         assert!(fixture.snapshot().success_events.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn production_classifier_does_not_invoke_git_or_refresh_stale_index() {
         let repo = TempDir::new().expect("repo tempdir");
@@ -1515,6 +1523,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn generic_lifecycle_has_no_destructive_worktree_reachability() {
         let lifecycle = include_str!("../session/lifecycle.rs");

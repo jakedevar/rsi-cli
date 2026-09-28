@@ -609,6 +609,77 @@ Read the full `INDEX.status.json` sidecar for a project.
 
 ---
 
+## Agent topology verbs (#633)
+
+Source: `crates/rsid/src/session/topology_agent_verbs.rs` (dispatch shared by
+RPC and native tools), `crates/rsid/src/topology/agent.rs` (authority, policy,
+store). Request DTOs: `crates/rsi-common/src/topology_agent.rs`; schemas:
+`rsi-rpc <Verb> --schema`.
+
+The operator methods above (`CreateTopology`, `UpdateTopology`,
+`ListTopologies`, `ExecuteTopology`, `GetWorkflowExecution`,
+`InterruptWorkflowExecution`, `ResolveTopologyAttempt`) stay operator-only. A
+token-attributed session uses these six `Agent*` verbs instead (native tools
+`rsi_control_topology_{upsert,list,execute,get_execution,interrupt,resolve_attempt}`):
+
+| Verb | Request | Result |
+|---|---|---|
+| `AgentTopologyUpsert` | `{name, definition, scope:"epic"\|"manager", epic_id?, expected_revision?, validate_only, idempotency_key}` | `{topology_id?, revision?, definition_digest, diagnostics[], deduplicated}` |
+| `AgentTopologyList` | `{scope?, epic_id?, include_executions, cursor?, limit≤32}` | `{topologies[], executions[], next_cursor?}` |
+| `AgentTopologyExecute` | `{topology_id, expected_digest, epic_id, inputs?, base_commit?, idempotency_key}` | `{execution_id, accepted_at, base_commit, deduplicated}` |
+| `AgentTopologyGetExecution` | `{execution_id, after_sequence?, limit≤64}` | `{execution, nodes[], events[], next_sequence}` |
+| `AgentTopologyInterrupt` | `{execution_id, expected_row_version, idempotency_key}` | `{execution_id, status, interrupt_requested_at, deduplicated}` |
+| `AgentTopologyResolveAttempt` | `ResolveTopologyAttempt` params: `{execution_id, attempt_id, action, expected_row_version, idempotency_key, confirm_preserved_commit?}` | `{attempt, execution_status, report?, deduplicated}` |
+
+Every request is `deny_unknown_fields` and names no caller identity; the daemon
+binds the caller from `$RSI_SESSION_TOKEN` (or the native tool registration).
+
+**Authority.** The current appointed manager holding V2 `Automation`, on Epics
+in its live scope (Execute mode and no pause for execute/retry/accept); or the
+current lead of an Epic, only within that Epic (`scope:"epic"`, may execute its
+Epic's topologies or `shared` operator/manager ones, never `discard`). Every
+other caller, including topology node sessions, gets `authority_denied`.
+
+**Policy.** Each session node's explicit provider/model/effort must equal an
+operator `allowed_launches` entry (empty fails closed) at upsert, at execute and
+at every launch; a review node's vendor family must differ from its author's; a
+layer with at least `topology_bulk_fanout_min_openrouter` (operator knob via
+`GetDaemonConfig`/`UpdateDaemonConfig` and the TUI settings row; default 4, `0`
+disables) same-kind session nodes must be OpenRouter; at most 3 session nodes of
+an agent execution run concurrently; manager-requested launches charge
+`max_created_sessions` (`creation_limit`).
+
+**Errors.** `-32602` with `data: {code, next_action}` (plus `diagnostics[]` for
+definition refusals). Codes include `authority_denied`, `capability_denied`,
+`not_found_in_scope`, `manager_not_execute`, `paused` (launch-time: `manager_paused`),
+`invalid_params`, `invalid_definition`, `launch_not_explicit`,
+`launch_not_granted`, `name_conflict`, `stale_revision`, `digest_mismatch`,
+`topology_not_visible`, `topology_changed`,
+`stale_row_version`, `idempotency_conflict`, `creation_limit`,
+`executor_disabled`, `discard_requires_manager`, `preserved_commit_mismatch`,
+and `request_failed` (internal failures are logged, never echoed).
+
+**Audit.** Every call after token resolution (all six verbs, reads,
+malformed requests and every refusal) appends exactly one row to the
+append-only `topology_agent_requests` ledger (V133):
+verb, caller session and kind (`manager`/`epic_lead`, or none), Epic,
+topology and execution targets, a canonical request digest without the key,
+outcome (`accepted`/`deduplicated`/`refused`), redacted code and a bounded
+receipt. Execution-scoped events (acceptance, interrupt, resolutions and
+refusals against a visible execution) also land in `topology_events`.
+
+**Idempotency.** `AgentTopologyUpsert` binds its `idempotency_key` to the
+first non-refused request in the same transaction as the write: an identical
+replay returns the original receipt with `deduplicated: true` and writes
+nothing; a changed name, definition, scope, Epic or `expected_revision` under
+the same key is `idempotency_conflict`. A refused request never binds its key,
+and `validate_only` never binds. `AgentTopologyExecute` re-reads the topology
+under the accepting lock after resolving its base: an unshared, archived or
+out-of-scope topology refuses `topology_not_visible`, and a revised definition
+refuses `topology_changed`; neither persists an execution.
+
+---
+
 ## See Also
 
 - [README.md](README.md) — Phase 1 overview, architecture diagram, Quickstart

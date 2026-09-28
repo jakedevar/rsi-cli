@@ -12,13 +12,65 @@ pub mod memory;
 pub mod rsi_control;
 pub mod schedule_wake;
 pub mod shell;
+pub(crate) mod truncation;
 
+use crate::claude::StreamEvent;
 use crate::session::agent_verbs::AgentControlHandle;
 use crate::session::harness::types::{HarnessToolSpec, ToolResult};
+use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Whether a tool may execute alongside other calls from the same model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    ParallelSafe,
+    Sequential,
+}
+
+/// Shared limits passed to tools. Later session policy can narrow these limits.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolPolicy {
+    pub max_output_bytes: usize,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Construction-bound context for one tool invocation.
+#[derive(Clone)]
+pub struct ToolContext {
+    pub session_id: Option<uuid::Uuid>,
+    pub working_dir: PathBuf,
+    pub cancel: CancellationToken,
+    pub event_sink: Option<mpsc::Sender<StreamEvent>>,
+    pub policy: ToolPolicy,
+}
+
+impl ToolContext {
+    pub async fn report_progress(&self, tool_name: &str, message: &str) {
+        if let Some(sink) = &self.event_sink {
+            let _ = sink
+                .send(StreamEvent {
+                    event_type: "tool_progress".into(),
+                    data: json!({
+                        "session_id": self.session_id,
+                        "name": tool_name,
+                        "message": message,
+                    }),
+                })
+                .await;
+        }
+    }
+}
 
 /// Trait for tools executable by the agent harness.
 #[async_trait::async_trait]
@@ -31,6 +83,11 @@ pub trait HarnessTool: Send + Sync {
 
     /// JSON Schema string for input parameters.
     fn parameters_json(&self) -> &str;
+
+    /// Calls are sequential unless the tool explicitly declares itself safe.
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
 
     /// Execute the tool with the given arguments.
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult;
@@ -55,6 +112,17 @@ pub trait HarnessTool: Send + Sync {
         }
     }
 
+    /// New tools receive progress, cancellation, policy and session context.
+    /// Existing tools keep their cancellable implementation during migration.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolResult {
+        self.execute_cancellable(args, &context.working_dir, &context.cancel)
+            .await
+    }
+
     /// Convert to a HarnessToolSpec for provider API calls.
     fn to_spec(&self) -> HarnessToolSpec {
         HarnessToolSpec {
@@ -68,21 +136,69 @@ pub trait HarnessTool: Send + Sync {
 /// Registry of available tools for the agent loop.
 pub struct HarnessToolRegistry {
     tools: HashMap<String, Arc<dyn HarnessTool>>,
+    order: Vec<String>,
+    session_id: Option<uuid::Uuid>,
 }
 
 impl HarnessToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            order: Vec::new(),
+            session_id: None,
         }
     }
 
     pub fn register(&mut self, tool: Arc<dyn HarnessTool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        self.try_register(tool)
+            .expect("built-in Harness tool names must be unique");
+    }
+
+    /// Register a tool without changing the existing roster on a duplicate.
+    pub fn try_register(&mut self, tool: Arc<dyn HarnessTool>) -> Result<(), String> {
+        let name = tool.name().to_string();
+        if self.tools.contains_key(&name) {
+            return Err(format!("Duplicate Harness tool: {name}"));
+        }
+        self.tools.insert(name.clone(), tool);
+        self.order.push(name);
+        Ok(())
     }
 
     pub fn specs(&self) -> Vec<HarnessToolSpec> {
-        self.tools.values().map(|t| t.to_spec()).collect()
+        self.order
+            .iter()
+            .map(|name| self.tools[name].to_spec())
+            .collect()
+    }
+
+    pub fn execution_mode(&self, name: &str) -> Option<ToolExecutionMode> {
+        self.tools.get(name).map(|tool| tool.execution_mode())
+    }
+
+    pub async fn execute_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        working_dir: &Path,
+        cancel: &CancellationToken,
+        event_sink: Option<mpsc::Sender<StreamEvent>>,
+    ) -> ToolResult {
+        let context = ToolContext {
+            session_id: self.session_id,
+            working_dir: working_dir.to_path_buf(),
+            cancel: cancel.clone(),
+            event_sink,
+            policy: ToolPolicy::default(),
+        };
+        match self.tools.get(name) {
+            Some(tool) => tool.execute_with_context(args, &context).await,
+            None => ToolResult {
+                success: false,
+                output: String::new(),
+                error_msg: Some(format!("Unknown tool: {name}")),
+            },
+        }
     }
 
     pub async fn execute(
@@ -179,6 +295,7 @@ impl HarnessToolRegistry {
         execution_scratch: Option<crate::sandbox::execution_scratch::SandboxExecutionScratch>,
     ) -> Self {
         let mut registry = Self::new();
+        registry.session_id = origin_session_id;
         registry.register(Arc::new(file::ReadFileTool));
         registry.register(Arc::new(file::WriteFileTool));
         registry.register(Arc::new(file::EditFileTool));
@@ -270,6 +387,13 @@ impl HarnessToolRegistry {
                     kind,
                 )));
             }
+            for verb in crate::session::topology_agent_verbs::TOPOLOGY_AGENT_VERBS {
+                registry.register(Arc::new(rsi_control::RsiControlTopologyTool::new(
+                    control.clone(),
+                    caller,
+                    verb,
+                )));
+            }
         }
         registry
     }
@@ -307,6 +431,7 @@ pub fn is_system_blocked(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_is_system_blocked() {
         assert!(is_system_blocked(Path::new("/etc/passwd")));
@@ -317,6 +442,7 @@ mod tests {
         assert!(!is_system_blocked(Path::new("/tmp/workdir/file.txt")));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_registry_unknown_tool() {
         let registry = HarnessToolRegistry::new();
@@ -330,6 +456,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("Unknown tool"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_default_tools_has_all_builtins() {
         let registry = HarnessToolRegistry::default_tools(
@@ -344,16 +471,130 @@ mod tests {
         assert!(names.contains(&"list_files".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_specs_returns_all() {
-        // Without a store, schedule_wake is not registered, so count stays 6.
         let registry = HarnessToolRegistry::default_tools(
             None, None, None, None, None, None, None, None, None,
         );
-        let specs = registry.specs();
-        assert_eq!(specs.len(), 6);
+        let names: Vec<_> = registry.specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "write_file",
+                "file_edit",
+                "shell",
+                "git",
+                "list_files"
+            ]
+        );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn registry_specs_are_stable_and_duplicate_registration_fails() {
+        let mut first = HarnessToolRegistry::default_tools(
+            None, None, None, None, None, None, None, None, None,
+        );
+        let second = HarnessToolRegistry::default_tools(
+            None, None, None, None, None, None, None, None, None,
+        );
+        let before = serde_json::to_vec(&first.specs()).unwrap();
+        assert_eq!(before, serde_json::to_vec(&second.specs()).unwrap());
+        assert!(first.try_register(Arc::new(file::ReadFileTool)).is_err());
+        assert_eq!(before, serde_json::to_vec(&first.specs()).unwrap());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    struct ProgressTool;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[async_trait::async_trait]
+    impl HarnessTool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Report progress until cancelled"
+        }
+
+        fn parameters_json(&self) -> &str {
+            r#"{"type":"object"}"#
+        }
+
+        async fn execute(&self, _args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+            unreachable!("context execution must be used")
+        }
+
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            context: &ToolContext,
+        ) -> ToolResult {
+            context.report_progress(self.name(), "started").await;
+            context.cancel.cancelled().await;
+            ToolResult {
+                success: false,
+                output: String::new(),
+                error_msg: Some("cancelled".into()),
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn tool_context_reports_progress_and_observes_midrun_cancel() {
+        let mut registry = HarnessToolRegistry::new();
+        registry.session_id = Some(uuid::Uuid::nil());
+        registry.register(Arc::new(ProgressTool));
+        let (tx, mut rx) = mpsc::channel(2);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            registry
+                .execute_with_context(
+                    "progress_probe",
+                    json!({}),
+                    Path::new("/tmp"),
+                    &task_cancel,
+                    Some(tx),
+                )
+                .await
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_type, "tool_progress");
+        assert_eq!(event.data["session_id"], uuid::Uuid::nil().to_string());
+        assert_eq!(event.data["message"], "started");
+        cancel.cancel();
+        assert!(task.await.unwrap().is_error());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn execution_modes_default_to_sequential_except_read_only_tools() {
+        let registry = HarnessToolRegistry::default_tools(
+            None, None, None, None, None, None, None, None, None,
+        );
+        assert_eq!(
+            registry.execution_mode("read_file"),
+            Some(ToolExecutionMode::ParallelSafe)
+        );
+        assert_eq!(
+            registry.execution_mode("list_files"),
+            Some(ToolExecutionMode::ParallelSafe)
+        );
+        assert_eq!(
+            registry.execution_mode("shell"),
+            Some(ToolExecutionMode::Sequential)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn test_register_and_specs() {
         let mut registry = HarnessToolRegistry::new();
@@ -392,6 +633,7 @@ mod tests {
     /// `schedule_wake` and the native `rsi_control` tools the legacy rotation
     /// registry used to omit. Pin the exact non-memory roster so any future
     /// tool added to one path only (re-introducing split-brain) trips here.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rotation_and_fresh_share_identical_tool_set() {
         let store = Arc::new(tokio::sync::Mutex::new(
@@ -455,6 +697,12 @@ mod tests {
             "rsi_control_manager_commit_prepared_control",
             "rsi_control_manager_get_action",
             "rsi_control_manager_work_view",
+            "rsi_control_topology_upsert",
+            "rsi_control_topology_list",
+            "rsi_control_topology_execute",
+            "rsi_control_topology_get_execution",
+            "rsi_control_topology_interrupt",
+            "rsi_control_topology_resolve_attempt",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -462,6 +710,7 @@ mod tests {
         assert_eq!(fresh, expected, "unified Harness tool roster drifted");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn agent_bound_native_tool_schemas_match_the_common_catalog() {
         let store = Arc::new(tokio::sync::Mutex::new(
@@ -552,6 +801,7 @@ mod tests {
     /// The native `rsi_control` tools are gated on BOTH a control handle and a
     /// bound caller session id — without a caller there is nothing to bind, so
     /// they must not register (defense against an unbound/spoofable caller).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rsi_control_tools_require_a_bound_caller() {
         let control = test_control_handle();

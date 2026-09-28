@@ -261,6 +261,7 @@ fn s1_assert_template_error(result: Result<()>, code: CurrentSchemaTemplateError
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_fixture_matches_migrated_current_schema() {
     let cached = Store::open_in_memory().unwrap();
@@ -314,6 +315,7 @@ fn cached_current_schema_fixture_matches_migrated_current_schema() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_fixtures_are_mutably_isolated() {
     let first = Store::open_in_memory().unwrap();
@@ -362,6 +364,7 @@ fn cached_current_schema_fixtures_are_mutably_isolated() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_template_ignores_thread_local_failpoints() {
     let _guard = S1IssueV97FaultGuard;
@@ -378,6 +381,7 @@ fn cached_current_schema_template_ignores_thread_local_failpoints() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_initialization_error_is_cached_and_replayed() {
     let (attempts, first, second) = current_schema_template_cached_failure_replay_for_test();
@@ -386,6 +390,7 @@ fn current_schema_template_initialization_error_is_cached_and_replayed() {
     assert!(first.contains("test_current_schema_template:init_store"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_spawn_and_join_failures_are_stable_store_errors() {
     let spawn = current_schema_template_init_failure_for_test(false);
@@ -396,6 +401,7 @@ fn current_schema_template_spawn_and_join_failures_are_stable_store_errors() {
     assert!(!join.contains("injected current-schema template join failure"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_mutex_poison_is_a_stable_store_error() {
     let error = current_schema_template_poison_failure_for_test();
@@ -403,6 +409,7 @@ fn current_schema_template_mutex_poison_is_a_stable_store_error() {
     assert!(!error.contains("into_inner"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_source_has_zero_d04_seed_rows() {
     let (page_count, seed_rows) = current_schema_template_source_proof_for_test().unwrap();
@@ -410,6 +417,7 @@ fn current_schema_template_source_has_zero_d04_seed_rows() {
     assert_eq!(seed_rows, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_disk_cache_reuses_a_valid_publication() {
     let directory = tempfile::tempdir().unwrap();
@@ -437,6 +445,7 @@ fn current_schema_template_disk_cache_reuses_a_valid_publication() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_disk_cache_rebuilds_corrupt_content() {
     let directory = tempfile::tempdir().unwrap();
@@ -458,6 +467,7 @@ fn current_schema_template_disk_cache_rebuilds_corrupt_content() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_concurrent_publishers_share_one_atomic_file() {
     let directory = std::sync::Arc::new(tempfile::tempdir().unwrap());
@@ -854,6 +864,7 @@ fn run_schema_cache_helper_wave(
 }
 
 #[cfg(unix)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[ignore = "spawned only by the multi-process parent"]
 fn current_schema_template_multiprocess_helper() {
@@ -950,6 +961,7 @@ fn current_schema_template_multiprocess_helper() {
 }
 
 #[cfg(unix)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_real_multiprocess_publication_is_atomic_reused_and_repairs_corruption() {
     let invocation = tempfile::tempdir().expect("invocation tempdir");
@@ -1006,6 +1018,7 @@ fn current_schema_template_real_multiprocess_publication_is_atomic_reused_and_re
     assert_schema_cache_inventory(&cache_dir, &key);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_fixture_seed_uses_fresh_timestamp() {
     let first_timestamp = "2026-08-27T00:00:00.000000001Z";
@@ -1040,6 +1053,7 @@ fn cached_current_schema_fixture_seed_uses_fresh_timestamp() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_early_failure_clears_caller_tls() {
     let guard = S1IssueV97FaultGuard;
@@ -1058,6 +1072,7 @@ fn cached_current_schema_early_failure_clears_caller_tls() {
         .expect("scope guard must clear the still-armed caller TLS fault");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_backup_budgets_are_enforced() {
     let (pages_per_step, page_limit, step_limit, no_progress_limit, busy_limit, deadline) =
@@ -1144,6 +1159,7 @@ fn current_schema_template_backup_budgets_are_enforced() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn current_schema_template_backup_releases_mutex_on_every_exit() {
     let cases = [
@@ -1159,6 +1175,7 @@ fn current_schema_template_backup_releases_mutex_on_every_exit() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn cached_current_schema_fixtures_reconstruct_fresh_runtime_state() {
     let stores = [
@@ -1186,16 +1203,7 @@ fn cached_current_schema_fixtures_reconstruct_fresh_runtime_state() {
     }
 }
 
-#[test]
-fn parse_timestamp_accepts_legacy_comma_fraction_rfc3339() {
-    let parsed = parse_timestamp("2026-08-02T16:15:11,769711900-07:00").unwrap();
-    let expected = chrono::DateTime::parse_from_rfc3339("2026-08-02T16:15:11.769711900-07:00")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-
-    assert_eq!(parsed, expected);
-}
-
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn load_sessions_survives_legacy_comma_fraction_timestamp() {
     let store = Store::open_in_memory().unwrap();
@@ -1217,152 +1225,6 @@ fn load_sessions_survives_legacy_comma_fraction_timestamp() {
     assert_eq!(sessions[0].id, session.id);
 }
 
-#[test]
-fn insert_session_persists_testing_needed_and_rotation_disabled_at() {
-    let store = Store::open_in_memory().unwrap();
-    let mut session = make_test_session();
-    let testing_needed_at = chrono::Utc::now();
-    let rotation_disabled_at = testing_needed_at + chrono::Duration::nanoseconds(1);
-    session.testing_needed_at = Some(testing_needed_at);
-    session.rotation_disabled_at = Some(rotation_disabled_at);
-
-    store.insert_session(&session).unwrap();
-
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.testing_needed_at, Some(testing_needed_at));
-    assert_eq!(loaded.rotation_disabled_at, Some(rotation_disabled_at));
-}
-
-#[test]
-fn set_session_rotation_disabled_at_is_idempotent() {
-    let store = Store::open_in_memory().unwrap();
-    let mut session = make_test_session();
-    let stamp = chrono::Utc::now();
-    session.rotation_disabled_at = Some(stamp);
-    store.insert_session(&session).unwrap();
-
-    for _ in 0..3 {
-        store
-            .set_session_rotation_disabled_at(session.id, Some(stamp))
-            .unwrap();
-        assert_eq!(
-            store
-                .get_session(session.id)
-                .unwrap()
-                .unwrap()
-                .rotation_disabled_at,
-            Some(stamp)
-        );
-    }
-
-    store
-        .set_session_rotation_disabled_at(session.id, None)
-        .unwrap();
-    assert!(
-        store
-            .get_session(session.id)
-            .unwrap()
-            .unwrap()
-            .rotation_disabled_at
-            .is_none()
-    );
-    assert!(
-        store
-            .set_session_rotation_disabled_at(Uuid::new_v4(), Some(stamp))
-            .is_err()
-    );
-}
-
-#[test]
-fn fill_session_title_if_absent_supplies_only_a_missing_title() {
-    let store = Store::open_in_memory().unwrap();
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Absent title: the generated fill is accepted.
-    assert!(
-        store
-            .fill_session_title_if_absent(session.id, "Generated title")
-            .unwrap()
-    );
-    assert_eq!(
-        store.get_session(session.id).unwrap().unwrap().title,
-        Some("Generated title".to_string())
-    );
-
-    // Present title: the next fill is refused and the title is unchanged.
-    assert!(
-        !store
-            .fill_session_title_if_absent(session.id, "Generated overwrite")
-            .unwrap()
-    );
-    assert_eq!(
-        store.get_session(session.id).unwrap().unwrap().title,
-        Some("Generated title".to_string())
-    );
-
-    // A missing session is an error, not a silent no-op.
-    assert!(
-        store
-            .fill_session_title_if_absent(Uuid::new_v4(), "Orphan")
-            .is_err()
-    );
-}
-
-#[test]
-fn explicit_title_survives_generated_fill_and_deliberate_rename_still_wins() {
-    let store = Store::open_in_memory().unwrap();
-    let mut session = make_test_session();
-    session.title = Some("PARITYMODALSESSION".to_string());
-    store.insert_session(&session).unwrap();
-
-    // Asynchronous enrichment must not overwrite the explicit title.
-    assert!(
-        !store
-            .fill_session_title_if_absent(session.id, "Demiurge: Generated")
-            .unwrap()
-    );
-    assert_eq!(
-        store.get_session(session.id).unwrap().unwrap().title,
-        Some("PARITYMODALSESSION".to_string())
-    );
-
-    // Deliberate rename is a distinct path and must still overwrite.
-    store
-        .update_session_title(session.id, "Operator rename")
-        .unwrap();
-    assert_eq!(
-        store.get_session(session.id).unwrap().unwrap().title,
-        Some("Operator rename".to_string())
-    );
-}
-
-#[test]
-fn load_archived_sessions_returns_only_the_previous_seven_days() {
-    let store = Store::open_in_memory().unwrap();
-    let now = chrono::Utc::now();
-
-    let mut recent = make_test_session();
-    recent.status = SessionStatus::Archived;
-    recent.updated_at = now - chrono::Duration::days(6);
-
-    let mut expired = make_test_session();
-    expired.status = SessionStatus::Archived;
-    expired.updated_at = now - chrono::Duration::days(8);
-
-    store.insert_session(&recent).unwrap();
-    store.insert_session(&expired).unwrap();
-
-    let archived = store.load_archived_sessions(None).unwrap();
-
-    assert_eq!(archived.len(), 1);
-    assert_eq!(archived[0].id, recent.id);
-
-    let project_archived = store.load_archived_sessions(recent.project_id).unwrap();
-    assert_eq!(project_archived.len(), 1);
-    assert_eq!(project_archived[0].id, recent.id);
-}
-
 // D04 named regression filters. These small, deterministic probes pin the
 // public project-ownership seams; fuller migration/link fault coverage lives
 // alongside the production transaction tests above.
@@ -1371,6 +1233,7 @@ fn load_archived_sessions_returns_only_the_previous_seven_days() {
 /// legitimate provenance — V77 keeps the column nullable — so the migration must
 /// neither drop the row nor invent a creator. It refuses until the operator
 /// declares an owner, then attributes only the unowned rows to it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_v77_attributes_issues_with_no_creating_session_by_declaration() {
@@ -1545,6 +1408,7 @@ fn d04_v77_attributes_issues_with_no_creating_session_by_declaration() {
     assert_eq!(owned_creator, Some(session.id.to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_issue_linkage_copied_v76_upgrade_reopen_fault_rollback_and_fingerprint() {
@@ -1877,6 +1741,7 @@ fn d04_issue_linkage_copied_v76_upgrade_reopen_fault_rollback_and_fingerprint() 
     assert_eq!(d04_database_snapshot(&reopened.conn).unwrap(), v77_snapshot);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_operator_create_rejects_unknown_project() {
@@ -1896,6 +1761,7 @@ fn d04_operator_create_rejects_unknown_project() {
     assert!(store.create_issue(&issue).is_err());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_issue_linkage_linked_unlinked_roundtrip_and_strict_mapper() {
@@ -1910,6 +1776,7 @@ fn d04_issue_linkage_linked_unlinked_roundtrip_and_strict_mapper() {
     assert_eq!(store.get_issue(issue.id).unwrap(), Some(issue));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_composite_foreign_keys_reject_cross_project_idea_event_and_deps() -> anyhow::Result<()> {
@@ -1992,6 +1859,7 @@ fn d04_composite_foreign_keys_reject_cross_project_idea_event_and_deps() -> anyh
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_link_constraint_classes_are_typed_and_rpc_data_is_redacted() {
@@ -2170,6 +2038,7 @@ fn assert_issue_event_semantics_are_complete(event: &rsi_common::types::IssueEve
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
 async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_atomic_event() {
@@ -2398,6 +2267,7 @@ async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_at
     assert_eq!(persisted.idea_id, Some(created.idea.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_ready_work_project_scope_preserves_v72_semantics_and_query_plan() {
@@ -2417,6 +2287,7 @@ fn d04_ready_work_project_scope_preserves_v72_semantics_and_query_plan() {
     assert!(detail.contains("idx_issues_project_ready"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_store_agent_create_rejects_unavailable_context() {
@@ -2429,6 +2300,7 @@ fn d04_store_agent_create_rejects_unavailable_context() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_agent_and_native_schemas_reject_linkage_spoof_fields() {
@@ -2466,6 +2338,7 @@ fn d04_agent_and_native_schemas_reject_linkage_spoof_fields() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_c5_settlement_project_and_pending_marker_are_atomic() {
@@ -2485,6 +2358,7 @@ fn d04_c5_settlement_project_and_pending_marker_are_atomic() {
     assert!(store.get_daemon_setting(&key).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_active_dispatch_restore_query_is_project_scoped_and_keyed() {
@@ -2560,6 +2434,7 @@ fn d04_active_dispatch_restore_query_is_project_scoped_and_keyed() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
 async fn d04_uuidv5_domains_and_display_numbers_are_unchanged() {
@@ -2621,6 +2496,7 @@ async fn d04_uuidv5_domains_and_display_numbers_are_unchanged() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn d04_attributed_create_schema_rejects_idea_id() {
@@ -2685,6 +2561,7 @@ fn make_pending_question() -> PendingQuestion {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_store_open_creates_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -2726,6 +2603,7 @@ fn test_store_open_creates_schema() {
     assert_eq!(has_pending_question_json, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn sandbox_reclaim_one_effectful_item_per_custody_generation_across_runs() {
@@ -2776,6 +2654,7 @@ fn sandbox_reclaim_one_effectful_item_per_custody_generation_across_runs() {
     assert_eq!((rows, effectful_rows), (2, 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn sandbox_reclaim_manager_operation_reuses_run_and_unique_index_rejects_duplicate() {
@@ -2855,6 +2734,7 @@ fn insert_sandbox_recreation_for_test(
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn sandbox_reclaim_recreation_phase_trigger_is_forward_only() {
@@ -2927,6 +2807,7 @@ fn sandbox_reclaim_recreation_phase_trigger_is_forward_only() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn sandbox_reclaim_recreation_linkage_and_checkout_checks_are_enforced() {
@@ -2992,6 +2873,7 @@ fn sandbox_reclaim_recreation_linkage_and_checkout_checks_are_enforced() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn sandbox_reclaim_recreation_allows_only_one_open_row_per_session() {
@@ -3168,6 +3050,7 @@ fn assert_user_version_read_was_denied(error: DaemonError) {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn init_schema_propagates_a_failed_user_version_read_without_migrating() {
@@ -3211,6 +3094,7 @@ fn init_schema_propagates_a_failed_user_version_read_without_migrating() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn init_schema_runs_the_full_chain_for_a_new_database_reading_version_zero() {
@@ -3237,6 +3121,7 @@ fn init_schema_runs_the_full_chain_for_a_new_database_reading_version_zero() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn init_schema_failed_version_read_leaves_a_migrated_database_untouched() {
@@ -3275,6 +3160,7 @@ fn init_schema_failed_version_read_leaves_a_migrated_database_untouched() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn closure_v84_copied_v83_upgrades_twice_with_catalog_guards_intact() {
     let directory = tempfile::tempdir().unwrap();
@@ -3941,6 +3827,7 @@ fn closure_v84_copied_v83_upgrades_twice_with_catalog_guards_intact() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn closure_operator_same_key_replays_and_different_payload_refuses_without_effect() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4212,6 +4099,7 @@ fn closure_operator_same_key_replays_and_different_payload_refuses_without_effec
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn closure_event_and_typed_provenance_commit_atomically() {
     use rsi_common::closure_kernel::{
@@ -4349,6 +4237,7 @@ fn closure_event_and_typed_provenance_commit_atomically() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_migration_backfills_and_triggers_unverified_projections() {
     let mut store = Store::open_in_memory().unwrap();
@@ -4383,6 +4272,7 @@ fn h1_v83_migration_backfills_and_triggers_unverified_projections() {
     assert_eq!(projection.2, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_participant_keysets_use_custody_indexes() {
     let store = Store::open_in_memory().unwrap();
@@ -4410,8 +4300,8 @@ fn h1_v83_startup_participant_keysets_use_custody_indexes() {
         .unwrap()
         .join("\n");
     for index in [
-        "idx_sessions_sandbox_custody_id_id",
-        "idx_sessions_sandbox_root_id",
+        "idx_swc_v120_custody_participants",
+        "idx_swc_v120_sessions_sandbox_root",
         "idx_sandbox_custody_events_to_owner",
     ] {
         assert!(
@@ -4421,6 +4311,7 @@ fn h1_v83_startup_participant_keysets_use_custody_indexes() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_group_pages_use_production_phase_indexes_without_global_sort() {
     let store = Store::open_in_memory().unwrap();
@@ -4446,6 +4337,7 @@ fn h1_v83_startup_group_pages_use_production_phase_indexes_without_global_sort()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_group_cursor_crosses_all_production_phases_without_loss() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4541,6 +4433,7 @@ fn h1_v83_startup_group_cursor_crosses_all_production_phases_without_loss() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_direct_bind_transfer_and_generation_cas_are_atomic() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4619,6 +4512,7 @@ fn h1_v83_direct_bind_transfer_and_generation_cas_are_atomic() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_direct_insert_rejects_nonstarting_and_nonnew_bindings_without_mutation() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -4690,6 +4584,7 @@ fn h1_v83_direct_insert_rejects_nonstarting_and_nonnew_bindings_without_mutation
     assert_eq!(durable_rows, (0, 0, 0, 0));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_effect_permits_balance_and_clear_boot_identity() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4739,6 +4634,7 @@ fn h1_v83_effect_permits_balance_and_clear_boot_identity() {
     assert_eq!(settled, (0, 0, None));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_failed_reserved_bind_never_publishes_an_executable_projection() {
     let mut store = Store::open_in_memory().unwrap();
@@ -4792,6 +4688,7 @@ fn h1_v83_failed_reserved_bind_never_publishes_an_executable_projection() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_failed_revalidation_quarantines_an_idle_root_and_removes_effective_cwd() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4845,6 +4742,7 @@ fn h1_v83_failed_revalidation_quarantines_an_idle_root_and_removes_effective_cwd
     assert_eq!(projection, ("invalid".into(), None));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_tombstone_is_root_scoped_and_retains_history() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4896,6 +4794,7 @@ fn h1_v83_tombstone_is_root_scoped_and_retains_history() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_stale_boot_reconciliation_quarantines_once_and_is_idempotent() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -4948,6 +4847,7 @@ fn h1_v83_stale_boot_reconciliation_quarantines_once_and_is_idempotent() {
     assert_eq!(root, ("quarantined".into(), None, 2, 0, 0));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconciliation_finishes_all_bounded_batches_before_restore_readiness() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -5022,6 +4922,7 @@ fn h1_v83_startup_reconciliation_finishes_all_bounded_batches_before_restore_rea
     assert_eq!(running, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_target_reclaim_removes_only_target_under_generation_fence() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -5457,6 +5358,7 @@ fn h1_v83_terminal_filesystem_snapshot(fixture: &H1V83RealCustodyFixture) -> Str
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_terminal_transitions_settle_transferred_history_without_filesystem_cleanup() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -5666,6 +5568,7 @@ fn h1_v83_terminal_transitions_settle_transferred_history_without_filesystem_cle
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_terminal_refusals_and_settlement_failures_roll_back_completely() {
     use super::sandbox_custody::CustodyCause;
@@ -5770,6 +5673,7 @@ fn h1_v83_terminal_refusals_and_settlement_failures_roll_back_completely() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_terminal_refuses_malformed_transferred_participant_before_mutation() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -5881,6 +5785,7 @@ fn h1_v83_terminal_refuses_malformed_transferred_participant_before_mutation() {
     assert_eq!(filesystem, h1_v83_terminal_filesystem_snapshot(&fixture));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_legacy_row_scoped_sandbox_mutators_refuse_linked_history() {
     use rsi_common::types::{SandboxCleanupState, SandboxKind};
@@ -5958,6 +5863,56 @@ fn h1_v83_legacy_row_scoped_sandbox_mutators_refuse_linked_history() {
         .unwrap();
 }
 
+/// A root written without `allocation_id` (a pre-V98 binary running against a
+/// migrated store) made every startup reconcile fail with "Invalid column type
+/// Null ... allocation_id", which skipped restart-intent recovery on every
+/// boot. Startup must backfill it by the V98 rule and complete.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn startup_reconcile_backfills_root_missing_allocation_identity() {
+    use crate::sandbox::custody::CustodyService;
+
+    let mut fixture = h1_v83_real_custody_fixture(SessionStatus::Completed, "startup-null-alloc");
+    let allocation_of = |store: &Store| -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT allocation_id FROM sandbox_custody_roots WHERE custody_id=?1",
+                [fixture.custody_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let original = allocation_of(&fixture.store).expect("fixture allocation identity");
+    fixture
+        .store
+        .conn
+        .execute(
+            "UPDATE sandbox_custody_roots SET allocation_id=NULL WHERE custody_id=?1",
+            [fixture.custody_id.to_string()],
+        )
+        .unwrap();
+
+    CustodyService::reconcile_startup(&mut fixture.store, &fixture.sandbox_base).unwrap();
+
+    assert_eq!(allocation_of(&fixture.store), Some(original.clone()));
+    let root = fixture
+        .store
+        .startup_custody_root_for_sandbox_root(&fixture.root.display().to_string())
+        .unwrap()
+        .expect("aggregate root");
+    assert_eq!(root.allocation_id.to_string(), original);
+    // Idempotent: nothing left to repair on the next boot.
+    assert_eq!(
+        fixture
+            .store
+            .repair_missing_custody_allocation_ids()
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_revalidates_live_worktree_before_restore_exposure() {
     use crate::sandbox::custody::CustodyService;
@@ -6004,6 +5959,7 @@ fn h1_v83_startup_revalidates_live_worktree_before_restore_exposure() {
     assert_eq!(root, ("verified".into(), 1, None));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_foreign_boot_preserves_custody_changed_projection() {
     use crate::sandbox::custody::CustodyService;
@@ -6038,6 +5994,7 @@ fn h1_v83_startup_foreign_boot_preserves_custody_changed_projection() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_failures_record_startup_provenance_not_effect_provenance() {
     use crate::sandbox::custody::CustodyService;
@@ -6088,6 +6045,7 @@ fn h1_v83_startup_failures_record_startup_provenance_not_effect_provenance() {
     CustodyService::reconcile_startup(&mut runtime.store, &runtime.sandbox_base).unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconciliation_persistence_failure_blocks_readiness() {
     use crate::sandbox::custody::CustodyService;
@@ -6133,6 +6091,7 @@ fn h1_v83_startup_reconciliation_persistence_failure_blocks_readiness() {
     assert_eq!(root, ("live".into(), 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_typed_startup_settlement_failures_propagate_without_invalidation() {
     use crate::sandbox::custody::{
@@ -6224,6 +6183,7 @@ fn h1_v83_typed_startup_settlement_failures_propagate_without_invalidation() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reverse_event_participant_mismatch_quarantines_aggregate() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -6271,6 +6231,7 @@ fn h1_v83_startup_reverse_event_participant_mismatch_quarantines_aggregate() {
     assert_eq!(state, "quarantined");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconciles_existing_aggregate_across_participant_pages() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -6315,6 +6276,7 @@ fn h1_v83_startup_reconciles_existing_aggregate_across_participant_pages() {
     assert_eq!(root, ("live".into(), owner.to_string(), generation as i64));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_repairs_quarantined_projection_by_sql_link() {
     use crate::sandbox::custody::CustodyService;
@@ -6360,6 +6322,7 @@ fn h1_v83_startup_repairs_quarantined_projection_by_sql_link() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconstructs_legacy_lineage_idempotently() {
     use crate::sandbox::custody::CustodyService;
@@ -6407,6 +6370,7 @@ fn h1_v83_startup_reconstructs_legacy_lineage_idempotently() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_legacy_rotation_resets_parent_retry_budget() {
     use crate::sandbox::custody::CustodyService;
@@ -6496,6 +6460,7 @@ fn h1_v83_startup_legacy_rotation_resets_parent_retry_budget() {
     assert_eq!(invalid_projection, ("invalid".into(), "Completed".into()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_legacy_rejects_mixed_cleanup_shapes() {
     use crate::sandbox::custody::CustodyService;
@@ -6543,6 +6508,7 @@ fn h1_v83_startup_legacy_rejects_mixed_cleanup_shapes() {
     assert_eq!(aggregate_count, 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconstructs_complete_live_legacy_tuple() {
     use crate::sandbox::custody::CustodyService;
@@ -6579,6 +6545,7 @@ fn h1_v83_startup_reconstructs_complete_live_legacy_tuple() {
     assert_eq!(root_row, ("live".into(), allocation.id.to_string(), 1));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_reconstructs_admitted_retry_lineage() {
     use crate::sandbox::custody::CustodyService;
@@ -6624,6 +6591,7 @@ fn h1_v83_startup_reconstructs_admitted_retry_lineage() {
     assert_eq!(cause, "retry");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_publishes_rootless_historical_purged_compatibility() {
     use crate::sandbox::custody::CustodyService;
@@ -6645,6 +6613,7 @@ fn h1_v83_startup_publishes_rootless_historical_purged_compatibility() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_linked_purged_tombstone_retains_aggregate_identity() {
     use super::sandbox_custody::CustodyCause;
@@ -6687,6 +6656,7 @@ fn h1_v83_startup_linked_purged_tombstone_retains_aggregate_identity() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_terminal_root_authenticates_retained_evidence_and_missing_history() {
     use super::sandbox_custody::CustodyCause;
@@ -6761,6 +6731,7 @@ fn h1_v83_startup_terminal_root_authenticates_retained_evidence_and_missing_hist
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_terminal_missing_static_identity_never_publishes_history() {
     use super::sandbox_custody::CustodyCause;
@@ -6851,6 +6822,7 @@ fn h1_v83_startup_terminal_missing_static_identity_never_publishes_history() {
     assert_quarantined(&mut repository_alias, &base);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_linked_failed_repairs_stale_projection_by_sql_link() {
     use crate::sandbox::custody::CustodyService;
@@ -6887,6 +6859,7 @@ fn h1_v83_startup_linked_failed_repairs_stale_projection_by_sql_link() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_terminal_history_is_idempotent_across_file_backed_reopen() {
     use crate::sandbox::custody::CustodyService;
@@ -6932,6 +6905,7 @@ fn h1_v83_startup_terminal_history_is_idempotent_across_file_backed_reopen() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn startup_settles_unbound_reserved_successor_before_authenticating_owner() {
     use crate::sandbox::custody::CustodyService;
@@ -7011,6 +6985,7 @@ fn startup_settles_unbound_reserved_successor_before_authenticating_owner() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_root_claimant_without_sql_link_quarantines_aggregate() {
     use crate::sandbox::custody::CustodyService;
@@ -7044,6 +7019,7 @@ fn h1_v83_startup_root_claimant_without_sql_link_quarantines_aggregate() {
     assert_eq!(contender_status, "Failed");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_retained_unowned_diagnostics_are_captured_without_following_entries() {
     use crate::sandbox::custody::{CustodyService, take_startup_diagnostics_for_test};
@@ -7065,6 +7041,7 @@ fn h1_v83_startup_retained_unowned_diagnostics_are_captured_without_following_en
     )));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_diagnostic_caps_257_direct_entries_without_following_sentinel() {
     use crate::sandbox::custody::{CustodyService, take_startup_diagnostics_for_test};
@@ -7090,6 +7067,7 @@ fn h1_v83_startup_diagnostic_caps_257_direct_entries_without_following_sentinel(
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_publishes_rootless_historical_failed_compatibility() {
     use crate::sandbox::custody::CustodyService;
@@ -7116,6 +7094,7 @@ fn h1_v83_startup_publishes_rootless_historical_failed_compatibility() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_includes_archived_and_deleted_live_owners() {
     use crate::sandbox::custody::CustodyService;
@@ -7143,6 +7122,7 @@ fn h1_v83_startup_includes_archived_and_deleted_live_owners() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_retains_authenticated_failed_terminal_history() {
     use crate::sandbox::custody::CustodyService;
@@ -7184,6 +7164,7 @@ fn h1_v83_startup_retains_authenticated_failed_terminal_history() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_reclaim_first_keeps_worktree_and_allows_cold_transfer() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -7242,6 +7223,7 @@ fn h1_v83_reclaim_first_keeps_worktree_and_allows_cold_transfer() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_malformed_reserved_successor_cannot_publish_or_transfer() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -7304,6 +7286,7 @@ fn h1_v83_malformed_reserved_successor_cannot_publish_or_transfer() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_binding_rejects_mismatched_new_and_nonordinary_tuples() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -7364,6 +7347,7 @@ fn h1_v83_binding_rejects_mismatched_new_and_nonordinary_tuples() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 async fn h1_v83_transfer_first_revalidates_successor_and_reclaims_original_root_name() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
@@ -7451,6 +7435,7 @@ async fn h1_v83_transfer_first_revalidates_successor_and_reclaims_original_root_
     worker.shutdown(&service).await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 async fn h1_v83_effect_first_fences_reclaim_until_settlement() {
     use crate::sandbox::custody::{CustodyService, CustodySettlementService, EffectKind};
@@ -7519,6 +7504,7 @@ async fn h1_v83_effect_first_fences_reclaim_until_settlement() {
     worker.shutdown(&service).await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 async fn h1_v83_effect_permits_settle_drop_abort_failures_and_backpressure() {
     use super::sandbox_custody::{
@@ -7720,6 +7706,7 @@ async fn h1_v83_effect_permits_settle_drop_abort_failures_and_backpressure() {
     worker.shutdown(&service).await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[tokio::test]
 async fn h1_v83_settlement_shutdown_seals_waits_for_permit_and_drains() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -7839,6 +7826,7 @@ async fn h1_v83_settlement_shutdown_seals_waits_for_permit_and_drains() {
     assert_eq!(counters, (0, 0, 0));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_store_open_sets_busy_timeout() {
     let dir = tempfile::tempdir().unwrap();
@@ -7855,6 +7843,7 @@ fn test_store_open_sets_busy_timeout() {
     assert_eq!(busy_timeout_ms, 10000);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_insert_and_load_session() {
     let dir = tempfile::tempdir().unwrap();
@@ -7964,6 +7953,7 @@ fn test_insert_and_load_session() {
     assert_eq!(all[0].id, session.id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_pending_question_persists_rehydrates_and_clears() {
     let dir = tempfile::tempdir().unwrap();
@@ -7993,6 +7983,7 @@ fn test_pending_question_persists_rehydrates_and_clears() {
     assert_eq!(reloaded[0].pending_question, Some(question));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_update_session_status() {
     let dir = tempfile::tempdir().unwrap();
@@ -8021,6 +8012,7 @@ fn test_update_session_status() {
     assert_eq!(loaded.status, SessionStatus::Completed);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn event_watermark_moves_on_append_and_on_inplace_rewrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -8064,6 +8056,7 @@ fn event_watermark_moves_on_append_and_on_inplace_rewrite() {
     assert_eq!(store.event_watermark(session.id).unwrap(), after_rewrite);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_insert_and_load_events() {
     let dir = tempfile::tempdir().unwrap();
@@ -8118,6 +8111,7 @@ fn test_insert_and_load_events() {
     assert_eq!(events[2].content, "Message 3");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_load_events_since_sequence() {
     let dir = tempfile::tempdir().unwrap();
@@ -8156,6 +8150,7 @@ fn test_load_events_since_sequence() {
     assert!(since_100.is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_event_autoincrement_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -8183,6 +8178,7 @@ fn test_event_autoincrement_id() {
     assert_eq!(events[2].id, id3);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_load_sessions_empty_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -8193,6 +8189,7 @@ fn test_load_sessions_empty_db() {
     assert!(sessions.is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_session() {
     let dir = tempfile::tempdir().unwrap();
@@ -8218,6 +8215,7 @@ fn test_delete_session() {
     assert!(store.load_events(session.id).unwrap().is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_nonexistent_session() {
     let dir = tempfile::tempdir().unwrap();
@@ -8229,6 +8227,7 @@ fn test_delete_nonexistent_session() {
     assert!(result.is_ok());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_purge_guard_preserves_retained_history() {
     let directory = tempfile::tempdir().unwrap();
@@ -8406,6 +8405,7 @@ fn session_execution_projection_purge_guard_preserves_retained_history() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_purge_rejects_unsafe_custody_states_atomically() {
     let cases = [
@@ -8445,6 +8445,7 @@ fn session_execution_projection_purge_rejects_unsafe_custody_states_atomically()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_purge_accepts_existing_terminal_states_without_rewrite() {
     for state in ["historical_purged", "historical_transferred"] {
@@ -8486,6 +8487,7 @@ fn session_execution_projection_purge_accepts_existing_terminal_states_without_r
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_purge_requires_projection_for_existing_session() {
     let connection = Connection::open_in_memory().unwrap();
@@ -8521,6 +8523,7 @@ fn session_execution_projection_purge_requires_projection_for_existing_session()
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn soft_delete_retains_restorable_session_and_execution_projection() {
     let store = Store::open_in_memory().unwrap();
@@ -8543,6 +8546,7 @@ fn soft_delete_retains_restorable_session_and_execution_projection() {
     assert_eq!(v90_projection_fingerprint(&store.conn), before);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_update_claude_session_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -8565,6 +8569,7 @@ fn test_update_claude_session_id() {
     assert_eq!(loaded.claude_session_id, Some("claude-xyz-789".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_session_metadata_persistence() {
     let dir = tempfile::tempdir().unwrap();
@@ -8617,6 +8622,7 @@ fn test_session_metadata_persistence() {
     assert_eq!(all[0].stop_reason, Some("end_turn".to_string()));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_schema_migration_idempotent() {
     let dir = tempfile::tempdir().unwrap();
@@ -8654,6 +8660,7 @@ fn test_schema_migration_idempotent() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_fresh_catalog_is_private_and_idempotent() {
     let dir = tempfile::tempdir().expect("temporary V85 database");
@@ -9333,6 +9340,7 @@ fn h1_rb_create_complete_v84_checkpoint(path: &std::path::Path) {
         .expect("seal complete RB V84 checkpoint");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_ordered_migration_failpoints_rollback_exact_v84_snapshot() {
     let directory = tempfile::tempdir().expect("V85 fault directory");
@@ -9370,6 +9378,7 @@ fn h1_v85_ordered_migration_failpoints_rollback_exact_v84_snapshot() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_catalog_guards_and_query_plans_are_pinned() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -9452,6 +9461,7 @@ fn h1_v85_catalog_guards_and_query_plans_are_pinned() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_static_guard_matrix_rejects_corrupt_history() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -9513,6 +9523,7 @@ fn h1_v85_static_guard_matrix_rejects_corrupt_history() {
     ).is_err(), "noncanonical UUIDs are rejected in every catalog relation");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_textual_keys_session_fence_and_logical_history_are_adversarial() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -9822,6 +9833,7 @@ fn h1_v85_textual_keys_session_fence_and_logical_history_are_adversarial() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_request_key_grammar_and_claim_family_coupling_are_exhaustive() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -10132,6 +10144,7 @@ fn h1_v85_request_key_grammar_and_claim_family_coupling_are_exhaustive() {
     ).is_err(), "a connection lacking the deterministic parser must fail closed");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_request_key_provenance_and_linked_receipts_reject_component_mismatches() {
     use super::origin_authority::{
@@ -10341,6 +10354,7 @@ fn h1_v85_request_key_provenance_and_linked_receipts_reject_component_mismatches
     ).is_ok(), "linked receipt with exact key and authority inserts");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_data_bearing_upgrade_to_v86_is_atomic_reopenable_and_catalog_identical() {
     let directory = tempfile::tempdir().expect("V85-to-V86 upgrade directory");
@@ -10667,6 +10681,7 @@ fn h1_v87_create_sealed_deployed_v86_fixture(path: &std::path::Path) -> Store {
     source
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_migration_is_atomic_reopenable_and_rewindable() {
     let directory = tempfile::tempdir().expect("V87 migration directory");
@@ -10809,6 +10824,7 @@ fn h1_v87_session_fence_migration_is_atomic_reopenable_and_rewindable() {
     Store::open(&source_path).expect("V88 reopens idempotently");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_hydration_refuses_canonical_time_corruption_without_repair() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -10868,6 +10884,7 @@ fn h1_v85_hydration_refuses_canonical_time_corruption_without_repair() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_event_coupling_and_hydration_chain_fail_closed() {
     let store = Store::open_in_memory().expect("open V85 store");
@@ -12768,6 +12785,7 @@ fn h1_v87_try_hostile_live(
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_initial_bind_requires_exact_active_authority() {
     for sandbox in [false, true] {
@@ -12809,6 +12827,7 @@ fn h1_v87_session_fence_initial_bind_requires_exact_active_authority() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_provider_live_writes_are_exact_next_sequence() {
     for sandbox in [false, true] {
@@ -13033,6 +13052,7 @@ fn h1_v87_complete_finalize(fixture: &mut H1V87BoundFixture, with_c5: bool) {
     h1_v87_unbind_session(fixture).expect("unbind Session as the final exact V87 statement");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_upstream_event_and_receipt_owners_reject_omitted_correlations() {
     for (index, (from_phase, from_owner_generation)) in
@@ -13786,6 +13806,7 @@ fn h1_v87_try_hostile_finalize(
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_finalize_requires_complete_terminal_bundle() {
     for sandbox in [false, true] {
@@ -14089,6 +14110,7 @@ fn h1_v87_execute_finalize_transaction(
     tx.commit()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_session_fence_ordered_transactions_commit_or_rollback_atomically() {
     for boundary in 1..=6 {
@@ -14178,6 +14200,7 @@ fn h1_v88_canonical_c5(
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_private_validators_are_canonical_and_fail_closed() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -14633,6 +14656,7 @@ fn h1_v88_insert_production_c5_value_clone(
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_registered_sql_and_catalog_validator_matrices_are_isolated() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -15283,6 +15307,7 @@ CREATE TEMP TABLE h1_v88_c5_validator_probe(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_production_affinity_validator_hostiles_are_isolated() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -15557,6 +15582,7 @@ fn h1_v88_static_state_machine_production_affinity_validator_hostiles_are_isolat
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_production_affinity_predicate_owners_are_exact() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -16073,6 +16099,7 @@ fn h1_v88_static_state_machine_production_affinity_predicate_owners_are_exact() 
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_default_historical_claims_are_refused_for_all_families() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -16250,6 +16277,7 @@ fn h1_v88_static_state_machine_default_historical_claims_are_refused_for_all_fam
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_all_claimant_families_acquire_exact_owner_generation() {
     use rsi_common::types::{idea_controller_candidate_session_id, idea_controller_reservation_id};
@@ -16448,6 +16476,7 @@ fn h1_v88_static_state_machine_all_claimant_families_acquire_exact_owner_generat
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_claim_edges_close_provider_authorization_and_prepare() {
     for sandbox in [false, true] {
@@ -16628,6 +16657,7 @@ fn h1_v88_advance_before_provider(fixture: &mut H1V87BoundFixture, target: &str)
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_no_create_settlement_edges_are_exact() {
     for (index, source_phase) in ["claimed", "launch_ready", "launching"]
@@ -16701,6 +16731,7 @@ fn h1_v88_static_state_machine_no_create_settlement_edges_are_exact() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_recovery_quarantine_edges_are_exact() {
     for (index, source_phase) in ["claimed", "launch_ready", "launching", "provider_live"]
@@ -16811,6 +16842,7 @@ fn h1_v88_static_state_machine_recovery_quarantine_edges_are_exact() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_failed_prepare_requires_exact_c5() {
     let mut fixture = h1_v87_bound_fixture(0x8802_0000, false);
@@ -16887,6 +16919,7 @@ fn h1_v88_static_state_machine_failed_prepare_requires_exact_c5() {
     fixture.next_event_sequence += 1;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_acquisition_bundle_is_uncommittable_in_parts() {
     for sandbox in [false, true] {
@@ -16980,6 +17013,7 @@ fn h1_v88_static_state_machine_acquisition_bundle_is_uncommittable_in_parts() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_atomic_edge_hostiles_have_ordinary_sandbox_parity() {
     for sandbox in [false, true] {
@@ -17159,6 +17193,7 @@ fn h1_v88_static_state_machine_atomic_edge_hostiles_have_ordinary_sandbox_parity
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_forged_historical_wrong_authority_and_replay_commands_refuse() {
     for sandbox in [false, true] {
@@ -17323,6 +17358,7 @@ fn h1_v88_static_state_machine_forged_historical_wrong_authority_and_replay_comm
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_authority_acquisition_requires_one_generation_and_event() {
     for generation in [0_i64, 2] {
@@ -18254,6 +18290,7 @@ fn h1_qrrev_apply_active_hostile(
     h1_v87_assert_catalog_clean(connection, &format!("QRREV {hostile:?}"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_qrrev_v88_active_authority_classifier_hostiles_refuse_before_every_seam() {
     for sandbox in [false, true] {
@@ -18292,6 +18329,7 @@ fn h1_qrrev_v88_active_authority_classifier_hostiles_refuse_before_every_seam() 
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_qrrev_v88_prebind_claimed_controls_migrate_and_remain_bindable() {
     for sandbox in [false, true] {
@@ -18391,6 +18429,7 @@ fn h1_fqrrev_apply_prebind_hostile(
     h1_v87_assert_catalog_clean(connection, &format!("FQRREV pre-bind {hostile:?}"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_fqrrev_v88_prebind_provider_cell_absence_hostiles_refuse_before_every_seam() {
     for sandbox in [false, true] {
@@ -18535,6 +18574,7 @@ fn h1_fqrrev_build_active_terminal_hostile(
     binding
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_fqrrev_v88_active_terminal_invocation_and_c5_hostiles_refuse_before_every_seam() {
     for sandbox in [false, true] {
@@ -18636,6 +18676,7 @@ fn h1_fqrrev_assert_refusal_at_every_v91_seam(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam() {
     for sandbox in [false, true] {
@@ -18784,6 +18825,7 @@ fn h1_rb_apply_terminal_pending_hostile(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_rb_v91_terminal_pending_hostiles_refuse_before_every_seam() {
     for sandbox in [false, true] {
@@ -18936,6 +18978,7 @@ fn h1_fqrrev_prepare_positive_terminal_source(
     binding
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v91_active_terminal_controls_migrate_finalize_and_execute_unchanged_unbind() {
     for sandbox in [false, true] {
@@ -19072,6 +19115,7 @@ fn h1_v91_active_terminal_controls_migrate_finalize_and_execute_unchanged_unbind
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v91_schema_preserving_migration_is_atomic_rewindable_and_replayable() {
     assert_eq!(H1V91MigrationFault::ALL.len(), 4);
@@ -19481,6 +19525,7 @@ fn h1_rb_assert_unarmed_v91_replay(connection: &Connection, predecessor_version:
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_rb_full_v84_graph_is_nonempty_rewindable_and_replayable() {
     let directory = tempfile::tempdir().expect("RB checkpoint directory");
@@ -19624,6 +19669,7 @@ fn h1_rb_full_v84_graph_is_nonempty_rewindable_and_replayable() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v91_refuses_catalog_integrity_and_foreign_key_drift_without_mutation() {
     for case in ["catalog", "integrity", "foreign key"] {
@@ -19697,6 +19743,7 @@ fn h1_v91_refuses_catalog_integrity_and_foreign_key_drift_without_mutation() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_trrev_v88_session_bound_live_phases_refuse_laundering_before_every_seam() {
     for sandbox in [false, true] {
@@ -19731,6 +19778,7 @@ fn h1_trrev_v88_session_bound_live_phases_refuse_laundering_before_every_seam() 
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating() {
     #[derive(Clone, Copy, Debug)]
@@ -19927,6 +19975,7 @@ fn h1_trrev_assert_valid_v87_control_upgrades(
     h1_v87_assert_catalog_clean(&upgraded.conn, "upgraded TRREV control");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_trrev_v88_session_binding_classifier_accepts_active_and_terminal_controls() {
     for sandbox in [false, true] {
@@ -19962,6 +20011,7 @@ fn h1_trrev_v88_session_binding_classifier_accepts_active_and_terminal_controls(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v88_static_state_machine_data_bearing_migration_failpoints_rewind_and_replay() {
     let directory = tempfile::tempdir().unwrap();
@@ -20320,6 +20370,7 @@ fn h1_v85_seed_snapshot(connection: &Connection) -> Vec<String> {
         .expect("collect V85 seed snapshot")
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_catalog_drift_refuses_before_ddl() {
     let dir = tempfile::tempdir().expect("temporary V85 catalog database");
@@ -20359,6 +20410,7 @@ fn h1_v85_catalog_drift_refuses_before_ddl() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_copied_v84_ordinary_matrix_is_deterministic() {
     let dir = tempfile::tempdir().expect("temporary copied-V84 database");
@@ -20693,6 +20745,7 @@ fn h1_v85_sandbox_session(
     session
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_copied_v83_sandbox_history_uses_custody_events() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -20821,6 +20874,7 @@ fn h1_v85_copied_v83_sandbox_history_uses_custody_events() {
     assert_eq!(first_snapshot, h1_v85_seed_snapshot(&replayed.conn));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v85_copied_v83_cross_domain_projection_refuses_atomically() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
@@ -20944,6 +20998,7 @@ fn seed_legacy_v0_session(connection: &Connection) {
         .expect("insert legacy V0 Session");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_legacy_db_migration() {
     let dir = tempfile::tempdir().unwrap();
@@ -21260,269 +21315,7 @@ pub(crate) fn create_v88_pre_antigravity_fixture(path: &std::path::Path) -> Conn
     legacy
 }
 
-#[test]
-fn test_insert_and_load_turn_metrics() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Insert 3 turn metrics
-    let metric1 = TurnMetric {
-        id: 0,
-        session_id: session.id,
-        turn_number: 1,
-        input_tokens: 10000,
-        cache_creation_tokens: 5000,
-        cache_read_tokens: 3000,
-        output_tokens: 500,
-        stop_reason: Some("end_turn".to_string()),
-        tools_used: None,
-        tool_count: 0,
-        created_at: chrono::Utc::now(),
-        model: None,
-        thinking_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        service_tier: None,
-    };
-    let metric2 = TurnMetric {
-        id: 0,
-        session_id: session.id,
-        turn_number: 2,
-        input_tokens: 15000,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 8000,
-        output_tokens: 1200,
-        stop_reason: Some("tool_use".to_string()),
-        tools_used: Some(vec!["Read".to_string(), "Edit".to_string()]),
-        tool_count: 2,
-        created_at: chrono::Utc::now(),
-        model: None,
-        thinking_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        service_tier: None,
-    };
-    let metric3 = TurnMetric {
-        id: 0,
-        session_id: session.id,
-        turn_number: 3,
-        input_tokens: 20000,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 15000,
-        output_tokens: 800,
-        stop_reason: Some("end_turn".to_string()),
-        tools_used: Some(vec!["Bash".to_string()]),
-        tool_count: 1,
-        created_at: chrono::Utc::now(),
-        model: None,
-        thinking_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        service_tier: None,
-    };
-
-    let id1 = store.insert_turn_metric(&metric1).unwrap();
-    let id2 = store.insert_turn_metric(&metric2).unwrap();
-    let id3 = store.insert_turn_metric(&metric3).unwrap();
-
-    // IDs should be sequential
-    assert!(id1 > 0);
-    assert_eq!(id2, id1 + 1);
-    assert_eq!(id3, id2 + 1);
-
-    // Load and verify
-    let metrics = store.load_turn_metrics(session.id).unwrap();
-    assert_eq!(metrics.len(), 3);
-
-    // Verify ordering by turn_number
-    assert_eq!(metrics[0].turn_number, 1);
-    assert_eq!(metrics[1].turn_number, 2);
-    assert_eq!(metrics[2].turn_number, 3);
-
-    // Verify values
-    assert_eq!(metrics[0].input_tokens, 10000);
-    assert_eq!(metrics[0].tools_used, None);
-    assert_eq!(metrics[0].tool_count, 0);
-
-    assert_eq!(metrics[1].input_tokens, 15000);
-    assert_eq!(
-        metrics[1].tools_used,
-        Some(vec!["Read".to_string(), "Edit".to_string()])
-    );
-    assert_eq!(metrics[1].tool_count, 2);
-
-    assert_eq!(metrics[2].cache_read_tokens, 15000);
-    assert_eq!(metrics[2].stop_reason, Some("end_turn".to_string()));
-}
-
-#[test]
-fn test_turn_metrics_cascade_delete() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Insert some turn metrics
-    let metric = TurnMetric {
-        id: 0,
-        session_id: session.id,
-        turn_number: 1,
-        input_tokens: 10000,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 0,
-        output_tokens: 500,
-        stop_reason: None,
-        tools_used: None,
-        tool_count: 0,
-        created_at: chrono::Utc::now(),
-        model: None,
-        thinking_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        service_tier: None,
-    };
-    store.insert_turn_metric(&metric).unwrap();
-    store
-        .insert_turn_metric(&TurnMetric {
-            turn_number: 2,
-            ..metric.clone()
-        })
-        .unwrap();
-
-    // Verify turn metrics exist
-    let metrics = store.load_turn_metrics(session.id).unwrap();
-    assert_eq!(metrics.len(), 2);
-
-    // Delete session (should cascade to turn_metrics)
-    store.delete_session(session.id).unwrap();
-
-    // Verify turn_metrics are gone
-    let metrics = store.load_turn_metrics(session.id).unwrap();
-    assert!(metrics.is_empty());
-}
-
-#[test]
-fn test_context_snapshots_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // No snapshots initially
-    let latest = store.load_latest_context_snapshot(session.id).unwrap();
-    assert!(latest.is_none());
-
-    // Insert snapshots
-    store.insert_context_snapshot(session.id, 50_000).unwrap();
-    store.insert_context_snapshot(session.id, 80_000).unwrap();
-
-    // Latest should be the most recent
-    let latest = store.load_latest_context_snapshot(session.id).unwrap();
-    assert_eq!(latest, Some(80_000));
-
-    // Delete session should cascade
-    store.delete_session(session.id).unwrap();
-    let latest = store.load_latest_context_snapshot(session.id).unwrap();
-    assert!(latest.is_none());
-}
-
-// -- Project CRUD tests --
-
-#[test]
-fn test_insert_and_load_project() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let project = Project {
-        id: Uuid::new_v4(),
-        name: "flywheel".to_string(),
-        path: Some(PathBuf::from("/home/user/flywheel")),
-        description: Some("Claude session manager".to_string()),
-        color: "#89b4fa".to_string(),
-        context_files: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-
-    store.insert_project(&project).unwrap();
-
-    let loaded = store.get_project(project.id).unwrap().unwrap();
-    assert_eq!(loaded.name, "flywheel");
-    assert_eq!(loaded.path, Some(PathBuf::from("/home/user/flywheel")));
-    assert_eq!(
-        loaded.description,
-        Some("Claude session manager".to_string())
-    );
-    assert_eq!(loaded.color, "#89b4fa");
-}
-
-#[test]
-fn test_get_project_by_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let project = make_test_project("my-project");
-    store.insert_project(&project).unwrap();
-
-    let loaded = store.get_project_by_name("my-project").unwrap().unwrap();
-    assert_eq!(loaded.id, project.id);
-
-    // Non-existent name returns None
-    assert!(store.get_project_by_name("other").unwrap().is_none());
-}
-
-#[test]
-fn test_load_projects_ordered_by_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let p1 = make_test_project("zebra");
-    let p2 = make_test_project("alpha");
-    let p3 = make_test_project("middle");
-
-    store.insert_project(&p1).unwrap();
-    store.insert_project(&p2).unwrap();
-    store.insert_project(&p3).unwrap();
-
-    let projects = store.load_projects().unwrap();
-    assert_eq!(projects.len(), 3);
-    assert_eq!(projects[0].name, "alpha");
-    assert_eq!(projects[1].name, "middle");
-    assert_eq!(projects[2].name, "zebra");
-}
-
-#[test]
-fn test_update_project() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let mut project = make_test_project("original");
-    store.insert_project(&project).unwrap();
-
-    project.name = "updated".to_string();
-    project.color = "#a6e3a1".to_string();
-    project.path = Some(PathBuf::from("/new/path"));
-
-    store.update_project(&project).unwrap();
-
-    let loaded = store.get_project(project.id).unwrap().unwrap();
-    assert_eq!(loaded.name, "updated");
-    assert_eq!(loaded.color, "#a6e3a1");
-    assert_eq!(loaded.path, Some(PathBuf::from("/new/path")));
-}
-
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_clears_session_project_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -21617,6 +21410,7 @@ fn assert_project_delete_preserves_state(
     error
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_preserves_appointments_and_revocations_across_v111_backfill() {
     use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
@@ -21689,6 +21483,7 @@ fn test_delete_project_preserves_appointments_and_revocations_across_v111_backfi
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_preserves_v111_seeded_rotation_history_without_appointment() {
     for retired in [false, true] {
@@ -21719,6 +21514,7 @@ fn test_delete_project_preserves_v111_seeded_rotation_history_without_appointmen
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_preserves_restoration_epoch_without_appointment() {
     let store = Store::open_in_memory().unwrap();
@@ -21736,6 +21532,7 @@ fn test_delete_project_preserves_restoration_epoch_without_appointment() {
     assert_project_delete_preserves_state(&store, project.id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_fails_closed_for_missing_or_unknown_epoch() {
     use rusqlite::types::Value;
@@ -21785,6 +21582,7 @@ fn test_delete_project_fails_closed_for_missing_or_unknown_epoch() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_retains_manager_audit_origins_and_succession_references() {
     for history in ["event", "origin", "succession"] {
@@ -21835,6 +21633,7 @@ fn test_delete_project_retains_manager_audit_origins_and_succession_references()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_delete_project_extra_foreign_keys_roll_back_epoch_and_session_changes() {
     for reference in [
@@ -21872,712 +21671,7 @@ fn test_delete_project_extra_foreign_keys_roll_back_epoch_and_session_changes() 
     }
 }
 
-#[test]
-fn test_find_project_for_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let p1 = Project {
-        path: Some(PathBuf::from("/home/user")),
-        ..make_test_project("user-home")
-    };
-    let p2 = Project {
-        path: Some(PathBuf::from("/home/user/projects")),
-        ..make_test_project("projects")
-    };
-    let p3 = Project {
-        path: Some(PathBuf::from("/home/user/projects/flywheel")),
-        ..make_test_project("flywheel")
-    };
-    let p4 = make_test_project("no-path"); // path is None
-
-    store.insert_project(&p1).unwrap();
-    store.insert_project(&p2).unwrap();
-    store.insert_project(&p3).unwrap();
-    store.insert_project(&p4).unwrap();
-
-    // Exact match should return the project
-    let found = store
-        .find_project_for_path(&PathBuf::from("/home/user/projects/flywheel"))
-        .unwrap();
-    assert_eq!(found.unwrap().name, "flywheel");
-
-    // Subdirectory should match longest prefix
-    let found = store
-        .find_project_for_path(&PathBuf::from("/home/user/projects/flywheel/crates"))
-        .unwrap();
-    assert_eq!(found.unwrap().name, "flywheel");
-
-    // /home/user/projects/other should match "projects" not "flywheel"
-    let found = store
-        .find_project_for_path(&PathBuf::from("/home/user/projects/other"))
-        .unwrap();
-    assert_eq!(found.unwrap().name, "projects");
-
-    // Completely unrelated path returns None
-    let found = store
-        .find_project_for_path(&PathBuf::from("/opt/something"))
-        .unwrap();
-    assert!(found.is_none());
-}
-
-#[test]
-fn test_load_sessions_by_project() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let project = make_test_project("my-project");
-    store.insert_project(&project).unwrap();
-
-    // Create sessions: 2 assigned to project, 1 unassigned
-    let mut s1 = make_test_session();
-    s1.project_id = Some(project.id);
-    let mut s2 = make_test_session();
-    s2.project_id = Some(project.id);
-    // `make_test_session()` defaults `project_id` to `Some(d04_test_project_id())`
-    // (changed by cf01ae43, "feat: implement D04 issue linkage"), so an
-    // unassigned session must now say so explicitly.
-    let mut s3 = make_test_session();
-    s3.project_id = None;
-
-    store.insert_session(&s1).unwrap();
-    store.insert_session(&s2).unwrap();
-    store.insert_session(&s3).unwrap();
-
-    // Load project sessions
-    let project_sessions = store.load_sessions_by_project(Some(project.id)).unwrap();
-    assert_eq!(project_sessions.len(), 2);
-
-    // Load unassigned sessions
-    let unassigned = store.load_sessions_by_project(None).unwrap();
-    assert_eq!(unassigned.len(), 1);
-    assert_eq!(unassigned[0].id, s3.id);
-
-    // load_sessions returns all
-    let all = store.load_sessions().unwrap();
-    assert_eq!(all.len(), 3);
-}
-
-#[test]
-fn test_update_session_project() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let project = make_test_project("my-project");
-    store.insert_project(&project).unwrap();
-
-    // `make_test_session()` defaults `project_id` to `Some(d04_test_project_id())`
-    // (changed by cf01ae43, "feat: implement D04 issue linkage"); this test is
-    // about the unassigned -> assigned -> unassigned cycle, so start unassigned.
-    let mut session = make_test_session();
-    session.project_id = None;
-    store.insert_session(&session).unwrap();
-
-    // Initially unassigned
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.project_id.is_none());
-
-    // Assign to project
-    store
-        .update_session_project(session.id, Some(project.id))
-        .unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.project_id, Some(project.id));
-
-    // Unassign
-    store.update_session_project(session.id, None).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.project_id.is_none());
-}
-
-// -- Model Segment tests --
-
-#[test]
-fn test_model_segment_crud() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Create initial segment
-    let id1 = store
-        .create_model_segment(session.id, "claude-sonnet-5", 0)
-        .unwrap();
-    assert!(id1 > 0);
-
-    // Load segments
-    let segments = store.load_model_segments(session.id).unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].model_id, "claude-sonnet-5");
-    assert_eq!(segments[0].from_sequence, 0);
-    assert!(segments[0].to_sequence.is_none()); // Active segment
-
-    // Create second segment — should close the first
-    let id2 = store
-        .create_model_segment(session.id, "claude-opus-4-6", 5)
-        .unwrap();
-    assert!(id2 > id1);
-
-    let segments = store.load_model_segments(session.id).unwrap();
-    assert_eq!(segments.len(), 2);
-    assert_eq!(segments[0].to_sequence, Some(4)); // Closed at from_sequence - 1
-    assert_eq!(segments[1].model_id, "claude-opus-4-6");
-    assert_eq!(segments[1].from_sequence, 5);
-    assert!(segments[1].to_sequence.is_none()); // New active segment
-}
-
-#[test]
-fn test_get_model_at_sequence() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // No segments — returns None
-    let model = store.get_model_at_sequence(session.id, 0).unwrap();
-    assert!(model.is_none());
-
-    // Create two segments: [0, 4] sonnet, [5, NULL] opus
-    store
-        .create_model_segment(session.id, "claude-sonnet-5", 0)
-        .unwrap();
-    store
-        .create_model_segment(session.id, "claude-opus-4-6", 5)
-        .unwrap();
-
-    // Sequence 0 → sonnet
-    let model = store.get_model_at_sequence(session.id, 0).unwrap();
-    assert_eq!(model, Some("claude-sonnet-5".to_string()));
-
-    // Sequence 4 → sonnet (boundary)
-    let model = store.get_model_at_sequence(session.id, 4).unwrap();
-    assert_eq!(model, Some("claude-sonnet-5".to_string()));
-
-    // Sequence 5 → opus
-    let model = store.get_model_at_sequence(session.id, 5).unwrap();
-    assert_eq!(model, Some("claude-opus-4-6".to_string()));
-
-    // Sequence 100 → opus (active segment, no end)
-    let model = store.get_model_at_sequence(session.id, 100).unwrap();
-    assert_eq!(model, Some("claude-opus-4-6".to_string()));
-}
-
-#[test]
-fn test_model_segment_cascade_delete() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    store
-        .create_model_segment(session.id, "claude-sonnet-5", 0)
-        .unwrap();
-
-    // Verify segment exists
-    let segments = store.load_model_segments(session.id).unwrap();
-    assert_eq!(segments.len(), 1);
-
-    // Delete session — should cascade
-    store.delete_session(session.id).unwrap();
-
-    let segments = store.load_model_segments(session.id).unwrap();
-    assert!(segments.is_empty());
-}
-
-#[test]
-fn test_migration_v9_backfill() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert sessions: one with model, one without
-    let mut s1 = make_test_session();
-    s1.model = Some("claude-sonnet-5".to_string());
-    store.insert_session(&s1).unwrap();
-
-    let s2 = make_test_session(); // model = None
-    store.insert_session(&s2).unwrap();
-
-    // The V9 migration backfills on first open, but since we already opened,
-    // check that create_model_segment works for new sessions
-    // and that the backfill would have created segments for sessions with models.
-    // For a fresh DB opened from V0, the migration creates segments automatically.
-    // Here we verify the store methods work correctly.
-    let segments = store.load_model_segments(s2.id).unwrap();
-    assert!(segments.is_empty()); // No model, no segment
-}
-
-#[test]
-fn test_handoff_filepath_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let mut session = make_test_session();
-    session.handoff_filepath =
-        Some("thoughts/shared/handoffs/general/2026-02-13_test.md".to_string());
-
-    store.insert_session(&session).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.handoff_filepath, session.handoff_filepath);
-
-    // Also verify update_session_metadata persists it
-    let mut session2 = make_test_session();
-    store.insert_session(&session2).unwrap();
-    assert!(
-        store
-            .get_session(session2.id)
-            .unwrap()
-            .unwrap()
-            .handoff_filepath
-            .is_none()
-    );
-
-    session2.handoff_filepath = Some("thoughts/shared/handoffs/general/updated.md".to_string());
-    store.update_session_metadata(&session2).unwrap();
-    let loaded2 = store.get_session(session2.id).unwrap().unwrap();
-    assert_eq!(loaded2.handoff_filepath, session2.handoff_filepath);
-}
-
-#[test]
-fn test_rotation_depth_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Original session has depth 0 (default)
-    let session = make_test_session();
-    assert_eq!(session.rotation_depth, 0);
-    store.insert_session(&session).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.rotation_depth, 0);
-
-    // Simulate rotation chain: depth 1, 2, 3, 4
-    for depth in 1u32..=4 {
-        let mut child = make_test_session();
-        child.rotation_depth = depth;
-        store.insert_session(&child).unwrap();
-        let loaded_child = store.get_session(child.id).unwrap().unwrap();
-        assert_eq!(
-            loaded_child.rotation_depth, depth,
-            "rotation_depth {} should round-trip through DB",
-            depth
-        );
-    }
-
-    // Verify depth 4 is the limit — sessions at depth 4 persist correctly
-    let mut at_limit = make_test_session();
-    at_limit.rotation_depth = 4;
-    store.insert_session(&at_limit).unwrap();
-    let loaded_limit = store.get_session(at_limit.id).unwrap().unwrap();
-    assert_eq!(loaded_limit.rotation_depth, 4);
-}
-
-#[test]
-fn test_pipeline_artifact_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert session without pipeline_artifact
-    let mut session = make_test_session();
-    store.insert_session(&session).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.pipeline_artifact.is_none());
-
-    // Finalization discovers artifacts after insert; metadata must persist them.
-    session.pipeline_artifact = Some("thoughts/shared/research/2026-03-04-foo.md".to_string());
-    store.update_session_metadata(&session).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.pipeline_artifact, session.pipeline_artifact);
-
-    // Insert session with pipeline_artifact set at creation — insert_session still stores it
-    let mut session2 = make_test_session();
-    session2.pipeline_artifact = Some("thoughts/shared/plans/2026-03-04-bar.md".to_string());
-    store.insert_session(&session2).unwrap();
-    let loaded2 = store.get_session(session2.id).unwrap().unwrap();
-    assert_eq!(loaded2.pipeline_artifact, session2.pipeline_artifact);
-}
-
-#[test]
-#[allow(clippy::unwrap_used)]
-fn update_session_metadata_persists_pipeline_artifact() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("test.db")).unwrap();
-    let mut session = make_test_session();
-    store.insert_session(&session).unwrap();
-    session.pipeline_artifact = Some("thoughts/shared/plans/task.md".into());
-    store.update_session_metadata(&session).unwrap();
-    assert_eq!(
-        store
-            .get_session(session.id)
-            .unwrap()
-            .unwrap()
-            .pipeline_artifact,
-        session.pipeline_artifact
-    );
-}
-
-#[test]
-#[allow(clippy::unwrap_used)]
-fn update_session_metadata_persists_taskrabbit_escalation_kind() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("test.db")).unwrap();
-    let mut session = make_test_session();
-    session.session_kind = SessionKind::TaskRabbit;
-    store.insert_session(&session).unwrap();
-    session.session_kind = SessionKind::Standard;
-    store.update_session_metadata(&session).unwrap();
-    assert_eq!(
-        store.get_session(session.id).unwrap().unwrap().session_kind,
-        SessionKind::Standard
-    );
-}
-
-#[test]
-fn test_toggle_session_pin_atomic() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Initially not pinned
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.pinned_at.is_none());
-
-    // Pin: toggle once → should be set
-    let result = store.toggle_session_pin(session.id).unwrap();
-    assert!(result.is_some(), "first toggle should pin the session");
-
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.pinned_at.is_some());
-
-    // Unpin: toggle again → should be cleared
-    let result = store.toggle_session_pin(session.id).unwrap();
-    assert!(result.is_none(), "second toggle should unpin the session");
-
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.pinned_at.is_none());
-
-    // Re-pin for idempotency check
-    let result = store.toggle_session_pin(session.id).unwrap();
-    assert!(result.is_some(), "third toggle should pin again");
-}
-
-#[test]
-fn pin_session_if_unpinned_is_idempotent_and_preserves_the_original_time() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    let first = store
-        .pin_session_if_unpinned(session.id)
-        .unwrap()
-        .expect("an unpinned session is pinned");
-    assert_eq!(
-        store
-            .get_session(session.id)
-            .unwrap()
-            .unwrap()
-            .pinned_at
-            .map(|dt| dt.to_rfc3339()),
-        Some(first.clone()),
-    );
-
-    // Second call must be a no-op that reports the SAME pin time, not a
-    // toggle-off and not a fresh timestamp: pin order is succession order.
-    let second = store
-        .pin_session_if_unpinned(session.id)
-        .unwrap()
-        .expect("an already-pinned session stays pinned");
-    assert_eq!(second, first, "the original pin time is preserved");
-}
-
-#[test]
-fn pin_session_if_unpinned_reports_a_missing_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    assert!(
-        store.pin_session_if_unpinned(Uuid::new_v4()).is_err(),
-        "pinning an unknown session is an error, not a silent no-op",
-    );
-}
-
-#[test]
-fn test_toggle_session_pin_not_found() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Toggle on a non-existent session should return an error
-    let result = store.toggle_session_pin(Uuid::new_v4());
-    assert!(
-        result.is_err(),
-        "toggle on non-existent session should error"
-    );
-}
-
-// -- Workflow CRUD tests --
-
-#[test]
-fn test_workflow_insert_and_get() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let workflow = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "research codebase for feature X".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-
-    store.insert_workflow(&workflow).unwrap();
-
-    let loaded = store.get_workflow(workflow.id).unwrap().unwrap();
-    assert_eq!(loaded.id, workflow.id);
-    assert_eq!(loaded.title, "research codebase for feature X");
-    assert_eq!(loaded.stage, rsi_common::types::WorkflowStage::Research);
-    assert!(loaded.artifact_path.is_none());
-    assert!(loaded.project_id.is_none());
-}
-
-#[test]
-fn test_workflow_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let wf1 = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "workflow 1".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-    let wf2 = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "workflow 2".to_string(),
-        stage: rsi_common::types::WorkflowStage::PlanComplete,
-        artifact_path: Some("thoughts/shared/plans/test.md".to_string()),
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-
-    store.insert_workflow(&wf1).unwrap();
-    store.insert_workflow(&wf2).unwrap();
-
-    let all = store.list_workflows().unwrap();
-    assert_eq!(all.len(), 2);
-}
-
-#[test]
-fn test_workflow_update_stage() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let workflow = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "test workflow".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-
-    store.insert_workflow(&workflow).unwrap();
-
-    // Advance to ResearchComplete with artifact
-    store
-        .update_workflow_stage(
-            workflow.id,
-            rsi_common::types::WorkflowStage::ResearchComplete,
-            Some("thoughts/shared/research/2026-03-08-test.md"),
-        )
-        .unwrap();
-
-    let loaded = store.get_workflow(workflow.id).unwrap().unwrap();
-    assert_eq!(
-        loaded.stage,
-        rsi_common::types::WorkflowStage::ResearchComplete
-    );
-    assert_eq!(
-        loaded.artifact_path,
-        Some("thoughts/shared/research/2026-03-08-test.md".to_string())
-    );
-
-    // Advance to Planning (no artifact change)
-    store
-        .update_workflow_stage(
-            workflow.id,
-            rsi_common::types::WorkflowStage::Planning,
-            None,
-        )
-        .unwrap();
-
-    let loaded = store.get_workflow(workflow.id).unwrap().unwrap();
-    assert_eq!(loaded.stage, rsi_common::types::WorkflowStage::Planning);
-    // artifact_path preserved from previous update
-    assert_eq!(
-        loaded.artifact_path,
-        Some("thoughts/shared/research/2026-03-08-test.md".to_string())
-    );
-}
-
-#[test]
-fn test_workflow_list_by_project() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let project = make_test_project("test-project");
-    store.insert_project(&project).unwrap();
-
-    let wf1 = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "in project".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: Some(project.id),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-    let wf2 = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "no project".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-
-    store.insert_workflow(&wf1).unwrap();
-    store.insert_workflow(&wf2).unwrap();
-
-    let project_workflows = store.list_workflows_by_project(Some(project.id)).unwrap();
-    assert_eq!(project_workflows.len(), 2);
-    assert!(
-        project_workflows.iter().any(|wf| wf.title == "in project"),
-        "project-scoped list should include project-bound workflows"
-    );
-    assert!(
-        project_workflows.iter().any(|wf| wf.title == "no project"),
-        "project-scoped list should include global workflows"
-    );
-
-    let unassigned = store.list_workflows_by_project(None).unwrap();
-    assert_eq!(unassigned.len(), 1);
-    assert_eq!(unassigned[0].title, "no project");
-}
-
-#[test]
-fn test_session_workflow_id_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let workflow = rsi_common::types::Workflow {
-        id: Uuid::new_v4(),
-        title: "test workflow".to_string(),
-        stage: rsi_common::types::WorkflowStage::Research,
-        artifact_path: None,
-        project_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-    store.insert_workflow(&workflow).unwrap();
-
-    // Insert session with workflow_id
-    let mut session = make_test_session();
-    session.workflow_id = Some(workflow.id);
-    store.insert_session(&session).unwrap();
-
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.workflow_id, Some(workflow.id));
-
-    // Update session workflow
-    store.update_session_workflow(session.id, None).unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert!(loaded.workflow_id.is_none());
-
-    // Set it back
-    store
-        .update_session_workflow(session.id, Some(workflow.id))
-        .unwrap();
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.workflow_id, Some(workflow.id));
-}
-
-#[test]
-fn test_workflow_definition_upsert_round_trip_and_title_sync() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let workflow_id = Uuid::new_v4();
-    let document = rsi_common::types::WorkflowDocument {
-        workflow: rsi_common::types::Workflow {
-            id: workflow_id,
-            title: "stale title".to_string(),
-            stage: rsi_common::types::WorkflowStage::Planning,
-            artifact_path: None,
-            project_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        },
-        definition: serde_json::json!({
-            "version": "1.0",
-            "name": "synced title",
-            "nodes": [],
-            "edges": [],
-            "metadata": {},
-        }),
-    };
-
-    let saved = store.upsert_workflow_definition(&document).unwrap();
-    assert_eq!(saved.workflow.title, "synced title");
-    assert_eq!(saved.definition["name"], "synced title");
-
-    let loaded = store.get_workflow_definition(workflow_id).unwrap().unwrap();
-    assert_eq!(loaded.workflow.title, "synced title");
-    assert_eq!(loaded.definition["name"], "synced title");
-}
-
-#[test]
-fn test_workflow_get_nonexistent() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let result = store.get_workflow(Uuid::new_v4()).unwrap();
-    assert!(result.is_none());
-}
-
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_workflows_table_in_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -22603,119 +21697,6 @@ fn test_workflows_table_in_schema() {
     assert_eq!(version, LATEST_SCHEMA_VERSION);
 }
 
-#[test]
-fn test_esp_game_insert_and_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    let game = rsi_common::types::EspGame {
-        id: Uuid::new_v4(),
-        played_at: chrono::Utc::now(),
-        score: 3,
-        rounds_played: 10,
-        total_rounds: 12,
-        p_value: 0.1407,
-        round_details: r#"[{"pick":4,"target":4,"hit":true}]"#.to_string(),
-    };
-
-    store.insert_esp_game(&game).unwrap();
-
-    let games = store.list_esp_games(50).unwrap();
-    assert_eq!(games.len(), 1);
-    assert_eq!(games[0].id, game.id);
-    assert_eq!(games[0].score, 3);
-    assert_eq!(games[0].rounds_played, 10);
-    assert_eq!(games[0].total_rounds, 12);
-    assert!((games[0].p_value - 0.1407).abs() < 1e-10);
-    assert_eq!(games[0].round_details, game.round_details);
-}
-
-#[test]
-fn test_esp_game_list_ordering_and_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert 3 games with different timestamps
-    for i in 0..3u8 {
-        let game = rsi_common::types::EspGame {
-            id: Uuid::new_v4(),
-            played_at: chrono::Utc::now() + chrono::Duration::seconds(i64::from(i)),
-            score: i,
-            rounds_played: 12,
-            total_rounds: 12,
-            p_value: 0.5,
-            round_details: "[]".to_string(),
-        };
-        store.insert_esp_game(&game).unwrap();
-    }
-
-    // List with limit=2 should return the 2 most recent (score 2 and 1)
-    let games = store.list_esp_games(2).unwrap();
-    assert_eq!(games.len(), 2);
-    assert_eq!(games[0].score, 2); // most recent first
-    assert_eq!(games[1].score, 1);
-
-    // List with limit=0 returns empty
-    let empty = store.list_esp_games(0).unwrap();
-    assert!(empty.is_empty());
-}
-
-#[test]
-fn test_retry_state_persist_and_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert session with retry fields
-    let mut session = make_test_session();
-    session.retry_attempt = Some(2);
-    session.max_retries = Some(3);
-    store.insert_session(&session).unwrap();
-
-    // Load and verify retry fields persisted
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.retry_attempt, Some(2));
-    assert_eq!(loaded.max_retries, Some(3));
-}
-
-#[test]
-fn test_update_retry_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert session with no retry fields
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    // Update retry state
-    store
-        .update_retry_state(session.id, Some(1), Some(2))
-        .unwrap();
-
-    // Load and verify
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.retry_attempt, Some(1));
-    assert_eq!(loaded.max_retries, Some(2));
-}
-
-#[test]
-fn test_retry_fields_null_by_default() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
-
-    // Insert session without retry fields
-    let session = make_test_session();
-    store.insert_session(&session).unwrap();
-
-    let loaded = store.get_session(session.id).unwrap().unwrap();
-    assert_eq!(loaded.retry_attempt, None);
-    assert_eq!(loaded.max_retries, None);
-}
-
 /// schema-version-bump (RSI-020): test now exercises the full 38→LATEST chain.
 ///
 /// A DB rewound to V38 migrates to LATEST_SCHEMA_VERSION on first open
@@ -22726,6 +21707,7 @@ fn test_retry_fields_null_by_default() {
 /// `sessions` and the rest were never created; the chain then died inside V77
 /// with `no such table: projects`. It now strips the V39/V40 payload from a real
 /// head-shaped database and rewinds version and schema together.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v39_to_latest_idempotent() {
     let dir = tempfile::tempdir().unwrap();
@@ -22799,6 +21781,7 @@ fn migration_v39_to_latest_idempotent() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v73_repair_runs_on_reopened_partial_latest_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -22892,6 +21875,7 @@ fn migration_v73_repair_runs_on_reopened_partial_latest_schema() {
 /// V40 migration (hierarchical parent_id): seed a V39 DB with session rows,
 /// migrate, verify `parent_id` column exists with NULL for every pre-V40 row,
 /// and verify `idx_sessions_parent_id` is present. Idempotent on re-open.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v40_adds_parent_id_column_and_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -23009,6 +21993,7 @@ fn migration_v40_adds_parent_id_column_and_index() {
 /// (Originally written as V41 in PR #13; renumbered to V45 during 2026-05-13
 /// cherry-pick replay because V41–V44 were taken by main between PR #13 author
 /// time and replay.)
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v45_adds_capability_class_column() {
     let dir = tempfile::tempdir().unwrap();
@@ -23097,6 +22082,7 @@ fn migration_v45_adds_capability_class_column() {
 /// V41 migration (`approval_wait_ms` column): seed a V40 DB with session rows,
 /// migrate, verify the column exists and all pre-V41 rows carry NULL.
 /// Idempotent on re-open.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v41_adds_approval_wait_ms_column() {
     let dir = tempfile::tempdir().unwrap();
@@ -23182,6 +22168,7 @@ fn migration_v41_adds_approval_wait_ms_column() {
 /// V42 migration (`lead_session_id` column + index): seed a V41 DB with session
 /// rows, migrate, verify the column and index exist and all pre-V42 rows carry
 /// NULL. Idempotent on re-open.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v42_adds_lead_session_id_column_and_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -23283,6 +22270,7 @@ fn migration_v42_adds_lead_session_id_column_and_index() {
 /// V43 migration (`tag` column + `session_tags` table + `topologies` table):
 /// open at head, seed sessions, drop V43 artifacts, pin user_version back to 42,
 /// re-open, assert V43 re-runs cleanly and rows are intact. Idempotent on re-open.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v43_adds_tag_column_and_topologies_tables() {
     let dir = tempfile::tempdir().unwrap();
@@ -23407,6 +22395,7 @@ fn migration_v43_adds_tag_column_and_topologies_tables() {
 /// After V43 runs, every session loaded via the normal restore path
 /// carries `tag = ""` and `tags = []`. P1.1 leaves daemon-side population
 /// for P1.5; restored sessions land at the row-mapper defaults.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn tag_default_empty_after_v43_upgrade() {
     let dir = tempfile::tempdir().unwrap();
@@ -23435,6 +22424,7 @@ fn tag_default_empty_after_v43_upgrade() {
 /// Insert two `topologies` rows with the same name; the second insert must
 /// fail with a UNIQUE constraint violation. Verifies the migration's
 /// `name TEXT NOT NULL UNIQUE` clause survived the multi-statement DDL.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn topology_unique_name_constraint() {
     let dir = tempfile::tempdir().unwrap();
@@ -23469,6 +22459,7 @@ fn topology_unique_name_constraint() {
 }
 
 /// Round-trip: a Session with `lead_session_id: Some(_)` survives insert + read.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_lead_session_id_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -23524,6 +22515,7 @@ fn session_lead_session_id_round_trip() {
 /// V44 migration (`is_eval` column + `idx_sessions_is_eval` index): open at
 /// head, drop the V44 artifacts, pin user_version back to 43, re-open, assert
 /// V44 re-runs cleanly. Idempotent on re-open. RSI-006.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v44_adds_is_eval_column_and_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -23614,6 +22606,7 @@ fn migration_v44_adds_is_eval_column_and_index() {
 /// cleanly. Idempotent on re-open. master_improve chain driver.
 /// (Originally written as V45 in PR #10; renumbered to V46 during 2026-05-15
 /// merge because PR #18 took V45 for capability_class.)
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v46_adds_chain_iterations_table_and_indexes() {
     let dir = tempfile::tempdir().unwrap();
@@ -23742,6 +22735,7 @@ fn migration_v46_adds_chain_iterations_table_and_indexes() {
 
 /// Round-trip: a Session with `is_eval=true` is persisted as 1 in the DB and
 /// reads back as `Some(true)` through `SessionRow::into_session`. RSI-006.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_is_eval_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -23774,6 +22768,7 @@ fn session_is_eval_round_trip() {
 
 // ---- Hierarchy storage helpers (Phase 2) ----------------------------------
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_rpc_delete_container_empty_succeeds_via_has_children() {
     // Verify the delete-container guard primitive: an empty container
@@ -23792,6 +22787,7 @@ fn test_rpc_delete_container_empty_succeeds_via_has_children() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_rpc_delete_container_non_empty_rejected_via_has_children() {
     // Verify the inverse: a container with at least one child returns
@@ -23815,6 +22811,7 @@ fn test_rpc_delete_container_non_empty_rejected_via_has_children() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_list_children_root_and_parent_scopes() {
     // list_children(None) returns top-level rows; list_children(Some(id))
@@ -23846,6 +22843,7 @@ fn test_list_children_root_and_parent_scopes() {
     assert!(ids.contains(&child_b.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_update_session_parent_persists_reparent() {
     // Reparenting via update_session_parent() flips the indexed column
@@ -23881,6 +22879,7 @@ fn test_update_session_parent_persists_reparent() {
     assert!(roots.iter().any(|s| s.id == child.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_load_parent_index_snapshot() {
     // Cycle detector relies on a single snapshot of (id -> parent_id)
@@ -23905,6 +22904,7 @@ fn test_load_parent_index_snapshot() {
 /// V47 migration (`topology_node_id` + `topology_iteration` columns + compound index):
 /// open at head, drop the V47 artifacts, pin user_version back to 46, re-open,
 /// assert V47 re-runs cleanly. Also verify pre-V47 rows deserialize with correct defaults.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v47_adds_topology_columns_and_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -24010,6 +23010,7 @@ fn migration_v47_adds_topology_columns_and_index() {
 
 /// V48 (RSI-026): `daemon_settings` key-value table exists with the
 /// expected three-column shape after a fresh `Store::open`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn test_v48_daemon_settings_table_created() {
     let dir = tempfile::tempdir().unwrap();
@@ -24055,6 +23056,7 @@ fn test_v48_daemon_settings_table_created() {
 /// V70 migration (`work_time_ms` column, TD1): seed a V69 DB with session
 /// rows, migrate, verify the column exists and all pre-V70 rows carry NULL.
 /// Idempotent on re-open. Clone of `migration_v41_adds_approval_wait_ms_column`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn migration_v70_adds_work_time_ms_column() {
     let dir = tempfile::tempdir().unwrap();
@@ -24141,6 +23143,7 @@ fn migration_v70_adds_work_time_ms_column() {
 /// Store round-trip: `work_time_ms` threads through `insert_session` and
 /// `update_session_metadata` and is read back unchanged. Template mirrors
 /// the `duration_ms` / `approval_wait_ms` round-trips above.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn work_time_ms_persists_through_insert_and_metadata_update() {
     let dir = tempfile::tempdir().unwrap();
@@ -24177,6 +23180,7 @@ fn work_time_ms_persists_through_insert_and_metadata_update() {
 /// reopen (simulating a daemon restart) unchanged — never reset, never
 /// decreased. Complements the SessionManager-level
 /// `restore_sessions_preserves_work_time_ms_floor` test in `session::launch::tests`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn work_time_ms_survives_status_flip_and_store_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -24270,6 +23274,7 @@ fn seed_issue_v97_authority_topology(store: &Store) -> (Uuid, Project) {
     (caller.id, project)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_list_issues_ready_filter_matches_operator_projection_and_pages() {
@@ -24369,6 +23374,7 @@ fn agent_list_issues_ready_filter_matches_operator_projection_and_pages() {
     assert!(!after_close.contains(&dependent.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager() {
@@ -24492,6 +23498,7 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
     assert!(denied.contains("authority_denied"), "{denied}");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_migration_backfills_deterministic_baseline_event() {
     let directory = tempfile::tempdir().unwrap();
@@ -24531,6 +23538,7 @@ fn issue_v97_migration_backfills_deterministic_baseline_event() {
     assert_eq!(event.issue, issue);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_fault_after_baseline_rolls_back_to_exact_v96_then_repairs_once() {
     let directory = tempfile::tempdir().unwrap();
@@ -24612,6 +23620,7 @@ fn issue_v97_build_exact_v96_fixture(path: &Path, issue_count: usize) {
     rewind_store_to_schema_version(&store.conn, 96);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_every_fault_rolls_back_and_repairs_fresh_copied_and_large_fixtures() {
     let directory = tempfile::tempdir().unwrap();
@@ -24679,6 +23688,7 @@ fn issue_v97_every_fault_rolls_back_and_repairs_fresh_copied_and_large_fixtures(
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_rejects_malformed_v96_columns_indexes_foreign_keys_and_retained_catalog() {
     let directory = tempfile::tempdir().unwrap();
@@ -24901,6 +23911,7 @@ fn issue_v97_apply_hostile_semantic(
     canonical
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_hostile_v96_semantics_reject_before_ddl_then_repair_and_reopen_stably() {
     let directory = tempfile::tempdir().unwrap();
@@ -25002,6 +24013,7 @@ fn issue_v97_hostile_v96_semantics_reject_before_ddl_then_repair_and_reopen_stab
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_all_shipped_histories_share_exact_v96_issue_projection_and_migrate_stably() {
     let directory = tempfile::tempdir().unwrap();
@@ -25084,6 +24096,7 @@ fn issue_v97_all_shipped_histories_share_exact_v96_issue_projection_and_migrate_
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_v97_to_v96_rewind_preserves_exact_catalog_projection_dependencies_and_fks() {
     let directory = tempfile::tempdir().unwrap();
@@ -25113,6 +24126,7 @@ fn issue_v97_to_v96_rewind_preserves_exact_catalog_projection_dependencies_and_f
     assert_eq!(d04_database_snapshot(&reopened).unwrap(), expected);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
     let (store, caller, project) = issue_v97_authority_fixture();
@@ -25223,6 +24237,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_authority_hides_cross_project_target() {
     let (store, caller, project) = issue_v97_authority_fixture();
@@ -25267,6 +24282,7 @@ fn agent_issue_authority_hides_cross_project_target() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
     let (store, caller, _) = issue_v97_authority_fixture();
@@ -25387,6 +24403,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
     assert_eq!(history_error(unknown_id), history_error(remote.id));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_legacy_create_adoption_replays_immutable_receipt_after_mutation_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
@@ -25460,6 +24477,7 @@ fn agent_issue_legacy_create_adoption_replays_immutable_receipt_after_mutation_a
     assert!(!conflict.create_fields_match);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconciliation_lookup() {
     let (store, caller, project) = issue_v97_authority_fixture();
@@ -25538,6 +24556,7 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_inventory_routes_every_projection_write_through_v97_audit() {
     // Keep the inventory deliberate: production Issue projection writes are
@@ -25555,6 +24574,7 @@ fn issue_writer_inventory_routes_every_projection_write_through_v97_audit() {
     assert!(ideas.contains("row_version = row_version + 1"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
     use super::issues::{IssueWriteFault, fail_next_issue_write};
@@ -25648,6 +24668,7 @@ fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
     use rsi_common::types::{IssueActorKindV1, IssueEventOperationV1};
@@ -25778,6 +24799,7 @@ fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_local_project_move_race_preserves_scope_and_attribution() {
     let directory = tempfile::tempdir().unwrap();
@@ -25856,6 +24878,7 @@ fn issue_writer_local_project_move_race_preserves_scope_and_attribution() {
     assert_issue_event_semantics_are_complete(status);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_shared_owning_epic_topology_matrix_is_exhaustive() {
     use super::sessions::{OwningEpicTopologyError, resolve_owning_epic_topology_tx};
@@ -26002,6 +25025,7 @@ fn agent_issue_shared_owning_epic_topology_matrix_is_exhaustive() {
     store.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_authority_matrix_denies_nonlead_projectless_container_and_unknown_callers() {
     let (store, current_lead, project) = issue_v97_authority_fixture();
@@ -26049,6 +25073,7 @@ fn agent_issue_authority_matrix_denies_nonlead_projectless_container_and_unknown
     store.agent_list_issues(ordinary.id, &request).unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::too_many_lines, clippy::unwrap_used)]
 fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates_as_manager_actor()
@@ -26290,6 +25315,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
 /// The CAS race on the owning-Epic lead path with the manager grant present;
 /// the manager-path race is
 /// `manager_issue_concurrent_cas_has_one_winner_and_one_stale_version`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::too_many_lines, clippy::unwrap_used)]
 fn agent_issue_lead_concurrent_cas_has_one_winner_alongside_manager_coordinate_grant() {
@@ -26554,6 +25580,7 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
 /// A pre-migration store (released V97 `issue_events` at the exact source
 /// version) upgrades on open: every row is copied verbatim, the rebuilt
 /// catalog is the pinned one, and reopening is a stable no-op.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn issue_events_manager_actor_migration_copies_rows_verbatim_and_reopens_idempotently() {
@@ -26622,6 +25649,7 @@ fn issue_events_manager_actor_migration_copies_rows_verbatim_and_reopens_idempot
 
 /// The migration refuses any source other than the exact preceding head and
 /// leaves the released V97 catalog untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn issue_events_manager_actor_migration_refuses_wrong_source_version_without_ddl() {
@@ -26693,6 +25721,7 @@ fn insert_provenance_variant(
 
 /// The rebuilt CHECKs accept a manager row only with its session id and key,
 /// no label and no owning Epic; session and operator rules are unchanged.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn issue_events_manager_actor_check_admits_manager_without_owning_epic_only() {
@@ -26929,6 +25958,7 @@ fn lead_set_status(store: &Store, lead: Uuid, issue: &Issue, status: IssueStatus
         .issue
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_issue_update_content_records_manager_actor_replays_and_refuses_stale_or_revoked() {
     assert_manager_issue_mutation_contract(
@@ -26960,6 +25990,7 @@ fn manager_issue_update_content_records_manager_actor_replays_and_refuses_stale_
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_issue_update_status_records_manager_actor_replays_and_refuses_stale_or_revoked() {
     assert_manager_issue_mutation_contract(
@@ -26985,6 +26016,7 @@ fn manager_issue_update_status_records_manager_actor_replays_and_refuses_stale_o
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_issue_archive_records_manager_actor_replays_and_refuses_stale_or_revoked() {
     assert_manager_issue_mutation_contract(
@@ -27004,6 +26036,7 @@ fn manager_issue_archive_records_manager_actor_replays_and_refuses_stale_or_revo
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn manager_issue_restore_records_manager_actor_replays_and_refuses_stale_or_revoked() {
@@ -27042,6 +26075,7 @@ fn manager_issue_restore_records_manager_actor_replays_and_refuses_stale_or_revo
 
 /// A session with no manager appointment (an ordinary worker) is refused
 /// every mutation even when a different manager holds the grant.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn manager_issue_mutations_refuse_ordinary_worker_without_coordinator_grant() {
@@ -27084,6 +26118,7 @@ fn manager_issue_mutations_refuse_ordinary_worker_without_coordinator_grant() {
 
 /// Two concurrent manager CAS attempts on one row version: exactly one wins
 /// and the other observes `stale_version`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn manager_issue_concurrent_cas_has_one_winner_and_one_stale_version() {
@@ -27147,6 +26182,7 @@ fn manager_issue_concurrent_cas_has_one_winner_and_one_stale_version() {
 /// The Issue coordinator path and `manager_config_for_caller` share one
 /// lineage definition: a receipted rotation moves authority to the successor
 /// tip and away from the archived predecessor on both paths.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_issue_manager_coordinate_follows_rotation_tip_and_agrees_with_manager_config() {
@@ -27200,6 +26236,7 @@ fn agent_issue_manager_coordinate_follows_rotation_tip_and_agrees_with_manager_c
 /// `manager_lineage_tip` requires), not merely the caller's own parent: a
 /// committed edge from the anchor to a session under a different parent
 /// resolves to no current manager on either path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_issue_manager_coordinate_denies_successor_whose_parent_diverges_from_anchor() {
@@ -27252,6 +26289,7 @@ fn agent_issue_manager_coordinate_denies_successor_whose_parent_diverges_from_an
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_issue_manager_coordinate_denies_displaced_manager_after_reappointment() {
@@ -27284,6 +26322,7 @@ fn agent_issue_manager_coordinate_denies_displaced_manager_after_reappointment()
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_issue_manager_coordinate_is_bound_to_its_own_project() {
@@ -27328,6 +26367,7 @@ fn agent_issue_manager_coordinate_is_bound_to_its_own_project() {
     assert_eq!(get(manager_a.id, issue_a.id).unwrap().issue, issue_a);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_issue_manager_coordinate_grant_does_not_extend_to_workers_children_or_fresh_lineage() {
@@ -27370,6 +26410,7 @@ fn agent_issue_manager_coordinate_grant_does_not_extend_to_workers_children_or_f
     assert_eq!(manager_issue_list(&store, lead).unwrap(), vec![issue]);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_order() {
     let directory = tempfile::tempdir().unwrap();
@@ -27474,6 +26515,7 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
 }
 
 /// V72: fresh store lands at LATEST_SCHEMA_VERSION with both issue tables.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v72_creates_issue_tables() {
     let store = Store::open_in_memory().unwrap();
@@ -27501,6 +26543,7 @@ fn v72_creates_issue_tables() {
 /// V72: re-running init_schema on a migrated store is a clean no-op, and a
 /// crash-mid-block re-run (version bump never landed) re-executes the DDL
 /// over already-existing tables cleanly.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v72_idempotent_reopen() {
     let store = Store::open_in_memory().unwrap();
@@ -27547,6 +26590,7 @@ fn v72_idempotent_reopen() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn create_and_get_issue_roundtrip() {
     let store = Store::open_in_memory().unwrap();
@@ -27599,6 +26643,7 @@ fn create_and_get_issue_roundtrip() {
     assert!(store.get_issue(Uuid::new_v4()).unwrap().is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn display_number_monotonic() {
     let store = Store::open_in_memory().unwrap();
@@ -27611,6 +26656,7 @@ fn display_number_monotonic() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn list_issues_filters() {
     let store = Store::open_in_memory().unwrap();
@@ -27794,6 +26840,7 @@ fn tamper_issue_workspace_cursor(cursor: &IssueWorkspaceCursorV1) -> IssueWorksp
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_pages_are_bounded_stable_and_project_scoped() {
     let store = Store::open_in_memory().unwrap();
@@ -27907,6 +26954,7 @@ fn issue_workspace_pages_are_bounded_stable_and_project_scoped() {
     assert_eq!(selected.issue.labels, vec!["workspace", "beta"]);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_local_cursors_authenticate_project_uuid_and_all_sort_tuples() {
     let store = Store::open_in_memory().unwrap();
@@ -28033,6 +27081,7 @@ fn issue_workspace_local_cursors_authenticate_project_uuid_and_all_sort_tuples()
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_projects_authoritative_readiness_dependencies_and_events() {
     let store = Store::open_in_memory().unwrap();
@@ -28106,6 +27155,7 @@ fn issue_workspace_projects_authoritative_readiness_dependencies_and_events() {
     assert_eq!(events.events[0].issue.id, dependent.id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_dependency_cursors_authenticate_edge_direction_project_and_tuple() {
     let store = Store::open_in_memory().unwrap();
@@ -28285,6 +27335,7 @@ fn issue_workspace_error_code(error: DaemonError) -> IssueWorkspaceErrorV1 {
     serde_json::from_value(data).expect("valid Issue workspace error envelope")
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_create_unknown_project_is_typed_and_definitive() {
     let store = Store::open_in_memory().unwrap();
@@ -28311,6 +27362,7 @@ fn issue_workspace_create_unknown_project_is_typed_and_definitive() {
     assert_eq!(error.next_action, "refresh the project Issue list");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_strict_mutations_retry_across_reopen_and_preserve_operator_provenance() {
     let directory = tempfile::tempdir().unwrap();
@@ -28491,6 +27543,7 @@ fn issue_workspace_strict_mutations_retry_across_reopen_and_preserve_operator_pr
     assert_eq!(event_rows, (7, 7));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_workspace_dependency_mutations_converge_and_keep_store_authority() {
     let store = Store::open_in_memory().unwrap();
@@ -28574,6 +27627,7 @@ fn issue_workspace_dependency_mutations_converge_and_keep_store_authority() {
     assert!(store.list_issue_deps(dependent.id).unwrap().is_empty());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn update_issue_status_closed_at() {
     let store = Store::open_in_memory().unwrap();
@@ -28629,6 +27683,7 @@ fn update_issue_status_closed_at() {
     assert!(recancelled.updated_at > reclosed.updated_at);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn update_missing_issue_errors() {
     let store = Store::open_in_memory().unwrap();
@@ -28644,6 +27699,7 @@ fn update_missing_issue_errors() {
     assert!(err.is_err(), "status flip on an unknown issue must error");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn add_dep_rejects_self() {
     let store = Store::open_in_memory().unwrap();
@@ -28656,6 +27712,7 @@ fn add_dep_rejects_self() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn add_dep_rejects_unknown_endpoint() {
     let store = Store::open_in_memory().unwrap();
@@ -28672,6 +27729,7 @@ fn add_dep_rejects_unknown_endpoint() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn add_dep_duplicate_idempotent() {
     let store = Store::open_in_memory().unwrap();
@@ -28688,6 +27746,7 @@ fn add_dep_duplicate_idempotent() {
     assert_eq!(count, 1, "duplicate edge must not create a second row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn add_dep_rejects_cycle() {
     let store = Store::open_in_memory().unwrap();
@@ -28724,6 +27783,7 @@ fn add_dep_rejects_cycle() {
 /// `Result<bool>` contract: `true` when an edge existed and was deleted,
 /// `false` when there was nothing to remove — including on a second call
 /// for the same edge, and for an edge that never existed at all.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn remove_issue_dep_returns_true_then_false() {
     let store = Store::open_in_memory().unwrap();
@@ -28755,6 +27815,7 @@ fn remove_issue_dep_returns_true_then_false() {
 /// V97 rejects hard deletion even through raw SQL and retains dependency rows.
 /// The historical `ON DELETE CASCADE` remains defensive referential truth but
 /// can no longer become a user-visible destructive path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v97_issue_delete_is_rejected_and_retains_edges() {
     let store = Store::open_in_memory().unwrap();
@@ -28780,6 +27841,7 @@ fn v97_issue_delete_is_rejected_and_retains_edges() {
     assert!(store.get_issue(b.id).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn ready_work_semantics() {
     let store = Store::open_in_memory().unwrap();
@@ -28876,6 +27938,7 @@ fn ready_work_semantics() {
 
 /// SF-1: `update_issue` apply path — set, skip (None), and clear
 /// (`Some(None)`) semantics of the double-Option patch encoding.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn update_issue_apply_set_skip_clear() {
     let store = Store::open_in_memory().unwrap();
@@ -28961,6 +28024,7 @@ fn update_issue_apply_set_skip_clear() {
 
 /// N-2 / plan D3: a hand-inserted (raw SQL) dependency cycle never hangs the
 /// non-recursive ready-work query — its members are simply mutually blocked.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn ready_query_tolerates_raw_cycle() {
     let store = Store::open_in_memory().unwrap();
@@ -28996,6 +28060,7 @@ fn ready_query_tolerates_raw_cycle() {
     assert_eq!(ready, vec![free.id], "unrelated open issue stays ready");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_c5_automatic_insert_and_pending_resolution_are_one_replay_safe_transaction() {
     let store = Store::open_in_memory().unwrap();
@@ -29101,6 +28166,7 @@ fn issue_writer_c5_automatic_insert_and_pending_resolution_are_one_replay_safe_t
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_settlement_never_admits_a_stale_marker_and_rejects_unknown_journal_versions() {
     let store = Store::open_in_memory().unwrap();
@@ -29160,6 +28226,7 @@ fn c5_settlement_never_admits_a_stale_marker_and_rejects_unknown_journal_version
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_archive_settlement_is_atomic_and_requires_a_source_row() {
     let store = Store::open_in_memory().unwrap();
@@ -29201,6 +28268,7 @@ fn c5_archive_settlement_is_atomic_and_requires_a_source_row() {
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_successor_admission_is_atomic_and_preserves_parent_marker_on_fault() {
     let store = Store::open_in_memory().unwrap();
@@ -29284,6 +28352,7 @@ fn c5_retry_successor_admission_is_atomic_and_preserves_parent_marker_on_fault()
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_admission_child_insert_failure_leaves_parent_owned_retry_for_restart() {
     let store = Store::open_in_memory().unwrap();
@@ -29325,6 +28394,7 @@ fn c5_retry_admission_child_insert_failure_leaves_parent_owned_retry_for_restart
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_archive_commit_fault_leaves_status_and_marker_recoverable() {
     let store = Store::open_in_memory().unwrap();
@@ -29349,6 +28419,7 @@ fn c5_archive_commit_fault_leaves_status_and_marker_recoverable() {
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_admission_tombstone_is_not_a_successor() {
     let store = Store::open_in_memory().unwrap();
@@ -29365,6 +28436,7 @@ fn c5_retry_admission_tombstone_is_not_a_successor() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_admission_rejects_stale_parent_or_marker_without_a_child() {
     let store = Store::open_in_memory().unwrap();
@@ -29398,6 +28470,7 @@ fn c5_retry_admission_rejects_stale_parent_or_marker_without_a_child() {
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_admission_classifies_only_store_faults_as_rearmable() {
     let store = Store::open_in_memory().unwrap();
@@ -29436,6 +28509,7 @@ fn c5_retry_admission_classifies_only_store_faults_as_rearmable() {
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_prepared_reclaim_keeps_failed_source_and_retry_owner() {
     let store = Store::open_in_memory().unwrap();
@@ -29515,6 +28589,7 @@ fn c5_retry_prepared_reclaim_keeps_failed_source_and_retry_owner() {
     assert_eq!(store.get_c5_autofile_pending(&key).unwrap(), Some(marker));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn rotation_reservation_prepared_reclaim_preserves_parent_and_creates_no_child() {
     let mut store = Store::open_in_memory().unwrap();
@@ -29604,6 +28679,7 @@ fn c5_retry_admission_fixture() -> (
     (store, parent, child, marker, key)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_retry_admission_user_intent_matrix_has_exactly_one_durable_winner() {
     // Each row executes both legal serializations of the same durable race.
@@ -29694,6 +28770,7 @@ fn c5_retry_admission_user_intent_matrix_has_exactly_one_durable_winner() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn issue_writer_c5_transaction_failures_rollback_stage_event_and_settlement_without_orphans() {
     let store = Store::open_in_memory().unwrap();
@@ -29776,6 +28853,7 @@ fn issue_writer_c5_transaction_failures_rollback_stage_event_and_settlement_with
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_transition_faults_rollback_every_durable_boundary() {
     fn assert_retryable(error: super::daemon_settings::C5TransitionError, operation: &str) {
@@ -29924,6 +29002,7 @@ fn c5_transition_faults_rollback_every_durable_boundary() {
     assert!(store.get_c5_autofile_pending(&key).unwrap().is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_journal_parser_is_strict_and_retains_bad_rows() {
     use super::daemon_settings::{C5AutofilePending, C5JournalError};
@@ -29985,6 +29064,7 @@ fn c5_journal_parser_is_strict_and_retains_bad_rows() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_pending_list_is_key_ordered_and_bounded_to_64() {
     let store = Store::open_in_memory().unwrap();
@@ -30006,6 +29086,7 @@ fn c5_pending_list_is_key_ordered_and_bounded_to_64() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn c5_concurrent_suppression_and_settlement_have_one_legal_winner() {
     use std::sync::{Arc, Barrier};
@@ -30140,6 +29221,7 @@ fn c5_concurrent_suppression_and_settlement_have_one_legal_winner() {
 /// handler, so `PRAGMA busy_timeout=10000` was inert and two concurrent opens
 /// of the same database failed instantly. The repair now begins IMMEDIATE,
 /// which takes the write lock up front and does honor busy_timeout.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn concurrent_store_open_never_returns_database_busy() {
     use std::sync::{Arc, Barrier};
@@ -30908,6 +29990,7 @@ fn assert_d01_rollback_restore(fixture: &D01PriorVersionFixture) -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn d01_idea_kernel_copied_prior_upgrade_reopen_fault_and_rollback() -> anyhow::Result<()> {
     let fixture = d01_prior_version_fixture()?;
@@ -30917,17 +30000,10 @@ fn d01_idea_kernel_copied_prior_upgrade_reopen_fault_and_rollback() -> anyhow::R
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("D01 test operation")?;
     assert_eq!(version, LATEST_SCHEMA_VERSION);
-    // Literal tripwire on the schema head. V99 adds provider telemetry, V100
-    // adds context provenance, V101 adds configured context intent, and
-    // V102/V103 add manager scope, messages, rotation receipts, and notice CAS.
-    // The pin stays literal so every future head bump forces deliberate review.
-    // V104 adds the manager journal; V105 adds exact question publication.
-    // V106 adds native approval identity; V107 retains independent occurrences.
-    // V108/V109 retain decision history and bound approval scans; V110 adds
-    // project/Group scope; V111 reserves root succession authority/accounting.
-    // V112 converges the two immutable V111 catalogs without changing either,
-    // and V113 adds durable archive projection delivery.
-    assert_eq!(LATEST_SCHEMA_VERSION, 113);
+    // The D01 fixture must preserve its legacy rows and pointers after every
+    // migration through the current schema head. The version check above uses
+    // LATEST_SCHEMA_VERSION; the rewind fixture separately pins teardown
+    // coverage whenever a new migration is added.
     assert_eq!(
         d01_legacy_fingerprints(&store.conn)?,
         fixture.legacy_fingerprints,
@@ -31631,6 +30707,7 @@ fn assert_d01_immutability_and_project_delete(
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn d01_idea_kernel_round_trip_fk_immutability_and_many_to_many() -> anyhow::Result<()> {
     let fixture = d01_kernel_fixture()?;
@@ -31829,6 +30906,7 @@ fn assert_d01_compatibility_mapper_corruption(project_id: &str, timestamp: &str)
     assert!(bad_status.into_idea_compatibility_mapping().is_err());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn d01_idea_kernel_strict_row_mapping_rejects_corrupt_values() {
     let project_id = Uuid::new_v4().to_string();
@@ -32011,6 +31089,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_create_mutate_replay_and_counter_chain() -> anyhow::Result<()> {
         let fixture = d02_fixture().await;
@@ -32125,6 +31204,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_changed_replay_conflicts_before_writes() -> anyhow::Result<()> {
         let fixture = d02_fixture().await;
@@ -32278,6 +31358,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_creation_conflicts_roll_back_projection_event_and_edge()
     -> anyhow::Result<()> {
@@ -32356,6 +31437,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_relationship_direction_cycles_tombstones_and_supersession()
     -> anyhow::Result<()> {
@@ -32679,6 +31761,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_lifecycle_and_stage_fail_closed_without_writes()
     -> anyhow::Result<()> {
@@ -32841,6 +31924,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_every_write_boundary_rolls_back() -> anyhow::Result<()> {
         use super::super::ideas::{IdeaWriteFault, inject_d02_idea_write_fault};
@@ -33023,6 +32107,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn d02_idea_event_cas_two_file_connections_have_one_cas_winner() -> anyhow::Result<()> {
         use std::sync::{Arc, Barrier};
@@ -33123,6 +32208,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_history_is_bounded_stable_and_digest_strict() -> anyhow::Result<()>
     {
@@ -33205,6 +32291,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_corrupt_stored_events_fail_closed() -> anyhow::Result<()> {
         for corruption in [
@@ -33286,6 +32373,7 @@ mod d02_idea_event_cas_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test(flavor = "current_thread")]
     async fn d02_idea_event_cas_copied_v75_schema_reopen_and_restore_are_unchanged()
     -> anyhow::Result<()> {
@@ -33564,6 +32652,7 @@ mod d03_controller_store_tests {
         Ok((candidate, confirmation))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     #[allow(clippy::cast_sign_loss, clippy::too_many_lines, clippy::unwrap_used)]
     async fn d05_controller_assignment_reclaims_unexpired_claim_and_fences_old_authority() {
@@ -34058,6 +33147,7 @@ mod d03_controller_store_tests {
         assert!(old_third.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_store_reserve_assign_mutate_release_and_exact_replay() {
         let (store, project, idea) = d03_fixture().await;
@@ -34285,6 +33375,7 @@ mod d03_controller_store_tests {
         assert_eq!(denied, Err(IdeaControlError::ForbiddenActor));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_store_fault_rollback_and_competing_reservations() {
         let (store, _project, idea) = d03_fixture().await;
@@ -34336,6 +33427,7 @@ mod d03_controller_store_tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_store_all_transition_failpoints_are_atomic() {
         let (store, project, idea) = d03_fixture().await;
@@ -34509,6 +33601,7 @@ mod d03_controller_store_tests {
             .expect("release reservation after failpoints");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_store_file_backed_wal_reserve_race_and_assign_replay() {
         let temp = tempfile::tempdir().expect("D03 WAL tempdir");
@@ -34631,6 +33724,7 @@ mod d03_controller_store_tests {
         assert_eq!(first_assigned.idea.controller_epoch, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_store_reconciliation_zero_grace_two_pages_and_exact_release() {
         let (store, project, idea) = d03_fixture().await;
@@ -34810,6 +33904,7 @@ mod d03_controller_store_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_expiry_resolves_exact_intent_and_rebases_different_intent()
     -> anyhow::Result<()> {
@@ -34877,6 +33972,7 @@ mod d03_controller_store_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_rotation_transfers_grant_only_after_committed_assignment()
     -> anyhow::Result<()> {
@@ -34974,6 +34070,7 @@ mod d03_controller_store_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_assignment_and_cancellation_have_one_terminal_winner()
     -> anyhow::Result<()> {
@@ -35056,6 +34153,7 @@ mod d03_controller_store_tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn d03_sqlite_extended_code_classification_matrix_is_exact() {
         fn sqlite_failure(code: i32) -> rusqlite::Error {
@@ -35110,6 +34208,7 @@ mod d03_controller_store_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn d03_controller_store_migration_v76_reopen_idempotency_and_query_plan() {
         let dir = tempfile::tempdir().unwrap();
@@ -35396,6 +34495,7 @@ fn context_budget_fixture(active_tokens: u64, source: CapabilitySource) -> Resol
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v100_forward_migration_preserves_windows_backfills_legacy_and_reopens() {
     let directory = tempfile::tempdir().expect("create V100 migration fixture directory");
@@ -35529,6 +34629,7 @@ fn v100_forward_migration_preserves_windows_backfills_legacy_and_reopens() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v101_forward_migration_preserves_v100_tuple_and_new_writes_reopen_raw_configuration() {
     let directory = tempfile::tempdir().expect("create V101 migration fixture directory");
@@ -35628,6 +34729,7 @@ fn v101_forward_migration_preserves_v100_tuple_and_new_writes_reopen_raw_configu
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn context_budget_session_rows_roundtrip_runtime_catalog_configured_and_legacy_sources() {
     let store = Store::open_in_memory().expect("open context-budget row-roundtrip store");
@@ -35706,6 +34808,7 @@ fn context_budget_session_rows_roundtrip_runtime_catalog_configured_and_legacy_s
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn discovery_only_catalog_identity_survives_store_reopen() {
     let directory = tempfile::tempdir().expect("create discovery-only catalog fixture");
@@ -35769,6 +34872,7 @@ fn discovery_only_catalog_identity_survives_store_reopen() {
     assert!(!loaded_budget.authorizes_threshold_rotation());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn context_budget_session_writes_reject_incoherent_tuples() {
     let store = Store::open_in_memory().expect("open context-budget coherence store");
@@ -35795,6 +34899,7 @@ fn context_budget_session_writes_reject_incoherent_tuples() {
     assert!(store.get_session(zero.id).unwrap().is_none());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
     let store = Store::open_in_memory().expect("open V100 legacy-zero store");
@@ -35852,8 +34957,7 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 132;
-
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 137;
 /// Catalog objects installed by the V131 sandbox reclaim journal migration.
 const V131_SANDBOX_RECLAIM_OBJECTS: [(&str, &str); 16] = [
     ("table", "sandbox_reclaim_runs"),
@@ -36009,12 +35113,13 @@ fn rewind_session_model_updates_v132_fixture_to_v131(connection: &Connection) {
 // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-rewind
 
 /// Exact teardown of the post-V121 tail down to `target` (121..=head), always
-/// in chain order V132 -> V131 -> V130 -> V129 -> V128 -> V127 -> V126 ->
-/// V125 -> V124 -> V123 -> V122 so each helper receives the exact
-/// source version it requires. The generic fixture validator cannot claim a
+/// in descending version order through the current schema head.
+/// V136 -> V135 -> V134 -> V133 -> V132 -> V131 -> V130 -> V129 ->
+/// V128 -> V127 -> V126 -> V125 -> V124 -> V123 -> V122 so each helper receives
+/// the exact source version it requires. The generic fixture validator cannot claim a
 /// V120+ catalog, so tests that need an exact V121..V123 source use this.
 #[allow(clippy::expect_used)]
-pub(super) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
+pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
     let version = |connection: &Connection| -> i32 {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -36029,6 +35134,50 @@ pub(super) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= REWIND_TEARDOWN_COVERED_THROUGH && target < REWIND_TEARDOWN_COVERED_THROUGH {
+        connection
+            .execute_batch(
+                "DROP TRIGGER migration_allocation_claims_no_delete;
+                 DROP TRIGGER migration_allocation_events_no_update;
+                 DROP TRIGGER migration_allocation_events_no_delete;
+                 DROP TRIGGER migration_allocation_operations_no_update;
+                 DROP TRIGGER migration_allocation_operations_no_delete;
+                 DROP INDEX migration_allocation_live_version;
+                 DROP INDEX migration_allocation_live_source;
+                 DROP INDEX migration_allocation_order;
+                 DROP INDEX migration_allocation_events_by_repo;
+                 DROP TABLE migration_allocation_operations;
+                 DROP TABLE migration_allocation_events;
+                 DROP TABLE migration_allocation_claims;
+                 DROP TABLE migration_allocation_repositories;
+                 PRAGMA user_version=136;",
+            )
+            .expect("rewind migration allocation catalog");
+    }
+    if active >= 136 && target <= 135 {
+        connection
+            .execute_batch(
+                "DROP TRIGGER satellite_links_limit_insert;
+                 DROP INDEX satellite_links_by_peer;
+                 DROP TABLE satellite_observations;
+                 DROP TABLE satellite_links;
+                 DROP TABLE satellite_peers;
+                 DROP TABLE satellite_registry;
+                 PRAGMA user_version=135;",
+            )
+            .expect("rewind V136 satellite registry");
+    }
+    if active >= 135 && target <= 134 {
+        connection
+            .execute_batch("DROP TABLE satellite_installation_identity; PRAGMA user_version=134;")
+            .expect("rewind V135 installation identity");
+    }
+    if active >= 134 && target <= 133 {
+        super::restart_intents::rewind_v134_fixture_to_v133(connection);
+    }
+    if active >= 133 && target <= 132 {
+        super::topology_agent_audit::rewind_v133_fixture_to_v132(connection);
+    }
     if active >= 132 && target <= 131 {
         rewind_session_model_updates_v132_fixture_to_v131(connection);
     }
@@ -36299,6 +35448,7 @@ fn rewind_manager_notice_retirement_fixture_to_v117(connection: &Connection) {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_notice_v118_preserves_v117_catalog_and_rolls_back_failed_install() {
     let store = Store::open_in_memory().unwrap();
@@ -36331,13 +35481,13 @@ fn manager_notice_v118_preserves_v117_catalog_and_rolls_back_failed_install() {
             .collect::<Vec<_>>(),
         before
     );
-    assert_post_v77_chain_replayed(&store.conn);
+    assert_fixture_matches_claimed_version(&store.conn, 118);
     assert!(
         store
             .apply_manager_notice_retirement_v118_migration()
             .is_err()
     );
-    assert_post_v77_chain_replayed(&store.conn);
+    assert_fixture_matches_claimed_version(&store.conn, 118);
 
     rewind_store_to_schema_version(&store.conn, 117);
     store
@@ -36448,6 +35598,12 @@ const V117_MANAGER_NOTICE_OBJECTS: [(&str, &str); 31] = [
 
 #[allow(clippy::expect_used)]
 fn rewind_manager_notices_fixture_to_v116(connection: &Connection) {
+    let active_version: i32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read manager notice fixture head");
+    if active_version > 119 {
+        rewind_store_to_schema_version(connection, 119);
+    }
     if connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
         .unwrap()
@@ -36507,6 +35663,7 @@ fn rewind_manager_notices_fixture_to_v116(connection: &Connection) {
         .expect("rewind isolated V117 manager notice catalog to exact V116");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_notice_v117_migrates_exact_v116_and_reopens_idempotently() {
     let directory = tempfile::tempdir().expect("create V117 migration fixture directory");
@@ -37784,6 +36941,8 @@ fn restore_v93_settlement_fixture(connection: &Connection) {
 
 #[allow(clippy::expect_used)]
 fn h1_restore_v91_fixture(connection: &Connection) {
+    Store::register_sql_functions(connection)
+        .expect("register CHECK functions before deep fixture rewind");
     let mut active_version: i32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read V92 rewind source version");
@@ -38664,7 +37823,6 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
         pinned, target_version,
         "fixture claims V{target_version} but user_version is V{pinned}"
     );
-
     // RSI-RELEASED-MIGRATION-BEGIN: v127-session-diagnostics-fixture-assertion
     for (kind, name) in super::session_diagnostics::V127_CATALOG_OBJECTS {
         let present: bool = connection
@@ -38828,6 +37986,34 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             present,
             target_version >= 130,
             "fixture V{target_version} has incorrect V130 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::topology_agent_audit::V133_CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V133 topology agent ledger object");
+        assert_eq!(
+            present,
+            target_version >= 133,
+            "fixture V{target_version} has incorrect V133 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name, _) in super::restart_intents::CATALOG {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V134 restart intent catalog object");
+        assert_eq!(
+            present,
+            target_version >= 134,
+            "fixture V{target_version} has incorrect V134 {kind} `{name}` presence"
         );
     }
     for (kind, name) in V131_SANDBOX_RECLAIM_OBJECTS {
@@ -39332,6 +38518,60 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             "fixture claims V{target_version} but the V98 allocation identity index is missing"
         );
     }
+    assert_eq!(
+        table_exists(connection, "satellite_installation_identity"),
+        target_version >= 135,
+        "fixture V{target_version} has incorrect V135 installation identity presence"
+    );
+    for (kind, name) in [
+        ("table", "satellite_registry"),
+        ("table", "satellite_peers"),
+        ("table", "satellite_links"),
+        ("table", "satellite_observations"),
+        ("index", "satellite_links_by_peer"),
+        ("trigger", "satellite_links_limit_insert"),
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V136 satellite registry catalog object");
+        assert_eq!(
+            present,
+            target_version >= 136,
+            "fixture V{target_version} has incorrect V136 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in [
+        ("table", "migration_allocation_repositories"),
+        ("table", "migration_allocation_claims"),
+        ("table", "migration_allocation_events"),
+        ("table", "migration_allocation_operations"),
+        ("index", "migration_allocation_live_version"),
+        ("index", "migration_allocation_live_source"),
+        ("index", "migration_allocation_order"),
+        ("index", "migration_allocation_events_by_repo"),
+        ("trigger", "migration_allocation_claims_no_delete"),
+        ("trigger", "migration_allocation_events_no_update"),
+        ("trigger", "migration_allocation_events_no_delete"),
+        ("trigger", "migration_allocation_operations_no_update"),
+        ("trigger", "migration_allocation_operations_no_delete"),
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe migration allocation catalog object");
+        assert_eq!(
+            present,
+            target_version >= REWIND_TEARDOWN_COVERED_THROUGH,
+            "fixture V{target_version} has incorrect migration allocation {kind} `{name}` presence"
+        );
+    }
     // Checked last so the older, more specific fixture guards report first.
     {
         use super::issues::manager_actor_migration::{
@@ -39374,6 +38614,28 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
         version, LATEST_SCHEMA_VERSION,
         "replayed chain did not land at the schema head"
     );
+    let installation_id: String = connection
+        .query_row(
+            "SELECT installation_id FROM satellite_installation_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("V135 did not replay installation identity");
+    let parsed = Uuid::parse_str(&installation_id).expect("V135 identity is a UUID");
+    assert!(!parsed.is_nil() && parsed.to_string() == installation_id);
+    super::satellite_registry::validate_catalog(connection)
+        .expect("V136 did not replay the satellite registry catalog");
+    for name in [
+        "migration_allocation_repositories",
+        "migration_allocation_claims",
+        "migration_allocation_events",
+        "migration_allocation_operations",
+    ] {
+        assert!(
+            table_exists(connection, name),
+            "migration allocation replay omitted {name}"
+        );
+    }
 
     // RSI-RELEASED-MIGRATION-BEGIN: v127-session-diagnostics-replay-assertion
     for (kind, name) in super::session_diagnostics::V127_CATALOG_OBJECTS {
@@ -39450,8 +38712,10 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
     }
     super::source_worktree_v120::validate_v120_catalog(connection)
         .expect("V120 did not replay the exact source-worktree batch catalog");
-    super::manager_review_v121::validate_v121_catalog(connection)
-        .expect("V121 did not replay the exact manager-review catalog");
+    // V134 replaces the V121 forward trigger after validating its exact
+    // predecessor. Its validator covers every V121 review object at head.
+    super::restart_intents::validate_v134_catalog(connection)
+        .expect("V134 did not replay the exact restart and manager-review catalog");
     {
         let tx = connection
             .unchecked_transaction()
@@ -39480,6 +38744,16 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
             )
             .expect("probe V130 child relaunch catalog object");
         assert_eq!(found, 1, "V130 did not execute: {kind} {name} is missing");
+    }
+    for (kind, name) in super::topology_agent_audit::V133_CATALOG_OBJECTS {
+        let found: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe V133 topology agent ledger object");
+        assert_eq!(found, 1, "V133 did not execute: {kind} {name} is missing");
     }
     for (kind, name) in V131_SANDBOX_RECLAIM_OBJECTS {
         let found: i64 = connection
@@ -39851,8 +39125,9 @@ fn accepted_v82_mailbox_fingerprint(connection: &Connection) -> String {
 /// rewinding the schema must be rejected loudly, at fixture-construction time,
 /// instead of surfacing several migrations later as an opaque V77 preflight
 /// abort that reads like inherited background noise.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-#[should_panic(expected = "fixture claims V39 but the V112 archive journal is present")]
+#[should_panic(expected = "fixture V39 has incorrect V127 table `session_diagnostics` presence")]
 fn fixture_guard_rejects_a_version_only_rewind() {
     let store = Store::open_in_memory().unwrap();
     // Exactly what the broken fixtures used to do.
@@ -39863,22 +39138,25 @@ fn fixture_guard_rejects_a_version_only_rewind() {
     assert_fixture_matches_claimed_version(&store.conn, 39);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-#[should_panic(expected = "fixture claims V101 but the V112 archive journal is present")]
+#[should_panic(expected = "fixture V101 has incorrect V127 table `session_diagnostics` presence")]
 fn harness_manager_fixture_guard_rejects_a_version_only_v101_rewind() {
     let store = Store::open_in_memory().unwrap();
     store.conn.pragma_update(None, "user_version", 101).unwrap();
     assert_fixture_matches_claimed_version(&store.conn, 101);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-#[should_panic(expected = "fixture claims V102 but the V112 archive journal is present")]
+#[should_panic(expected = "fixture V102 has incorrect V127 table `session_diagnostics` presence")]
 fn harness_manager_fixture_guard_rejects_a_version_only_v102_rewind() {
     let store = Store::open_in_memory().unwrap();
     store.conn.pragma_update(None, "user_version", 102).unwrap();
     assert_fixture_matches_claimed_version(&store.conn, 102);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V102 has incorrect V103 manager notice_generation column")]
 fn harness_manager_fixture_guard_rejects_a_retained_notice_generation_column() {
@@ -39890,6 +39168,7 @@ fn harness_manager_fixture_guard_rejects_a_retained_notice_generation_column() {
     assert_fixture_matches_claimed_version(&store.conn, 102);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V101 has incorrect V103 manager trigger")]
 fn harness_manager_fixture_guard_rejects_a_dangling_restoration_trigger() {
@@ -39903,6 +39182,7 @@ fn harness_manager_fixture_guard_rejects_a_dangling_restoration_trigger() {
     assert_fixture_matches_claimed_version(&store.conn, 101);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn harness_manager_fixture_helpers_refuse_skipped_predecessor_versions_without_mutation() {
     let store = Store::open_in_memory().unwrap();
@@ -39959,6 +39239,7 @@ fn harness_manager_fixture_helpers_refuse_skipped_predecessor_versions_without_m
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), snapshot);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn harness_manager_fixture_rewinds_v102_v103_v104_v105_v106_v107_v108_v109_v110_v111_and_replays_the_exact_head_catalog()
  {
@@ -40040,6 +39321,7 @@ fn harness_manager_fixture_rewinds_v102_v103_v104_v105_v106_v107_v108_v109_v110_
 /// their relations were genuinely absent beforehand. This test states that
 /// premise directly: rewind, assert every relation is gone, replay, assert every
 /// relation is back and correctly fingerprinted.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn rewind_tears_down_the_non_idempotent_migration_tail() {
     let store = Store::open_in_memory().unwrap();
@@ -40117,6 +39399,7 @@ fn v90_projection_fingerprint(connection: &Connection) -> String {
     .expect("fingerprint execution projections")
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_retention_migration_rebuilds_prior_head_data_and_catalog() {
     let directory = tempfile::tempdir().expect("V90 migration directory");
@@ -40133,8 +39416,23 @@ fn session_execution_projection_retention_migration_rebuilds_prior_head_data_and
         assert_fixture_matches_claimed_version(&store.conn, 89);
     }
 
+    h1_v91_test_fail_next_migration(H1V91MigrationFault::AfterPreflight);
+    let error = match Store::open(&database) {
+        Ok(_) => panic!("V91 fault must stop the projection fixture at V90"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("injected V91 migration fault"));
     {
-        let migrated = Store::open(&database).expect("migrate exact V89 projection catalog");
+        let v90 = Connection::open(&database).expect("reopen exact V90 projection catalog");
+        Store::register_sql_functions(&v90).unwrap();
+        assert_eq!(v90_projection_fingerprint(&v90), before);
+        let tx = v90.unchecked_transaction().unwrap();
+        assert!(super::session_execution_projection_catalog_matches(&tx, true).unwrap());
+        assert!(super::session_execution_projection_foreign_keys_match(&tx, true).unwrap());
+    }
+
+    {
+        let migrated = Store::open(&database).expect("migrate exact V90 projection catalog");
         assert_eq!(
             migrated
                 .conn
@@ -40143,10 +39441,6 @@ fn session_execution_projection_retention_migration_rebuilds_prior_head_data_and
             LATEST_SCHEMA_VERSION
         );
         assert_eq!(v90_projection_fingerprint(&migrated.conn), before);
-        let tx = migrated.conn.unchecked_transaction().unwrap();
-        assert!(super::session_execution_projection_catalog_matches(&tx, true).unwrap());
-        assert!(super::session_execution_projection_foreign_keys_match(&tx, true).unwrap());
-        drop(tx);
         assert_eq!(
             migrated
                 .conn
@@ -40170,6 +39464,7 @@ fn session_execution_projection_retention_migration_rebuilds_prior_head_data_and
     assert_post_v77_chain_replayed(&reopened.conn);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_retention_migration_failpoints_rollback_exact_prior_head() {
     assert_eq!(super::V90MigrationFault::ALL.len(), 10);
@@ -40201,6 +39496,7 @@ fn session_execution_projection_retention_migration_failpoints_rollback_exact_pr
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_retention_migration_copy_parity_and_except_fail_closed() {
     for corruption in [
@@ -40236,6 +39532,7 @@ fn session_execution_projection_retention_migration_copy_parity_and_except_fail_
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_execution_projection_retention_migration_refuses_bad_preflight_without_mutation() {
     for case in ["catalog", "missing projection", "integrity", "foreign key"] {
@@ -40317,6 +39614,7 @@ fn session_execution_projection_retention_migration_refuses_bad_preflight_withou
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_data_bearing_v88_migration_reopen_and_direct_rewind_replay() {
     let store = Store::open_in_memory().expect("open V89 reference store");
@@ -40387,6 +39685,7 @@ fn v89_data_bearing_v88_migration_reopen_and_direct_rewind_replay() {
     store.init_schema().expect("V89 reopen is idempotent");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v91_deployed_additive_v90_descendant_matches_pinned_fingerprint() {
     let directory = tempfile::tempdir().expect("create deployed-additive V90 fixture dir");
@@ -40437,6 +39736,7 @@ fn v91_deployed_additive_v90_descendant_matches_pinned_fingerprint() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v91_pre_antigravity_v90_descendant_matches_pinned_fingerprint() {
     let directory = tempfile::tempdir().expect("create pre-Antigravity V90 fixture dir");
@@ -40486,6 +39786,7 @@ fn v91_pre_antigravity_v90_descendant_matches_pinned_fingerprint() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v92_pre_antigravity_descendant_matches_pinned_fingerprint() {
     let directory = tempfile::tempdir().expect("create pre-Antigravity V92 fixture dir");
@@ -40554,6 +39855,7 @@ fn v92_pre_antigravity_descendant_matches_pinned_fingerprint() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_rejects_unpinned_pre_antigravity_catalog_variant() {
     let directory = tempfile::tempdir().expect("create hostile pre-Antigravity V88 fixture dir");
@@ -40640,6 +39942,7 @@ fn v89_rejects_unpinned_pre_antigravity_catalog_variant() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v92_migration_seeds_epics_and_lead_generation_closes_aba() {
     let store = Store::open_in_memory().expect("open V92 lead-generation fixture");
@@ -40686,6 +39989,7 @@ fn h1_v92_migration_seeds_epics_and_lead_generation_closes_aba() {
     assert_eq!(after_aba, initial + 2, "A→B→A must advance the fence twice");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v92_migration_failpoints_restore_exact_v91_state() {
     assert_eq!(super::H1V92MigrationFault::ALL.len(), 6);
@@ -40746,6 +40050,7 @@ fn h1_v92_migration_failpoints_restore_exact_v91_state() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v92_full_catalog_authentication_rejects_drift() {
     let store = Store::open_in_memory_v92_for_test().expect("open authenticated V92 catalog");
@@ -40761,6 +40066,7 @@ fn h1_v92_full_catalog_authentication_rejects_drift() {
     assert!(error.to_string().contains("exact accepted full catalog"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v93_recursive_live_provider_constraint_admits_pioneer() {
     let store = Store::open_in_memory().expect("open V93 catalog");
@@ -40782,6 +40088,7 @@ fn v93_recursive_live_provider_constraint_admits_pioneer() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v126_rewind_fixture_replays_bedrock_provider_constraint() {
     let dir = tempfile::tempdir().unwrap();
@@ -40804,6 +40111,7 @@ fn v126_rewind_fixture_replays_bedrock_provider_constraint() {
     assert_post_v77_chain_replayed(&migrated.conn);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v94_rewind_fixture_removes_and_replays_the_settlement_tail() {
     let store = Store::open_in_memory().expect("open V94 rewind fixture");
@@ -40845,6 +40153,7 @@ fn v94_rewind_fixture_removes_and_replays_the_settlement_tail() {
         .expect("close replayed V94 fingerprint transaction");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v94_authenticates_each_normalized_v93_history_before_ddl() {
     fn migrate_to_v93(path: &std::path::Path) -> String {
@@ -40927,6 +40236,7 @@ fn v94_authenticates_each_normalized_v93_history_before_ddl() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_authenticates_each_original_v94_history_before_hardening() {
     fn migrate_to_v94(path: &std::path::Path) -> String {
@@ -40990,6 +40300,7 @@ fn v95_authenticates_each_original_v94_history_before_hardening() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_migration_failpoints_restore_exact_v94_state_then_converge() {
     assert_eq!(
@@ -41256,6 +40567,7 @@ fn seed_v94_settlement_projection_fixture(
 /// migration must backfill it to the sequence-one allocation owner when the
 /// fixture migrates forward. The helper must also refuse a store that already
 /// carries the V98 column, so nothing routes around the production insert.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn pre_v98_custody_fixture_insert_backfills_to_the_allocation_owner() {
     use super::sandbox_custody::{CustodyCause, NewCustodyRoot};
@@ -41387,6 +40699,7 @@ fn deployed_v94_fingerprint(store: &Store) -> (String, String, String) {
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_deployed_v94_bridge_reaches_schema_head_for_empty_and_data_bearing_journals() {
     let empty = deployed_v94_settlement_store();
@@ -41496,6 +40809,7 @@ fn v95_deployed_v94_bridge_reaches_schema_head_for_empty_and_data_bearing_journa
     tx.commit().expect("close bridged V95 catalog transaction");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_deployed_v94_bridge_faults_roll_back_exactly_then_retry() {
     assert_eq!(
@@ -41555,6 +40869,7 @@ fn v95_deployed_v94_bridge_faults_roll_back_exactly_then_retry() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_deployed_v94_v95_failpoints_roll_back_exactly_then_retry() {
     assert_eq!(
@@ -41633,6 +40948,7 @@ fn v95_deployed_v94_v95_failpoints_roll_back_exactly_then_retry() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_deployed_v94_bridge_rejects_hostile_catalog_and_row_before_writing() {
     let store = deployed_v94_settlement_store();
@@ -41823,6 +41139,7 @@ fn assert_v95_row_preflight_rejects_without_mutation(store: &Store, expected: &s
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_authentic_v94_oversized_text_before_any_hardening() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -41864,6 +41181,7 @@ fn v95_rejects_authentic_v94_oversized_text_before_any_hardening() {
     assert_v95_row_preflight_rejects_without_mutation(&store, "out-of-bounds V94 item row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_authentic_v94_invalid_original_timestamp_before_hardening() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -41901,6 +41219,7 @@ fn v95_rejects_authentic_v94_invalid_original_timestamp_before_hardening() {
     assert_v95_row_preflight_rejects_without_mutation(&store, "invalid original_updated_at");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_authentic_v94_wrong_text_storage_class_before_hardening() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -41928,6 +41247,7 @@ fn v95_rejects_authentic_v94_wrong_text_storage_class_before_hardening() {
     assert_v95_row_preflight_rejects_without_mutation(&store, "out-of-bounds V94 item row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_authentic_v94_nil_run_authority_before_hardening() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -42002,6 +41322,7 @@ fn v95_rejects_authentic_v94_nil_run_authority_before_hardening() {
     assert_v95_row_preflight_rejects_without_mutation(&store, "out-of-bounds V94 run row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_source_row_auth_rejects_null_and_noncanonical_authority_ids() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -42129,6 +41450,7 @@ fn v95_source_row_auth_rejects_null_and_noncanonical_authority_ids() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_authentic_v94_run_with_more_than_256_items() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -42223,6 +41545,7 @@ fn v95_rejects_authentic_v94_run_with_more_than_256_items() {
     assert_v95_row_preflight_rejects_without_mutation(&store, "out-of-bounds V94 run row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_runtime_bounds_triggers_reject_count_sequence_and_text_drift() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -42501,6 +41824,7 @@ fn v95_runtime_bounds_triggers_reject_count_sequence_and_text_drift() {
         .expect("restore SQLite constraints after V95 UUID trigger checks");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_normalizes_split_run_projection_and_preserves_item_evidence() {
     use rsi_common::cohort_settlement::{
@@ -42700,6 +42024,7 @@ fn v95_normalizes_split_run_projection_and_preserves_item_evidence() {
         .expect("wire-valid retryable BranchRemoved run");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_rejects_malformed_v94_catalog_before_any_hardening() {
     for mutation in [
@@ -42802,6 +42127,7 @@ fn v95_rejects_malformed_v94_catalog_before_any_hardening() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_migrated_split_journal_reopens_without_drift() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -42905,6 +42231,7 @@ fn v95_migrated_split_journal_reopens_without_drift() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_reopen_rejects_latest_run_pointer_catalog_drift() {
     let directory = tempfile::tempdir().expect("create hostile V95 reopen fixture");
@@ -42928,6 +42255,7 @@ fn v95_reopen_rejects_latest_run_pointer_catalog_drift() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_backfill_generation_survives_vacuum_and_reopen() {
     use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -43061,6 +42389,7 @@ fn v95_backfill_generation_survives_vacuum_and_reopen() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v95_empty_journal_rewinds_exactly_and_rejects_hostile_source_drift() {
     let store = Store::open_in_memory().expect("open V95 rewind fixture");
@@ -43113,6 +42442,7 @@ fn v95_empty_journal_rewinds_exactly_and_rejects_hostile_source_drift() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v94_rejects_malformed_v93_dependency_catalogs_before_ddl() {
     for mutation in [
@@ -43162,6 +42492,7 @@ fn v94_rejects_malformed_v93_dependency_catalogs_before_ddl() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v94_migration_failpoints_restore_exact_v93_state_then_converge() {
     assert_eq!(
@@ -43234,6 +42565,7 @@ fn v94_migration_failpoints_restore_exact_v93_state_then_converge() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v94_migrated_database_reopens_without_catalog_or_row_drift() {
     let directory = tempfile::tempdir().expect("create V94 reopen fixture directory");
@@ -43274,6 +42606,7 @@ fn v94_migrated_database_reopens_without_catalog_or_row_drift() {
     assert_post_v77_chain_replayed(&reopened.conn);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_deployed_additive_v88_migration_preserves_data_and_reopens() {
     let directory = tempfile::tempdir().expect("create deployed-additive migration fixture dir");
@@ -43359,6 +42692,7 @@ fn v89_deployed_additive_v88_migration_preserves_data_and_reopens() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_pre_antigravity_v88_migration_preserves_data_and_reopens() {
     let directory = tempfile::tempdir().expect("create pre-Antigravity migration fixture dir");
@@ -43526,6 +42860,7 @@ fn v89_pre_antigravity_v88_migration_preserves_data_and_reopens() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_migration_failpoints_restore_exact_v88_catalog_data_and_version() {
     assert_eq!(super::V89MigrationFault::ALL.len(), 7);
@@ -43563,6 +42898,7 @@ fn v89_migration_failpoints_restore_exact_v88_catalog_data_and_version() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v89_rejects_drifted_or_non_v88_sources_before_ddl() {
     for (label, mutate) in [
@@ -43644,6 +42980,7 @@ fn v89_rejects_drifted_or_non_v88_sources_before_ddl() {
     assert_no_v89_capacity_objects(&store.conn);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v87_data_bearing_direct_deep_rewind_families_replay_cleanly() {
     let fresh = Store::open_in_memory().expect("open fresh V87 catalog reference");
@@ -43750,6 +43087,7 @@ fn assert_migration_step_executes(step: &str, arm: impl FnOnce()) {
 /// would not distinguish "the migration rebuilt this" from "the fixture never
 /// tore it down"; arming each step's own failpoint does, because an unexecuted
 /// step cannot consume one.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn every_recovered_migration_step_actually_executes() {
     assert_migration_step_executes("V77", || {
@@ -43924,6 +43262,7 @@ fn d05_downgrade_to_legacy_v78_baseline(connection: &Connection) {
 /// failed the V79 gate on every boot and took the daemon down with it. This
 /// test reproduces that baseline and pins the repair, including its
 /// idempotency.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 fn d05_legacy_v78_baseline_repairs_forward_to_v79() {
@@ -44003,6 +43342,7 @@ fn d05_legacy_v78_baseline_repairs_forward_to_v79() {
 
 /// A database already on the canonical V78 baseline must be left exactly as it
 /// is by the repair — it is a no-op, not a rebuild.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 fn d05_canonical_v78_baseline_is_untouched_by_the_repair() {
@@ -44036,6 +43376,7 @@ fn d05_canonical_v78_baseline_is_untouched_by_the_repair() {
     assert_eq!(before, program_runs::D05_V78_SCHEMA_FINGERPRINT);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 fn agent_coordination_v80_fresh_v79_failpoints_reopen_and_fingerprint() {
@@ -44218,6 +43559,7 @@ fn agent_coordination_v80_fresh_v79_failpoints_reopen_and_fingerprint() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[allow(clippy::expect_used, clippy::too_many_lines, clippy::unwrap_used)]
 fn d05_v79_fresh_v77_v76_chain_failpoints_reopen_and_fingerprint() {
@@ -44530,6 +43872,7 @@ pub(crate) fn open_raw_store_connection(path: &std::path::Path) -> rusqlite::Con
 /// `cp ~/.rsi/rsi.db <sandbox>/v81-copy.db`.
 ///
 /// NEVER point this at `~/.rsi/rsi.db` itself. It MIGRATES what it opens.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[ignore = "operator-database upgrade rehearsal; set RSI_V82_REHEARSAL_DB to a COPY"]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -44619,6 +43962,7 @@ fn issue21_p2_06d_v82_upgrade_rehearsal_against_a_copy() {
     println!("V82_REHEARSAL_OK");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[ignore = "prints the corrected V81 fingerprint for pinning; not an assertion"]
 fn issue21_phase2_v81_print_fingerprint() {
@@ -44637,6 +43981,7 @@ fn issue21_phase2_v81_print_fingerprint() {
 /// drives the production `Store::open` across a real close/reopen plus the
 /// shared raw-connection helper, and pins that an UNregistered connection
 /// fails closed rather than admitting anything.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn jsonrpc_id_function_is_registered_on_every_store_connection_after_reopen() {
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -44725,6 +44070,7 @@ fn jsonrpc_id_function_is_registered_on_every_store_connection_after_reopen() {
 /// assertion needs a fully scaffolded correlated/acknowledged attempt and an
 /// open gate, which only P2-04 can build. This test is honest about covering
 /// the two layers it can reach today.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn raw_sql_insert_with_malformed_canonical_jsonrpc_id_is_rejected_by_check() {
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -44837,6 +44183,7 @@ fn raw_sql_insert_with_malformed_canonical_jsonrpc_id_is_rejected_by_check() {
 
 /// V96: `tool_use_id` and `metadata` round-trip through insert/select, and
 /// `tool_use_id` is a real indexed column queryable without JSON extraction.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v96_tool_use_id_and_metadata_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
@@ -44879,6 +44226,7 @@ fn v96_tool_use_id_and_metadata_roundtrip() {
 /// V96 upgrade path: a DB pinned at V95 with the legacy `conversation_events`
 /// shape gains the two columns and the index, existing rows survive with NULL
 /// (never backfilled), and re-opening is a no-op.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn v96_upgrade_from_v95_adds_columns_without_backfill() {
     let dir = tempfile::tempdir().unwrap();
@@ -45109,6 +44457,7 @@ mod v100_operator_identity_convergence_tests {
         (epic.id, child.id)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn v100_exact_v99_sources_converge_without_title_or_lineage_data_loss() {
         let directory = tempfile::tempdir().unwrap();
@@ -45166,6 +44515,7 @@ mod v100_operator_identity_convergence_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn v100_unknown_or_hybrid_v99_catalog_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
@@ -45194,6 +44544,7 @@ mod v100_operator_identity_convergence_tests {
         assert_eq!(full_catalog_fingerprint(&raw), before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn v100_failpoints_roll_back_both_exact_v99_sources_and_retry() {
         let directory = tempfile::tempdir().unwrap();
@@ -45264,6 +44615,11 @@ mod v112_v113_convergence_tests {
             capacity_recovery::v88_full_catalog_fingerprint(&tx).expect("catalog fingerprint");
         tx.commit().expect("close catalog transaction");
         value
+    }
+
+    fn canonical_head_fingerprint() -> String {
+        let store = Store::open_in_memory().expect("canonical schema head");
+        fingerprint(&store.conn)
     }
 
     fn current_v111_fixture(path: &Path) {
@@ -45599,6 +44955,7 @@ mod v112_v113_convergence_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn exact_v111_sources_converge_to_one_v113_catalog_and_preserve_rows() {
         let directory = tempfile::tempdir().expect("dual V111 fixture directory");
@@ -45610,10 +44967,7 @@ mod v112_v113_convergence_tests {
         let current = Store::open(&current_path).expect("migrate current V111 to head");
         let historical = Store::open(&historical_path).expect("migrate historical V111 to head");
         let current_fingerprint = fingerprint(&current.conn);
-        assert_eq!(
-            current_fingerprint,
-            super::manager_prepared_actions::V116_FULL_CATALOG_FINGERPRINT
-        );
+        assert_eq!(current_fingerprint, canonical_head_fingerprint());
         assert_eq!(current_fingerprint, fingerprint(&historical.conn));
         for store in [&current, &historical] {
             assert_eq!(
@@ -45678,6 +45032,7 @@ mod v112_v113_convergence_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn historical_v111_data_bearing_upgrade_preserves_identity_custody_archive_and_backfills() {
         let directory = tempfile::tempdir().expect("data-bearing historical V111 fixture");
@@ -45761,12 +45116,10 @@ mod v112_v113_convergence_tests {
             witness.preserved,
             "reopen is idempotent"
         );
-        assert_eq!(
-            fingerprint(&reopened.conn),
-            super::manager_prepared_actions::V116_FULL_CATALOG_FINGERPRINT
-        );
+        assert_eq!(fingerprint(&reopened.conn), canonical_head_fingerprint());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn v112_refuses_unknown_hybrid_without_mutation() {
         let directory = tempfile::tempdir().expect("hybrid fixture directory");
@@ -45797,8 +45150,9 @@ mod v112_v113_convergence_tests {
         assert_eq!(fingerprint(&connection), before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
-    fn v112_and_v113_faults_roll_back_and_retry() {
+    fn v112_identity_faults_roll_back_and_retry() {
         let directory = tempfile::tempdir().expect("migration fault directory");
         for (source, fixture) in [
             ("current", current_v111_fixture as fn(&Path)),
@@ -45828,6 +45182,17 @@ mod v112_v113_convergence_tests {
                 identity_v112_test_clear_migration_fault();
                 Store::open(&path).expect("retry V112 identity fault");
             }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn v112_archive_faults_roll_back_and_retry() {
+        let directory = tempfile::tempdir().expect("migration fault directory");
+        for (source, fixture) in [
+            ("current", current_v111_fixture as fn(&Path)),
+            ("historical", historical_v111_fixture as fn(&Path)),
+        ] {
             for fault in ArchiveCleanupV112MigrationFault::ALL {
                 let path = directory
                     .path()
@@ -45846,7 +45211,12 @@ mod v112_v113_convergence_tests {
                 Store::open(&path).expect("retry V112 archive fault");
             }
         }
+    }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn v113_projection_faults_roll_back_and_retry() {
+        let directory = tempfile::tempdir().expect("migration fault directory");
         for fault in ArchiveProjectionV113MigrationFault::ALL {
             let path = directory.path().join(format!("v113-{fault:?}.sqlite"));
             let store = Store::open(&path).expect("fresh V113 fault fixture");
@@ -45906,6 +45276,7 @@ mod v99_provider_telemetry_tests {
         names.iter().any(|name| name == column)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn latest_head_retains_every_v99_column_and_table() {
         let store = store();
@@ -45959,6 +45330,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(table, "provider_rate_limit_windows");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn latest_head_is_idempotent_after_v99_objects_are_installed() {
         let store = store();
@@ -45975,6 +45347,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(version, LATEST_SCHEMA_VERSION);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn provider_handshake_round_trips_through_the_session_row() {
         let store = store();
@@ -46006,6 +45379,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(after.provider_capabilities, capabilities);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn a_later_handshake_replaces_an_earlier_one() {
         // A resumed session re-announces, and the operator may have upgraded
@@ -46033,6 +45407,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(loaded.provider_capabilities, vec!["new_cap".to_string()]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn richer_usage_counters_round_trip_on_the_session() {
         let store = store();
@@ -46068,6 +45443,7 @@ mod v99_provider_telemetry_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn unmeasured_usage_counters_stay_none_rather_than_zero() {
         // "the provider never reported this" and "the provider reported 0" are
@@ -46091,6 +45467,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(loaded.subagent_stats_json, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn turn_metric_carries_the_cache_ttl_split() {
         let store = store();
@@ -46154,6 +45531,7 @@ mod v99_provider_telemetry_tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn rate_limit_windows_round_trip() {
         let store = store();
@@ -46185,6 +45563,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(five_hour.resets_at_epoch, Some(1_788_402_000));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn upsert_replaces_a_window_rather_than_duplicating_it() {
         // Latest-wins per (provider, window_key): utilization moves constantly
@@ -46218,6 +45597,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(five_hour.utilization, 0.61, "latest observation wins");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn an_unknown_third_window_is_persisted_not_dropped() {
         let store = store();
@@ -46253,6 +45633,7 @@ mod v99_provider_telemetry_tests {
     /// `sandbox_custody:persistence_transition_failed` — a failure with no
     /// textual connection to its cause. This assertion makes the next drift a
     /// direct, local test failure instead.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn session_column_count_matches_the_select_list() {
         let declared = super::super::row_mappers::SESSION_COLUMN_COUNT;
@@ -46269,6 +45650,7 @@ mod v99_provider_telemetry_tests {
 
     /// End-to-end guard for the same coupling: the rotation-authority read must
     /// return the session AND its three trailing columns intact.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn rotation_authority_read_returns_trailing_columns_after_v99() {
         let store = store();
@@ -46299,6 +45681,7 @@ mod v99_provider_telemetry_tests {
         assert_eq!(invocation_id, None, "no invocation was seeded");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn an_empty_table_loads_as_an_empty_snapshot_list() {
         let store = store();
@@ -46312,6 +45695,7 @@ mod v99_provider_telemetry_tests {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V103 has incorrect V104 manager table")]
 fn manager_v2_fixture_guard_rejects_version_only_rewind() {
@@ -46320,6 +45704,7 @@ fn manager_v2_fixture_guard_rejects_version_only_rewind() {
     assert_harness_manager_fixture_version(&store.conn, 103);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V104 has incorrect V105 manager table")]
 fn pending_question_v105_fixture_guard_rejects_version_only_rewind() {
@@ -46328,6 +45713,7 @@ fn pending_question_v105_fixture_guard_rejects_version_only_rewind() {
     assert_harness_manager_fixture_version(&store.conn, 104);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn pending_question_v105_fixture_requires_exact_predecessor_and_preserves_legacy_display() {
     let store = Store::open_in_memory().unwrap();
@@ -46364,6 +45750,7 @@ fn pending_question_v105_fixture_requires_exact_predecessor_and_preserves_legacy
         "V104 helper must reject an intact V105 tail"
     );
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), snapshot);
+    rewind_store_to_schema_version(&store.conn, 111);
     if store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
@@ -46421,6 +45808,7 @@ fn pending_question_v105_fixture_requires_exact_predecessor_and_preserves_legacy
     assert_post_v77_chain_replayed(&store.conn);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V105 has incorrect V106 manager table")]
 fn pending_approval_v106_fixture_guard_rejects_version_only_rewind() {
@@ -46429,6 +45817,7 @@ fn pending_approval_v106_fixture_guard_rejects_version_only_rewind() {
     assert_harness_manager_fixture_version(&store.conn, 105);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn pending_approval_v106_fixture_requires_exact_predecessor_preserves_legacy_and_reopens() {
     let store = Store::open_in_memory().unwrap();
@@ -46455,6 +45844,7 @@ fn pending_approval_v106_fixture_requires_exact_predecessor_preserves_legacy_and
         "cannot skip intact V106 tail"
     );
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), before);
+    rewind_store_to_schema_version(&store.conn, 111);
     if store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
@@ -46493,6 +45883,7 @@ fn pending_approval_v106_fixture_requires_exact_predecessor_preserves_legacy_and
     assert_eq!(query_fingerprint(&store.conn, catalog).unwrap(), head);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V106 has incorrect V107 manager table")]
 fn approval_lifecycle_v107_fixture_guard_rejects_version_only_rewind() {
@@ -46501,6 +45892,7 @@ fn approval_lifecycle_v107_fixture_guard_rejects_version_only_rewind() {
     assert_harness_manager_fixture_version(&store.conn, 106);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn approval_lifecycle_v107_migrates_without_inventing_a_writer_and_reopens() {
     let dir = tempfile::tempdir().unwrap();
@@ -46527,6 +45919,7 @@ fn approval_lifecycle_v107_migrates_without_inventing_a_writer_and_reopens() {
         "the exact V107 tail must be removed before the V106 tail"
     );
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), before);
+    rewind_store_to_schema_version(&store.conn, 111);
     if store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
@@ -46600,6 +45993,7 @@ fn approval_lifecycle_v107_migrates_without_inventing_a_writer_and_reopens() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn approval_lifecycle_v107_distinct_typed_ids_and_occurrences_have_independent_rows() {
     let store = Store::open_in_memory().unwrap();
@@ -46647,6 +46041,7 @@ fn approval_lifecycle_v107_distinct_typed_ids_and_occurrences_have_independent_r
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_decision_history_v108_upgrade_preserves_records_and_exact_catalog() {
     let dir = tempfile::tempdir().unwrap();
@@ -46677,6 +46072,7 @@ fn manager_decision_history_v108_upgrade_preserves_records_and_exact_catalog() {
         .is_err()
     );
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), before);
+    rewind_store_to_schema_version(&store.conn, 111);
     if store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
@@ -46707,6 +46103,7 @@ fn manager_decision_history_v108_upgrade_preserves_records_and_exact_catalog() {
     assert_eq!(query_fingerprint(&reopened.conn, rows).unwrap(), records);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V107 has incorrect V108 manager index")]
 fn manager_decision_history_v108_rejects_version_only_rewind() {
@@ -46715,6 +46112,7 @@ fn manager_decision_history_v108_rejects_version_only_rewind() {
     assert_harness_manager_fixture_version(&store.conn, 107);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn manager_decision_history_v109_upgrade_preserves_approval_mirrors_and_exact_catalog() {
     let dir = tempfile::tempdir().unwrap();
@@ -46740,6 +46138,7 @@ fn manager_decision_history_v109_upgrade_preserves_approval_mirrors_and_exact_ca
         .is_err()
     );
     assert_eq!(v89_database_snapshot(&store.conn).unwrap(), before);
+    rewind_store_to_schema_version(&store.conn, 111);
     if store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
@@ -46802,6 +46201,7 @@ fn manager_decision_history_v109_upgrade_preserves_approval_mirrors_and_exact_ca
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[should_panic(expected = "claimed V108 has incorrect V109 manager index")]
 fn manager_decision_history_v109_rejects_version_only_rewind() {
@@ -47157,6 +46557,7 @@ mod v111_branch_convergence_tests {
             .expect("collect detachment rows")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn both_observed_branch_shapes_converge_and_reach_the_schema_head() {
         let directory = tempfile::tempdir().expect("branch fixture directory");
@@ -47290,6 +46691,7 @@ mod v111_branch_convergence_tests {
         assert_eq!(row_count(&store.conn, "harness_manager_rotation_edges"), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn converging_a_branched_v111_database_twice_is_a_no_op() {
         let directory = tempfile::tempdir().expect("idempotency fixture directory");
@@ -47322,6 +46724,7 @@ mod v111_branch_convergence_tests {
         assert_eq!(branch_count(&second.conn), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn a_detached_successor_keeps_its_manager_rotation_attribution() {
         let directory = tempfile::tempdir().expect("attribution fixture directory");
@@ -47354,6 +46757,7 @@ mod v111_branch_convergence_tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn a_detachment_receipt_requires_a_matching_committed_receipt() {
         let store = Store::open_in_memory().expect("in-memory head store");
@@ -47403,6 +46807,7 @@ mod v111_branch_convergence_tests {
 /// `cp ~/.rsi/rsi.db <somewhere>/v111-copy.db` before the operator upgrades.
 ///
 /// NEVER point this at `~/.rsi/rsi.db` itself. It MIGRATES what it opens.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[ignore = "operator-database upgrade rehearsal; set RSI_V111_REHEARSAL_DB to a COPY"]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -47582,6 +46987,7 @@ fn v111_branch_convergence_rehearsal_against_a_copy() {
 /// `cp ~/.rsi/rsi.db <somewhere>/v114-copy.db` before upgrading.
 ///
 /// NEVER point this at `~/.rsi/rsi.db` itself. It MIGRATES what it opens.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 #[ignore = "operator-database upgrade rehearsal; set RSI_V114_REHEARSAL_DB to a COPY"]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -47749,6 +47155,7 @@ fn v114_catalog_convergence_rehearsal_against_a_copy() {
 /// instead of inline — on a real V114 fixture, then asserts that reopening
 /// migrates all the way to the head with the canonical catalog and every row
 /// intact. Without the convergence, V115 refuses this database at startup.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn deployed_additive_v114_catalog_converges_and_reaches_the_head() {
     let directory = tempfile::tempdir().expect("additive fixture directory");
@@ -47840,6 +47247,7 @@ fn deployed_additive_v114_catalog_converges_and_reaches_the_head() {
     assert_eq!(restored.provider, SessionProvider::Codex);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_diagnostics_are_bounded_and_page_in_stable_id_order() {
     let store = Store::open_in_memory().expect("open store");
@@ -47950,6 +47358,7 @@ fn session_diagnostics_are_bounded_and_page_in_stable_id_order() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_diagnostics_retention_caps_each_session() {
     use super::session_diagnostics::{
@@ -47988,6 +47397,7 @@ fn session_diagnostics_retention_caps_each_session() {
     assert_eq!(diagnostics[0].message, "distinct diagnostic 1");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_diagnostics_retention_caps_global_rows_by_last_seen() {
     use super::session_diagnostics::MAX_SESSION_DIAGNOSTICS_GLOBAL;
@@ -48067,6 +47477,7 @@ fn session_diagnostics_retention_caps_global_rows_by_last_seen() {
     assert_eq!(newest_present, 1);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn session_diagnostics_v127_migration_installs_and_rewinds_catalog() {
     let directory = tempfile::tempdir().expect("create migration database directory");

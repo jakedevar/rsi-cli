@@ -12,6 +12,7 @@ fn native(store: &Store, session: Uuid, id: Uuid) -> (Value, String) {
     (target, stamp)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn manager_decision_history_legacy_scan_work_stays_bounded_with_real_mirrors() {
     for history in [1030, 10300] {
@@ -96,6 +97,7 @@ fn manager_decision_history_legacy_scan_work_stays_bounded_with_real_mirrors() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn manager_decision_history_pages_native_history_and_sparse_legacy_gates_after_reopen() {
     let dir = tempfile::tempdir().unwrap();

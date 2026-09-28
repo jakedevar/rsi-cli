@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    BoundCodegraphScope, CodegraphReadService, IndexHandle, NATIVE_MAX_OUTPUT_BYTES,
-    NATIVE_MAX_OUTPUT_TOKENS,
+    BoundCodegraphScope, CodegraphReadService, CodegraphServiceError, IndexHandle,
+    NATIVE_MAX_OUTPUT_BYTES, NATIVE_MAX_OUTPUT_TOKENS,
 };
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
@@ -57,6 +57,31 @@ impl NativeCodegraphBinding {
             root,
             ready_at_launch,
         })
+    }
+
+    /// Prepared on a blocking lane before a terminal session's provider tools
+    /// are frozen. The session can still be terminal in Store at this point.
+    pub(crate) fn for_resumed_launch(
+        handle: &IndexHandle,
+        store: Arc<Mutex<Store>>,
+        project_id: Uuid,
+        session_id: Uuid,
+        root: &Path,
+    ) -> std::result::Result<Option<Self>, CodegraphServiceError> {
+        let Some((workspace_id, ready_at_launch)) = CodegraphReadService::with_store(handle, store)
+            .native_launch_scope(project_id, session_id, root)?
+        else {
+            return Ok(None);
+        };
+        let root = root
+            .canonicalize()
+            .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
+        Ok(Some(Self {
+            project_id,
+            workspace_id,
+            root,
+            ready_at_launch,
+        }))
     }
 
     pub fn permits(&self, kind: NativeCodegraphToolKind) -> bool {
@@ -258,25 +283,34 @@ pub async fn execute_native_read(
                 "Codegraph workspace scope changed".into(),
             ));
         }
-        let current = handle
-            .registered_workspace(binding.workspace_id)
-            .map_err(|_| DaemonError::Rpc("Codegraph registration is unavailable".into()))?;
-        let current = current.ok_or_else(|| {
-            DaemonError::PolicyDenied("Codegraph workspace is unregistered".into())
-        })?;
-        if current.workspace.root() != binding.root
-            || current.workspace.project_id() != binding.project_id
-        {
-            return Err(DaemonError::PolicyDenied(
-                "Codegraph workspace scope changed".into(),
-            ));
+        if session.sandbox_root.is_some() {
+            let current = store
+                .blocking_lock()
+                .codegraph_custody_by_root(&binding.root)?
+                .ok_or_else(|| {
+                    DaemonError::PolicyDenied("Codegraph custody is unavailable".into())
+                })?;
+            let custody_id = current.0;
+            let expected = rsi_codegraph::CodegraphStore::workspace_id(
+                binding.project_id,
+                &format!("rsi-sandbox:{custody_id}"),
+            )
+            .map_err(|_| DaemonError::PolicyDenied("Codegraph custody identity changed".into()))?;
+            if current.1 != session_id
+                || current.3 != binding.root
+                || expected != binding.workspace_id
+            {
+                return Err(DaemonError::PolicyDenied(
+                    "Codegraph custody scope changed".into(),
+                ));
+            }
         }
         let scope = BoundCodegraphScope::from_daemon_identity(
             binding.project_id,
             binding.workspace_id,
             kind == NativeCodegraphToolKind::Diff,
         );
-        let service = CodegraphReadService::new(&handle);
+        let service = CodegraphReadService::with_store(&handle, Arc::clone(&store));
         let output = match read {
             Some(request) => serde_json::to_value(
                 service
@@ -309,6 +343,7 @@ pub async fn execute_native_read(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn native_registration_binds_registered_root_and_status_before_ready() {
         let root = tempfile::tempdir().unwrap();
@@ -328,6 +363,7 @@ mod tests {
         assert!(!binding.permits(NativeCodegraphToolKind::Search));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn native_schemas_bind_queries_without_caller_scope_fields() {
         let names: Vec<_> = NativeCodegraphToolKind::ALL
@@ -366,6 +402,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn native_query_variants_reject_wrong_tool_and_unknown_fields() {
         let search: CodegraphNativeReadV1 = serde_json::from_value(json!({

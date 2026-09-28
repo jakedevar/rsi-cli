@@ -39,12 +39,66 @@ fn fresh_unarchive_sandbox_binding(
     SandboxAllocation,
     crate::store::sandbox_custody::SessionCustodyBinding,
 )> {
+    fresh_replacement_sandbox_binding(session, None, sandbox_base)
+}
+
+/// Resolve `branch` in the canonical repository to its full commit id, or
+/// `None` when the ref no longer exists.
+fn resolve_branch_commit(working_dir: &std::path::Path, branch: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|commit| !commit.is_empty())
+}
+
+/// Allocate a distinct replacement sandbox root for `session`. When
+/// `preferred_branch` still resolves in the canonical repository, the new
+/// worktree starts at that branch's tip so the prior sandbox's committed work
+/// carries forward; otherwise it starts from the fresh rolling base.
+pub(super) fn fresh_replacement_sandbox_binding(
+    session: &Session,
+    preferred_branch: Option<&str>,
+    sandbox_base: std::path::PathBuf,
+) -> Result<(
+    SandboxAllocation,
+    crate::store::sandbox_custody::SessionCustodyBinding,
+)> {
     let working_dir = session.working_dir.canonicalize().map_err(|error| {
         DaemonError::InvalidParam(format!(
             "cannot recreate sandbox: working directory '{}' is unavailable: {error}",
             session.working_dir.display()
         ))
     })?;
+    if let Some(source_commit) =
+        preferred_branch.and_then(|branch| resolve_branch_commit(&working_dir, branch))
+    {
+        let allocation = SandboxAllocator::new(sandbox_base).allocate_replacement(
+            session.id,
+            &working_dir,
+            SandboxKind::GitWorktree,
+            &source_commit,
+            None,
+        )?;
+        let binding = super::launch::new_root_binding_from_allocation(
+            &allocation,
+            &working_dir,
+            Some(&source_commit),
+            crate::store::sandbox_custody::CustodyCause::FreshLaunch,
+            None,
+        )?;
+        return Ok((allocation, binding));
+    }
     let source_commit = Command::new("git")
         .args(["rev-parse", "--verify", "HEAD^{commit}"])
         .current_dir(&working_dir)
@@ -195,6 +249,16 @@ pub(super) async fn load_completed_events_from_store(
 }
 
 impl SessionManager {
+    /// Publish the operator's durably committed completed-transcript limit.
+    pub(crate) async fn publish_completed_transcript_cache_cap(&self, cap: u64) {
+        self.completed_transcript_cache
+            .publish_cap(
+                &self.runtime_config.completed_transcript_cache_max_bytes,
+                cap,
+            )
+            .await;
+    }
+
     /// Stamp the derived-on-read `context_fill_pct` onto each session before it
     /// is returned over RPC. The daemon is the single producer of this value:
     /// active sessions use their live runtime state (matching the
@@ -305,6 +369,9 @@ impl SessionManager {
     /// copy is empty until hydrated, and the events are about to be carried
     /// forward into a new `TrackedSession` or replayed to a provider.
     pub(super) async fn hydrate_completed_events(&self, cs: &mut CompletedSession) -> Result<()> {
+        // Resume owns its event vector. A historical read must not retain a
+        // second copy after the source leaves the completed map.
+        self.completed_transcript_cache.evict(cs.session.id).await;
         if cs.events_hydrated {
             return Ok(());
         }
@@ -326,29 +393,61 @@ impl SessionManager {
             return Ok(events);
         }
 
-        // C7 Phase 1: a restored completed session may still carry the
-        // restore-time hydration placeholder (`events_hydrated == false`,
-        // `events` empty) -- see `SessionManager::restore_sessions`. Fast path
-        // below never touches the store; the slow path loads the real
-        // transcript once and writes it back into the cache so repeated polls
-        // of a VISIBLE session (the hot case this path serves) stay fast
-        // afterward instead of re-hitting SQLite every poll.
-        let needs_hydration = matches!(
-            self.completed.read().await.get(&session_id),
-            Some(completed) if !completed.events_hydrated
-        );
-        if needs_hydration {
-            let events = load_completed_events_from_store(&self.store, session_id).await?;
-            let mut completed_guard = self.completed.write().await;
-            if let Some(completed) = completed_guard.get_mut(&session_id)
-                && !completed.events_hydrated
-            {
-                completed.events = events;
-                completed.events_hydrated = true;
+        let completed_revision = {
+            let completed = self.completed.read().await;
+            completed.get(&session_id).map(|entry| {
+                (
+                    entry.session.updated_at,
+                    entry.events_hydrated,
+                    Self::filter_events_since(&entry.events, since_sequence),
+                )
+            })
+        };
+        if let Some((revision, hydrated, in_memory)) = completed_revision {
+            if hydrated {
+                Self::log_conversation_fetch(
+                    session_id,
+                    since_sequence,
+                    in_memory.len(),
+                    "completed",
+                );
+                return Ok(in_memory);
             }
-        }
-        if let Some(completed) = self.completed.read().await.get(&session_id) {
-            let events = Self::filter_events_since(&completed.events, since_sequence);
+            let all = self
+                .completed_transcript_cache
+                .get_or_load(
+                    &self.store,
+                    session_id,
+                    &self.runtime_config.completed_transcript_cache_max_bytes,
+                )
+                .await?;
+            // A continuation may have taken ownership while SQLite loaded.
+            // Its active events are authoritative, including new events.
+            let active_events = self
+                .active
+                .read()
+                .await
+                .get(&session_id)
+                .map(|tracked| Self::filter_events_since(&tracked.events, since_sequence));
+            if let Some(events) = active_events {
+                self.completed_transcript_cache.evict(session_id).await;
+                return Ok(events);
+            }
+            let same_completed_owner =
+                self.completed
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .is_some_and(|entry| {
+                        entry.session.updated_at == revision && !entry.events_hydrated
+                    });
+            if !same_completed_owner {
+                self.completed_transcript_cache.evict(session_id).await;
+                if let Some(tracked) = self.active.read().await.get(&session_id) {
+                    return Ok(Self::filter_events_since(&tracked.events, since_sequence));
+                }
+            }
+            let events = Self::filter_events_since(&all, since_sequence);
             Self::log_conversation_fetch(session_id, since_sequence, events.len(), "completed");
             return Ok(events);
         }
@@ -641,6 +740,8 @@ impl SessionManager {
     /// Return daemon health metrics for observability.
     pub async fn get_health_status(&self) -> rsi_common::rpc::HealthStatusResponse {
         let project_cache_size = self.project_index.read().await.len();
+        let worker_slice_memory_pressure =
+            crate::process_scope::worker_slice_memory_pressure().await;
 
         // Fetch queue metrics and rate-limit windows with try_lock to avoid
         // blocking if store is busy. Both are advisory telemetry: a busy store
@@ -675,9 +776,12 @@ impl SessionManager {
                 self.codex_client.is_some(),
             ),
             provider_bedrock_available: crate::bedrock::available(self.codex_client.is_some()),
-            provider_openrouter_available: crate::openrouter::openrouter_provider_available(
-                self.codex_client.is_some(),
-            ),
+            provider_openrouter_available:
+                crate::openrouter::openrouter_provider_available_for_route(
+                    &crate::vault::global(),
+                    self.codex_client.is_some(),
+                    self.runtime_config.any_openrouter_harness_route(),
+                ),
             provider_local_available: self.local_client.is_some(),
             provider_antigravity_available: self.agy_client.is_some(),
             provider_harness_available: true,
@@ -688,6 +792,7 @@ impl SessionManager {
             queue_completed: queue_metrics.as_ref().map(|m| m.completed).unwrap_or(0),
             queue_failed: queue_metrics.as_ref().map(|m| m.failed).unwrap_or(0),
             latest_daemon_restart: self.latest_daemon_restart.clone(),
+            worker_slice_memory_pressure,
         }
     }
 

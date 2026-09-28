@@ -66,6 +66,16 @@ through this verification; the CLI never tears down a source worktree.
 Successful output includes `candidate_id`, `candidate_kind`,
 `fetched_target_id`, and `published_target_id`.
 
+A stale target (the remote advanced before or during the push) is retried on
+the newer tip. When the advance touches none of the candidate's paths, the
+remade candidate reuses the earlier gate, so such a retry costs one fetch, merge
+and push; up to 8 stale retries run in one landing. An overlapping advance
+re-runs the gate and is allowed at most 2 times. The remote may advance again
+between the observation and the retry fetch; any fast-forward of the observed
+tip is a valid retry base. Every receipt, published or not, prints
+`stale_attempts=<n>` and one `stale_retry_<i>=<fetched>..<observed>:<gate_reused|regated>`
+line per lost race, so exhausted retries are visible (Issue #952).
+
 If the published-tip canary fails, the CLI creates a new child commit of the
 published candidate whose tree matches the pre-landing rolling tip. It
 first tries to publish this forward revert when the remote still equals the

@@ -63,6 +63,10 @@ impl SessionManager {
         let Ok(mut cursor) = self.manager_coordinator_cursor.try_lock() else {
             return Ok(0);
         };
+        // Sample cgroup files before any SQLite guard; the Store receives only
+        // the completed, optional Health projection.
+        let worker_pressure = crate::process_scope::worker_slice_memory_pressure().await;
+        let pressure_observed_at = chrono::Utc::now();
         let projects = self
             .store
             .lock()
@@ -77,6 +81,19 @@ impl SessionManager {
                 + store.recover_manager_actions_startup(self.program_run_boot_id)?
         };
         for project in &projects {
+            if let Some(pressure) = worker_pressure.as_ref() {
+                match self.store.lock().await.record_worker_slice_pressure_notice(
+                    *project,
+                    pressure,
+                    pressure_observed_at,
+                ) {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"worker slice pressure notice deferred");
+                    }
+                }
+            }
             let reconciled = {
                 let store = self.store.lock().await;
                 store.reconcile_manager_intent(
@@ -199,8 +216,9 @@ impl SessionManager {
         } else {
             projects.last().copied()
         };
-        // Lifecycle journal claims are globally single-flight and perform their
-        // own guard-time checks. No second retry timer is installed here.
+        // Keep prompt action progress on successful coordinator passes. The
+        // daemon's independent action backstop uses this same single-flight
+        // reconciler when a seat or notice pass is parked (#720).
         changed += self.reconcile_manager_actions_once().await?;
         Ok(changed)
     }

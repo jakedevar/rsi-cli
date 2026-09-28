@@ -448,6 +448,7 @@ mod tests {
         (dir, store, session.id, invocation_id)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn queued_update_is_idempotent_and_applies_at_the_next_sequence() {
         let (_dir, mut store, session_id, invocation_id) = store_with_running_session();
@@ -498,6 +499,7 @@ mod tests {
         assert_eq!(segment_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn antigravity_model_switch_accepts_supported_effort_and_applies_it() {
         let (_dir, mut store, session_id, invocation_id) =
@@ -536,6 +538,7 @@ mod tests {
         assert_eq!(session.effort.as_deref(), Some("high"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn stale_invocation_marks_the_pending_update_stale_without_applying_it() {
         let (_dir, mut store, session_id, invocation_id) = store_with_running_session();
@@ -575,6 +578,7 @@ mod tests {
         assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-5"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn target_validation_respects_provider_effort_ladders() {
         assert!(validate_target(SessionProvider::Antigravity, "gemini-3.6-flash", None).is_ok());
@@ -601,6 +605,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v132_migration_recreates_the_pinned_catalog() {
         let (_dir, store, _session_id, _invocation_id) = store_with_running_session();

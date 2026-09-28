@@ -9,7 +9,8 @@
 
 use crate::error::DaemonError;
 use crate::model_control::ModelExecutionCapability;
-use crate::session::harness::api_key::{ANTHROPIC_ENV_VARS, resolve_api_key};
+use crate::session::harness::api_key::ApiCredential;
+use crate::session::harness::errors;
 use crate::session::harness::provider::{ApiProvider, Result};
 use crate::session::harness::sse::{AccumulatedToolCall, read_anthropic_sse_stream};
 use crate::session::harness::types::*;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 pub struct AnthropicProvider {
     http: reqwest::Client,
-    api_key: String,
+    credential: ApiCredential,
     base_url: String,
 }
 
@@ -44,13 +45,20 @@ pub(crate) fn uses_adaptive_thinking(model: &str) -> bool {
 
 impl AnthropicProvider {
     pub fn new(explicit_key: Option<&str>) -> Result<Self> {
-        let api_key = resolve_api_key(explicit_key, ANTHROPIC_ENV_VARS).ok_or_else(|| {
-            DaemonError::Process("No Anthropic API key found. Set ANTHROPIC_API_KEY.".into())
-        })?;
-
         let base_url = std::env::var("ANTHROPIC_API_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".into());
+        Self::with_credential(
+            base_url,
+            ApiCredential::for_slot(explicit_key, Some(crate::vault::Slot::Anthropic)),
+        )
+    }
 
+    /// Build against `base_url` with a per-request credential. Launch still
+    /// fails fast when no key resolves now.
+    pub fn with_credential(base_url: String, credential: ApiCredential) -> Result<Self> {
+        if credential.current().is_none() {
+            return Err(Self::missing_key());
+        }
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -58,9 +66,16 @@ impl AnthropicProvider {
 
         Ok(Self {
             http,
-            api_key,
+            credential,
             base_url,
         })
+    }
+
+    fn missing_key() -> DaemonError {
+        DaemonError::Process(
+            "No Anthropic API key found. Set it in the RSI key vault or export ANTHROPIC_API_KEY."
+                .into(),
+        )
     }
 
     /// Build Anthropic-format request body.
@@ -113,13 +128,40 @@ impl AnthropicProvider {
                     }
                 }
                 MessageRole::Tool => {
+                    let content = if msg.has_typed_tool_blocks() {
+                        json!(
+                            msg.tool_blocks()
+                                .into_iter()
+                                .map(|block| match block {
+                                    ToolContentBlock::Text { text } => json!({
+                                        "type": "text",
+                                        "text": text,
+                                    }),
+                                    ToolContentBlock::Image { media_type, data } => json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": data,
+                                        },
+                                    }),
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    } else {
+                        json!(msg.content)
+                    };
+                    let mut tool_result = json!({
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                        "content": content,
+                    });
+                    if msg.is_error {
+                        tool_result["is_error"] = json!(true);
+                    }
                     messages.push(json!({
                         "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                            "content": msg.content,
-                        }],
+                        "content": [tool_result],
                     }));
                 }
             }
@@ -184,13 +226,17 @@ impl AnthropicProvider {
         body
     }
 
-    fn auth_header(&self) -> (&str, String) {
+    /// Resolved on every request, so a vault rotation applies to the next
+    /// request of a live session.
+    fn auth_header(&self) -> Result<(&'static str, String)> {
+        let key = self.credential.current().ok_or_else(Self::missing_key)?;
+        let key = key.expose();
         // OAuth tokens use Bearer, standard keys use x-api-key
-        if self.api_key.starts_with("sk-ant-oat01-") {
-            ("Authorization", format!("Bearer {}", self.api_key))
+        Ok(if key.starts_with("sk-ant-oat01-") {
+            ("Authorization", format!("Bearer {key}"))
         } else {
-            ("x-api-key", self.api_key.clone())
-        }
+            ("x-api-key", key.to_owned())
+        })
     }
 
     fn convert_tool_calls(accumulated: Vec<AccumulatedToolCall>) -> Vec<ToolCall> {
@@ -217,7 +263,7 @@ impl ApiProvider for AnthropicProvider {
         // Ensure non-streaming
         req_body.as_object_mut().map(|o| o.remove("stream"));
 
-        let (header_name, header_value) = self.auth_header();
+        let (header_name, header_value) = self.auth_header()?;
         let request = self
             .http
             .post(&url)
@@ -231,14 +277,11 @@ impl ApiProvider for AnthropicProvider {
                 request,
             )
             .send("Anthropic")
-            .await?;
+            .await
+            .map_err(errors::transport)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(DaemonError::Process(format!(
-                "Anthropic API {status}: {body}"
-            )));
+            return Err(errors::classify_response(resp).await);
         }
 
         let json: Value = resp
@@ -331,7 +374,7 @@ impl ApiProvider for AnthropicProvider {
         streaming_request.stream = true;
         let body = self.build_request_body(&streaming_request);
 
-        let (header_name, header_value) = self.auth_header();
+        let (header_name, header_value) = self.auth_header()?;
         let request = self
             .http
             .post(&url)
@@ -345,21 +388,11 @@ impl ApiProvider for AnthropicProvider {
                 request,
             )
             .send("Anthropic")
-            .await?;
+            .await
+            .map_err(errors::transport)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-
-            if status.is_server_error() {
-                return Err(DaemonError::StreamFallbackRequired(format!(
-                    "Anthropic API {status}: {body_text}"
-                )));
-            }
-
-            return Err(DaemonError::Process(format!(
-                "Anthropic API {status}: {body_text}"
-            )));
+            return Err(errors::classify_response(resp).await);
         }
 
         let (content, tool_calls, usage, stop_reason) =
@@ -401,7 +434,7 @@ mod tests {
     fn provider() -> AnthropicProvider {
         AnthropicProvider {
             http: reqwest::Client::new(),
-            api_key: String::new(),
+            credential: ApiCredential::None,
             base_url: String::new(),
         }
     }
@@ -418,6 +451,88 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn tool_result_error_flag_is_sent_only_for_failures() {
+        let mut successful = request("claude-opus-5", None);
+        successful.messages = vec![ChatMessage::tool_result("call-1", "ok")];
+        let success_body = provider().build_request_body(&successful);
+        assert_eq!(
+            success_body["messages"][0]["content"][0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "ok"
+            })
+        );
+
+        let mut failed = request("claude-opus-5", None);
+        failed.messages = vec![ChatMessage::tool_error_result("call-1", "Error: failed")];
+        let failure_body = provider().build_request_body(&failed);
+        assert_eq!(failure_body["messages"][0]["content"][0]["is_error"], true);
+        assert_eq!(
+            failure_body["messages"][0]["content"][0]["content"],
+            "Error: failed"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn typed_tool_results_use_anthropic_content_blocks() {
+        let mut request = request("claude-opus-5", None);
+        request.messages = vec![
+            ChatMessage::tool_result_blocks(
+                "text",
+                vec![ToolContentBlock::Text { text: "ok".into() }],
+                false,
+            ),
+            ChatMessage::tool_result_blocks(
+                "image",
+                vec![
+                    ToolContentBlock::Text {
+                        text: "preview".into(),
+                    },
+                    ToolContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                false,
+            ),
+            ChatMessage::tool_result_blocks(
+                "error",
+                vec![ToolContentBlock::Text {
+                    text: "failed".into(),
+                }],
+                true,
+            ),
+        ];
+        let body = provider().build_request_body(&request);
+        assert_eq!(
+            body["messages"][0]["content"][0]["content"],
+            json!([
+                {"type": "text", "text": "ok"}
+            ])
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["content"],
+            json!([
+                {"type": "text", "text": "preview"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "aGVsbG8="
+                }}
+            ])
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["content"],
+            json!([
+                {"type": "text", "text": "failed"}
+            ])
+        );
+        assert_eq!(body["messages"][2]["content"][0]["is_error"], true);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn current_models_use_adaptive_thinking_without_temperature_or_budget() {
         for model in [
@@ -437,6 +552,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn suffixed_current_models_use_adaptive_thinking() {
         let body = provider().build_request_body(&request("claude-opus-5-20260724", Some("max")));
@@ -446,6 +562,7 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn current_models_without_effort_omit_thinking_and_output_config() {
         let body = provider().build_request_body(&request("claude-opus-5", None));
@@ -455,6 +572,7 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn older_models_keep_legacy_thinking_request_shape() {
         let body = provider().build_request_body(&request("claude-opus-4-6", Some("high")));

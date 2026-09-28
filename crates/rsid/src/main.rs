@@ -16,9 +16,72 @@ use rsid::rpc::RpcServer;
 use rsid::session::SessionManager;
 use rsid::store::Store;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::signal;
 use tracing::{error, info, warn};
+
+const MANAGER_ACTION_BACKSTOP_INTERVAL: Duration = Duration::from_secs(10);
+const MANAGER_COORDINATOR_STALL_AFTER: Duration = Duration::from_secs(30);
+const CONNECTION_DRAIN_LIMIT: Duration = Duration::from_secs(2);
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+
+async fn shutdown_stage<F: std::future::Future>(
+    subsystem: &'static str,
+    deadline: tokio::time::Instant,
+    future: F,
+) -> F::Output {
+    info!(subsystem, "Shutdown stage started");
+    tokio::pin!(future);
+    let result = if let Ok(result) = tokio::time::timeout_at(deadline, &mut future).await {
+        result
+    } else {
+        // Settlement owners must finish before the runtime exits. Keep
+        // waiting, but identify the stage that exceeded the deploy bound.
+        warn!(subsystem, "Shutdown stage exceeded ten-second deadline");
+        future.await
+    };
+    info!(subsystem, "Shutdown stage complete");
+    result
+}
+
+#[derive(Clone, Copy)]
+struct ManagerCoordinatorProgress {
+    last_completed: tokio::time::Instant,
+    pass_started: Option<tokio::time::Instant>,
+}
+
+async fn run_manager_action_backstop<F, Fut>(mut reconcile: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<usize>>,
+{
+    let mut interval = tokio::time::interval(MANAGER_ACTION_BACKSTOP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) = reconcile().await {
+            warn!(error = %error, "Manager action backstop deferred");
+        }
+    }
+}
+
+async fn supervise_manager_coordinator<F>(mut spawn: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()>,
+{
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let result = spawn().await;
+        match result {
+            Ok(()) => error!("Manager coordinator exited; restarting"),
+            Err(error) => error!(error = %error, "Manager coordinator task failed; restarting"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
 
 async fn program_run_startup_sequence<R, RFut, C, CFut, D, T, E>(
     restore_sessions: R,
@@ -40,7 +103,45 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run_daemon().await
+    // Informational flags exit here, before any daemon state exists. The
+    // daemon starts after the match so no arm owns daemon startup: the
+    // provider-capability scan reads a match arm's callees as one mapping.
+    match cli_action(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        CliAction::Run => {}
+        CliAction::Help => {
+            println!(
+                "rsid {}\nUsage: rsid [--help | --version]\nRun the RSI daemon when no flag is given.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        CliAction::Version => {
+            println!("rsid {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Invalid => {
+            eprintln!("Usage: rsid [--help | --version]");
+            std::process::exit(2);
+        }
+    }
+    Box::pin(run_daemon()).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Run,
+    Help,
+    Version,
+    Invalid,
+}
+
+fn cli_action(args: &[std::ffi::OsString]) -> CliAction {
+    match args {
+        [] => CliAction::Run,
+        [flag] if flag == "--help" || flag == "-h" => CliAction::Help,
+        [flag] if flag == "--version" || flag == "-V" => CliAction::Version,
+        _ => CliAction::Invalid,
+    }
 }
 
 async fn run_daemon() -> Result<()> {
@@ -249,21 +350,22 @@ async fn run_daemon() -> Result<()> {
         );
     }
 
+    // #694 K1: open the provider key vault after the persisted
+    // `vault.*` settings are applied. A vault whose directory or file mode is
+    // looser than 0700/0600 (or is malformed) refuses daemon start and names
+    // the path; nothing falls back silently past a tombstone.
+    let vault = rsid::vault::open_default(Arc::clone(&runtime_config.vault_settings))
+        .map_err(|error| rsid::error::DaemonError::Process(format!("key vault: {error}")))?;
+    if rsid::vault::install_global(vault).is_err() {
+        warn!("key vault was already installed; keeping the first handle");
+    }
+
     // Codegraph uses its own project-bound databases. An unavailable project
     // or index subsystem must not prevent the session daemon from starting.
-    let sandboxes = store.list_codegraph_sandbox_registrations().unwrap_or_else(|error| {
-        warn!(%error, "Could not load codegraph sandbox registrations; primary project indexing continues");
-        Vec::new()
-    });
-    let projects = store.load_projects().unwrap_or_else(|error| {
-        warn!(%error, "Could not load codegraph project registrations; registry refresh will retry");
-        Vec::new()
-    });
     let index_root = db_path.with_file_name("codegraph");
-    let mut _codegraph_runtime = match IndexRuntime::start_with_registrations_and_bus_and_gate(
+    let mut _codegraph_runtime = match IndexRuntime::start_from_store(
         index_root.clone(),
-        projects,
-        sandboxes,
+        &store,
         &config.workspace_roots,
         Some(Arc::clone(&event_bus)),
         Arc::clone(&runtime_config.codegraph_indexing_enabled),
@@ -358,7 +460,7 @@ async fn run_daemon() -> Result<()> {
     }
 
     // Take retry receiver before wrapping in Arc
-    let mut retry_rx = session_manager
+    let retry_rx = session_manager
         .take_retry_rx()
         .expect("retry_rx already taken");
 
@@ -394,6 +496,13 @@ async fn run_daemon() -> Result<()> {
             false
         }
     };
+    if session_restore_ready {
+        // The exact journal owns graceful interruptions. Claim it after
+        // invocation and custody restore, before schedulers or watch dispatch.
+        session_manager
+            .reconcile_restart_intents_at_startup()
+            .await?;
+    }
 
     let program_run_dispatcher = match program_run_startup_sequence(
         || async { session_restore_ready },
@@ -1146,6 +1255,9 @@ async fn run_daemon() -> Result<()> {
         warn!(error = %error, "Incomplete master successor reconciliation deferred");
     }
     let session_manager_for_successor_backstop = Arc::clone(&session_manager);
+    tokio::spawn(rsid::session::retention::run_retention_loop(Arc::clone(
+        &session_manager,
+    )));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1163,39 +1275,105 @@ async fn run_daemon() -> Result<()> {
 
     // Manager operating intent is daemon-owned durable work. Event hints give
     // prompt feedback; a bounded keyset backstop covers missed events/restart.
-    let manager_runtime = Arc::clone(&session_manager);
-    let mut manager_events = event_bus.subscribe();
+    let manager_progress = Arc::new(std::sync::Mutex::new(ManagerCoordinatorProgress {
+        last_completed: tokio::time::Instant::now(),
+        pass_started: None,
+    }));
+    let action_runtime = Arc::clone(&session_manager);
+    tokio::spawn(run_manager_action_backstop(move || {
+        let runtime = Arc::clone(&action_runtime);
+        async move { runtime.reconcile_manager_actions_once().await }
+    }));
+    let progress_for_watch = Arc::clone(&manager_progress);
     tokio::spawn(async move {
-        if let Err(error) = manager_runtime.reconcile_harness_managers_startup().await {
-            warn!(error=%error,"Manager startup reconciliation deferred");
-        }
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(MANAGER_ACTION_BACKSTOP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_scan = tokio::time::Instant::now();
+        interval.tick().await;
+        let mut stalled = false;
+        let mut last_stall_log: Option<tokio::time::Instant> = None;
         loop {
-            let due = tokio::select! {
-                _=interval.tick()=>true,
-                event=manager_events.recv()=>match event {
-                    Ok(event)=>matches!(event.as_ref(),
-                        rsid::bus::DaemonEvent::SessionStatusChanged{..}
-                        |rsid::bus::DaemonEvent::SessionQuestionRaised{..}
-                        |rsid::bus::DaemonEvent::SessionCreated{..}
-                        |rsid::bus::DaemonEvent::SessionMetadataChanged{..}
-                        |rsid::bus::DaemonEvent::ProviderRateLimitUpdated{..})
-                        ||matches!(event.as_ref(),rsid::bus::DaemonEvent::SystemMessage{message,..} if message.starts_with("Harness manager decision")),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>true,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
+            interval.tick().await;
+            let progress = *progress_for_watch.lock().unwrap();
+            let age = progress.last_completed.elapsed();
+            if age >= MANAGER_COORDINATOR_STALL_AFTER {
+                if last_stall_log
+                    .is_none_or(|last| last.elapsed() >= MANAGER_COORDINATOR_STALL_AFTER)
+                {
+                    warn!(
+                        last_completed_age_secs = age.as_secs(),
+                        active_pass_age_secs =
+                            progress.pass_started.map(|start| start.elapsed().as_secs()),
+                        "Manager coordinator pass stalled"
+                    );
+                    last_stall_log = Some(tokio::time::Instant::now());
                 }
-            };
-            if !due || last_scan.elapsed() < std::time::Duration::from_secs(1) {
-                continue;
-            }
-            last_scan = tokio::time::Instant::now();
-            if let Err(error) = manager_runtime.reconcile_harness_managers_once().await {
-                warn!(error=%error,"Manager bounded reconciliation deferred");
+                stalled = true;
+            } else if stalled {
+                info!(
+                    last_completed_age_secs = age.as_secs(),
+                    "Manager coordinator pass recovered"
+                );
+                stalled = false;
+                last_stall_log = None;
             }
         }
     });
+    let manager_runtime = Arc::clone(&session_manager);
+    let manager_bus = event_bus.clone();
+    tokio::spawn(supervise_manager_coordinator(move || {
+        let manager_runtime = Arc::clone(&manager_runtime);
+        let mut manager_events = manager_bus.subscribe();
+        let progress = Arc::clone(&manager_progress);
+        tokio::spawn(async move {
+            progress.lock().unwrap().pass_started = Some(tokio::time::Instant::now());
+            if let Err(error) = manager_runtime.reconcile_harness_managers_startup().await {
+                warn!(error=%error,"Manager startup reconciliation deferred");
+            }
+            *progress.lock().unwrap() = ManagerCoordinatorProgress {
+                last_completed: tokio::time::Instant::now(),
+                pass_started: None,
+            };
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_scan = tokio::time::Instant::now();
+            loop {
+                let due = tokio::select! {
+                    _=interval.tick()=>true,
+                    event=manager_events.recv()=>match event {
+                        Ok(event)=>matches!(event.as_ref(),
+                            rsid::bus::DaemonEvent::SessionStatusChanged{..}
+                            |rsid::bus::DaemonEvent::SessionQuestionRaised{..}
+                            |rsid::bus::DaemonEvent::SessionCreated{..}
+                            |rsid::bus::DaemonEvent::SessionMetadataChanged{..}
+                            |rsid::bus::DaemonEvent::ProviderRateLimitUpdated{..})
+                            ||matches!(event.as_ref(),rsid::bus::DaemonEvent::SystemMessage{message,..} if message.starts_with("Harness manager decision")),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>true,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
+                    }
+                };
+                if !due || last_scan.elapsed() < Duration::from_secs(1) {
+                    continue;
+                }
+                last_scan = tokio::time::Instant::now();
+                progress.lock().unwrap().pass_started = Some(tokio::time::Instant::now());
+                let result = manager_runtime.reconcile_harness_managers_once().await;
+                let pass_age = progress.lock().unwrap().pass_started.unwrap().elapsed();
+                *progress.lock().unwrap() = ManagerCoordinatorProgress {
+                    last_completed: tokio::time::Instant::now(),
+                    pass_started: None,
+                };
+                if pass_age >= MANAGER_COORDINATOR_STALL_AFTER {
+                    warn!(
+                        pass_age_secs = pass_age.as_secs(),
+                        "Manager coordinator slow pass completed"
+                    );
+                }
+                if let Err(error) = result {
+                    warn!(error=%error,"Manager bounded reconciliation deferred");
+                }
+            }
+        })
+    }));
 
     // Spawn stall-retry handler if RSI_RETRY_ON_STALL=true
     if config.retry_on_stall {
@@ -1238,7 +1416,7 @@ async fn run_daemon() -> Result<()> {
     // authority-bearing restore and reconciliation above. Its daemon-owned
     // receiver monitor keeps the lifecycle cancellation signal truthful while
     // request readiness advances independently of the pass result.
-    let _ = session_manager.submit_sandbox_build_cache_reclaim_startup();
+    let sandbox_cache_maintenance = session_manager.start_sandbox_build_cache_maintenance();
 
     // Journaled Prepared intents hold the custody gate until their rename
     // seam is resolved. Retry them independently of the ordinary policy
@@ -1258,30 +1436,6 @@ async fn run_daemon() -> Result<()> {
         });
     }
 
-    // Create the periodic sleeper only after startup has had the first queue
-    // position. A short configured interval therefore cannot overtake startup
-    // during a long authority initialization.
-    {
-        let manager = Arc::clone(&session_manager);
-        let runtime_config = Arc::clone(&runtime_config);
-        tokio::spawn(async move {
-            loop {
-                let interval_secs = runtime_config
-                    .sandbox_build_cache_reclaim_snapshot()
-                    .interval_secs;
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                match manager.run_sandbox_build_cache_reclaim(false).await {
-                    Ok(report) => rsid::session::SessionManager::log_sandbox_build_cache_reclaim(
-                        "periodic", &report,
-                    ),
-                    Err(e) => {
-                        warn!(error = %e, "Periodic build-cache reclaim failed (will retry next interval)");
-                    }
-                }
-            }
-        });
-    }
-
     info!(
         startup_milestone = "request_ready",
         post_authority_elapsed_ms = authority_initialized_at
@@ -1291,7 +1445,7 @@ async fn run_daemon() -> Result<()> {
         "Daemon initialized, ready to accept connections"
     );
 
-    let watchdog = rsid::watchdog::start_watchdog(
+    let mut watchdog = Some(rsid::watchdog::start_watchdog(
         config.socket_path.clone(),
         Arc::clone(session_manager.store()),
         scheduler_heartbeat,
@@ -1301,7 +1455,7 @@ async fn run_daemon() -> Result<()> {
             config.reconciliation_liveness_interval_secs,
         ),
         data_dir,
-    )?;
+    )?);
 
     // Main loop
     let ctrl_c = signal::ctrl_c();
@@ -1317,21 +1471,58 @@ async fn run_daemon() -> Result<()> {
     // losing this branch to another `select!` arm cannot drop a signal.
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut shutdown_deadline = tokio::time::Instant::now();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        if drain_deadline.is_some() && connections.is_empty() {
+            info!("Connection drain complete");
+            break;
+        }
+        let deadline_snapshot = drain_deadline;
         tokio::select! {
-            _ = &mut ctrl_c => {
+            _ = &mut ctrl_c, if drain_deadline.is_none() => {
                 info!("Received shutdown signal (Ctrl+C)");
-                break;
+                shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
+                session_manager.begin_restart_drain();
+                if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
+                if let Some(handle) = &scheduler_handle {
+                    let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
+                }
+                drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                info!(connections = connections.len(), "Connection drain started");
             }
-            _ = sigterm.recv() => {
+            _ = sigterm.recv(), if drain_deadline.is_none() => {
                 info!("Received shutdown signal (SIGTERM)");
+                shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
+                session_manager.begin_restart_drain();
+                if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
+                if let Some(handle) = &scheduler_handle {
+                    let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
+                }
+                drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                info!(connections = connections.len(), "Connection drain started");
+            }
+            () = async {
+                if let Some(deadline) = deadline_snapshot {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                warn!(connections = connections.len(), "Connection drain deadline reached");
                 break;
             }
-            result = listener.accept() => {
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(%error, "Connection handler task failed during drain");
+                }
+            }
+            result = listener.accept(), if drain_deadline.is_none() => {
                 match result {
                     Ok((stream, _)) => {
                         let server = Arc::clone(&rpc_server);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(e) = server.handle_connection(stream).await {
                                 let msg = e.to_string();
                                 if msg.contains("Broken pipe") || msg.contains("Connection reset") {
@@ -1349,44 +1540,80 @@ async fn run_daemon() -> Result<()> {
             }
         }
     }
+    // Timed-out handlers retain their ordinary task lifetime while the other
+    // subsystems settle. Dropping a JoinSet would abort them immediately.
+    connections.detach_all();
+
+    // Stop pressure continuations before shutdown awaits other services.
+    // Already accepted worker jobs retain their cancellation-safe settlement.
+    sandbox_cache_maintenance.abort();
 
     // Graceful shutdown
-    watchdog.stop();
-    info!("Shutting down...");
+    if let Some(watchdog) = watchdog.take() {
+        watchdog.stop();
+    }
+    info!("Shutting down subsystems...");
 
     if let Some((cancellation, handle)) = program_run_dispatcher {
+        info!(
+            subsystem = "program_run_dispatcher",
+            "Shutdown stage started"
+        );
         cancellation.cancel();
-        if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        if tokio::time::timeout_at(shutdown_deadline - Duration::from_secs(5), handle)
             .await
             .is_err()
         {
-            warn!("ProgramRun dispatcher did not stop within the shutdown deadline");
+            warn!(
+                subsystem = "program_run_dispatcher",
+                "Shutdown stage exceeded worker deadline"
+            );
+        } else {
+            info!(
+                subsystem = "program_run_dispatcher",
+                "Shutdown stage complete"
+            );
         }
     }
 
     if let Some((cancellation, handle)) = app_server_seal_worker {
+        info!(
+            subsystem = "app_server_seal_worker",
+            "Shutdown stage started"
+        );
         cancellation.cancel();
-        if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        if tokio::time::timeout_at(shutdown_deadline - Duration::from_secs(5), handle)
             .await
             .is_err()
         {
-            warn!("AppServer control worker did not stop within the shutdown deadline");
+            warn!(
+                subsystem = "app_server_seal_worker",
+                "Shutdown stage exceeded worker deadline"
+            );
+        } else {
+            info!(
+                subsystem = "app_server_seal_worker",
+                "Shutdown stage complete"
+            );
         }
     }
 
     // Shut down background queue before session manager
     if let Some(qh) = session_manager.queue_handle() {
-        info!("Shutting down background queue...");
-        let _ = qh.shutdown().await;
+        let _ = shutdown_stage("background_queue", shutdown_deadline, qh.shutdown()).await;
     }
 
     // Shut down memory system before session manager
     if let Some(ref mm) = memory_manager {
-        info!("Shutting down memory system...");
-        mm.shutdown().await;
+        shutdown_stage("memory", shutdown_deadline, mm.shutdown()).await;
     }
 
-    session_manager.shutdown().await?;
+    shutdown_stage(
+        "session_manager",
+        shutdown_deadline,
+        session_manager.shutdown(),
+    )
+    .await?;
 
     // Clean up socket
     if let Err(e) = tokio::fs::remove_file(&config.socket_path).await {
@@ -1432,6 +1659,71 @@ fn recursive_startup_recovery_budget(config: &Config) -> RecursiveRecoveryBudget
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_action_backstop_reaches_one_due_claim_while_coordinator_is_parked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = tokio::spawn(std::future::pending::<()>());
+        let claims = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backstop = tokio::spawn(run_manager_action_backstop({
+            let claims = Arc::clone(&claims);
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let claims = Arc::clone(&claims);
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    // Model the durable claim transition: later passes see no
+                    // queued work, even while the coordinator stays parked.
+                    if claims
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        Ok(1)
+                    } else {
+                        Ok(0)
+                    }
+                }
+            }
+        }));
+        tokio::task::yield_now().await;
+        for expected in 1..=3 {
+            tokio::time::advance(MANAGER_ACTION_BACKSTOP_INTERVAL).await;
+            tokio::task::yield_now().await;
+            assert_eq!(attempts.load(Ordering::SeqCst), expected);
+        }
+        assert!(!coordinator.is_finished());
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        coordinator.abort();
+        backstop.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_coordinator_supervisor_restarts_after_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let supervisor = tokio::spawn(supervise_manager_coordinator({
+            let launches = Arc::clone(&launches);
+            move || {
+                let launch = launches.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if launch == 0 {
+                        panic!("simulated coordinator failure");
+                    }
+                    std::future::pending::<()>().await;
+                })
+            }
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        assert!(!supervisor.is_finished());
+        supervisor.abort();
+    }
 
     struct IsolatedDaemonChild(Option<std::process::Child>);
 
@@ -1479,6 +1771,33 @@ mod tests {
         Ok(response)
     }
 
+    fn fixture_rpc(
+        socket_path: &std::path::Path,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        use std::io::{BufRead, Write};
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(socket_path).expect("connect isolated daemon");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("RPC timeout");
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            }),
+        )
+        .expect("encode RPC");
+        stream.write_all(b"\n").expect("send RPC");
+        let mut response = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .expect("read RPC");
+        serde_json::from_str(&response).expect("parse RPC")
+    }
+
     fn parse_u64_log_field(line: &str, field: &str) -> Option<u64> {
         let prefix = format!("{field}=");
         line.split_whitespace()
@@ -1502,6 +1821,214 @@ mod tests {
             .expect("isolated daemon fixture");
     }
 
+    fn assert_isolated_sigint_exit(hold_client_open: bool, live_provider: bool, bound: Duration) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let fixture = tempfile::Builder::new()
+            .prefix("rsid-sigint-")
+            .tempdir_in("/tmp")
+            .expect("fixture root");
+        let home = fixture.path().join("home");
+        let data_dir = home.join(".rsi");
+        let bin_dir = fixture.path().join("bin");
+        let sandbox_base = fixture.path().join("sandboxes");
+        for dir in [&data_dir, &bin_dir, &sandbox_base] {
+            std::fs::create_dir_all(dir).expect("fixture directory");
+        }
+        let provider_stub = bin_dir.join("codex");
+        std::fs::write(&provider_stub, b"#!/bin/sh\nexit 0\n").expect("provider stub");
+        std::fs::set_permissions(&provider_stub, std::fs::Permissions::from_mode(0o755))
+            .expect("provider stub permissions");
+        let provider_marker = fixture.path().join("provider-running");
+        let (provider_url, provider_release, provider_thread) = if live_provider {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind isolated provider");
+            let url = format!(
+                "http://{}/v1",
+                listener.local_addr().expect("provider address")
+            );
+            let marker = provider_marker.clone();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept provider request");
+                std::fs::write(marker, b"accepted\n").expect("provider dispatch marker");
+                let _ = released.recv_timeout(Duration::from_secs(15));
+                drop(stream);
+            });
+            (Some(url), Some(release), Some(thread))
+        } else {
+            (None, None, None)
+        };
+        let socket = data_dir.join("daemon.sock");
+        let log_path = fixture.path().join("rsid.log");
+        let log = std::fs::File::create(&log_path).expect("daemon log");
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        let child = Command::new(std::env::current_exe().expect("current rsid test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::sr2_real_daemon_fixture_process",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env("RSI_DAEMON_SOCKET_PATH", &socket)
+            .env("RSI_SANDBOX_BASE", &sandbox_base)
+            .env("RSI_MEMORY_ENABLED", "false")
+            .env("RSI_DREAM_ENABLED", "false")
+            .env("RSI_QUEUE_ENABLED", "false")
+            .env("RSI_RECONCILIATION_ENABLED", "false")
+            .env("RSI_STALL_DETECTION_ENABLED", "false")
+            .env("RSI_SCHEDULER_ENABLED", "false")
+            .env("RSI_SMOKE_SUPPRESS_RETRY_RESTORE", "true")
+            .env("PATH", format!("{}:{inherited_path}", bin_dir.display()))
+            .env_remove("RSI_PROCESS_OWNERSHIP_NAMESPACE")
+            .env_remove("RSI_SESSION_ID")
+            .env_remove("RSI_SESSION_TOKEN")
+            .env_remove("RSI_SOCKET")
+            .stdout(Stdio::from(log.try_clone().expect("clone daemon stdout")))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn isolated daemon fixture");
+        let mut child = IsolatedDaemonChild(Some(child));
+        wait_for_log(
+            &log_path,
+            "Daemon initialized, ready to accept connections",
+            Duration::from_secs(15),
+        );
+        let response = health_rpc(&socket).expect("isolated daemon health RPC");
+        assert!(response.contains("\"result\""));
+        let session_id = if live_provider {
+            let response = fixture_rpc(
+                &socket,
+                "LaunchSession",
+                serde_json::json!({
+                    "query": "wait for restart interrupt",
+                    "working_dir": sandbox_base,
+                "provider": "Local",
+                "model": "qwen3:14b",
+                "openai_base_url": provider_url.expect("isolated provider URL"),
+                    "tags": ["restart-test"],
+                    "skip_context_pipeline": true
+                }),
+            );
+            let session_id = response["result"]["session_id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "launch failed: {response}; log:\n{}",
+                        std::fs::read_to_string(&log_path).unwrap_or_default()
+                    )
+                })
+                .to_owned();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !provider_marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "provider did not start; log:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Some(session_id)
+        } else {
+            None
+        };
+        let held_client = if hold_client_open {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(&socket).expect("connect held client");
+            stream.write_all(b"{").expect("start held request");
+            std::thread::sleep(Duration::from_millis(50));
+            Some(stream)
+        } else {
+            None
+        };
+
+        let started = std::time::Instant::now();
+        let pid = nix::unistd::Pid::from_raw(child.0.as_ref().expect("child").id() as i32);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).expect("send fixture SIGINT");
+        let status = loop {
+            if let Some(status) = child
+                .0
+                .as_mut()
+                .expect("child")
+                .try_wait()
+                .expect("poll child")
+            {
+                break status;
+            }
+            assert!(
+                started.elapsed() < bound,
+                "daemon did not exit within {bound:?}; log:\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(started.elapsed() < bound, "daemon exit exceeded {bound:?}");
+        assert!(
+            status.success(),
+            "daemon exit: {status}; log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        let log = std::fs::read_to_string(&log_path).expect("daemon log");
+        assert!(log.contains("Shutdown complete"), "{log}");
+        if hold_client_open {
+            assert!(log.contains("Connection drain deadline reached"), "{log}");
+        }
+        if let Some(session_id) = session_id {
+            let db = rusqlite::Connection::open(data_dir.join(rsi_common::identity::DB_FILENAME))
+                .expect("open isolated database");
+            let (state, outcome): (String, Option<String>) = db
+                .query_row(
+                    "SELECT state,outcome FROM daemon_restart_intents WHERE session_id=?1",
+                    [&session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("durable restart intent");
+            assert_eq!(
+                state, "pending",
+                "restart intent must remain available for startup recovery; log:\n{log}"
+            );
+            assert_eq!(
+                outcome.as_deref(),
+                Some("shutdown_cancelled"),
+                "intent state: {state}; log:\n{log}"
+            );
+            let session_status: String = db
+                .query_row(
+                    "SELECT status FROM sessions WHERE id=?1",
+                    [&session_id],
+                    |row| row.get(0),
+                )
+                .expect("persisted session status");
+            assert_eq!(session_status, "Interrupted", "log:\n{log}");
+        }
+        if let Some(release) = provider_release {
+            release.send(()).expect("release isolated provider");
+        }
+        if let Some(thread) = provider_thread {
+            thread.join().expect("isolated provider thread");
+        }
+        drop(held_client);
+        child.0.take();
+    }
+
+    #[test]
+    fn idle_daemon_exits_cleanly_within_three_seconds_of_sigint() {
+        assert_isolated_sigint_exit(false, false, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn open_client_does_not_prevent_bounded_sigint_shutdown() {
+        assert_isolated_sigint_exit(true, false, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn live_provider_settles_restart_intent_within_ten_seconds_of_sigint() {
+        assert_isolated_sigint_exit(false, true, Duration::from_secs(10));
+    }
+
     #[test]
     fn startup_real_daemon_accepts_health_while_reclaim_is_held_for_two_seconds() {
         use std::os::unix::fs::PermissionsExt;
@@ -1509,7 +2036,7 @@ mod tests {
 
         let fixture = tempfile::Builder::new()
             .prefix("rsid-sr2-startup-")
-            .tempdir()
+            .tempdir_in("/tmp")
             .expect("fixture root");
         let home = fixture.path().join("home");
         let data_dir = home.join(".rsi");
@@ -1847,12 +2374,9 @@ mod tests {
         let authority_initialized = main_body
             .find("startup_milestone = \"authority_initialized\"")
             .expect("final authority milestone");
-        let startup_submit = main_body
-            .find("submit_sandbox_build_cache_reclaim_startup")
-            .expect("accepted startup reclaim submission");
-        let periodic = main_body
-            .find("Create the periodic sleeper only after startup")
-            .expect("periodic sleeper creation");
+        let maintenance = main_body
+            .find("session_manager.start_sandbox_build_cache_maintenance()")
+            .expect("startup maintenance submission");
         let request_ready = main_body
             .find("startup_milestone = \"request_ready\"")
             .expect("request-ready milestone");
@@ -1865,10 +2389,30 @@ mod tests {
         assert!(app_server < agent_spawns);
         assert!(agent_spawns < successors);
         assert!(successors < authority_initialized);
-        assert!(authority_initialized < startup_submit);
-        assert!(startup_submit < periodic);
-        assert!(periodic < request_ready);
+        assert!(authority_initialized < maintenance);
+        assert!(maintenance < request_ready);
         assert!(request_ready < accept);
+
+        let launch = include_str!("session/launch.rs");
+        let maintenance_start = launch
+            .find("pub fn start_sandbox_build_cache_maintenance")
+            .expect("maintenance producer");
+        let maintenance_end = launch[maintenance_start..]
+            .find("pub async fn recover_prepared_target_reclaims")
+            .map(|offset| maintenance_start + offset)
+            .expect("next maintenance helper");
+        let maintenance_body = &launch[maintenance_start..maintenance_end];
+        let startup_submit = maintenance_body
+            .find("self.submit_sandbox_build_cache_reclaim(false, false, \"startup\")")
+            .expect("synchronous startup submission");
+        let producer = maintenance_body
+            .find("tokio::spawn(async move")
+            .expect("periodic producer");
+        let periodic = maintenance_body
+            .find("\"periodic\"")
+            .expect("periodic submission");
+        assert!(startup_submit < producer);
+        assert!(producer < periodic);
     }
 
     #[test]

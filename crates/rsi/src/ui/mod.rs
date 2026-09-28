@@ -211,20 +211,32 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
         ),
     );
 
-    if let Some(notification) = active_transient_notification(app)
-        && let Some(notification_area) = centered_top_lane(content_area, left_width, right_width)
-    {
-        use crate::types::NotificationPriority;
-        let fg = match notification.priority {
-            NotificationPriority::High => theme::error_status(),
-            _ => theme::toast_text(),
-        };
-        frame.render_widget(
-            Paragraph::new(notification.message.as_str())
-                .style(Style::default().fg(fg).bg(bg))
-                .alignment(Alignment::Center),
-            notification_area,
-        );
+    if let Some(notification_area) = centered_top_lane(content_area, left_width, right_width) {
+        if let Some(notification) = active_transient_notification(app) {
+            use crate::types::NotificationPriority;
+            let fg = match notification.priority {
+                NotificationPriority::High => theme::error_status(),
+                _ => theme::toast_text(),
+            };
+            frame.render_widget(
+                Paragraph::new(notification.message.as_str())
+                    .style(Style::default().fg(fg).bg(bg))
+                    .alignment(Alignment::Center),
+                notification_area,
+            );
+        } else if let Some(pressure) = app.worker_slice_memory_pressure.as_ref() {
+            let fg = if pressure.full_avg60 > 10.0 {
+                theme::error_status()
+            } else {
+                theme::toast_text()
+            };
+            frame.render_widget(
+                Paragraph::new(worker_pressure_status(pressure))
+                    .style(Style::default().fg(fg).bg(bg))
+                    .alignment(Alignment::Center),
+                notification_area,
+            );
+        }
     }
 
     if right_width > 0 {
@@ -242,6 +254,18 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
     }
 
     model_dropdown_anchor(content_area)
+}
+
+fn worker_pressure_status(pressure: &rsi_common::rpc::WorkerSliceMemoryPressure) -> String {
+    let rate = pressure
+        .high_events_per_minute
+        .map(|rate| format!("{rate:.1}/min"))
+        .unwrap_or_else(|| "sampling".to_string());
+    let warning = if pressure.full_avg60 > 10.0 { "! " } else { "" };
+    format!(
+        "{warning}workers full60 {:.1}% · high {rate}",
+        pressure.full_avg60
+    )
 }
 
 fn spans_width(spans: &[Span<'_>]) -> u16 {
@@ -468,7 +492,12 @@ fn render_pane(
                 .get_mut(session_id)
                 .map(cached_table_requested_detail_width)
                 .unwrap_or(DETAIL_MAX_CONTENT_WIDTH);
-            let centered_area = compute_centered_detail_area(session_area, requested_detail_width);
+            let gutter_pct = app
+                .settings
+                .detail_column_alignment
+                .gutter_pct(app.settings.detail_column_position_pct);
+            let centered_area =
+                compute_aligned_detail_area(session_area, requested_detail_width, gutter_pct);
 
             // Compute dynamic input bar height against the FINAL (centered) width, so
             // the height pre-computation and the actual render agree exactly.
@@ -509,20 +538,7 @@ fn render_pane(
                     )
                 })
                 .unwrap_or(false);
-            let formulation_active = app
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.formulation)
-                .map(|f| {
-                    chrono::Utc::now().timestamp_millis() - f.started_at_ms
-                        < session::FORMULATION_ANIMATION_MS
-                })
-                .unwrap_or(false);
-            let show_loading_bar = is_active && content_area.height > 5 && !formulation_active;
-            // Keep redraws alive while formulation animation is running.
-            if formulation_active {
-                app.has_formulation_animation = true;
-            }
+            let show_loading_bar = is_active && content_area.height > 5;
 
             // Pre-render: update height cache with the actual inner rendering width.
             // Must account for the explicit transcript inset in render_session_detail.
@@ -551,15 +567,20 @@ fn render_pane(
                 state.last_content_area = content_area;
                 height::update_event_heights(state, content_width);
 
-                // Resolve formulation target_height sentinel and clear expired animations.
-                if let Some(ref mut form) = state.formulation {
-                    if form.target_height == 0 {
-                        if let Some(&h) = state.event_heights.get(form.event_index) {
-                            form.target_height = h as u16;
-                        }
-                    }
-                    let elapsed = chrono::Utc::now().timestamp_millis() - form.started_at_ms;
-                    if elapsed >= session::FORMULATION_ANIMATION_MS {
+                // Drop the formulation reveal when disabled or expired; while
+                // it runs, keep the redraw heartbeat alive.
+                if let Some(form) = state.formulation {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if session::formulation_progress(
+                        form,
+                        now_ms,
+                        app.settings.formulation_anim_enabled,
+                        app.settings.formulation_anim_ms,
+                    )
+                    .is_some()
+                    {
+                        app.has_formulation_animation = true;
+                    } else {
                         state.formulation = None;
                     }
                 }
@@ -913,14 +934,27 @@ fn cached_table_requested_detail_width(state: &mut crate::types::SessionState) -
 /// `DETAIL_CENTERING_ENABLE_WIDTH`; otherwise return `area` unchanged. The
 /// requested width is clamped to the available pane, so a table can use spare
 /// width but cannot force horizontal overflow.
+#[cfg(test)]
 fn compute_centered_detail_area(area: Rect, requested_width: u16) -> Rect {
+    compute_aligned_detail_area(
+        area,
+        requested_width,
+        crate::settings::DETAIL_COLUMN_CENTER_PCT,
+    )
+}
+
+/// Like `compute_centered_detail_area`, but places the column so that
+/// `gutter_pct` percent of the free width sits to its left (0 = left edge,
+/// 50 = centered, 100 = right edge). See `DetailColumnAlignment`.
+fn compute_aligned_detail_area(area: Rect, requested_width: u16, gutter_pct: u8) -> Rect {
     if area.width <= DETAIL_CENTERING_ENABLE_WIDTH {
         return area;
     }
     let target_width = area
         .width
         .min(requested_width.max(DETAIL_MAX_CONTENT_WIDTH));
-    let gutter = (area.width - target_width) / 2;
+    let free = u32::from(area.width - target_width);
+    let gutter = (free * u32::from(gutter_pct.min(100)) / 100) as u16;
     Rect::new(area.x + gutter, area.y, target_width, area.height)
 }
 
@@ -1162,6 +1196,27 @@ mod tests {
     }
 
     #[test]
+    fn top_chrome_shows_live_worker_pressure_warning() {
+        let mut app = fixture_app();
+        app.worker_slice_memory_pressure = Some(rsi_common::rpc::WorkerSliceMemoryPressure {
+            high_events: 42,
+            high_events_per_minute: Some(6.0),
+            full_avg60: 12.5,
+        });
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_top_chrome(frame, Rect::new(0, 0, 100, 1), &app);
+            })
+            .expect("draw");
+        assert!(
+            buffer_text(terminal.backend().buffer())
+                .contains("! workers full60 12.5% · high 6.0/min")
+        );
+    }
+
+    #[test]
     fn model_dropdown_anchor_present_whenever_area_nonzero() {
         assert!(model_dropdown_anchor(Rect::new(0, 0, 80, 1)).is_some());
         assert!(model_dropdown_anchor(Rect::new(5, 2, 1, 1)).is_some());
@@ -1254,6 +1309,32 @@ mod tests {
             assert_eq!(result.y, area.y);
             assert_eq!(result.height, area.height);
         }
+    }
+
+    #[test]
+    fn compute_aligned_detail_area_places_column_by_gutter_share() {
+        let area = Rect::new(5, 0, 200, 40);
+        let left = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 0);
+        assert_eq!(left.x, area.x);
+        assert_eq!(left.width, DETAIL_MAX_CONTENT_WIDTH);
+
+        let right = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 100);
+        assert_eq!(right.x + right.width, area.x + area.width);
+
+        let quarter = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 25);
+        assert_eq!(quarter.x, area.x + 25);
+
+        let centered = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 50);
+        assert_eq!(
+            centered,
+            compute_centered_detail_area(area, DETAIL_MAX_CONTENT_WIDTH)
+        );
+
+        let narrow = Rect::new(0, 0, DETAIL_CENTERING_ENABLE_WIDTH, 40);
+        assert_eq!(
+            compute_aligned_detail_area(narrow, DETAIL_MAX_CONTENT_WIDTH, 0),
+            narrow
+        );
     }
 
     #[test]

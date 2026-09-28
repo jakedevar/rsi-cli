@@ -3,7 +3,7 @@
 use rsi_common::harness_manager::HarnessManagerConfigV1;
 use rsi_common::harness_manager_v2::*;
 use rsi_common::types::SessionStatus;
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -64,13 +64,104 @@ impl Store {
         config: &HarnessManagerConfigV1,
         epic: Uuid,
     ) -> Result<(i64, bool)> {
-        let Some(record) = self.manager_v2_record(config, LEAD_PAUSE_KIND, &epic.to_string())?
-        else {
-            return Ok((0, false));
+        if let Some(record) = self.manager_v2_record(config, LEAD_PAUSE_KIND, &epic.to_string())? {
+            let pause: ManagerLeadPauseV2 = serde_json::from_value(record.payload)
+                .map_err(|_| refused("manager_v2_pause_malformed"))?;
+            return Ok((record.row_version, pause.paused));
+        }
+        Ok((
+            0,
+            self.manager_v2_previous_lead_pause(config, epic)?
+                .is_some_and(|p| p.paused),
+        ))
+    }
+
+    /// A retirement stop belongs to automatic intent recovery. Explicit
+    /// manager actions must remain available to settle work on that Epic.
+    pub(crate) fn manager_v2_action_pause(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<(i64, bool)> {
+        let (version, paused) = self.manager_v2_lead_pause(config, epic)?;
+        if !paused {
+            return Ok((version, false));
+        }
+        let pause = match self.manager_v2_record(config, LEAD_PAUSE_KIND, &epic.to_string())? {
+            Some(record) => Some(
+                serde_json::from_value::<ManagerLeadPauseV2>(record.payload)
+                    .map_err(|_| refused("manager_v2_pause_malformed"))?,
+            ),
+            None => self.manager_v2_previous_lead_pause(config, epic)?,
         };
-        let pause: ManagerLeadPauseV2 = serde_json::from_value(record.payload)
-            .map_err(|_| refused("manager_v2_pause_malformed"))?;
-        Ok((record.row_version, pause.paused))
+        let Some(pause) = pause.filter(|pause| pause.paused) else {
+            return Ok((version, false));
+        };
+        // The free-form PauseLead reason cannot identify retirement: prove
+        // that this pause was written by an admitted retirement operation.
+        let retirement: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_v2_operations
+             WHERE id=?1 AND project_id=?2 AND kind='lifecycle_action'
+               AND json_extract(payload_json,'$.request.operation.action')='retire_lead_continuations')",
+            params![pause.operation_id.to_string(), config.project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok((version, !retirement))
+    }
+
+    fn manager_v2_previous_lead_pause(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<Option<ManagerLeadPauseV2>> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM harness_manager_v2_records
+             WHERE project_id=?1 AND scope_version<?2 AND kind=?3
+               AND epic_id=?4 AND record_key=?4
+             ORDER BY scope_version DESC LIMIT 1",
+                params![
+                    config.project_id.to_string(),
+                    config.row_version,
+                    LEAD_PAUSE_KIND,
+                    epic.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| refused("manager_v2_pause_malformed"))
+            })
+            .transpose()
+    }
+
+    /// Materialize an inherited stop before recovery or explicit action
+    /// admission captures a pause version. A local clear always wins.
+    pub(crate) fn manager_v2_inherit_lead_pause(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<()> {
+        if self
+            .manager_v2_record(config, LEAD_PAUSE_KIND, &epic.to_string())?
+            .is_none()
+        {
+            if let Some(pause) = self
+                .manager_v2_previous_lead_pause(config, epic)?
+                .filter(|p| p.paused)
+            {
+                self.manager_v2_record_changed(
+                    config,
+                    LEAD_PAUSE_KIND,
+                    &epic.to_string(),
+                    Some(epic),
+                    &serde_json::to_value(pause)?,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     // Caller holds the action admission transaction and has checked exact
@@ -108,6 +199,7 @@ impl Store {
         expected_version: i64,
         cleared_by: &str,
     ) -> Result<()> {
+        self.manager_v2_inherit_lead_pause(config, epic)?;
         let Some(record) = self.manager_v2_record(config, LEAD_PAUSE_KIND, &epic.to_string())?
         else {
             return Ok(());
@@ -144,6 +236,7 @@ impl Store {
                     .is_some_and(|e| e.lead_session_id == Some(session))
                 {
                     if let Some(config) = self.get_harness_manager(project)? {
+                        self.manager_v2_inherit_lead_pause(&config, epic)?;
                         let (version, _) = self.manager_v2_lead_pause(&config, epic)?;
                         self.manager_v2_clear_lead_pause(
                             &config,
@@ -230,7 +323,7 @@ impl Store {
     pub(crate) fn reconcile_manager_intent(
         &self,
         project: Uuid,
-        retry_enabled: bool,
+        _retry_enabled: bool,
     ) -> Result<ManagerIntentReconciliationV2> {
         let mut result = ManagerIntentReconciliationV2::default();
         let Some(config) = self.get_harness_manager(project)? else {
@@ -271,6 +364,7 @@ impl Store {
         });
         let mut candidates = Vec::new();
         for epic in epics {
+            self.manager_v2_inherit_lead_pause(&config, epic)?;
             let members: Vec<_> = cohort.iter().filter(|m| m.epic_id == Some(epic)).collect();
             let items: Vec<_> = work
                 .iter()
@@ -390,14 +484,7 @@ impl Store {
                 state["state"] = json!("monitoring");
                 state["reason"] = json!("ready_work_idle");
             } else if let Some(lead) = lead {
-                match self.manager_v2_intent_action(
-                    &config,
-                    &grant,
-                    epic,
-                    &lead,
-                    &ready,
-                    retry_enabled,
-                ) {
+                match self.manager_v2_intent_action(&config, &grant, epic, &lead, &ready) {
                     Ok(action) => {
                         // Do not publish a transient state before admission.
                         // A refused candidate must have one stable semantic
@@ -549,7 +636,6 @@ impl Store {
         epic: Uuid,
         lead: &rsi_common::types::Session,
         ready: &[&Value],
-        retry_enabled: bool,
     ) -> Result<AgentManagerControlRequestV2> {
         self.manager_action_human_gate(lead.id)?;
         if self.manager_v2_lead_pause(config, epic)?.1 {
@@ -562,8 +648,10 @@ impl Store {
         {
             return Err(refused("manager_v2_lead_control_grant_required"));
         }
-        if lead.status == SessionStatus::Failed && !retry_enabled {
-            return Err(refused("manager_v2_retry_disabled"));
+        // Only the operator's explicit launch allowlist authorizes automatic
+        // recovery. Explicit manager actions have their own admission path.
+        if grant.policy.allowed_launches.is_empty() {
+            return Err(refused("manager_v2_intent_launch_allowlist_required"));
         }
         let used:i64=self.conn.query_row("SELECT COUNT(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind='lifecycle_action' AND json_extract(payload_json,'$.origin.origin')='operating_intent' AND json_extract(payload_json,'$.request.operation.epic_id')=?4",params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,epic.to_string()],|r|r.get(0))?;
         if used >= i64::from(grant.policy.max_recovery_attempts) {
@@ -574,14 +662,7 @@ impl Store {
             model: model.clone(),
             effort: lead.effort.clone(),
         });
-        // An empty list leaves launch choice unrestricted. Automatic recovery
-        // retains the current lead's configuration; explicit manager actions
-        // can choose another valid provider/model/effort when needed.
-        let mut choices = if grant.policy.allowed_launches.is_empty() {
-            current.iter().cloned().collect()
-        } else {
-            grant.policy.allowed_launches.clone()
-        };
+        let mut choices = grant.policy.allowed_launches.clone();
         choices.sort_by_key(|choice| Some(choice) != current.as_ref());
         let choice = choices
             .into_iter()
@@ -608,29 +689,36 @@ impl Store {
         let message = format!(
             "Continue the operator's persisted Execute intent for this Epic. An ordinary completed provider turn does not finish the declared work. Read AgentManagerInspect work/requests/decisions for current scope and exact fences. Preserve operator decisions and existing custody. Gather independent acceptance evidence, obey dependencies and coordinate rolling integration through the established lead workflow. Ready work (first 16; inspect for all):\n{work_summary}"
         );
-        let operation = if lead.status == SessionStatus::Failed {
-            ManagerActionV2::RetryLead {
-                epic_id: epic,
-                expected,
-                message,
-                launch: Some(choice),
-            }
-        } else if Some(&choice) == current.as_ref()
-            && lead.provider != rsi_common::types::SessionProvider::CodexAppServer
-        {
-            ManagerActionV2::ResumeLead {
-                epic_id: epic,
-                expected,
-                message,
-            }
-        } else {
-            ManagerActionV2::ReplaceLead {
-                epic_id: epic,
-                expected,
-                query: message,
-                launch: choice,
-            }
-        };
+        // A missing tool output may represent an uncertain mutation. Keep it
+        // available to an explicit guarded retry_lead, but do not let Execute
+        // intent choose that boundary automatically.
+        if self.manager_lead_invalid_tool_history(lead)? {
+            return Err(refused("manager_v2_transcript_manual_recovery_required"));
+        }
+        let operation =
+            if lead.status == SessionStatus::Failed || self.manager_lead_torn_tail(lead)? {
+                ManagerActionV2::RetryLead {
+                    epic_id: epic,
+                    expected,
+                    message,
+                    launch: Some(choice),
+                }
+            } else if Some(&choice) == current.as_ref()
+                && lead.provider != rsi_common::types::SessionProvider::CodexAppServer
+            {
+                ManagerActionV2::ResumeLead {
+                    epic_id: epic,
+                    expected,
+                    message,
+                }
+            } else {
+                ManagerActionV2::ReplaceLead {
+                    epic_id: epic,
+                    expected,
+                    query: message,
+                    launch: choice,
+                }
+            };
         let decision_versions = self.manager_v2_decision_generation(config, Some(epic))?;
         // Cross-Epic/transitive prerequisite revisions can invalidate and
         // restore readiness without changing this work row or lead cursor.

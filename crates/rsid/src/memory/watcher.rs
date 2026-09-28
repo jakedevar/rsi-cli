@@ -194,6 +194,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_create_md() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -204,6 +205,7 @@ mod tests {
         assert!(should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_modify_md() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -214,6 +216,7 @@ mod tests {
         assert!(should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_remove_md() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -224,6 +227,7 @@ mod tests {
         assert!(should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_non_md() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -234,6 +238,7 @@ mod tests {
         assert!(!should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_ignored_dir() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -244,6 +249,7 @@ mod tests {
         assert!(!should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_node_modules() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -254,6 +260,7 @@ mod tests {
         assert!(!should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_should_process_event_access() {
         let watch_dir = PathBuf::from("/tmp/memory");
@@ -264,6 +271,7 @@ mod tests {
         assert!(!should_process_event(&event, &watch_dir));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_debounce_coalesces_events() {
         let (raw_tx, raw_rx) = mpsc::channel::<()>(16);
@@ -297,6 +305,7 @@ mod tests {
         let _ = task.await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_debounce_fires_after_quiet_period() {
         let (raw_tx, raw_rx) = mpsc::channel::<()>(16);
@@ -324,6 +333,7 @@ mod tests {
         let _ = task.await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn test_debounce_separate_windows() {
         let (raw_tx, raw_rx) = mpsc::channel::<()>(16);

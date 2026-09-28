@@ -543,6 +543,7 @@ pub fn spawn_reconciliation_loop_with_heartbeat(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_reconciliation_reason_serde_roundtrip() {
         for reason in [
@@ -556,6 +557,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_reconciliation_config_default() {
         let config = ReconciliationConfig::default();
@@ -568,6 +570,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_stall_action_from_str() {
         assert_eq!(StallAction::from_str("notify"), StallAction::Notify);
@@ -581,6 +584,7 @@ mod tests {
         assert_eq!(StallAction::from_str("INTERRUPT"), StallAction::Interrupt);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn d05_reconciliation_executes_bounded_dry_run_without_mutation() {
         let store = Store::open_in_memory().unwrap();
@@ -697,6 +701,7 @@ mod tests {
         /// in-memory map has its surviving stamped subprocess SIGKILLed **and**
         /// its row flipped to `Failed` — the reap runs inside the same Failed-flip
         /// loop, structurally before the flip.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn reaps_orphan_before_marking_failed() {
             let sid = Uuid::new_v4();
@@ -746,6 +751,7 @@ mod tests {
         /// failing. A live process stamped with a DIFFERENT session id (a foreign
         /// session / the daemon analogue) is never touched — the crashed-daemon
         /// reap cannot misfire onto an unrelated process.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn does_not_reap_unrelated_stamped_process() {
             let failing = Uuid::new_v4();
@@ -795,6 +801,7 @@ mod tests {
         /// session is in the map when reconcile snapshots it, so the difference
         /// set excludes it; the fresh `contains_key` re-check is the second line
         /// of defense for the stale-snapshot race.)
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn does_not_reap_tracked_live_session() {
             use crate::session::types::TrackedSession;
@@ -845,6 +852,7 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }
 
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn orphan_proof_failure_retains_active_like_row_for_retry() {
             let sid = Uuid::new_v4();
@@ -878,6 +886,7 @@ mod tests {
         /// A finalizer removes the active entry before SQLite records its
         /// terminal status. That interval remains owned by the finalizer;
         /// reconciliation must leave it alone and honor the eventual status.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn settling_turn_keeps_terminal_status_during_reconciliation() {
             let sid = Uuid::new_v4();
@@ -913,6 +922,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn d03_controller_reconciliation_clears_process_local_grants() -> anyhow::Result<()> {
         use crate::config::{Config, RuntimeConfig};

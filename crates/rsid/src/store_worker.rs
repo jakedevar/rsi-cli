@@ -408,6 +408,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_insert_session_via_worker() {
         let (_dir, store) = test_store();
@@ -419,6 +420,7 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_update_status_via_worker() {
         let (_dir, store) = test_store();
@@ -434,6 +436,7 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_insert_event_via_worker() {
         let (_dir, store) = test_store();
@@ -463,6 +466,7 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_shutdown_drains_remaining() {
         let (_dir, store) = test_store();
@@ -492,6 +496,7 @@ mod tests {
         assert_eq!(metrics.queue_depth(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_channel_full_returns_error() {
         let (_dir, store) = test_store();
@@ -513,6 +518,7 @@ mod tests {
         let _ = handle.shutdown();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_insert_turn_metric_via_worker() {
         let (_dir, store) = test_store();
@@ -545,6 +551,7 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_attach_project_via_worker() {
         let (_dir, store) = test_store();
@@ -559,6 +566,7 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_queue_depth_tracks_pending_commands() {
         let (_dir, store) = test_store();
@@ -590,6 +598,7 @@ mod tests {
         assert_eq!(handle.queue_depth(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_last_command_duration_updated() {
         let (_dir, store) = test_store();
@@ -609,6 +618,7 @@ mod tests {
         let _duration = handle.last_command_duration_ms();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_queue_depth_zero_after_shutdown_drain() {
         let (_dir, store) = test_store();

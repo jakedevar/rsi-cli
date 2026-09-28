@@ -503,7 +503,8 @@ impl Store {
                     source: DaemonError::Database(source),
                 })?;
         let changed = tx.execute(
-            "UPDATE sessions SET status = 'Archived', pending_archive = 0, updated_at = ?1 WHERE id = ?2",
+            "UPDATE sessions SET status = 'Archived', pending_archive = 0,
+                    retry_attempt = COALESCE(max_retries, retry_attempt), updated_at = ?1 WHERE id = ?2",
             params![now_nanos(), session_id.to_string()],
         ).map_err(|source| C5TransitionError::Retryable {
             operation: "archive_status",
@@ -519,6 +520,12 @@ impl Store {
         .map_err(|source| C5TransitionError::Retryable {
             operation: "archive_marker_delete",
             source: DaemonError::Database(source),
+        })?;
+        super::Store::cancel_queued_recovery_for_archive_on(&tx, session_id).map_err(|source| {
+            C5TransitionError::Retryable {
+                operation: "archive_recovery_cancel",
+                source,
+            }
         })?;
         commit_c5_transaction(tx, "archive_commit")?;
         Ok(C5SuppressionOutcome::Committed)
@@ -824,6 +831,13 @@ impl Store {
 }
 
 fn daemon_setting_text_to_json(field: &str, raw: &str) -> serde_json::Value {
+    if field.starts_with("api_route.openrouter") {
+        return if raw == "null" {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(raw.to_string())
+        };
+    }
     match field {
         "title_model_base_url"
         | "memory_model_fallback_base_url"
@@ -945,6 +959,93 @@ pub fn persist_sandbox_build_cache_config_update(
     Ok(true)
 }
 
+/// Replay a memory high/max pair together so either legitimate update order
+/// survives restart and a corrupt pair cannot be half-published.
+fn complete_scope_memory_pair(
+    default_high: u64,
+    default_max: u64,
+    saved_high: Option<u64>,
+    saved_max: Option<u64>,
+) -> (u64, u64) {
+    match (saved_high, saved_max) {
+        (Some(high), Some(max)) => (high, max),
+        (Some(high), None) => (high, default_max.max(high.saturating_add(1))),
+        (None, Some(max)) => (default_high.min(max.saturating_sub(1)), max),
+        (None, None) => (default_high, default_max),
+    }
+}
+
+fn apply_persisted_scope_memory_pair(
+    store: &Store,
+    runtime_config: &crate::config::RuntimeConfig,
+    high_field: &str,
+    max_field: &str,
+) -> Result<usize> {
+    let high_raw = store.get_daemon_setting(high_field)?;
+    let max_raw = store.get_daemon_setting(max_field)?;
+    if high_raw.is_none() && max_raw.is_none() {
+        return Ok(0);
+    }
+    let defaults = runtime_config.to_json();
+    let saved_high = high_raw
+        .as_deref()
+        .and_then(|raw| daemon_setting_text_to_json(high_field, raw).as_u64());
+    let saved_max = max_raw
+        .as_deref()
+        .and_then(|raw| daemon_setting_text_to_json(max_field, raw).as_u64());
+    let pair = if (high_raw.is_some() && saved_high.is_none())
+        || (max_raw.is_some() && saved_max.is_none())
+    {
+        None
+    } else {
+        Some(complete_scope_memory_pair(
+            defaults[high_field]
+                .as_u64()
+                .expect("numeric scope default"),
+            defaults[max_field].as_u64().expect("numeric scope default"),
+            saved_high,
+            saved_max,
+        ))
+    };
+    let valid = pair.filter(|(high, max)| {
+        (crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MIN
+            ..=crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MAX)
+            .contains(high)
+            && (crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MIN
+                ..=crate::config::RSID_SCOPE_MEMORY_LIMIT_MIB_MAX)
+                .contains(max)
+            && high < max
+    });
+    let Some((high, max)) = valid else {
+        tracing::warn!(
+            high_field,
+            max_field,
+            high = ?high_raw,
+            max = ?max_raw,
+            "Ignoring invalid persisted systemd scope memory pair"
+        );
+        return Ok(0);
+    };
+
+    // Both target values have been validated. Choose an order that keeps the
+    // invariant true at each atomic field write, including pairs entirely
+    // above or below the defaults. Boot replay has no concurrent readers.
+    let current_max = defaults[max_field]
+        .as_u64()
+        .expect("scope default is numeric");
+    let ordered = if high >= current_max {
+        [(max_field, max), (high_field, high)]
+    } else {
+        [(high_field, high), (max_field, max)]
+    };
+    for (field, value) in ordered {
+        runtime_config
+            .update_field(field, &serde_json::json!(value))
+            .expect("validated scope memory pair replays in invariant-preserving order");
+    }
+    Ok(usize::from(high_raw.is_some()) + usize::from(max_raw.is_some()))
+}
+
 /// Re-apply durable RuntimeConfig rows from SQLite to a freshly-created
 /// `RuntimeConfig`. Invalid rows are ignored with a warning so a corrupt
 /// setting cannot prevent the daemon from booting.
@@ -986,8 +1087,26 @@ pub fn apply_persisted_runtime_config(
             "Ignoring incomplete persisted target-cache watermark pair"
         ),
     }
+    for (high, max) in [
+        ("rsid_scope_memory_high_mib", "rsid_scope_memory_max_mib"),
+        (
+            "worker_scope_memory_high_mib",
+            "worker_scope_memory_max_mib",
+        ),
+    ] {
+        applied += apply_persisted_scope_memory_pair(store, runtime_config, high, max)?;
+    }
     for field in crate::config::PERSISTED_RUNTIME_CONFIG_FIELDS {
-        if *field == high_field || *field == low_field {
+        if *field == high_field
+            || *field == low_field
+            || matches!(
+                *field,
+                "rsid_scope_memory_high_mib"
+                    | "rsid_scope_memory_max_mib"
+                    | "worker_scope_memory_high_mib"
+                    | "worker_scope_memory_max_mib"
+            )
+        {
             continue;
         }
         let Some(raw) = store.get_daemon_setting(field)? else {
@@ -1006,6 +1125,23 @@ pub fn apply_persisted_runtime_config(
                 error = %e,
                 "Ignoring invalid persisted daemon setting"
             ),
+        }
+    }
+    let mut routes = store.conn.prepare(
+        "SELECT key, value FROM daemon_settings WHERE key LIKE 'api_route.openrouter.%'",
+    )?;
+    let rows = routes.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (field, raw) = row?;
+        if crate::config::is_persisted_runtime_config_field(&field) {
+            if runtime_config
+                .update_field(&field, &daemon_setting_text_to_json(&field, &raw))
+                .is_ok()
+            {
+                applied += 1;
+            }
         }
     }
     Ok(applied)
@@ -1162,6 +1298,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn legacy_memory_import_keeps_existing_rows_when_state_json_differs() {
@@ -1191,6 +1328,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn legacy_memory_import_seeds_rows_from_state_json_when_absent() {
@@ -1212,6 +1350,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn legacy_memory_import_is_idempotent() {
@@ -1252,6 +1391,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn legacy_memory_import_writes_nothing_without_state_json_value() {
@@ -1279,6 +1419,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn daemon_settings_get_missing_returns_none() {
         let tmp = tempdir().unwrap();
@@ -1289,6 +1430,7 @@ mod tests {
         assert!(v.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn daemon_settings_upsert_roundtrip() {
         let tmp = tempdir().unwrap();
@@ -1334,6 +1476,7 @@ mod tests {
         assert!(ts2 > ts1, "updated_at should advance: ts1={ts1}, ts2={ts2}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn runtime_config_field_persistence_roundtrip() {
         let tmp = tempdir().unwrap();
@@ -1370,6 +1513,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn runtime_config_bool_field_persistence_roundtrip() {
         let tmp = tempdir().unwrap();
@@ -1398,6 +1542,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn daemon_settings_restarts_target_cache_watermark_pairs_exactly() {
         let tmp = tempdir().unwrap();
@@ -1427,6 +1572,113 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn daemon_settings_restarts_raised_and_lowered_scope_memory_pairs() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let config = crate::config::Config::from_env();
+
+        for (prefix, high, max) in [
+            ("rsid_scope", 8192_u64, 12_288_u64),
+            ("rsid_scope", 4096, 5120),
+            ("worker_scope", 8192, 12_288),
+            ("worker_scope", 4096, 5120),
+        ] {
+            let high_field = format!("{prefix}_memory_high_mib");
+            let max_field = format!("{prefix}_memory_max_mib");
+            store
+                .set_daemon_setting(&high_field, &high.to_string())
+                .unwrap();
+            store
+                .set_daemon_setting(&max_field, &max.to_string())
+                .unwrap();
+            let restarted = crate::config::RuntimeConfig::from_config(&config);
+            apply_persisted_runtime_config(&store, &restarted).unwrap();
+            let snapshot = restarted.to_json();
+            assert_eq!(snapshot[high_field.as_str()], high, "{prefix} high");
+            assert_eq!(snapshot[max_field.as_str()], max, "{prefix} max");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn daemon_settings_replays_one_sided_worker_limits_across_host_defaults() {
+        assert_eq!(
+            complete_scope_memory_pair(18_000, 23_000, None, Some(8192)),
+            (8191, 8192)
+        );
+        assert_eq!(
+            complete_scope_memory_pair(6144, 8192, Some(16_384), None),
+            (16_384, 16_385)
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_daemon_setting("worker_scope_memory_max_mib", "8192")
+            .unwrap();
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(1_048_576))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_high_mib", &serde_json::json!(16_384))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(20_000))
+            .unwrap();
+        apply_persisted_runtime_config(&store, &runtime).unwrap();
+        let snapshot = runtime.to_json();
+        assert_eq!(snapshot["worker_scope_memory_high_mib"], 8191);
+        assert_eq!(snapshot["worker_scope_memory_max_mib"], 8192);
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_daemon_setting("worker_scope_memory_high_mib", "16384")
+            .unwrap();
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(1_048_576))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_high_mib", &serde_json::json!(6144))
+            .unwrap();
+        runtime
+            .update_field("worker_scope_memory_max_mib", &serde_json::json!(8192))
+            .unwrap();
+        apply_persisted_runtime_config(&store, &runtime).unwrap();
+        let snapshot = runtime.to_json();
+        assert_eq!(snapshot["worker_scope_memory_high_mib"], 16_384);
+        assert_eq!(snapshot["worker_scope_memory_max_mib"], 16_385);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn daemon_settings_ignores_invalid_scope_memory_pair_as_a_unit() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        store
+            .set_daemon_setting("worker_scope_memory_high_mib", "8192")
+            .unwrap();
+        store
+            .set_daemon_setting("worker_scope_memory_max_mib", "4096")
+            .unwrap();
+        let restarted =
+            crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        let defaults = restarted.to_json();
+        apply_persisted_runtime_config(&store, &restarted).unwrap();
+        let snapshot = restarted.to_json();
+        assert_eq!(
+            snapshot["worker_scope_memory_high_mib"],
+            defaults["worker_scope_memory_high_mib"]
+        );
+        assert_eq!(
+            snapshot["worker_scope_memory_max_mib"],
+            defaults["worker_scope_memory_max_mib"]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn daemon_settings_rejects_incomplete_or_invalid_watermark_pairs_atomically() {
         let tmp = tempdir().unwrap();
@@ -1459,6 +1711,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn canonical_target_cache_setting_failure_leaves_existing_row_unchanged() {
         let tmp = tempdir().unwrap();
@@ -1480,6 +1733,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_seeds_default_when_state_json_absent() {
         let tmp = tempdir().unwrap();
@@ -1492,6 +1746,7 @@ mod tests {
         assert_eq!(row.as_deref(), Some("default"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_imports_concise_from_state_json() {
         let tmp = tempdir().unwrap();
@@ -1506,6 +1761,7 @@ mod tests {
         assert_eq!(row.as_deref(), Some("concise"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_imports_caveman_alias() {
         let tmp = tempdir().unwrap();
@@ -1521,6 +1777,7 @@ mod tests {
         assert_eq!(result, "caveman");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_imports_code_only_label_alias() {
         let tmp = tempdir().unwrap();
@@ -1537,6 +1794,7 @@ mod tests {
         assert_eq!(result, "code-only");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_is_idempotent() {
         let tmp = tempdir().unwrap();
@@ -1567,6 +1825,7 @@ mod tests {
         assert_eq!(row.as_deref(), Some("concise"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_handles_corrupt_state_json() {
         let tmp = tempdir().unwrap();
@@ -1580,6 +1839,7 @@ mod tests {
         assert_eq!(row.as_deref(), Some("default"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn import_legacy_system_prompt_preset_handles_unknown_variant() {
         let tmp = tempdir().unwrap();

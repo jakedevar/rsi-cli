@@ -153,6 +153,7 @@ fn parse_contradict_line(line: &str) -> Option<(Uuid, Uuid, String)> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_infer_line_valid() {
         let id1 = Uuid::new_v4();
@@ -165,6 +166,7 @@ mod tests {
         assert!(sources.contains(&id2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_infer_line_no_sources() {
         let line = "INFER: Standalone inference";
@@ -173,12 +175,14 @@ mod tests {
         assert!(sources.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_infer_line_empty_content() {
         let line = "INFER:  SOURCES: some-uuid";
         assert!(parse_infer_line(line).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_supersede_line_valid() {
         let id = Uuid::new_v4();
@@ -187,12 +191,14 @@ mod tests {
         assert_eq!(parsed, id);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_supersede_line_invalid_uuid() {
         let line = "SUPERSEDE: not-a-uuid REASON: whatever";
         assert!(parse_supersede_line(line).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_contradict_line_valid() {
         let id1 = Uuid::new_v4();
@@ -204,12 +210,14 @@ mod tests {
         assert_eq!(reason, "one says X, other says Y");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_contradict_line_invalid() {
         let line = "CONTRADICT: invalid format";
         assert!(parse_contradict_line(line).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_response_mixed() {
         let id1 = Uuid::new_v4();
@@ -263,6 +271,7 @@ mod tests {
         assert_eq!(result.contradictions[0].1, id2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_parse_response_empty() {
         let result = DeductionSpecialist::parse_response("", &[], None);

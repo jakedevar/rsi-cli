@@ -247,6 +247,7 @@ fn git_common_dir(root: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn external_checkout_requires_same_registered_repository() {
         let primary = tempfile::tempdir().unwrap();

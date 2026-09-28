@@ -506,6 +506,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_answer_is_exact_replayable_and_keeps_question_until_delivery() {
         let store = Store::open_in_memory().unwrap();
@@ -547,6 +548,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_old_answer_cannot_clear_new_same_text_question() {
         let store = Store::open_in_memory().unwrap();
@@ -576,6 +578,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_restart_recovers_pre_effect_and_preserves_post_effect_uncertainty() {
         let dir = tempfile::tempdir().unwrap();
@@ -650,6 +653,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_policy_revocation_prevents_queued_delivery() {
         let store = Store::open_in_memory().unwrap();
@@ -700,6 +704,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_terminal_settlement_survives_appointment_revocation() {
         use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
@@ -745,6 +750,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn manager_v2_decision_before_effect_failure_allows_new_exact_operator_attempt() {
         let store = Store::open_in_memory().unwrap();

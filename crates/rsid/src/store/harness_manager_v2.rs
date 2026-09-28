@@ -40,7 +40,7 @@ pub(super) const BOOKKEEPING_LIMIT: i64 = 1024;
 /// archived bookkeeping history never enters the scanned range. The trailing
 /// request-marker exclusion (#664) only narrows it: a stricter WHERE still
 /// implies the partial-index WHERE, so the released index DDL is unchanged.
-pub(super) const COORDINATION_BUDGET_COUNT_SQL: &str = "SELECT count(*) FROM harness_manager_v2_records INDEXED BY harness_manager_v2_coordination_budget WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind NOT IN ('retrieval','resource_spend','resource_launch_origin','lifecycle_context','lifecycle_execution','lifecycle_hold') AND NOT (kind='decision_generation' OR (kind IN ('decision','decision_target') AND substr(record_key,1,9)='approval:') OR (kind='decision_delivery' AND json_extract(payload_json,'$.target.kind') IS 'appserver_approval') OR (kind='decision_retrieval' AND (substr(record_key,1,17)='manager:approval:' OR substr(record_key,1,14)='lead:approval:'))) AND kind NOT IN ('request_released','request_settle','request_rollover','request_unsettled')";
+pub(super) const COORDINATION_BUDGET_COUNT_SQL: &str = "SELECT count(*) FROM harness_manager_v2_records INDEXED BY harness_manager_v2_coordination_budget WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind NOT IN ('retrieval','resource_spend','resource_launch_origin','lifecycle_context','lifecycle_execution','lifecycle_hold') AND NOT (kind='decision_generation' OR (kind IN ('decision','decision_target') AND substr(record_key,1,9)='approval:') OR (kind='decision_delivery' AND json_extract(payload_json,'$.target.kind') IS 'appserver_approval') OR (kind='decision_retrieval' AND (substr(record_key,1,17)='manager:approval:' OR substr(record_key,1,14)='lead:approval:'))) AND kind NOT IN ('request_released','request_settle','request_rollover','request_unsettled') AND NOT (kind='request' AND json_extract(payload_json,'$.execution_evidence.kind') IN ('attributed_reply','manager_disposition'))";
 
 /// Server-owned #664/#656 request markers, each its own bookkeeping class
 /// (see [`bookkeeping_class`]) excluded from the coordination count above. A
@@ -228,6 +228,16 @@ impl Store {
         target: Uuid,
         mutation: bool,
     ) -> Result<Option<super::harness_manager::ManagerSessionScope>> {
+        self.manager_session_control_scope_with_soft_restart(caller, target, mutation, false)
+    }
+
+    pub(crate) fn manager_session_control_scope_with_soft_restart(
+        &self,
+        caller: Uuid,
+        target: Uuid,
+        mutation: bool,
+        allow_soft_restart: bool,
+    ) -> Result<Option<super::harness_manager::ManagerSessionScope>> {
         let Some(scope) = self.manager_session_scope(caller, target)? else {
             return Ok(None);
         };
@@ -253,11 +263,15 @@ impl Store {
         {
             return Err(refused("manager_v2_paused"));
         }
-        self.manager_session_control_human_gate(target)?;
+        self.manager_session_control_human_gate(target, allow_soft_restart)?;
         Ok(Some(scope))
     }
 
-    fn manager_session_control_human_gate(&self, target: Uuid) -> Result<()> {
+    fn manager_session_control_human_gate(
+        &self,
+        target: Uuid,
+        allow_soft_restart: bool,
+    ) -> Result<()> {
         let held: bool = self.conn.query_row(
             "SELECT pending_question_json IS NOT NULL OR status='WaitingApproval'
              OR EXISTS(SELECT 1 FROM approvals a WHERE a.session_id=?1 AND a.status='Pending'
@@ -265,11 +279,11 @@ impl Store {
                    WHERE p.approval_id=a.id AND (p.closure_state='closed' OR p.state='superseded')))
              OR EXISTS(SELECT 1 FROM appserver_approval_publications
                  WHERE session_id=?1 AND closure_state<>'closed' AND state<>'superseded')
-             OR EXISTS(SELECT 1 FROM daemon_settings WHERE key=?2 AND value<>'false')
+             OR EXISTS(SELECT 1 FROM daemon_settings WHERE key=?2 AND value<>'false' AND (NOT ?3 OR value<>'soft'))
              FROM sessions WHERE id=?1",
             params![
                 target.to_string(),
-                format!("manager_operator_pause:{target}")
+                format!("manager_operator_pause:{target}"), allow_soft_restart
             ],
             |row| row.get(0),
         )?;
@@ -588,7 +602,13 @@ impl Store {
                         return Err(refused(code));
                     }
                 }
-            } else if !super::manager_decision_history::native_history(kind, key, payload) {
+            } else if !(super::manager_decision_history::native_history(kind, key, payload)
+                || (kind == "request"
+                    && matches!(
+                        payload["execution_evidence"]["kind"].as_str(),
+                        Some("attributed_reply" | "manager_disposition")
+                    )))
+            {
                 let count: i64 = self.conn.query_row(
                     COORDINATION_BUDGET_COUNT_SQL,
                     params![
@@ -951,11 +971,10 @@ impl Store {
             // resolve it from the accepted source's work record.
             if let Some(epic) = epic {
                 self.manager_v2_decision_gate(&authority.config, epic)?;
-                // RME-S2A-001: Check lead pause. manager_action_runtime_gate_on
-                // applies this for lead/container actions; integrate must
-                // also respect a paused Epic lead. There is no explicit
-                // resume for integrate, so any paused lead blocks it.
-                let (_, lead_paused) = self.manager_v2_lead_pause(&authority.config, epic)?;
+                // RME-S2A-001: Match the runtime action pause gate. A
+                // retirement stop fences automatic intent recovery while
+                // leaving explicit manager integration available.
+                let (_, lead_paused) = self.manager_v2_action_pause(&authority.config, epic)?;
                 if lead_paused {
                     return Err(refused("manager_v2_manager_paused"));
                 }
@@ -1333,6 +1352,7 @@ mod tests {
         (project, manager, epic, [lead.id, worker.id, nested.id])
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn manager_progress_default_keeps_own_cohort_with_large_scoped_epic() {
@@ -1361,6 +1381,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used, clippy::too_many_lines)]
     fn manager_session_control_reads_and_mutation_gates_cover_lead_worker_and_nested_worker() {
@@ -1552,6 +1573,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn manager_mail_is_accepted_audited_and_dispatchable_without_parent_custody() {
@@ -1595,6 +1617,7 @@ mod tests {
         assert_eq!(events, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_appointment_requires_an_explicit_capability_grant() {
         let store = Store::open_in_memory().unwrap();
@@ -1630,6 +1653,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_operator_policy_replay_is_exact_and_scope_edits_revoke_grants() {
         let store = Store::open_in_memory().unwrap();
@@ -1683,6 +1707,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_record_and_event_roll_back_together_on_a_failed_transition() {
         let store = Store::open_in_memory().unwrap();
@@ -1727,6 +1752,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn manager_v2_policy_receipt_and_limits_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1845,6 +1871,7 @@ mod tests {
     const FAKE_SHA2: &str = "fedcba9876543210fedcba9876543210fedcba98";
     const INTEGRATE_TARGET: &str = "refs/heads/rolling";
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn accepted_source_returns_acceptance_when_source_matches() {
         let store = Store::open_in_memory().unwrap();
@@ -1865,6 +1892,7 @@ mod tests {
         assert_eq!(accepted.method, "independent_review");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn accepted_source_returns_none_when_no_acceptance() {
         let store = Store::open_in_memory().unwrap();
@@ -1882,6 +1910,7 @@ mod tests {
         assert!(accepted.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn accepted_source_returns_none_when_source_mismatch() {
         let store = Store::open_in_memory().unwrap();
@@ -1897,6 +1926,7 @@ mod tests {
         assert!(accepted.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn accepted_source_returns_none_when_work_missing() {
         let store = Store::open_in_memory().unwrap();
@@ -1911,6 +1941,7 @@ mod tests {
         assert!(accepted.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_rejects_without_integration_capability() {
         let store = Store::open_in_memory().unwrap();
@@ -1931,6 +1962,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_rejects_without_accepted_source() {
         let store = Store::open_in_memory().unwrap();
@@ -1951,6 +1983,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_succeeds_with_accepted_source() {
         let store = Store::open_in_memory().unwrap();
@@ -1973,6 +2006,7 @@ mod tests {
         assert!(receipt.target_session_id.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_rejects_second_nonterminal_for_same_target() {
         let store = Store::open_in_memory().unwrap();
@@ -1999,6 +2033,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_allows_different_targets() {
         let store = Store::open_in_memory().unwrap();
@@ -2020,6 +2055,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_replays_identical_request() {
         let store = Store::open_in_memory().unwrap();
@@ -2043,6 +2079,7 @@ mod tests {
         assert!(second.deduplicated);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn enqueue_integrate_rejects_stale_fence() {
         let store = Store::open_in_memory().unwrap();
@@ -2060,6 +2097,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("scope_changed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_action_is_claimed_and_finished() {
         let store = Store::open_in_memory().unwrap();
@@ -2114,6 +2152,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_action_recovered_as_uncertain_on_lost_claim() {
         let store = Store::open_in_memory().unwrap();
@@ -2155,6 +2194,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_runtime_gate_rejects_revoked_policy() {
         let store = Store::open_in_memory().unwrap();
@@ -2189,6 +2229,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_effect_gate_rejects_when_acceptance_removed_before_execution() {
         let store = Store::open_in_memory().unwrap();
@@ -2250,6 +2291,7 @@ mod tests {
 
     // ── RME-S2A-001: live pause/decision stop gates ──────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_runtime_gate_rejects_when_policy_paused() {
         let store = Store::open_in_memory().unwrap();
@@ -2279,6 +2321,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("policy_paused"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_runtime_gate_rejects_when_epic_paused() {
         let store = Store::open_in_memory().unwrap();
@@ -2306,6 +2349,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("policy_paused"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_runtime_gate_rejects_when_decision_hold_active() {
         let store = Store::open_in_memory().unwrap();
@@ -2344,6 +2388,7 @@ mod tests {
 
     // ── RME-S2A-004: dependency blockers ────────────────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_runtime_gate_rejects_when_dependency_unsatisfied() {
         let store = Store::open_in_memory().unwrap();
@@ -2388,6 +2433,7 @@ mod tests {
 
     // ── RME-S2A-005: bounded pending admission ──────────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn integrate_enqueue_rejects_when_pending_limit_exceeded() {
         let store = Store::open_in_memory().unwrap();
@@ -2429,6 +2475,7 @@ mod tests {
 
     // ── RME-S2A-002/003: custody evidence and crash reconciliation ──────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn persist_integrate_candidate_stores_oid_in_execution_record() {
         let store = Store::open_in_memory().unwrap();
@@ -2467,6 +2514,7 @@ mod tests {
         assert_eq!(exec.payload["expected_tip"], serde_json::json!(FAKE_SHA));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn reconcile_integrate_claim_succeeds_when_ref_matches_candidate() {
         let store = Store::open_in_memory().unwrap();
@@ -2497,6 +2545,7 @@ mod tests {
         assert_eq!(state, ManagerActionStateV2::Succeeded);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn reconcile_integrate_claim_fails_when_ref_matches_expected_tip() {
         let store = Store::open_in_memory().unwrap();
@@ -2526,6 +2575,7 @@ mod tests {
         assert_eq!(state, ManagerActionStateV2::Failed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn reconcile_integrate_claim_remains_uncertain_when_ref_is_unknown() {
         let store = Store::open_in_memory().unwrap();
@@ -2556,6 +2606,7 @@ mod tests {
         assert_eq!(state, ManagerActionStateV2::Uncertain);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn verify_integrate_custody_rejects_when_target_moved() {
         let store = Store::open_in_memory().unwrap();
@@ -2582,6 +2633,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("target_changed"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn settle_integrate_claim_cas_from_uncertain_to_succeeded() {
         let store = Store::open_in_memory().unwrap();
@@ -2635,6 +2687,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn settle_integrate_claim_cas_from_uncertain_to_failed() {
         let store = Store::open_in_memory().unwrap();
@@ -2689,6 +2742,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn settle_integrate_claim_no_ops_on_non_uncertain_row() {
         let store = Store::open_in_memory().unwrap();

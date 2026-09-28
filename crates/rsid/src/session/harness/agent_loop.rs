@@ -6,14 +6,17 @@ use crate::claude::StreamEvent;
 use crate::error::DaemonError;
 use crate::model_control::call_control::{ModelCallControl, ModelCallKind, ModelCallUsage};
 use crate::session::harness::compaction::{auto_compact, hard_trim};
+use crate::session::harness::errors::ProviderError;
 use crate::session::harness::normalize::normalize_history;
 use crate::session::harness::provider::ApiProvider;
+use crate::session::harness::retry;
 use crate::session::harness::tools::HarnessToolRegistry;
 use crate::session::harness::types::*;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +33,69 @@ fn hash_tool_call(name: &str, arguments: &str) -> u64 {
     name.hash(&mut hasher);
     arguments.hash(&mut hasher);
     hasher.finish()
+}
+
+fn tool_result_message(call_id: &str, result: ToolResult) -> ChatMessage {
+    let is_error = result.is_error();
+    let has_typed_blocks = result.has_typed_blocks();
+    let content = if is_error {
+        result
+            .error_msg
+            .map(|error| format!("Error: {error}"))
+            .unwrap_or_else(|| {
+                if has_typed_blocks {
+                    result.output
+                } else {
+                    format!("Error: {}", result.output)
+                }
+            })
+    } else {
+        result.output
+    };
+    if is_error {
+        ChatMessage::tool_error_result(call_id, content)
+    } else {
+        ChatMessage::tool_result(call_id, content)
+    }
+}
+
+#[cfg(test)]
+mod tool_content_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[test]
+    fn block_result_survives_loop_handoff_without_exposing_image_in_event_text() {
+        let message = tool_result_message(
+            "image",
+            ToolResult::from_blocks(
+                vec![
+                    ToolContentBlock::Text {
+                        text: "preview".into(),
+                    },
+                    ToolContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                true,
+            ),
+        );
+        assert!(message.is_error);
+        assert_eq!(message.tool_blocks().len(), 2);
+        assert_eq!(message.visible_tool_text(), "preview\n[image: image/png]");
+        assert!(!message.visible_tool_text().contains("aGVsbG8="));
+
+        let legacy = tool_result_message(
+            "failure",
+            ToolResult {
+                success: false,
+                output: String::new(),
+                error_msg: Some("failed".into()),
+            },
+        );
+        assert_eq!(legacy.content, "Error: failed");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,7 +156,7 @@ pub async fn run_harness_loop(
         }
 
         // Fresh cache for each turn (dedup cache)
-        let mut seen_tool_calls: HashMap<u64, String> = HashMap::new();
+        let mut seen_tool_calls: HashMap<u64, (String, bool)> = HashMap::new();
 
         // 2. Auto-compaction check
         auto_compact(
@@ -152,124 +218,191 @@ pub async fn run_harness_loop(
                 .map(|message| message.content.as_str())
                 .unwrap_or_default()
         );
-        let admitted_call = model_call_control
-            .admit(
-                ModelCallKind::Primary,
-                &format!("turn:{iteration}"),
-                &fingerprint_hint,
-                None,
-            )
-            .await?;
-        let (mut settlement, execution) = admitted_call.into_parts();
+        let mut retries_done = 0;
+        let mut prior_invocation_id = None;
+        let mut last_retry_error: Option<ProviderError> = None;
+        let (response, settlement) = loop {
+            let admission = model_call_control
+                .admit(
+                    ModelCallKind::Primary,
+                    &format!("turn:{iteration}:attempt:{retries_done}"),
+                    &format!("{fingerprint_hint}:attempt:{retries_done}"),
+                    prior_invocation_id,
+                )
+                .await;
+            let admitted_call = match admission {
+                Ok(call) => call,
+                Err(DaemonError::PolicyDenied(reason)) if retries_done > 0 => {
+                    let Some(error) = last_retry_error else {
+                        return Err(DaemonError::PolicyDenied(reason));
+                    };
+                    tracing::info!(%reason, "model retry policy refused another Harness attempt");
+                    event_tx
+                        .send(StreamEvent {
+                            event_type: "provider_error".into(),
+                            data: json!({
+                                "class": error.class, "http_status": error.http_status,
+                                "retry_after_ms": error.retry_after_ms,
+                                "detail_code": error.detail_code, "session_id": session_tag,
+                            }),
+                        })
+                        .await
+                        .map_err(|_| DaemonError::ChannelClosed)?;
+                    return Err(error.into_daemon_error());
+                }
+                Err(error) => return Err(error),
+            };
+            let (mut settlement, execution) = admitted_call.into_parts();
+            let emitted_chunk = Arc::new(AtomicBool::new(false));
 
-        let response = if provider.supports_streaming() {
-            let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(64);
-            let event_tx_clone = event_tx.clone();
-            let tag = session_tag.clone();
+            let response = if provider.supports_streaming() {
+                let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(64);
+                let event_tx_clone = event_tx.clone();
+                let tag = session_tag.clone();
+                let emitted = Arc::clone(&emitted_chunk);
 
-            let forward_task = tokio::spawn(async move {
-                while let Some(chunk) = chunk_rx.recv().await {
-                    if !chunk.delta_text.is_empty() {
-                        let _ = event_tx_clone
-                            .send(StreamEvent {
-                                event_type: "content_block_delta".into(),
-                                data: json!({
-                                    "session_id": tag,
-                                    "delta": { "type": "text_delta", "text": chunk.delta_text },
-                                }),
-                            })
-                            .await;
+                let forward_task = tokio::spawn(async move {
+                    while let Some(chunk) = chunk_rx.recv().await {
+                        emitted.store(true, Ordering::Release);
+                        if !chunk.delta_text.is_empty() {
+                            let _ = event_tx_clone
+                                .send(StreamEvent {
+                                    event_type: "content_block_delta".into(),
+                                    data: json!({
+                                        "session_id": tag,
+                                        "delta": { "type": "text_delta", "text": chunk.delta_text },
+                                    }),
+                                })
+                                .await;
+                        }
                     }
-                }
-            });
+                });
 
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    forward_task.abort();
-                    let _ = forward_task.await;
-                    model_call_control.fail(settlement, "interrupted").await?;
-                    break;
-                }
-                result = provider.stream_chat(&request, chunk_tx, &cancel, execution) => {
-                    forward_task.abort();
-                    let _ = forward_task.await;
-                    result
-                }
-            }
-        } else {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    model_call_control.fail(settlement, "interrupted").await?;
-                    break;
-                }
-                result = provider.chat(&request, execution) => result,
-            }
-        };
-
-        let response = match response {
-            Err(DaemonError::StreamFallbackRequired(reason)) => {
-                let failed_stream_invocation_id = settlement.invocation_id();
-                model_call_control
-                    .fail(settlement, "stream_fallback_required")
-                    .await?;
-                tracing::warn!(
-                    %reason,
-                    iteration,
-                    "streaming attempt failed; requesting separately admitted blocking fallback"
-                );
-                if cancel.is_cancelled() {
-                    break;
-                }
-
-                let fallback_call = model_call_control
-                    .admit(
-                        ModelCallKind::Primary,
-                        &format!("turn:{iteration}:blocking_fallback"),
-                        &format!("{fingerprint_hint}:blocking_fallback"),
-                        failed_stream_invocation_id,
-                    )
-                    .await?;
-                let (fallback_settlement, fallback_execution) = fallback_call.into_parts();
-                settlement = fallback_settlement;
-
-                let mut fallback_request = request.clone();
-                fallback_request.stream = false;
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
+                    () = cancel.cancelled() => {
+                        forward_task.abort();
+                        let _ = forward_task.await;
                         model_call_control.fail(settlement, "interrupted").await?;
-                        break;
+                        break 'turns;
                     }
-                    result = provider.chat(&fallback_request, fallback_execution) => result,
+                    result = provider.stream_chat(&request, chunk_tx, &cancel, execution) => {
+                        forward_task.abort();
+                        let _ = forward_task.await;
+                        result
+                    }
                 }
-            }
-            other => other,
-        };
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        model_call_control.fail(settlement, "interrupted").await?;
+                        break 'turns;
+                    }
+                    result = provider.chat(&request, execution) => result,
+                }
+            };
 
-        // 5. On provider error: retry logic
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                model_call_control
-                    .fail(settlement, "provider_call_failed")
-                    .await?;
-                tracing::error!(error = %e, iteration, "LLM call failed");
+            let response = match response {
+                Err(DaemonError::StreamFallbackRequired(reason)) => {
+                    let failed_stream_invocation_id = settlement.invocation_id();
+                    model_call_control
+                        .fail(settlement, "stream_fallback_required")
+                        .await?;
+                    tracing::warn!(
+                        %reason,
+                        iteration,
+                        "streaming attempt failed; requesting separately admitted blocking fallback"
+                    );
+                    if cancel.is_cancelled() {
+                        break 'turns;
+                    }
 
-                event_tx
-                    .send(StreamEvent {
-                        event_type: "system".into(),
-                        data: json!({
-                            "subtype": "error",
-                            "error": e.to_string(),
-                            "session_id": session_tag,
-                        }),
-                    })
-                    .await
-                    .map_err(|_| DaemonError::ChannelClosed)?;
+                    let fallback_call = model_call_control
+                        .admit(
+                            ModelCallKind::Primary,
+                            &format!("turn:{iteration}:blocking_fallback"),
+                            &format!("{fingerprint_hint}:blocking_fallback"),
+                            failed_stream_invocation_id,
+                        )
+                        .await?;
+                    let (fallback_settlement, fallback_execution) = fallback_call.into_parts();
+                    settlement = fallback_settlement;
 
-                return Err(DaemonError::Process(format!("Provider error: {}", e)));
+                    let mut fallback_request = request.clone();
+                    fallback_request.stream = false;
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            model_call_control.fail(settlement, "interrupted").await?;
+                            break 'turns;
+                        }
+                        result = provider.chat(&fallback_request, fallback_execution) => result,
+                    }
+                }
+                other => other,
+            };
+
+            // 5. On provider error: retry logic
+            match response {
+                Ok(r) => break (r, settlement),
+                Err(e) => {
+                    let failed_invocation_id = settlement.invocation_id();
+                    let provider_error = ProviderError::from_daemon_error(&e);
+                    model_call_control
+                        .fail(
+                            settlement,
+                            provider_error
+                                .as_ref()
+                                .map_or("provider_call_failed", |error| error.detail_code.as_str()),
+                        )
+                        .await?;
+                    if let Some(error) = provider_error.as_ref()
+                        && !emitted_chunk.load(Ordering::Acquire)
+                        && retry::delay(error, retries_done).is_some()
+                    {
+                        if retry::wait(error, retries_done, &cancel).await {
+                            retries_done += 1;
+                            prior_invocation_id = failed_invocation_id;
+                            last_retry_error = Some(error.clone());
+                            continue;
+                        }
+                        break 'turns;
+                    }
+                    tracing::error!(error = %e, iteration, "LLM call failed");
+
+                    event_tx
+                        .send(StreamEvent {
+                            event_type: if provider_error.is_some() {
+                                "provider_error"
+                            } else {
+                                "system"
+                            }
+                            .into(),
+                            data: provider_error.map_or_else(
+                                || {
+                                    json!({
+                                        "subtype": "error",
+                                        "error": e.to_string(),
+                                        "session_id": session_tag,
+                                    })
+                                },
+                                |error| {
+                                    json!({
+                                        "class": error.class,
+                                        "http_status": error.http_status,
+                                        "retry_after_ms": error.retry_after_ms,
+                                        "detail_code": error.detail_code,
+                                        "session_id": session_tag,
+                                    })
+                                },
+                            ),
+                        })
+                        .await
+                        .map_err(|_| DaemonError::ChannelClosed)?;
+
+                    return Err(e);
+                }
             }
         };
 
@@ -325,14 +458,19 @@ pub async fn run_harness_loop(
             role: MessageRole::Assistant,
             content: response.content.clone(),
             tool_call_id: None,
+            is_error: false,
             tool_calls: response.tool_calls.clone(),
         };
         history.push(assistant_msg);
 
         for tc in &response.tool_calls {
             let fingerprint = hash_tool_call(&tc.name, &tc.arguments);
-            if let Some(cached_result) = seen_tool_calls.get(&fingerprint) {
-                history.push(ChatMessage::tool_result(&tc.id, cached_result));
+            if let Some((cached_result, is_error)) = seen_tool_calls.get(&fingerprint) {
+                history.push(if *is_error {
+                    ChatMessage::tool_error_result(&tc.id, cached_result)
+                } else {
+                    ChatMessage::tool_result(&tc.id, cached_result)
+                });
                 continue;
             }
 
@@ -353,17 +491,21 @@ pub async fn run_harness_loop(
                 .map_err(|_| DaemonError::ChannelClosed)?;
 
             let result = tools
-                .execute_cancellable(&tc.name, args, &working_dir, &cancel)
+                .execute_with_context(
+                    &tc.name,
+                    args,
+                    &working_dir,
+                    &cancel,
+                    Some(event_tx.clone()),
+                )
                 .await;
             if cancel.is_cancelled() {
                 model_call_control.fail_pending("interrupted").await?;
                 break 'turns;
             }
-            let result_text = if result.success {
-                result.output
-            } else {
-                format!("Error: {}", result.error_msg.unwrap_or(result.output))
-            };
+            let result_message = tool_result_message(&tc.id, result);
+            let is_error = result_message.is_error;
+            let result_text = result_message.visible_tool_text();
 
             event_tx
                 .send(StreamEvent {
@@ -373,13 +515,14 @@ pub async fn run_harness_loop(
                         "content": result_text,
                         "name": tc.name,
                         "tool_use_id": tc.id,
+                        "is_error": is_error,
                     }),
                 })
                 .await
                 .map_err(|_| DaemonError::ChannelClosed)?;
 
-            seen_tool_calls.insert(fingerprint, result_text.clone());
-            history.push(ChatMessage::tool_result(&tc.id, result_text));
+            seen_tool_calls.insert(fingerprint, (result_message.content.clone(), is_error));
+            history.push(result_message);
         }
 
         hard_trim(&mut history, 200); // safety backstop
@@ -411,12 +554,15 @@ mod tests {
     use super::*;
     use crate::model_control::call_control::StoreBackedModelCallControl;
     use crate::model_control::{AdmissionDecision, admit_invocation};
+    use crate::session::harness::api_key::ApiCredential;
+    use crate::session::harness::providers::openai_api::OpenAiApiProvider;
     use crate::store::Store;
     use rusqlite::params;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn test_estimate_remaining_tokens() {
         let history = vec![
@@ -439,6 +585,7 @@ mod tests {
     struct CapturingProvider {
         request_efforts: Arc<Mutex<Vec<Option<String>>>>,
         request_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        responses: Option<Arc<Mutex<VecDeque<ChatResponse>>>>,
     }
 
     struct FallbackProvider {
@@ -504,6 +651,11 @@ mod tests {
                 .lock()
                 .await
                 .push(request.messages.clone());
+            if let Some(responses) = &self.responses {
+                return responses.lock().await.pop_front().ok_or_else(|| {
+                    DaemonError::Process("missing captured fake response".to_string())
+                });
+            }
             Ok(ChatResponse {
                 content: "done".to_string(),
                 tool_calls: vec![],
@@ -760,6 +912,7 @@ mod tests {
         let provider = CapturingProvider {
             request_efforts: Arc::clone(&request_efforts),
             request_messages: Arc::new(Mutex::new(Vec::new())),
+            responses: None,
         };
         let (event_tx, _event_rx) = mpsc::channel(32);
 
@@ -788,6 +941,7 @@ mod tests {
             .expect("provider receives primary request")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_forwards_configured_launch_effort_and_preserves_none() {
         assert_eq!(
@@ -797,6 +951,7 @@ mod tests {
         assert_eq!(captured_harness_request_effort(None).await, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn resumed_orphan_call_is_repaired_before_provider_request() {
@@ -807,6 +962,7 @@ mod tests {
         let provider = CapturingProvider {
             request_efforts: Arc::new(Mutex::new(Vec::new())),
             request_messages: Arc::clone(&requests),
+            responses: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let mut prior_call = ChatMessage::assistant("calling");
@@ -846,6 +1002,114 @@ mod tests {
         assert_eq!(repairs[0].data, json!({"synthesized": 1, "dropped": 0}));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn resumed_late_tool_result_is_relocated_before_provider_request() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let permit = root_permit(&store, session_id).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            request_efforts: Arc::new(Mutex::new(Vec::new())),
+            request_messages: Arc::clone(&requests),
+            responses: None,
+        };
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut prior_call = ChatMessage::assistant("calling");
+        prior_call
+            .tool_calls
+            .push(tool_call("late", "unknown_tool"));
+        let mut late_result = ChatMessage::tool_error_result("late", "failed");
+        late_result.is_error = true;
+
+        run_harness_loop(
+            Box::new(provider),
+            Arc::new(HarnessToolRegistry::new()),
+            String::new(),
+            "resume".to_string(),
+            std::env::temp_dir(),
+            "claude-opus-5".to_string(),
+            None,
+            event_tx,
+            CancellationToken::new(),
+            controller(&store, session_id, permit),
+            1,
+            100_000,
+            Some(vec![prior_call, ChatMessage::user("middle"), late_result]),
+        )
+        .await
+        .expect("loop succeeds");
+
+        let messages = requests.lock().await[0].clone();
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("late"));
+        assert!(messages[1].is_error);
+        assert_eq!(messages[2].content, "middle");
+        assert_eq!(messages[3].content, "resume");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn failing_tool_result_is_flagged_in_the_next_provider_request() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let permit = root_permit(&store, session_id).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            request_efforts: Arc::new(Mutex::new(Vec::new())),
+            request_messages: Arc::clone(&requests),
+            responses: Some(Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    content: String::new(),
+                    tool_calls: vec![tool_call("failure", "unknown_tool")],
+                    usage: TokenUsage::default(),
+                    reasoning_content: None,
+                    stop_reason: None,
+                },
+                ChatResponse {
+                    content: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
+                    reasoning_content: None,
+                    stop_reason: None,
+                },
+            ])))),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(32);
+
+        run_harness_loop(
+            Box::new(provider),
+            Arc::new(HarnessToolRegistry::new()),
+            String::new(),
+            "run failing tool".to_string(),
+            std::env::temp_dir(),
+            "claude-opus-5".to_string(),
+            None,
+            event_tx,
+            CancellationToken::new(),
+            controller(&store, session_id, permit),
+            2,
+            100_000,
+            None,
+        )
+        .await
+        .expect("loop succeeds after reporting the tool failure");
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let failure = requests[1]
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("second request includes the failed tool result");
+        assert_eq!(failure.tool_call_id.as_deref(), Some("failure"));
+        assert!(failure.is_error);
+        drop(requests);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_records_three_attempts_in_non_streaming_mode() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -938,6 +1202,7 @@ mod tests {
         assert_eq!(child_rows, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_records_three_attempts_in_streaming_mode() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1030,6 +1295,7 @@ mod tests {
         assert_eq!(child_rows, 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_stream_fallback_requires_a_second_admission() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1121,6 +1387,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn cancellation_during_compaction_prevents_the_followup_turn_send() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1213,6 +1480,7 @@ mod tests {
         assert_eq!(root.1.as_deref(), Some("interrupted"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_denies_third_backend_call_before_execution() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));

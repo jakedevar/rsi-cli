@@ -155,6 +155,205 @@ fn plan(f: &Fixture) -> Snapshot {
     before
 }
 
+fn another_epic(f: &Fixture) -> Uuid {
+    let mut epic = f.store.get_session(f.epic).unwrap().unwrap();
+    epic.id = Uuid::new_v4();
+    epic.lead_session_id = None;
+    f.store.insert_session(&epic).unwrap();
+    epic.id
+}
+
+/// Reproduce legacy/superseded ledger state that cannot be created by current
+/// writes: an ownership fact whose Work was not carried into the new scope.
+fn insert_orphan_ownership(f: &Fixture, work_key: &str, domain: &str) {
+    let c = config(f);
+    let key = record_key(&[work_key, domain]).unwrap();
+    let payload = serde_json::to_value(Ownership {
+        work_key: work_key.into(),
+        domain: domain.into(),
+        mode: ManagerOwnershipModeV2::Exclusive,
+        files: vec![domain.into()],
+        active: true,
+    })
+    .unwrap();
+    let stamp = now();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO harness_manager_v2_work_facts(project_id,kind,record_key,epic_id,
+                 work_key,row_version,payload_json,archived,manager_session_id,scope_version,
+                 policy_version,created_at,updated_at)
+             VALUES(?1,'ownership',?2,?3,?4,1,?5,0,?6,?7,1,?8,?8)",
+            params![
+                f.project.to_string(),
+                key,
+                f.epic.to_string(),
+                work_key,
+                payload.to_string(),
+                c.manager_session_id.to_string(),
+                c.row_version,
+                stamp,
+            ],
+        )
+        .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn project_wide_ownership_ignores_orphan_claims_but_keeps_live_cross_scope_conflicts() {
+    let f = fixture();
+    let domain = "crates/rsid/src/rpc.rs";
+    insert_orphan_ownership(&f, "superseded-work", domain);
+
+    let c = config(&f);
+    let p = policy_version(&f);
+    f.store
+        .manager_v2_commit_update(
+            f.manager,
+            &fenced(product(&f, "current-work", 0), "current-work", &c, p),
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+    f.store
+        .manager_v2_commit_update(
+            f.manager,
+            &fenced(
+                ManagerUpdateV2::Ownership {
+                    key: "current-work".into(),
+                    expected_row_version: 0,
+                    domain: domain.into(),
+                    mode: ManagerOwnershipModeV2::Exclusive,
+                    files: vec![domain.into()],
+                    active: true,
+                },
+                "current-claim",
+                &c,
+                p,
+            ),
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+
+    let successor_epic = another_epic(&f);
+    save_scope(&f, f.manager, vec![f.epic, successor_epic]);
+    let c = config(&f);
+    let p = regrant(&f, "regrant-after-scope-change");
+    let mut successor_work = product(&f, "successor-work", 0);
+    if let ManagerUpdateV2::Work { epic_id, .. } = &mut successor_work {
+        *epic_id = successor_epic;
+    }
+    f.store
+        .manager_v2_commit_update(
+            f.manager,
+            &fenced(successor_work, "successor-work", &c, p),
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+    let conflict = f
+        .store
+        .manager_v2_commit_update(
+            f.manager,
+            &fenced(
+                ManagerUpdateV2::Ownership {
+                    key: "successor-work".into(),
+                    expected_row_version: 0,
+                    domain: domain.into(),
+                    mode: ManagerOwnershipModeV2::Exclusive,
+                    files: vec![domain.into()],
+                    active: true,
+                },
+                "successor-conflict",
+                &c,
+                p,
+            ),
+            &LedgerObservation::default(),
+        )
+        .unwrap_err();
+    assert!(
+        conflict.to_string().contains("manager_v2_domain_conflict"),
+        "{conflict}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn project_wide_ownership_ignores_archived_and_deleted_epic_claims() {
+    for terminal_status in ["Archived", "Deleted"] {
+        let f = fixture();
+        let domain = "crates/rsid/src/rpc.rs";
+        let c = config(&f);
+        let p = policy_version(&f);
+        f.store
+            .manager_v2_commit_update(
+                f.manager,
+                &fenced(product(&f, "old-work", 0), "old-work", &c, p),
+                &LedgerObservation::default(),
+            )
+            .unwrap();
+        f.store
+            .manager_v2_commit_update(
+                f.manager,
+                &fenced(
+                    ManagerUpdateV2::Ownership {
+                        key: "old-work".into(),
+                        expected_row_version: 0,
+                        domain: domain.into(),
+                        mode: ManagerOwnershipModeV2::Exclusive,
+                        files: vec![domain.into()],
+                        active: true,
+                    },
+                    "old-claim",
+                    &c,
+                    p,
+                ),
+                &LedgerObservation::default(),
+            )
+            .unwrap();
+
+        let successor_epic = another_epic(&f);
+        f.store
+            .conn
+            .execute(
+                "UPDATE sessions SET status=?2 WHERE id=?1",
+                params![f.epic.to_string(), terminal_status],
+            )
+            .unwrap();
+        save_scope(&f, f.manager, vec![successor_epic]);
+        let c = config(&f);
+        let p = regrant(&f, "regrant-after-terminal-epic");
+        let mut successor_work = product(&f, "successor-work", 0);
+        if let ManagerUpdateV2::Work { epic_id, .. } = &mut successor_work {
+            *epic_id = successor_epic;
+        }
+        f.store
+            .manager_v2_commit_update(
+                f.manager,
+                &fenced(successor_work, "successor-work", &c, p),
+                &LedgerObservation::default(),
+            )
+            .unwrap();
+        f.store
+            .manager_v2_commit_update(
+                f.manager,
+                &fenced(
+                    ManagerUpdateV2::Ownership {
+                        key: "successor-work".into(),
+                        expected_row_version: 0,
+                        domain: domain.into(),
+                        mode: ManagerOwnershipModeV2::Exclusive,
+                        files: vec![domain.into()],
+                        active: true,
+                    },
+                    "successor-claim",
+                    &c,
+                    p,
+                ),
+                &LedgerObservation::default(),
+            )
+            .unwrap();
+    }
+}
+
 /// Simulate delivered work: accepted and integrated at an exact source.
 fn land(f: &Fixture, key: &str) -> WorkRecord {
     let c = config(f);
@@ -187,6 +386,7 @@ fn land(f: &Fixture, key: &str) -> WorkRecord {
     work
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn policy_refresh_and_scope_save_keep_every_live_work_fact() {
     let f = fixture();
@@ -224,6 +424,7 @@ fn policy_refresh_and_scope_save_keep_every_live_work_fact() {
     assert_eq!(receipt.row_version, 2);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn seat_move_returns_records_and_accepted_source_with_identical_digests() {
     let f = fixture();
@@ -319,6 +520,7 @@ fn seat_move_returns_records_and_accepted_source_with_identical_digests() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn landed_work_is_not_readmitted_by_a_successor_seat() {
     let f = fixture();
@@ -349,6 +551,7 @@ fn landed_work_is_not_readmitted_by_a_successor_seat() {
     assert!(work.acceptance.is_some());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn stale_revoked_or_out_of_scope_seats_are_refused_exactly() {
     let f = fixture();
@@ -499,6 +702,7 @@ fn stale_revoked_or_out_of_scope_seats_are_refused_exactly() {
     assert_eq!(claims[0].payload["work_key"], "alpha");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn fresh_store_opens_at_head_with_the_work_facts_catalog() {
     let store = Store::open_in_memory().unwrap();
@@ -524,6 +728,7 @@ fn fresh_store_opens_at_head_with_the_work_facts_catalog() {
 
 /// Opens a real V121 database holding multi-seat history and upgrades it
 /// through the production `if version < 122` block.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn v121_database_upgrade_carries_forward_the_newest_row_per_identity() {
     let directory = tempfile::tempdir().unwrap();
@@ -720,6 +925,7 @@ fn v121_database_upgrade_carries_forward_the_newest_row_per_identity() {
 
 /// P-001: project-wide gates never judge a truncated fact set. Over budget they
 /// fail closed with the typed budget refusal; `record_key` order is total.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn project_gates_fail_closed_rather_than_read_a_truncated_fact_set() {
     let f = fixture();
@@ -849,6 +1055,7 @@ fn insert_v121_record(f: &Fixture, epic: Option<Uuid>, kind: &str, key: &str, pa
 
 /// P-006 / P-010: a defective newest row fails the upgrade with a typed error
 /// and leaves the database at V121; nothing is dropped silently.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn v121_upgrade_refuses_defective_carry_forward_instead_of_dropping_rows() {
     let directory = tempfile::tempdir().unwrap();
@@ -959,6 +1166,7 @@ fn v121_upgrade_refuses_defective_carry_forward_instead_of_dropping_rows() {
 
 /// P-009: NULL policy provenance requires a project that never had a grant;
 /// a missing policy projection after a grant is refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn null_policy_provenance_requires_a_project_that_was_never_granted() {
     let f = fixture();
@@ -1055,6 +1263,7 @@ fn null_policy_provenance_requires_a_project_that_was_never_granted() {
 
 /// P-007: a successor pages every carried fact into lead notices, including a
 /// lower key written after its cursor has already advanced.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn successor_notice_paging_visits_carried_and_later_lower_key_facts() {
     let f = fixture();
@@ -1100,6 +1309,7 @@ fn successor_notice_paging_visits_carried_and_later_lower_key_facts() {
 /// Delivered history beyond the budget: integrated works (and their claims and
 /// edges) are terminal, so writes, gates and the work view stay live, while
 /// every landed work stays readable by key and is never re-admitted.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn delivered_history_beyond_the_budget_leaves_writes_and_gates_live() {
     let f = fixture();
@@ -1276,6 +1486,7 @@ fn delivered_history_beyond_the_budget_leaves_writes_and_gates_live() {
 /// Review finding 3: a key reused by another Epic (or, for a claim, edge or
 /// reservation, by another work) across seats is a collision, not history: the
 /// upgrade fails typed and stays at V121 instead of dropping one of them.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn v121_upgrade_refuses_cross_epic_or_cross_work_key_collisions() {
     let directory = tempfile::tempdir().unwrap();
@@ -1353,6 +1564,7 @@ fn v121_upgrade_refuses_cross_epic_or_cross_work_key_collisions() {
 /// Review finding 1: delivered history with many claims per work keeps the
 /// Work and Overview views within budget; the window is the recency prefix
 /// whose works and associations fit, and live work is always shown.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn delivered_history_with_many_claims_keeps_work_and_overview_within_budget() {
     let f = fixture();

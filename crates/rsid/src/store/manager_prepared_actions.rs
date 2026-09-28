@@ -552,7 +552,7 @@ impl Store {
                     self.manager_v2_decision_gate(&authority.config, epic),
                     &mut blockers,
                 )?;
-                let (_, paused) = self.manager_v2_lead_pause(&authority.config, epic)?;
+                let (_, paused) = self.manager_v2_action_pause(&authority.config, epic)?;
                 let explicit_resume = matches!(
                     action,
                     ManagerActionV2::ResumeLead { .. }
@@ -609,13 +609,24 @@ impl Store {
             {
                 let allow_interrupted_resume = matches!(action, ManagerActionV2::ResumeLead { .. })
                     && target.status == SessionStatus::Interrupted;
-                capture_blocker(
+                let gate = if matches!(
+                    action,
+                    ManagerActionV2::ResumeLead { .. }
+                        | ManagerActionV2::RetryLead { .. }
+                        | ManagerActionV2::ReplaceLead { .. }
+                        | ManagerActionV2::AssignLead {
+                            session_id: Some(_),
+                            ..
+                        }
+                ) {
+                    self.manager_restart_human_gate(target.id, allow_interrupted_resume)
+                } else {
                     self.manager_action_human_gate_with_interrupted_resume(
                         target.id,
                         allow_interrupted_resume,
-                    ),
-                    &mut blockers,
-                )?;
+                    )
+                };
+                capture_blocker(gate, &mut blockers)?;
             }
         } else if let Some(target) = admission.target.as_ref() {
             capture_blocker(self.manager_action_human_gate(target.id), &mut blockers)?;
@@ -942,6 +953,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_fresh_upgrade_reopen_and_exact_rewind() {
         let dir = tempfile::tempdir().unwrap();
@@ -992,6 +1004,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_each_atomic_boundary_rolls_back_and_retries() {
         for fault in [
@@ -1023,6 +1036,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_refuses_wrong_version_and_catalog_drift_without_mutation() {
         for mutation in [
@@ -1048,6 +1062,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_foreign_key_violation_rolls_back_catalog_and_version() {
         let journal = Journal::at_v115();
@@ -1084,6 +1099,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v116_forward_upgrade_preserves_exact_v115_and_reopens() {
         let directory = tempfile::tempdir().unwrap();
@@ -1121,6 +1137,7 @@ mod tests {
         assert_eq!(fingerprint(&reopened.conn), V118_FULL_CATALOG_FINGERPRINT);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v116_refuses_wrong_version_or_v115_catalog_drift_without_mutation() {
         for mutation in [
@@ -1217,6 +1234,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_journal_retains_identity_and_consumes_one_matching_operation() {
         let journal = Journal::new();
@@ -1269,6 +1287,7 @@ mod tests {
             updated_at='2026-09-10T12:01:00.000000000Z' WHERE id=?2",params![journal.operation,second]).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_ttl_and_terminal_transitions_are_bounded() {
         let journal = Journal::new();
@@ -1302,6 +1321,7 @@ mod tests {
         assert!(journal.update("state='prepared',row_version=3").is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_reservation_rejects_mismatched_authority_and_retains_revoked_receipt() {
         let journal = Journal::new();
@@ -1333,6 +1353,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt, ("revoked".into(), journal.operation));
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn v115_journal_validates_new_rows_and_supported_semantic_actions() {
         let journal = Journal::new();

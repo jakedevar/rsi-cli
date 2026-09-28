@@ -1,0 +1,19 @@
+[Unit]
+Description=RSI daemon
+Requires=rsi-workers.slice
+After=rsi-workers.slice
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment="PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=%h/.config/rsi/rsid.env
+ExecStartPre=/usr/bin/bash -c 'mode=$$(/usr/bin/stat -c %%a %h/.config/rsi/rsid.env); test "$$mode" = 600'
+ExecStart=%h/.local/bin/rsid
+Restart=on-failure
+RestartSec=3
+Slice=rsi.slice
+UMask=0077
+
+[Install]
+WantedBy=default.target

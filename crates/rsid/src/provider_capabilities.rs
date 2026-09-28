@@ -1466,6 +1466,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn real_codex_0_155_1_fixture_preserves_capacity_reasoning_and_projection() {
         let snapshot = fixture_snapshot();
@@ -1527,6 +1528,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn reviewed_raw_and_semantic_0_155_1_contracts_are_allowlisted_exactly() {
         for digest in [
@@ -1550,6 +1552,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn catalog_rejects_zero_overflow_and_bad_percent() {
         for raw in [
@@ -1573,6 +1576,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn catalog_cache_reuses_exact_key_and_refreshes_version_or_digest() {
         let cache = CodexCatalogCache::default();
@@ -1636,6 +1640,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn unreviewed_version_or_digest_stays_discoverable_but_degrades_capacity() {
         let registry = ProviderCapabilityRegistry::default();
@@ -1727,6 +1732,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn discovery_only_launch_pins_catalog_identity_across_intervening_refresh() {
         let registry = ProviderCapabilityRegistry::default();
@@ -1833,6 +1839,7 @@ mod tests {
         assert_eq!(runtime.capacity.effective_percent, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn failed_refresh_preserves_parsed_cache_but_degrades_resolution() {
         let registry = ProviderCapabilityRegistry::default();
@@ -1857,6 +1864,7 @@ mod tests {
         assert_eq!(resolved.evidence.confidence, CapabilityConfidence::Degraded);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn claude_repository_resolution_uses_shared_catalog_and_variant_normalization() {
         let registry = ProviderCapabilityRegistry::default();
@@ -1888,6 +1896,7 @@ mod tests {
         assert_eq!(local.evidence.source, CapabilitySource::LegacyUnverified);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn resolver_distinguishes_catalog_repository_unknown_pioneer_and_authority() {
         let registry = ProviderCapabilityRegistry::default();
@@ -1983,6 +1992,7 @@ mod tests {
         assert!(!harness.authorizes_threshold_rotation());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn supported_gpt_6_astra_resolves_capacity_and_provenance() {
         let registry = ProviderCapabilityRegistry::default();
@@ -2004,6 +2014,7 @@ mod tests {
         assert_eq!(canonical.capacity.provider_default_tokens, Some(272_000));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn resume_and_retry_invalidate_runtime_but_preserve_configured_authority() {
         let runtime = ResolvedContextBudget::new(
@@ -2079,6 +2090,7 @@ mod tests {
         assert_eq!(resumed.evidence.source, CapabilitySource::Configured);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn restart_rehydration_preserves_active_provenance_and_separates_maximum() {
         let persisted = ResolvedContextBudget::new(
@@ -2109,6 +2121,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn legacy_consumers_have_no_provider_specific_mapping_or_stale_numeric_value() {
         let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

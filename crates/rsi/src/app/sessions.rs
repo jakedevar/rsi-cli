@@ -215,19 +215,23 @@ impl App {
         }
     }
 
-    /// Debug-only invariant check: every entry in `session_order` MUST be
-    /// in exactly one bucket of `children_by_parent`, keyed by its current
-    /// `parent_id`. Total bucket size equals `session_order.len()`.
+    /// Debug-build production and test invariant check: every entry in
+    /// `session_order` MUST be in exactly one bucket of `children_by_parent`,
+    /// keyed by its current `parent_id`. Total bucket size equals
+    /// `session_order.len()`.
     ///
     /// `session_order` is the source-of-truth ordering and is what the
     /// rebuild iterates -- the invariant follows the rebuild semantics
     /// rather than `sessions.len()` so transient states where a session
     /// exists in `self.sessions` but not yet in `session_order` (or
     /// vice-versa, post test-fixture inserts) don't trip the assert.
-    #[cfg(debug_assertions)]
+    /// Ordinary assertions are intentional: `cfg(test)` includes optimized
+    /// tests with debug assertions disabled, while release production omits
+    /// this helper and its already debug-gated call sites.
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn assert_children_index_invariant(&self) {
         let total: usize = self.children_by_parent.values().map(Vec::len).sum();
-        debug_assert_eq!(
+        assert_eq!(
             total,
             self.session_order.len(),
             "children_by_parent bucket sum ({}) != session_order.len() ({})",
@@ -245,7 +249,7 @@ impl App {
                 .children_by_parent
                 .get(&key)
                 .expect("children_by_parent missing bucket for known parent_id");
-            debug_assert!(
+            assert!(
                 bucket.contains(id),
                 "session {} not in its parent_id={:?} bucket",
                 id,
@@ -329,6 +333,7 @@ impl App {
         }
         for id in &removed_ids {
             self.sessions.remove(id);
+            self.operator_pauses.remove(id);
             changed = true;
         }
         if !removed_ids.is_empty() {
@@ -1567,6 +1572,27 @@ mod tests {
         // The order should be the reverse of the initial order.
         assert_eq!(after[0], b, "freshest (b) should now come first");
         assert_eq!(after[1], a);
+        app.assert_children_index_invariant();
+    }
+
+    #[test]
+    #[should_panic(expected = "not in its parent_id=None bucket")]
+    fn children_index_invariant_panics_on_wrong_bucket_in_release_tests() {
+        let mut app = make_test_app();
+        let session_id = Uuid::new_v4();
+        app.update_sessions(vec![make_session(session_id, None, SessionKind::Standard)]);
+
+        let misplaced = app
+            .children_by_parent
+            .get_mut(&None)
+            .unwrap()
+            .pop()
+            .unwrap();
+        app.children_by_parent
+            .entry(Some(Uuid::new_v4()))
+            .or_default()
+            .push(misplaced);
+
         app.assert_children_index_invariant();
     }
 

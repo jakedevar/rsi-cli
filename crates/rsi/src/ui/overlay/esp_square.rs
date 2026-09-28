@@ -1,4 +1,5 @@
 use super::fixed_centered_rect;
+use crate::ui::theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -59,7 +60,8 @@ pub fn render_esp_square(
     let outer = Block::default()
         .title(" ESP Square ")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::overlay_border()));
     frame.render_widget(outer, popup_area);
 
     let inner = Rect {

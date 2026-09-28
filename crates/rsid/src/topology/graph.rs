@@ -472,6 +472,7 @@ mod tests {
 
     /// T2-A6: loops stop at the per-node cap, at the topology `until`, and
     /// never beyond `MAX_ITERATIONS`, whichever comes first.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn t2_a6_loop_caps_bound_every_region() {
         let unbounded =
@@ -530,6 +531,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn readiness_follows_forward_edges_and_region_iterations() {
         let shape =

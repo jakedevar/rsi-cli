@@ -140,42 +140,49 @@ mod tests {
 
     // --- calculate_temporal_decay_multiplier tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_zero_age() {
         let m = calculate_temporal_decay_multiplier(0.0, 30.0);
         assert!((m - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_at_half_life() {
         let m = calculate_temporal_decay_multiplier(30.0, 30.0);
         assert!((m - 0.5).abs() < 1e-10);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_at_double_half_life() {
         let m = calculate_temporal_decay_multiplier(60.0, 30.0);
         assert!((m - 0.25).abs() < 1e-10);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_zero_half_life() {
         let m = calculate_temporal_decay_multiplier(10.0, 0.0);
         assert!((m - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_negative_half_life() {
         let m = calculate_temporal_decay_multiplier(10.0, -10.0);
         assert!((m - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_negative_age() {
         let m = calculate_temporal_decay_multiplier(-5.0, 30.0);
         assert!((m - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_calculate_decay_large_age() {
         let m = calculate_temporal_decay_multiplier(365.0, 30.0);
@@ -185,6 +192,7 @@ mod tests {
 
     // --- parse_memory_date_from_path tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_valid() {
         let ts = parse_memory_date_from_path("memory/2026-02-28.md").unwrap();
@@ -197,32 +205,38 @@ mod tests {
         assert_eq!(ts, expected);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_nested() {
         let ts = parse_memory_date_from_path("./memory/2026-02-28.md");
         assert!(ts.is_some());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_not_memory() {
         assert!(parse_memory_date_from_path("notes/2026-02-28.md").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_invalid_date() {
         assert!(parse_memory_date_from_path("memory/2026-13-32.md").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_no_date() {
         assert!(parse_memory_date_from_path("memory/architecture.md").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_root_memory() {
         assert!(parse_memory_date_from_path("MEMORY.md").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_parse_date_from_path_backslash() {
         let ts = parse_memory_date_from_path("memory\\2026-02-28.md");
@@ -231,31 +245,37 @@ mod tests {
 
     // --- is_evergreen_memory_path tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_root_memory() {
         assert!(is_evergreen_memory_path("MEMORY.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_alt_memory() {
         assert!(is_evergreen_memory_path("memory.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_undated_subfile() {
         assert!(is_evergreen_memory_path("memory/architecture.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_dated_file() {
         assert!(!is_evergreen_memory_path("memory/2026-02-28.md"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_session() {
         assert!(!is_evergreen_memory_path("sessions/abc-123"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_evergreen_random_path() {
         assert!(!is_evergreen_memory_path("src/main.rs"));
@@ -263,6 +283,7 @@ mod tests {
 
     // --- apply_temporal_decay tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_disabled() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -276,6 +297,7 @@ mod tests {
         assert!((chunks[0].score - original_score).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_evergreen_exempt() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -292,6 +314,7 @@ mod tests {
         assert!((chunks[0].score - original_score).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_dated_file() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -315,6 +338,7 @@ mod tests {
         assert!((chunks[0].score - 0.265).abs() < 0.01);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_undated_memory_file() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -329,6 +353,7 @@ mod tests {
         assert!((chunks[0].score - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_session_chunk() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -358,6 +383,7 @@ mod tests {
         assert!(chunks[0].score < 1.0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_no_timestamp_found() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -368,6 +394,7 @@ mod tests {
         assert!((chunks[0].score - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_apply_decay_caches_timestamps() {
         let store = MemoryStore::open_in_memory().unwrap();

@@ -363,6 +363,7 @@ mod tests {
         chrono::Utc::now()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_session_stalled_event_type() {
         let event = DaemonEvent::SessionStalled {
@@ -374,6 +375,7 @@ mod tests {
         assert_eq!(bus_event.event_type, "session_stalled");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_session_stalled_serde_roundtrip() {
         let event = DaemonEvent::SessionStalled {
@@ -391,6 +393,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_stall_config_default() {
         let config = StallConfig::default();
@@ -404,6 +407,7 @@ mod tests {
         assert_eq!(config.classifier_max_per_session, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_stall_action_imported_from_reconciliation() {
         // Verify StallAction types are correctly imported and usable
@@ -415,6 +419,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn stall_retry_gate_uses_retry_policy() {
         let runtime = RuntimeConfig::from_config(&Config::default());
@@ -450,6 +455,7 @@ mod tests {
 
     // --- Classifier-branch gating (RSI-0XX) ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_signals_when_threshold_met() {
         let c = cfg();
@@ -464,6 +470,7 @@ mod tests {
         assert!(should_signal_classifier(&i));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_silent_below_threshold() {
         let c = cfg();
@@ -478,6 +485,7 @@ mod tests {
         assert!(!should_signal_classifier(&i));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_uses_codex_threshold_for_codex_sessions() {
         let c = cfg();
@@ -498,6 +506,7 @@ mod tests {
         assert!(!should_signal_classifier(&codex));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_blocked_by_cap() {
         let c = cfg();
@@ -512,6 +521,7 @@ mod tests {
         assert!(!should_signal_classifier(&i));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_blocked_by_cooldown() {
         let c = cfg();
@@ -528,6 +538,7 @@ mod tests {
         assert!(!should_signal_classifier(&inputs));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_allows_after_cooldown_expires() {
         let c = cfg();
@@ -544,6 +555,7 @@ mod tests {
         assert!(should_signal_classifier(&inputs));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_blocked_when_provider_codex_below_codex_threshold() {
         let c = cfg();
@@ -558,6 +570,7 @@ mod tests {
         assert!(!should_signal_classifier(&inputs));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_branch_uses_codex_threshold_for_pioneer() {
         let c = cfg();

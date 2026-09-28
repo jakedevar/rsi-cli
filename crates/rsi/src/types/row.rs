@@ -135,6 +135,8 @@ pub struct SessionRowViewModel {
     pub status: SessionStatus,
     pub status_icon: String,
     pub status_color: Color,
+    /// Persisted operator pause strength, read through GetOperatorPause.
+    pub operator_pause: crate::client::OperatorPauseLevel,
     /// Independent one-cell navigator attention signal and inspector reasons.
     pub attention_glyph: &'static str,
     pub attention_reasons: Vec<String>,
@@ -209,6 +211,7 @@ impl SessionRowViewModel {
             status: SessionStatus::Starting,
             status_icon: String::new(),
             status_color: theme::overlay0(),
+            operator_pause: crate::client::OperatorPauseLevel::None,
             attention_glyph: "",
             attention_reasons: Vec::new(),
             display_title: String::new(),
@@ -576,6 +579,7 @@ pub fn compute_session_row_for_state_with_focus(
         status: session.status,
         status_icon: status_icon_str,
         status_color: status_color_value,
+        operator_pause: crate::client::OperatorPauseLevel::None,
         attention_glyph,
         attention_reasons,
         display_title,

@@ -302,6 +302,7 @@ impl World {
 }
 const METHOD: &str = "item/commandExecution/requestApproval";
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_monitor_operator_writer_roundtrip_and_exact_replay_emit_once() {
     let mut w = World::new().await;
@@ -355,6 +356,7 @@ async fn appserver_approval_monitor_operator_writer_roundtrip_and_exact_replay_e
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_new_same_text_reused_id_and_stale_clear_preserve_latest_gate() {
     let mut w = World::new().await;
@@ -396,6 +398,7 @@ async fn appserver_approval_new_same_text_reused_id_and_stale_clear_preserve_lat
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_new_unpersisted_frame_invalidates_old_runtime_and_failed_event_gate() {
     let mut w = World::new().await;
@@ -410,30 +413,22 @@ async fn appserver_approval_new_unpersisted_frame_invalidates_old_runtime_and_fa
         .manager_v2_claim_decision_delivery(&w.config, w.manager.program_run_boot_id)
         .unwrap()
         .unwrap();
-    // Force the exact publication/event split: the producer updates its runtime
-    // witness while FIFO persistence waits for Store ownership.
-    let store = w.manager.store.lock().await;
-    store.conn.execute_batch("CREATE TRIGGER approval_event_fail BEFORE INSERT ON conversation_events BEGIN SELECT RAISE(ABORT,'controlled event failure'); END;").unwrap();
+    // Force the exact publication/event split: pause after the runtime witness
+    // changes, then hold Store ownership while FIFO persistence starts.
+    {
+        let store = w.manager.store.lock().await;
+        store.conn.execute_batch("CREATE TRIGGER approval_event_fail BEFORE INSERT ON conversation_events BEGIN SELECT RAISE(ABORT,'controlled event failure'); END;").unwrap();
+    }
+    let (entered, release) = pause_next_publication_for_test(w.session);
     w.inject(json!(91), METHOD);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if w.manager
-                .active
-                .read()
-                .await
-                .get(&w.session)
-                .unwrap()
-                .events
-                .len()
-                >= 2
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("monitor must reach the runtime publication boundary")
+        .expect("publication boundary sender must remain live");
+    let store = w.manager.store.lock().await;
+    release
+        .send(())
+        .expect("release publication into FIFO persistence");
     assert_eq!(
         store.pending_appserver_approval_target(w.session).unwrap(),
         Some(old.clone()),
@@ -458,6 +453,7 @@ async fn appserver_approval_new_unpersisted_frame_invalidates_old_runtime_and_fa
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_wrong_writer_incarnation_refuses_and_keeps_human_gate() {
     let mut w = World::new().await;
@@ -512,6 +508,7 @@ async fn appserver_approval_wrong_writer_incarnation_refuses_and_keeps_human_gat
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_revocation_after_claim_prevents_writer_effect() {
     let mut w = World::new().await;
@@ -554,6 +551,7 @@ async fn appserver_approval_revocation_after_claim_prevents_writer_effect() {
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_post_enqueue_failure_is_uncertain_and_restart_never_resends() {
     let mut w = World::new().await;
@@ -605,6 +603,7 @@ async fn appserver_approval_post_enqueue_failure_is_uncertain_and_restart_never_
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_writer_closed_before_enqueue_is_blocked_without_effect() {
     let mut w = World::new().await;
@@ -627,6 +626,7 @@ async fn appserver_approval_writer_closed_before_enqueue_is_blocked_without_effe
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_reopen_expires_exact_enqueued_writer_and_preserves_delivery_id() {
     let mut w = World::new().await;
@@ -678,6 +678,7 @@ async fn appserver_approval_reopen_expires_exact_enqueued_writer_and_preserves_d
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_missing_id_is_visible_unresolved_not_request_zero() {
     let mut w = World::new().await;
@@ -712,6 +713,7 @@ async fn appserver_approval_missing_id_is_visible_unresolved_not_request_zero() 
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_public_delivery_and_actual_invocation_fences_hold_under_spawn_guard() {
     let mut w = World::new().await;
@@ -787,6 +789,7 @@ async fn appserver_approval_public_delivery_and_actual_invocation_fences_hold_un
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_queued_restart_loses_writer_and_stays_explicitly_blocked() {
     let mut w = World::new().await;
@@ -828,6 +831,7 @@ async fn appserver_approval_queued_restart_loses_writer_and_stays_explicitly_blo
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_current_schema_transport_matrix_preserves_numeric_and_string_ids() {
     let mut w = World::new().await;
@@ -880,6 +884,7 @@ async fn appserver_approval_current_schema_transport_matrix_preserves_numeric_an
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_offered_choices_gate_operator_admission_and_reused_string_request() {
     let mut w = World::new().await;
@@ -919,6 +924,7 @@ async fn appserver_approval_offered_choices_gate_operator_admission_and_reused_s
     w.finish().await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn appserver_approval_unsupported_protocols_and_unoffered_binary_choices_stay_visible() {
     let mut w = World::new().await;

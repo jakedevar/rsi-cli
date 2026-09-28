@@ -29,6 +29,33 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// sufficient; no cross-file collision is possible.
 static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+struct RestoreEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl RestoreEnvVar {
+    fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            previous: std::env::var_os(key),
+        }
+    }
+}
+
+impl Drop for RestoreEnvVar {
+    fn drop(&mut self) {
+        // SAFETY: HTTP tests in this binary hold TEST_LOCK while changing
+        // these variables; other integration binaries have separate processes.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 fn runtime_config() -> Arc<RuntimeConfig> {
     RuntimeConfig::from_config(&Config::from_env())
 }
@@ -103,10 +130,14 @@ async fn http_paths_supersede_happy_and_error() {
 
     let server = MockServer::start().await;
 
-    // SAFETY: TEST_LOCK is held above; no other test in this binary can write
-    // RSI_OLLAMA_URL concurrently. The var is read fresh per generate call
-    // (see `ollama_client::ollama_url`), so our server binding stays pinned.
+    let _restore_ollama_url = RestoreEnvVar::new("RSI_OLLAMA_URL");
+    let _restore_local_base_url = RestoreEnvVar::new("LOCAL_LLM_BASE_URL");
+
+    // SAFETY: TEST_LOCK is held above; no other HTTP test in this binary can
+    // change either variable concurrently. A configured LOCAL_LLM_BASE_URL
+    // routes the request away from Ollama and bypasses this wiremock server.
     unsafe {
+        std::env::remove_var("LOCAL_LLM_BASE_URL");
         std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
     }
 
@@ -148,8 +179,27 @@ async fn http_paths_supersede_happy_and_error() {
     let first_id = first_resp.request_id;
     assert!(first_resp.cached.is_none());
 
-    // Let the engine register the in_flight entry before the supersede fires.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first request is in-flight once the delayed mock has received it.
+    // Waiting for that request also catches an early admission or route error.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let requests = server
+                .received_requests()
+                .await
+                .expect("wiremock request recording");
+            if requests.iter().any(|request| {
+                request
+                    .body
+                    .windows(b"slow-first-call-input".len())
+                    .any(|window| window == b"slow-first-call-input")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first compile request did not reach wiremock");
 
     // Cache-hits short-circuit BEFORE the supersede check (see
     // `CompileEngine::compile`), so we force an uncached second call. Mount
@@ -183,17 +233,26 @@ async fn http_paths_supersede_happy_and_error() {
         )
         .await;
 
+    let mut first_outcomes = Vec::new();
     let saw_supersede = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match rx_super.recv().await {
-                Ok(ev) => {
-                    if let DaemonEvent::CompilePromptFailed { request_id, error } = &*ev
-                        && *request_id == first_id
-                        && error == "superseded"
+                Ok(ev) => match &*ev {
+                    DaemonEvent::CompilePromptFailed { request_id, error }
+                        if *request_id == first_id =>
                     {
-                        return true;
+                        first_outcomes.push(error.clone());
+                        if error == "superseded" {
+                            return true;
+                        }
                     }
-                }
+                    DaemonEvent::CompilePromptCompleted { request_id, .. }
+                        if *request_id == first_id =>
+                    {
+                        first_outcomes.push("completed".to_string());
+                    }
+                    _ => {}
+                },
                 Err(_) => return false,
             }
         }
@@ -202,7 +261,7 @@ async fn http_paths_supersede_happy_and_error() {
     .unwrap_or(false);
     assert!(
         saw_supersede,
-        "expected CompilePromptFailed {{ error: \"superseded\" }} for first request_id {first_id}"
+        "expected CompilePromptFailed {{ error: \"superseded\" }} for first request_id {first_id}; observed first outcomes: {first_outcomes:?}"
     );
 
     // ── 2. Happy path ─────────────────────────────────────────────────────

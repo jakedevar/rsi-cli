@@ -190,6 +190,7 @@ fn is_valid_keyword(token: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_basic() {
         assert_eq!(
@@ -198,6 +199,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_conversational() {
         assert_eq!(
@@ -206,26 +208,31 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_empty() {
         assert_eq!(extract_keywords(""), Vec::<String>::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_only_stop_words() {
         assert_eq!(extract_keywords("the is a to for"), Vec::<String>::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_short_tokens_filtered() {
         assert_eq!(extract_keywords("a do if go"), Vec::<String>::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_numbers_filtered() {
         assert_eq!(extract_keywords("42 100 2026"), Vec::<String>::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_mixed_valid_invalid() {
         assert_eq!(
@@ -234,6 +241,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_punctuation_stripped() {
         assert_eq!(
@@ -242,21 +250,25 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_deduplication() {
         assert_eq!(extract_keywords("memory memory memory"), vec!["memory"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_case_insensitive() {
         assert_eq!(extract_keywords("API api Api"), vec!["api"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_unicode_tokens() {
         assert_eq!(extract_keywords("the uber design"), vec!["uber", "design"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_extract_keywords_underscores_kept() {
         assert_eq!(
@@ -265,16 +277,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_tokenize_basic() {
         assert_eq!(tokenize("hello world"), vec!["hello", "world"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_tokenize_empty() {
         assert_eq!(tokenize(""), Vec::<String>::new());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_tokenize_punctuation() {
         assert_eq!(
@@ -283,36 +298,43 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_tokenize_lowercased() {
         assert_eq!(tokenize("Hello WORLD"), vec!["hello", "world"]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_valid_keyword_empty() {
         assert!(!is_valid_keyword(""));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_valid_keyword_short_ascii() {
         assert!(!is_valid_keyword("ab"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_valid_keyword_three_char_ascii() {
         assert!(is_valid_keyword("abc"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_valid_keyword_pure_numbers() {
         assert!(!is_valid_keyword("123"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_is_valid_keyword_alphanumeric() {
         assert!(is_valid_keyword("abc123"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_stop_words_contains_expected() {
         assert!(STOP_WORDS.contains("the"));
@@ -321,6 +343,7 @@ mod tests {
         assert!(STOP_WORDS.contains("something"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_stop_words_does_not_contain_keywords() {
         assert!(!STOP_WORDS.contains("rust"));

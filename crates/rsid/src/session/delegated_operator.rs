@@ -37,17 +37,19 @@ impl SessionManager {
         match call.typed().map_err(refused)? {
             DelegatedOperatorCallV1::ArchiveSession(params) => {
                 let id = params.session_id;
-                // Same quiescence rules as scoped housekeeping: no concurrent
-                // continuation, no live process, no retry/recovery owner.
+                // A pending retry is cancelled by the archive transaction.
+                // A successor already established by retry retains its owner.
                 let _spawn_guard = super::spawn_single_flight::acquire_spawn_guard(id).await;
                 if self.active.read().await.contains_key(&id) {
                     return Err(refused("manager_v2_session_active"));
                 }
-                if self.completed.read().await.get(&id).is_some_and(|cs| {
-                    cs.retry_cancel.is_some()
-                        || cs.retry_fired_at.is_some()
-                        || cs.superseded_by_retry.is_some()
-                }) {
+                if self
+                    .completed
+                    .read()
+                    .await
+                    .get(&id)
+                    .is_some_and(|cs| cs.superseded_by_retry.is_some())
+                {
                     return Err(refused("manager_v2_human_or_recovery_owner"));
                 }
                 self.store.lock().await.apply_delegated_archive(claim)?;

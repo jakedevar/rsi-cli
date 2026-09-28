@@ -1174,6 +1174,7 @@ mod tests {
     // P1.2 — effective_topology() helper
     // ─────────────────────────────────────────────────────────────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn effective_topology_returns_none_for_orphan_leaf() {
         let leaf_id = Uuid::new_v4();
@@ -1183,6 +1184,7 @@ mod tests {
         assert_eq!(effective_topology_with_override(&leaf, &view), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn effective_topology_returns_epic_workflow() {
         let workflow = Uuid::new_v4();
@@ -1195,6 +1197,7 @@ mod tests {
         assert_eq!(effective_topology(&leaf, &view), Some(workflow));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn effective_topology_walks_through_epic_to_group() {
         let workflow = Uuid::new_v4();
@@ -1209,6 +1212,7 @@ mod tests {
         assert_eq!(effective_topology(&leaf, &view), Some(workflow));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn effective_topology_short_circuits_on_cycle() {
         // a.parent_id = b, b.parent_id = a → 2-cycle.
@@ -1222,6 +1226,7 @@ mod tests {
         assert_eq!(effective_topology_with_override(&a, &view), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn effective_topology_with_override_beats_inherited() {
         let inherited = Uuid::new_v4();
@@ -1241,6 +1246,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn create_container_is_immediately_visible_in_runtime() {
         let (manager, _dir) = manager();
@@ -1277,6 +1283,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn create_container_uses_project_working_dir() {
         let (manager, dir) = manager();
@@ -1302,6 +1309,7 @@ mod tests {
         assert_eq!(group.working_dir, project_dir.canonicalize().unwrap());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn create_container_inherits_parent_working_dir_without_project() {
         let (manager, dir) = manager();
@@ -1338,6 +1346,7 @@ mod tests {
         assert_eq!(epic.working_dir, group.working_dir);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn reparent_lead_out_clears_old_epic_and_auto_promotes_new_epic() {
         let (manager, _dir) = manager();
@@ -1405,6 +1414,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn promoting_a_lead_preserves_its_session_title() {
         let (manager, _dir) = manager();
@@ -1462,6 +1472,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn promoting_a_lead_pins_it_and_keeps_an_existing_pin_time() {
         let (manager, _dir) = manager();
@@ -1549,6 +1560,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn the_rotation_runtime_path_applies_the_same_marks_as_a_promotion() {
         // Rotation transfers the baton from a static context, so it calls the
@@ -1605,6 +1617,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn an_untitled_lead_is_left_for_its_own_generation_path() {
         let (manager, _dir) = manager();
@@ -1647,6 +1660,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn archiving_current_lead_clears_epic_pointer() {
         let (manager, _dir) = manager();
@@ -1693,6 +1707,7 @@ mod tests {
         assert_eq!(persisted.lead_session_id, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn finalize_pending_archive_lead_retains_terminal_notice_across_reopen() {
         let (manager, dir) = manager();
@@ -1816,6 +1831,7 @@ mod tests {
 
     // ─── P1.6 tests: create_container tag + topology validation ─────────────
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_empty_tags_rejected() {
         let (manager, _dir) = manager();
@@ -1838,6 +1854,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_malformed_tag_rejected() {
         let (manager, _dir) = manager();
@@ -1860,6 +1877,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_valid_tags_persisted() {
         let (manager, _dir) = manager();
@@ -1879,6 +1897,7 @@ mod tests {
         assert_eq!(session.tag, "alpha"); // lex-first
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_topology_id_on_non_epic_rejected() {
         let (manager, _dir) = manager();
@@ -1906,6 +1925,7 @@ mod tests {
         assert_eq!(session.workflow_id, Some(fake_topo));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_topology_id_nonexistent_row_rejected() {
         // This test verifies that topology_exists returns false for unknown UUIDs.
@@ -1924,6 +1944,7 @@ mod tests {
         assert!(!exists, "non-existent topology UUID must not exist");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn create_container_topology_id_on_epic_persisted_to_workflow_id() {
         let (manager, _dir) = manager();
@@ -1996,6 +2017,7 @@ mod tests {
         s
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn max_iter_for_node_scoped_to_epic() {
         let (manager, _dir) = manager();
@@ -2049,6 +2071,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn prereq_satisfied_checks_status() {
         let epic_id = Uuid::new_v4();
@@ -2128,6 +2151,7 @@ mod tests {
     /// through the authority gate. While a continuation of the candidate
     /// holds its spawn guard, the promotion (and its generation bump) waits;
     /// it commits once the guard is released.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
     async fn auto_promotion_waits_for_the_candidate_continuation_guard() {
@@ -2166,6 +2190,7 @@ mod tests {
     /// K2 design test 12: `SetEpicLead` never waits on a lead continuation's
     /// guard; it is refused `lead_mutation_contended` and the retry after the
     /// continuation installs its provider succeeds at generation + 1.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::unwrap_used)]
     async fn set_epic_lead_is_refused_while_a_lead_continuation_holds_its_guard() {

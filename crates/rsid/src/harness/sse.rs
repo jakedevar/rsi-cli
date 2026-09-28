@@ -409,12 +409,14 @@ impl Default for ThinkStripFilter {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_think_strip_filter_no_tags() {
         let mut f = ThinkStripFilter::new();
         assert_eq!(f.filter("hello world"), "hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_think_strip_filter_strips_block() {
         let mut f = ThinkStripFilter::new();
@@ -424,6 +426,7 @@ mod tests {
         assert!(!result.contains("hidden"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_think_strip_filter_across_chunks() {
         let mut f = ThinkStripFilter::new();

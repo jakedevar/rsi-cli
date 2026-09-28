@@ -898,6 +898,7 @@ mod tests {
             .expect("provider receives primary request")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn legacy_harness_loop_forwards_configured_effort_and_preserves_none() {
         assert_eq!(
@@ -915,6 +916,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_estimate_remaining_tokens() {
         let history = vec![
@@ -928,6 +930,7 @@ mod tests {
         assert!(remaining < 100);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_hash_tool_call_deterministic() {
         let h1 = hash_tool_call("read_file", r#"{"path":"foo.rs"}"#);
@@ -937,6 +940,7 @@ mod tests {
         assert_ne!(h1, h3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_trim_history_preserves_system() {
         let mut history = vec![
@@ -954,6 +958,7 @@ mod tests {
         assert_eq!(history[2].content, "msg5");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_trim_history_no_op_when_under_limit() {
         let mut history = vec![ChatMessage::user("a"), ChatMessage::user("b")];
@@ -961,6 +966,7 @@ mod tests {
         assert_eq!(history.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_force_compress_preserves_system_and_tail() {
         let mut history = vec![
@@ -981,6 +987,7 @@ mod tests {
         assert_eq!(history[5].content, "msg6");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_force_compress_no_op_when_short() {
         let mut history = vec![
@@ -992,6 +999,7 @@ mod tests {
         assert_eq!(history.len(), 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn legacy_harness_loop_records_three_attempts_in_streaming_mode() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1080,6 +1088,7 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn legacy_harness_stream_fallback_requires_a_second_admission() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1171,6 +1180,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn legacy_harness_compaction_denial_performs_zero_provider_calls() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
@@ -1226,6 +1236,7 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn legacy_harness_cancellation_settles_the_in_flight_attempt() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));

@@ -648,6 +648,7 @@ mod tests {
         (tool, store, caller, child, stranger)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_fresh_insert_in_seconds() {
         let store = make_store();
@@ -669,6 +670,7 @@ mod tests {
         assert_eq!(jobs[0].wake_mode, rsi_common::types::WakeMode::Fresh);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn bound_native_explicit_fresh_persists_agent_fresh() {
         let (tool, store, caller, _child, _stranger) = make_watch_tool().await;
@@ -690,6 +692,7 @@ mod tests {
         assert_eq!(jobs[0].wake_session_id, Some(caller));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn bound_native_omitted_or_unknown_mode_rejects_without_insert() {
         let (tool, store, _caller, _child, _stranger) = make_watch_tool().await;
@@ -719,6 +722,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_past_once_at_rejects() {
         let store = make_store();
@@ -732,6 +736,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("past"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_missing_timing_rejects() {
         let store = make_store();
@@ -741,6 +746,7 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_both_timing_rejects() {
         let store = make_store();
@@ -755,6 +761,7 @@ mod tests {
         assert!(result.error_msg.unwrap().contains("not both"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_unknown_mode_rejects_without_insert() {
         let store = make_store();
@@ -786,6 +793,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_non_positive_in_seconds_rejects() {
         let store = make_store();
@@ -798,6 +806,7 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_non_positive_every_seconds_rejects() {
         let store = make_store();
@@ -811,6 +820,7 @@ mod tests {
         assert!(!result.success);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_resume_without_origin_rejects() {
         let store = make_store();
@@ -837,6 +847,7 @@ mod tests {
     /// a watch — `mode:"on_terminal"` (even with a smuggled arg) is rejected
     /// and nothing is inserted. Watch capability requires the
     /// construction-time [`AgentControlHandle`], never tool args.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -860,6 +871,7 @@ mod tests {
 
     /// A8 builder contract: `on_terminal` defaults (recurring 60s, name
     /// rsi-watch, wake target = origin) and its requirement matrix.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn test_build_on_terminal_defaults_and_requirements() {
@@ -896,6 +908,7 @@ mod tests {
         assert!(build_scheduled_job(wrong_mode).is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn program_guard_builder_is_deterministic_daemon_bound_and_unsteerable() {
         let origin = Uuid::new_v4();
@@ -926,6 +939,7 @@ mod tests {
         assert!(first.name.starts_with("master-orchestrate-program-guard-"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn test_resume_with_origin_inserts() {
         let store = make_store();
@@ -960,6 +974,7 @@ mod tests {
     /// A8.1 Q3: the advertised schema follows watch capability — a
     /// handle-ful tool advertises `on_terminal` + `watch_session_id`; a
     /// handle-less tool keeps the pre-A8.1 schema verbatim.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn test_schema_advertises_watch_only_when_capable() {
@@ -1024,6 +1039,7 @@ mod tests {
     /// caller's direct child) through the shared arm service — the persisted
     /// row carries `OnTerminal(child)` with the wake target bound to the
     /// caller, exactly like the RPC verb.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -1055,6 +1071,7 @@ mod tests {
 
     /// A8.1 Q3: an out-of-scope watched subject is denied by the SAME guarded
     /// authority the RPC verb uses, and nothing is inserted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -1081,6 +1098,7 @@ mod tests {
     }
 
     /// A8.1 Q3: self-watch is rejected explicitly (same as the RPC verb).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -1103,6 +1121,7 @@ mod tests {
 
     /// A8.1 Q3: a second identical arm deduplicates through the shared
     /// service — the tool says so, and no second row is created.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -1125,6 +1144,7 @@ mod tests {
         assert_eq!(guard.list_scheduled_jobs().unwrap().len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn native_program_guard_registration_is_deterministic_and_idempotent() {
         let (tool, store, caller, _child, _stranger) = make_watch_tool().await;

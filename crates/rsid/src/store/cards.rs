@@ -164,6 +164,7 @@ mod tests {
         Store::open(std::path::Path::new(":memory:")).unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_insert_and_get() {
         let store = test_store();
@@ -189,6 +190,7 @@ mod tests {
         assert_eq!(loaded.facts[0], "Uses Rust");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_upsert_replaces_facts() {
         let store = test_store();
@@ -221,6 +223,7 @@ mod tests {
         assert_eq!(loaded.facts[0], "Updated fact 1");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_get_nonexistent() {
         let store = test_store();
@@ -228,6 +231,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_delete() {
         let store = test_store();
@@ -256,6 +260,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_list_by_type() {
         let store = test_store();
@@ -289,6 +294,7 @@ mod tests {
         assert_eq!(user_cards.len(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn test_card_empty_facts() {
         let store = test_store();

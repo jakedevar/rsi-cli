@@ -383,6 +383,10 @@ pub struct AgentProgressRowV1 {
     /// sandbox custody root. Absent when no durable sandbox base exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Final Git status observation for the terminal tip's sandbox. `None`
+    /// means no observation is available; false means the worktree was clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_worktree_dirty: Option<bool>,
     pub cursor: AgentProgressCursorV1,
     pub freshness: AgentProgressFreshnessV1,
     pub watch_state: AgentWatchStateV1,
@@ -644,12 +648,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn agent_progress_base_commit_is_optional_and_serde_compatible() {
         let row = AgentProgressRowV1 {
             spawn_request_id: None,
             spawn_state: None,
             spawn_safe_error_class: None,
             base_commit: Some("known-object-id".into()),
+            sandbox_worktree_dirty: None,
             cursor: AgentProgressCursorV1 {
                 session_id: Uuid::nil(),
                 lineage_tip_id: Uuid::nil(),
@@ -676,6 +682,18 @@ mod tests {
         let absent = serde_json::to_value(&without_base).expect("serialize base-less row");
         assert!(absent.get("base_commit").is_none());
         assert!(absent.get("spawn_safe_error_class").is_none());
+        assert!(absent.get("sandbox_worktree_dirty").is_none());
+
+        let mut dirty = row;
+        dirty.sandbox_worktree_dirty = Some(true);
+        let encoded = serde_json::to_value(&dirty).expect("serialize dirty observation");
+        assert_eq!(encoded["sandbox_worktree_dirty"], true);
+        assert_eq!(
+            serde_json::from_value::<AgentProgressRowV1>(encoded)
+                .expect("deserialize dirty observation")
+                .sandbox_worktree_dirty,
+            Some(true)
+        );
 
         for value in [absent.clone(), {
             let mut explicit_null = absent;
@@ -699,6 +717,7 @@ mod tests {
             spawn_state: None,
             spawn_safe_error_class: None,
             base_commit: None,
+            sandbox_worktree_dirty: None,
             cursor: AgentProgressCursorV1 {
                 session_id: Uuid::nil(),
                 lineage_tip_id: Uuid::nil(),

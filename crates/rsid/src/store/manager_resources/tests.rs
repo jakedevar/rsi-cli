@@ -209,6 +209,7 @@ fn queue_answer(
     .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_historical_creation_cannot_authorize_reparented_answer_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -251,6 +252,7 @@ fn manager_v2_resources_historical_creation_cannot_authorize_reparented_answer_a
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_answer_requires_live_epic_and_group() {
     for retire_group in [false, true] {
@@ -287,6 +289,7 @@ fn manager_v2_resources_answer_requires_live_epic_and_group() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_answer_cannot_redirect_between_selected_epics() {
     let store = Store::open_in_memory().unwrap();
@@ -335,6 +338,7 @@ fn manager_v2_resources_answer_cannot_redirect_between_selected_epics() {
     assert_eq!(current.payload["status"], "pending");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_group_rotation_needs_receipt_and_retains_capacity_pause_and_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -411,6 +415,7 @@ fn manager_v2_resources_group_rotation_needs_receipt_and_retains_capacity_pause_
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_rotation_attribution_has_a_fixed_walk_budget() {
     let store = Store::open_in_memory().unwrap();
@@ -440,6 +445,7 @@ fn manager_v2_resources_rotation_attribution_has_a_fixed_walk_budget() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and spend assertions must fail immediately.
 fn manager_v2_resources_unattributed_rotation_admission_skips_spend_walk() {
@@ -466,6 +472,7 @@ fn manager_v2_resources_unattributed_rotation_admission_skips_spend_walk() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and exact attribution assertions must fail immediately.
 fn manager_v2_resources_rotation_prefilter_includes_selected_epic_parent_attribution() {
@@ -496,6 +503,7 @@ fn manager_v2_resources_rotation_prefilter_includes_selected_epic_parent_attribu
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and result inspection must fail immediately.
 fn manager_v2_resources_rejects_changed_rotation_attribution_and_cycle() {
@@ -553,6 +561,7 @@ fn manager_v2_resources_rejects_changed_rotation_attribution_and_cycle() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and result inspection must fail immediately.
 fn manager_v2_resources_resumed_completed_descendant_keeps_legacy_spend_floor() {
@@ -581,6 +590,7 @@ fn manager_v2_resources_resumed_completed_descendant_keeps_legacy_spend_floor() 
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Exact fixture setup and spend assertions must fail immediately.
 fn manager_v2_resources_group_standard_rotation_successor_keeps_spend_floor() {
@@ -612,6 +622,7 @@ fn manager_v2_resources_group_standard_rotation_successor_keeps_spend_floor() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Exact fixture setup and spend assertions must fail immediately.
 fn manager_v2_resources_root_context_rotation_successor_keeps_spend_floor() {
@@ -663,6 +674,7 @@ fn manager_v2_resources_root_context_rotation_successor_keeps_spend_floor() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Exact fixture setup and negative attribution assertions must fail immediately.
 fn manager_v2_resources_unreceipted_continuation_gains_no_spend_floor() {
@@ -691,6 +703,7 @@ fn manager_v2_resources_unreceipted_continuation_gains_no_spend_floor() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and result inspection must fail immediately.
 fn manager_v2_resources_refreshes_terminal_question_decision() {
@@ -743,6 +756,7 @@ fn manager_v2_resources_refreshes_terminal_question_decision() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and result inspection must fail immediately.
 fn manager_v2_resources_refreshes_archived_approval_decision() {
@@ -808,6 +822,7 @@ fn manager_v2_resources_refreshes_archived_approval_decision() {
     assert_eq!(record.epic_id, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_cancellation_holds_capacity_until_actual_settlement_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -867,6 +882,7 @@ fn manager_v2_resources_cancellation_holds_capacity_until_actual_settlement_acro
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_first_invocation_preserves_legacy_floor_and_unknown_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -913,6 +929,7 @@ fn manager_v2_resources_first_invocation_preserves_legacy_floor_and_unknown_cove
     assert_denied(admit(&store, &lead), "spend_unknown");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_proven_zero_origin_allows_measured_ledger_cost_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -943,6 +960,7 @@ fn manager_v2_resources_proven_zero_origin_allows_measured_ledger_cost_after_reo
     assert_denied(admit(&store, &lead), "spend_exhausted");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_preexisting_telemetry_does_not_prove_legacy_coverage() {
     let store = Store::open_in_memory().unwrap();
@@ -1001,6 +1019,7 @@ fn create_action(
     )
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_actions_share_scoped_capacity_cost_unknowns_and_provider_windows() {
     let store = Store::open_in_memory().unwrap();
@@ -1134,6 +1153,7 @@ fn manager_v2_resources_actions_share_scoped_capacity_cost_unknowns_and_provider
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_rotation_reserves_capacity_before_successor_publication() {
     let dir = tempfile::tempdir().unwrap();
@@ -1202,6 +1222,7 @@ fn manager_v2_resources_rotation_reserves_capacity_before_successor_publication(
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_unproved_rotation_is_unknown_but_proven_unrelated_origin_is_unscoped() {
     let store = Store::open_in_memory().unwrap();
@@ -1245,6 +1266,7 @@ fn manager_v2_resources_unproved_rotation_is_unknown_but_proven_unrelated_origin
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_concurrent_store_admissions_reserve_one_scoped_slot() {
     let dir = tempfile::tempdir().unwrap();
@@ -1286,6 +1308,7 @@ fn manager_v2_resources_concurrent_store_admissions_reserve_one_scoped_slot() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_denied_attempt_cannot_certify_later_untracked_history_as_zero() {
     let store = Store::open_in_memory().unwrap();
@@ -1355,6 +1378,7 @@ fn admit_unpublished(
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_unpublished_permit_replay_rechecks_current_policy() {
     let store = Store::open_in_memory().unwrap();
@@ -1399,6 +1423,7 @@ fn manager_v2_resources_unpublished_permit_replay_rechecks_current_policy() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_fresh_unpublished_admission_retains_capacity_and_cost_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -1506,6 +1531,7 @@ fn manager_v2_resources_fresh_unpublished_admission_retains_capacity_and_cost_af
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_launch_after_retired_bookkeeping_history() {
     let store = Store::open_in_memory().unwrap();
@@ -1591,6 +1617,7 @@ fn manager_v2_resources_launch_after_retired_bookkeeping_history() {
     assert_eq!(budget["lifecycle"]["used"], 0);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_fresh_transaction_rechecks_pause_provider_and_spend_after_preflight() {
     for change in ["pause", "provider", "spend", "unknown", "retired"] {
@@ -1647,6 +1674,7 @@ fn manager_v2_resources_fresh_transaction_rechecks_pause_provider_and_spend_afte
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_fresh_origin_is_exact_and_unknown_settlement_stays_unknown() {
     let store = Store::open_in_memory().unwrap();
@@ -1687,6 +1715,7 @@ fn manager_v2_resources_fresh_origin_is_exact_and_unknown_settlement_stays_unkno
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_question_cleanup_reopen_preserves_unknown_usage_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
@@ -1743,6 +1772,7 @@ fn manager_v2_resources_question_cleanup_reopen_preserves_unknown_usage_and_canc
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_resources_selected_pending_uuid_survives_scope_revision_and_reopen() {
     use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
@@ -1820,6 +1850,7 @@ fn manager_v2_resources_selected_pending_uuid_survives_scope_revision_and_reopen
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used, clippy::too_many_lines)] // Large history fixture needs explicit fail-fast setup and end-to-end assertions.
 fn manager_v2_resources_preserves_large_retired_accounting_history_with_small_live_cohort() {
@@ -1946,6 +1977,7 @@ fn manager_v2_resources_preserves_large_retired_accounting_history_with_small_li
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // The capacity fixture must fail immediately on setup or admission errors.
 fn manager_v2_resources_rejects_more_than_budget_live_members() {
@@ -1966,6 +1998,7 @@ fn manager_v2_resources_rejects_more_than_budget_live_members() {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_answer_reopen_preserves_only_exact_invocation_measurements() {
     for bind_answer in [false, true] {
@@ -2020,6 +2053,7 @@ fn manager_v2_answer_reopen_preserves_only_exact_invocation_measurements() {
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 #[allow(clippy::unwrap_used)] // Fixture setup and exact usage assertions must fail immediately.
 fn manager_v2_resources_reports_created_session_usage_against_the_quota() {

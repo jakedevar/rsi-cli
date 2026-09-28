@@ -11,6 +11,23 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 const CONVERSATION_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const WORKER_PRESSURE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn fetch_worker_pressure(
+    socket_path: std::path::PathBuf,
+) -> Result<Option<rsi_common::rpc::WorkerSliceMemoryPressure>, String> {
+    tokio::time::timeout(CONVERSATION_POLL_TIMEOUT, async {
+        let mut client = crate::client::DaemonClient::new(socket_path);
+        client.connect().await.map_err(|error| error.to_string())?;
+        client
+            .get_health_status()
+            .await
+            .map(|status| status.worker_slice_memory_pressure)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "worker pressure Health read timed out".to_string())?
+}
 
 fn is_connection_error(error: &crate::client::ClientError) -> bool {
     matches!(
@@ -129,6 +146,44 @@ async fn run_background_conversation_poll_with_timeout(
 }
 
 impl App {
+    /// Complete one bounded Health task and schedule the next without waiting
+    /// for daemon I/O on the input/render task.
+    pub(crate) async fn poll_worker_pressure_refresh(&mut self) {
+        if self
+            .worker_pressure_refresh_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+            && let Some(handle) = self.worker_pressure_refresh_handle.take()
+        {
+            let pressure = match handle.await {
+                Ok(Ok(pressure)) => pressure,
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "worker pressure Health refresh unavailable");
+                    None
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "worker pressure Health task failed");
+                    None
+                }
+            };
+            if self.worker_slice_memory_pressure != pressure {
+                self.worker_slice_memory_pressure = pressure;
+                self.mark_dirty();
+            }
+        }
+        if !self.poll.connected
+            || self.worker_pressure_refresh_handle.is_some()
+            || std::time::Instant::now() < self.worker_pressure_next_refresh_at
+        {
+            return;
+        }
+        self.worker_pressure_next_refresh_at =
+            std::time::Instant::now() + WORKER_PRESSURE_REFRESH_INTERVAL;
+        let socket_path = self.client.socket_path().to_path_buf();
+        self.worker_pressure_refresh_handle =
+            Some(tokio::spawn(fetch_worker_pressure(socket_path)));
+    }
+
     pub(crate) fn note_manager_turnover(&mut self, session: &rsi_common::types::Session) {
         if session
             .continued_from
@@ -237,6 +292,20 @@ impl App {
             Err(e) => {
                 self.mark_transport_lost(e.to_string());
                 return;
+            }
+        }
+
+        // GetOperatorPause is a per-session operator read. Walk the visible
+        // list in bounded batches so every row eventually reflects external
+        // pause edits without holding an entire poll behind a large roster.
+        for _ in 0..self.session_order.len().min(8) {
+            let index = self.operator_pause_probe_cursor % self.session_order.len();
+            self.operator_pause_probe_cursor = self.operator_pause_probe_cursor.wrapping_add(1);
+            let session_id = self.session_order[index];
+            if let Ok(level) = self.client.get_operator_pause(session_id).await
+                && self.operator_pauses.insert(session_id, level) != Some(level)
+            {
+                self.needs_redraw = true;
             }
         }
 
@@ -842,10 +911,13 @@ impl App {
                             .map(|s| s.session.parent_id);
                         self.sessions.remove(&parsed.session_id);
                         self.session_order.retain(|id| *id != parsed.session_id);
-                        self.recalculate_filtered_order();
-                        self.reconcile_all_session_list_selections(true);
-                        if let Some(parent_id) = old_parent {
-                            self.invalidate_hierarchy_node(parent_id);
+                        if !self.docreg_operation_is_archiving(parsed.session_id) {
+                            self.recalculate_filtered_order();
+                            self.reconcile_all_session_list_selections(true);
+                            self.forget_removed_session(parsed.session_id);
+                            if let Some(parent_id) = old_parent {
+                                self.invalidate_hierarchy_node(parent_id);
+                            }
                         }
                         return true;
                     }
@@ -895,10 +967,16 @@ impl App {
                         .map(|s| s.session.parent_id);
                     self.sessions.remove(&parsed.session_id);
                     self.session_order.retain(|id| *id != parsed.session_id);
-                    self.recalculate_filtered_order();
-                    self.reconcile_all_session_list_selections(true);
-                    if let Some(parent_id) = old_parent {
-                        self.invalidate_hierarchy_node(parent_id);
+                    if !self.docreg_operation_is_archiving(parsed.session_id) {
+                        self.recalculate_filtered_order();
+                        self.reconcile_all_session_list_selections(true);
+                        self.forget_removed_session(parsed.session_id);
+                        if let Some(parent_id) = old_parent {
+                            self.invalidate_hierarchy_node(parent_id);
+                        }
+                    } else if let Some(parent_id) = old_parent {
+                        self.hierarchy_stale_nodes.insert(parent_id);
+                        self.navigation_cache.invalidate_hierarchy(parent_id);
                     }
                     return true;
                 }
@@ -922,10 +1000,16 @@ impl App {
                         .map(|s| s.session.parent_id);
                     self.sessions.remove(&parsed.session_id);
                     self.session_order.retain(|id| *id != parsed.session_id);
-                    self.recalculate_filtered_order();
-                    self.reconcile_all_session_list_selections(true);
-                    if let Some(parent_id) = old_parent {
-                        self.invalidate_hierarchy_node(parent_id);
+                    if !self.docreg_operation_is_archiving(parsed.session_id) {
+                        self.recalculate_filtered_order();
+                        self.reconcile_all_session_list_selections(true);
+                        self.forget_removed_session(parsed.session_id);
+                        if let Some(parent_id) = old_parent {
+                            self.invalidate_hierarchy_node(parent_id);
+                        }
+                    } else if let Some(parent_id) = old_parent {
+                        self.hierarchy_stale_nodes.insert(parent_id);
+                        self.navigation_cache.invalidate_hierarchy(parent_id);
                     }
                     return true;
                 }
@@ -1447,6 +1531,48 @@ fn system_message_notification(
         ),
         "warn" | "warning" => (NotificationKind::Info, NotificationPriority::Medium),
         _ => (NotificationKind::Info, NotificationPriority::Low),
+    }
+}
+
+#[cfg(test)]
+mod worker_pressure_refresh_tests {
+    use super::super::App;
+    use crate::client::DaemonClient;
+
+    #[tokio::test]
+    async fn held_health_read_keeps_one_background_refresh_and_returns_promptly() {
+        let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+        let socket_path = temp_dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket listener");
+        let mut app = App::new(DaemonClient::new(socket_path));
+        app.poll.connected = true;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.poll_worker_pressure_refresh(),
+        )
+        .await
+        .expect("refresh schedules without waiting for Health");
+        let first_id = app
+            .worker_pressure_refresh_handle
+            .as_ref()
+            .expect("background Health task")
+            .id();
+        let (_held_stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept())
+                .await
+                .expect("background connection starts")
+                .expect("accept background connection");
+
+        app.worker_pressure_next_refresh_at = std::time::Instant::now();
+        app.poll_worker_pressure_refresh().await;
+        assert_eq!(
+            app.worker_pressure_refresh_handle
+                .as_ref()
+                .expect("single background Health task")
+                .id(),
+            first_id
+        );
     }
 }
 

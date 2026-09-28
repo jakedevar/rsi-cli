@@ -195,6 +195,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn identical_replay_commits_once_but_divergent_id_is_rejected() {
         let conn = fixture();
@@ -216,6 +217,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn latest_uses_observation_time_and_preserves_nanoseconds() {
         let conn = fixture();
@@ -230,6 +232,7 @@ mod tests {
         assert_eq!(observed.last_healthy_at, newer.last_healthy_at);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn sidecar_replay_commits_then_unlinks_and_duplicate_replay_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
@@ -259,6 +262,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn migrated_evidence_is_immutable() {
         let conn = fixture();
@@ -284,6 +288,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn catalog_validation_detects_changed_restart_index() {
         let conn = fixture();
@@ -300,6 +305,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn store_api_reads_committed_restart_evidence() {
         let store = Store::open_in_memory().unwrap();
@@ -311,15 +317,14 @@ mod tests {
         assert_eq!(observed.failed_probes, restart.failed_probes);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn store_replays_v128_from_exact_v127_and_rejects_catalog_drift_on_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("rsi.db");
         let store = Store::open(&database).unwrap();
-        // V130 (#670) and V129 (#634) sit above V128; rewind them first so V128
-        // is the head.
-        crate::store::agent_child_relaunch_intents::rewind_v130_fixture_to_v129(&store.conn);
-        crate::store::topology_v129::rewind_v129_fixture_to_v128(&store.conn);
+        // Rewind the current migration tail so V128 can be replayed from V127.
+        crate::store::tests::rewind_post_v121_tail_to(&store.conn, 128);
         store
             .conn
             .execute_batch(

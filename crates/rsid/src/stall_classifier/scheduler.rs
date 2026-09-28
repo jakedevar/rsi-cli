@@ -407,6 +407,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn classifier_config_mirrors_top_level_config() {
         let mut c = cfg();
@@ -421,6 +422,7 @@ mod tests {
 
     // --- decide_action ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_finished_is_notify_only() {
         let v = verdict(Verdict::Finished, 0.99, None);
@@ -430,6 +432,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_needs_user_is_notify_only() {
         let v = verdict(Verdict::NeedsUser, 0.99, Some("ignored"));
@@ -439,6 +442,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_stalled_continue_below_floor_is_notify_only() {
         let v = verdict(Verdict::StalledContinue, 0.5, Some("go"));
@@ -448,6 +452,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_stalled_continue_without_prompt_is_notify_only() {
         let v = verdict(Verdict::StalledContinue, 0.9, None);
@@ -457,6 +462,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_stalled_continue_with_empty_prompt_is_notify_only() {
         let v = verdict(Verdict::StalledContinue, 0.9, Some("   \n  "));
@@ -466,6 +472,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_stalled_continue_above_floor_with_prompt_is_continue() {
         let v = verdict(Verdict::StalledContinue, 0.85, Some("Please continue."));
@@ -478,6 +485,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn decide_action_stalled_check_team_above_floor_with_prompt_is_continue() {
         let v = verdict(Verdict::StalledCheckTeam, 0.9, Some("Check sub-agents."));
@@ -491,6 +499,7 @@ mod tests {
 
     // --- parse_verdict_payload ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn parse_verdict_payload_accepts_strict_json() {
         let raw = r#"{"verdict":"Finished","confidence":0.95}"#;
@@ -499,6 +508,7 @@ mod tests {
         assert_eq!(v.confidence, 0.95);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn parse_verdict_payload_strips_code_fences() {
         let raw = "```json\n{\"verdict\":\"NeedsUser\",\"confidence\":0.5}\n```";
@@ -506,6 +516,7 @@ mod tests {
         assert!(matches!(v.verdict, Verdict::NeedsUser));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn parse_verdict_payload_strips_generic_fences() {
         let raw = "```\n{\"verdict\":\"NeedsUser\",\"confidence\":0.5}\n```";
@@ -513,6 +524,7 @@ mod tests {
         assert!(matches!(v.verdict, Verdict::NeedsUser));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn parse_verdict_payload_rejects_garbage() {
         assert!(parse_verdict_payload("not json").is_err());
@@ -690,6 +702,7 @@ mod tests {
         (dir, Arc::new(Mutex::new(store)))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classify_once_dispatches_continue_for_stalled_continue() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -719,6 +732,7 @@ mod tests {
         assert_eq!(llm.call_count(), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classifier_policy_denial_does_not_call_completer() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -742,6 +756,7 @@ mod tests {
         assert_eq!(llm.call_count(), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classify_once_downgrades_low_confidence_to_notify_only() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -759,6 +774,7 @@ mod tests {
         assert!(matches!(action, NudgeAction::NotifyOnly { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classify_once_notify_only_when_nudge_prompt_missing() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -775,6 +791,7 @@ mod tests {
         assert!(matches!(action, NudgeAction::NotifyOnly { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classify_once_malformed_json_downgrades_to_needs_user() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -798,6 +815,7 @@ mod tests {
         assert_eq!(guard.get(&id).unwrap().classification_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn classify_once_finished_verdict_emits_telemetry_only() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -839,6 +857,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn update_tracked_after_classification_increments_count() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -852,6 +871,7 @@ mod tests {
         assert_eq!(c2, Some(2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn update_tracked_after_classification_noop_for_missing_session() {
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
@@ -861,11 +881,13 @@ mod tests {
         assert!(c.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn strip_code_fence_handles_naked_text() {
         assert_eq!(strip_code_fence("plain"), "plain");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn strip_code_fence_handles_json_fence() {
         assert_eq!(strip_code_fence("```json\n{x:1}\n```"), "{x:1}");

@@ -564,6 +564,7 @@ mod tests {
         .expect("recovered rotation reaches a terminal decision");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_rotation_intent_survives_restart_with_exactly_one_successor() -> anyhow::Result<()>
     {
@@ -635,6 +636,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_rotation_intent_without_handoff_restores_task_query() -> anyhow::Result<()> {
         let (manager, dir) = rotation_manager();
@@ -672,6 +674,7 @@ mod tests {
     /// Crash after the durable reservation but before publication: the
     /// reserved successor died with the daemon, so recovery refuses and
     /// never creates a second `continued_from` row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_rotation_intent_with_unpublished_successor_refuses_without_second_row()
     -> anyhow::Result<()> {
@@ -717,6 +720,7 @@ mod tests {
     /// recovery decider reserves a successor. Boot 2 no longer sees P as
     /// crash-reconciled, yet recovers the claimed intent: exactly one
     /// successor is published and P is never relaunched by restart retry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn claimed_open_rotation_intent_survives_a_second_crash_before_reservation()
     -> anyhow::Result<()> {

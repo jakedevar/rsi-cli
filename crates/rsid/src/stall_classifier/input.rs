@@ -203,11 +203,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_returns_empty_for_no_events() {
         assert_eq!(format_excerpt(&[], 5, 100), "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_drops_system_and_thinking_events() {
         let events = vec![
@@ -221,6 +223,7 @@ mod tests {
         assert!(!s.contains("deep"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_uses_role_prefix() {
         let events = vec![
@@ -237,6 +240,7 @@ mod tests {
         assert!(s.contains("\n---\n"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_truncates_long_content_with_ellipsis() {
         let long = "x".repeat(800);
@@ -248,6 +252,7 @@ mod tests {
         assert!(s.len() < long.len());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_keeps_only_last_limit_events() {
         let events = (0..10)
@@ -261,6 +266,7 @@ mod tests {
         assert!(!s.contains("m6"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn format_excerpt_truncate_respects_utf8_boundaries() {
         let multi = "é".repeat(200); // each 'é' is 2 bytes
@@ -271,6 +277,7 @@ mod tests {
         assert!(s.ends_with('…'));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn child_idle_secs_zeroes_when_future_timestamp() {
         let now = chrono::Utc::now();
@@ -278,6 +285,7 @@ mod tests {
         assert_eq!(child_idle_secs(now, future), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn child_idle_secs_computes_diff_in_seconds() {
         let now = chrono::Utc::now();
@@ -285,6 +293,7 @@ mod tests {
         assert_eq!(child_idle_secs(now, past), 42);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn active_child_statuses_excludes_terminal_states() {
         for s in [
@@ -302,6 +311,7 @@ mod tests {
     // children; lives in `tests/` once Phase 4's scheduler hooks the
     // pipeline end-to-end. Here we exercise the helpers in isolation.
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn classification_input_fields_assemble() {
         let id = Uuid::new_v4();
@@ -444,6 +454,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_happy_path() {
         let store = Store::open(std::path::Path::new(":memory:")).unwrap();
@@ -487,6 +498,7 @@ mod tests {
         assert!(out.children.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_with_children() {
         let store = Store::open(std::path::Path::new(":memory:")).unwrap();
@@ -513,6 +525,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_missing_session_errors() {
         let store = Arc::new(Mutex::new(

@@ -29,6 +29,7 @@ mod tests {
     use super::*;
     use rsi_common::types::{ConversationEvent, EventType, SessionProvider};
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_detect_claude_valid() {
         let question_json = serde_json::json!({
@@ -77,6 +78,7 @@ mod tests {
         assert_eq!(pending.questions[0].multi_select, false);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_detect_non_claude() {
         let question_json = serde_json::json!({
@@ -102,6 +104,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_detect_wrong_tool() {
         let question_json = serde_json::json!({
@@ -127,6 +130,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_detect_wrong_event_type() {
         let event = ConversationEvent {
@@ -148,6 +152,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn test_encode_answer() {
         let ans = encode_answer(SessionProvider::Claude, "Blue");

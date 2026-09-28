@@ -32,7 +32,7 @@ pub const PROVIDERS: [SessionProvider; 9] = [
     SessionProvider::CodexAppServer,
     SessionProvider::Harness,
 ];
-const CAPABILITIES: [ManagerCapabilityV2; 11] = [
+const CAPABILITIES: [ManagerCapabilityV2; 12] = [
     ManagerCapabilityV2::WorkPlan,
     ManagerCapabilityV2::LeadControl,
     ManagerCapabilityV2::Topology,
@@ -44,6 +44,7 @@ const CAPABILITIES: [ManagerCapabilityV2; 11] = [
     ManagerCapabilityV2::SessionControl,
     ManagerCapabilityV2::IssueCoordinate,
     ManagerCapabilityV2::OperatorDelegation,
+    ManagerCapabilityV2::Automation,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +239,9 @@ const fn capability_description(capability: ManagerCapabilityV2) -> &'static str
         ManagerCapabilityV2::OperatorDelegation => {
             "Call allowlisted operator methods (logical archive, restore, session list) in the project"
         }
+        ManagerCapabilityV2::Automation => {
+            "Author, run, interrupt and resolve topologies on scoped Epics"
+        }
     }
 }
 
@@ -392,7 +396,7 @@ impl PolicyState {
                 Field::RemoveLaunch(i),
                 &format!("Remove launch {}", i + 1),
                 if d.allowed_launches.len() == 1 {
-                    "Enter remove → Any valid choice"
+                    "Enter remove → manual any; automatic recovery held"
                 } else {
                     "Enter remove"
                 }
@@ -405,14 +409,14 @@ impl PolicyState {
             Field::AddLaunch,
             "Allowed models",
             if d.allowed_launches.is_empty() {
-                "Any provider/model/effort (valid choices, including future models) · Enter to restrict".into()
+                "Manual: any valid choice · automatic recovery: held · Enter to restrict".into()
             } else {
                 format!(
                     "Restricted to {} exact choices · Enter catalog",
                     d.allowed_launches.len()
                 )
             },
-            "Restrict launches to exact catalog choices; an empty list allows any valid choice",
+            "Restrict launches to exact catalog choices; an empty list allows valid manual launches but holds automatic intent recovery",
         );
         push(
             section,

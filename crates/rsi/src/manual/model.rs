@@ -71,7 +71,7 @@ pub static MANUAL_CHAPTERS: &[ManualChapter] = &[
     ManualChapter {
         id: "getting-started",
         title: "Getting started",
-        intro: "rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start the daemon, then the TUI. Press `?` for help on the focused view, `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.",
+        intro: "rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start `rsi`; on Linux and macOS it starts `rsid` if no daemon is accepting connections and the daemon binary is available. Press `?` for help on the focused view, `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.",
         categories: &["DISCOVERY"],
         only_when_nonempty: false,
     },
@@ -226,6 +226,7 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::Dialectic => "tools",
         C::ThemePicker | C::ColorCustomizer | C::TextAreaBgEditor => "theming",
         C::ProviderForm
+        | C::ProviderCredentialForm
         | C::MessageBridgeForm
         | C::HookForm
         | C::HookConflict

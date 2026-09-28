@@ -61,6 +61,7 @@ fn load_daemon_dotenv_from_path(path: &Path) -> DaemonDotenvStatus {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn load_dotenv_sets_missing_values_without_overriding_process_env() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -93,6 +94,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn missing_dotenv_is_non_fatal() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -104,6 +106,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn malformed_dotenv_is_warning_only_status() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -115,6 +118,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn load_dotenv_handles_comments_export_and_quotes() {
         let dir = tempfile::tempdir().expect("tempdir");

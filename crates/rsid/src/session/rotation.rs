@@ -1339,6 +1339,19 @@ impl SessionManager {
                     }
                 }
                 // ───────────────────────────────────────────────────────────────────────
+                // Re-read after finalization: review enrollment or a source seal may
+                // have appeared since the threshold admitted this rotation.
+                if Self::suppress_protected_automatic_rotation(
+                    session_id,
+                    &completed,
+                    &event_bus,
+                    &store,
+                    &persistence,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
                 if let Some(ref rid) = rotation_id_for_log {
                     let start_head = {
                         let guard = completed.read().await;
@@ -1428,6 +1441,17 @@ impl SessionManager {
                     handoff_filepath.as_deref(),
                     rotation_id_for_log.as_deref(),
                     &completed,
+                    &store,
+                    &persistence,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
+                if Self::suppress_protected_automatic_rotation(
+                    sid,
+                    &completed,
+                    &event_bus,
                     &store,
                     &persistence,
                 )
@@ -1551,6 +1575,33 @@ impl SessionManager {
                 PostFinalizeRotationOutcome::Handled
             }
         }
+    }
+
+    async fn suppress_protected_automatic_rotation(
+        session_id: Uuid,
+        completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+        event_bus: &Arc<crate::bus::EventBus>,
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        persistence: &PersistenceHandle,
+    ) -> bool {
+        let protection = store.lock().await.automatic_rotation_protection(session_id);
+        let diagnostic = match protection {
+            Ok(None) => return false,
+            Ok(Some(reason)) => format!("Automatic context rotation deferred: {reason}"),
+            Err(error) => {
+                tracing::error!(%session_id, %error, "Automatic context rotation protection read failed; deferring");
+                format!("Automatic context rotation deferred: protection read failed: {error}")
+            }
+        };
+        Self::inject_session_system_event(
+            session_id,
+            diagnostic,
+            completed,
+            event_bus,
+            persistence,
+        )
+        .await;
+        true
     }
 
     async fn suppress_final_handoff_rotation(
@@ -4691,21 +4742,18 @@ mod tests {
     /// routing at its new home and prove the legacy split-brain client appears
     /// in neither the funnel nor rotation — guarding against a regression back
     /// to the split-brain registry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn harness_rotation_uses_fresh_client_not_legacy_split_brain() {
         let funnel_source = include_str!("provider_spawn.rs");
         let rotation_source = include_str!("rotation.rs");
-        // Needles are assembled from fragments so these very assertions (also
-        // captured by `include_str!`) don't self-satisfy the `contains` checks.
-        let fresh_needle = [
-            "crate::session::harness::HarnessClient",
-            "::new().",
-            "launch(",
-        ]
-        .concat();
+        // The legacy needle is assembled so rotation.rs cannot satisfy its
+        // own source check through this assertion's string literal.
+        let fresh_constructor = "crate::session::harness::HarnessClient::new()";
+        let fresh_route = "Self::harness_client(self.harness.codegraph_handle.as_ref()).launch(";
         let legacy_needle = ["crate::harness", "::client::HarnessClient::", "launch("].concat();
         assert!(
-            funnel_source.contains(&fresh_needle),
+            funnel_source.contains(fresh_constructor) && funnel_source.contains(fresh_route),
             "rotation Harness launches must go through the fresh HarnessClient"
         );
         assert!(
@@ -4719,6 +4767,7 @@ mod tests {
     /// `spawn_rotation_child`) must stamp a minted token — a config site
     /// regressing its token field back to `None` would silently re-open the
     /// rotation token gap the A6 slice closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn rotation_config_sites_carry_session_token() {
         let rotation_source = include_str!("rotation.rs");
@@ -4737,6 +4786,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn h1_v83_handoff_resume_source_ratchet_orders_custody_before_config_and_dispatch() {
         let source = include_str!("rotation.rs");
@@ -4783,6 +4833,7 @@ mod tests {
         assert!(!body.contains("sandbox_allocator.allocate("));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn h1_v83_rotation_successor_source_ratchet_orders_authenticated_phases() {
         let source = include_str!("rotation.rs");
@@ -4855,6 +4906,7 @@ mod tests {
         assert!(spawn[monitor..].contains("AutofileCause::RotationMonitorPanic"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn h2_rotation_lead_acknowledgement_precedes_controller_success_and_parent_revocation() {
         let source = include_str!("rotation.rs");
@@ -4896,6 +4948,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn h2_rotation_lead_marks_follow_the_durable_lead_transfer() {
         let source = include_str!("rotation.rs");
@@ -4932,9 +4985,13 @@ mod tests {
         context_rotation_enabled: bool,
     ) -> (SessionManager, tempfile::TempDir) {
         // Live sandbox fixtures need a disk-backed root: execution scratch
-        // correctly rejects tmpfs, which may be the host's TMPDIR.
+        // correctly rejects tmpfs. QA may check out the source under /tmp, so
+        // the process cwd is not a reliable place for these fixtures. Use the
+        // compiled test target, which the test runner provisions on disk.
+        let test_binary = std::env::current_exe().expect("test binary path");
+        let target_dir = test_binary.parent().expect("test binary directory");
         let dir = tempfile::Builder::new()
-            .tempdir_in(std::env::current_dir().expect("test worktree"))
+            .tempdir_in(target_dir)
             .expect("disk-backed rotation fixture");
         let manager = rotation_manager_on(dir.path(), context_rotation_enabled);
         (manager, dir)
@@ -5444,6 +5501,7 @@ mod tests {
         .expect("post-finalization decision completes")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -5490,6 +5548,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -5525,6 +5584,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -5584,6 +5644,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(
         clippy::unwrap_used,
@@ -5781,6 +5842,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn rotation_without_bound_handoff_resumes_original_task() -> anyhow::Result<()> {
@@ -5813,6 +5875,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn rotation_chain_task_resolution_skips_create_handoff_rows() -> anyhow::Result<()> {
@@ -5840,6 +5903,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn lead_at_depth_three_with_progress_rotates_to_depth_four() -> anyhow::Result<()> {
@@ -5879,6 +5943,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
     async fn failing_child_cascade_is_still_stopped() -> anyhow::Result<()> {
@@ -5908,6 +5973,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn rate_window_refuses_burst_rotations() -> anyhow::Result<()> {
@@ -5951,6 +6017,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn epic_lead_rotation_refusal_emits_durable_notice() -> anyhow::Result<()> {
@@ -6052,6 +6119,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn pipeline_artifact_detected_after_insert_does_not_refuse_rotation_custody()
@@ -6077,6 +6145,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn custody_refusal_records_refused_event_and_keeps_predecessor_completed()
@@ -6126,6 +6195,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn rotation_without_task_records_no_task_refusal() -> anyhow::Result<()> {
@@ -6163,6 +6233,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn rotation_replayed_decision_keeps_one_terminal_event() -> anyhow::Result<()> {
@@ -6525,6 +6596,7 @@ mod tests {
         Ok((project, assigned.idea, fixture, parent_token))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn resume_for_handoff_write_remints_agent_token() {
         // G2 (A6) + D03: the handoff writer re-mints before spawn, revoking
@@ -6660,6 +6732,7 @@ mod tests {
         assert_eq!(durable_budget.evidence, resumed_evidence);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d03_controller_handoff_real_interrupt_blocks_same_id_reconstruction()
     -> anyhow::Result<()> {
@@ -6745,6 +6818,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn h1_v83_rotation_custody_atomic_reservation_is_all_or_nothing() {
         let mut store = Store::open_in_memory().expect("open reservation store");
@@ -6999,6 +7073,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_predecessor_refusal_matrix_has_no_successor_effects()
     -> anyhow::Result<()> {
@@ -7097,6 +7172,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3e_ordinary_durable_preflight_refuses_missing_substituted_and_stale_rows()
     -> anyhow::Result<()> {
@@ -7180,6 +7256,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_missing_and_substituted_live_evidence_quarantines_before_child()
     -> anyhow::Result<()> {
@@ -7257,6 +7334,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_transferred_predecessor_refuses_without_backward_effects()
     -> anyhow::Result<()> {
@@ -7346,6 +7424,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_ordinary_bind_mismatch_matrix_settles_reserved_child()
     -> anyhow::Result<()> {
@@ -7391,6 +7470,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3e_stale_ordinary_fence_settles_child_as_superseded_without_parent_revival()
     -> anyhow::Result<()> {
@@ -7463,6 +7543,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3g_finalizer_barrier_reaches_post_finalize_provider_seam()
     -> anyhow::Result<()> {
@@ -7577,6 +7658,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3f_stable_pre_bind_authority_mutations_refuse_before_effect()
     -> anyhow::Result<()> {
@@ -7616,6 +7698,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_rotation_custody_7f3f_all_null_session_with_durable_custody_link_refuses()
     -> anyhow::Result<()> {
@@ -7648,6 +7731,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_live_bind_refusal_classifies_current_and_mismatched_owner()
     -> anyhow::Result<()> {
@@ -7711,6 +7795,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_ordinary_provider_unavailable_settles_exactly()
     -> anyhow::Result<()> {
@@ -7851,6 +7936,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_live_provider_unavailable_preserves_worktree()
     -> anyhow::Result<()> {
@@ -8057,6 +8143,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_competing_transfer_loser_is_superseded() -> anyhow::Result<()>
     {
@@ -8175,6 +8262,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_post_bind_refusal_preserves_invalid_projection()
     -> anyhow::Result<()> {
@@ -8290,6 +8378,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rotation_execution_scratch_failure_preserves_forward_transfer_and_settles_invocation()
     -> anyhow::Result<()> {
@@ -8401,6 +8490,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines)]
     async fn manual_completed_rotation_missing_handoff_resumes_task_once() -> anyhow::Result<()> {
@@ -8563,6 +8653,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn rotation_child_inherits_parent_rotation_disabled_at() {
         let (manager, directory) = rotation_manager();
@@ -8641,6 +8732,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_manager_rotation_records_only_the_successfully_established_successor()
     -> anyhow::Result<()> {
@@ -8879,6 +8971,268 @@ mod tests {
         Ok((manager, directory, parent))
     }
 
+    async fn sealed_rotation_source_fixture()
+    -> anyhow::Result<(SessionManager, tempfile::TempDir, Uuid, Uuid, Uuid, String)> {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        let (manager, directory) = rotation_manager_with_context_rotation(true);
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Review rotation".into(),
+            path: None,
+            description: None,
+            color: Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut manager_session = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        manager_session.project_id = Some(project.id);
+        let mut group = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        group.session_kind = SessionKind::Group;
+        group.project_id = Some(project.id);
+        let mut epic = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        epic.session_kind = SessionKind::Epic;
+        epic.project_id = Some(project.id);
+        epic.parent_id = Some(group.id);
+        {
+            let store = manager.store.lock().await;
+            store.insert_project(&project)?;
+            store.insert_session(&manager_session)?;
+            store.insert_session(&group)?;
+            store.insert_session(&epic)?;
+        }
+        let fixture =
+            persist_live_rotation_parent(&manager, directory.path(), Some(project.id)).await;
+        let source_id = fixture.parent.id;
+        let source_sha = git_output(&fixture.root, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        {
+            let store = manager.store.lock().await;
+            store.conn.execute(
+                "UPDATE sessions SET parent_id=?2,session_kind='Task' WHERE id=?1",
+                rusqlite::params![source_id.to_string(), epic.id.to_string()],
+            )?;
+            store.configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: vec![],
+                project_id: project.id,
+                session_id: manager_session.id,
+                epic_ids: Some(vec![epic.id]),
+                expected_row_version: 0,
+            })?;
+            let config = store.get_harness_manager(project.id)?.unwrap();
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let work = serde_json::json!({
+                "key":"rotation-source", "epic_id":epic.id, "title":"Review rotation source",
+                "kind":"product", "priority":1, "weight":1, "required_gates":["implementation"],
+                "spec_revision":1, "source_session_id":source_id, "source_commit":source_sha,
+                "stages":[{"stage":"implementation","state":"passed","note":"sealed",
+                    "evidence":null,"admission":null,"updated_at":at}],
+                "acceptance":null,"integration":null,"pending_acceptance":null
+            });
+            store.conn.execute(
+                "INSERT INTO harness_manager_v2_work_facts(project_id,kind,record_key,epic_id,work_key,
+                  row_version,payload_json,archived,manager_session_id,scope_version,policy_version,created_at,updated_at)
+                 VALUES(?1,'work','rotation-source',?2,'rotation-source',1,?3,0,?4,?5,NULL,?6,?6)",
+                rusqlite::params![project.id.to_string(),epic.id.to_string(),work.to_string(),
+                    manager_session.id.to_string(),config.row_version,at],
+            )?;
+        }
+        manager
+            .completed
+            .write()
+            .await
+            .insert(source_id, CompletedSession::for_test(fixture.parent));
+        Ok((
+            manager, directory, project.id, epic.id, source_id, source_sha,
+        ))
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn automatic_rotation_rechecks_sealed_source_before_handoff_write() -> anyhow::Result<()>
+    {
+        let (manager, _directory, project, epic, source, sha) =
+            sealed_rotation_source_fixture().await?;
+        assert_eq!(
+            manager
+                .store
+                .lock()
+                .await
+                .automatic_rotation_protection(source)?,
+            Some("sealed_unaccepted_source")
+        );
+        let outcome = post_finalize_action_for_test(
+            &manager,
+            source,
+            super::super::rotation_coordinator::RotationAction::SendCreateHandoff,
+            "review-seal-race",
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            PostFinalizeRotationOutcome::ContinueNormalCompletion
+        ));
+        let successor_outcome = post_finalize_action_for_test(
+            &manager,
+            source,
+            super::super::rotation_coordinator::RotationAction::SpawnChild {
+                session_id: source,
+                handoff_filepath: None,
+            },
+            "review-seal-successor-race",
+        )
+        .await;
+        assert!(matches!(
+            successor_outcome,
+            PostFinalizeRotationOutcome::ContinueNormalCompletion
+        ));
+        {
+            let store = manager.store.lock().await;
+            assert_eq!(
+                store.get_session(source)?.unwrap().status,
+                SessionStatus::Completed
+            );
+            let writing: i64 = store.conn.query_row(
+                "SELECT count(*) FROM rotation_events WHERE session_id=?1 AND phase='writing_handoff'",
+                [source.to_string()], |row| row.get(0),
+            )?;
+            assert_eq!(writing, 0);
+            let assignment = Uuid::new_v4();
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store.conn.execute(
+                "INSERT INTO manager_review_assignments(assignment_id,project_id,epic_id,
+                  manager_session_id,scope_version,work_key,spec_revision,author_session_id,
+                  source_sha,state,row_version,request_json,request_fingerprint,created_at,updated_at)
+                 SELECT ?1,?2,?3,manager_session_id,scope_version,'rotation-source',1,?4,?5,
+                   'reserved',1,'{}',?6,?7,?7 FROM harness_manager_v2_work_facts
+                  WHERE project_id=?2 AND kind='work' AND record_key='rotation-source'",
+                rusqlite::params![assignment.to_string(),project.to_string(),epic.to_string(),
+                    source.to_string(),sha,format!("sha256:{}", "a".repeat(64)),at],
+            )?;
+            assert_eq!(
+                store.automatic_rotation_protection(source)?,
+                Some("sealed_unaccepted_source")
+            );
+            let later = (chrono::Utc::now() + chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store.conn.execute(
+                "UPDATE manager_review_assignments SET state='failed',failure_code='review_failed',
+                  row_version=2,updated_at=?2,terminal_at=?2 WHERE assignment_id=?1",
+                rusqlite::params![assignment.to_string(), later],
+            )?;
+            assert_eq!(store.automatic_rotation_protection(source)?, None);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn automatic_rotation_source_acceptance_releases_seal() -> anyhow::Result<()> {
+        let (manager, _directory, project, _epic, source, sha) =
+            sealed_rotation_source_fixture().await?;
+        let store = manager.store.lock().await;
+        assert_eq!(
+            store.automatic_rotation_protection(source)?,
+            Some("sealed_unaccepted_source")
+        );
+        store.conn.execute(
+            "UPDATE harness_manager_v2_work_facts SET payload_json=json_set(payload_json,
+              '$.acceptance',json_object('source_commit',?2,'spec_revision',1,
+              'evidence_digest','review','method','db_review_receipt','accepted_at',?3)),
+              row_version=row_version+1 WHERE project_id=?1 AND kind='work' AND record_key='rotation-source'",
+            rusqlite::params![project.to_string(),sha,
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+        )?;
+        assert_eq!(store.automatic_rotation_protection(source)?, None);
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn automatic_rotation_source_review_dispositions() -> anyhow::Result<()> {
+        for (state, verdict, protects) in [
+            ("submitted", Some("accepted"), true),
+            ("submitted", Some("changes_requested"), false),
+            ("failed", None, false),
+            ("cancelled", None, false),
+            ("superseded", None, false),
+        ] {
+            let (manager, _directory, project, epic, source, sha) =
+                sealed_rotation_source_fixture().await?;
+            let store = manager.store.lock().await;
+            // These rows stand in for the review producer; the test checks the
+            // rotation classifier's DB observation of each durable disposition.
+            store.conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+            let assignment = Uuid::new_v4();
+            let reviewer = Uuid::new_v4();
+            let invocation = Uuid::new_v4();
+            let custody = Uuid::new_v4();
+            let action = Uuid::new_v4();
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let manager_id: String = store.conn.query_row(
+                "SELECT manager_session_id FROM harness_manager_v2_work_facts
+                  WHERE project_id=?1 AND kind='work' AND record_key='rotation-source'",
+                [project.to_string()],
+                |row| row.get(0),
+            )?;
+            store.conn.execute(
+                "INSERT INTO manager_review_assignments(assignment_id,project_id,epic_id,
+                  manager_session_id,scope_version,work_key,spec_revision,author_session_id,
+                  source_sha,reviewer_session_id,reviewer_invocation_id,reviewer_custody_id,
+                  reviewer_custody_generation,action_operation_id,state,row_version,request_json,
+                  request_fingerprint,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,1,'rotation-source',1,?5,?6,?7,?8,?9,1,?10,
+                   'active',1,'{}',?11,?12,?12)",
+                rusqlite::params![
+                    assignment.to_string(),
+                    project.to_string(),
+                    epic.to_string(),
+                    manager_id,
+                    source.to_string(),
+                    sha,
+                    reviewer.to_string(),
+                    invocation.to_string(),
+                    custody.to_string(),
+                    action.to_string(),
+                    format!("sha256:{}", "a".repeat(64)),
+                    at
+                ],
+            )?;
+            assert_eq!(
+                store.automatic_rotation_protection(reviewer)?,
+                Some("db_native_reviewer")
+            );
+            if let Some(verdict) = verdict {
+                store.conn.execute(
+                    "INSERT INTO manager_review_receipts(receipt_id,assignment_id,source_sha,
+                      reviewer_session_id,reviewer_invocation_id,reviewer_custody_id,
+                      reviewer_custody_generation,verdict,idempotency_key,request_fingerprint,created_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,1,?7,'rotation-test',?8,?9)",
+                    rusqlite::params![Uuid::new_v4().to_string(),assignment.to_string(),sha,
+                        reviewer.to_string(),invocation.to_string(),custody.to_string(),verdict,
+                        format!("sha256:{}", "b".repeat(64)),at],
+                )?;
+            }
+            let later = (chrono::Utc::now() + chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store.conn.execute(
+                "UPDATE manager_review_assignments SET state=?2,row_version=2,updated_at=?3,
+                  terminal_at=?3,failure_code=CASE WHEN ?2='failed' THEN 'review_failed' ELSE NULL END,
+                  superseded_by_assignment_id=CASE WHEN ?2='superseded' THEN ?4 ELSE NULL END
+                  WHERE assignment_id=?1",
+                rusqlite::params![assignment.to_string(),state,later,Uuid::new_v4().to_string()],
+            )?;
+            assert_eq!(store.automatic_rotation_protection(reviewer)?, None);
+            assert_eq!(
+                store.automatic_rotation_protection(source)?,
+                protects.then_some("sealed_unaccepted_source"),
+                "disposition {state}/{verdict:?}"
+            );
+        }
+        Ok(())
+    }
+
     async fn finish_manager_rotation_test(
         manager: &SessionManager,
         child_id: Uuid,
@@ -8928,6 +9282,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_manager_rotation_receipt_failure_rolls_back_archival_for_both_custodies()
     -> anyhow::Result<()> {
@@ -9006,6 +9361,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_manager_rotation_atomic_receipt_survives_reopen_and_rejects_retired_replays()
     -> anyhow::Result<()> {
@@ -9101,6 +9457,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_manager_rotation_provider_failure_has_no_receipt_for_both_custodies()
     -> anyhow::Result<()> {
@@ -9132,6 +9489,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn rotation_child_gets_registered_agent_token() {
         let (manager, _dir) = rotation_manager();
@@ -9558,6 +9916,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection()
     -> anyhow::Result<()> {
@@ -9783,6 +10142,7 @@ mod tests {
     /// Exactly one continuation survives, and `manager_lineage_tip` resolves to
     /// it — the state that four times in one working session became
     /// `manager_lineage_ambiguous`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_predecessor_keeps_one_continuation_across_both_turnover_mechanisms()
     -> anyhow::Result<()> {
@@ -9947,6 +10307,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h2_rotation_baton_fence_precedes_controller_assignment_and_revocation()
     -> anyhow::Result<()> {
@@ -10112,6 +10473,7 @@ mod tests {
     /// reservation leaves the predecessor as tip and lead, settles the
     /// reserved child Failed, and closes the rotation with exactly one
     /// `refused:lead_transfer` terminal event.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lead_transfer_refusal_leaves_predecessor_tip_and_lead() -> anyhow::Result<()> {
         let (manager, directory) = rotation_manager();
@@ -10209,6 +10571,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h2_rotation_final_fence_after_controller_assignment_releases_and_settles_child()
     -> anyhow::Result<()> {
@@ -10391,6 +10754,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn h2_rotation_release_failure_retains_visible_controller_until_exact_retry()
     -> anyhow::Result<()> {
@@ -10847,6 +11211,7 @@ mod tests {
         (count, pointer)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_handoff_config_uses_exact_ordinary_and_live_reuse_paths() {
         let (ordinary, ordinary_dir) = rotation_manager();
@@ -10890,6 +11255,7 @@ mod tests {
         assert!(handoff_custody_test_seams_are_clean(live_id));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_handoff_revalidation_refusal_restores_completed_before_mutation() {
         let (manager, dir) = rotation_manager();
@@ -10925,6 +11291,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_handoff_historical_and_partial_refuse_with_handoff_transition() {
         use rsi_common::types::SandboxCustodyTransitionV1;
@@ -11009,6 +11376,7 @@ mod tests {
         let _ = SandboxCustodyTransitionV1::HandoffResume;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_handoff_transferred_predecessor_refuses_and_preserves_successor_owner() {
         let (manager, dir) = rotation_manager();
@@ -11126,6 +11494,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_ordinary_monitor_panic_restores_exact_parent_and_authority()
     -> anyhow::Result<()> {
@@ -11271,6 +11640,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3e_monitor_panic_restoration_failure_keeps_parent_non_authoritative()
     -> anyhow::Result<()> {
@@ -11381,6 +11751,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_7f3f_monitor_panic_restoration_refuses_changed_archived_parent()
     -> anyhow::Result<()> {
@@ -11483,6 +11854,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_live_monitor_panic_is_forward_only_and_retains_worktree()
     -> anyhow::Result<()> {
@@ -11600,6 +11972,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_rotation_custody_7f3g_exact_identity_restoration_preserves_history() {
         let (manager, dir) = rotation_manager();
@@ -11695,6 +12068,7 @@ mod tests {
         manager.event_bus.unsubscribe();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_rotation_custody_7f3g_caller_identity_mismatch_refuses_before_store_mutation()
     -> anyhow::Result<()> {
@@ -11743,6 +12117,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_rotation_custody_7f3g_retained_history_identity_mismatch_refuses_before_store_mutation()
     -> anyhow::Result<()> {
@@ -11790,6 +12165,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn h1_v83_rotation_custody_7f3e_fallback_restoration_uses_acknowledged_durable_row()
     -> anyhow::Result<()> {
@@ -11839,6 +12215,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn d03_controller_rotation_uses_effective_provider_identity_for_new_child() {
         assert_eq!(
@@ -11951,6 +12328,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_controller_confirmation_failure_matrix_is_forward_only()
     -> anyhow::Result<()> {
@@ -12145,6 +12523,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_ordinary_controller_cancellation_after_confirmation_preserves_parent()
     -> anyhow::Result<()> {
@@ -12323,6 +12702,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn h1_v83_rotation_custody_live_controller_cancellation_after_confirmation_is_forward_only()
     -> anyhow::Result<()> {

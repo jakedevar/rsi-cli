@@ -201,6 +201,7 @@ async fn assert_settled(
     assert!(f.root.join(".git").is_file());
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_successor_service_replay_at_cap_one_settles_retained_unpublished_root() {
     let f = interrupted_successor().await;
@@ -252,6 +253,7 @@ async fn manager_v2_successor_service_replay_at_cap_one_settles_retained_unpubli
     f.manager.persistence.barrier().await.unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_successor_service_replay_denied_admission_settles_without_relaunch() {
     let f = interrupted_successor().await;
@@ -355,6 +357,7 @@ async fn manager_v2_successor_service_replay_denied_admission_settles_without_re
     drop_controller_candidate_test_process(f.reservation.candidate_session_id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_successor_service_replay_policy_or_authority_change_never_relaunches() {
     for change in ["pause", "provider", "spend", "scope", "lead"] {
@@ -451,6 +454,7 @@ async fn manager_v2_successor_service_replay_policy_or_authority_change_never_re
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_successor_service_cleanup_failure_and_reopen_retain_capacity_until_proven() {
     for failure in ["before_reap", "reaper", "ledger", "after_settlement"] {
@@ -554,6 +558,7 @@ async fn manager_v2_successor_service_cleanup_failure_and_reopen_retain_capacity
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_v2_successor_service_cleanup_rejects_changed_admission_identity() {
     let f = interrupted_successor().await;
@@ -810,6 +815,7 @@ async fn assert_committed_once(
     assert_eq!(successors, 1, "exactly one successor row");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_with_retained_candidate_sandbox_relaunches_once() {
     let f = uncertain_successor_with_retained_root(None).await;
@@ -836,6 +842,7 @@ async fn uncertain_successor_with_retained_candidate_sandbox_relaunches_once() {
     stop_candidate(&f.manager, f.candidate).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_with_foreign_or_dirty_root_settles_failed_and_unlocks_epic() {
     for case in ["dirty", "foreign_branch"] {
@@ -883,6 +890,7 @@ async fn uncertain_successor_with_foreign_or_dirty_root_settles_failed_and_unloc
     }
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_after_capacity_refusal_settles_failed_without_retry_loop() {
     let (manager, _dir, sandbox, repo, scope, lead) = successor_lead_fixture().await;
@@ -966,6 +974,7 @@ async fn uncertain_successor_after_capacity_refusal_settles_failed_without_retry
     drop_controller_candidate_test_process(candidate);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cleanup_admission_drift_settles_failed_and_unlocks_epic() {
     let f = interrupted_successor().await;
@@ -1029,6 +1038,7 @@ async fn cleanup_admission_drift_settles_failed_and_unlocks_epic() {
     drop_controller_candidate_test_process(f.reservation.candidate_session_id);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_retryable_failure_is_bounded_in_process() {
     let f = uncertain_successor_with_retained_root(None).await;
@@ -1074,6 +1084,7 @@ async fn uncertain_successor_retryable_failure_is_bounded_in_process() {
         .unwrap();
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_with_retained_root_converges_after_restart() {
     let f = uncertain_successor_with_retained_root(None).await;
@@ -1123,6 +1134,7 @@ async fn uncertain_successor_with_retained_root_converges_after_restart() {
     stop_candidate(&restarted, candidate).await;
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_successor_past_durable_deadline_settles_exhausted_after_restart() {
     let f = uncertain_successor_with_retained_root(None).await;

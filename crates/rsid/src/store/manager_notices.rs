@@ -3,10 +3,11 @@ use super::Store;
 use super::harness_manager_v2::{fingerprint, now, refused};
 use super::manager_actions::{ManagerActionOperationV2, action_epic};
 use crate::error::{DaemonError, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::{
     harness_manager::{HarnessManagerConfigV1, HarnessManagerNoticeV1},
     harness_manager_v2::*,
+    rpc::WorkerSliceMemoryPressure,
     types::{PendingQuestion, Session, SessionKind, SessionStatus},
 };
 use rusqlite::{
@@ -23,6 +24,9 @@ const MAX_OBSOLETE_NOTICES_PER_JOB: i64 = 16;
 const MAX_SCOPE_RETIREMENTS_PER_PASS: i64 = 8;
 const MAX_NOTICE_QUESTION_BYTES: usize = 8192;
 const MAX_NOTICE_RECORDS_PER_EPIC_PASS: i64 = 16;
+const WORKER_PRESSURE_FULL_AVG60_THRESHOLD_PCT: f64 = 10.0;
+const WORKER_PRESSURE_NOTICE_INTERVAL_MINUTES: i64 = 15;
+const WORKER_PRESSURE_NOTICE_SUBJECT: &str = "worker_slice_pressure";
 
 // Keep the executed statement shared with its physical-work regression. The
 // route equalities precede sequence in V118, so LIMIT bounds the scanned page
@@ -294,11 +298,17 @@ impl Store {
         subject_version: &str,
         source_session_id: Option<Uuid>,
         state: &Value,
+        event_wake: bool,
     ) -> Result<Option<Uuid>> {
         let lead = self.manager_lead(config.project_id, epic)?;
-        let (job_id, route_source, recipient, _) =
-            self.manager_watch_identity(config, &lead, to_manager)?;
-        if route_source == recipient {
+        let (job_id, route_source, recipient) = if event_wake {
+            self.manager_action_watch_identity(config)
+        } else {
+            let (job, source, target, _) =
+                self.manager_watch_identity(config, &lead, to_manager)?;
+            (job, source, target)
+        };
+        if route_source == recipient && !event_wake {
             return Ok(None);
         }
         let existing_unsettled: Option<bool> = self
@@ -323,7 +333,11 @@ impl Store {
                     .get_scheduled_job(&job_id)?
                     .is_none_or(|job| !job.enabled)
             {
-                self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+                if event_wake {
+                    self.ensure_manager_action_watch(config, subject_version)?;
+                } else {
+                    self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+                }
                 self.refresh_manager_notice_job(job_id)?;
             }
             return Ok(None);
@@ -334,7 +348,14 @@ impl Store {
         // transport when a slot becomes available. Lead-facing mail retains
         // ensure_manager_watch's explicit capacity refusal and transaction
         // rollback.
-        self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+        if event_wake {
+            self.ensure_manager_action_watch(
+                config,
+                &format!("{kind}:{subject_id}:{subject_version}"),
+            )?;
+        } else {
+            self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+        }
         let direction = if to_manager { "to_manager" } else { "to_lead" };
         let recorded_at = now();
         self.conn.execute(
@@ -402,7 +423,43 @@ impl Store {
             &version,
             Some(lead.id),
             &state,
+            false,
         )
+    }
+
+    /// One durable recovery notice per refused provider thread. The manager
+    /// uses its normal guarded `retry_lead` action, so policy budgets and pauses
+    /// remain authoritative even when the scheduled resume is retired.
+    pub(crate) fn record_manager_transcript_refusal_notice(
+        &self,
+        session_id: Uuid,
+        error_class: &str,
+    ) -> Result<()> {
+        let Some(lead) = self.get_session(session_id)? else {
+            return Ok(());
+        };
+        let Some((config, epic)) = self.delivery_abandoned_notice_route(&lead)? else {
+            return Ok(());
+        };
+        let thread = lead.claude_session_id.as_deref().unwrap_or("unknown");
+        self.insert_manager_notice(
+            &config,
+            epic,
+            true,
+            "session_state",
+            &session_id.to_string(),
+            &format!("transcript_unresumable:{thread}"),
+            Some(session_id),
+            &json!({
+                "lead_session_id": session_id,
+                "epic_id": epic,
+                "recovery_code": "codex_transcript_unresumable",
+                "error_class": error_class,
+                "next_action": "retry_lead",
+            }),
+            false,
+        )?;
+        Ok(())
     }
 
     /// Capture the final exact session state while the Epic still names this
@@ -466,6 +523,7 @@ impl Store {
             }),
             &json!({"message_id":receipt.message_id,"message_sequence":receipt.sequence,
                     "request_id":receipt.request_id}),
+            to_manager && receipt.request_id.is_some(),
         )
     }
 
@@ -544,6 +602,65 @@ impl Store {
         Ok(())
     }
 
+    fn record_intent_resumed_notice_in_transaction(
+        &self,
+        config: &HarnessManagerConfigV1,
+        operation: &ManagerActionOperationV2,
+    ) -> Result<Option<Uuid>> {
+        if operation.receipt.state != ManagerActionStateV2::Succeeded
+            || !matches!(
+                &operation.context.origin,
+                super::manager_actions::ManagerActionOriginV2::OperatingIntent { .. }
+            )
+            || !matches!(
+                &operation.context.request.operation,
+                ManagerActionV2::ResumeLead { .. }
+                    | ManagerActionV2::RetryLead { .. }
+                    | ManagerActionV2::ReplaceLead { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let receipt = &operation.receipt;
+        let version = receipt.row_version.to_string();
+        let (job_id, _, _) = self.manager_action_watch_identity(config);
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices
+             WHERE job_id=?1 AND kind='ledger_change' AND subject_id=?2 AND subject_version=?3)",
+            params![
+                job_id.to_string(),
+                receipt.operation_id.to_string(),
+                version
+            ],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(None);
+        }
+        self.ensure_manager_action_watch(config, &version)?;
+        let recorded_at = now();
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'to_manager',?7,?4,'ledger_change',?8,?9,?10,?11,?11)",
+            params![
+                Uuid::new_v4().to_string(), job_id.to_string(), config.project_id.to_string(),
+                config.manager_session_id.to_string(), config.row_version,
+                self.manager_action_notice_epic(operation)?.map(|id| id.to_string()),
+                operation.context.target_session_id.map(|id| id.to_string()),
+                receipt.operation_id.to_string(), version,
+                serde_json::to_string(&json!({"record_kind":"intent_resumed",
+                    "operation_id":receipt.operation_id,
+                    "action_kind":&receipt.action_kind,"target_session_id":receipt.target_session_id,
+                    "outcome":&receipt.outcome}))?, recorded_at
+            ],
+        )?;
+        self.refresh_manager_notice_job(job_id)?;
+        Ok(Some(job_id))
+    }
+
     fn record_manager_action_notice_in_transaction(
         &self,
         config: &HarnessManagerConfigV1,
@@ -573,8 +690,10 @@ impl Store {
                 manager_action_notice_fault(ManagerActionNoticeFault::AfterWatch)?;
                 self.refresh_manager_notice_job(job_id)?;
             }
+            let intent_notice =
+                self.record_intent_resumed_notice_in_transaction(config, operation)?;
             self.mark_manager_action_notice_reconciled(receipt)?;
-            return Ok(None);
+            return Ok(intent_notice);
         }
         self.ensure_manager_action_watch(config, &version)?;
         manager_action_notice_fault(ManagerActionNoticeFault::AfterWatch)?;
@@ -601,6 +720,7 @@ impl Store {
             ],
         )?;
         manager_action_notice_fault(ManagerActionNoticeFault::AfterNotice)?;
+        self.record_intent_resumed_notice_in_transaction(config, operation)?;
         self.refresh_manager_notice_job(job_id)?;
         self.mark_manager_action_notice_reconciled(receipt)?;
         Ok(Some(job_id))
@@ -617,6 +737,86 @@ impl Store {
         Ok(inserted)
     }
 
+    /// One project-wide notice per manager scope and 15-minute pressure interval.
+    /// The retained notice timestamp is the dedupe fence, including after
+    /// retrieval or daemon restart. The caller supplies a completed cgroup
+    /// snapshot; no filesystem I/O occurs inside the SQLite transaction.
+    pub(crate) fn record_worker_slice_pressure_notice(
+        &self,
+        project_id: Uuid,
+        pressure: &WorkerSliceMemoryPressure,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        if !pressure.full_avg60.is_finite()
+            || pressure.full_avg60 <= WORKER_PRESSURE_FULL_AVG60_THRESHOLD_PCT
+            || pressure.full_avg60 > 100.0
+            || pressure
+                .high_events_per_minute
+                .is_some_and(|rate| !rate.is_finite() || rate < 0.0)
+        {
+            return Ok(None);
+        }
+        let Some(config) = self.get_harness_manager_notice_config(project_id)? else {
+            return Ok(None);
+        };
+        if config.current_session_id.is_none()
+            || config.is_revoked()
+            || self
+                .get_harness_manager_policy(project_id)?
+                .is_none_or(|policy| policy.revoked)
+        {
+            return Ok(None);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (job_id, _, _) = self.manager_action_watch_identity(&config);
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT subject_version FROM harness_manager_notices
+                 WHERE job_id=?1 AND kind='ledger_change' AND subject_id=?2
+                 ORDER BY subject_version DESC LIMIT 1",
+                params![job_id.to_string(), WORKER_PRESSURE_NOTICE_SUBJECT],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            let previous = super::parse_timestamp(&previous).map_err(DaemonError::Store)?;
+            if observed_at.signed_duration_since(previous)
+                < chrono::Duration::minutes(WORKER_PRESSURE_NOTICE_INTERVAL_MINUTES)
+            {
+                return Ok(None);
+            }
+        }
+        let version = observed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        self.ensure_manager_action_watch(&config, &version)?;
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'ledger_change',?6,?7,?8,?7,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                job_id.to_string(),
+                project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                WORKER_PRESSURE_NOTICE_SUBJECT,
+                version,
+                serde_json::to_string(&json!({
+                    "record_kind": WORKER_PRESSURE_NOTICE_SUBJECT,
+                    "full_avg60": pressure.full_avg60,
+                    "threshold_pct": WORKER_PRESSURE_FULL_AVG60_THRESHOLD_PCT,
+                    "high_events": pressure.high_events,
+                    "high_events_per_minute": pressure.high_events_per_minute,
+                }))?,
+            ],
+        )?;
+        self.refresh_manager_notice_job(job_id)?;
+        tx.commit()?;
+        Ok(Some(job_id))
+    }
+
     fn record_manager_ledger_notice(
         &self,
         config: &HarnessManagerConfigV1,
@@ -626,6 +826,57 @@ impl Store {
         let epic = lead
             .parent_id
             .ok_or_else(|| refused("manager_legal_epic_required"))?;
+        let actor_and_prior: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT actor_session_id,
+                    CASE WHEN ?7 THEN (SELECT payload_json FROM harness_manager_v2_events prior
+                     WHERE prior.project_id=event.project_id
+                       AND prior.kind='work' AND prior.record_key=event.record_key
+                       AND prior.row_version<event.row_version
+                     ORDER BY prior.row_version DESC,prior.sequence DESC LIMIT 1) END
+                 FROM harness_manager_v2_events event
+                 WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
+                   AND kind=?4 AND record_key=?5 AND row_version=?6
+                 ORDER BY sequence DESC LIMIT 1",
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    record.kind,
+                    record.key,
+                    record.row_version,
+                    record.kind == "work" && !record.payload["integration"].is_null()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let actor = actor_and_prior
+            .as_ref()
+            .and_then(|(actor, _)| actor.as_deref())
+            .and_then(|id| Uuid::parse_str(id).ok());
+        if record.kind == "work"
+            && !record.payload["integration"].is_null()
+            && actor.is_some_and(|id| {
+                self.manager_lineage_root(id).ok() == Some(config.manager_session_id)
+            })
+        {
+            // A manager-authored integration needs no self-wake. Preserve
+            // ordinary work notices, including keys added below the cursor.
+            return Ok(None);
+        }
+        let integration_advanced =
+            if record.kind == "work" && !record.payload["integration"].is_null() {
+                let previous = actor_and_prior
+                    .and_then(|(_, prior)| prior)
+                    .map(|json| serde_json::from_str::<Value>(&json))
+                    .transpose()?;
+                actor.is_some_and(|id| self.manager_lineage_tip(id).ok() == Some(lead.id))
+                    && previous
+                        .is_none_or(|value| value["integration"] != record.payload["integration"])
+            } else {
+                false
+            };
         self.insert_manager_notice(
             config,
             epic,
@@ -636,7 +887,42 @@ impl Store {
             Some(lead.id),
             &json!({"record_kind":record.kind,"record_key":record.key,
                     "row_version":record.row_version,"payload":record.payload}),
+            integration_advanced,
         )
+    }
+
+    /// Post-commit hook for an exact lead-authored integration update. The
+    /// caller publishes the returned job after releasing the Store lock.
+    /// The coordinator's keyset pass remains the restart backstop.
+    pub(crate) fn manager_integration_notice_for_committed_update(
+        &self,
+        project: Uuid,
+        work_key: &str,
+        row_version: i64,
+    ) -> Result<Option<Uuid>> {
+        let Some(config) = self.get_harness_manager_notice_config(project)? else {
+            return Ok(None);
+        };
+        let Some(record) = self.manager_v2_record(&config, "work", work_key)? else {
+            return Ok(None);
+        };
+        if record.row_version != row_version || record.payload["integration"].is_null() {
+            return Ok(None);
+        }
+        let Some(epic) = record.epic_id else {
+            return Ok(None);
+        };
+        if !self.manager_config_covers_epic(&config, epic)? {
+            return Ok(None);
+        }
+        let Ok(lead) = self.manager_lead(project, epic) else {
+            return Ok(None);
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let job = self.record_manager_ledger_notice(&config, &lead, &record)?;
+        tx.commit()?;
+        let (event_job, _, _) = self.manager_action_watch_identity(&config);
+        Ok(job.filter(|id| *id == event_job))
     }
 
     fn reconcile_manager_action_notices(&self, config: &HarnessManagerConfigV1) -> Result<()> {
@@ -741,6 +1027,7 @@ impl Store {
             Some(config.manager_session_id),
             &json!({"decision_key":decision_key,"row_version":row_version,
                     "target_digest":target_digest,"state":"answered"}),
+            false,
         )
     }
 
@@ -915,6 +1202,7 @@ impl Store {
             terminal_state,
             Some(lead.id),
             state,
+            true,
         )
     }
 
@@ -1052,6 +1340,7 @@ impl Store {
                     "minutes_unconsumed": delivery.minutes,
                     "abandoned_at": abandoned_at_text,
                 }),
+                false,
             )?;
         }
         transaction.commit()?;
@@ -1512,7 +1801,11 @@ impl Store {
         let rows = self.pending_manager_notice_candidates(config, direction, epic, request_id)?;
         let last_candidate_sequence = rows.last().map(|row| row.public.sequence);
         for row in rows {
-            let scoped = (is_manager && row.public.kind == "action_result")
+            let scoped = (is_manager
+                && (row.public.kind == "action_result"
+                    || (row.public.kind == "ledger_change"
+                        && row.public.subject_id == WORKER_PRESSURE_NOTICE_SUBJECT
+                        && row.public.epic_id.is_none())))
                 || row
                     .public
                     .epic_id
@@ -1698,6 +1991,29 @@ impl Store {
         } else {
             Some(epic.to_string())
         };
+        if kind == "work" {
+            // Integrated work is no longer a live work fact. It still needs
+            // its exact ledger_change notice when a post-commit hint is lost.
+            let mut statement = self.conn.prepare(
+                "SELECT record_key FROM harness_manager_v2_work_facts
+                 WHERE project_id=?1 AND epic_id=?2 AND kind='work'
+                   AND archived=0 AND record_key>?3
+                 ORDER BY record_key LIMIT ?4",
+            )?;
+            let keys = statement
+                .query_map(
+                    params![
+                        config.project_id.to_string(),
+                        epic.to_string(),
+                        after,
+                        MAX_NOTICE_RECORDS_PER_EPIC_PASS
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            return self.manager_v2_notice_record_keys(config, epic, kind, &lane, &after, keys);
+        }
         if super::manager_ledger::is_work_fact(kind) {
             // D19: work facts survive seat moves, so they page by Epic, not seat.
             let keys = self.manager_v2_fact_keys_after(
@@ -1912,6 +2228,205 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn lead_integration_advance_uses_one_manager_idle_transport() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, policy());
+        let (event_job, _, _) = store.manager_action_watch_identity(&config);
+        let epic = lead.parent_id.unwrap();
+        let first = json!({"integration":{"target_commit":"a"}});
+        let mut record = store
+            .manager_v2_put_record(&config, "work", "integrated", Some(epic), 0, &first)
+            .unwrap();
+        store
+            .manager_v2_event(
+                &config,
+                Some(config.manager_session_id),
+                "work",
+                &record.key,
+                1,
+                &record.payload,
+            )
+            .unwrap();
+        let manager_authored = store
+            .record_manager_ledger_notice(&config, &lead, &record)
+            .unwrap();
+        assert!(
+            manager_authored.is_none(),
+            "manager's own ledger write has no self-wake"
+        );
+
+        let second = json!({"integration":{"target_commit":"b"}});
+        record = store
+            .manager_v2_put_record(&config, "work", "integrated", Some(epic), 1, &second)
+            .unwrap();
+        store
+            .manager_v2_event(
+                &config,
+                Some(lead.id),
+                "work",
+                &record.key,
+                2,
+                &record.payload,
+            )
+            .unwrap();
+        let lead_authored = store
+            .manager_integration_notice_for_committed_update(config.project_id, &record.key, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead_authored, event_job);
+        let job = store.get_scheduled_job(&event_job).unwrap().unwrap();
+        assert_eq!(
+            job.wake_mode,
+            rsi_common::types::WakeMode::OnTerminal(config.manager_session_id)
+        );
+        assert_eq!(job.wake_session_id, Some(config.manager_session_id));
+        assert!(
+            job.message
+                .contains("ledger_change subject=work:integrated version=2")
+        );
+
+        record = store
+            .manager_v2_put_record(&config, "work", "integrated", Some(epic), 2, &second)
+            .unwrap();
+        store
+            .manager_v2_event(
+                &config,
+                Some(lead.id),
+                "work",
+                &record.key,
+                3,
+                &record.payload,
+            )
+            .unwrap();
+        let unchanged = store
+            .record_manager_ledger_notice(&config, &lead, &record)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            unchanged, event_job,
+            "a later work edit retaining integration must not re-wake"
+        );
+        assert_eq!(
+            store.manager_notice_undelivered_count(event_job).unwrap(),
+            1
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn integrated_work_notice_survives_lost_post_commit_hint() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, policy());
+        let record = store
+            .manager_v2_put_record(
+                &config,
+                "work",
+                "finished",
+                lead.parent_id,
+                0,
+                &json!({"integration":{"target_commit":"a"}}),
+            )
+            .unwrap();
+        store
+            .manager_v2_event(
+                &config,
+                Some(lead.id),
+                "work",
+                &record.key,
+                1,
+                &record.payload,
+            )
+            .unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+        let (event_job, _, _) = store.manager_action_watch_identity(&config);
+        let recorded: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM harness_manager_notices WHERE job_id=?1
+             AND kind='ledger_change' AND subject_id='work:finished' AND subject_version='1'",
+                [event_job.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn worker_pressure_notice_is_durable_thresholded_and_rate_limited() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, _) = fixture(&store, policy());
+        let observed_at = Utc::now();
+        let mut pressure = WorkerSliceMemoryPressure {
+            high_events: 42,
+            high_events_per_minute: Some(6.0),
+            full_avg60: 10.0,
+        };
+        assert_eq!(
+            store
+                .record_worker_slice_pressure_notice(config.project_id, &pressure, observed_at)
+                .unwrap(),
+            None
+        );
+
+        pressure.full_avg60 = 10.1;
+        let job = store
+            .record_worker_slice_pressure_notice(config.project_id, &pressure, observed_at)
+            .unwrap()
+            .expect("pressure above 10% creates a durable notice");
+        let manager = config.current_session_id.unwrap();
+        let (notices, more) = store
+            .retrieve_manager_notices(&config, manager, true, 32, None)
+            .unwrap();
+        assert!(!more);
+        let pressure_notices: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.subject_id == WORKER_PRESSURE_NOTICE_SUBJECT)
+            .collect();
+        assert_eq!(pressure_notices.len(), 1);
+        let notice = pressure_notices[0];
+        assert_eq!(notice.kind, "ledger_change");
+        assert_eq!(notice.epic_id, None);
+        assert_eq!(notice.state["record_kind"], WORKER_PRESSURE_NOTICE_SUBJECT);
+        assert_eq!(notice.state["full_avg60"], 10.1);
+        assert_eq!(notice.state["high_events"], 42);
+        assert_eq!(notice.state["high_events_per_minute"], 6.0);
+
+        // Settling the inbox notice must not clear the retained dedupe fence.
+        assert_eq!(
+            store
+                .record_worker_slice_pressure_notice(
+                    config.project_id,
+                    &pressure,
+                    observed_at + chrono::Duration::minutes(14),
+                )
+                .unwrap(),
+            None
+        );
+        pressure.high_events = 60;
+        assert_eq!(
+            store
+                .record_worker_slice_pressure_notice(
+                    config.project_id,
+                    &pressure,
+                    observed_at + chrono::Duration::minutes(15),
+                )
+                .unwrap(),
+            Some(job)
+        );
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, manager, true, 32, None)
+            .unwrap();
+        let pressure_notices: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.subject_id == WORKER_PRESSURE_NOTICE_SUBJECT)
+            .collect();
+        assert_eq!(pressure_notices.len(), 1);
+        assert_eq!(pressure_notices[0].state["high_events"], 60);
+    }
+
     fn action_operation(
         config: &HarnessManagerConfigV1,
         action: ManagerActionV2,
@@ -2034,6 +2549,7 @@ mod tests {
         live_job
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_board_exposes_current_lead_and_container_control_fences() {
         let store = Store::open_in_memory().unwrap();
@@ -2082,6 +2598,7 @@ mod tests {
             && r["expected"]["lead_session_id"] == lead.id.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_decision_board_refreshes_actual_question_and_protects_daemon_keys() {
         let store = Store::open_in_memory().unwrap();
@@ -2132,6 +2649,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_operator_answers_have_attributed_retrieval_without_breaking_pages() {
         let store = Store::open_in_memory().unwrap();
@@ -2193,6 +2711,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_operator_answer_refuses_a_changed_work_gate() {
         let store = Store::open_in_memory().unwrap();
@@ -2244,6 +2763,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_reconciliation_deduplicates_exact_subject_versions() {
         let store = Store::open_in_memory().unwrap();
@@ -2293,6 +2813,7 @@ mod tests {
         assert_eq!(answer_count, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn lead_replacement_binds_new_route_and_stale_prefix_cannot_hide_live_notice() {
         let store = Store::open_in_memory().unwrap();
@@ -2368,6 +2889,7 @@ mod tests {
         assert_eq!(retired_without_retrieval, stale_before);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn inbox_stale_cleanup_is_bounded_and_reaches_a_live_notice_on_retry() {
         let store = Store::open_in_memory().unwrap();
@@ -2444,6 +2966,7 @@ mod tests {
         assert_eq!(retired_after_second, 513);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn stale_route_retirement_v118_has_job_bounded_steps_and_restart_order() {
         use rusqlite::StatementStatus;
@@ -2607,6 +3130,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn deferred_recovery_retires_stale_jobs_in_bounded_forward_batches() {
         let store = Store::open_in_memory().unwrap();
@@ -2666,6 +3190,7 @@ mod tests {
         assert!(store.get_scheduled_job(&live_job).unwrap().unwrap().enabled);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn deferred_transport_discovery_skips_repeated_enabled_job_prefix() {
         let store = Store::open_in_memory().unwrap();
@@ -2752,6 +3277,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn deferred_transport_discovery_pages_past_distinct_enabled_live_candidates() {
         use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
@@ -2889,6 +3415,7 @@ mod tests {
         assert_eq!(live_prefix_notices, MAX_NOTICE_RECONCILIATION_BATCH + 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn deferred_transport_discovery_progresses_past_more_than_page_of_dead_candidates() {
         let store = Store::open_in_memory().unwrap();
@@ -2990,6 +3517,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn deferred_recovery_bounds_cleanup_within_one_stale_job() {
         let store = Store::open_in_memory().unwrap();
@@ -3061,6 +3589,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn inbox_settles_exact_notice_without_clearing_question_or_operator_answer() {
         let store = Store::open_in_memory().unwrap();
@@ -3121,6 +3650,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_notice_binds_operation_target_and_terminal_receipt() {
         let store = Store::open_in_memory().unwrap();
@@ -3168,6 +3698,7 @@ mod tests {
         assert_eq!(notice.state["outcome"], "lead_committed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn project_wide_action_notice_uses_manager_transport_without_fabricating_epic() {
         let store = Store::open_in_memory().unwrap();
@@ -3218,6 +3749,7 @@ mod tests {
         assert_eq!(notice.state["outcome"], "container_committed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn vacant_lead_action_notice_does_not_depend_on_the_replacement_route() {
         let store = Store::open_in_memory().unwrap();
@@ -3263,6 +3795,7 @@ mod tests {
         assert_eq!(notice.state["state"], "succeeded");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_reconciliation_queue_uses_its_bounded_pending_index() {
         let store = Store::open_in_memory().unwrap();
@@ -3301,6 +3834,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn mixed_kind_queue_prefix_retires_in_one_page_then_recovers_exact_action() {
         let store = Store::open_in_memory().unwrap();
@@ -3426,6 +3960,7 @@ mod tests {
         assert_eq!(recovered, (MAX_NOTICE_RECONCILIATION_BATCH, 1, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn notice_candidate_queries_use_bounded_ordered_access_paths() {
         let store = Store::open_in_memory().unwrap();
@@ -3567,6 +4102,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_reconciliation_retains_each_terminal_version_for_one_operation() {
         let store = Store::open_in_memory().unwrap();
@@ -3677,6 +4213,7 @@ mod tests {
         assert_eq!(queue_state, (2, 2));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_notice_construction_rolls_back_crash_boundaries_and_recovers_after_restart() {
         for fault in [
@@ -3791,6 +4328,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_notice_retry_adopts_an_exact_orphaned_scheduled_job() {
         let store = Store::open_in_memory().unwrap();
@@ -3852,6 +4390,7 @@ mod tests {
         assert!(recovered.2.contains(&receipt.operation_id.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_reconciliation_recovers_an_old_missing_receipt_beyond_latest_window() {
         let store = Store::open_in_memory().unwrap();
@@ -3955,6 +4494,7 @@ mod tests {
         assert_eq!(action_notices, MAX_NOTICE_RECONCILIATION_BATCH + 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn retrieving_message_notice_preserves_the_genuine_pending_request() {
         let store = Store::open_in_memory().unwrap();
@@ -3966,6 +4506,7 @@ mod tests {
                     epic_id: lead.parent_id.unwrap(),
                     message: "Report the focused verification evidence".into(),
                     idempotency_key: "pending-mail".into(),
+                    informational: false,
                 },
             )
             .unwrap();
@@ -3999,6 +4540,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn request_filtered_notice_retrieval_uses_exact_message_exchange() {
         let store = Store::open_in_memory().unwrap();
@@ -4010,6 +4552,7 @@ mod tests {
                     epic_id: lead.parent_id.unwrap(),
                     message: "Report the exact request evidence".into(),
                     idempotency_key: "filtered-request".into(),
+                    informational: false,
                 },
             )
             .unwrap();
@@ -4036,6 +4579,7 @@ mod tests {
                     request_id: request.message_id,
                     message: "Exact evidence attached".into(),
                     idempotency_key: "filtered-reply".into(),
+                    still_running: false,
                 },
             )
             .unwrap();
@@ -4060,6 +4604,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn failed_and_interrupted_session_versions_are_distinct_and_restart_safe() {
         let directory = tempfile::tempdir().unwrap();
@@ -4113,6 +4658,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn oversized_question_projects_truthfully_without_rolling_back_other_project() {
         let store = Store::open_in_memory().unwrap();
@@ -4189,6 +4735,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn v2_ledger_notice_materialization_advances_in_fixed_cursor_pages() {
         let store = Store::open_in_memory().unwrap();
@@ -4243,6 +4790,7 @@ mod tests {
         assert_eq!(cursor_rows, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn scope_replacement_retires_old_notices_in_restart_safe_bounded_pages() {
         let directory = tempfile::tempdir().unwrap();
@@ -4368,6 +4916,7 @@ mod tests {
         assert_eq!(old_live, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn scope_edit_retires_its_exact_owner_without_draining_older_owners() {
         let store = Store::open_in_memory().unwrap();
@@ -4446,6 +4995,7 @@ mod tests {
         assert_eq!(older_mutations, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn failed_action_notice_then_scope_change_retires_exact_queue_obligation() {
         let directory = tempfile::tempdir().unwrap();
@@ -4551,6 +5101,7 @@ mod tests {
         assert_eq!(materialized, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn action_finishing_after_scope_change_is_immediately_retired() {
         let store = Store::open_in_memory().unwrap();
@@ -4617,6 +5168,7 @@ mod tests {
         assert_eq!(state, (1, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn distinct_subject_burst_is_transport_bounded_without_erasing_durable_versions() {
         let store = Store::open_in_memory().unwrap();
@@ -4676,6 +5228,7 @@ mod tests {
         assert!(job.message.contains("additional notices remain"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_question_projection_resolves_legacy_blocker_after_new_publication() {
         let store = Store::open_in_memory().unwrap();
@@ -4737,6 +5290,7 @@ mod tests {
             "resolved"
         );
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn manager_v2_board_retains_unroutable_tool_approval_as_an_exact_visible_gate() {
         use rsi_common::types::{Approval, ApprovalStatus};

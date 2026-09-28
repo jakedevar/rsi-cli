@@ -156,6 +156,10 @@ pub struct LaunchConfig {
 /// Stamp the exact daemon-owned execution environment shared by every CLI
 /// provider.  Scratch revalidation happens at the final command-construction
 /// boundary so replacement or mount drift cannot reach a child process.
+///
+/// This is also the shared credential-scrub chokepoint (Claude, Codex, AGY
+/// and the `CodexAppServer` `build_app_server_command`): see
+/// [`crate::vault::scrub_credential_env`].
 pub(crate) fn stamp_execution_environment(
     cmd: &mut Command,
     config: &LaunchConfig,
@@ -184,11 +188,16 @@ pub(crate) fn stamp_execution_environment(
         );
         cmd.env(identity::ENV_CARGO_TARGET_DIR, scratch.target());
         cmd.env(identity::ENV_TMPDIR, scratch.temp());
+        scratch.stamp_build_env(cmd);
     } else if let Some(dir) = &config.cargo_target_dir {
         // Compatibility for pre-existing internally-constructed sandbox
         // configs; normal Slice 8 paths always carry a descriptor.
         cmd.env(identity::ENV_CARGO_TARGET_DIR, dir);
     }
+    // #694 K1: no provider API key reaches an agent-facing CLI by
+    // inheritance. A route credential the launch explicitly injected (Codex
+    // fallback only) survives; every other slot/generic var is removed.
+    crate::vault::scrub_credential_env(cmd);
     Ok(())
 }
 
@@ -264,8 +273,7 @@ impl ClaudeProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
+        crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
     /// Wait for the process to exit.
@@ -446,6 +454,14 @@ fn validated_claude_effort(config: &LaunchConfig) -> Result<Option<&'static str>
 }
 
 impl ClaudeClient {
+    #[cfg(test)]
+    pub(crate) fn with_binary_path_for_test(binary_path: PathBuf) -> Self {
+        Self {
+            binary_path,
+            runtime_config: None,
+        }
+    }
+
     /// Create a new client, finding the Claude binary in PATH.
     pub fn new(runtime_config: Arc<RuntimeConfig>) -> Result<Self> {
         let binary_path = which::which("claude").map_err(|_| DaemonError::ClaudeBinaryNotFound)?;
@@ -584,6 +600,8 @@ impl ClaudeClient {
         }
 
         stamp_execution_environment(&mut cmd, config, invocation_id)?;
+
+        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -828,6 +846,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn execution_environment_stamps_authenticated_scratch_and_identity() {
         use rsi_common::identity;
@@ -864,6 +883,35 @@ mod tests {
         );
     }
 
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn claude_cli_environment_scrubs_every_provider_credential() {
+        // Claude, AGY and Codex all build their child env through this
+        // chokepoint; no slot or generic credential var may be inherited.
+        let config = launch_config_for_provider_test("scrub");
+        let mut cmd = Command::new("claude");
+        stamp_execution_environment(&mut cmd, &config, uuid::Uuid::new_v4()).unwrap();
+        crate::vault::env_scrub::tests::assert_only_injected(&cmd, None);
+        // Identity stamping is unaffected by the scrub.
+        assert!(
+            command_environment(&cmd).contains_key(rsi_common::identity::ENV_MODEL_INVOCATION_ID)
+        );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn stamped_claude_child_suppresses_daemon_keys_and_keeps_ordinary_env() {
+        let mut config = launch_config_for_provider_test("scrub-daemon-keys");
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        let mut cmd = Command::new("claude");
+        stamp_execution_environment(&mut cmd, &config, uuid::Uuid::new_v4()).unwrap();
+        crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&cmd, None);
+        assert!(command_environment(&cmd).contains_key(rsi_common::identity::ENV_SESSION_ID));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn ordinary_cli_environment_matches_pre_slice8_identity_without_scratch_ownership() {
         use rsi_common::identity;
@@ -877,6 +925,7 @@ mod tests {
         assert!(!env.contains_key(identity::ENV_PROCESS_OWNERSHIP_NAMESPACE));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_claude_agent_role_for_kind_maps_implementer_kinds() {
         use rsi_common::types::SessionKind;
@@ -897,6 +946,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_claude_agent_role_for_kind_non_implementers_are_none() {
         use rsi_common::types::SessionKind;
@@ -979,6 +1029,7 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_claude_client_availability() {
         // This test documents behavior, doesn't assert (Claude may or may not be installed)
@@ -986,6 +1037,7 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
         println!("Claude CLI available: {}", available);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_stream_event_parsing() {
         let json = r#"{"type":"system","subtype":"init","session_id":"abc123"}"#;
@@ -994,6 +1046,7 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
         assert_eq!(event.data.get("subtype").unwrap(), "init");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_stream_event_with_content() {
         let json = r#"{"type":"assistant","session_id":"abc","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}}"#;
@@ -1002,6 +1055,7 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn launch_sends_query_and_system_prompt_as_separate_cli_args() {
         let block = "<docregblock>\n\
@@ -1041,6 +1095,7 @@ worker prompt body\n\
     }
 
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn claude_launch_stamps_authenticated_execution_environment() {
         let tmp = TempDir::new().unwrap();
@@ -1070,6 +1125,7 @@ worker prompt body\n\
         assert!(!parts[4].is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_launch_config() {
         let config = LaunchConfig {
@@ -1128,6 +1184,7 @@ worker prompt body\n\
     /// no matter what `launch()` actually emitted. It now runs the real
     /// builder against the fake `claude` binary.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn launch_includes_permission_and_verbose_flags() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1182,6 +1239,7 @@ worker prompt body\n\
     /// not a spot check, so ANY future flag added unconditionally to `launch()`
     /// trips it and forces a deliberate decision about the default.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn default_launch_argv_is_unchanged_by_config_isolation() {
         // The exact argv `launch()` built before this feature, for a config
@@ -1218,6 +1276,7 @@ worker prompt body\n\
     /// connected the server; adding these flags blocked both while leaving
     /// `permissionMode: bypassPermissions` and ambient OAuth intact.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn opt_in_config_isolation_passes_isolation_flags() {
         let settings = argv_for_isolation(Some("settings")).await;
@@ -1246,6 +1305,7 @@ worker prompt body\n\
     }
 
     /// The setting is validated on write, and the default is `off`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn config_isolation_policy_parses_and_defaults_to_off() {
         assert_eq!(
@@ -1274,6 +1334,7 @@ worker prompt body\n\
 
     /// F-155 companion: same rewrite for the `--resume` argv test.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn launch_with_resume_passes_session_id() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1299,6 +1360,7 @@ worker prompt body\n\
 
     /// V-006: a supported effort reaches the CLI verbatim.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn launch_passes_supported_effort_to_cli() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1330,6 +1392,7 @@ worker prompt body\n\
     /// `ultra`, so the launch is rejected instead — the same treatment the
     /// Codex path already gives an unsupported effort.
     #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn launch_rejects_effort_the_cli_would_silently_downgrade() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1356,6 +1419,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn claude_effort_level_accepts_exactly_the_cli_vocabulary() {
         for accepted in ["low", "medium", "high", "xhigh", "max"] {
@@ -1402,6 +1466,7 @@ fn append_catalog_family(models: &mut Vec<(String, String)>, family: &str) {
 mod model_discovery_tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_append_catalog_family_dedupes_and_filters() {
         // A current entry already present is not duplicated, while the
@@ -1435,6 +1500,7 @@ mod model_discovery_tests {
     /// pins the daemon side and
     /// `crates/rsi/src/app/mod.rs::tui_claude_models_are_the_canonical_catalog`
     /// pins the client side, so a model added to one and not the other fails.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn discover_models_returns_the_canonical_catalog() {
         let client = ClaudeClient {

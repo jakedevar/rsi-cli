@@ -259,6 +259,7 @@ mod tests {
         dir
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn retained_successor_root_absent_is_noop() {
         let repo = repo();
@@ -269,6 +270,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn retained_successor_root_pristine_allocation_is_reclaimed_and_reallocatable() {
         let repo = repo();
@@ -284,6 +286,7 @@ mod tests {
         assert!(again.root.join("README.md").is_file());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn retained_successor_root_with_evidence_or_unique_commit_is_foreign_and_kept() {
         for case in ["untracked", "commit", "branch"] {
@@ -315,6 +318,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn freshest_successor_source_fast_forwards_to_fetched_upstream_only() {
         let upstream = repo();

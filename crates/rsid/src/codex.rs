@@ -6,10 +6,10 @@ use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::model_control::CliExecutionCapability;
 use crate::model_control::registry::RuntimeExecutionRoute;
-use crate::openrouter::{OpenRouterCodexConfigOverrides, openrouter_credential_from_env};
+use crate::openrouter::{OpenRouterCodexConfigOverrides, openrouter_credential_from};
 use crate::pioneer::{
     PioneerCodexConfigOverrides, PioneerCredentialSource, existing_pioneer_codex_catalog_path,
-    pioneer_credential_from_env, pioneer_launch_model,
+    pioneer_credential_from, pioneer_launch_model,
 };
 use crate::process_control::{
     BoundedLineError, BoundedLines, CaptureLimits, PROVIDER_MAX_LINE_BYTES,
@@ -45,6 +45,7 @@ const CODEX_FATAL_STDERR_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const CODEX_STORAGE_FULL_ERROR_CLASS: &str = "codex_storage_full";
 pub(crate) const CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE: &str = "stderr.codex_storage_full";
 pub(crate) const CODEX_STORAGE_FULL_STOP_REASON: &str = "provider_error:codex_storage_full";
+pub(crate) const CODEX_TOOL_HISTORY_ERROR_CLASS: &str = "codex_resume_tool_history_invalid";
 const CODEX_USAGE_LIMIT_MESSAGE_PREFIX: &str = "You've hit your usage limit.";
 pub(crate) const CODEX_USAGE_LIMIT_ERROR_CLASS: &str = "codex_usage_limit";
 pub(crate) const CODEX_USAGE_LIMIT_STOP_REASON: &str = "provider_error:codex_usage_limit";
@@ -54,10 +55,14 @@ pub struct CodexProcess {
     child: Child,
 }
 
-/// Sandbox policy for fresh `codex exec` launches.
-///
-/// `exec resume` inherits the sandbox policy from the original session, so this
-/// only affects new Codex sessions.
+#[cfg(test)]
+impl CodexProcess {
+    pub(crate) fn from_child_for_route_test(child: Child) -> Self {
+        Self { child }
+    }
+}
+
+/// Sandbox policy for each `codex exec` turn, including resumed turns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexSandboxMode {
     ReadOnly,
@@ -100,8 +105,7 @@ impl CodexProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
+        crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
     /// Non-blocking check if the process has exited.
@@ -112,15 +116,16 @@ impl CodexProcess {
 
 /// Client for interacting with Codex CLI.
 ///
-/// Holds an `Arc<RuntimeConfig>` so each `launch()` reads the current
-/// `--sandbox` policy at spawn time. This means an `UpdateDaemonConfig` RPC
-/// flipping `codex_sandbox_mode` takes effect on the next fresh Codex spawn
-/// — no daemon restart required. `exec resume` continues to skip `--sandbox`
-/// (it inherits the original session's policy from the Codex CLI side).
+/// Holds an `Arc<RuntimeConfig>` so each `launch()` reads the current sandbox
+/// policy. Fresh turns use `--sandbox`; resumed turns use the equivalent
+/// `-c sandbox_mode=...` override because `exec resume` rejects `--sandbox`.
+/// An `UpdateDaemonConfig` change therefore applies on the next turn.
 pub struct CodexClient {
     binary_path: PathBuf,
     agent_mcp_path: PathBuf,
     runtime_config: Arc<RuntimeConfig>,
+    #[cfg(test)]
+    skip_resume_history_validation_for_test: bool,
 }
 
 impl CodexClient {
@@ -140,7 +145,46 @@ impl CodexClient {
                     DaemonError::Process("rsid executable has no parent directory".to_string())
                 })?,
             runtime_config,
+            #[cfg(test)]
+            skip_resume_history_validation_for_test: false,
         })
+    }
+
+    /// Test-only constructor bypassing `which::which`/`current_exe`
+    /// resolution: fills `binary_path` and `agent_mcp_path` with caller-chosen
+    /// paths so a test can exercise `build_cmd`/`launch` deterministically —
+    /// e.g. pointing both at an existing no-op binary (`/usr/bin/true`) to
+    /// isolate the launch refusal boundary to a single remaining precondition
+    /// (such as a missing working directory) instead of ambient host state
+    /// (codex on PATH, the daemon-installed `rsi-agent-mcp` sibling).
+    #[cfg(test)]
+    pub(crate) const fn with_paths_for_test(
+        binary_path: PathBuf,
+        agent_mcp_path: PathBuf,
+        runtime_config: Arc<RuntimeConfig>,
+    ) -> Self {
+        Self {
+            binary_path,
+            agent_mcp_path,
+            runtime_config,
+            skip_resume_history_validation_for_test: false,
+        }
+    }
+
+    /// Launch-boundary fixtures use a dummy thread token and a no-op binary.
+    /// Keep their unrelated filesystem assertions independent of rollout lookup.
+    #[cfg(test)]
+    pub(crate) fn without_resume_history_validation_for_test(mut self) -> Self {
+        self.skip_resume_history_validation_for_test = true;
+        self
+    }
+
+    fn validate_resume_history_for_launch(&self, thread_id: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.skip_resume_history_validation_for_test {
+            return Ok(());
+        }
+        validate_codex_resume_tool_history(thread_id)
     }
 
     pub fn is_available() -> bool {
@@ -234,6 +278,8 @@ impl CodexClient {
             rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
             rsi_common::identity::process_ownership_namespace(),
         );
+        // Probes need no provider credential (#694 K1).
+        crate::vault::scrub_credential_env(&mut command);
         let output = capture_bounded(
             command,
             CaptureLimits::catalog(),
@@ -265,6 +311,7 @@ impl CodexClient {
             rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
             rsi_common::identity::process_ownership_namespace(),
         );
+        crate::vault::scrub_credential_env(&mut command);
         let output = capture_bounded(
             command,
             CaptureLimits::catalog(),
@@ -290,28 +337,41 @@ impl CodexClient {
     /// The sandbox arg is read from `self.runtime_config` at call time, so
     /// runtime mutations are reflected on the next spawn.
     pub(crate) fn build_cmd(&self, config: &LaunchConfig) -> Result<Command> {
-        let pioneer_launch = if config.provider == Some(rsi_common::types::SessionProvider::Pioneer)
-        {
-            let credential = pioneer_credential_from_env()
+        self.build_cmd_with_vault(config, &crate::vault::global())
+    }
+
+    /// Resolve the route credential through `vault`, build the command, and
+    /// inject exactly one credential var (plus the matching Codex tool-shell
+    /// exclude) after the credential env scrub.
+    pub(crate) fn build_cmd_with_vault(
+        &self,
+        config: &LaunchConfig,
+        vault: &crate::vault::VaultHandle,
+    ) -> Result<Command> {
+        use crate::vault::Slot;
+        use rsi_common::provider_credentials::{
+            CliExposureConsumer::SessionCodexCli, CliExposureReason::Route,
+        };
+        use rsi_common::types::SessionProvider;
+        let pioneer_launch = if config.provider == Some(SessionProvider::Pioneer) {
+            let credential = pioneer_credential_from(vault)
                 .map_err(|error| DaemonError::Process(error.to_string()))?;
-            Some((credential.source(), existing_pioneer_codex_catalog_path()))
+            Some((credential, existing_pioneer_codex_catalog_path()))
         } else {
             None
         };
-        let openrouter_launch =
-            if config.provider == Some(rsi_common::types::SessionProvider::OpenRouter) {
-                Some(
-                    openrouter_credential_from_env()
-                        .map_err(|error| DaemonError::Process(error.to_string()))?,
-                )
-            } else {
-                None
-            };
-        let bedrock_launch = if config.provider == Some(rsi_common::types::SessionProvider::Bedrock)
-        {
+        let openrouter_launch = if config.provider == Some(SessionProvider::OpenRouter) {
+            Some(
+                openrouter_credential_from(vault)
+                    .map_err(|error| DaemonError::Process(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let bedrock_launch = if config.provider == Some(SessionProvider::Bedrock) {
             Some((
                 bedrock::region().map_err(DaemonError::Process)?,
-                bedrock::credential().map_err(DaemonError::Process)?,
+                bedrock::credential_from(vault).map_err(DaemonError::Process)?,
             ))
         } else {
             None
@@ -320,12 +380,45 @@ impl CodexClient {
             config,
             pioneer_launch
                 .as_ref()
-                .map(|(source, path)| (*source, path.as_deref())),
-            openrouter_launch.as_deref(),
+                .map(|(credential, path)| (credential.source(), path.as_deref())),
+            openrouter_launch
+                .as_ref()
+                .map(|resolved| resolved.secret.expose()),
             bedrock_launch.as_ref().map(|(region, _)| region.as_str()),
         )?;
-        if let Some((_, credential)) = bedrock_launch {
-            command.env(bedrock::BEDROCK_ENV, credential);
+        if let Some((credential, _)) = pioneer_launch {
+            let secret = crate::vault::SecretString::new(credential.value().to_owned());
+            let var = credential.source().env_name();
+            vault.inject_cli_credential(
+                &mut command,
+                Slot::Pioneer,
+                var,
+                &secret,
+                SessionCodexCli,
+                Route,
+            );
+        }
+        if let Some(resolved) = openrouter_launch {
+            let var = crate::openrouter::OPENROUTER_ENV;
+            vault.inject_cli_credential(
+                &mut command,
+                Slot::Openrouter,
+                var,
+                &resolved.secret,
+                SessionCodexCli,
+                Route,
+            );
+        }
+        if let Some((_, resolved)) = bedrock_launch {
+            let var = bedrock::BEDROCK_ENV;
+            vault.inject_cli_credential(
+                &mut command,
+                Slot::Bedrock,
+                var,
+                &resolved.secret,
+                SessionCodexCli,
+                Route,
+            );
         }
         Ok(command)
     }
@@ -352,15 +445,16 @@ impl CodexClient {
 
         cmd.args(["--json", "--skip-git-repo-check"]);
 
-        // `--sandbox` is only valid on the top-level `exec` subcommand.
-        // `exec resume` rejects it ("unexpected argument '--sandbox'") and
-        // inherits the original session's sandbox configuration.
-        if !is_resume {
-            let mode_str = self.runtime_config.codex_sandbox_mode.read().clone();
-            // Defensive fallback — `update_field` validates inputs, so this
-            // should never trip in practice.
-            let mode =
-                CodexSandboxMode::parse(&mode_str).unwrap_or(CodexSandboxMode::WorkspaceWrite);
+        let mode_str = self.runtime_config.codex_sandbox_mode.read().clone();
+        // Defensive fallback — `update_field` validates inputs, so this
+        // should never trip in practice.
+        let mode = CodexSandboxMode::parse(&mode_str).unwrap_or(CodexSandboxMode::WorkspaceWrite);
+        if is_resume {
+            // `exec resume` rejects `--sandbox`, but accepts config overrides.
+            // Override the stored thread policy on every turn so changes in
+            // either direction take effect immediately.
+            cmd.args(["-c", &format!("sandbox_mode={:?}", mode.cli_arg())]);
+        } else {
             cmd.args(["--sandbox", mode.cli_arg()]);
         }
 
@@ -464,9 +558,16 @@ impl CodexClient {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+        if let Some(thread_id) = config.resume_session_id.as_deref() {
+            self.validate_resume_history_for_launch(thread_id)?;
+        }
         let invocation_id = execution.invocation_id();
         let mut cmd = self.build_cmd(config)?;
         crate::claude::stamp_execution_environment(&mut cmd, config, invocation_id)?;
+        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
         configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
         let is_resume = config.resume_session_id.is_some();
         let transcript_boundary =
@@ -874,6 +975,8 @@ async fn probe_codex_configured_context_window(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    // The config probe needs no provider credential (#694 K1).
+    crate::vault::scrub_credential_env(&mut command);
     configure_tokio_process_group(&mut command, ProcessContainment::Group).ok()?;
 
     let mut child = command.spawn().ok()?;
@@ -1139,6 +1242,79 @@ fn codex_transcript_watermark(thread_id: &str) -> Option<CodexTranscriptWatermar
         inode: metadata.ino(),
         prefix_tail,
     })
+}
+
+/// Codex CLI resumes by replaying its local rollout. A lost result can leave a
+/// custom/function call in that rollout without its output, and every later
+/// resume then repeats the same invalid request. Check the persisted history
+/// before spawning another provider process. An uncertain tool outcome is not
+/// repairable here: fabricating an output could replay a mutation as success.
+pub(crate) fn validate_codex_resume_tool_history(thread_id: &str) -> Result<()> {
+    let path = find_codex_session_transcript(thread_id).ok_or_else(|| {
+        DaemonError::CodexResumeToolHistory("persisted transcript unavailable".into())
+    })?;
+    validate_codex_tool_history_file(&path)
+}
+
+fn validate_codex_tool_history_file(path: &Path) -> Result<()> {
+    let file = File::open(path).map_err(|_| {
+        DaemonError::CodexResumeToolHistory("persisted transcript unreadable".into())
+    })?;
+    // A call ID must pair within its own protocol item family. Counting only
+    // total calls/outputs would accept a custom call with a function output.
+    let mut calls: HashMap<String, [usize; 4]> = HashMap::new();
+    let mut reader = StdBufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = reader.read_until(b'\n', &mut line).map_err(|_| {
+            DaemonError::CodexResumeToolHistory("persisted transcript unreadable".into())
+        })?;
+        if count == 0 {
+            break;
+        }
+        let value: Value = serde_json::from_slice(&line).map_err(|_| {
+            if line.ends_with(b"\n") {
+                DaemonError::CodexResumeToolHistory("persisted transcript record malformed".into())
+            } else {
+                DaemonError::CodexResumeTornTail
+            }
+        })?;
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let kind = payload.get("type").and_then(Value::as_str);
+        let item_index = match kind {
+            Some("custom_tool_call") => 0,
+            Some("custom_tool_call_output") => 1,
+            Some("function_call") => 2,
+            Some("function_call_output") => 3,
+            _ => continue,
+        };
+        let call_id = payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DaemonError::CodexResumeToolHistory("tool item missing call_id".into())
+            })?;
+        let entry = calls.entry(call_id.to_string()).or_default();
+        entry[item_index] += 1;
+    }
+    for (call_id, counts) in calls {
+        if matches!(counts, [1, 1, 0, 0] | [0, 0, 1, 1]) {
+            continue;
+        }
+        let call_count = counts[0] + counts[2];
+        let output_count = counts[1] + counts[3];
+        return Err(DaemonError::CodexResumeToolHistory(format!(
+            "call_id={} has {call_count} call(s) and {output_count} output(s) with incompatible tool item kinds; recover from a fresh conversation boundary",
+            bounded_codex_transcript_field(&call_id, 128),
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1864,15 +2040,15 @@ pub(crate) fn parse_codex_model_catalog(raw: &str) -> Result<Vec<(String, String
 /// system-prompt channel. `config.query` is never mutated; this is a pure
 /// function over it, so the stored user event stays clean.
 pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> String {
-    // `system_prompt` has historically not been a Codex CLI channel. Only
-    // forward the daemon's dedicated sandbox instruction; passing arbitrary
-    // caller system prompts here would silently change ordinary Codex launches.
-    let sandbox_custody_instruction = config
-        .system_prompt
-        .as_deref()
-        .filter(|prompt| prompt.starts_with("## RSI sandbox custody (HARD)"));
+    // `system_prompt` has historically not been a Codex CLI channel. Forward
+    // only the daemon's dedicated custody and transport-recovery instructions;
+    // arbitrary caller prompts must not change ordinary Codex launches.
+    let launch_instruction = config.system_prompt.as_deref().filter(|prompt| {
+        prompt.starts_with("## RSI sandbox custody (HARD)")
+            || prompt.starts_with("## Codex transport recovery")
+    });
     if is_resume {
-        match sandbox_custody_instruction {
+        match launch_instruction {
             Some(instruction) => format!("{instruction}\n\n{}", config.query),
             None => config.query.clone(),
         }
@@ -1882,7 +2058,7 @@ pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> Str
             crate::session::preamble::THOUGHTS_COMMIT_POLICY,
             crate::session::preamble::DAEMON_MESSAGE_CONVENTION,
         ];
-        if let Some(instruction) = sandbox_custody_instruction {
+        if let Some(instruction) = launch_instruction {
             parts.push(instruction);
         }
         parts.push(&config.query);
@@ -1907,7 +2083,14 @@ fn validated_codex_reasoning_effort(config: &LaunchConfig) -> Result<Option<&'st
         return Ok(None);
     };
     let effort = codex_reasoning_effort(Some(raw_effort)).ok_or_else(|| {
-        DaemonError::InvalidParam(format!("unsupported Codex reasoning effort '{raw_effort}'"))
+        let model = config
+            .model
+            .as_deref()
+            .map(|model| format!(" for model '{model}'"))
+            .unwrap_or_default();
+        DaemonError::InvalidParam(format!(
+            "unsupported Codex reasoning effort '{raw_effort}'{model}"
+        ))
     })?;
 
     // A missing model deliberately remains compatible with the configured
@@ -1982,6 +2165,10 @@ fn is_codex_usage_limit_error(message: &str) -> bool {
             .strip_prefix(CODEX_USAGE_LIMIT_MESSAGE_PREFIX)
             .and_then(|suffix| suffix.chars().next())
             .is_some_and(char::is_whitespace)
+}
+
+fn is_codex_missing_tool_output_error(message: &str) -> bool {
+    message.contains("Custom tool call output is missing for call id:")
 }
 
 pub(crate) fn map_codex_json_to_stream_event(
@@ -2199,6 +2386,7 @@ fn map_codex_json_to_stream_event_inner(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{:?}", error_obj));
             let usage_limited = classify_cli_usage_limit && is_codex_usage_limit_error(&message);
+            let invalid_tool_history = is_codex_missing_tool_output_error(&message);
             let mut data = serde_json::json!({
                 "error": message,
                 "source": "codex_event",
@@ -2210,6 +2398,14 @@ fn map_codex_json_to_stream_event_inner(
                     .insert(
                         "error_class".to_string(),
                         Value::String(CODEX_USAGE_LIMIT_ERROR_CLASS.to_string()),
+                    );
+            }
+            if invalid_tool_history {
+                data.as_object_mut()
+                    .expect("Codex turn.failed data is an object")
+                    .insert(
+                        "error_class".to_string(),
+                        Value::String(CODEX_TOOL_HISTORY_ERROR_CLASS.to_string()),
                     );
             }
             Some(StreamEvent {
@@ -2244,6 +2440,7 @@ mod tests {
     use super::*;
     use crate::pioneer::PIONEER_DEFAULT_MODEL;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn sandbox_mode_parse_accepts_known_values() {
         assert_eq!(
@@ -2260,6 +2457,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn sandbox_mode_parse_accepts_underscore_aliases() {
         assert_eq!(
@@ -2336,11 +2534,11 @@ mod tests {
     /// Build a CodexClient with a stub binary path — `build_cmd` never spawns,
     /// so the path's existence is irrelevant; only argv is inspected.
     fn codex_client_for_test(rc: Arc<RuntimeConfig>) -> CodexClient {
-        CodexClient {
-            binary_path: PathBuf::from("/usr/bin/true"),
-            agent_mcp_path: PathBuf::from("/usr/bin/true"),
-            runtime_config: rc,
-        }
+        CodexClient::with_paths_for_test(
+            PathBuf::from("/usr/bin/true"),
+            PathBuf::from("/usr/bin/true"),
+            rc,
+        )
     }
 
     /// Pull args out of a `tokio::process::Command` as owned `String`s.
@@ -2365,6 +2563,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn session_launch_injects_only_ephemeral_trusted_agent_mcp_config() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2398,6 +2597,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bedrock_fresh_and_resume_commands_route_to_runtime() {
         let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
@@ -2405,6 +2605,7 @@ mod tests {
             let mut config = launch_config_minimal(resume.clone());
             config.provider = Some(rsi_common::types::SessionProvider::Bedrock);
             config.model = Some("global.openai.gpt-5.6-sol".to_string());
+            config.effort = Some("ultra".to_string());
             let command = client
                 .build_cmd_with_custom_provider(&config, None, None, Some("us-west-1"))
                 .unwrap();
@@ -2419,11 +2620,16 @@ mod tests {
                         .any(|pair| pair[0] == "-c" && pair[1] == *value)
                 );
             }
+            assert!(
+                args.windows(2)
+                    .any(|pair| { pair == ["-c", "model_reasoning_effort=\"ultra\""] })
+            );
             assert_eq!(args.iter().any(|arg| arg == "resume"), resume.is_some());
             assert!(!args.join(" ").contains("bedrock-api-key-"));
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bedrock_launch_passes_key_only_in_child_environment() {
         temp_env::with_vars(
@@ -2450,6 +2656,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_fresh_and_resume_commands_apply_secret_safe_codex_overrides() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2489,6 +2696,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn pioneer_command_preserves_explicit_model_and_requires_resolved_source() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2519,6 +2727,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn build_cmd_injects_rsi_identity_env() {
         use rsi_common::identity;
@@ -2548,6 +2757,7 @@ mod tests {
     /// Issue #25: a designated build scratch is stamped into the subprocess
     /// env as `CARGO_TARGET_DIR`; absent designation leaves the env alone
     /// (non-sandboxed sessions keep the user's own cargo config).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn build_cmd_stamps_cargo_target_dir_only_when_designated() {
         use rsi_common::identity;
@@ -2567,6 +2777,7 @@ mod tests {
         assert_eq!(cmd_env(&cmd, identity::ENV_CARGO_TARGET_DIR), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn codex_and_pioneer_commands_stamp_authenticated_execution_scratch() {
         use crate::sandbox::execution_scratch::SandboxExecutionScratch;
@@ -2610,6 +2821,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn ordinary_codex_and_pioneer_environments_match_pre_slice8_ownership_absence() {
         use rsi_common::identity;
@@ -2630,6 +2842,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn stdin_payload_prepends_nudge_first_turn_only() {
         use crate::session::preamble::{
@@ -2665,6 +2878,7 @@ mod tests {
         assert_eq!(config.query, "do the thing");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn stdin_payload_carries_sandbox_custody_instruction_on_initial_and_resume() {
         let mut config = launch_config_minimal(None);
@@ -2686,6 +2900,7 @@ mod tests {
         assert!(resumed.ends_with("implement the assigned task"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn parse_codex_model_catalog_keeps_visible_models_in_priority_order() {
         let raw = serde_json::json!({
@@ -2728,6 +2943,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn codex_fallback_models_match_installed_visible_catalog() {
         assert_eq!(
@@ -2742,6 +2958,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn prioritize_codex_models_keeps_every_discovered_entry_after_gpt_6() {
         let models = prioritize_codex_models(vec![
@@ -2761,6 +2978,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn parse_codex_model_catalog_uses_abbreviated_display_fallback() {
         let raw = serde_json::json!({
@@ -2777,10 +2995,11 @@ mod tests {
         let models = parse_codex_model_catalog(&raw.to_string()).unwrap();
         assert_eq!(
             models,
-            vec![("gpt-6-astra".to_string(), "GPT-6-Astra".to_string())]
+            vec![("gpt-6-astra".to_string(), "GPT-6 Astra".to_string())]
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_emits_sandbox_arg_from_runtime_config() {
         let rc = runtime_config_with_sandbox_mode("danger-full-access");
@@ -2794,6 +3013,7 @@ mod tests {
         assert_eq!(pair[1], "danger-full-access");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_emits_workspace_write_default() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2804,23 +3024,60 @@ mod tests {
         assert_eq!(pair[1], "workspace-write");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
-    fn launch_cmd_suppresses_sandbox_arg_on_resume() {
-        let rc = runtime_config_with_sandbox_mode("danger-full-access");
-        let client = codex_client_for_test(rc);
-        let cmd = client
-            .build_cmd(&launch_config_minimal(Some("abc-123".to_string())))
-            .unwrap();
-        let args = cmd_args(&cmd);
-        assert!(
-            !args.iter().any(|a| a == "--sandbox"),
-            "resume must NOT pass --sandbox (codex inherits parent session policy)"
-        );
-        // Resume positional args still present.
-        assert!(args.iter().any(|a| a == "resume"));
-        assert!(args.iter().any(|a| a == "abc-123"));
+    fn launch_cmd_overrides_sandbox_mode_on_resume() {
+        for mode in ["read-only", "workspace-write", "danger-full-access"] {
+            let client = codex_client_for_test(runtime_config_with_sandbox_mode(mode));
+            let cmd = client
+                .build_cmd(&launch_config_minimal(Some("abc-123".to_string())))
+                .unwrap_or_else(|error| panic!("resume command for {mode}: {error}"));
+            let args = cmd_args(&cmd);
+            assert!(
+                args.windows(2)
+                    .any(|pair| { pair[0] == "-c" && pair[1] == format!("sandbox_mode={mode:?}") })
+            );
+            assert!(!args.iter().any(|arg| arg == "--sandbox"));
+            assert!(args.iter().any(|arg| arg == "resume"));
+            assert!(args.iter().any(|arg| arg == "abc-123"));
+        }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn launch_cmd_applies_runtime_sandbox_changes_to_resume() {
+        let rc = runtime_config_with_sandbox_mode("danger-full-access");
+        let client = codex_client_for_test(rc.clone());
+        let fresh = cmd_args(
+            &client
+                .build_cmd(&launch_config_minimal(None))
+                .unwrap_or_else(|error| panic!("fresh command: {error}")),
+        );
+        assert!(
+            fresh
+                .windows(2)
+                .any(|pair| { pair[0] == "--sandbox" && pair[1] == "danger-full-access" })
+        );
+
+        let resume = launch_config_minimal(Some("abc-123".to_string()));
+        for mode in ["read-only", "workspace-write", "danger-full-access"] {
+            assert!(
+                rc.update_field("codex_sandbox_mode", &serde_json::json!(mode))
+                    .is_ok()
+            );
+            let args = cmd_args(
+                &client
+                    .build_cmd(&resume)
+                    .unwrap_or_else(|error| panic!("resume command for {mode}: {error}")),
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| { pair[0] == "-c" && pair[1] == format!("sandbox_mode={mode:?}") })
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_reflects_runtime_mutation() {
         // Seed workspace-write, mutate at runtime to read-only, expect build_cmd
@@ -2835,6 +3092,7 @@ mod tests {
         assert_eq!(pair[1], "read-only");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_falls_back_to_workspace_write_on_corrupt_runtime_value() {
         // Directly corrupt the lock to simulate a stale unvalidated value.
@@ -2848,6 +3106,7 @@ mod tests {
         assert_eq!(pair[1], "workspace-write");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_emits_codex_reasoning_effort_config() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2865,6 +3124,7 @@ mod tests {
         assert_eq!(pair[1], "model_reasoning_effort=\"high\"");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_emits_raw_configured_context_window() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -2935,6 +3195,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_uses_codex_effective_project_over_base_layer() {
         let directory = tempfile::tempdir().unwrap();
@@ -2960,6 +3221,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_uses_codex_effective_project_only_layer() {
         let directory = tempfile::tempdir().unwrap();
@@ -2978,6 +3240,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_uses_codex_effective_selected_profile_layer() {
         let directory = tempfile::tempdir().unwrap();
@@ -2998,6 +3261,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_uses_codex_effective_cwd_layer() {
         let directory = tempfile::tempdir().unwrap();
@@ -3017,6 +3281,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_validates_explicit_override_before_probe() {
         let probe_irrelevant_working_dir = Path::new("/definitely/not/a/codex-binary");
@@ -3041,6 +3306,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_rejects_malformed_and_zero_probe_values() {
         let directory = tempfile::tempdir().unwrap();
@@ -3074,6 +3340,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn configured_context_window_probe_failure_is_bounded_and_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
@@ -3098,6 +3365,7 @@ done
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_preserves_max_effort_for_codex() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -3115,6 +3383,7 @@ done
         assert_eq!(pair[1], "model_reasoning_effort=\"max\"");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_validates_known_codex_model_effort_pairs_and_preserves_unknown_models() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -3123,6 +3392,8 @@ done
             ("gpt-6-astra", "low"),
             ("gpt-6-astra", "high"),
             ("gpt-6-astra", "ultra"),
+            ("gpt-6-sol", "ultra"),
+            ("gpt-6-luna", "max"),
         ] {
             let mut config = launch_config_minimal(None);
             config.model = Some(model.to_string());
@@ -3138,7 +3409,7 @@ done
         }
 
         for (model, effort) in [
-            ("gpt-6-astra", "turbo"),
+            ("gpt-6-luna", "ultra"),
             ("gpt-5.5", "max"),
             ("gpt-5.5", "ultra"),
         ] {
@@ -3175,6 +3446,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn launch_cmd_rejects_invalid_codex_reasoning_effort() {
         let rc = runtime_config_with_sandbox_mode("workspace-write");
@@ -3188,6 +3460,7 @@ done
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_completed_ignores_cached_for_turn_metrics() {
         // Codex cached_input_tokens is cumulative provider telemetry, not an
@@ -3224,6 +3497,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_event_msg_token_count_maps_current_window_usage() {
         let value = serde_json::json!({
@@ -3265,6 +3539,7 @@ done
         assert_eq!(usage.cache_read_tokens, Some(84_864));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn transcript_token_count_uses_latest_current_window_usage() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -3297,6 +3572,7 @@ done
         assert_eq!(usage.context_window, Some(258_400));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_completed_cumulative_cache_does_not_become_context() {
         // Regression fixture from real Codex telemetry: adding cached_input_tokens
@@ -3318,6 +3594,7 @@ done
         assert_eq!(extracted.total_input, 201_832);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_completed_no_cached_tokens() {
         // When no cached tokens are reported, input_tokens passes through unchanged.
@@ -3337,6 +3614,7 @@ done
         assert_eq!(usage.get("output_tokens").unwrap(), 2000);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_completed_cached_equals_total() {
         // Edge case: all tokens are cached → non-cached = 0.
@@ -3356,6 +3634,7 @@ done
         assert!(usage.get("cache_read_input_tokens").is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_error_event_becomes_process_error() {
         let value = serde_json::json!({
@@ -3371,6 +3650,7 @@ done
         assert_eq!(event.data.get("terminal"), Some(&Value::Bool(false)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_codex_retry_notices_are_nonterminal_at_every_attempt_count() {
@@ -3391,6 +3671,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_usage_limit_error_receives_closed_classification() {
         let message = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 15th, 2026 1:29 PM.";
@@ -3413,6 +3694,7 @@ done
         assert_eq!(event.data.get("terminal"), Some(&Value::Bool(false)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_usage_limit_near_misses_and_other_error_shapes_remain_unclassified() {
         for message in [
@@ -3459,6 +3741,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_failed_extracts_nested_message() {
         let value = serde_json::json!({
@@ -3472,6 +3755,37 @@ done
         assert_eq!(event.data.get("error").unwrap(), "Quota exceeded.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn fresh_codex_transport_recovery_instruction_reaches_stdin() {
+        let mut config = launch_config_minimal(None);
+        config.system_prompt = Some(
+            "## Codex transport recovery\nInspect the previous turn before repeating actions."
+                .into(),
+        );
+        let payload = codex_stdin_payload(&config, false);
+        assert!(payload.contains("Inspect the previous turn before repeating actions."));
+        assert!(payload.contains(&config.query));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn missing_tool_output_failed_turn_has_durable_error_class_and_call_id() {
+        let call_id = "call_lBOpAdOMk2RedXyoTW4h5052";
+        let value = serde_json::json!({
+            "type": "turn.failed",
+            "error": {"message": format!("Custom tool call output is missing for call id: {call_id}")},
+        });
+        let event = map_codex_json_to_stream_event(&value, &mut None).expect("failed turn event");
+        assert_eq!(event.event_type, "process_error");
+        assert_eq!(
+            event.data["error_class"],
+            serde_json::json!(CODEX_TOOL_HISTORY_ERROR_CLASS)
+        );
+        assert!(event.data["error"].as_str().unwrap().contains(call_id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_item_completed_error_subtype_becomes_process_error() {
         let value = serde_json::json!({
@@ -3504,6 +3818,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_command_execution_result_sets_error_flag_from_integer_exit_code() {
         for (exit_code, expected_error) in
@@ -3530,6 +3845,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_unknown_event_type_returns_none() {
         let value = serde_json::json!({
@@ -3540,6 +3856,7 @@ done
         assert!(map_codex_json_to_stream_event(&value, &mut thread_id).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_turn_started_returns_none() {
         let value = serde_json::json!({ "type": "turn.started" });
@@ -3547,6 +3864,7 @@ done
         assert!(map_codex_json_to_stream_event(&value, &mut thread_id).is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_latest_codex_turn_snapshot_maps_only_current_custom_tool_pair() {
         let values = vec![
@@ -3625,6 +3943,146 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn interrupted_codex_tool_result_blocks_resume_until_its_real_output_is_persisted() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().expect("transcript directory");
+        let path = directory.path().join("rollout-interrupted.jsonl");
+        let mut transcript = File::create(&path).expect("create transcript");
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "call_interrupted_mutation",
+                    "name": "exec",
+                    "input": "tools.apply_patch(...)"
+                }
+            })
+        )
+        .expect("persist call before interruption");
+        transcript.flush().expect("flush call");
+
+        // A new daemon process has no in-memory result. It must retain the
+        // exact call identity and stop before another Codex resume attempt.
+        let error = validate_codex_tool_history_file(&path).expect_err("missing output");
+        assert!(matches!(error, DaemonError::CodexResumeToolHistory(_)));
+        assert!(error.to_string().contains("call_interrupted_mutation"));
+        assert!(error.to_string().contains("0 output(s)"));
+
+        // A late tool process may still append its actual result. A second
+        // preflight can then resume without inventing the mutation's outcome.
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_interrupted_mutation",
+                    "output": "patch applied"
+                }
+            })
+        )
+        .expect("persist late output");
+        transcript.flush().expect("flush output");
+        validate_codex_tool_history_file(&path).expect("matched call and output");
+
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_interrupted_mutation",
+                    "output": "duplicate result"
+                }
+            })
+        )
+        .expect("persist duplicate output");
+        transcript.flush().expect("flush duplicate");
+        let error = validate_codex_tool_history_file(&path).expect_err("duplicate output");
+        assert!(error.to_string().contains("2 output(s)"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_resume_distinguishes_torn_final_record_from_malformed_history() {
+        let directory = tempfile::tempdir().expect("transcript directory");
+        let path = directory.path().join("rollout-torn.jsonl");
+        let complete = serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}});
+
+        std::fs::write(&path, format!("{complete}\n{{\"type\":")).expect("torn rollout");
+        let original = std::fs::read(&path).expect("original rollout");
+        let error = validate_codex_tool_history_file(&path).expect_err("torn tail refused");
+        assert!(matches!(error, DaemonError::CodexResumeTornTail));
+        assert_eq!(
+            crate::model_control::classify_error_class(&error),
+            "codex_resume_rollout_torn_tail"
+        );
+        assert_eq!(std::fs::read(&path).expect("rollout retained"), original);
+
+        std::fs::write(&path, format!("{complete}\n{{\"type\":\n{complete}\n"))
+            .expect("malformed interior rollout");
+        let error = validate_codex_tool_history_file(&path).expect_err("interior refused");
+        assert!(matches!(error, DaemonError::CodexResumeToolHistory(_)));
+
+        // A complete final record does not need a trailing newline.
+        std::fs::write(&path, format!("{complete}\n{complete}")).expect("complete rollout");
+        validate_codex_tool_history_file(&path).expect("complete final record accepted");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_function_call_history_requires_matching_output() {
+        let directory = tempfile::tempdir().expect("transcript directory");
+        let path = directory.path().join("rollout-function.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "call_id": "call_function"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "function_call_output", "call_id": "other_call", "output": "ok"}
+                })
+            ),
+        )
+        .expect("persist mismatched history");
+        let error = validate_codex_tool_history_file(&path).expect_err("mismatched output");
+        assert!(matches!(error, DaemonError::CodexResumeToolHistory(_)));
+        assert!(
+            error.to_string().contains("0 output(s)") || error.to_string().contains("0 call(s)")
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "call_id": "call_function"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call_output", "call_id": "call_function", "output": "ok"}
+                })
+            ),
+        )
+        .expect("persist wrong output kind");
+        let error = validate_codex_tool_history_file(&path).expect_err("wrong output kind");
+        assert!(error.to_string().contains("incompatible tool item kinds"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_transcript_does_not_duplicate_successful_exec_json_tool() {
         let values = vec![
@@ -3663,6 +4121,7 @@ done
         assert!(snapshot.failure_evidence.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_failed_typed_tool_stderr_is_suppressed_one_for_one() {
         let failure = "resources/read failed: unknown MCP server 'filesystem'";
@@ -3708,6 +4167,7 @@ done
         assert_eq!(remaining, vec![record]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_typed_failure_evidence_is_scoped_to_latest_turn() {
         let failure = "resources/read failed: unknown MCP server 'filesystem'";
@@ -3750,6 +4210,7 @@ done
         assert!(snapshot.failure_evidence.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_transcript_watermark_excludes_stale_completed_turn() {
         use std::io::Write;
@@ -3819,6 +4280,7 @@ done
         assert!(current.turn_complete);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_transcript_watermark_mismatch_refuses_correlation() {
         use std::io::Write;
@@ -3912,6 +4374,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_codex_resume_without_watermark_refuses_transcript_correlation() {
         let snapshot = read_latest_codex_turn_snapshot_with_retry(
@@ -3923,6 +4386,7 @@ done
         assert!(snapshot.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_unpaired_typed_router_stderr_stays_visible() {
         let record = "2026-08-26T19:38:29.060758Z ERROR codex_core::tools::router: error=resources/read failed: unknown MCP server 'filesystem'".to_string();
@@ -3933,6 +4397,7 @@ done
         assert_eq!(remaining, vec![record]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_multiline_apply_patch_stderr_requires_exact_paired_output() {
         let payload = "apply_patch verification failed: Failed to find expected lines in /tmp/a.rs:\n    old line";
@@ -3956,6 +4421,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn summarize_codex_stderr_records_compacts_consecutive_timestamped_retries() {
         let records = vec![
@@ -3980,6 +4446,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_apply_patch_stderr_with_different_context_stays_visible() {
         let mut correlation = CodexStderrCorrelation {
@@ -3995,6 +4462,7 @@ done
         assert_eq!(remaining, vec![record]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_batched_write_stdin_stderr_is_consumed_one_for_one() {
         let first = "write_stdin failed: Unknown process id 7";
@@ -4019,6 +4487,7 @@ done
         assert_eq!(remaining, vec![excess_record]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_router_stderr_without_matching_tool_family_stays_visible() {
         let record = "2026-08-20T01:02:03.000Z ERROR codex_core::tools::router: error=write_stdin failed: Unknown process id 7".to_string();
@@ -4034,6 +4503,7 @@ done
         assert_eq!(remaining, vec![record]);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_storage_full_classifier_requires_complete_recorder_signature() {
         let exact = "2026-08-19T21:48:22.123456Z ERROR codex_rollout::recorder: failed to persist rollout: No space left on device (os error 28); error_kind=StorageFull; raw_os_error=Some(28)";
@@ -4054,6 +4524,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_storage_full_companion_requires_exact_error_component() {
         let exact = "2026-08-19T21:48:22.123456Z ERROR codex_core::session: failed to record rollout items: thread-store internal error: No space left on device (os error 28)";
@@ -4072,6 +4543,7 @@ done
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_storage_full_state_emits_once_and_removes_companions() {
         let companion = "2026-08-19T21:48:22.123456Z ERROR codex_core::session: failed to record rollout items: thread-store internal error: No space left on device (os error 28)";
@@ -4099,6 +4571,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_transcript_fields_are_utf8_safe_and_bounded() {
         let input = "é".repeat(CODEX_TRANSCRIPT_FIELD_MAX_BYTES);
@@ -4109,6 +4582,7 @@ done
         assert!(bounded.len() <= CODEX_TRANSCRIPT_FIELD_MAX_BYTES + 32);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_suppresses_stdin_message() {
         let line = "Reading prompt from stdin...";
@@ -4118,6 +4592,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_suppresses_project_config_warning() {
         let line = "Ignored unsupported project-local config keys in /home/jakedevar/rsi/.codex/config.toml: notify.";
@@ -4127,6 +4602,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_suppresses_collab_deprecation_warning() {
         let line = "`[features].collab` is deprecated. Use `[features].multi_agent` instead.";
@@ -4136,12 +4612,14 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_keeps_real_errors_visible() {
         let line = "Quota exceeded. Check your plan and billing details.";
         assert_eq!(codex_stderr_suppression_reason(line), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_suppresses_nonfatal_rollout_recorder_diagnostic() {
         // Issue #67 benchmark session 6c3ebb3a emitted this exact shape as an
@@ -4161,6 +4639,7 @@ done
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_keeps_fatal_and_unrelated_rollout_records_visible() {
         // Issue #68 storage exhaustion must stay visible and terminal even
@@ -4192,5 +4671,192 @@ done
                 "unrelated recorder stderr must remain visible: {unrelated}"
             );
         }
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn empty_env_vault(root: &std::path::Path) -> crate::vault::VaultHandle {
+        crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+            .dir(root.join("vault"))
+            .env(|_| None)
+            .open()
+            .unwrap()
+    }
+
+    fn assert_shell_exclude(command: &Command, var: &str) {
+        let args = cmd_args(command);
+        let exclude = crate::vault::env_scrub::codex_shell_exclude_arg(var);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == exclude),
+            "missing Codex shell exclude for {var}: {args:?}"
+        );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn plain_codex_launch_carries_no_provider_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = empty_env_vault(root.path());
+        vault
+            .set(crate::vault::Slot::Openai, "sk-test-codex-openai-0001")
+            .unwrap();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let mut config = launch_config_minimal(None);
+        config.provider = Some(rsi_common::types::SessionProvider::Codex);
+        let mut command = client.build_cmd_with_vault(&config, &vault).unwrap();
+        crate::claude::stamp_execution_environment(&mut command, &config, uuid::Uuid::new_v4())
+            .unwrap();
+        crate::vault::env_scrub::tests::assert_only_injected(&command, None);
+        crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&command, None);
+        assert!(
+            !cmd_args(&command)
+                .iter()
+                .any(|arg| arg.starts_with("shell_environment_policy"))
+        );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_openrouter_and_pioneer_inject_only_their_vault_credential_and_exclude() {
+        use crate::vault::Slot;
+        let root = tempfile::tempdir().unwrap();
+        let vault = empty_env_vault(root.path());
+        vault
+            .set(Slot::Openrouter, "sk-test-codex-openrouter-0002")
+            .unwrap();
+        vault
+            .set(Slot::Pioneer, "sk-test-codex-pioneer-0003")
+            .unwrap();
+        vault
+            .set(Slot::Anthropic, "sk-test-codex-anthropic-0004")
+            .unwrap();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        for (provider, var, secret) in [
+            (
+                rsi_common::types::SessionProvider::OpenRouter,
+                crate::openrouter::OPENROUTER_ENV,
+                "sk-test-codex-openrouter-0002",
+            ),
+            (
+                rsi_common::types::SessionProvider::Pioneer,
+                crate::pioneer::PIONEER_PRIMARY_ENV,
+                "sk-test-codex-pioneer-0003",
+            ),
+        ] {
+            let mut config = launch_config_minimal(None);
+            config.provider = Some(provider);
+            let mut command = client.build_cmd_with_vault(&config, &vault).unwrap();
+            // `launch()` stamps a second time with the real invocation id;
+            // the injected route credential must survive that scrub.
+            crate::claude::stamp_execution_environment(&mut command, &config, uuid::Uuid::new_v4())
+                .unwrap();
+            crate::vault::env_scrub::tests::assert_only_injected(&command, Some(var));
+            crate::vault::env_scrub::tests::assert_child_env_suppresses_keys(&command, Some(var));
+            assert_eq!(cmd_env(&command, var).as_deref(), Some(secret));
+            assert_shell_exclude(&command, var);
+            assert!(!cmd_args(&command).join(" ").contains(secret));
+        }
+        // Each injection was reported as residual exposure R1.
+        for slot in [Slot::Openrouter, Slot::Pioneer] {
+            assert!(
+                vault.metadata(slot).last_cli_exposure_at.is_some(),
+                "{slot}"
+            );
+        }
+        assert!(
+            vault
+                .metadata(Slot::Anthropic)
+                .last_cli_exposure_at
+                .is_none()
+        );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_bedrock_injects_only_bedrock_token_and_exclude() {
+        temp_env::with_vars([("AWS_REGION", Some("us-west-1"))], || {
+            let root = tempfile::tempdir().unwrap();
+            let vault = empty_env_vault(root.path());
+            vault
+                .set(
+                    crate::vault::Slot::Bedrock,
+                    "bedrock-api-key-test-vault-0005",
+                )
+                .unwrap();
+            let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+            let mut config = launch_config_minimal(None);
+            config.provider = Some(rsi_common::types::SessionProvider::Bedrock);
+            let mut command = client.build_cmd_with_vault(&config, &vault).unwrap();
+            crate::claude::stamp_execution_environment(&mut command, &config, uuid::Uuid::new_v4())
+                .unwrap();
+            crate::vault::env_scrub::tests::assert_only_injected(
+                &command,
+                Some(bedrock::BEDROCK_ENV),
+            );
+            assert_eq!(
+                cmd_env(&command, bedrock::BEDROCK_ENV).as_deref(),
+                Some("bedrock-api-key-test-vault-0005")
+            );
+            assert_shell_exclude(&command, bedrock::BEDROCK_ENV);
+        });
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn cleared_openrouter_refuses_codex_launch_even_with_env_key() {
+        let root = tempfile::tempdir().unwrap();
+        let vault =
+            crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+                .dir(root.path().join("vault"))
+                .env(|name| {
+                    (name == crate::openrouter::OPENROUTER_ENV)
+                        .then(|| "sk-test-env-openrouter-0006".to_string())
+                })
+                .open()
+                .unwrap();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let mut config = launch_config_minimal(None);
+        config.provider = Some(rsi_common::types::SessionProvider::OpenRouter);
+        let command = client.build_cmd_with_vault(&config, &vault).unwrap();
+        assert_eq!(
+            cmd_env(&command, crate::openrouter::OPENROUTER_ENV).as_deref(),
+            Some("sk-test-env-openrouter-0006")
+        );
+        vault.clear(crate::vault::Slot::Openrouter).unwrap();
+        let error = client.build_cmd_with_vault(&config, &vault).unwrap_err();
+        assert!(error.to_string().contains("not configured"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn launch_slot_maps_codex_routes_and_harness_models() {
+        use crate::vault::{Slot, launch_slot};
+        use rsi_common::types::SessionProvider;
+        let mut config = launch_config_minimal(None);
+        assert_eq!(
+            launch_slot(SessionProvider::OpenRouter, &config),
+            Some(Slot::Openrouter)
+        );
+        assert_eq!(
+            launch_slot(SessionProvider::Bedrock, &config),
+            Some(Slot::Bedrock)
+        );
+        assert_eq!(
+            launch_slot(SessionProvider::Pioneer, &config),
+            Some(Slot::Pioneer)
+        );
+        assert_eq!(launch_slot(SessionProvider::Codex, &config), None);
+        assert_eq!(launch_slot(SessionProvider::Claude, &config), None);
+        config.model = Some("gpt-5.2".into());
+        assert_eq!(
+            launch_slot(SessionProvider::Harness, &config),
+            Some(Slot::Openai)
+        );
+        config.openai_api_key = Some("sk-test-explicit".into());
+        assert_eq!(launch_slot(SessionProvider::Harness, &config), None);
     }
 }

@@ -51,6 +51,7 @@ pub fn compute_harness_version_hash(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn deterministic_same_inputs_produce_same_hash() {
         let a = compute_harness_version_hash(Some("prompt"), "query", None);
@@ -58,6 +59,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn different_prompts_produce_different_hashes() {
         let a = compute_harness_version_hash(Some("prompt_a"), "query", None);
@@ -65,6 +67,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn different_queries_produce_different_hashes() {
         let a = compute_harness_version_hash(Some("prompt"), "query_a", None);
@@ -72,6 +75,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn none_prompt_differs_from_empty_prompt() {
         // Both should produce valid digests, and they should be identical
@@ -82,6 +86,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn separator_prevents_boundary_collision() {
         // "ab" + "c" must differ from "a" + "bc" thanks to the 0x00 separator.
@@ -90,6 +95,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn hash_is_lowercase_hex_64_chars() {
         let hash = compute_harness_version_hash(Some("prompt"), "query", None);
@@ -100,6 +106,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn different_kinds_produce_different_hashes() {
         // RSI-012: two kinds with identical (system_prompt, query) must hash
@@ -133,6 +140,7 @@ mod tests {
         assert_ne!(refactor_hash, research_hash);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn none_kind_matches_legacy_behavior() {
         // The pre-RSI-012 hash contract — kind=None — must remain stable

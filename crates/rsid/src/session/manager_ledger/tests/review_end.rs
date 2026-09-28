@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
 
 use super::*;
+use rsi_common::agent_coordination::AgentContinueChildRequestV1;
 
 /// Bind the fixture invocation to the review's allocation action exactly as a
 /// daemon-launched reviewer invocation is bound.
@@ -76,6 +77,7 @@ async fn end_bound_review(
     (assignment_id, changed, state, code)
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_normal_final_without_receipt_records_final_without_receipt() {
     let f = fixture().await;
@@ -97,6 +99,7 @@ async fn review_normal_final_without_receipt_records_final_without_receipt() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_restart_interruption_reserves_infra_successor() {
     let f = fixture().await;
@@ -115,6 +118,7 @@ async fn review_restart_interruption_reserves_infra_successor() {
     assert_eq!(code, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_provider_failure_reserves_infra_successor() {
     let f = fixture().await;
@@ -133,6 +137,7 @@ async fn review_provider_failure_reserves_infra_successor() {
     assert_eq!(code, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_end_under_unbound_invocation_cannot_settle_assignment() {
     // A terminal invocation not bound to this assignment's allocation action is
@@ -153,6 +158,7 @@ async fn review_end_under_unbound_invocation_cannot_settle_assignment() {
     assert_eq!(code, None);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_with_submitted_receipt_keeps_success_path_at_terminal() {
     let f = fixture().await;
@@ -202,6 +208,7 @@ async fn review_with_submitted_receipt_keeps_success_path_at_terminal() {
     assert_eq!((state.as_str(), verdict.as_str()), ("submitted", "blocked"));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_final_with_tool_denials_falls_back_to_missing_receipt() {
     let f = fixture().await;
@@ -223,6 +230,7 @@ async fn review_final_with_tool_denials_falls_back_to_missing_receipt() {
     );
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn review_over_explicit_budget_records_budget_exceeded_end_reason() {
     let f = fixture().await;
@@ -242,4 +250,366 @@ async fn review_over_explicit_budget_records_budget_exceeded_end_reason() {
         code.as_deref(),
         Some("manager_review_receipt_missing_budget_exceeded")
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn archived_reviewer_without_receipt_fails_once_with_typed_disposition() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "archived-reviewer").await;
+    let store = f.handle.store.lock().await;
+    store
+        .update_session_status(f.reviewer, SessionStatus::Archived)
+        .unwrap();
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    let (state, code): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state,failure_code FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(code, "manager_review_reviewer_archived");
+    assert!(!store.refresh_manager_review_assignment(assignment).unwrap());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn lead_and_operator_continue_preserve_active_reviewer_turn() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "lead-continue-refusal").await;
+    let cursor = f
+        .handle
+        .store
+        .lock()
+        .await
+        .agent_continuation_cursor(f.reviewer)
+        .unwrap();
+    let request = AgentContinueChildRequestV1 {
+        target_session_id: f.reviewer,
+        query: "replace review verdict".into(),
+        expected_tip_session_id: cursor.tip_session_id,
+        expected_event_sequence: cursor.event_sequence,
+        expected_custody_generation: cursor.custody_generation,
+        idempotency_key: None,
+    };
+    let error = f
+        .sessions
+        .agent_continue_child(f.source, request)
+        .await
+        .unwrap_err();
+    let crate::error::DaemonError::StructuredRpc { message, .. } = error else {
+        panic!("review continuation refusal must be structured");
+    };
+    assert_eq!(
+        message,
+        "agent_continue_failed:manager_review_reviewer_continuation_owned"
+    );
+    let operator_error = f
+        .sessions
+        .continue_session_operator(f.reviewer, "replace review verdict".into())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        operator_error,
+        crate::error::DaemonError::PolicyDenied(ref reason)
+            if reason == "manager_review_reviewer_continuation_owned"
+    ));
+    let store = f.handle.store.lock().await;
+    let (state, invocation): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state,reviewer_invocation_id FROM manager_review_assignments
+              WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "active");
+    assert_eq!(invocation, f.invocation.to_string());
+    assert_eq!(
+        store.get_session(f.reviewer).unwrap().unwrap().status,
+        SessionStatus::Running
+    );
+}
+
+/// Exercise the installed V130 journal and review forward trigger together.
+fn stage_restart_review_successor(
+    store: &Store,
+    f: &Fixture,
+    assignment: Uuid,
+    journal_invocation: Uuid,
+    journal_generation: i64,
+) -> Uuid {
+    bind_review_invocation(store, f, assignment);
+    let custody = store.live_custody_for_session(f.reviewer).unwrap();
+    let next = Uuid::new_v4();
+    let intent = Uuid::new_v4();
+    let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "UPDATE model_invocations SET status='failed',error_class='restart_reconciled_interrupted',
+                    completed_at=?2 WHERE id=?1",
+            params![f.invocation.to_string(), stamp],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO model_invocations(
+                id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                provider,model,trigger_source,session_id,project_id,parent_invocation_id,dedup_key,
+                policy_snapshot_json,usage_confidence,created_at)
+             VALUES(?1,'session.continue.resume','session_lifecycle','foreground',
+                'paid_capable','admitted','running','Claude','test',
+                'daemon_restart',?2,?3,?4,?5,'{}','unavailable',?6)",
+            params![
+                next.to_string(),
+                f.reviewer.to_string(),
+                store
+                    .get_session(f.reviewer)
+                    .unwrap()
+                    .unwrap()
+                    .project_id
+                    .unwrap()
+                    .to_string(),
+                f.invocation.to_string(),
+                format!("daemon.restart:{intent}"),
+                stamp
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET model_invocation_id=?2 WHERE id=?1",
+            params![f.reviewer.to_string(), next.to_string()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO daemon_restart_intents
+                (id,session_id,invocation_id,custody_id,custody_generation,
+                 boot_id,continuation_invocation_id,state,outcome,created_at,updated_at,delivered_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'delivered','restart_reconciled_interrupted',?8,?8,?8)",
+            params![
+                intent.to_string(),
+                f.reviewer.to_string(),
+                journal_invocation.to_string(),
+                custody.custody_id.to_string(),
+                journal_generation,
+                Uuid::new_v4().to_string(),
+                next.to_string(),
+                stamp,
+            ],
+        )
+        .unwrap();
+    next
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn active_review_claims_exact_restart_owner_before_generic_recovery() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "review-restart-owner").await;
+    let store = f.handle.store.lock().await;
+    bind_review_invocation(&store, &f, assignment);
+    let boot = Uuid::new_v4();
+    assert!(store.record_restart_intent(f.reviewer, boot).unwrap());
+    store.mark_restart_interrupt_sent(f.reviewer, boot).unwrap();
+    assert_eq!(store.prepare_restart_intents_for_restore().unwrap(), 1);
+    store
+        .conn
+        .execute(
+            "UPDATE model_invocations SET status='failed',error_class='restart_reconciled_interrupted' WHERE id=?1",
+            [f.invocation.to_string()],
+        )
+        .unwrap();
+    assert!(store.next_restart_intent(None).unwrap().is_none());
+    let intent = store.next_review_restart_intent(None).unwrap().unwrap();
+    assert_eq!(
+        (intent.session_id, intent.invocation_id),
+        (f.reviewer, f.invocation)
+    );
+    assert!(
+        store
+            .claim_review_restart_intent(&intent, Uuid::new_v4())
+            .unwrap()
+    );
+    assert!(store.next_review_restart_intent(None).unwrap().is_some());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn exact_restart_origin_rebinds_active_review_and_accepts_reviewer_receipt() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "restart-rebind").await;
+    let store = f.handle.store.lock().await;
+    let generation = store
+        .live_custody_for_session(f.reviewer)
+        .unwrap()
+        .generation as i64;
+    let next = stage_restart_review_successor(&store, &f, assignment, f.invocation, generation);
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    let bound: String = store
+        .conn
+        .query_row(
+            "SELECT reviewer_invocation_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound, next.to_string());
+    drop(store);
+    let receipt = f
+        .handle
+        .agent_submit_review_receipt(
+            f.reviewer,
+            AgentSubmitReviewReceiptRequestV1 {
+                assignment_id: assignment,
+                verdict: ManagerReviewVerdictV1::Blocked,
+                findings: vec![],
+                idempotency_key: "restart-rebound-receipt".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.assignment_id, assignment);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn rebound_reviewer_final_without_receipt_settles_typed() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "rebound-final").await;
+    let store = f.handle.store.lock().await;
+    let generation = store
+        .live_custody_for_session(f.reviewer)
+        .unwrap()
+        .generation as i64;
+    let next = stage_restart_review_successor(&store, &f, assignment, f.invocation, generation);
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    store
+        .update_session_status(f.reviewer, SessionStatus::Completed)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE model_invocations SET status='completed',completed_at=?2 WHERE id=?1",
+            params![
+                next.to_string(),
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )
+        .unwrap();
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    let (state, code): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state,failure_code FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(code, "manager_review_receipt_missing_final_without_receipt");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn forged_restart_intent_cannot_rebind_review() {
+    for wrong in ["invocation", "generation", "completed", "parent", "outcome"] {
+        let f = fixture().await;
+        let assignment = request_and_activate_db_review(&f, wrong).await;
+        let store = f.handle.store.lock().await;
+        let generation = store
+            .live_custody_for_session(f.reviewer)
+            .unwrap()
+            .generation as i64;
+        let old = if wrong == "invocation" {
+            Uuid::new_v4()
+        } else {
+            f.invocation
+        };
+        if wrong == "invocation" {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO model_invocations
+                     (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                      trigger_source,session_id,created_at)
+                     VALUES(?1,'session.launch','session','foreground','paid','admitted','failed',
+                            'launch_session',?2,?3)",
+                    params![
+                        old.to_string(),
+                        f.reviewer.to_string(),
+                        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        }
+        let next = stage_restart_review_successor(
+            &store,
+            &f,
+            assignment,
+            old,
+            generation + i64::from(wrong == "generation"),
+        );
+        if wrong == "completed" {
+            store
+                .conn
+                .execute(
+                    "UPDATE model_invocations SET status='completed',error_class=NULL
+                      WHERE id=?1",
+                    [f.invocation.to_string()],
+                )
+                .unwrap();
+        }
+        if wrong == "parent" {
+            store
+                .conn
+                .execute(
+                    "UPDATE model_invocations SET parent_invocation_id=NULL WHERE id=?1",
+                    [next.to_string()],
+                )
+                .unwrap();
+        }
+        if wrong == "outcome" {
+            store
+                .conn
+                .execute(
+                    "UPDATE daemon_restart_intents SET outcome='not_needed' WHERE continuation_invocation_id=?1",
+                    [next.to_string()],
+                )
+                .unwrap();
+        }
+        if matches!(wrong, "parent" | "outcome") {
+            let attempted = store.conn.execute(
+                "UPDATE manager_review_assignments
+                    SET reviewer_invocation_id=?2,row_version=row_version+1,updated_at=?3
+                  WHERE assignment_id=?1",
+                params![
+                    assignment.to_string(),
+                    next.to_string(),
+                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                ],
+            );
+            assert!(attempted.is_err(), "V130 trigger admitted {wrong} origin");
+        }
+        assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+        let (state, code): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT state,failure_code FROM manager_review_assignments WHERE assignment_id=?1",
+                [assignment.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert_eq!(code, "manager_review_unproven_continuation");
+    }
 }

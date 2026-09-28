@@ -165,6 +165,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_disabled() {
         let mut settings = default_settings();
@@ -172,6 +173,7 @@ mod tests {
         assert!(!should_run_for_window(100_000, 200_000, &settings, None, 0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_zero_tokens() {
         assert!(!should_run_for_window(
@@ -183,6 +185,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_below_threshold() {
         // context_window=200000, reserve=20000, soft=4000 → threshold = 176000
@@ -195,6 +198,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_at_threshold() {
         // threshold = 200000 - 20000 - 4000 = 176000
@@ -207,6 +211,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_above_threshold() {
         assert!(should_run_for_window(
@@ -218,6 +223,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_double_flush_guard() {
         // Already flushed at compaction count 2
@@ -230,6 +236,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_different_compaction_count() {
         // Flushed at count 1, now at count 2 → should flush again
@@ -242,6 +249,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_no_previous_flush() {
         assert!(should_run_for_window(
@@ -253,6 +261,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_zero_soft_threshold() {
         let mut settings = default_settings();
@@ -260,6 +269,7 @@ mod tests {
         assert!(!should_run_for_window(190_000, 200_000, &settings, None, 0));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_flush_large_context_window() {
         // 1M context window
@@ -277,6 +287,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_format_flush_prompt_replaces_date() {
         let result = format_flush_prompt(MEMORY_FLUSH_PROMPT);
@@ -285,6 +296,7 @@ mod tests {
         assert!(!result.contains("YYYY-MM-DD"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[test]
     fn test_format_flush_prompt_no_placeholder() {
         let input = "No date placeholder here";
@@ -296,6 +308,7 @@ mod tests {
     // StdinInjector tests
     // -------------------------------------------------------------------------
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_claude_stdin_injection() {
         let mut child = tokio::process::Command::new("cat")
@@ -311,6 +324,7 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-02"))]
     #[tokio::test]
     async fn test_noop_stdin_injector() {
         let injector = NoopStdinInjector;

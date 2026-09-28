@@ -199,11 +199,14 @@ types. It has only two outcomes:
 There is deliberately no `Eligible`, `Authorized`, proof token, boolean
 override, destructive callback, or unchecked constructor. The observer reads
 only the in-memory and durable ownership witnesses needed to reject shared or
-drifting rows. A complete, exclusively owned worktree ends at
-`missing_independently_verified_proof` before production classification invokes
-Git, traverses the worktree, or runs configured Git helpers. More detailed Git
-identity diagnostics remain isolated test machinery and cannot authorize a
-lifecycle mutation.
+drifting rows. A complete, exclusively owned worktree is retained before
+production classification invokes Git, traverses the worktree, or runs
+configured Git helpers. The archive/delete error identifies the retained
+sandbox and directs the operator to **Settings → Daemon Features → Source
+worktree settlement** for its zero-write audit. That audit reports the actual
+dirty, identity, ownership, and integration condition without granting a
+lifecycle mutation. More detailed Git identity diagnostics remain isolated test
+machinery and cannot authorize a lifecycle mutation.
 
 Explicit archive, delete, purge, and `mark_pending_archive(true)` return a
 stable policy-denied error for a real sandbox. The check happens before process
@@ -334,7 +337,7 @@ See `docs/keybindings.md` for the full overlay key reference.
 | `git worktree add` non-zero exit | `DaemonError::Process(stderr)` | Same — fail-closed, no Session row |
 | `canonicalize_non_strict` rejects path | `DaemonError::InvalidParam` | Same |
 | Sandbox root already exists | `DaemonError::InvalidParam("sandbox root already exists at '...' (possible orphan)")` | Same |
-| Real sandbox archive/delete/purge | `DaemonError::PolicyDenied` | Returned before mutation with a stable `sandbox cleanup blocked: <reason>` detail |
+| Real sandbox archive/delete/purge | `DaemonError::PolicyDenied` | Returned before mutation with an actionable retained-sandbox detail; use the zero-write Source worktree settlement audit to inspect dirty, identity, ownership, and integration state |
 | `mark_pending_archive(true)` for a real sandbox | `DaemonError::PolicyDenied` | In-memory and durable pending markers remain unchanged |
 | Missing/unreadable/inconsistent row | blocked classification | No fail-open no-sandbox default and no path-only fallback |
 | Launch abort after allocation | structured retained warning | Allocation remains available for recovery |

@@ -127,6 +127,25 @@ fn register_rsi_control_tools(
         registry.register(spec, handler);
     }
 
+    // Scoped agent topology tools (#633): the shared guarded service binds
+    // authority to `caller`, exactly like the `AgentTopology*` RPC verbs.
+    for verb in crate::session::topology_agent_verbs::TOPOLOGY_AGENT_VERBS {
+        let descriptor = verb.descriptor();
+        let spec = ToolSpec {
+            name: rsi_control::topology_tool_name(verb).to_string(),
+            description: descriptor.description.to_string(),
+            parameters: descriptor.parameters(),
+        };
+        let control = control.clone();
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                rsi_control::execute_topology_tool(&control, caller, verb, args).await
+            })
+        });
+        registry.register(spec, handler);
+    }
+
     // strong master baton reservation
     {
         let control = control.clone();
@@ -551,6 +570,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn d05_program_run_rpcs_are_absent_from_native_tool_registry() {
         let registry = ToolRegistry::new();
@@ -572,6 +592,7 @@ mod tests {
     }
     use serde_json::json;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn test_registry_register_and_execute() {
         let mut registry = ToolRegistry::new();
@@ -590,6 +611,7 @@ mod tests {
         assert_eq!(result["input"], "hello");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_registry_tool_specs() {
         let mut registry = ToolRegistry::new();
@@ -617,6 +639,7 @@ mod tests {
         assert_eq!(specs.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn test_registry_unknown_tool_returns_error() {
         let registry = ToolRegistry::new();
@@ -626,6 +649,7 @@ mod tests {
         assert!(err.contains("Unknown tool"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn codex_app_server_registers_argument_free_program_guard() {
         let caller = uuid::Uuid::new_v4();
@@ -661,6 +685,7 @@ mod tests {
         assert!(routed.to_string().to_lowercase().contains("not found"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn codex_app_server_agent_tool_schemas_match_the_common_catalog() {
         use rsi_common::agent_control_schema::NativeAgentControlToolV1;
@@ -706,6 +731,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn manager_codex_tools_bind_caller_and_redact_malformed_args() {
         use crate::session::harness::tools::rsi_control::ManagerControlToolKind;
@@ -729,7 +755,7 @@ mod tests {
             Some(test_control_handle()),
             Some(uuid::Uuid::new_v4()),
         );
-        assert_eq!(registry.len(), 28);
+        assert_eq!(registry.len(), 34);
         for kind in ManagerControlToolKind::ALL {
             let reference = uuid::Uuid::new_v4();
             let mut args = match kind {
@@ -771,6 +797,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn agent_issue_codex_parser_and_authority_failures_use_safe_envelopes() {
         use rsi_common::rpc::{
@@ -869,6 +896,7 @@ mod tests {
         assert_eq!(envelope.validation, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_rsi_memory_search_tool_spec_json_schema() {
         // Verify the spec would have correct JSON schema if memory was available
@@ -902,6 +930,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     #[allow(clippy::unwrap_used)]
     fn d04_codex_app_server_create_issue_schema_has_no_linkage_or_authority_fields() {

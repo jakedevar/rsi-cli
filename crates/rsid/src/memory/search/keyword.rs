@@ -180,6 +180,7 @@ mod tests {
 
     // --- Pure function tests (build_fts_query) ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_basic() {
         assert_eq!(
@@ -188,16 +189,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_empty() {
         assert_eq!(build_fts_query(""), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_only_punctuation() {
         assert_eq!(build_fts_query("!@#$%"), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_quotes_stripped() {
         assert_eq!(
@@ -206,6 +210,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_fts_operators_neutralized() {
         assert_eq!(
@@ -214,6 +219,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_column_filter_neutralized() {
         assert_eq!(
@@ -222,6 +228,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_near_operator_neutralized() {
         assert_eq!(
@@ -230,11 +237,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_single_word() {
         assert_eq!(build_fts_query("rust"), Some(r#""rust""#.to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_lowercased() {
         assert_eq!(
@@ -243,6 +252,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_build_fts_query_unicode() {
         let result = build_fts_query("uber design").unwrap();
@@ -252,33 +262,39 @@ mod tests {
 
     // --- Pure function tests (bm25_rank_to_score) ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_zero() {
         assert!((bm25_rank_to_score(0.0) - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_one() {
         assert!((bm25_rank_to_score(1.0) - 0.5).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_nine() {
         assert!((bm25_rank_to_score(9.0) - 0.1).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_negative() {
         // Negative rank clamped to 0 -> score 1.0
         assert!((bm25_rank_to_score(-5.0) - 1.0).abs() < f64::EPSILON);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_infinity() {
         let score = bm25_rank_to_score(f64::INFINITY);
         assert!((score - 1.0 / 1000.0).abs() < 0.001);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_bm25_rank_to_score_nan() {
         let score = bm25_rank_to_score(f64::NAN);
@@ -326,6 +342,7 @@ mod tests {
         store
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_empty_query() {
         let store = setup_fts_store(&[]);
@@ -333,6 +350,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_fts_unavailable() {
         // We can't easily make fts unavailable in tests since open_in_memory
@@ -342,6 +360,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_zero_limit() {
         let store = setup_fts_store(&[]);
@@ -349,6 +368,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_with_results() {
         let store = setup_fts_store(&[
@@ -399,6 +419,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_no_matches() {
         let store = setup_fts_store(&[(
@@ -419,6 +440,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_model_filter() {
         let store = setup_fts_store(&[
@@ -456,6 +478,7 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[test]
     fn test_search_keyword_project_filter() {
         // Chunks indexed under two distinct project scopes plus one with

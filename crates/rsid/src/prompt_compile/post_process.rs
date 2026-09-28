@@ -210,24 +210,28 @@ pub fn strip_think_tags(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn strip_think_tags_removes_thinking_blocks() {
         let input = "<think>reasoning here</think>Rewritten prompt.";
         assert_eq!(strip_think_tags(input), "Rewritten prompt.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn strip_think_tags_noop_on_clean_text() {
         let input = "Just a normal prompt.";
         assert_eq!(strip_think_tags(input), "Just a normal prompt.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn strip_think_tags_nested() {
         let input = "<think>outer <think>inner</think> still outer</think>Result.";
         assert_eq!(strip_think_tags(input), "Result.");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn extract_compile_error_found() {
         let input = "COMPILE_ERROR:AMBIGUOUS_INTENT:unclear target file";
@@ -237,12 +241,14 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn extract_compile_error_none() {
         let input = "For each file in the directory, return the name.\nCOMPLETE";
         assert_eq!(extract_compile_error(input), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn parse_contract_complete() {
         let input = "Some compiled prompt text.\nCOMPLETE";
@@ -251,6 +257,7 @@ mod tests {
         assert_eq!(contract, OutputContract::Complete);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn parse_contract_incomplete() {
         let input = "Prompt body.\nINCOMPLETE:missing scope";
@@ -264,6 +271,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn parse_contract_error() {
         let input = "Prompt body.\nERROR:VALIDATION:field X is missing";
@@ -278,6 +286,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn parse_contract_no_contract_line() {
         let input = "Just a prompt with no contract.";
@@ -286,6 +295,7 @@ mod tests {
         assert!(matches!(contract, OutputContract::Incomplete { .. }));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn validate_layers_full() {
         let text = "You are investigating a production defect. Treat the following as a specification.\n\
@@ -302,6 +312,7 @@ mod tests {
         assert!(v.all_present());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn validate_layers_missing_pragmatic() {
         let text = "Extract all names from the list.\nReturn them as JSON.";
@@ -312,6 +323,7 @@ mod tests {
         assert!(v.missing().contains(&"PRAGMATIC"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn validate_layers_creative_frame() {
         let text = "Write naturally for a human reader.\nFirst, generate three title options.";
@@ -321,6 +333,7 @@ mod tests {
         assert!(v.discourse);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn validate_layers_research_frame() {
         let text =
@@ -329,6 +342,7 @@ mod tests {
         assert!(v.pragmatic);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn validate_layers_detects_pronouns() {
         let text = "Your output is structured.\nExtract it from the file.";
@@ -337,6 +351,7 @@ mod tests {
         assert!(v.missing().contains(&"DEICTIC"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn contains_word_basic() {
         assert!(contains_word("extract all items", "extract"));
@@ -345,6 +360,7 @@ mod tests {
         assert!(contains_word("validate the input", "validate"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn contains_word_edges() {
         assert!(contains_word("extract", "extract"));
@@ -353,6 +369,7 @@ mod tests {
         assert!(!contains_word("reextract", "extract"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn discourse_no_false_positive_first_principles() {
         let text =

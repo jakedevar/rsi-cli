@@ -6,6 +6,7 @@ use super::*;
 use crate::store::manager_actions::{
     ManagerActionOperationV2, SETTLED_EFFECT_ABSENT, SETTLED_PAUSE_CONFIRMED,
 };
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 
 pub(super) enum EffectObservation {
@@ -15,6 +16,21 @@ pub(super) enum EffectObservation {
 }
 
 type Guards = Vec<super::super::spawn_single_flight::SpawnGuard>;
+
+/// Invocation error classes the daemon records only when it refused a launch
+/// before any provider process was spawned. `DaemonError::CodexResumeToolHistory`
+/// is raised solely by `validate_codex_resume_tool_history`, which every launch
+/// path runs before `spawn()`; post-spawn session exits settle their invocation
+/// with the session status class instead. Extend this list only for classes
+/// with the same pre-spawn-only provenance.
+const PRE_SPAWN_REFUSAL_ERROR_CLASSES: &[&str] = &[
+    "codex_resume_rollout_torn_tail",
+    crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS,
+];
+
+fn is_pre_spawn_refusal(error_class: &str) -> bool {
+    PRE_SPAWN_REFUSAL_ERROR_CLASSES.contains(&error_class)
+}
 
 impl SessionManager {
     /// Same witness as `settle_manager_predecessor`: absent from the active
@@ -111,12 +127,85 @@ impl SessionManager {
         })
     }
 
+    /// A resume's only effect is its keyed provider invocation on the exact
+    /// target: completed proves it; no row, or a pre-spawn refusal with no
+    /// provider usage evidence, proves absence once the target is quiescent.
+    async fn observe_resume_target(
+        &self,
+        op: &ManagerActionOperationV2,
+        automatic: bool,
+        guards: &mut Guards,
+    ) -> Result<(EffectObservation, Value)> {
+        use EffectObservation::{Absent, Proven, Unobservable};
+        let target = op
+            .context
+            .target_session_id
+            .ok_or_else(|| refused("manager_v2_target_unavailable"))?;
+        let Some(guard) = Self::recovery_guard(target, automatic).await else {
+            return Ok((Unobservable, json!({"target": target})));
+        };
+        guards.push(guard);
+        let invocation = self
+            .store
+            .lock()
+            .await
+            .conn
+            .query_row(
+                "SELECT status, error_class,
+                    input_tokens IS NULL AND output_tokens IS NULL
+                    AND cache_creation_tokens IS NULL AND cache_read_tokens IS NULL
+                    AND reasoning_tokens IS NULL AND wall_time_ms IS NULL
+                    AND estimated_cost_usd IS NULL AND usage_confidence='unavailable'
+                 FROM model_invocations WHERE dedup_key=?1 AND session_id=?2
+                 ORDER BY id LIMIT 1",
+                rusqlite::params![
+                    format!("manager.action:{}", op.receipt.operation_id),
+                    target.to_string()
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let quiescent = self.manager_session_quiescent(target, true).await?;
+        Ok(match (invocation, quiescent) {
+            (Some((status, _, _)), Some(witness)) if status == "completed" && !automatic => (
+                Proven("lead_resumed_reconciled"),
+                json!({"target": witness, "invocation": "completed"}),
+            ),
+            (None, Some(witness)) if !automatic => {
+                (Absent, json!({"target": witness, "invocation": null}))
+            }
+            (Some((status, Some(class), true)), Some(witness))
+                if status == "failed" && is_pre_spawn_refusal(&class) =>
+            {
+                (
+                    Absent,
+                    json!({
+                        "target": witness,
+                        "invocation": "failed",
+                        "error_class": class,
+                        "provider_started": false,
+                    }),
+                )
+            }
+            (invocation, _) => (
+                Unobservable,
+                json!({"target": target, "invocation": invocation.map(|i| i.0)}),
+            ),
+        })
+    }
+
     pub(super) async fn observe_uncertain_manager_effect(
         &self,
         op: &ManagerActionOperationV2,
         automatic: bool,
     ) -> Result<(EffectObservation, Value, Guards)> {
-        use EffectObservation::{Absent, Proven, Unobservable};
+        use EffectObservation::{Absent, Unobservable};
         use ManagerActionV2::{
             ArchiveContainer, ArchiveSession, AssignLead, CreateContainer, CreateSession,
             DeleteContainer, Integrate, OperatorCall, PauseLead, ReplaceLead, RestoreContainer,
@@ -131,33 +220,8 @@ impl SessionManager {
                     .await?
             }
             ResumeLead { .. } => {
-                let target = op
-                    .context
-                    .target_session_id
-                    .ok_or_else(|| refused("manager_v2_target_unavailable"))?;
-                let Some(guard) = Self::recovery_guard(target, automatic).await else {
-                    return Ok((Unobservable, json!({"target": target}), guards));
-                };
-                guards.push(guard);
-                let invocation: Option<String> = self.store.lock().await.conn.query_row(
-                    "SELECT (SELECT status FROM model_invocations WHERE dedup_key=?1 AND session_id=?2 ORDER BY id LIMIT 1)",
-                    rusqlite::params![format!("manager.action:{}", op.receipt.operation_id), target.to_string()],
-                    |r| r.get(0),
-                )?;
-                let quiescent = self.manager_session_quiescent(target, true).await?;
-                match (invocation.as_deref(), quiescent) {
-                    (Some("completed"), Some(witness)) => (
-                        Proven("lead_resumed_reconciled"),
-                        json!({"target": witness, "invocation": "completed"}),
-                    ),
-                    (None, Some(witness)) => {
-                        (Absent, json!({"target": witness, "invocation": null}))
-                    }
-                    (invocation, _) => (
-                        Unobservable,
-                        json!({"target": target, "invocation": invocation}),
-                    ),
-                }
+                self.observe_resume_target(op, automatic, &mut guards)
+                    .await?
             }
             CreateSession { .. } | ReplaceLead { .. } | RetryLead { .. } => {
                 // Establishment and any lead CAS commit with the receipt; a
@@ -203,9 +267,10 @@ impl SessionManager {
         Ok((observation.0, observation.1, guards))
     }
 
-    /// #380: bounded daemon settlement of uncertain pause/assign actions whose
-    /// exact predecessor is durably terminal and process-absent.
-    pub(super) async fn reconcile_uncertain_lead_actions(&self) -> Result<usize> {
+    /// #380: bounded daemon settlement of uncertain pause/assign actions and
+    /// keyed pre-spawn transcript refusals on quiescent resume targets. Other
+    /// uncertain resumes still require explicit `settle_uncertain_action`.
+    pub(in crate::session) async fn reconcile_uncertain_lead_actions(&self) -> Result<usize> {
         let candidates = self
             .store
             .lock()

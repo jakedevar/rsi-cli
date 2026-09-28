@@ -26,6 +26,30 @@ use uuid::Uuid;
 
 static WRITERS: LazyLock<Mutex<HashMap<Uuid, Weak<ApprovalRuntime>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+type PublicationPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static PUBLICATION_PAUSES: LazyLock<Mutex<HashMap<Uuid, PublicationPause>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn pause_next_publication_for_test(
+    session: Uuid,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    PUBLICATION_PAUSES
+        .lock()
+        .unwrap()
+        .insert(session, (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
 pub(super) struct ApprovalRuntime {
     incarnation: Uuid,
     generation: u64,
@@ -210,6 +234,11 @@ pub(super) async fn publish_monitor_approval(
                 );
             }
         }
+    }
+    #[cfg(test)]
+    if let Some((entered, release)) = { PUBLICATION_PAUSES.lock().unwrap().remove(&session) } {
+        let _ = entered.send(());
+        let _ = release.await;
     }
     event.id = persistence
         .publish_appserver_approval(event.clone(), target.clone())

@@ -4,6 +4,7 @@
 //! provider launch funnel receives it only after a custody ContextRead permit
 //! has authenticated the sandbox root.
 
+use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::sandbox::custody::CustodyEffectPermit;
 use nix::fcntl::{OFlag, open, openat};
@@ -11,6 +12,8 @@ use nix::sys::stat::{Mode, SFlag, fstat, mkdirat};
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use tokio::process::Command;
 
 const TARGET_NAME: &CStr = c"target";
 const TEMP_NAME: &CStr = c".rsi-tmp";
@@ -30,6 +33,41 @@ pub struct SandboxExecutionScratch {
     root_identity: FileIdentity,
     target_identity: FileIdentity,
     temp_identity: FileIdentity,
+    build_env: Option<AgentBuildEnvironment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentBuildEnvironment {
+    jobs: u32,
+    line_tables_only: bool,
+    worker: bool,
+    wrapper: Option<PathBuf>,
+    slots: u32,
+    sccache: Option<PathBuf>,
+    cache_gib: u32,
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+fn installed_build_wrapper() -> Option<PathBuf> {
+    let sibling = std::env::current_exe().ok().and_then(|executable| {
+        executable
+            .parent()
+            .map(|parent| parent.join("rsi-build-rustc"))
+    });
+    sibling
+        .filter(|wrapper| wrapper.is_file())
+        .or_else(|| executable_on_path("rsi-build-rustc"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +105,7 @@ impl SandboxExecutionScratch {
             root_identity,
             target_identity,
             temp_identity,
+            build_env: None,
         })
     }
 
@@ -101,6 +140,67 @@ impl SandboxExecutionScratch {
     }
     pub(crate) fn temp(&self) -> &Path {
         &self.temp
+    }
+
+    /// Attach daemon-owned build defaults only after the custody permit has
+    /// established this sandbox's scratch directory.
+    pub(crate) fn with_build_env(mut self, runtime: &RuntimeConfig, worker: bool) -> Self {
+        let cache_enabled = runtime.agent_build_sccache_enabled.load(Ordering::Relaxed);
+        self.build_env = Some(AgentBuildEnvironment {
+            jobs: runtime.agent_build_jobs.load(Ordering::Relaxed),
+            line_tables_only: runtime.agent_build_line_tables_only.load(Ordering::Relaxed),
+            worker,
+            wrapper: installed_build_wrapper(),
+            slots: runtime.agent_build_slots.load(Ordering::Relaxed),
+            sccache: (worker && cache_enabled)
+                .then(|| executable_on_path("sccache"))
+                .flatten(),
+            cache_gib: runtime
+                .agent_build_sccache_cache_gib
+                .load(Ordering::Relaxed),
+        });
+        self
+    }
+
+    pub(crate) fn stamp_build_env(&self, cmd: &mut Command) {
+        let Some(build) = &self.build_env else { return };
+        cmd.env("CARGO_BUILD_JOBS", build.jobs.to_string());
+        if build.line_tables_only {
+            cmd.env("CARGO_PROFILE_DEV_DEBUG", "line-tables-only");
+        } else {
+            cmd.env_remove("CARGO_PROFILE_DEV_DEBUG");
+        }
+        if build.worker {
+            cmd.env("CARGO_INCREMENTAL", "0");
+        } else {
+            cmd.env_remove("CARGO_INCREMENTAL");
+        }
+        if let Some(wrapper) = &build.wrapper {
+            cmd.env("RUSTC_WRAPPER", wrapper);
+            cmd.env("RSI_BUILD_SLOTS", build.slots.to_string());
+            if let Some(home) = dirs::home_dir() {
+                cmd.env("RSI_BUILD_SLOT_ROOT", home.join(".rsi/build-slots"));
+            }
+            if let Some(sccache) = &build.sccache {
+                cmd.env("RSI_BUILD_SCCACHE", sccache);
+            } else {
+                cmd.env_remove("RSI_BUILD_SCCACHE");
+            }
+        } else if let Some(sccache) = &build.sccache {
+            cmd.env("RUSTC_WRAPPER", sccache);
+        } else {
+            cmd.env_remove("RUSTC_WRAPPER");
+        }
+        if build.sccache.is_some() {
+            cmd.env("SCCACHE_CACHE_SIZE", format!("{}G", build.cache_gib));
+            if let Some(home) = dirs::home_dir() {
+                cmd.env("SCCACHE_DIR", home.join(".rsi/agent-sccache"));
+                cmd.env("SCCACHE_SERVER_UDS", home.join(".rsi/agent-sccache.sock"));
+            }
+            // Keep compilation in the wrapper-held client process; the cache
+            // daemon only serves artifacts and never consumes a build slot.
+            cmd.env("SCCACHE_CLIENT_SIDE", "1");
+        }
     }
 
     /// Reopen all fixed names below the pinned root and compare their exact
@@ -258,6 +358,69 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn sandbox_build_env_distinguishes_worker_and_lead() {
+        use crate::config::Config;
+        let fixture = disk_backed_fixture();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let env_value = |cmd: &Command, name: &str| {
+            cmd.as_std().get_envs().find_map(|(key, value)| {
+                (key == name)
+                    .then(|| value.map(|v| v.to_string_lossy().into_owned()))
+                    .flatten()
+            })
+        };
+
+        let worker = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, true);
+        let mut worker_cmd = Command::new("true");
+        worker.stamp_build_env(&mut worker_cmd);
+        assert_eq!(
+            env_value(&worker_cmd, "CARGO_BUILD_JOBS").as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            env_value(&worker_cmd, "CARGO_PROFILE_DEV_DEBUG").as_deref(),
+            Some("line-tables-only")
+        );
+        assert_eq!(
+            env_value(&worker_cmd, "CARGO_INCREMENTAL").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            env_value(&worker_cmd, "RUSTC_WRAPPER").is_some(),
+            executable_on_path("sccache").is_some() || installed_build_wrapper().is_some()
+        );
+        if executable_on_path("sccache").is_some() {
+            assert_eq!(
+                env_value(&worker_cmd, "SCCACHE_CACHE_SIZE").as_deref(),
+                Some("10G")
+            );
+            assert_eq!(
+                env_value(&worker_cmd, "SCCACHE_CLIENT_SIDE").as_deref(),
+                Some("1")
+            );
+        }
+
+        let lead = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, false);
+        let mut lead_cmd = Command::new("true");
+        lead.stamp_build_env(&mut lead_cmd);
+        assert_eq!(
+            env_value(&lead_cmd, "CARGO_BUILD_JOBS").as_deref(),
+            Some("4")
+        );
+        assert_eq!(env_value(&lead_cmd, "CARGO_INCREMENTAL"), None);
+        assert_eq!(
+            env_value(&lead_cmd, "RUSTC_WRAPPER").is_some(),
+            installed_build_wrapper().is_some()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_prepares_fixed_private_layout() {
         let fixture = disk_backed_fixture();
@@ -269,6 +432,7 @@ mod tests {
         scratch.revalidate().unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_accepts_only_context_read_permits_and_preserves_ordinary_none() {
         let fixture = disk_backed_fixture();
@@ -312,6 +476,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_rejects_target_and_temp_symlinks_and_replacement() {
         let fixture = disk_backed_fixture();
@@ -331,6 +496,7 @@ mod tests {
         assert!(scratch.revalidate().is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_revalidation_rejects_mode_drift() {
         let fixture = disk_backed_fixture();
@@ -343,6 +509,7 @@ mod tests {
         assert!(scratch.revalidate().is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn repeated_execution_scratch_refusal_keeps_file_descriptors_bounded() {
         let fixture = disk_backed_fixture();
@@ -366,6 +533,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn repeated_prepare_refusal_after_target_open_keeps_file_descriptors_bounded() {
         let fixture = disk_backed_fixture();
@@ -397,6 +565,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_rejects_cross_device_identity() {
         let root = FileIdentity {
@@ -410,6 +579,7 @@ mod tests {
         assert!(require_same_device(root, child, "target").is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn execution_scratch_rejects_tmpfs_root_when_available() {
         let tmpfs = Path::new("/dev/shm");

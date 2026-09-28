@@ -30,7 +30,7 @@ pub(super) fn render_terminal_overlay(frame: &mut Frame, area: Rect, app: &App) 
 
     // --- Determine title and border color ---
     let title_text = " TERMINAL ";
-    let border_color = theme::accent();
+    let border_color = theme::overlay_border();
 
     // Default background follows the session detail text-area background
     // setting (theme fallback: overlay_bg). Also used below as the default

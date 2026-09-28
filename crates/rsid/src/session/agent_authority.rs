@@ -147,6 +147,7 @@ struct VerbRights {
     work_writer: bool,
     control: bool,
     prepared: bool,
+    topology_manager: bool,
 }
 
 fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
@@ -177,6 +178,12 @@ fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         Verb::ManagerControl => rights.control,
         Verb::ManagerPrepareControl | Verb::ManagerCommitPreparedControl => rights.prepared,
         Verb::SubmitReviewReceipt => rights.reviewer,
+        Verb::TopologyUpsert
+        | Verb::TopologyList
+        | Verb::TopologyExecute
+        | Verb::TopologyGetExecution
+        | Verb::TopologyInterrupt
+        | Verb::TopologyResolveAttempt => rights.lead || rights.topology_manager,
     }
 }
 
@@ -302,11 +309,22 @@ impl Store {
                     ],
                     |row| row.get::<_, bool>(0),
                 )?;
-                current_tip
-                    && managed
-                    && self
-                        .manager_v2_descendant_epic(config, caller)
-                        .is_ok_and(|epic| config.epic_ids.contains(&epic))
+                if current_tip && managed {
+                    match self.manager_v2_descendant_epic(config, caller) {
+                        Ok(epic) => config.epic_ids.contains(&epic),
+                        Err(DaemonError::InvalidParam(reason))
+                            if matches!(
+                                reason.as_str(),
+                                "manager_v2_epic_out_of_scope" | "manager_v2_session_out_of_scope"
+                            ) =>
+                        {
+                            false
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -343,32 +361,34 @@ impl Store {
         }
         pending |= reviewer_rows.iter().any(|row| row.1 == "allocating");
         let invocation = self.session_model_invocation_id(caller)?;
-        let custody = if reviewer_rows.iter().any(|row| row.1 == "active") {
-            self.live_custody_for_session(caller).ok()
-        } else {
-            None
-        };
-        let is_reviewer = reviewer_rows.iter().any(|row| {
+        let custody = reviewer_rows
+            .iter()
+            .any(|row| row.1 == "active")
+            .then(|| self.live_custody_for_session(caller))
+            .transpose()?;
+        let mut is_reviewer = false;
+        for row in &reviewer_rows {
             if row.1 == "allocating" {
-                return false;
+                continue;
             }
-            let ready = Uuid::parse_str(&row.0).ok().is_some_and(|assignment_id| {
-                self.prepare_manager_review_submission(
-                    caller,
-                    &AgentSubmitReviewReceiptRequestV1 {
-                        assignment_id,
-                        verdict: ManagerReviewVerdictV1::Accepted,
-                        findings: Vec::new(),
-                        idempotency_key: "authority-projection".into(),
-                    },
-                )
-                .is_ok()
-            });
-            if !ready {
-                pending = true;
+            let assignment_id = Uuid::parse_str(&row.0)
+                .map_err(|_| DaemonError::Store("invalid reviewer assignment identity".into()))?;
+            match self.prepare_manager_review_submission(
+                caller,
+                &AgentSubmitReviewReceiptRequestV1 {
+                    assignment_id,
+                    verdict: ManagerReviewVerdictV1::Accepted,
+                    findings: Vec::new(),
+                    idempotency_key: "authority-projection".into(),
+                },
+            ) {
+                Ok(_) => is_reviewer = true,
+                Err(DaemonError::InvalidParam(_)) | Err(DaemonError::PolicyDenied(_)) => {
+                    pending = true;
+                }
+                Err(error) => return Err(error),
             }
-            ready
-        });
+        }
 
         let rights = VerbRights {
             lead: is_lead,
@@ -382,6 +402,8 @@ impl Store {
             work_writer: !update_variants.is_empty(),
             control: !control_actions.is_empty(),
             prepared: !prepared_actions.is_empty(),
+            topology_manager: manager_grant
+                .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation)),
         };
         let verbs = agent_control_catalog_v1()
             .iter()
@@ -435,6 +457,7 @@ mod tests {
     use rsi_common::types::Project;
     use std::path::PathBuf;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn manager_action_grants_cover_new_variants_and_closed_delegation() {
         assert_eq!(
@@ -452,6 +475,7 @@ mod tests {
         assert_eq!(DELEGABLE_OPERATOR_METHODS.len(), 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn manager_update_variants_follow_role_and_grants() {
         let work_only = [Capability::WorkPlan];
@@ -478,6 +502,7 @@ mod tests {
         assert!(lead_extended.contains(&"integration"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn worker_baseline_and_role_specific_catalog_are_positive() {
         assert!(permitted_verb(Verb::GetStatus, &VerbRights::default()));
@@ -511,6 +536,185 @@ mod tests {
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn managed_worker_with_broken_hierarchy_reports_projection_error() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Uuid::new_v4();
+        let manager_id = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let epic_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        store
+            .insert_project(&Project {
+                id: project,
+                name: "Broken managed hierarchy".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut manager = test_session(manager_id, PathBuf::from("/tmp/authority-manager"));
+        manager.project_id = Some(project);
+        manager.status = SessionStatus::Running;
+        store.insert_session(&manager).unwrap();
+        let mut group = test_session(group_id, PathBuf::from("/tmp/authority-group"));
+        group.project_id = Some(project);
+        group.session_kind = SessionKind::Group;
+        group.status = SessionStatus::Running;
+        store.insert_session(&group).unwrap();
+        let mut epic = test_session(epic_id, PathBuf::from("/tmp/authority-epic"));
+        epic.project_id = Some(project);
+        epic.session_kind = SessionKind::Epic;
+        epic.status = SessionStatus::Running;
+        epic.parent_id = Some(group_id);
+        store.insert_session(&epic).unwrap();
+        let mut worker = test_session(worker_id, PathBuf::from("/tmp/authority-worker"));
+        worker.project_id = Some(project);
+        worker.parent_id = Some(epic_id);
+        worker.status = SessionStatus::Running;
+        store.insert_session(&worker).unwrap();
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: project,
+                session_id: manager_id,
+                epic_ids: Some(vec![epic_id]),
+                expected_row_version: 0,
+            })
+            .unwrap();
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: project,
+                expected_scope_version: 1,
+                expected_policy_version: 0,
+                idempotency_key: "managed-worker-policy".into(),
+                policy: ManagerPolicyV2 {
+                    mode: ManagerOperatingModeV2::Execute,
+                    capabilities: vec![Capability::WorkPlan],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_entities
+                 (session_id,operation_id,project_id,manager_session_id,
+                  scope_version,policy_version,kind,created_at)
+                 VALUES (?1,?2,?3,?4,1,1,'session',?5)",
+                params![
+                    worker_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    project.to_string(),
+                    manager_id.to_string(),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                ],
+            )
+            .unwrap();
+        let managed = store.agent_authority_projection(worker_id).unwrap();
+        assert!(managed.verbs.contains(&Verb::ManagerWorkView));
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![worker_id.to_string(), group_id.to_string()],
+            )
+            .unwrap();
+        let outside_epic = store.agent_authority_projection(worker_id).unwrap();
+        assert!(!outside_epic.verbs.contains(&Verb::ManagerWorkView));
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?1 WHERE id=?1",
+                [worker_id.to_string()],
+            )
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+
+        let error = store.agent_authority_projection(worker_id).unwrap_err();
+        assert!(error.to_string().contains("manager_v2_hierarchy_cycle"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn active_reviewer_without_live_custody_reports_projection_error() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Uuid::new_v4();
+        let manager_id = Uuid::new_v4();
+        let epic_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        store
+            .insert_project(&Project {
+                id: project,
+                name: "Review custody failure".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut manager = test_session(manager_id, PathBuf::from("/tmp/authority-manager"));
+        manager.project_id = Some(project);
+        manager.status = SessionStatus::Running;
+        store.insert_session(&manager).unwrap();
+        let mut epic = test_session(epic_id, PathBuf::from("/tmp/authority-epic"));
+        epic.project_id = Some(project);
+        epic.session_kind = SessionKind::Epic;
+        epic.status = SessionStatus::Running;
+        store.insert_session(&epic).unwrap();
+        let mut reviewer = test_session(reviewer_id, PathBuf::from("/tmp/authority-reviewer"));
+        reviewer.project_id = Some(project);
+        reviewer.parent_id = Some(epic_id);
+        reviewer.status = SessionStatus::Running;
+        store.insert_session(&reviewer).unwrap();
+
+        store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO manager_review_assignments (
+                    assignment_id,project_id,epic_id,manager_session_id,scope_version,
+                    work_key,spec_revision,author_session_id,source_sha,reviewer_session_id,
+                    reviewer_invocation_id,reviewer_custody_id,reviewer_custody_generation,
+                    action_operation_id,state,row_version,request_json,request_fingerprint,
+                    created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,1,'authority',1,?4,?5,?6,?7,?8,1,?9,
+                         'active',1,'{}',?10,?11,?11)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    project.to_string(),
+                    epic_id.to_string(),
+                    manager_id.to_string(),
+                    "0".repeat(40),
+                    reviewer_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    format!("sha256:{}", "0".repeat(64)),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                ],
+            )
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+
+        let error = store.agent_authority_projection(reviewer_id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live sandbox custody ownership is missing")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn committed_lead_publication_changes_revision_and_role() {
         let store = Store::open_in_memory().unwrap();
@@ -550,6 +754,7 @@ mod tests {
         assert_ne!(pending.revision, published.revision);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn live_policy_publication_changes_manager_and_lead_catalogs() {
         let store = Store::open_in_memory().unwrap();
@@ -594,6 +799,12 @@ mod tests {
         store.insert_session(&lead).unwrap();
         let lead_before_appointment = store.agent_authority_projection(lead_id).unwrap();
         assert!(lead_before_appointment.verbs.contains(&Verb::SpawnChild));
+        assert!(
+            lead_before_appointment
+                .verbs
+                .contains(&Verb::TopologyUpsert)
+        );
+        assert!(lead_before_appointment.verbs.contains(&Verb::TopologyList));
         assert!(!lead_before_appointment.verbs.contains(&Verb::ManagerInbox));
         store
             .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
@@ -615,6 +826,7 @@ mod tests {
             Capability::IssueCoordinate,
             Capability::LeadControl,
             Capability::OperatorDelegation,
+            Capability::Automation,
         ];
         store
             .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
@@ -634,6 +846,8 @@ mod tests {
         assert!(manager_after.verbs.contains(&Verb::ManagerUpdate));
         assert!(manager_after.verbs.contains(&Verb::ListIssues));
         assert!(manager_after.verbs.contains(&Verb::ManagerControl));
+        assert!(manager_after.verbs.contains(&Verb::TopologyExecute));
+        assert!(manager_after.verbs.contains(&Verb::TopologyGetExecution));
         assert!(
             manager_after
                 .control_actions

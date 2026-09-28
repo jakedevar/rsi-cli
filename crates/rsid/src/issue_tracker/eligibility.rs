@@ -108,6 +108,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn eligible_active_state_no_blockers() {
         let config = make_config();
@@ -116,6 +117,7 @@ mod tests {
         assert!(result.is_none(), "Expected eligible, got: {:?}", result);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn ineligible_terminal_state() {
         let config = make_config();
@@ -128,6 +130,7 @@ mod tests {
         assert_eq!(result, Some("terminal state".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn ineligible_already_claimed() {
         let config = make_config();
@@ -138,6 +141,7 @@ mod tests {
         assert_eq!(result, Some("already claimed".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn ineligible_concurrency_limit() {
         let config = make_config();
@@ -146,6 +150,7 @@ mod tests {
         assert_eq!(result, Some("concurrency limit".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn ineligible_blocked_non_terminal_blocker() {
         let config = make_config();
@@ -158,6 +163,7 @@ mod tests {
         assert_eq!(result, Some("blocked".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn eligible_blocked_all_terminal() {
         let config = make_config();
@@ -176,6 +182,7 @@ mod tests {
         assert!(result.is_none(), "Expected eligible, got: {:?}", result);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn sort_priority_lower_first() {
         let mut issues = vec![
@@ -195,6 +202,7 @@ mod tests {
         assert_eq!(issues[1].priority, Some(4));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn sort_none_priority_last() {
         let mut issues = vec![
@@ -214,6 +222,7 @@ mod tests {
         assert!(issues[1].priority.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn sort_same_priority_older_first() {
         let now = Utc::now();

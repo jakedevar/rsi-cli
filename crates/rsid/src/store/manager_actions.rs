@@ -8,7 +8,8 @@ use super::sessions::historical_session_restore_blocked_on;
 use crate::error::Result;
 use chrono::Utc;
 use rsi_common::harness_manager_v2::*;
-use rsi_common::types::{Session, SessionKind, SessionStatus};
+use rsi_common::manager_operator_delegation::DelegatedOperatorCallV1;
+use rsi_common::types::{SandboxCleanupState, SandboxKind, Session, SessionKind, SessionStatus};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,12 +27,46 @@ const MAX_PENDING: i64 = 64;
 /// Durable witness that a terminal/idle lead's exact agent-declared program
 /// outcome was superseded by an explicit manager recovery (K2, #390).
 pub(crate) const LEAD_RETIREMENT_KIND: &str = "lead_continuation_retirement";
+pub(crate) const RETIREMENT_PAUSE_REASON: &str = "retire_lead_continuations";
 /// Settlement outcome codes. The original receipt and evidence are retained;
 /// settlement is appended and never re-executes an effect.
 pub(crate) const SETTLED_EFFECT_ABSENT: &str = "manager_v2_recovered_effect_absent";
 pub(crate) const SETTLED_PAUSE_CONFIRMED: &str = "lead_paused_reconciled";
 const UNCERTAIN_RECOVERY_BATCH: i64 = 16;
 const MAX_SETTLE_NESTING: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OperatorPause {
+    None,
+    Soft,
+    Hard,
+}
+
+impl OperatorPause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "false",
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+/// A lead pause prevents continuations, not inert delegated cleanup or reads.
+fn delegated_cleanup_allowed_during_lead_pause(action: &ManagerActionV2) -> bool {
+    matches!(
+        action,
+        ManagerActionV2::OperatorCall { call, .. }
+            if matches!(
+                call.typed(),
+                Ok(DelegatedOperatorCallV1::ArchiveSession(_)
+                    | DelegatedOperatorCallV1::UnarchiveSession(_)
+                    | DelegatedOperatorCallV1::ListSessions(_)
+                    | DelegatedOperatorCallV1::GetArchiveCleanupStatus(_))
+            )
+    )
+}
 /// Idempotency-key namespace owned by the DB-native review allocator (#674
 /// K15A-1). Only the allocator journals keys in it, so an operation linked by
 /// `manager_review_assignments.action_operation_id` is a genuine review launch.
@@ -48,7 +83,14 @@ const CREATION_CHARGED: &str = "NOT (o.state IN ('blocked','revoked') AND json_e
 pub(crate) enum RecoveryOwnerMode {
     /// A manager lifecycle action. Byte-identical to the pre-extraction
     /// `manager_action_human_gate_with_interrupted_resume`.
-    ManagerAction { allow_interrupted_resume: bool },
+    ManagerAction {
+        allow_interrupted_resume: bool,
+        allow_soft_operator_pause: bool,
+    },
+    /// A terminal manager archive leaves an operator interruption marker in
+    /// place for a later restore or continuation. It may settle C5 and resume
+    /// owners without restarting the session.
+    ManagerArchive,
     /// `AgentArchiveChild`: the strictest program mode, with no
     /// interrupted-resume exception, and no hold on the C5 marker that the
     /// archive commit settles itself.
@@ -233,6 +275,74 @@ pub(crate) fn manager_retry_admissible(lead: &Session) -> Result<()> {
     }
 }
 
+impl Store {
+    /// The latest failed resume invocation carries the transcript refusal.
+    /// A later successful attempt clears that evidence even if the provider
+    /// thread ID has not changed.
+    fn manager_lead_transcript_refusal_class(&self, lead: &Session) -> Result<Option<String>> {
+        if lead.provider != rsi_common::types::SessionProvider::Codex {
+            return Ok(None);
+        }
+        let latest: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT status,error_class FROM model_invocations
+             WHERE session_id=?1 AND purpose='session.continue.resume'
+             ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                [lead.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(match latest {
+            Some((status, Some(class)))
+                if status == "failed"
+                    && matches!(
+                        class.as_str(),
+                        "codex_resume_rollout_torn_tail" | "codex_resume_tool_history_invalid"
+                    ) =>
+            {
+                Some(class)
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn manager_lead_transcript_unresumable(&self, lead: &Session) -> Result<bool> {
+        Ok(self.manager_lead_transcript_refusal_class(lead)?.is_some())
+    }
+
+    pub(crate) fn manager_lead_torn_tail(&self, lead: &Session) -> Result<bool> {
+        Ok(self.manager_lead_transcript_refusal_class(lead)?.as_deref()
+            == Some("codex_resume_rollout_torn_tail"))
+    }
+
+    pub(crate) fn manager_lead_invalid_tool_history(&self, lead: &Session) -> Result<bool> {
+        Ok(self.manager_lead_transcript_refusal_class(lead)?.as_deref()
+            == Some("codex_resume_tool_history_invalid"))
+    }
+
+    pub(crate) fn manager_resume_available_for_lead(&self, lead: &Session) -> Result<()> {
+        manager_resume_available(lead)?;
+        if matches!(
+            lead.status,
+            SessionStatus::Completed | SessionStatus::Interrupted | SessionStatus::Failed
+        ) && self.manager_lead_transcript_unresumable(lead)?
+        {
+            return Err(crate::session::lifecycle::manager_resume_unavailable());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn manager_retry_admissible_for_lead(&self, lead: &Session) -> Result<()> {
+        if lead.status == SessionStatus::Completed
+            && self.manager_lead_transcript_unresumable(lead)?
+        {
+            return Ok(());
+        }
+        manager_retry_admissible(lead)
+    }
+}
+
 fn state_name(state: ManagerActionStateV2) -> &'static str {
     match state {
         ManagerActionStateV2::Queued => "queued",
@@ -246,6 +356,55 @@ fn state_name(state: ManagerActionStateV2) -> &'static str {
 }
 
 impl Store {
+    /// Archive is a terminal operator decision. Settle queued lead recovery
+    /// before it can be claimed; a later manager poll must not relaunch it.
+    /// The caller includes this in the same transaction as the Archived row.
+    pub(crate) fn cancel_queued_recovery_for_archive_on(
+        tx: &rusqlite::Connection,
+        session_id: Uuid,
+    ) -> Result<()> {
+        let key = session_id.to_string();
+        let mut stmt = tx.prepare(
+            "SELECT id,outcome_json FROM harness_manager_v2_operations
+             WHERE kind='lifecycle_action' AND state='queued'
+               AND json_extract(payload_json,'$.request.operation.action')
+                   IN ('resume_lead','retry_lead','replace_lead')
+               AND (json_extract(payload_json,'$.request.operation.epic_id')=?1
+                    OR json_extract(payload_json,'$.request.operation.expected.lead_session_id')=?1)
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([&key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let stamp = now();
+        for (id, raw) in rows {
+            let mut receipt: ManagerActionReceiptV2 = serde_json::from_str(&raw)?;
+            receipt.state = ManagerActionStateV2::Blocked;
+            receipt.row_version += 1;
+            receipt.outcome = Some("cancelled_by_archive".into());
+            tx.execute(
+                "UPDATE harness_manager_v2_operations
+                 SET state='blocked',row_version=?2,outcome_json=?3,updated_at=?4
+                 WHERE id=?1 AND state='queued'",
+                params![
+                    id,
+                    receipt.row_version,
+                    serde_json::to_string(&receipt)?,
+                    stamp
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE scheduled_jobs SET enabled=0,updated_at=?2
+             WHERE wake_session_id=?1 AND enabled=1 AND wake_mode='resume'",
+            params![key, stamp],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn manager_action_authority(
         &self,
         origin: &ManagerActionOriginV2,
@@ -598,7 +757,7 @@ impl Store {
     /// A single terminal leaf only: trees use the container cascade, and a
     /// current lead must be replaced/unassigned first. The operator archive
     /// path clears lead pointers; the manager path refuses instead.
-    fn manager_action_validate_archive_session(&self, session: &Session) -> Result<()> {
+    pub(crate) fn manager_action_validate_archive_session(&self, session: &Session) -> Result<()> {
         match session.status {
             SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Interrupted => {}
             SessionStatus::Archived | SessionStatus::Deleted => {
@@ -632,7 +791,21 @@ impl Store {
         if lead {
             return Err(refused("manager_v2_session_is_lead"));
         }
-        self.manager_action_human_gate(session.id)
+        self.manager_action_archive_gate(session.id)
+    }
+
+    fn manager_action_live_worktree_blocked(session: &Session) -> bool {
+        if session.sandbox_kind != Some(SandboxKind::GitWorktree)
+            || session.sandbox_cleanup_state != Some(SandboxCleanupState::Live)
+        {
+            return false;
+        }
+        session.sandbox_root.as_deref().is_none_or(|root| {
+            !matches!(
+                crate::sandbox::git_worktree::observe_tracked_clean_idle(root),
+                Ok(true)
+            )
+        })
     }
 
     /// Shape, tag normalization (exactly `update_session_tags`: normalize,
@@ -672,12 +845,65 @@ impl Store {
             .transpose()
     }
 
-    /// Durable operator ownership independent of the manager's scope. This
-    /// marker can only be cleared by an explicit operator continuation.
+    /// Legacy callers create a HARD pause; only the operator or an admitted
+    /// manager restart can clear an operator marker.
     pub(crate) fn record_manager_operator_pause(&self, session: Uuid, paused: bool) -> Result<()> {
-        let key = format!("manager_operator_pause:{session}");
-        self.conn.execute("INSERT INTO daemon_settings(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,if paused {"true"} else {"false"},now()])?;
+        self.set_operator_pause(
+            session,
+            if paused {
+                OperatorPause::Hard
+            } else {
+                OperatorPause::None
+            },
+        )?;
         Ok(())
+    }
+
+    pub(crate) fn set_operator_pause(
+        &self,
+        session: Uuid,
+        pause: OperatorPause,
+    ) -> Result<OperatorPause> {
+        if self.get_session(session)?.is_none() {
+            return Err(crate::error::DaemonError::SessionNotFound(session));
+        }
+        self.conn.execute("INSERT INTO daemon_settings(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("manager_operator_pause:{session}"),pause.as_str(),now()])?;
+        Ok(pause)
+    }
+
+    pub(crate) fn get_operator_pause(&self, session: Uuid) -> Result<OperatorPause> {
+        if self.get_session(session)?.is_none() {
+            return Err(crate::error::DaemonError::SessionNotFound(session));
+        }
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM daemon_settings WHERE key=?1",
+                [format!("manager_operator_pause:{session}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match value.as_deref() {
+            None | Some("false") => OperatorPause::None,
+            Some("soft") => OperatorPause::Soft,
+            _ => OperatorPause::Hard,
+        })
+    }
+
+    pub(crate) fn clear_soft_operator_pause(
+        &self,
+        session: Uuid,
+        actor: Uuid,
+        action: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE daemon_settings SET value='false',updated_at=?2 WHERE key=?1 AND value='soft'",
+            params![format!("manager_operator_pause:{session}"), now()],
+        )?;
+        if changed != 0 {
+            tracing::info!(%session, %actor, action, "manager cleared soft operator pause");
+        }
+        Ok(changed != 0)
     }
 
     pub(crate) fn manager_action_operator_paused(&self, target: Uuid) -> Result<bool> {
@@ -692,7 +918,11 @@ impl Store {
         self.manager_action_human_gate_with_interrupted_resume(target, false)
     }
 
-    fn manager_action_descendant_ids(&self, root: Uuid) -> Result<Vec<Uuid>> {
+    fn manager_action_archive_gate(&self, target: Uuid) -> Result<()> {
+        self.recovery_owner_gate(target, RecoveryOwnerMode::ManagerArchive)
+    }
+
+    pub(crate) fn manager_action_descendant_ids(&self, root: Uuid) -> Result<Vec<Uuid>> {
         let mut ids = vec![root];
         let mut pending = vec![root];
         let mut seen = std::collections::HashSet::from([root]);
@@ -720,7 +950,15 @@ impl Store {
     }
 
     pub(crate) fn manager_action_container_tree_ids(&self, root: Uuid) -> Result<Vec<Uuid>> {
-        self.manager_action_descendant_ids(root)
+        self.manager_action_descendant_ids(root)?
+            .into_iter()
+            .filter_map(|id| match self.get_session(id) {
+                Ok(Some(session)) if session.status != SessionStatus::Deleted => Some(Ok(id)),
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Err(refused("manager_v2_container_changed"))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     fn manager_action_validate_archive_cascade(&self, root: Uuid) -> Result<Vec<(Uuid, bool)>> {
@@ -730,6 +968,9 @@ impl Store {
             let session = self
                 .get_session(id)?
                 .ok_or_else(|| refused("manager_v2_container_changed"))?;
+            if session.status == SessionStatus::Deleted {
+                continue;
+            }
             let archived = session.status == SessionStatus::Archived;
             if !matches!(
                 session.status,
@@ -741,7 +982,10 @@ impl Store {
                 return Err(refused("container_not_terminal"));
             }
             if !archived && rsi_common::is_leaf_kind(session.session_kind) {
-                self.manager_action_human_gate(id)?;
+                self.manager_action_archive_gate(id)?;
+                if Self::manager_action_live_worktree_blocked(&session) {
+                    return Err(refused("manager_v2_retention_live_worktree"));
+                }
             }
             result.push((id, archived));
         }
@@ -840,6 +1084,9 @@ impl Store {
                 let Some((status, updated_at)) = row else {
                     return Err(refused("manager_v2_cascade_record_stale"));
                 };
+                if status == "Deleted" {
+                    continue;
+                }
                 let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
                     .map_err(|_| refused("manager_v2_invalid_cascade_timestamp"))?;
                 if updated_at > record.completed_at {
@@ -884,6 +1131,21 @@ impl Store {
             target,
             RecoveryOwnerMode::ManagerAction {
                 allow_interrupted_resume,
+                allow_soft_operator_pause: false,
+            },
+        )
+    }
+
+    pub(crate) fn manager_restart_human_gate(
+        &self,
+        target: Uuid,
+        allow_interrupted_resume: bool,
+    ) -> Result<()> {
+        self.recovery_owner_gate(
+            target,
+            RecoveryOwnerMode::ManagerAction {
+                allow_interrupted_resume,
+                allow_soft_operator_pause: true,
             },
         )
     }
@@ -891,28 +1153,40 @@ impl Store {
     /// The one recovery-owner check shared by manager lifecycle actions and
     /// `AgentArchiveChild`: the held-row SQL plus the program gate.
     ///
-    /// Only the C5 autofile-marker clause is mode-bound. A manager action
-    /// treats a pending marker as the settlement owner; an agent archive
-    /// settles that marker in its own commit instead, so its mode does not
-    /// hold on it. Every other clause, and the program gate, applies to both
-    /// modes. It reads through `self.conn`, so a caller holding an open
-    /// transaction on that connection observes its own writes.
+    /// Manager archive tolerates operator pause, C5, and resume owners without
+    /// clearing the pause marker. Agent archive settles C5 in its own commit.
+    /// Other holds and the program gate still apply. Reads through `self.conn` also
+    /// observe writes in an open transaction on that connection.
     pub(crate) fn recovery_owner_gate(&self, target: Uuid, mode: RecoveryOwnerMode) -> Result<()> {
-        let (hold_on_c5_marker, allow_interrupted_resume) = match mode {
+        let (
+            hold_on_c5_marker,
+            hold_on_operator_pause,
+            hold_on_resume,
+            allow_interrupted_resume,
+            allow_soft_operator_pause,
+        ) = match mode {
             RecoveryOwnerMode::ManagerAction {
                 allow_interrupted_resume,
-            } => (true, allow_interrupted_resume),
-            RecoveryOwnerMode::AgentArchive => (false, false),
+                allow_soft_operator_pause,
+            } => (
+                true,
+                true,
+                true,
+                allow_interrupted_resume,
+                allow_soft_operator_pause,
+            ),
+            RecoveryOwnerMode::ManagerArchive => (false, false, false, false, false),
+            RecoveryOwnerMode::AgentArchive => (false, true, true, false, false),
         };
         let held: bool = self.conn.query_row(
             "SELECT pending_question_json IS NOT NULL OR pending_archive=1 OR status='WaitingApproval'
              OR EXISTS(SELECT 1 FROM approvals a WHERE session_id=?1 AND status='Pending' AND NOT EXISTS(SELECT 1 FROM appserver_approval_publications p WHERE p.approval_id=a.id AND (p.closure_state='closed' OR p.state='superseded')))
              OR EXISTS(SELECT 1 FROM appserver_approval_publications WHERE session_id=?1 AND closure_state<>'closed' AND state<>'superseded')
-             OR EXISTS(SELECT 1 FROM daemon_settings WHERE (?5 AND key=?3) OR (key=?2 AND value<>'false'))
-             OR EXISTS(SELECT 1 FROM scheduled_jobs WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1 AND id<>?4)
+             OR EXISTS(SELECT 1 FROM daemon_settings WHERE (?5 AND key=?3) OR (?6 AND key=?2 AND value<>'false' AND (NOT ?7 OR value<>'soft')))
+             OR EXISTS(SELECT 1 FROM scheduled_jobs WHERE ?8 AND enabled=1 AND wake_mode='resume' AND wake_session_id=?1 AND id<>?4)
              OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents WHERE state='open' AND controller_session_id=?1)
              OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents i JOIN model_invocations m ON m.id=i.last_capacity_model_invocation_id WHERE i.state='open' AND m.session_id=?1)
-             FROM sessions WHERE id=?1", params![target.to_string(), format!("manager_operator_pause:{target}"), super::daemon_settings::c5_autofile_pending_key(target), crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(target).to_string(), hold_on_c5_marker], |r| r.get(0))?;
+             FROM sessions WHERE id=?1", params![target.to_string(), format!("manager_operator_pause:{target}"), super::daemon_settings::c5_autofile_pending_key(target), crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(target).to_string(), hold_on_c5_marker, hold_on_operator_pause, allow_soft_operator_pause, hold_on_resume], |r| r.get(0))?;
         if held {
             return Err(refused("manager_v2_human_or_recovery_owner"));
         }
@@ -971,7 +1245,14 @@ impl Store {
             params![config.project_id.to_string(), config.manager_session_id.to_string(), config.row_version],
             |r| r.get(0),
         )?;
-        Ok(count + retained)
+        // #633: sessions launched by topology executions this manager
+        // requested in the current scope are charged to the same quota.
+        let topology = crate::topology::agent::topology_created_usage(
+            &self.conn,
+            config.project_id,
+            config.row_version,
+        )?;
+        Ok(count + retained + topology)
     }
 
     /// Test fixture: journal a lifecycle operation in an exact state for the
@@ -1179,9 +1460,16 @@ impl Store {
                 source = Some(if let Some(source) = review_source {
                     source.clone()
                 } else {
-                    let source_session = target
-                        .as_ref()
-                        .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+                    let source_session = target.as_ref().ok_or_else(|| {
+                        // `replace_lead` forks from the current lead. An Epic
+                        // with no lead needs `create_session` + `assign_lead`;
+                        // say so instead of a generic source refusal.
+                        if matches!(request.operation, ReplaceLead { .. }) {
+                            refused("manager_v2_replace_lead_requires_lead_use_create_session")
+                        } else {
+                            refused("manager_v2_source_unavailable")
+                        }
+                    })?;
                     self.manager_action_freeze_source(source_session)?
                 });
                 launch = Some(choice.clone());
@@ -1201,10 +1489,10 @@ impl Store {
                     effort: lead.effort.clone(),
                 });
                 if matches!(request.operation, ResumeLead { .. }) {
-                    manager_resume_available(lead)?;
+                    self.manager_resume_available_for_lead(lead)?;
                 }
                 if let RetryLead { launch: choice, .. } = &request.operation {
-                    manager_retry_admissible(lead)?;
+                    self.manager_retry_admissible_for_lead(lead)?;
                     if let Some(choice) = choice {
                         launch = Some(choice.clone());
                     }
@@ -1375,6 +1663,13 @@ impl Store {
             }
             return Ok(receipt);
         }
+        if matches!(
+            &request.operation,
+            ResumeLead { .. } | RetryLead { .. } | ReplaceLead { .. }
+        ) {
+            let epic = action_epic(&request.operation).expect("lead action");
+            self.manager_v2_inherit_lead_pause(&authority.config, epic)?;
+        }
         let admission = self.manager_action_admission(
             &authority,
             &origin,
@@ -1405,20 +1700,27 @@ impl Store {
             ManagerActionOriginV2::OperatingIntent { .. } => None,
         };
         self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',1,?11,?12,?13,?14,?14)", params![operation_id.to_string(),authority.config.project_id.to_string(),authority.config.manager_session_id.to_string(),authority.config.row_version,authority.grant.row_version,actor.map(|v|v.to_string()),request.idempotency_key,fingerprint(&payload)?,ACTION_KIND,serde_json::to_string(&payload)?,id.map(|v|v.to_string()),serde_json::to_string(&receipt)?,due,stamp])?;
-        // Publish manager pause intent at admission, before waiting on an
-        // earlier action or a process guard. Automatic effects re-read it.
-        if let PauseLead {
-            epic_id,
-            expected,
-            reason,
-        } = &request.operation
-        {
+        // Publish stop intent at admission, before waiting on an earlier
+        // action or a process guard. Retirement must close the gap before its
+        // wake-disabling effect; automatic recovery re-reads this pause.
+        let pause = match &request.operation {
+            PauseLead {
+                epic_id,
+                expected,
+                reason,
+            } => Some((*epic_id, expected.lead_session_id, reason.as_str())),
+            RetireLeadContinuations { epic_id, expected } => {
+                Some((*epic_id, expected.lead_session_id, RETIREMENT_PAUSE_REASON))
+            }
+            _ => None,
+        };
+        if let Some((epic_id, lead_session_id, reason)) = pause {
             self.manager_v2_set_lead_pause(
                 &authority.config,
-                *epic_id,
+                epic_id,
                 operation_id,
                 actor,
-                expected.lead_session_id,
+                lead_session_id,
                 reason,
             )?;
         }
@@ -1649,7 +1951,7 @@ impl Store {
         // Retry admission is re-proved at every execution gate: a lead that an
         // operator resumed after admission must not be settled by the retry.
         if let (ManagerActionV2::RetryLead { .. }, Some(lead)) = (&action, target.as_ref()) {
-            manager_retry_admissible(lead)?;
+            self.manager_retry_admissible_for_lead(lead)?;
         }
         let effect_epic = match action
             .housekeeping_session()
@@ -1672,7 +1974,16 @@ impl Store {
                 if !review_evidence_action {
                     self.manager_v2_decision_gate(&authority.config, epic)?;
                 }
-                let (version, paused) = self.manager_v2_lead_pause(&authority.config, epic)?;
+                let (version, paused) = self.manager_v2_action_pause(&authority.config, epic)?;
+                // Retirement stops automatic intent recovery at admission,
+                // including an intent action queued before the retirement.
+                if matches!(
+                    op.context.origin,
+                    ManagerActionOriginV2::OperatingIntent { .. }
+                ) && self.manager_v2_lead_pause(&authority.config, epic)?.1
+                {
+                    return Err(refused("manager_v2_manager_paused"));
+                }
                 let explicit_resume =
                     matches!(op.context.origin, ManagerActionOriginV2::Agent { .. })
                         && matches!(
@@ -1683,10 +1994,12 @@ impl Store {
                         );
                 if paused
                     && (!explicit_resume || version != op.context.manager_pause_version)
+                    && !delegated_cleanup_allowed_during_lead_pause(&action)
                     && !matches!(
                         action,
                         ManagerActionV2::AssignLead { .. }
                             | ManagerActionV2::RetireLeadContinuations { .. }
+                            | ManagerActionV2::ArchiveContainer { .. }
                     )
                 {
                     return Err(refused("manager_v2_manager_paused"));
@@ -1748,11 +2061,30 @@ impl Store {
                     // Retirement supersedes continuation owners and program
                     // declarations only; operator ownership still refuses.
                     self.manager_action_operator_gate(target.id)?;
+                } else if matches!(action, ManagerActionV2::ArchiveSession { .. })
+                    || operator_delegation::delegated_archive_effect(&action)
+                {
+                    self.manager_action_archive_gate(target.id)?;
                 } else {
-                    self.manager_action_human_gate_with_interrupted_resume(
-                        target.id,
-                        allow_interrupted_resume,
-                    )?;
+                    if matches!(op.context.origin, ManagerActionOriginV2::Agent { .. })
+                        && matches!(
+                            action,
+                            ManagerActionV2::ResumeLead { .. }
+                                | ManagerActionV2::RetryLead { .. }
+                                | ManagerActionV2::ReplaceLead { .. }
+                                | ManagerActionV2::AssignLead {
+                                    session_id: Some(_),
+                                    ..
+                                }
+                        )
+                    {
+                        self.manager_restart_human_gate(target.id, allow_interrupted_resume)?;
+                    } else {
+                        self.manager_action_human_gate_with_interrupted_resume(
+                            target.id,
+                            allow_interrupted_resume,
+                        )?;
+                    }
                 }
             }
         } else if let Some(target) = target.as_ref() {
@@ -1925,19 +2257,52 @@ impl Store {
                 ManagerActionV2::ResumeLead { .. }
                     | ManagerActionV2::RetryLead { .. }
                     | ManagerActionV2::ReplaceLead { .. }
+                    | ManagerActionV2::AssignLead {
+                        session_id: Some(_),
+                        ..
+                    }
             )
         {
-            if let Some(config) = self.get_harness_manager(op.project_id)? {
-                if config.manager_session_id == op.manager_session_id
-                    && config.row_version == op.scope_version
-                {
-                    let epic = action_epic(&op.context.request.operation).expect("lead action");
-                    self.manager_v2_clear_lead_pause(
-                        &config,
-                        epic,
-                        op.context.manager_pause_version,
-                        &format!("manager_action:{}", claim.id()),
-                    )?;
+            let actor = match op.context.origin {
+                ManagerActionOriginV2::Agent { caller } => caller,
+                _ => unreachable!(),
+            };
+            let mut cleared_targets = action_fence(&op.context.request.operation)
+                .and_then(|f| f.lead_session_id)
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let ManagerActionV2::AssignLead {
+                session_id: Some(target),
+                ..
+            } = &op.context.request.operation
+            {
+                if !cleared_targets.contains(target) {
+                    cleared_targets.push(*target);
+                }
+            }
+            for old in cleared_targets {
+                if self.clear_soft_operator_pause(old, actor, "manager_restart")? {
+                    if let Some(config) = self.get_harness_manager(op.project_id)? {
+                        self.manager_v2_event(&config, Some(actor), "operator_pause_cleared", &old.to_string(), receipt.row_version, &json!({"action_id":claim.id(),"action":op.context.request.operation.action_kind(),"level":"soft","session_id":old}))?;
+                    }
+                }
+            }
+            if !matches!(
+                op.context.request.operation,
+                ManagerActionV2::AssignLead { .. }
+            ) {
+                if let Some(config) = self.get_harness_manager(op.project_id)? {
+                    if config.manager_session_id == op.manager_session_id
+                        && config.row_version == op.scope_version
+                    {
+                        let epic = action_epic(&op.context.request.operation).expect("lead action");
+                        self.manager_v2_clear_lead_pause(
+                            &config,
+                            epic,
+                            op.context.manager_pause_version,
+                            &format!("manager_action:{}", claim.id()),
+                        )?;
+                    }
                 }
             }
         }
@@ -2070,13 +2435,16 @@ impl Store {
         let outcome = match claim.action() {
             ArchiveSession { .. } => {
                 let changed = self.conn.execute(
-                    "UPDATE sessions SET status='Archived',pending_archive=0,updated_at=?2
+                    "UPDATE sessions SET status='Archived',pending_archive=0,
+                     retry_attempt=COALESCE(max_retries,retry_attempt),updated_at=?2
                      WHERE id=?1 AND status IN ('Completed','Failed','Interrupted')",
                     params![id.to_string(), stamp],
                 )?;
                 if changed != 1 {
                     return Err(refused("manager_v2_session_state_changed"));
                 }
+                Self::resolve_c5_autofile_pending_tx(&tx, id)?;
+                Self::cancel_queued_recovery_for_archive_on(&tx, id)?;
                 "session_archived"
             }
             RestoreSession { .. } => {
@@ -2168,9 +2536,16 @@ impl Store {
         for (member, was_archived) in &members {
             if !*was_archived {
                 self.conn.execute(
-                    "UPDATE sessions SET status='Archived',lead_session_id=NULL,updated_at=?2 WHERE id=?1 AND status IN ('Completed','Failed','Interrupted')",
+                    "UPDATE sessions SET status='Archived',lead_session_id=NULL,
+                     retry_attempt=COALESCE(max_retries,retry_attempt),updated_at=?2
+                     WHERE id=?1 AND status IN ('Completed','Failed','Interrupted')",
                     params![member.to_string(), stamp],
                 )?;
+                self.conn.execute(
+                    "DELETE FROM daemon_settings WHERE key=?1",
+                    [super::daemon_settings::c5_autofile_pending_key(*member)],
+                )?;
+                Self::cancel_queued_recovery_for_archive_on(&self.conn, *member)?;
             }
         }
         Ok(transitioned)

@@ -105,6 +105,7 @@ pub struct ClassificationInput {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn verdict_roundtrip_all_variants() {
         for v in [
@@ -119,12 +120,14 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn verdict_pascal_case_wire_format() {
         let json = serde_json::to_string(&Verdict::StalledCheckTeam).unwrap();
         assert_eq!(json, "\"StalledCheckTeam\"");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn classifier_verdict_tolerates_missing_optional_fields() {
         let raw = r#"{"verdict":"Finished","confidence":0.95}"#;
@@ -135,6 +138,7 @@ mod tests {
         assert_eq!(v.reasoning, "");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn classifier_verdict_full_payload() {
         let raw = r#"{
@@ -153,6 +157,7 @@ mod tests {
         assert!(v.reasoning.contains("mid-task"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn unknown_verdict_string_rejected() {
         let raw = r#"{"verdict":"Maybe","confidence":0.5}"#;
@@ -160,6 +165,7 @@ mod tests {
         assert!(r.is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn nudge_action_labels() {
         assert_eq!(
@@ -179,6 +185,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn verdict_str_labels() {
         assert_eq!(Verdict::Finished.as_str(), "finished");

@@ -96,12 +96,13 @@ class ProvisionalMigrationTest(unittest.TestCase):
         self.write(worktree, RENUMBER.STORE, store)
         tests = self.base_tests().replace("REWIND: i32 = 129", "REWIND: i32 = 130")
         self.write(worktree, "crates/rsid/src/store/tests.rs", tests)
-        inventory = RENUMBER.guard.inventory({
-            RENUMBER.STORE: store,
-            "crates/rsid/src/store/cohort_settlement.rs": "",
-            "crates/rsid/src/store/tests.rs": tests,
-            helper: helper_text,
-        })
+        base_manifest = RENUMBER.revision_inventory(self.repo, self.base)
+        files = {name: (worktree / name).read_text()
+                 for name in RENUMBER.guard.tracked_source_paths(base_manifest)}
+        files.update({RENUMBER.STORE: store,
+                      "crates/rsid/src/store/tests.rs": tests,
+                      helper: helper_text})
+        inventory = RENUMBER.guard.inventory(files)
         self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
         files = [
             (RENUMBER.STORE, store, RENUMBER.STORE, [
@@ -194,6 +195,14 @@ class ProvisionalMigrationTest(unittest.TestCase):
                     self.repo, self.base, unit["source"], final, proof_path)
         RENUMBER.guard.validate_append_only(RENUMBER.revision_inventory(self.repo, self.base),
                                             manifest)
+
+    def test_build_merge_uses_private_committer_identity(self):
+        source = self.source("alpha")
+        self.git(self.repo, "config", "--unset", "user.name")
+        self.git(self.repo, "config", "--unset", "user.email")
+        _, candidate = self.candidate(source, self.base)
+        self.assertEqual(self.git(self.repo, "show", "-s", "--format=%cn <%ce>", candidate),
+                         "rsi rolling landing <rsi-rolling-land@rsi.invalid>")
 
     def test_undeclared_version_site_refuses(self):
         source = self.source("alpha", "const HIDDEN_V130: i32 = 130;\n")

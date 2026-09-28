@@ -171,8 +171,18 @@ static CLAUDE_THREE_LEVEL_EFFORT_LADDER: &[&str] = &["low", "medium", "high"];
 // These Codex ladders and defaults mirror the installed CLI bundled catalog,
 // not the OpenAI API's model catalog.
 static CODEX_ULTRA_EFFORT_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+static CODEX_FIVE_LEVEL_EFFORT_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 static CODEX_LEGACY_EFFORT_LADDER: &[&str] = &["low", "medium", "high", "xhigh"];
 static NO_EFFORT_LADDER: &[&str] = &[];
+
+/// Bedrock's Responses endpoint names OpenAI models through inference profile
+/// IDs. The underlying Codex model retains the same effort capabilities.
+fn codex_model_slug(model_id: &str) -> &str {
+    model_id
+        .strip_prefix("openai.")
+        .or_else(|| model_id.split_once(".openai.").map(|(_, slug)| slug))
+        .unwrap_or(model_id)
+}
 
 /// Returns the ordered effort levels the model supports for `--effort`.
 pub fn effort_ladder(model_id: &str) -> &'static [&'static str] {
@@ -199,9 +209,11 @@ pub fn effort_ladder(model_id: &str) -> &'static [&'static str] {
 /// model supports no effort. This lets the CLI validate explicit custom or
 /// future model IDs while still rejecting invalid pairs for known models.
 pub fn known_codex_effort_ladder(model_id: &str) -> Option<&'static [&'static str]> {
-    match model_id.to_ascii_lowercase().as_str() {
-        "gpt-6-astra" | "gpt-6-sol" => Some(CODEX_ULTRA_EFFORT_LADDER),
-        "gpt-6-luna" => Some(CODEX_LEGACY_EFFORT_LADDER),
+    match codex_model_slug(model_id).to_ascii_lowercase().as_str() {
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => {
+            Some(CODEX_ULTRA_EFFORT_LADDER)
+        }
+        "gpt-6-luna" | "gpt-5.6-luna" => Some(CODEX_FIVE_LEVEL_EFFORT_LADDER),
         // Retain legacy capability knowledge for persisted hidden models.
         "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.2" | "codex-auto-review" => {
             Some(CODEX_LEGACY_EFFORT_LADDER)
@@ -273,13 +285,13 @@ pub fn effort_level_count(model_id: &str) -> u8 {
 /// - Sonnet ≥ 5.0 → `"xhigh"`
 /// - Sonnet ≥ 4.6 → `"high"`
 /// - Fable        → `"max"`
-/// - GPT-6 Astra/Sol → `"low"`
+/// - GPT-6 Astra and GPT-5.6 Sol → `"low"`
 /// - other GPT-5 Codex/OpenAI reasoning models → `"medium"`
 pub fn default_effort_level(model_id: &str) -> Option<&'static str> {
     if is_codex_reasoning_model(model_id) {
         return if matches!(
-            model_id.to_ascii_lowercase().as_str(),
-            "gpt-6-astra" | "gpt-6-sol"
+            codex_model_slug(model_id).to_ascii_lowercase().as_str(),
+            "gpt-6-astra" | "gpt-5.6-sol"
         ) {
             Some("low")
         } else {
@@ -298,7 +310,7 @@ pub fn default_effort_level(model_id: &str) -> Option<&'static str> {
 }
 
 fn is_codex_reasoning_model(model_id: &str) -> bool {
-    let lower = model_id.to_ascii_lowercase();
+    let lower = codex_model_slug(model_id).to_ascii_lowercase();
     lower.starts_with("gpt-6")
         || lower.starts_with("gpt-5")
         || lower.starts_with("codex-auto-review")
@@ -590,7 +602,10 @@ mod tests {
         assert_eq!(effort_ladder("claude-opus-4-5"), three_levels);
         assert_eq!(effort_ladder("gpt-6-astra"), codex_ultra_levels);
         assert_eq!(effort_ladder("gpt-6-sol"), codex_ultra_levels);
-        assert_eq!(effort_ladder("gpt-6-luna"), codex_legacy_levels);
+        assert_eq!(effort_ladder("gpt-6-luna"), five_levels);
+        assert_eq!(effort_ladder("gpt-5.6-sol"), codex_ultra_levels);
+        assert_eq!(effort_ladder("gpt-5.6-terra"), codex_ultra_levels);
+        assert_eq!(effort_ladder("gpt-5.6-luna"), five_levels);
         assert_eq!(effort_ladder("codex-auto-review"), codex_legacy_levels);
         // This legacy GPT-5 fallback remains available to the UI, but it is
         // absent from the installed bundled catalog and must not be daemon-known.
@@ -612,6 +627,21 @@ mod tests {
         let mut effort = Some("ultra".to_string());
         reconcile_effort("gpt-5.5", &mut effort);
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn bedrock_profile_effort_uses_underlying_model_capabilities() {
+        let sol = "global.openai.gpt-5.6-sol";
+        let luna = "us.openai.gpt-6-luna";
+        assert_eq!(effort_ladder(sol), effort_ladder("gpt-5.6-sol"));
+        assert_eq!(default_effort_level(sol), Some("low"));
+        assert!(supports_effort(sol, "ultra"));
+        assert!(supports_effort(luna, "max"));
+        assert!(!supports_effort(luna, "ultra"));
+        assert_eq!(
+            known_codex_effort_ladder(luna),
+            known_codex_effort_ladder("gpt-6-luna")
+        );
     }
 
     #[test]
@@ -652,7 +682,7 @@ mod tests {
         // Codex/OpenAI reasoning models: current variants are model-specific.
         assert_eq!(effort_level_count("gpt-6-astra"), 6);
         assert_eq!(effort_level_count("gpt-6-sol"), 6);
-        assert_eq!(effort_level_count("gpt-6-luna"), 4);
+        assert_eq!(effort_level_count("gpt-6-luna"), 5);
         assert_eq!(effort_level_count("gpt-5.5"), 4);
         assert_eq!(effort_level_count("gpt-5.4-mini"), 4);
         assert_eq!(effort_level_count("gpt-5.3-codex"), 4);
@@ -673,7 +703,7 @@ mod tests {
         assert_eq!(default_effort_level("claude-sonnet-5"), Some("xhigh"));
         assert_eq!(default_effort_level("claude-sonnet-5-9"), Some("xhigh"));
         assert_eq!(default_effort_level("gpt-6-astra"), Some("low"));
-        assert_eq!(default_effort_level("gpt-6-sol"), Some("low"));
+        assert_eq!(default_effort_level("gpt-6-sol"), Some("medium"));
         assert_eq!(default_effort_level("gpt-6-luna"), Some("medium"));
         assert_eq!(default_effort_level("gpt-5.5"), Some("medium"));
         assert_eq!(default_effort_level("gpt-5.3-codex"), Some("medium"));

@@ -397,6 +397,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_spawn_and_shutdown() {
         let (_dir, store) = open_test_store();
@@ -405,6 +406,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_enqueue_via_handle() {
         let (_dir, store) = open_test_store();
@@ -436,6 +438,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_wake_triggers_processing() {
         let (_dir, store) = open_test_store();
@@ -473,6 +476,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_noop_processor_completes() {
         let (_dir, store) = open_test_store();
@@ -499,6 +503,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn test_drain_on_shutdown() {
         let (_dir, store) = open_test_store();

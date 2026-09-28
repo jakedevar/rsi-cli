@@ -1504,6 +1504,7 @@ mod tests {
             .await
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn non_lead_emitter_silently_dropped() {
         let (store, _td) = open_store();
@@ -1537,6 +1538,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no spawn request should be sent");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn explicit_pioneer_model_is_rejected_only_when_cached_catalog_excludes_it() {
         assert!(unavailable_explicit_pioneer_model(Some("vendor/model"), Some(true)).is_none());
@@ -1589,6 +1591,7 @@ mod tests {
         invocation_id
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn escalating_effort_spawn_is_rejected_not_enqueued() {
         let (store, _td) = open_store();
@@ -1647,6 +1650,7 @@ mod tests {
 
     /// Issue #243: an explicit effort outside the selected model's ladder must
     /// be refused at the spawn boundary instead of being persisted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn explicit_effort_outside_model_ladder_is_rejected_not_enqueued() {
         let (store, _td) = open_store();
@@ -1695,6 +1699,7 @@ mod tests {
     }
 
     /// The guard must not over-reject: a supported explicit effort still spawns.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn explicit_supported_effort_still_enqueues() {
         let (store, _td) = open_store();
@@ -1729,6 +1734,7 @@ mod tests {
 
     /// Fail-open: a model RSI has no authoritative ladder for keeps the CLI as
     /// the validator, so an effort we cannot refute is not rejected.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn effort_for_model_without_authoritative_ladder_is_not_rejected() {
         let (store, _td) = open_store();
@@ -1771,6 +1777,7 @@ mod tests {
     /// whose own row already persisted an undefined effort (#243, session
     /// 5faae71c) must still be able to spawn: the unusable inherited value is
     /// dropped for the child rather than rejecting the spawn.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn inherited_effort_unsupported_by_child_model_is_dropped_not_rejected() {
         let (store, _td) = open_store();
@@ -1804,6 +1811,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn non_escalating_effort_spawn_still_enqueues() {
         let (store, _td) = open_store();
@@ -1839,6 +1847,7 @@ mod tests {
         assert_eq!(sent.config.effort.as_deref(), Some("xhigh"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn escalation_reject_reason_renders_actionable_payload() {
         let reason = SpawnRejectReason::OrchestrationEscalationDenied {
@@ -1867,6 +1876,7 @@ mod tests {
         assert!(display.contains("high"), "display: {display}");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn escalation_precheck_missing_lineage_row_is_rejected_not_dropped() {
         let (store, _td) = open_store();
@@ -1915,6 +1925,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no spawn request should be sent");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn valid_directive_launches_child_with_correct_parent_id() {
         let (store, _td) = open_store();
@@ -1956,6 +1967,7 @@ mod tests {
         assert_eq!(req.kind, SessionKind::Task);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn child_launch_config_prompt_is_query_body_only_before_launch_assembly() {
         let (store, _td) = open_store();
@@ -1986,6 +1998,7 @@ mod tests {
         assert!(req.config.system_prompt.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_uses_requested_cross_provider_and_persists_it() {
         let (store, _td) = open_store();
@@ -2036,6 +2049,7 @@ mod tests {
         assert_eq!(durable.request.model.as_deref(), Some("claude-sonnet-5"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn directive_spawn_uses_requested_cross_provider() {
         let (store, _td) = open_store();
@@ -2066,6 +2080,7 @@ mod tests {
         assert_eq!(queued.config.model.as_deref(), Some("claude-sonnet-5"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn docregblock_spawn_enqueues_query_body_only_for_claude_and_antigravity() {
         let block = "<docregblock>\n\
@@ -2109,6 +2124,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn duplicate_directive_block_spawns_once() {
         let (store, _td) = open_store();
@@ -2150,6 +2166,7 @@ worker prompt body\n\
     /// the emitter is ordinary (unsandboxed). The fork SOURCE is then
     /// resolved by `launch_agent_child` from the authenticated emitter
     /// custody; neither funnel can reach the canonical rev-parse.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn h1_v83_spawn_child_fork_custody_directive_and_agent_paths_request_fork_spec() {
         let (store, _td) = open_store();
@@ -2205,6 +2222,7 @@ worker prompt body\n\
     /// provider, model, effort, project, sandbox) is unchanged. The
     /// `workflow_id` topology is no longer copied — it now lives on the Epic
     /// and is resolved via `effective_topology_with_override` on read.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn child_inherits_runtime_context_from_lead() {
         let (store, _td) = open_store();
@@ -2281,6 +2299,7 @@ worker prompt body\n\
     /// kill-the-copy invariant on the spawn config, this test confirms that
     /// the persisted child's `workflow_id_override` stays `None` and the
     /// `effective_topology` walk reaches the Epic over the parent_id chain.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn child_inherits_topology_from_epic_via_effective_topology() {
         let (store, _td) = open_store();
@@ -2333,6 +2352,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn depth_limit_enforced() {
         // Build a chain: root <- epic <- a <- b <- c <- emitter
@@ -2378,6 +2398,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn token_bucket_caps_burst() {
         let (store, _td) = open_store();
@@ -2445,6 +2466,7 @@ worker prompt body\n\
         assert_eq!(count, TOKEN_BUCKET_CAPACITY as usize);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn emitter_with_no_parent_rejected_as_not_lead() {
         let (store, _td) = open_store();
@@ -2469,6 +2491,7 @@ worker prompt body\n\
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn container_emitter_rejected() {
         let (store, _td) = open_store();
@@ -2499,6 +2522,7 @@ worker prompt body\n\
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn missing_emitter_rejected() {
         let (store, _td) = open_store();
@@ -2520,6 +2544,7 @@ worker prompt body\n\
     /// AC4i: Spawn coordinator reads emitter's tag set and populates
     /// LaunchConfig.tags. When the emitter carries ["ci", "infra"],
     /// the child's LaunchConfig.tags must match.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn child_inherits_emitter_tags() {
         let (store, _td) = open_store();
@@ -2643,6 +2668,7 @@ worker prompt body\n\
         (epic_id, emitter_id)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn binds_node_and_auto_increments_iteration() {
         // No prior sessions → auto-increment: 0 + 1 = 1.
@@ -2668,6 +2694,7 @@ worker prompt body\n\
         assert_eq!(req.config.topology_iteration, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn binds_node_with_explicit_iteration() {
         let (store, _td) = open_store();
@@ -2691,6 +2718,7 @@ worker prompt body\n\
         assert_eq!(req.config.topology_iteration, 5);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn rejects_kind_mismatch() {
         let (store, _td) = open_store();
@@ -2719,6 +2747,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn rejects_unsatisfied_prereqs() {
         let (store, _td) = open_store();
@@ -2751,6 +2780,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn rejects_iteration_cap_global() {
         let (store, _td) = open_store();
@@ -2780,6 +2810,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn rejects_iteration_cap_node() {
         let (store, _td) = open_store();
@@ -2805,6 +2836,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn unbound_spawn_no_topology() {
         // Epic has no topology (workflow_id = None), directive has no node → unbound spawn.
@@ -2827,6 +2859,7 @@ worker prompt body\n\
         assert_eq!(req.config.topology_iteration, 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn rejects_node_on_topologyless_epic() {
         // Epic has no topology, directive names a node → NoTopologyOnEpic.
@@ -2855,6 +2888,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn node_absent_from_topology_rejected() {
         // Epic has a topology but the directive names a node not in it.
@@ -2899,6 +2933,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_exact_replay_returns_reserved_ids_without_reenqueue() {
         let (store, _td) = open_store();
@@ -2972,6 +3007,7 @@ worker prompt body\n\
         assert_eq!(durable.epic_spawn_ordinal, 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_changed_replay_conflicts() {
         let (store, _td) = open_store();
@@ -3031,6 +3067,7 @@ worker prompt body\n\
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_provider_changed_replay_conflicts() {
         let (store, _td) = open_store();
@@ -3077,6 +3114,7 @@ worker prompt body\n\
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_launch_queue_failure_settles_typed_failed_replay() {
         let (store, _td) = open_store();
@@ -3131,6 +3169,7 @@ worker prompt body\n\
         ));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_reservation_error_refunds_token_without_store_lock_deadlock() {
         let (store, _td) = open_store();
@@ -3202,6 +3241,7 @@ worker prompt body\n\
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_persists_queued_before_main_loop_publication() {
         let (store, _td) = open_store();
@@ -3276,6 +3316,7 @@ worker prompt body\n\
         assert!(rx.try_recv().is_err(), "restart must enqueue exactly once");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_restart_requeues_incomplete_reservation_once() {
         let (store, _td) = open_store();
@@ -3349,6 +3390,7 @@ worker prompt body\n\
         assert!(restart_rx.try_recv().is_err());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn agent_spawn_child_restart_accepts_legacy_request_json_fingerprint() {
         let (store, _td) = open_store();
@@ -3433,6 +3475,7 @@ worker prompt body\n\
         assert!(rx.try_recv().is_err(), "legacy replay must not re-enqueue");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_spawn_child_concurrent_identical_requests_enqueue_once() {
         let (store, _td) = open_store();
@@ -3493,6 +3536,7 @@ worker prompt body\n\
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn successor_dispatch_hints_are_bounded_and_coalesced() {
         let (spawn_tx, _spawn_rx) = mpsc::channel(1);

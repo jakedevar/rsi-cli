@@ -300,12 +300,20 @@ impl AgentManagerInboxRequestV1 {
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if passes a reference
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerSendRequestV1 {
     pub epic_id: Uuid,
     pub message: String,
     pub idempotency_key: String,
+    /// Informational mail is delivered and audited without reserving a reply slot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub informational: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +322,9 @@ pub struct AgentManagerReplyRequestV1 {
     pub request_id: Uuid,
     pub message: String,
     pub idempotency_key: String,
+    /// Keep the request active after this reply instead of settling it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub still_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +459,8 @@ pub struct HarnessManagerMessageV1 {
     pub message: String,
     pub created_at: DateTime<Utc>,
     pub replied: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub informational: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readdressed_from: Option<Uuid>,
     /// #656: the standing root request of a rollover successor, set on the
@@ -561,6 +574,15 @@ pub struct ManagerWorkViewStageV1 {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Current review assignment for the Work's recorded source, without the
+/// manager-only review history or reviewer custody details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerWorkViewReviewV1 {
+    pub state: String,
+    pub verdict: Option<String>,
+    pub blocking_finding_count: i64,
+}
+
 /// One live work item of the caller's Epic. Stage notes, evidence paths and
 /// acceptance digests stay manager-facing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,7 +597,12 @@ pub struct ManagerWorkViewWorkV1 {
     pub source_session_id: Option<Uuid>,
     pub source_commit: Option<String>,
     pub stages: Vec<ManagerWorkViewStageV1>,
+    /// Kept for existing callers; equivalent to `source_accepted`.
     pub accepted: bool,
+    pub source_accepted: bool,
+    pub source_acceptance_recorded: bool,
+    pub evidence_state: String,
+    pub current_review: Option<ManagerWorkViewReviewV1>,
     pub integrated: bool,
 }
 

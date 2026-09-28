@@ -2,6 +2,7 @@
 //! response parsing into structured observations.
 
 use crate::bus::EventBus;
+use crate::memory::worker::MemoryWorkContext;
 use chrono::Utc;
 use rsi_common::types::{ConversationEvent, Observation, ObservationLevel};
 use uuid::Uuid;
@@ -134,6 +135,7 @@ pub async fn extract_observations(
     max_input_chars: usize,
     runtime_config: &Arc<RuntimeConfig>,
 ) -> Result<Vec<Observation>> {
+    MemoryWorkContext::check_current()?;
     if events.len() < min_events {
         tracing::debug!(
             session_id = %session_id,
@@ -211,19 +213,49 @@ async fn call_llm(
     prompt: &str,
     runtime_config: &Arc<RuntimeConfig>,
 ) -> Result<String> {
+    MemoryWorkContext::check_current()?;
     let local_model = runtime_config.memory_model_local.read().clone();
     let fallback_model = runtime_config.memory_model_fallback.read().clone();
     let http = reqwest::Client::new();
-    match generate_ollama(&http, prompt, &local_model).await {
-        Ok(raw) => return Ok(raw),
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "Ollama observation extraction failed, falling back to local model"
-            );
+    local_then_fallback(generate_ollama(&http, prompt, &local_model), || {
+        call_fallback(
+            store,
+            event_bus,
+            session_id,
+            project_id,
+            prompt,
+            runtime_config,
+            fallback_model,
+        )
+    })
+    .await
+}
+
+async fn local_then_fallback<F: std::future::Future<Output = Result<String>>>(
+    local: impl std::future::Future<Output = Result<String>>,
+    fallback: impl FnOnce() -> F,
+) -> Result<String> {
+    match MemoryWorkContext::interruptible(local).await {
+        Ok(raw) => Ok(raw),
+        Err(error) => {
+            // Never turn local cancellation into another model admission.
+            MemoryWorkContext::check_current()?;
+            tracing::debug!(%error, "Ollama observation extraction failed, falling back to local model");
+            fallback().await
         }
     }
+}
 
+async fn call_fallback(
+    store: &Arc<Mutex<Store>>,
+    event_bus: &Arc<EventBus>,
+    session_id: Uuid,
+    project_id: Option<Uuid>,
+    prompt: &str,
+    runtime_config: &Arc<RuntimeConfig>,
+    fallback_model: String,
+) -> Result<String> {
+    MemoryWorkContext::check_current()?;
     let fallback_provider = *runtime_config.memory_model_fallback_provider.read();
     let fallback_base_url = runtime_config.memory_model_fallback_base_url.read().clone();
     let fallback_api_key = runtime_config.memory_model_fallback_api_key.read().clone();
@@ -341,8 +373,61 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[tokio::test(start_paused = true)]
+    async fn live_memory_off_local_cancellation_never_admits_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        let context = MemoryWorkContext::new(
+            Arc::clone(&runtime),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let started = tokio::sync::Notify::new();
+        let fallbacks = AtomicUsize::new(0);
+        let execution = context.clone().scope(local_then_fallback(
+            async {
+                started.notify_one();
+                std::future::pending::<Result<String>>().await
+            },
+            || async {
+                fallbacks.fetch_add(1, Ordering::Relaxed);
+                Ok("fallback".into())
+            },
+        ));
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = started.notified() => {},
+            result = &mut execution => panic!("local future must block: {result:?}"),
+        }
+        runtime.memory_enabled.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+                .await
+                .unwrap(),
+            Err(DaemonError::ChannelClosed)
+        ));
+        runtime.memory_enabled.store(true, Ordering::Relaxed);
+        assert!(
+            context.check().is_err(),
+            "ON must not resurrect this cancelled extraction"
+        );
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 0);
+        // Explicit callers have no Memory scope and retain their fallback behavior.
+        runtime.memory_enabled.store(false, Ordering::Relaxed);
+        let explicit = local_then_fallback(async { Err(DaemonError::ChannelClosed) }, || async {
+            fallbacks.fetch_add(1, Ordering::Relaxed);
+            Ok("explicit fallback".into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(explicit, "explicit fallback");
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+    }
+
     // --- Prompt construction tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_build_extraction_prompt_contains_key_elements() {
         let prompt = build_extraction_prompt("User: hello\nAssistant: hi", "fix bug");
@@ -352,6 +437,7 @@ mod tests {
         assert!(prompt.contains("JSON array"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_build_extraction_prompt_truncates_long_query() {
         let long_query = "a".repeat(500);
@@ -363,18 +449,21 @@ mod tests {
 
     // --- Truncation tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_truncate_session_text_short() {
         let text = "short text";
         assert_eq!(truncate_session_text(text, 100), text);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_truncate_session_text_at_limit() {
         let text = "exactly ten";
         assert_eq!(truncate_session_text(text, 11), text);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_truncate_session_text_over_limit() {
         let text = "hello world this is long";
@@ -382,6 +471,7 @@ mod tests {
         assert_eq!(truncated, "hello world");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_truncate_session_text_unicode_boundary() {
         // Multi-byte unicode: each char is 3 bytes
@@ -392,6 +482,7 @@ mod tests {
 
     // --- Parsing tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_valid_json_array() {
         let raw = r#"["Observation one", "Observation two", "Observation three"]"#;
@@ -402,6 +493,7 @@ mod tests {
         assert_eq!(obs[2], "Observation three");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_json_array_with_empty_strings() {
         let raw = r#"["Good observation", "", "Another one", "  "]"#;
@@ -411,6 +503,7 @@ mod tests {
         assert_eq!(obs[1], "Another one");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_embedded_json_array() {
         let raw = r#"Here are the observations:
@@ -421,6 +514,7 @@ Hope that helps!"#;
         assert_eq!(obs[0], "First fact");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_newline_separated_fallback() {
         let raw = "Observation one\nObservation two\nObservation three";
@@ -429,6 +523,7 @@ Hope that helps!"#;
         assert_eq!(obs[0], "Observation one");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_bullet_list_fallback() {
         let raw = "- First observation\n- Second observation\n- Third observation";
@@ -438,6 +533,7 @@ Hope that helps!"#;
         assert_eq!(obs[1], "Second observation");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_numbered_list_fallback() {
         let raw = "1. First observation\n2. Second observation\n3. Third observation";
@@ -447,6 +543,7 @@ Hope that helps!"#;
         assert_eq!(obs[1], "Second observation");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_asterisk_list_fallback() {
         let raw = "* First\n* Second";
@@ -455,12 +552,14 @@ Hope that helps!"#;
         assert_eq!(obs[0], "First");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_empty_response() {
         assert!(parse_observations_response("").is_empty());
         assert!(parse_observations_response("   ").is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn test_parse_malformed_json() {
         // Invalid JSON should fall through to line-based parsing
@@ -472,6 +571,7 @@ Hope that helps!"#;
 
     // --- extract_observations threshold tests ---
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_extract_below_min_events_returns_empty() {
         let events = vec![make_event(1, EventType::Message, Some(Role::User), "hello")];
@@ -493,6 +593,7 @@ Hope that helps!"#;
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_extract_empty_events_returns_empty() {
         let rt_cfg = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
@@ -513,6 +614,7 @@ Hope that helps!"#;
         assert!(result.is_empty());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn test_extract_no_message_events_returns_empty() {
         let events = vec![
@@ -545,6 +647,7 @@ Hope that helps!"#;
     // (hard-coded `num_predict: 1024`). If either this file's helper or
     // `ollama_client::build_body` drifts, the snapshot fails.
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn extractor_body_matches_pinned_snapshot() {
         let opts = crate::ollama_client::GenerateOptions {
@@ -585,6 +688,7 @@ mod http_tests {
     // `TEST_OLLAMA_URL_LOCK` is intentionally held across awaits — it exists to
     // serialise env-var mutation across this binary's HTTP tests.
     #[allow(clippy::await_holding_lock)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn extractor_generate_ollama_posts_expected_body_shape() {
         let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();

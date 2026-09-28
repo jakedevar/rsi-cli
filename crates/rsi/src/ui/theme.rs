@@ -654,38 +654,38 @@ const SAPHIRE_PALETTE: CustomPalette = CustomPalette {
     raw_session_magenta: rgb(231, 126, 184),
 };
 
-const DEVIL_PALETTE: CustomPalette = CustomPalette {
-    rosewater: rgb(240, 226, 228),
-    flamingo: rgb(255, 127, 138),
-    pink: rgb(255, 87, 133),
-    mauve: rgb(174, 107, 242),
-    red: rgb(241, 45, 66),
-    maroon: rgb(204, 28, 54),
-    peach: rgb(232, 133, 120),
-    yellow: rgb(230, 164, 110),
+const DAMON_PALETTE: CustomPalette = CustomPalette {
+    rosewater: rgb(245, 231, 233),
+    flamingo: rgb(255, 103, 116),
+    pink: rgb(255, 53, 100),
+    mauve: rgb(177, 105, 230),
+    red: rgb(255, 30, 48),
+    maroon: rgb(205, 12, 37),
+    peach: rgb(244, 104, 91),
+    yellow: rgb(232, 176, 95),
     green: rgb(103, 199, 133),
     teal: rgb(78, 198, 187),
     sky: rgb(104, 192, 235),
     sapphire: rgb(72, 165, 225),
     blue: rgb(113, 138, 235),
     lavender: rgb(203, 186, 255),
-    text: rgb(238, 232, 233),
-    subtext1: rgb(212, 203, 205),
-    subtext0: rgb(181, 170, 173),
-    overlay2: rgb(156, 144, 147),
-    overlay1: rgb(134, 123, 126),
-    overlay0: rgb(114, 104, 107),
-    surface2: rgb(73, 28, 37),
-    surface1: rgb(52, 18, 26),
-    surface0: rgb(36, 12, 18),
+    text: rgb(242, 237, 238),
+    subtext1: rgb(213, 204, 206),
+    subtext0: rgb(179, 168, 171),
+    overlay2: rgb(157, 146, 148),
+    overlay1: rgb(126, 117, 119),
+    overlay0: rgb(91, 84, 86),
+    surface2: rgb(51, 48, 49),
+    surface1: rgb(31, 29, 30),
+    surface0: rgb(17, 16, 16),
     base: rgb(0, 0, 0),
-    mantle: rgb(0, 0, 0),
+    mantle: rgb(5, 5, 5),
     crust: rgb(0, 0, 0),
     tier_base: rgb(0, 0, 0),
-    tier_panel: rgb(36, 12, 18),
-    tier_raised: rgb(52, 18, 26),
-    tier_selected: rgb(72, 25, 34),
-    dark_purple: rgb(143, 93, 220),
+    tier_panel: rgb(16, 15, 15),
+    tier_raised: rgb(29, 27, 28),
+    tier_selected: rgb(59, 9, 17),
+    dark_purple: rgb(156, 92, 220),
     group_powder_blue: rgb(174, 200, 230),
     epic_purple: rgb(182, 134, 250),
     story_yellow_orange: rgb(230, 164, 110),
@@ -875,10 +875,10 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
     ),
     ThemeDefinition::new(
         "d-is-for-devil",
-        "D. is for Devil",
-        &DEVIL_PALETTE,
+        "D. is for Daemon",
+        &DAMON_PALETTE,
         3,
-        rgb(241, 45, 66),
+        rgb(255, 30, 48),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     ),
@@ -1776,8 +1776,9 @@ pub(crate) fn test_rgb_channels(color: Color) -> Option<(u8, u8, u8)> {
 }
 
 // Overlay / popup
+/// Shared modal frame color, aligned with the session-detail divider.
 pub fn overlay_border() -> Color {
-    active_primary_color()
+    surface2()
 }
 pub fn overlay_title() -> Color {
     text()
@@ -1887,6 +1888,33 @@ pub fn rainbow_palette() -> Vec<Color> {
     ]
 }
 
+/// Resolve a colour to sRGB when it has a known value (RGB or basic named).
+fn to_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        // Named colors resolved to approximate sRGB values.
+        Color::Red => Some((255, 0, 0)),
+        Color::Green => Some((0, 128, 0)),
+        Color::Blue => Some((0, 0, 255)),
+        Color::Yellow => Some((255, 255, 0)),
+        Color::Cyan => Some((0, 255, 255)),
+        Color::Magenta => Some((255, 0, 255)),
+        Color::White => Some((255, 255, 255)),
+        Color::Black => Some((0, 0, 0)),
+        _ => None,
+    }
+}
+
+/// Channel-wise blend `a` → `b` at `t` (clamped to `0.0..=1.0`), or `None`
+/// when either colour has no resolvable RGB value (`Reset`, indexed, …).
+pub fn blend_rgb(a: Color, b: Color, t: f32) -> Option<Color> {
+    let (ar, ag, ab) = to_rgb(a)?;
+    let (br, bg, bb) = to_rgb(b)?;
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Some(Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb)))
+}
+
 /// Linearly interpolate between two ratatui colors.
 ///
 /// - `t <= 0.0` returns `a`.
@@ -1901,22 +1929,6 @@ pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     }
     if t >= 1.0 {
         return b;
-    }
-
-    fn to_rgb(c: Color) -> Option<(u8, u8, u8)> {
-        match c {
-            Color::Rgb(r, g, b) => Some((r, g, b)),
-            // Named colors resolved to approximate sRGB values.
-            Color::Red => Some((255, 0, 0)),
-            Color::Green => Some((0, 128, 0)),
-            Color::Blue => Some((0, 0, 255)),
-            Color::Yellow => Some((255, 255, 0)),
-            Color::Cyan => Some((0, 255, 255)),
-            Color::Magenta => Some((255, 0, 255)),
-            Color::White => Some((255, 255, 255)),
-            Color::Black => Some((0, 0, 0)),
-            _ => None,
-        }
     }
 
     match (to_rgb(a), to_rgb(b)) {
@@ -1950,7 +1962,7 @@ pub fn overlay_block() -> ratatui::widgets::Block<'static> {
         .style(Style::default().bg(overlay_bg()))
 }
 
-/// Overlay block with plain (square-corner) borders for TaskRabbit popups (teal border).
+/// Overlay block with plain (square-corner) borders for TaskRabbit popups.
 pub fn taskrabbit_overlay_block() -> ratatui::widgets::Block<'static> {
     use ratatui::style::Style;
     use ratatui::widgets::{Block, BorderType, Borders};
@@ -1958,11 +1970,11 @@ pub fn taskrabbit_overlay_block() -> ratatui::widgets::Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(taskrabbit_border()))
+        .border_style(Style::default().fg(overlay_border()))
         .style(Style::default().bg(overlay_bg()))
 }
 
-/// Teal border color for TaskRabbit overlays.
+/// Teal accent color for TaskRabbit overlays.
 pub fn taskrabbit_border() -> Color {
     teal()
 }
@@ -1972,7 +1984,7 @@ pub fn taskrabbit_title() -> Color {
     teal()
 }
 
-/// Dimmed overlay block for unfocused input overlays in the stacked view.
+/// Overlay block for unfocused input overlays in the stacked view.
 pub fn unfocused_overlay_block() -> ratatui::widgets::Block<'static> {
     use ratatui::style::Style;
     use ratatui::widgets::{Block, BorderType, Borders};
@@ -1980,11 +1992,11 @@ pub fn unfocused_overlay_block() -> ratatui::widgets::Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(surface1()))
+        .border_style(Style::default().fg(overlay_border()))
         .style(Style::default().bg(overlay_bg()))
 }
 
-/// White/gray overlay block with plain (square-corner) borders for Blank popups (paper-like).
+/// Overlay block with plain (square-corner) borders for Blank popups (paper-like).
 pub fn blank_overlay_block() -> ratatui::widgets::Block<'static> {
     use ratatui::style::Style;
     use ratatui::widgets::{Block, BorderType, Borders};
@@ -1992,11 +2004,11 @@ pub fn blank_overlay_block() -> ratatui::widgets::Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(blank_border()))
+        .border_style(Style::default().fg(overlay_border()))
         .style(Style::default().bg(overlay_bg()))
 }
 
-/// Light gray border color for Blank overlays (paper-like).
+/// Light gray accent color for Blank overlays (paper-like).
 pub fn blank_border() -> Color {
     overlay2()
 }
@@ -2119,7 +2131,7 @@ mod tests {
         ("diamond", "Diamond"),
         ("ruby", "Ruby"),
         ("saphire", "Saphire"),
-        ("d-is-for-devil", "D. is for Devil"),
+        ("d-is-for-devil", "D. is for Daemon"),
     ];
 
     /// Pin theme state for a whole test body.  These tests mutate the globals,
@@ -2169,20 +2181,19 @@ mod tests {
     }
 
     #[test]
-    fn borders_follow_theme_primary_color() {
+    fn modal_borders_follow_session_detail_divider_color() {
         let _guard = theme_test_guard();
 
-        // Explicit pin on the 2 pre-existing themes' historical primary values.
+        // Modal frames share the theme's session-detail divider color.
         assert!(set_theme_by_name("goth"));
         assert_eq!(focused_border(), Color::Rgb(181, 138, 215));
-        assert_eq!(overlay_border(), Color::Rgb(181, 138, 215));
+        assert_eq!(overlay_border(), surface2());
 
         assert!(set_theme_by_name("junkyard"));
         assert_eq!(focused_border(), Color::Rgb(30, 185, 128));
-        assert_eq!(overlay_border(), focused_border());
+        assert_eq!(overlay_border(), surface2());
 
-        // Generalized (F-021, PI-14 item 2): every theme's focused/overlay
-        // border tracks its own declared primary color.
+        // Every theme keeps modal borders aligned with the session-detail divider.
         for i in 0..theme_count() {
             set_theme_by_index(i);
             let key = theme_key(i);
@@ -2193,8 +2204,8 @@ mod tests {
             );
             assert_eq!(
                 overlay_border(),
-                focused_border(),
-                "{key}: overlay_border should equal focused_border"
+                surface2(),
+                "{key}: modal border should match session-detail divider"
             );
         }
 
@@ -2346,12 +2357,11 @@ mod tests {
     fn non_transparent_semantic_surfaces_preserve_existing_chrome() {
         let _guard = theme_test_guard();
 
-        // Generalized (F-021, PI-14 item 3): loop all 5 non-transparent
-        // themes for the invariants that hold universally by construction
-        // (surface0==tier_panel makes glass_panel_bg==card_bg for every
-        // opaque theme; table_header_text/operations_deck_cell_bg are
-        // unconditionally aliased to header_fg/bottom_strip_bg on the
-        // non-transparent branch).
+        // Generalized (F-021, PI-14 item 3): loop all opaque themes for the
+        // invariants that hold universally by construction
+        // (glass panels follow tier_panel and cards follow surface0;
+        // table_header_text/operations_deck_cell_bg are unconditionally
+        // aliased to header_fg/bottom_strip_bg on the non-transparent branch).
         for key in [
             "goth",
             "junkyard",
@@ -2368,11 +2378,16 @@ mod tests {
         ] {
             assert!(set_theme_by_name(key), "{key}: should be a valid theme key");
             assert!(!is_transparent_theme(), "{key}: must not be transparent");
-            assert_eq!(
-                glass_panel_bg(),
-                card_bg(),
-                "{key}: glass_panel_bg should equal card_bg"
-            );
+            assert_eq!(glass_panel_bg(), tier_panel(), "{key}: glass panel tier");
+            assert_eq!(card_bg(), surface0(), "{key}: card surface");
+            if key == "d-is-for-devil" {
+                // Its authored palette keeps the glass panel one RGB step
+                // darker than the card, preserving the intended depth.
+                assert_eq!(glass_panel_bg(), rgb(16, 15, 15));
+                assert_eq!(card_bg(), rgb(17, 16, 16));
+            } else {
+                assert_eq!(glass_panel_bg(), card_bg(), "{key}: shared chrome");
+            }
             assert_eq!(
                 table_header_text(),
                 header_fg(),

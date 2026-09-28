@@ -458,6 +458,7 @@ impl CommandRunner {
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn argv_and_env_are_daemon_built() {
         let op = CatalogOp::CargoTestFocused {
@@ -499,6 +500,7 @@ mod tests {
 
     /// The runner spawns its own process group, keeps bounded tails and
     /// reports the exit code (a stand-in program replaces `cargo`).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn runner_reports_exit_code_tails_and_group() {
         let dir = tempfile::TempDir::new().unwrap();

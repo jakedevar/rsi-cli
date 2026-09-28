@@ -1,6 +1,7 @@
 use super::*;
 use crate::error::Result;
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn ownership_expansion_survives_work_row_advance_and_keeps_ownership_cas() -> Result<()> {
     let f = fixture().await;
@@ -106,6 +107,7 @@ async fn ownership_expansion_survives_work_row_advance_and_keeps_ownership_cas()
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn ownership_expansion_still_refuses_an_exclusive_domain_conflict() -> Result<()> {
     let f = fixture().await;
@@ -174,6 +176,7 @@ async fn ownership_expansion_still_refuses_an_exclusive_domain_conflict() -> Res
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn evidence_stage_still_refuses_when_source_head_moves() -> Result<()> {
     let f = fixture().await;
@@ -212,6 +215,7 @@ async fn evidence_stage_still_refuses_when_source_head_moves() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[test]
 fn source_bound_update_classification_is_explicit() {
     let evidence = ManagerEvidenceV2 {
@@ -305,6 +309,7 @@ fn source_bound_update_classification_is_explicit() {
     ));
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn ownership_update_commits_across_concurrent_work_row_advance() -> Result<()> {
     let f = fixture().await;
@@ -367,6 +372,7 @@ async fn ownership_update_commits_across_concurrent_work_row_advance() -> Result
     Ok(())
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test]
 async fn source_bound_stage_update_rejects_across_concurrent_work_row_advance() -> Result<()> {
     let f = fixture().await;

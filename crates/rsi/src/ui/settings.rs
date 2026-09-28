@@ -1243,6 +1243,9 @@ fn settings_item_count(app: &App) -> usize {
             .unwrap_or(1),
         SettingsSection::Usage => stats_rows(app).len().max(1),
         SettingsSection::Budgets => budget_rows(app).len().max(1),
+        SettingsSection::ProviderKeys => {
+            rsi_common::provider_credentials::ProviderCredentialSlot::ALL.len()
+        }
         section => item_count(section, &app.settings).max(1),
     }
 }
@@ -1377,20 +1380,34 @@ fn settings_row(app: &App, idx: usize) -> SettingsRow {
                 },
                 "Edit the optional text-surface background color.",
             ),
-            2 => SettingsRow {
-                label: "Formulation animation".to_string(),
-                value: format!("{} ms ↻", settings.formulation_anim_ms),
+            2 => bool_row(
+                "Formulation animation",
+                settings.formulation_anim_enabled,
+                "Reveal each new live message with a top-to-bottom wipe.",
+            ),
+            3 => SettingsRow {
+                label: "Formulation speed".to_string(),
+                value: format!("{} ms", settings.formulation_anim_ms),
                 short_action: "next".to_string(),
                 selected_action: "Enter next duration".to_string(),
-                description: "Cycle the message-formulation grow animation duration.".to_string(),
+                description: if settings.formulation_anim_enabled {
+                    "Cycle how long the formulation reveal runs.".to_string()
+                } else {
+                    "Cycle how long the formulation reveal runs (animation is off).".to_string()
+                },
                 tone: ValueTone::Neutral,
                 destructive: false,
                 empty: false,
             },
-            3 => cycle_row(
+            4 => cycle_row(
                 "Activity indicator",
                 settings.activity_indicator_style.label(),
                 "Choose the working indicator shown while a provider is active.",
+            ),
+            5 => cycle_row(
+                "Detail column",
+                settings.detail_column_alignment.label(),
+                "Place the session-detail transcript column; Ctrl-Left / Ctrl-Right move it.",
             ),
             _ => unknown_row(),
         },
@@ -1788,6 +1805,22 @@ fn settings_row(app: &App, idx: usize) -> SettingsRow {
                 )
             }
         }
+        SettingsSection::ProviderKeys => {
+            let rows = crate::provider_credential_rows::provider_credential_rows(app);
+            match rows.get(idx).cloned() {
+                Some((label, value)) => SettingsRow {
+                    label,
+                    tone: if value == "loading…" { ValueTone::Muted } else { ValueTone::Neutral },
+                    value,
+                    short_action: "s/r/c/d".to_string(),
+                    selected_action: "s set  r rotate  c check  d clear  i import".to_string(),
+                    description: "Key-vault slot: s set, r rotate, c check, d clear after confirmation, i import from env.".to_string(),
+                    destructive: false,
+                    empty: false,
+                },
+                None => unknown_row(),
+            }
+        }
         SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
@@ -1961,7 +1994,8 @@ fn spec_for_row(
         | SettingsSection::ClaudeHooks
         | SettingsSection::ClaudeSkills
         | SettingsSection::Budgets
-        | SettingsSection::Usage => section_specs.first().copied(),
+        | SettingsSection::Usage
+        | SettingsSection::ProviderKeys => section_specs.first().copied(),
         _ => section_specs
             .get(idx)
             .copied()
@@ -2299,5 +2333,71 @@ mod tests {
         assert_eq!(row.value, "[ON]");
         assert_eq!(row.selected_action, "Enter toggle → OFF");
         assert!(!row.label.contains("[x]"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn provider_keys_row_shows_positive_state_fingerprint_and_exposure_text() {
+        use rsi_common::provider_credentials::{
+            CliExposure, CredentialRoute, CredentialState, ListProviderCredentialsResult,
+            ProviderCredentialMetadata, ProviderCredentialSlot,
+        };
+
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        app.cached_provider_credentials = Some(ListProviderCredentialsResult {
+            env_compat: true,
+            check_ttl_secs: 600,
+            credentials: vec![ProviderCredentialMetadata {
+                slot: ProviderCredentialSlot::Openrouter,
+                state: CredentialState::Vault,
+                fingerprint: Some("ab12ef34".to_string()),
+                set_at: None,
+                rotated_from_fingerprint: None,
+                cleared_at: None,
+                check: None,
+                generation: 1,
+                route: CredentialRoute::CodexCli,
+                cli_exposure: CliExposure::Always,
+                last_cli_exposure_at: None,
+            }],
+        });
+
+        let idx = ProviderCredentialSlot::ALL
+            .iter()
+            .position(|slot| *slot == ProviderCredentialSlot::Openrouter)
+            .unwrap();
+        let row = settings_row(&app, idx);
+        assert_eq!(row.label, "openrouter");
+        assert!(row.value.contains("vault"), "{}", row.value);
+        assert!(row.value.contains("fp:ab12ef34"), "{}", row.value);
+        assert!(row.value.contains("cli:always"), "{}", row.value);
+        assert!(row.value.contains("route:codex_cli"), "{}", row.value);
+    }
+
+    #[test]
+    fn provider_keys_row_count_is_the_fixed_slot_count() {
+        use rsi_common::provider_credentials::ProviderCredentialSlot;
+
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        assert_eq!(settings_item_count(&app), ProviderCredentialSlot::ALL.len());
+    }
+
+    #[test]
+    fn provider_keys_section_renders_slots_and_set_key_hint() {
+        use rsi_common::provider_credentials::ProviderCredentialSlot;
+
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        assert_eq!(settings_item_count(&app), ProviderCredentialSlot::ALL.len());
+        let row = settings_row(&app, 0);
+        assert_eq!(row.label, ProviderCredentialSlot::ALL[0].as_str());
+        assert!(row.selected_action.contains("s set"));
+        app.settings_state.focus = SettingsFocus::Items;
+        let buffer = rendered_settings(&app, 240, 70);
+        let visible: String = (0..70).map(|y| buffer_row(&buffer, y, 240)).collect();
+        assert!(visible.contains(ProviderCredentialSlot::ALL[0].as_str()));
+        assert!(visible.contains("s set"));
     }
 }

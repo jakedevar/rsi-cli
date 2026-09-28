@@ -25,9 +25,9 @@ help:
 		'make codex-prompts-check - verify .codex/prompts matches ~/.codex/prompts' \
 		'make claude-commands  - sync Codex prompts into .claude/commands' \
 		'make claude-commands-check - verify Codex/Claude command parity' \
-		'make test-fast        - run the complete rsid library suite with bounded nextest workers' \
-		'make test-full        - run workspace, doctests, model-control validator, and provider-capability validator' \
-		'make test-serial      - run the rsid library suite through the legacy serial path' \
+		'make test-fast        - run every bounded rsid shard, integration/bin target, and doctest' \
+		'make test-full        - run sharded rsid and the remaining workspace, doctests, and validators' \
+		'make test-serial      - run the rsid fast lane with one test worker' \
 		'make test-benchmark   - capture repeated full-lane timing evidence' \
 		'make manual           - regenerate docs/manual/* and the generated regions of docs/keybindings.md' \
 		'make manual-pdf       - render docs/manual/rsi-manual.md to target/rsi-manual.pdf with pandoc' \
@@ -83,7 +83,7 @@ clean-shared:
 	@echo 'Scratch targets: removed'
 
 release:
-	cargo build --release --bin rsi --bin rsid
+	cargo build --release --bin rsi --bin rsid --bin rsi-build-rustc
 
 release-install:
 	./scripts/install-release.sh
@@ -121,18 +121,18 @@ manual-pdf:
 	pandoc docs/manual/rsi-manual.md -o target/rsi-manual.pdf
 
 test-fast:
-	cargo nextest run --profile rsid-fast -p rsid --lib -j $(NEXTEST_JOBS)
+	./scripts/run-rsid-test-shards.sh fast --jobs $(NEXTEST_JOBS)
 
 test-full:
+	python3 scripts/check-rsid-test-shards.py --require-gates
 	@status=0; \
-	cargo nextest run --profile ci-full --workspace -j $(NEXTEST_JOBS) || status=$$?; \
-	cargo test --workspace --doc || status=$$?; \
+	./scripts/run-rsid-test-shards.sh full --jobs $(NEXTEST_JOBS) || status=$$?; \
 	cargo run -p rsid --bin rsi-model-control-validate --offline || status=$$?; \
 	cargo run -p rsid --bin rsi-provider-capability-validate --offline || status=$$?; \
 	exit $$status
 
 test-serial:
-	cargo test -p rsid --lib -- --test-threads=1
+	./scripts/run-rsid-test-shards.sh fast --jobs 1
 
 test-benchmark:
 	./scripts/test-suite-benchmark.sh capture \

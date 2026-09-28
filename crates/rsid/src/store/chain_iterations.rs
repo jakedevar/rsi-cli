@@ -255,41 +255,49 @@ mod tests {
         assert_eq!(lookup, Some((chain_id, 0)));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_done() {
         round_trip_halt(&HaltReason::Done);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_cap() {
         round_trip_halt(&HaltReason::Cap);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_regression() {
         round_trip_halt(&HaltReason::Regression { pre: 1, post: 4 });
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_stop_file() {
         round_trip_halt(&HaltReason::StopFile);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_judge_blocked() {
         round_trip_halt(&HaltReason::JudgeBlocked("missing data".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_judge_malformed() {
         round_trip_halt(&HaltReason::JudgeMalformed);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn round_trip_halt_error() {
         round_trip_halt(&HaltReason::Error("daemon crash".to_string()));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn list_active_chains_filters_null_halt_rows() {
         let (_dir, store) = make_store();
@@ -318,6 +326,7 @@ mod tests {
         assert_eq!(active[0], (chain_a, 1));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn get_chain_for_execution_returns_none_for_unknown() {
         let (_dir, store) = make_store();
@@ -326,6 +335,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn list_chain_iterations_orders_ascending() {
         let (_dir, store) = make_store();

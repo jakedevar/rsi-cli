@@ -33,11 +33,7 @@ pub(super) fn render_dialectic(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if in_flight {
-            theme::status_waiting()
-        } else {
-            theme::accent()
-        }))
+        .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()));
 
     let inner = block.inner(popup_area);

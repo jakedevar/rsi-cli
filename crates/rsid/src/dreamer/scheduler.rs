@@ -1809,6 +1809,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::task::yield_now;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn test_dream_config_defaults() {
         let config = DreamConfig {
@@ -2129,6 +2130,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_dreamer_handle_channel() {
         let status = Arc::new(RwLock::new(DreamStatusSnapshot {
@@ -2171,6 +2173,7 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn disabled_dream_produces_zero_calls() {
         let store = store();
@@ -2192,6 +2195,7 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn dream_respects_idle_window_before_auto_run() {
         let store = store();
@@ -2228,6 +2232,7 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn live_disable_pauses_active_dream_work() {
         let store = store();
@@ -2260,6 +2265,7 @@ mod tests {
         assert_eq!(status.reason.as_deref(), Some("disabled"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn foreground_activity_pauses_active_dream_work() {
         let store = store();
@@ -2291,6 +2297,7 @@ mod tests {
         assert_eq!(status.reason.as_deref(), Some("foreground_active"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn restart_reuses_checkpoint_without_reexecution() {
         let store = store();
@@ -2367,6 +2374,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn manual_trigger_rechecks_live_disable_before_run() {
         let store = store();
@@ -2397,6 +2405,7 @@ mod tests {
         assert!(load_state(&guard).unwrap().active_run.is_none());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn manual_trigger_rechecks_model_control_modes_before_run() {
         for mode in ["pause_background", "deny_paid", "local_only", "stop_all"] {
@@ -2428,6 +2437,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn checkpointed_response_settles_and_applies_without_backend_execution() {
         let store = store();
@@ -2533,6 +2543,7 @@ mod tests {
         assert_eq!(existing.status, "completed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn uncheckpointed_invocation_fails_without_reexecution() {
         let store = store();
@@ -2636,6 +2647,7 @@ mod tests {
         assert_eq!(existing.status, "failed");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn extraction_application_is_idempotent_on_replay() {
         let store = store();
@@ -2703,6 +2715,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn persisted_caps_cannot_be_raised_by_live_config_changes() {
         let store = store();
@@ -2794,6 +2807,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_registration_is_idempotent_until_settlement() {
         let store = store();

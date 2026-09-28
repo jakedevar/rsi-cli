@@ -1263,6 +1263,7 @@ mod tests {
     /// the provider dispatch — and observing them from inside the provider is
     /// the only place either can be checked against the real control flow
     /// rather than against a reading of it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_claim_commits_before_any_provider_dispatch() {
         let fixture = fixture().await;
@@ -1335,6 +1336,7 @@ mod tests {
     /// the corrected crash-window block draws — the `claimed` no-effect proof
     /// and the `dispatching` `uncertain` answer — but it establishes neither on
     /// its own.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_delivery_attempt_is_stamped_with_the_live_daemon_boot_id() {
         let fixture = fixture().await;
@@ -1375,6 +1377,7 @@ mod tests {
     }
 
     /// A dispatched message becomes this session's turn and stays correlatable.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_dispatched_message_is_injected_and_stays_correlation_pending() {
         let fixture = fixture().await;
@@ -1410,6 +1413,7 @@ mod tests {
     }
 
     /// The delivered payload is the WRAPPED rendering, never the sender's bytes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn the_delivered_payload_is_the_neutralized_envelope_rendering() {
         let fixture = fixture().await;
@@ -1467,6 +1471,7 @@ mod tests {
     ///    settlement back for explicit settlement. Defence in depth, so a future
     ///    regression in the gate degrades to a failed message rather than to an
     ///    unadmitted send.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn the_non_app_server_provider_path_is_fail_closed_and_unreachable() {
         let mut provider = default_provider();
@@ -1507,6 +1512,7 @@ mod tests {
     /// `provider.rs` default body executes — a fake that reconstructed
     /// `Unsupported { settlement }` in its own override would prove only that
     /// the test agrees with itself.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn an_unsupported_provider_seals_the_attempt_without_any_effect() {
         let fixture = fixture().await;
@@ -1550,6 +1556,7 @@ mod tests {
     /// pre-effect class. If it were left to `Drop`, a provably clean pre-effect
     /// abort would be recorded as `model_call_task_exited` — a wrong error
     /// class on a path that had no effect at all.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_non_dispatch_exit_settles_explicitly_rather_than_by_drop() {
         let fixture = fixture().await;
@@ -1635,6 +1642,7 @@ mod tests {
     /// it, a queue that had simply gone empty would produce the same refusal
     /// for an entirely different reason; showing that the SAME boundary grants
     /// immediately once the grant is released proves the hold was the cause.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_grant_held_across_a_real_dispatch_blocks_the_next_boundary_for_that_root() {
         let fixture = fixture().await;
