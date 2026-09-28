@@ -104,3 +104,6 @@ __pycache__/
 .claude/skills/*
 !.claude/skills/*/
 !.claude/skills/*/SKILL.md
+
+# Private planning notes live only in the private rsi repo
+thoughts/
