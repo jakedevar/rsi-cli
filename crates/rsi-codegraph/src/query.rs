@@ -396,6 +396,22 @@ impl QuerySession {
         &self.snapshot
     }
 
+    /// Return the source digest of one file in this pinned snapshot.
+    ///
+    /// # Errors
+    /// Returns an input error for an invalid path or a `SQLite` read error.
+    pub fn file_source_digest(&self, path: &str) -> Result<Option<String>> {
+        validate_path(path)?;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT source_digest FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
+                params![self.snapshot.workspace_id.to_string(), self.snapshot.generation, path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn node(
         &self,
         id: Uuid,

@@ -220,6 +220,11 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Bool(false),
             },
             Self {
+                field: "satellite_polling_enabled".to_string(),
+                label: "Satellite polling".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
                 field: "session_retention_enabled".to_string(),
                 label: "Automatic session archive".to_string(),
                 value: DaemonFeatureValue::Bool(true),
@@ -446,14 +451,296 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "api_route.bedrock".to_string(),
+                label: "Bedrock engine".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: vec!["codex_cli".to_string(), "harness".to_string()],
+                    current: 0,
+                },
+            },
+            Self {
                 field: "api_route.fallback".to_string(),
                 label: "API route fallback".to_string(),
                 value: DaemonFeatureValue::Bool(true),
             },
             Self {
+                field: "harness_max_iterations_per_turn".to_string(),
+                label: "Harness iterations per turn".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["25", "50", "100", "150", "300", "600", "1000"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "openrouter_context_budget_tokens".to_string(),
+                label: "OpenRouter context budget (0 off)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "64000", "128000", "256000", "512000"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
                 field: "sandbox_build_cache_reclaim_enabled".to_string(),
                 label: "Sandbox cache reclaim".to_string(),
                 value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "sandbox_max_source_roots".to_string(),
+                label: "Maximum sandbox roots".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["512", "1024", "2048", "4096", "8192", "16384"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "sandbox_min_free_gib".to_string(),
+                label: "Minimum free space (GiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1", "2", "5", "10", "20", "30", "50", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 6,
+                },
+            },
+            Self {
+                field: "archived_sandbox_purge_enabled".to_string(),
+                label: "Purge archived sandboxes".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "rolling_queue_enabled".to_string(),
+                label: "Rolling merge queue".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "deploy_drain_enabled".to_string(),
+                label: "Hold new work while a deploy waits".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "rolling_queue_batch_size".to_string(),
+                label: "Merge queue batch size".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "5", "6", "7", "8"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "rolling_queue_speculation_depth".to_string(),
+                label: "Merge queue speculation depth".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1", "2"].into_iter().map(str::to_string).collect(),
+                    current: 1,
+                },
+            },
+            Self {
+                field: "program_hold_while_children_run".to_string(),
+                label: "Hold program wakes while children run".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "child_keepalive_enabled".to_string(),
+                label: "Child keep-alive valve".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "child_keepalive_window_secs".to_string(),
+                label: "Child keep-alive window (s)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["300", "600", "900", "1500", "3600", "7200", "21600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "governor_build_slots".to_string(),
+                label: "Build slots".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "5", "6", "8", "12", "16"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "governor_lander_slots".to_string(),
+                label: "Lander slots".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "5", "6", "7", "8"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
+            },
+            Self {
+                field: "governor_max_load".to_string(),
+                label: "Governor max load (0 auto)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "16", "24", "32", "40", "48", "64", "80"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "governor_min_free_disk_gb".to_string(),
+                label: "Governor min free disk (GB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["10", "20", "30", "40", "50", "60"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "governor_min_avail_mem_gb".to_string(),
+                label: "Governor min available memory (GB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["8", "12", "16", "24", "32"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "governor_max_workers_slice_gb".to_string(),
+                label: "Governor max workers-slice memory (GB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["16", "20", "24", "30", "36", "40", "48"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "harness_web_access".to_string(),
+                label: "Harness web access".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["enabled", "hosted_only", "disabled"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "harness_egress_mode".to_string(),
+                label: "Harness network egress".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["deny_private", "offline"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "harness_max_search_calls".to_string(),
+                label: "Harness search call cap".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "5", "10", "25", "50", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "harness_max_fetch_calls".to_string(),
+                label: "Harness fetch call cap".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "5", "10", "25", "50", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "completion_gates_enabled".to_string(),
+                label: "Harness completion gates".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "harness_max_result_bytes".to_string(),
+                label: "Harness tool output cap (bytes)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1048576", "10485760", "104857600", "1073741824"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "harness_max_web_cost_usd_micros".to_string(),
+                label: "Harness web cost cap (micro-USD)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "100000", "500000", "1000000", "5000000", "10000000"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "mcp.deferred_tool_threshold".to_string(),
+                label: "MCP deferred tool threshold".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "8", "16", "32", "64", "128", "256"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "cloud_spend_status".to_string(),
+                label: "Cloud spend".to_string(),
+                value: DaemonFeatureValue::Display("?".to_string()),
+            },
+            Self {
+                field: "cloud_spend_stop_line_usd".to_string(),
+                label: "Cloud spend stop line (USD)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["25", "50", "75", "90", "100", "150", "200"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "cloud_spend_daily_cap_usd".to_string(),
+                label: "Cloud spend daily cap (USD)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["5", "10", "15", "25", "50", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
             },
             Self {
                 field: "agent_build_jobs".to_string(),
@@ -1137,6 +1424,12 @@ pub enum ActivityIndicatorStyle {
     RainbowClassic,
     /// A calmer solid-cell rainbow animation.
     RainbowCompact,
+    /// The classic half-block rainbow strip reserved to one terminal row.
+    RainbowClassicCompact,
+    /// Fast-moving rainbow speed streaks.
+    SonicSpeedUp,
+    /// A field of animated, rainbow-colored sparkles.
+    RainbowStarlight,
 }
 
 impl ActivityIndicatorStyle {
@@ -1145,6 +1438,9 @@ impl ActivityIndicatorStyle {
             Self::Semantic => "Semantic",
             Self::RainbowClassic => "Rainbow Classic",
             Self::RainbowCompact => "Rainbow Compact",
+            Self::RainbowClassicCompact => "Rainbow Classic Compact",
+            Self::SonicSpeedUp => "Sonic Speed Up",
+            Self::RainbowStarlight => "Rainbow Starlight",
         }
     }
 
@@ -1152,7 +1448,10 @@ impl ActivityIndicatorStyle {
         match self {
             Self::Semantic => Self::RainbowClassic,
             Self::RainbowClassic => Self::RainbowCompact,
-            Self::RainbowCompact => Self::Semantic,
+            Self::RainbowCompact => Self::RainbowClassicCompact,
+            Self::RainbowClassicCompact => Self::SonicSpeedUp,
+            Self::SonicSpeedUp => Self::RainbowStarlight,
+            Self::RainbowStarlight => Self::Semantic,
         }
     }
 }
@@ -1263,6 +1562,13 @@ pub struct UserSettings {
     /// advanced override, containing only optional navigator columns.
     #[serde(default)]
     pub navigator_optional_columns: Option<Vec<NavigatorOptionalColumn>>,
+
+    /// Operator-chosen left-to-right order of the optional navigator columns,
+    /// kept separately for each preset (view mode). A preset without an entry
+    /// uses the default order; a partial entry is completed in default order.
+    #[serde(default)]
+    pub navigator_column_order:
+        std::collections::BTreeMap<NavigatorPreset, Vec<NavigatorOptionalColumn>>,
 
     /// Local Ollama model for title/description generation.
     #[serde(default = "default_title_model_local")]
@@ -1380,6 +1686,18 @@ pub struct UserSettings {
     /// Cycles through `FORMULATION_ANIM_DURATIONS` via Enter in Settings > Screen.
     #[serde(default = "default_formulation_anim_ms")]
     pub formulation_anim_ms: u64,
+
+    /// Settings view: operator-resized category rail width in cells
+    /// (`None` = automatic). `<` / `>` with the rail focused change it and
+    /// `=` resets it; the renderer clamps it to the pane.
+    #[serde(default)]
+    pub settings_rail_width: Option<u16>,
+
+    /// Settings view: operator-resized info card width in cells while the
+    /// card sits beside the settings list (`None` = automatic). `<` / `>`
+    /// with the list focused move the list/card divider; `=` resets it.
+    #[serde(default)]
+    pub settings_info_width: Option<u16>,
 }
 
 impl Default for UserSettings {
@@ -1398,6 +1716,7 @@ impl Default for UserSettings {
             card_fields: default_card_fields(),
             navigator_preset: NavigatorPreset::Dense,
             navigator_optional_columns: None,
+            navigator_column_order: std::collections::BTreeMap::new(),
             title_model_local: default_title_model_local(),
             title_model_provider: default_title_model_provider(),
             title_model_custom_provider_id: None,
@@ -1421,6 +1740,8 @@ impl Default for UserSettings {
             text_area_backfill_hex: String::new(),
             formulation_anim_enabled: false,
             formulation_anim_ms: default_formulation_anim_ms(),
+            settings_rail_width: None,
+            settings_info_width: None,
         }
     }
 }
@@ -1530,6 +1851,42 @@ impl UserSettings {
             .iter()
             .find(|e| e.field == field)
             .is_none_or(|e| e.enabled)
+    }
+
+    /// The complete optional-column order for `preset`.
+    pub fn navigator_column_order_for(
+        &self,
+        preset: NavigatorPreset,
+    ) -> Vec<NavigatorOptionalColumn> {
+        crate::ui::navigator_layout::normalize_order(
+            self.navigator_column_order
+                .get(&preset)
+                .map_or(&[][..], Vec::as_slice),
+        )
+    }
+
+    /// The column shown on settings row `row` (1-based within the navigator
+    /// block; row 0 is the preset) under the active preset's order.
+    pub fn navigator_column_at_row(&self, row: usize) -> Option<NavigatorOptionalColumn> {
+        self.navigator_column_order_for(self.navigator_preset)
+            .get(row.checked_sub(1)?)
+            .copied()
+    }
+
+    /// Moves the column on settings row `row` one place earlier (`-1`) or
+    /// later (`+1`) in the active preset's order. Returns the new row, or
+    /// `None` when the row is not a column or is already at that edge.
+    pub fn move_navigator_column(&mut self, row: usize, delta: isize) -> Option<usize> {
+        let mut order = self.navigator_column_order_for(self.navigator_preset);
+        let from = row.checked_sub(1)?;
+        let to = from.checked_add_signed(delta)?;
+        if from >= order.len() || to >= order.len() {
+            return None;
+        }
+        order.swap(from, to);
+        self.navigator_column_order
+            .insert(self.navigator_preset, order);
+        Some(to + 1)
     }
 
     pub fn toggle_navigator_optional_column(&mut self, column: NavigatorOptionalColumn) {
@@ -1839,6 +2196,47 @@ mod tests {
     }
 
     #[test]
+    fn navigator_column_order_is_saved_per_preset_and_survives_reload() {
+        use crate::types::NavigatorPreset as P;
+        let legacy: UserSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.navigator_column_order.is_empty());
+        for preset in P::ALL {
+            assert_eq!(
+                legacy.navigator_column_order_for(preset),
+                crate::ui::navigator_layout::OPTIONAL_ORDER.to_vec()
+            );
+        }
+
+        let mut settings = UserSettings::default();
+        settings.navigator_preset = P::Dense;
+        // Row 2 is ModelEffort by default; move it to the front (row 1).
+        assert_eq!(settings.move_navigator_column(2, -1), Some(1));
+        settings.navigator_preset = P::Operations;
+        // Row 3 is Retry by default; move it up to row 2.
+        assert_eq!(settings.move_navigator_column(3, -1), Some(2));
+        // Edges refuse to move.
+        assert_eq!(settings.move_navigator_column(1, -1), None);
+        assert_eq!(settings.move_navigator_column(8, 1), None);
+        assert_eq!(settings.move_navigator_column(0, 1), None);
+
+        let restored: UserSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        use NavigatorOptionalColumn as O;
+        assert_eq!(
+            restored.navigator_column_order_for(P::Dense)[..2],
+            [O::ModelEffort, O::Age]
+        );
+        assert_eq!(
+            restored.navigator_column_order_for(P::Operations)[..3],
+            [O::Age, O::Retry, O::ModelEffort]
+        );
+        assert_eq!(
+            restored.navigator_column_order_for(P::Cost),
+            crate::ui::navigator_layout::OPTIONAL_ORDER.to_vec()
+        );
+    }
+
+    #[test]
     fn navigator_optional_override_is_absent_for_legacy_state_and_toggles_one_column() {
         let mut settings: UserSettings = serde_json::from_str("{}").unwrap();
         assert!(settings.navigator_optional_columns.is_none());
@@ -1975,14 +2373,19 @@ mod tests {
         );
 
         let mut settings = UserSettings::default();
-        settings.activity_indicator_style = ActivityIndicatorStyle::RainbowCompact;
-        let json = serde_json::to_string(&settings).expect("settings should serialize");
-        let restored: UserSettings =
-            serde_json::from_str(&json).expect("settings should deserialize");
-        assert_eq!(
-            restored.activity_indicator_style,
-            ActivityIndicatorStyle::RainbowCompact
-        );
+        for style in [
+            ActivityIndicatorStyle::RainbowClassic,
+            ActivityIndicatorStyle::RainbowCompact,
+            ActivityIndicatorStyle::RainbowClassicCompact,
+            ActivityIndicatorStyle::SonicSpeedUp,
+            ActivityIndicatorStyle::RainbowStarlight,
+        ] {
+            settings.activity_indicator_style = style;
+            let json = serde_json::to_string(&settings).expect("settings should serialize");
+            let restored: UserSettings =
+                serde_json::from_str(&json).expect("settings should deserialize");
+            assert_eq!(restored.activity_indicator_style, style);
+        }
     }
 
     #[test]
@@ -2386,15 +2789,21 @@ mod tests {
     #[test]
     fn daemon_feature_defaults_has_codex_sandbox_entry() {
         let entries = DaemonFeatureEntry::defaults();
-        // Item-count contract with settings_keys.rs::item_count.
-        // RSI-026: bumped to 12 — system_prompt_preset joined the list.
-        // Stall classifier adds 7 daemon-owned knobs.
-        // Issue #69 adds six controls, one status row, and two explicit
-        // target-cache actions.
-        // Claude project-config isolation (SECURITY) adds one control -> 33.
-        // Rolling's T4 topology row brings its defaults to 62; #694 adds two
-        // API route controls.
-        assert_eq!(entries.len(), 64);
+        // Item-count contract with settings_keys.rs::item_count (#1013): the
+        // count is derived from the keyed registry, so adding a setting never
+        // edits a literal here.
+        let registry_backed: std::collections::BTreeSet<&str> = crate::settings_registry::SETTINGS
+            .iter()
+            .filter_map(|spec| crate::settings_keys::daemon_feature_field_for(spec.id))
+            .collect();
+        let unbacked: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.field.as_str())
+            .filter(|field| !registry_backed.contains(field))
+            .collect();
+        // Defaults with no registry row of their own (named, not counted).
+        assert_eq!(unbacked, vec!["stall_classifier_model"]);
+        assert_eq!(entries.len(), registry_backed.len() + unbacked.len());
         let codex = entries
             .iter()
             .find(|e| e.field == "codex_sandbox_mode")
@@ -2446,7 +2855,8 @@ mod tests {
     }
 
     #[test]
-    fn daemon_feature_defaults_expose_openrouter_route_and_fallback() {
+    #[allow(clippy::unwrap_used)]
+    fn daemon_feature_defaults_expose_provider_routes_and_fallback() {
         let entries = DaemonFeatureEntry::defaults();
         let route = entries
             .iter()
@@ -2455,11 +2865,55 @@ mod tests {
         assert!(
             matches!(&route.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 0)
         );
+        let bedrock = entries
+            .iter()
+            .find(|entry| entry.field == "api_route.bedrock")
+            .unwrap();
+        assert!(
+            matches!(&bedrock.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 0)
+        );
         let fallback = entries
             .iter()
             .find(|entry| entry.field == "api_route.fallback")
             .unwrap();
         assert!(matches!(&fallback.value, DaemonFeatureValue::Bool(true)));
+        let mut entries = entries;
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({"api_route.bedrock":"harness"}),
+        );
+        let bedrock = entries
+            .iter()
+            .find(|entry| entry.field == "api_route.bedrock")
+            .unwrap();
+        assert!(
+            matches!(&bedrock.value, DaemonFeatureValue::Cycle { current, .. } if *current == 1)
+        );
+    }
+
+    /// #966: the OpenRouter context budget is an operator row that follows
+    /// the daemon value (default 128000, `0` off, unlisted values kept).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn daemon_feature_defaults_expose_openrouter_context_budget() {
+        let budget = |entries: &[DaemonFeatureEntry]| match &entries
+            .iter()
+            .find(|entry| entry.field == "openrouter_context_budget_tokens")
+            .unwrap()
+            .value
+        {
+            DaemonFeatureValue::Cycle { options, current } => options[*current].clone(),
+            other => panic!("budget row must be a cycle, got {other:?}"),
+        };
+        let mut entries = DaemonFeatureEntry::defaults();
+        assert_eq!(budget(&entries), "128000");
+        for value in [0_u64, 100_000] {
+            DaemonFeatureEntry::update_from_json(
+                &mut entries,
+                &serde_json::json!({ "openrouter_context_budget_tokens": value }),
+            );
+            assert_eq!(budget(&entries), value.to_string());
+        }
     }
 
     #[test]
@@ -3157,6 +3611,164 @@ mod tests {
             settings.system_prompt_preset = SystemPromptPreset::Default;
             settings.set_system_prompt_preset_from_slug(variant.slug());
             assert_eq!(settings.system_prompt_preset, variant);
+        }
+    }
+
+    #[test]
+    fn child_autonomy_tui_defaults_match_daemon_defaults() {
+        let features = DaemonFeatureEntry::defaults();
+        let find = |field: &str| {
+            features
+                .iter()
+                .find(|feature| feature.field == field)
+                .unwrap_or_else(|| panic!("missing TUI setting {field}"))
+        };
+        assert!(matches!(
+            find("program_hold_while_children_run").value,
+            DaemonFeatureValue::Bool(true)
+        ));
+        assert!(matches!(
+            find("child_keepalive_enabled").value,
+            DaemonFeatureValue::Bool(false)
+        ));
+        let DaemonFeatureValue::Cycle { options, current } =
+            &find("child_keepalive_window_secs").value
+        else {
+            panic!("the window is a cycle setting");
+        };
+        assert_eq!(options.get(*current).map(String::as_str), Some("1500"));
+        assert_eq!(options.first().map(String::as_str), Some("300"));
+        assert_eq!(options.last().map(String::as_str), Some("21600"));
+    }
+
+    #[test]
+    fn harness_tool_policy_tui_defaults_match_daemon_defaults() {
+        let features = DaemonFeatureEntry::defaults();
+        for (field, expected_default) in [
+            ("harness_web_access", "enabled"),
+            ("harness_egress_mode", "deny_private"),
+            ("harness_max_search_calls", "0"),
+            ("harness_max_fetch_calls", "0"),
+            ("harness_max_result_bytes", "0"),
+            ("harness_max_web_cost_usd_micros", "0"),
+        ] {
+            let feature = features
+                .iter()
+                .find(|feature| feature.field == field)
+                .unwrap_or_else(|| panic!("missing TUI setting {field}"));
+            match &feature.value {
+                DaemonFeatureValue::Cycle { options, current } => {
+                    assert_eq!(
+                        options.get(*current).map(String::as_str),
+                        Some(expected_default),
+                        "{field}"
+                    );
+                }
+                other => panic!("{field} should be a cycle setting, got {other:?}"),
+            }
+        }
+        let web = features
+            .iter()
+            .find(|feature| feature.field == "harness_web_access")
+            .expect("web access setting");
+        let DaemonFeatureValue::Cycle { options, .. } = &web.value else {
+            panic!("web access is a cycle");
+        };
+        assert_eq!(options, &["enabled", "hosted_only", "disabled"]);
+    }
+
+    #[test]
+    fn completion_gate_tui_default_and_toggle_match_daemon_defaults() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let entry = features
+            .iter()
+            .find(|feature| feature.field == "completion_gates_enabled")
+            .expect("completion gate kill switch must be in the settings overlay");
+        assert_eq!(entry.label, "Harness completion gates");
+        assert!(matches!(entry.value, DaemonFeatureValue::Bool(true)));
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({"completion_gates_enabled": false}),
+        );
+        let entry = features
+            .iter()
+            .find(|feature| feature.field == "completion_gates_enabled")
+            .expect("completion gate entry remains present");
+        assert!(matches!(entry.value, DaemonFeatureValue::Bool(false)));
+    }
+
+    #[test]
+    fn mcp_deferred_tool_threshold_tui_defaults_match_daemon() {
+        let features = DaemonFeatureEntry::defaults();
+        let feature = features
+            .iter()
+            .find(|feature| feature.field == "mcp.deferred_tool_threshold")
+            .expect("MCP deferred threshold setting");
+        let DaemonFeatureValue::Cycle { options, current } = &feature.value else {
+            panic!("MCP deferred threshold is a cycle");
+        };
+        assert_eq!(options.first().map(String::as_str), Some("0"));
+        assert_eq!(options.last().map(String::as_str), Some("256"));
+        assert_eq!(options.get(*current).map(String::as_str), Some("32"));
+    }
+
+    #[test]
+    fn cloud_spend_rows_default_to_the_daemon_caps_and_show_the_daemon_summary() {
+        let mut features = DaemonFeatureEntry::defaults();
+        for (field, expected) in [
+            ("cloud_spend_stop_line_usd", "90"),
+            ("cloud_spend_daily_cap_usd", "15"),
+        ] {
+            let feature = features
+                .iter()
+                .find(|feature| feature.field == field)
+                .expect("cloud spend cap setting");
+            let DaemonFeatureValue::Cycle { options, current } = &feature.value else {
+                panic!("{field} is a cycle");
+            };
+            assert_eq!(options.get(*current).map(String::as_str), Some(expected));
+        }
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({
+                "cloud_spend_daily_cap_usd": 12,
+                "cloud_spend_status": "today $3.50 of $12 · total $33.15 of $90",
+            }),
+        );
+        let daily = features
+            .iter()
+            .find(|feature| feature.field == "cloud_spend_daily_cap_usd")
+            .unwrap();
+        let DaemonFeatureValue::Cycle { options, current } = &daily.value else {
+            panic!("daily cap is a cycle");
+        };
+        assert_eq!(options.get(*current).map(String::as_str), Some("12"));
+        assert_eq!(
+            DaemonFeatureEntry::display_value(&features, "cloud_spend_status"),
+            Some("today $3.50 of $12 · total $33.15 of $90")
+        );
+    }
+
+    #[test]
+    fn sandbox_allocation_tui_defaults_match_daemon_budgets() {
+        let features = DaemonFeatureEntry::defaults();
+        for (field, expected_default) in [
+            ("sandbox_max_source_roots", "4096"),
+            ("sandbox_min_free_gib", "30"),
+        ] {
+            let feature = features
+                .iter()
+                .find(|feature| feature.field == field)
+                .unwrap_or_else(|| panic!("missing TUI setting {field}"));
+            match &feature.value {
+                DaemonFeatureValue::Cycle { options, current } => {
+                    assert_eq!(
+                        options.get(*current).map(String::as_str),
+                        Some(expected_default)
+                    );
+                }
+                other => panic!("{field} should be a cycle setting, got {other:?}"),
+            }
         }
     }
 }

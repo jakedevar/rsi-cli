@@ -304,6 +304,144 @@ const METHOD: &str = "item/commandExecution/requestApproval";
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
+async fn remote_exact_native_witness_is_bounded_and_nonblocking() {
+    use crate::remote_read::{NativeRuntimeApprovalRecheck, NativeRuntimeApprovalState, ReadError};
+
+    let mut w = World::new().await;
+    w.inject(json!(610), METHOD);
+    let target = w.publication(None, "published").await;
+    let id = Uuid::parse_str(target["publication_id"].as_str().unwrap()).unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match remote_selected_native_approval(w.session, id) {
+                Err(ReadError::Busy) => tokio::task::yield_now().await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .expect("monitor releases pending witness after publication");
+    let NativeRuntimeApprovalState::Present(ref row) = snapshot.state else {
+        panic!("published native witness must be present");
+    };
+    assert_eq!(row.id, id);
+    assert_eq!(
+        row.incarnation_id.to_string(),
+        target["incarnation_id"].as_str().unwrap()
+    );
+    assert_eq!(row.spawn_generation, 0);
+    assert_eq!(row.method.as_ref().unwrap().text, METHOD);
+    assert!(!row.resolution_observed);
+    assert!(!row.resolution_persisted);
+    assert!(row.writer_live);
+    assert!(row.writer_capacity <= 64);
+    assert_eq!(
+        remote_selected_native_approval_recheck(&snapshot)
+            .unwrap()
+            .state,
+        NativeRuntimeApprovalRecheck::NoObservedChange
+    );
+
+    let runtime = WRITERS
+        .lock()
+        .unwrap()
+        .get(&w.session)
+        .and_then(Weak::upgrade)
+        .unwrap();
+    let held = runtime.pending.lock().await;
+    assert!(matches!(
+        remote_selected_native_approval(w.session, id),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    assert!(matches!(
+        remote_selected_native_approval(w.session, Uuid::new_v4())
+            .unwrap()
+            .state,
+        NativeRuntimeApprovalState::Missing
+    ));
+    w.finish().await;
+    assert_eq!(
+        remote_selected_native_approval_recheck(&snapshot)
+            .unwrap()
+            .state,
+        NativeRuntimeApprovalRecheck::Changed
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_native_runtime_list_is_bounded_and_missing_is_not_empty() {
+    use crate::remote_read::{
+        NativeRuntimeApprovalListState, NativeRuntimeApprovalRecheck, ReadError,
+    };
+
+    let w = World::new().await;
+    let session = w.session;
+    w.inject(json!(611), METHOD);
+    let first = w.publication(None, "published").await;
+    w.inject(json!(612), METHOD);
+    let second = w.publication(Some(&first), "published").await;
+    let first_id = Uuid::parse_str(first["publication_id"].as_str().unwrap()).unwrap();
+    let second_id = Uuid::parse_str(second["publication_id"].as_str().unwrap()).unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match remote_native_approval_list(w.session) {
+                Err(ReadError::Busy) => tokio::task::yield_now().await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .expect("monitor releases bounded native list after publication");
+    let NativeRuntimeApprovalListState::Present(ref rows) = snapshot.state else {
+        panic!("live writer list must be present");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), {
+        let mut ids = vec![first_id, second_id];
+        ids.sort_unstable();
+        ids
+    });
+    assert!(rows.iter().all(|row| {
+        row.method.as_ref().unwrap().text == METHOD
+            && row.writer_live
+            && row.writer_capacity <= 64
+            && !row.resolution_observed
+    }));
+    assert_eq!(
+        remote_native_approval_list_recheck(&snapshot)
+            .unwrap()
+            .state,
+        NativeRuntimeApprovalRecheck::NoObservedChange
+    );
+    let runtime = WRITERS
+        .lock()
+        .unwrap()
+        .get(&w.session)
+        .and_then(Weak::upgrade)
+        .unwrap();
+    let held = runtime.pending.lock().await;
+    assert!(matches!(
+        remote_native_approval_list(w.session),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    w.finish().await;
+    assert!(matches!(
+        remote_native_approval_list(session).unwrap().state,
+        NativeRuntimeApprovalListState::Missing
+    ));
+    assert_eq!(
+        remote_native_approval_list_recheck(&snapshot)
+            .unwrap()
+            .state,
+        NativeRuntimeApprovalRecheck::Changed
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
 async fn appserver_approval_monitor_operator_writer_roundtrip_and_exact_replay_emit_once() {
     let mut w = World::new().await;
     w.inject(json!(71), METHOD);

@@ -22,6 +22,10 @@ use crate::provider_capabilities::{
     CatalogRefreshReason, CodexCatalogRefresh, MAX_VALIDATED_CONTEXT_TOKENS,
     ProviderCapabilityRegistry, provider_capabilities,
 };
+pub(crate) use crate::store_support::provider_defaults::{
+    CODEX_TOOL_HISTORY_ERROR_CLASS, codex_reasoning_effort,
+};
+pub use crate::store_support::provider_settings::CodexSandboxMode;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -45,7 +49,6 @@ const CODEX_FATAL_STDERR_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const CODEX_STORAGE_FULL_ERROR_CLASS: &str = "codex_storage_full";
 pub(crate) const CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE: &str = "stderr.codex_storage_full";
 pub(crate) const CODEX_STORAGE_FULL_STOP_REASON: &str = "provider_error:codex_storage_full";
-pub(crate) const CODEX_TOOL_HISTORY_ERROR_CLASS: &str = "codex_resume_tool_history_invalid";
 const CODEX_USAGE_LIMIT_MESSAGE_PREFIX: &str = "You've hit your usage limit.";
 pub(crate) const CODEX_USAGE_LIMIT_ERROR_CLASS: &str = "codex_usage_limit";
 pub(crate) const CODEX_USAGE_LIMIT_STOP_REASON: &str = "provider_error:codex_usage_limit";
@@ -59,34 +62,6 @@ pub struct CodexProcess {
 impl CodexProcess {
     pub(crate) fn from_child_for_route_test(child: Child) -> Self {
         Self { child }
-    }
-}
-
-/// Sandbox policy for each `codex exec` turn, including resumed turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexSandboxMode {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-}
-
-impl CodexSandboxMode {
-    pub(crate) fn cli_arg(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
-            Self::DangerFullAccess => "danger-full-access",
-        }
-    }
-
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
-        match normalized.as_str() {
-            "read-only" => Some(Self::ReadOnly),
-            "workspace-write" => Some(Self::WorkspaceWrite),
-            "danger-full-access" => Some(Self::DangerFullAccess),
-            _ => None,
-        }
     }
 }
 
@@ -130,7 +105,8 @@ pub struct CodexClient {
 
 impl CodexClient {
     pub fn new(runtime_config: Arc<RuntimeConfig>) -> Result<Self> {
-        let binary_path = which::which("codex").map_err(|_| DaemonError::CodexBinaryNotFound)?;
+        let binary_path =
+            crate::provider_cli::resolve("codex").ok_or(DaemonError::CodexBinaryNotFound)?;
         tracing::info!(
             path = %binary_path.display(),
             "Found Codex binary"
@@ -188,7 +164,7 @@ impl CodexClient {
     }
 
     pub fn is_available() -> bool {
-        which::which("codex").is_ok()
+        crate::provider_cli::resolve("codex").is_some()
     }
 
     /// Return model menu entries for the Codex provider.
@@ -524,6 +500,13 @@ impl CodexClient {
                 )
             })?;
             OpenRouterCodexConfigOverrides::new(credential).append_to(&mut cmd);
+            // #966: compact at an absolute live-context budget. OpenRouter
+            // models have 1M+ windows, so Codex's window-derived limit let a
+            // child re-read 600k+ cached tokens on every step. `exec resume`
+            // accepts config overrides, so every turn gets the current value.
+            if let Some(budget) = self.runtime_config.openrouter_context_budget() {
+                cmd.args(["-c", &format!("model_auto_compact_token_limit={budget}")]);
+            }
         }
 
         // Apply working directory at the process level so both `exec` and
@@ -620,6 +603,24 @@ impl CodexClient {
                     &event_tx,
                 )
                 .await;
+                let next_line = match next_line {
+                    Err(BoundedLineError::Exceeded { limit }) => {
+                        match lines.drain_oversized_line().await {
+                            Ok(()) => {
+                                if event_tx
+                                    .send(crate::provider::stdout_line_truncated_event(limit))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    other => other,
+                };
                 let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
@@ -627,18 +628,13 @@ impl CodexClient {
                         if let Some(pid) = child_pid {
                             terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
                         }
-                        let error_class = if matches!(error, BoundedLineError::Exceeded { .. }) {
-                            "provider_output_overflow"
-                        } else {
-                            "provider_output_read_error"
-                        };
                         let _ = event_tx.try_send(StreamEvent {
                             event_type: "process_error".to_string(),
                             data: serde_json::json!({
                                 "error": error.to_string(),
                                 "source": "stdout",
                                 "terminal": true,
-                                "error_class": error_class,
+                                "error_class": "provider_output_read_error",
                             }),
                         });
                         break;
@@ -928,7 +924,7 @@ pub(crate) async fn load_codex_configured_context_window(
         return Ok(result);
     }
 
-    let Some(binary_path) = which::which("codex").ok() else {
+    let Some(binary_path) = crate::provider_cli::resolve("codex") else {
         return Ok(None);
     };
     Ok(
@@ -2053,28 +2049,22 @@ pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> Str
             None => config.query.clone(),
         }
     } else {
-        let mut parts = vec![
-            crate::session::preamble::AGENT_DISCOVERY_NUDGE,
-            crate::session::preamble::THOUGHTS_COMMIT_POLICY,
-            crate::session::preamble::DAEMON_MESSAGE_CONVENTION,
-        ];
+        // The same RSI-generic part every other provider gets, resolved
+        // against the session's own tree (the thoughts policy is included
+        // only when that tree has a `thoughts/` directory). The backend
+        // policy rides the generic part too, so Codex sees what Claude sees.
+        let project_dir = config
+            .working_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let mut parts = vec![crate::session::preamble::load_generic(
+            project_dir.as_deref(),
+        )];
         if let Some(instruction) = launch_instruction {
-            parts.push(instruction);
+            parts.push(instruction.to_string());
         }
-        parts.push(&config.query);
+        parts.push(config.query.clone());
         parts.join("\n\n")
-    }
-}
-
-pub(crate) fn codex_reasoning_effort(effort: Option<&str>) -> Option<&'static str> {
-    match effort {
-        Some("low") => Some("low"),
-        Some("medium") => Some("medium"),
-        Some("high") => Some("high"),
-        Some("xhigh") => Some("xhigh"),
-        Some("max") => Some("max"),
-        Some("ultra") => Some("ultra"),
-        _ => None,
     }
 }
 
@@ -2340,6 +2330,9 @@ fn map_codex_json_to_stream_event_inner(
                         // context-window input, so context % continues to use
                         // the normalized input token estimate above.
                         "output_tokens": usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        // Metric-only: raw full-prompt tokens before cache subtraction.
+                        // Accumulated by the monitor into total_prompt_tokens.
+                        "prompt_tokens_total": reported_input,
                     },
                     "subtype": "turn_completed",
                     "provider_event_type": "turn.completed",
@@ -2482,6 +2475,7 @@ mod tests {
     /// fields default to `None`/`false` — only `query` is mandatory.
     fn launch_config_minimal(resume: Option<String>) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query: "noop".to_string(),
             title: None,
             agent_role: None,
@@ -2516,6 +2510,7 @@ mod tests {
             model_invocation_dedup_key: None,
             model_invocation_request_fingerprint: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
             sandbox: None,
@@ -2846,15 +2841,17 @@ mod tests {
     #[test]
     fn stdin_payload_prepends_nudge_first_turn_only() {
         use crate::session::preamble::{
-            AGENT_DISCOVERY_NUDGE, DAEMON_MESSAGE_CONVENTION, THOUGHTS_COMMIT_POLICY,
+            DAEMON_MESSAGE_CONVENTION, THOUGHTS_COMMIT_POLICY, agent_discovery_nudge,
         };
         let mut config = launch_config_minimal(None);
         config.query = "do the thing".to_string();
+        // A session in the rsi repo (which has `thoughts/`).
+        config.working_dir = Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
 
         // First turn (!is_resume): nudge prepended, query preserved verbatim.
         let first = codex_stdin_payload(&config, false);
         assert!(
-            first.contains(AGENT_DISCOVERY_NUDGE),
+            first.contains(agent_discovery_nudge()),
             "first-turn stdin payload must carry the discovery nudge"
         );
         assert!(
@@ -2866,16 +2863,46 @@ mod tests {
             "first-turn stdin payload must carry the daemon message convention"
         );
         assert!(first.contains("do the thing"));
-        assert!(first.starts_with(AGENT_DISCOVERY_NUDGE));
+        assert!(first.starts_with(agent_discovery_nudge()));
 
         // Resume turn: verbatim query, no nudge re-injection.
         let resumed = codex_stdin_payload(&config, true);
         assert_eq!(resumed, "do the thing");
-        assert!(!resumed.contains(AGENT_DISCOVERY_NUDGE));
+        assert!(!resumed.contains(agent_discovery_nudge()));
         assert!(!resumed.contains(THOUGHTS_COMMIT_POLICY));
 
         // `config.query` (the stored user event) is never mutated.
         assert_eq!(config.query, "do the thing");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn stdin_payload_matches_generic_part_for_the_session_project() {
+        use crate::session::preamble::{THOUGHTS_COMMIT_POLICY, load_generic};
+        let project = tempfile::tempdir().expect("temp project");
+        // Mark the project root so the search never climbs into whatever
+        // repository hosts the temp directory.
+        std::fs::create_dir(project.path().join(".git")).expect("git marker");
+        let mut config = launch_config_minimal(None);
+        config.query = "do the thing".to_string();
+        config.working_dir = Some(project.path().to_path_buf());
+
+        // No `thoughts/` in the project: exactly the generic part, no policy
+        // naming a directory the tree lacks.
+        let first = codex_stdin_payload(&config, false);
+        assert_eq!(
+            first,
+            format!("{}\n\ndo the thing", load_generic(Some(project.path())))
+        );
+
+        // With `thoughts/`, the policy joins the same generic part.
+        std::fs::create_dir(project.path().join("thoughts")).expect("thoughts dir");
+        let with_thoughts = codex_stdin_payload(&config, false);
+        assert!(with_thoughts.contains(THOUGHTS_COMMIT_POLICY));
+        assert_eq!(
+            with_thoughts,
+            format!("{}\n\ndo the thing", load_generic(Some(project.path())))
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -2889,7 +2916,7 @@ mod tests {
         ));
 
         let initial = codex_stdin_payload(&config, false);
-        assert!(initial.contains(crate::session::preamble::AGENT_DISCOVERY_NUDGE));
+        assert!(initial.contains(crate::session::preamble::agent_discovery_nudge()));
         assert!(initial.contains("/tmp/rsi-sandboxes/43ae018b"));
         assert!(initial.contains("rsi/43ae018b"));
         assert!(initial.ends_with("implement the assigned task"));
@@ -3570,6 +3597,33 @@ done
         assert_eq!(usage.context_tokens, 130_492);
         assert_eq!(usage.output_tokens, 640);
         assert_eq!(usage.context_window, Some(258_400));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn test_turn_completed_context_input_is_uncached_and_prompt_total_is_raw() {
+        // Context/input accounting takes the uncached remainder only; the raw
+        // prompt (cached included) is a separate metric-only field and the
+        // cumulative cached count never becomes a cache-read or context value.
+        let value = serde_json::json!({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 90_000u64,
+                "cached_input_tokens": 70_000u64,
+                "output_tokens": 300u64,
+            }
+        });
+        let mut thread_id = Some("thread-per-turn".to_string());
+        let event = map_codex_json_to_stream_event(&value, &mut thread_id).unwrap();
+        let usage = event.data.get("usage").unwrap();
+        assert_eq!(usage.get("input_tokens").unwrap(), 20_000);
+        assert_eq!(usage.get("prompt_tokens_total").unwrap(), 90_000);
+        assert!(usage.get("cache_read_input_tokens").is_none());
+
+        let extracted = crate::monitor::extract_token_usage(&event).unwrap();
+        assert_eq!(extracted.total_input, 20_000);
+        assert_eq!(extracted.cache_read, 0);
+        assert_eq!(extracted.prompt_tokens_total, 90_000);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -4595,7 +4649,7 @@ done
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn test_codex_stderr_suppression_reason_suppresses_project_config_warning() {
-        let line = "Ignored unsupported project-local config keys in /home/jakedevar/rsi/.codex/config.toml: notify.";
+        let line = "Ignored unsupported project-local config keys in /home/user/rsi/.codex/config.toml: notify.";
         assert_eq!(
             codex_stderr_suppression_reason(line),
             Some("unsupported project-local config keys warning")
@@ -4771,6 +4825,60 @@ done
                 .last_cli_exposure_at
                 .is_none()
         );
+    }
+
+    /// #966: an OpenRouter child compacts at the operator's absolute budget on
+    /// every turn; other Codex routes keep Codex's own limit.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_openrouter_launch_compacts_at_the_context_budget_on_every_turn() {
+        use crate::vault::Slot;
+        let root = tempfile::tempdir().unwrap();
+        let vault = empty_env_vault(root.path());
+        vault
+            .set(Slot::Openrouter, "sk-test-codex-openrouter-0966")
+            .unwrap();
+        vault
+            .set(Slot::Pioneer, "sk-test-codex-pioneer-0966")
+            .unwrap();
+        let runtime = runtime_config_with_sandbox_mode("workspace-write");
+        let client = codex_client_for_test(Arc::clone(&runtime));
+        let budget_arg = |provider, resume: Option<&str>| {
+            let mut config = launch_config_minimal(resume.map(str::to_string));
+            config.provider = provider;
+            let args = cmd_args(&client.build_cmd_with_vault(&config, &vault).unwrap());
+            args.windows(2)
+                .filter(|pair| pair[0] == "-c")
+                .find_map(|pair| pair[1].strip_prefix("model_auto_compact_token_limit="))
+                .map(str::to_string)
+        };
+        let openrouter = Some(rsi_common::types::SessionProvider::OpenRouter);
+        assert_eq!(budget_arg(openrouter, None).as_deref(), Some("128000"));
+        assert_eq!(
+            budget_arg(openrouter, Some("thread-0966")).as_deref(),
+            Some("128000")
+        );
+        assert_eq!(budget_arg(None, None), None);
+        assert_eq!(
+            budget_arg(Some(rsi_common::types::SessionProvider::Pioneer), None),
+            None
+        );
+
+        runtime
+            .update_field(
+                "openrouter_context_budget_tokens",
+                &serde_json::json!(64_000),
+            )
+            .unwrap();
+        assert_eq!(
+            budget_arg(openrouter, Some("thread-0966")).as_deref(),
+            Some("64000")
+        );
+        runtime
+            .update_field("openrouter_context_budget_tokens", &serde_json::json!(0))
+            .unwrap();
+        assert_eq!(budget_arg(openrouter, None), None);
     }
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]

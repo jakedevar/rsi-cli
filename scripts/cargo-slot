@@ -1,0 +1,204 @@
+#!/bin/bash
+# cargo-slot: run a command under the machine's resource governor (#1014).
+# usage: scripts/cargo-slot <command...>
+#
+# The daemon (rsid) owns the policy: build/lander slots, load, memory and disk
+# gates, the FIFO queue and slot leases (operator settings `governor_*`, TUI
+# Settings > Orchestration; inspect with `rsi-rpc GetResourceGovernor`). This
+# script is a thin client: it asks rsid for a slot (AcquireAdmission), polls
+# while queued, runs the command as a child, and releases the slot
+# (ReleaseAdmission). The lease is tied to this script's pid, so a killed run
+# never leaks a slot. It grants a slot and nothing else; no session token is sent.
+#
+# If rsid is unreachable (or predates the governor) the script falls back to the
+# previous local behaviour: the same gates and flock slot files, with the
+# defaults the daemon policy uses (RSI_LANDER_SLOTS=5, RSI_CARGO_SLOTS=4,
+# RSI_CARGO_MIN_FREE_GB=30, RSI_CARGO_MAX_LOAD=1.25 x cores,
+# RSI_CARGO_MIN_AVAIL_GB=16, RSI_CARGO_MAX_SLICE_GB=30).
+#
+# Both modes: CARGO_BUILD_JOBS=4, nice 19, idle I/O, line-tables-only debug info,
+# exit status and TERM/INT/HUP forwarding preserved, the command runs as a child
+# with the slot fd closed, `rsi-rolling-land` runs use the lander pool with
+# CARGO_INCREMENTAL=0 and a tmpfs TMPDIR, other runs cap test threads at 4.
+# Shard, sweep and gate runs (see below) also get CARGO_INCREMENTAL=0.
+# Set RSI_CARGO_SLOT_LOCAL=1 to skip the daemon and use the local gates.
+is_lander=0
+# An argument right after --bin/-p/--package/--example names a build target, not
+# the lander executable (`cargo build --bin rsi-rolling-land` is a build).
+prev=""
+for a in "$@"; do case "$prev" in --bin|-p|--package|--example) prev="$a"; continue;; esac; case "$(basename -- "$a")" in rsi-rolling-land) is_lander=1; break;; esac; prev="$a"; done
+
+# Lander test I/O goes to RAM: a private TMPDIR under /dev/shm (tmpfs) when
+# >= 12 GB is free there. Removed after the run. Opt out: RSI_LANDER_KEEP_TMPDIR=1.
+LTMP=
+if [ $is_lander -eq 1 ] && [ -z "${RSI_LANDER_KEEP_TMPDIR:-}" ]; then
+  shm_free=$(df -BG --output=avail /dev/shm 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [ "${shm_free:-0}" -ge 12 ] && LTMP=$(mktemp -d /dev/shm/rsi-lander-XXXXXX 2>/dev/null); then
+    export TMPDIR="$LTMP"
+  else
+    LTMP=
+  fi
+fi
+# Lander runs build each side once and never reuse incremental state.
+[ $is_lander -eq 1 ] && export CARGO_INCREMENTAL=0
+# One-off builds (the shard runner, per-shard feature sets, the QA sweep) also
+# never reuse incremental state; it grew the shared target to 63 GB (#1063).
+# Interactive and worker dev builds keep incremental. Honour an explicit
+# CARGO_INCREMENTAL from the caller.
+for a in "$@"; do case "$a" in
+  *run-rsid-test-shards.sh|*run-rolling-qa.py|*cloud-sweep.sh|*cloud-gate.sh|test-shard-*|*features=test-shard-*)
+    export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"; break;;
+esac; done
+# Test-thread cap for NON-lander runs; override per run with RUST_TEST_THREADS=N.
+if [ $is_lander -eq 0 ]; then
+  export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
+  export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-4}"
+fi
+
+class=build; [ $is_lander -eq 1 ] && class=lander
+lease=""
+child=""
+
+# run_child: start the command as a child (lock fds closed), forward signals,
+# release the daemon lease, clean up, and exit with the command's status.
+run_child() {
+  exec 3<&0
+  nice -n 19 ionice -c3 env CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=line-tables-only "$@" <&3 3<&- 9>&- &
+  child=$!
+  exec 3<&-
+  trap 'kill -TERM "$child" 2>/dev/null' TERM HUP
+  trap 'kill -INT "$child" 2>/dev/null' INT
+  rc=0
+  while :; do
+    wait "$child"; rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  release_lease
+  [ -n "$LTMP" ] && rm -rf -- "$LTMP"
+  exit "$rc"
+}
+
+# --- daemon (governor) mode ------------------------------------------------
+RPC_PY=$(cat <<'PY'
+import json, os, socket, sys
+sock = os.environ.get("RSI_DAEMON_SOCKET_PATH") or os.path.expanduser("~/.rsi/daemon.sock")
+op = sys.argv[1]
+if op == "acquire":
+    method = "AcquireAdmission"
+    params = {"class": sys.argv[2], "pid": int(sys.argv[3]), "label": sys.argv[4][:200]}
+    if len(sys.argv) > 5 and sys.argv[5]:
+        params["ticket_id"] = sys.argv[5]
+else:
+    method = "ReleaseAdmission"
+    params = {"lease_id": sys.argv[2]}
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(5)
+    s.connect(sock)
+    s.sendall((json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    reply = json.loads(buf)
+except Exception:
+    print("unreachable")
+    sys.exit(0)
+if "error" in reply and reply["error"]:
+    msg = str(reply["error"].get("message", ""))
+    print(("badticket " if "ticket" in msg else "unreachable ") + msg.replace("\n", " "))
+    sys.exit(0)
+r = reply.get("result") or {}
+if op == "release":
+    print("released")
+elif r.get("status") == "granted":
+    print("granted", r["lease_id"])
+elif r.get("status") == "queued":
+    print("queued", r["ticket_id"], r["position"], r.get("message", "").replace("\n", " "))
+else:
+    print("unreachable")
+PY
+)
+PYTHON=/usr/bin/python3; [ -x "$PYTHON" ] || PYTHON=$(command -v python3)
+
+rpc() { [ -n "$PYTHON" ] && "$PYTHON" -c "$RPC_PY" "$@" 2>/dev/null; }
+
+release_lease() {
+  [ -n "$lease" ] && rpc release "$lease" >/dev/null
+  lease=""
+}
+
+# governed_wait: 0 = granted (lease set), 1 = daemon unusable (use local gates).
+governed_wait() {
+  [ -n "${RSI_CARGO_SLOT_LOCAL:-}" ] && return 1
+  [ -n "$PYTHON" ] || return 1
+  local label out status id pos msg ticket="" lastmsg=""
+  label="$*"
+  while :; do
+    out=$(rpc acquire "$class" "$$" "$label" "$ticket") || return 1
+    read -r status id pos msg <<<"$out"
+    case "$status" in
+      granted) lease="$id"; return 0 ;;
+      queued)
+        ticket="$id"; lease="$id"  # release_lease also cancels a queued ticket
+        if [ "$msg" != "$lastmsg" ]; then
+          echo "cargo-slot: queued ($class position $pos): $msg" >&2
+          lastmsg="$msg"
+        fi
+        sleep 2 ;;
+      badticket) ticket=""; lease="" ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+# Cancel a still-queued ticket on abnormal exit so it does not hold the queue.
+trap 'release_lease; [ -n "$LTMP" ] && rm -rf -- "$LTMP"; exit 130' INT
+trap 'release_lease; [ -n "$LTMP" ] && rm -rf -- "$LTMP"; exit 143' TERM HUP
+
+if governed_wait "$@"; then
+  run_child "$@"
+fi
+
+# --- local fallback (rsid unreachable): the previous flock/gate behaviour ---
+MIN_FREE_GB=${RSI_CARGO_MIN_FREE_GB:-30}
+if [ $is_lander -eq 1 ]; then
+  N=${RSI_LANDER_SLOTS:-5}
+  # Landers use the legacy lock files so runs under the older script count.
+  lock_for() { if [ "$1" -eq 0 ]; then echo "$HOME/.rsi/cargo-slot.lock"; else echo "$HOME/.rsi/cargo-slot-$1.lock"; fi; }
+else
+  N=${RSI_CARGO_SLOTS:-4}
+  lock_for() { echo "$HOME/.rsi/build-slot-$1.lock"; }
+fi
+warned=0
+while :; do
+  free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+  if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
+    [ $warned -eq 0 ] && echo "cargo-slot: only ${free_gb} GB free on / (< ${MIN_FREE_GB}); waiting for space" >&2 && warned=1
+    sleep 30; continue
+  fi
+  load1=$(cut -d' ' -f1 /proc/loadavg); maxload=${RSI_CARGO_MAX_LOAD:-$(( $(nproc) * 5 / 4 ))}
+  if [ "${load1%%.*}" -ge "$maxload" ]; then
+    [ $warned -eq 0 ] && echo "cargo-slot: load ${load1} >= ${maxload}; waiting" >&2 && warned=1
+    sleep 15; continue
+  fi
+  # Memory gate: MemAvailable, and anonymous + shmem memory of the workers slice
+  # (never memory.current, which counts reclaimable page cache).
+  avail_gb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
+  slice_stat=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/rsi.slice/rsi-workers.slice/memory.stat
+  slice_gb=0; [ -r "$slice_stat" ] && slice_gb=$(awk '$1=="anon"||$1=="shmem"{s+=$2} END{printf "%d", s/1073741824}' "$slice_stat")
+  if [ "$avail_gb" -lt "${RSI_CARGO_MIN_AVAIL_GB:-16}" ] || [ "$slice_gb" -ge "${RSI_CARGO_MAX_SLICE_GB:-30}" ]; then
+    [ $warned -eq 0 ] && echo "cargo-slot: memory low (available ${avail_gb} GB, workers slice ${slice_gb} GB); waiting" >&2 && warned=1
+    sleep 15; continue
+  fi
+  for i in $(seq 0 $((N-1))); do
+    exec 9>>"$(lock_for $i)"
+    if flock -n 9; then
+      run_child "$@"
+    fi
+    exec 9>&-
+  done
+  sleep 5
+done

@@ -171,13 +171,44 @@ class LandingGuardTest(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn("accepted binary edit reverted to base blob sha256:", findings[0])
 
-    def test_filter_is_explicit_and_must_name_affected_crate(self):
+    def test_filter_is_explicit_and_may_target_readers(self):
         self.assertEqual(
             GUARD.test_commands(["fixture"], ["fixture=accepted_default"]),
             [["cargo", "test", "-p", "fixture", "--lib", "accepted_default"]],
         )
         with self.assertRaises(GUARD.GuardError):
-            GUARD.test_commands(["fixture"], ["other=accepted_default"])
+            GUARD.test_commands(["fixture"], ["fixture="])
+        # A reader of a changed doc may live in a crate the diff did not touch,
+        # and bin:/test: filters select a cargo target.
+        self.assertEqual(
+            GUARD.test_commands(["fixture"], ["other=bin:tool", "other=test:corpus"]),
+            [["cargo", "test", "-p", "fixture", "--lib"],
+             ["cargo", "test", "-p", "other", "--bin", "tool"],
+             ["cargo", "test", "-p", "other", "--test", "corpus"]],
+        )
+
+    def test_toml_parser_falls_back_to_tomli_then_fails_clearly(self):
+        real = GUARD.importlib.import_module
+        tomli = mock.Mock()
+
+        def without_tomllib(name, *args, **kwargs):
+            if name == "tomllib":
+                raise ModuleNotFoundError("No module named 'tomllib'", name="tomllib")
+            if name == "tomli":
+                return tomli
+            return real(name, *args, **kwargs)
+
+        with mock.patch.object(GUARD.importlib, "import_module", without_tomllib):
+            self.assertIs(GUARD.load_toml_module(), tomli)
+
+        def without_any(name, *args, **kwargs):
+            if name in ("tomllib", "tomli"):
+                raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+            return real(name, *args, **kwargs)
+
+        with mock.patch.object(GUARD.importlib, "import_module", without_any):
+            with self.assertRaisesRegex(GUARD.GuardError, "Python >= 3.11 .*tomli"):
+                GUARD.load_toml_module()
 
 
 if __name__ == "__main__":

@@ -674,6 +674,9 @@ fn validate_exclusion(
                     violations,
                 )
         }
+        AllowedExclusionOperation::CredentialHttpProbe => {
+            credential_probe_is_bounded(item.block, contract.proof_ident)
+        }
         AllowedExclusionOperation::TransportSpawn if transport_factory_proof => true,
         _ => facts
             .operation_proofs
@@ -730,6 +733,14 @@ fn validate_exclusion(
                     && facts.spawn == 0
                     && no_model_family
             }
+            AllowedExclusionOperation::CredentialHttpProbe => {
+                facts.post == contract.occurrences
+                    && facts.get == 3
+                    && facts.raw_http_send == contract.occurrences
+                    && !facts.assigned_bindings.contains("request")
+                    && facts.spawn == 0
+                    && no_model_family
+            }
             AllowedExclusionOperation::QueueNoOp => {
                 facts.post == 0
                     && facts.spawn == 0
@@ -758,6 +769,138 @@ fn validate_exclusion(
             facts.tcp_connect,
         ));
     }
+}
+
+/// This credential check mixes catalog GETs with a bounded Bedrock model POST.
+/// Keep its request identity and POST payload explicit rather than treating it
+/// as a non-model HTTP operation.
+fn credential_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
+    fn method<'a>(expr: &'a Expr, name: &str) -> Option<&'a ExprMethodCall> {
+        match expr {
+            Expr::MethodCall(call) if call.method == name && call.args.len() == 1 => Some(call),
+            _ => None,
+        }
+    }
+
+    fn macro_matches(expr: &Expr, path: &[&str], tokens: &str) -> bool {
+        let Expr::Macro(expr) = expr else {
+            return false;
+        };
+        expr.mac
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .eq(path.iter().copied())
+            && expr.mac.tokens.to_string()
+                == tokens
+                    .parse::<proc_macro2::TokenStream>()
+                    .expect("probe proof tokens")
+                    .to_string()
+    }
+
+    fn bounded_post(expr: &Expr) -> bool {
+        let Some(json) = method(expr, "json") else {
+            return false;
+        };
+        let Some(Expr::Reference(payload)) = json.args.first() else {
+            return false;
+        };
+        if payload.mutability.is_some()
+            || !macro_matches(
+                &payload.expr,
+                &["serde_json", "json"],
+                r#"{
+            "model": crate::bedrock::BEDROCK_DEFAULT_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }"#,
+            )
+        {
+            return false;
+        }
+        let Some(auth) = method(&json.receiver, "bearer_auth") else {
+            return false;
+        };
+        let Some(Expr::MethodCall(secret)) = auth.args.first() else {
+            return false;
+        };
+        if secret.method != "expose"
+            || !secret.args.is_empty()
+            || !expr_is_ident(&secret.receiver, "secret")
+        {
+            return false;
+        }
+        let Some(post) = method(&auth.receiver, "post") else {
+            return false;
+        };
+        expr_is_ident(&post.receiver, "http")
+            && macro_matches(
+                post.args.first().expect("one POST argument"),
+                &["format"],
+                r#""{base}/openai/v1/chat/completions""#,
+            )
+    }
+
+    struct ProbeShape {
+        requests: usize,
+        bounded: bool,
+        sends: usize,
+    }
+    impl<'ast> Visit<'ast> for ProbeShape {
+        fn visit_local(&mut self, local: &'ast Local) {
+            if let Pat::Ident(ident) = &local.pat
+                && ident.ident == "request"
+            {
+                self.requests += 1;
+                if ident.mutability.is_none()
+                    && let Some(init) = &local.init
+                    && let Expr::Match(request) = init.expr.as_ref()
+                    && expr_is_ident(&request.expr, "slot")
+                    && request.arms.len() == 5
+                {
+                    self.bounded = request.arms.iter().any(|arm| {
+                        let Pat::Path(pattern) = &arm.pat else {
+                            return false;
+                        };
+                        let is_bedrock = pattern
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .eq(["Slot", "Bedrock"]);
+                        if !is_bedrock || arm.guard.is_some() {
+                            return false;
+                        }
+                        let Expr::Block(body) = arm.body.as_ref() else {
+                            return false;
+                        };
+                        matches!(body.block.stmts.last(), Some(syn::Stmt::Expr(expr, None)) if bounded_post(expr))
+                    });
+                }
+            }
+            visit::visit_local(self, local);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+            if call.method == "send"
+                && call.args.is_empty()
+                && expr_is_ident(&call.receiver, "request")
+            {
+                self.sends += 1;
+            }
+            visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut shape = ProbeShape {
+        requests: 0,
+        bounded: false,
+        sends: 0,
+    };
+    shape.visit_block(block);
+    proof_ident == "BEDROCK_DEFAULT_MODEL"
+        && shape.requests == 1
+        && shape.bounded
+        && shape.sends == 1
 }
 
 fn transport_factory_proves_app_server(file: &syn::File, block: &Block, name: &str) -> bool {
@@ -1372,6 +1515,9 @@ fn exclusion_covers(operation: AllowedExclusionOperation, kind: PrimitiveKind) -
             PrimitiveKind::HttpPost
         ) | (
             AllowedExclusionOperation::NonModelHttpPost,
+            PrimitiveKind::HttpPost
+        ) | (
+            AllowedExclusionOperation::CredentialHttpProbe,
             PrimitiveKind::HttpPost
         )
     )

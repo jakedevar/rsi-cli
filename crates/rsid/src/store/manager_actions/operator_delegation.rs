@@ -11,6 +11,7 @@ use rsi_common::archive_cleanup::ArchiveSessionResultV1;
 use rsi_common::harness_manager_v2::{
     ManagerActionStateV2, ManagerActionV2, ManagerOperatingModeV2,
 };
+use rsi_common::manager_daemon_settings::check_daemon_setting_proposal;
 use rsi_common::manager_operator_delegation::{
     DELEGATED_PAGE_MAX_BYTES, DELEGATED_PAGE_MAX_ROWS, DelegatedListSessionsParamsV1,
     DelegatedOperatorCallV1, DelegatedSessionCursorV1, DelegatedSessionRowV1, OperatorCallFenceV1,
@@ -121,8 +122,49 @@ impl Store {
                 self.manager_action_project_target(authority, params.session_id)?;
                 Ok(None)
             }
-            DelegatedOperatorCallV1::ListSessions(_) => Ok(None),
+            // #1043: daemon-global storage calls carry no session target; the
+            // Execute/pause gates above and the capability check at admission
+            // are their whole admission.
+            DelegatedOperatorCallV1::ListSessions(_)
+            | DelegatedOperatorCallV1::GetSandboxStorageStatus(_)
+            | DelegatedOperatorCallV1::RunSandboxBuildCacheReclaim(_) => Ok(None),
+            // #1046: the allowlist and the operator's per-key bounds are
+            // checked at admission and again at effect time against the
+            // grant's current policy, so a tightened bound refuses a queued
+            // proposal.
+            DelegatedOperatorCallV1::ProposeDaemonSetting(params) => {
+                check_daemon_setting_proposal(
+                    &authority.grant.policy.daemon_setting_bounds,
+                    &params.key,
+                    params.value,
+                )
+                .map_err(refused)?;
+                Ok(None)
+            }
         }
+    }
+
+    /// #1046: gate a claimed `ProposeDaemonSetting` at effect time and return
+    /// its params. Re-checks the allowlist and bounds against the grant's
+    /// current policy and the Execute/pause gates before any setting changes.
+    pub(crate) fn authorize_delegated_setting(
+        &self,
+        claim: &ManagerActionClaimV2,
+    ) -> Result<rsi_common::manager_daemon_settings::ProposeDaemonSettingParamsV1> {
+        let authority = self.manager_action_runtime_gate_on(claim)?;
+        let DelegatedOperatorCallV1::ProposeDaemonSetting(params) = typed_call(claim)? else {
+            return Err(refused("manager_v2_not_operator_call"));
+        };
+        let policy = &authority.grant.policy;
+        if policy.mode != ManagerOperatingModeV2::Execute {
+            return Err(refused("manager_v2_execute_required"));
+        }
+        if policy.paused {
+            return Err(refused("manager_v2_policy_paused"));
+        }
+        check_daemon_setting_proposal(&policy.daemon_setting_bounds, &params.key, params.value)
+            .map_err(refused)?;
+        Ok(params)
     }
 
     /// Epic pause and the required `session_updated_at` fence shared by every
@@ -294,7 +336,8 @@ impl Store {
             return Err(refused("manager_v2_not_operator_call"));
         };
         let changed = self.conn.execute(
-            "UPDATE sessions SET status='Completed',pending_archive=0,updated_at=?2
+            "UPDATE sessions SET status='Completed',pending_archive=0,
+             stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'completed:restored'),updated_at=?2
              WHERE id=?1 AND status='Archived'",
             params![params.session_id.to_string(), stamp(Utc::now())],
         )?;

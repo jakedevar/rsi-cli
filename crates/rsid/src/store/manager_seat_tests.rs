@@ -469,6 +469,7 @@ fn seat_classifier_is_live_only_on_output_after_evidence() {
         attempts: 1,
         max_attempts: 3,
         retry_delay_seconds: 1,
+        usage_hold_until: None,
         down_since: now,
         evidence_after: Some(now),
         last_output: Some(now - Duration::seconds(1)),
@@ -572,4 +573,75 @@ fn seat_codex_appserver_tip_records_recovery_unavailable() {
     assert_eq!(state.reason, SEAT_UNAVAILABLE_REASON);
     assert!(state.next_action.unwrap().contains("retry or replace"));
     assert_eq!(attempts(&store, config.project_id), Vec::new());
+}
+
+/// #754: a seat tip whose Codex account is on an authoritative usage-limit
+/// hold is not claimed (and no attempt is charged) before the provider reset;
+/// at the reset the same attempt number is claimed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn seat_recovery_waits_for_the_provider_usage_limit_reset_without_charging_attempts() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, _) = fixture(&store, execute(3, 10));
+    let tip = manager(&config);
+    let failed_at = Utc::now();
+    let reset = failed_at + Duration::hours(30);
+    let text = format!(
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {} {}th, {} {}.",
+        reset.format("%b"),
+        reset.format("%-d"),
+        reset.format("%Y"),
+        reset.format("%-I:%M %p"),
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET provider='Codex', claude_session_id='codex-thread',
+                 stop_reason=?2 WHERE id=?1",
+            rusqlite::params![tip.to_string(), crate::codex::CODEX_USAGE_LIMIT_STOP_REASON],
+        )
+        .unwrap();
+    store
+        .insert_event(&ConversationEvent {
+            id: 0,
+            session_id: tip,
+            sequence: 1_000,
+            event_type: EventType::Message,
+            role: Some(Role::Assistant),
+            created_at: failed_at,
+            content: format!("**Process Error (codex_event)**\n```\n{text}\n```"),
+            tool_name: None,
+            tool_input: None,
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        })
+        .unwrap();
+    fail(&store, tip);
+    let hold = store
+        .codex_usage_limit_hold(failed_at)
+        .unwrap()
+        .expect("the usage-limit hold is in force")
+        .until;
+    // Past the ordinary backoff but inside the hold: nothing is claimed.
+    for offset in [11, 3_600, 24 * 3_600] {
+        let at = failed_at + Duration::seconds(offset);
+        assert_eq!(pass(&store, config.project_id, true, at).claim, None);
+        let state = seat(&store, &config);
+        assert_eq!(state.state, ManagerSeatConditionV1::Recovering);
+        assert_eq!(state.reason, SEAT_USAGE_LIMIT_HOLD_REASON);
+        assert_eq!(state.not_before, Some(hold));
+        assert_eq!(state.attempts, 0, "no attempt is charged during the hold");
+        assert!(
+            state
+                .next_action
+                .is_some_and(|text| text.contains("provider reset"))
+        );
+    }
+    assert_eq!(attempts(&store, config.project_id), Vec::new());
+    // At the reset the first attempt is claimed.
+    let claim = pass(&store, config.project_id, true, hold + Duration::seconds(1))
+        .claim
+        .expect("claimed after the provider reset");
+    assert_eq!((claim.tip_session_id, claim.attempt), (tip, 1));
 }

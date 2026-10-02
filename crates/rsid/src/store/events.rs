@@ -342,6 +342,102 @@ impl Store {
         })
     }
 
+    /// `AgentReadSessionEvents` (#1041): one page of a session's events.
+    ///
+    /// With `after_sequence` the page is forward (sequence greater, ascending);
+    /// without it the page is the newest `limit` matching events, ascending.
+    /// Returns `(events, has_more, has_earlier)` relative to the page. Read
+    /// only.
+    pub(crate) fn read_session_events_page(
+        &self,
+        session_id: Uuid,
+        after_sequence: Option<i32>,
+        limit: u32,
+        event_types: Option<&[EventType]>,
+    ) -> Result<(Vec<ConversationEvent>, bool, bool)> {
+        // The type filter is one bound JSON array (NULL = no filter), so every
+        // statement below is a static string the protected-DML audit can prove
+        // never writes: no SQL text is assembled from event-type names.
+        let type_filter: Option<String> = match event_types {
+            Some(types) if !types.is_empty() => {
+                let names: Vec<&str> = types.iter().map(|t| event_type_to_str(*t)).collect();
+                Some(serde_json::to_string(&names).map_err(|e| DaemonError::Store(e.to_string()))?)
+            }
+            _ => None,
+        };
+        let fetch = i64::from(limit) + 1;
+        let sid = session_id.to_string();
+        let (mut rows, has_more, has_earlier) = if let Some(after) = after_sequence {
+            let mut stmt = self.conn.prepare(concat!(
+                "SELECT id, session_id, sequence, event_type, role, content, tool_name, tool_input, created_at, tool_use_id, metadata FROM conversation_events WHERE session_id = ?1 AND sequence > ?2 ",
+                "AND (?4 IS NULL OR event_type IN (SELECT value FROM json_each(?4))) ORDER BY sequence ASC LIMIT ?3"
+            ))?;
+            let rows = stmt
+                .query_map(params![sid, after, fetch, type_filter], Self::map_event_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let earlier: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_events WHERE session_id = ?1 AND sequence <= ?2 AND (?3 IS NULL OR event_type IN (SELECT value FROM json_each(?3))))",
+                params![sid, after, type_filter],
+                |row| row.get(0),
+            )?;
+            let more = rows.len() as i64 > i64::from(limit);
+            (rows, more, earlier)
+        } else {
+            let mut stmt = self.conn.prepare(concat!(
+                "SELECT id, session_id, sequence, event_type, role, content, tool_name, tool_input, created_at, tool_use_id, metadata FROM conversation_events WHERE session_id = ?1 ",
+                "AND (?3 IS NULL OR event_type IN (SELECT value FROM json_each(?3))) ORDER BY sequence DESC LIMIT ?2"
+            ))?;
+            let mut rows = stmt
+                .query_map(params![sid, fetch, type_filter], Self::map_event_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let earlier = rows.len() as i64 > i64::from(limit);
+            rows.reverse();
+            (rows, false, earlier)
+        };
+        // Drop the probe row: the oldest one for a tail, the newest otherwise.
+        if rows.len() as i64 > i64::from(limit) {
+            if after_sequence.is_some() {
+                rows.pop();
+            } else {
+                rows.remove(0);
+            }
+        }
+        let events = rows
+            .into_iter()
+            .map(Self::convert_event_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((events, has_more, has_earlier))
+    }
+
+    /// The newest assistant `Message` event of a session, if any. Provider
+    /// diagnostics (marked `metadata.provider_diagnostic`) are skipped: they
+    /// are not the agent's own output (#1089).
+    pub(crate) fn last_assistant_message_event(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<ConversationEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, sequence, event_type, role, content, tool_name, tool_input, created_at, tool_use_id, metadata
+             FROM conversation_events
+             WHERE session_id = ?1 AND event_type = 'Message' AND role = 'Assistant'
+               AND (metadata IS NULL
+                    OR NOT json_valid(metadata)
+                    OR COALESCE(json_extract(metadata, '$.provider_diagnostic'), 0) != 1)
+             ORDER BY sequence DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_map(params![session_id.to_string()], Self::map_event_row)?
+            .next()
+            .transpose()?;
+        row.map(Self::convert_event_row).transpose()
+    }
+
+    /// The rotation tip of `origin`'s `continued_from` lineage.
+    pub(crate) fn session_lineage_tip(&self, origin: Uuid) -> Result<Uuid> {
+        let tx = self.conn.unchecked_transaction()?;
+        super::agent_coordination::resolve_lineage_tip(&tx, origin)
+    }
+
     /// Update the content of a conversation event (for compression/offload).
     pub fn update_event_content(&self, event_id: i64, new_content: &str) -> Result<()> {
         self.conn.execute(

@@ -174,6 +174,10 @@ pub(crate) struct InteractiveLaunchResult {
     pub generation: u64,
     pub accepted: Result<Uuid, String>,
     pub model_warning: Option<String>,
+    /// Outcome of the manager appointment planned on the prompt's settings
+    /// side: `None` when none was planned (or the launch failed), otherwise a
+    /// success summary or the refusal that left the session unappointed.
+    pub manager: Option<Result<String, String>>,
 }
 
 pub(crate) struct PendingInteractiveLaunch {
@@ -339,6 +343,20 @@ impl App {
         origin: InteractiveLaunchOrigin,
         placement: LaunchPlacement,
     ) -> Result<(), String> {
+        self.begin_interactive_launch_with_manager(request, origin, placement, None)
+    }
+
+    /// Start one response-bearing launch. When `manager` is planned, the same
+    /// task appoints the accepted session as its project's manager and grants
+    /// the chosen policy before reporting back, so the outcome arrives with the
+    /// launch result.
+    fn begin_interactive_launch_with_manager(
+        &mut self,
+        request: OwnedLaunchRequest,
+        origin: InteractiveLaunchOrigin,
+        placement: LaunchPlacement,
+        manager: Option<crate::types::ManagerLaunchPlan>,
+    ) -> Result<(), String> {
         if self.interactive_launch_pending.is_some() {
             let error = "A session launch is awaiting daemon acceptance; draft preserved";
             self.notify_error(error);
@@ -370,12 +388,24 @@ impl App {
         let socket_path = self.client.socket_path().to_path_buf();
         let tx = self.interactive_launch_tx.clone();
         self.interactive_launch_handle = Some(runtime.spawn(async move {
-            let accepted = request.execute(socket_path).await;
+            let accepted = request.execute(socket_path.clone()).await;
+            let manager = match (&accepted, manager) {
+                (Ok(session_id), Some(plan)) => Some(
+                    crate::overlay::launch_settings::appoint_launched_manager(
+                        socket_path,
+                        *session_id,
+                        plan,
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
             let _ = tx
                 .send(InteractiveLaunchResult {
                     generation,
                     accepted,
                     model_warning,
+                    manager,
                 })
                 .await;
         }));
@@ -489,6 +519,7 @@ impl App {
         provider_override: Option<SessionProvider>,
         custom_provider_index: Option<usize>,
         sandbox: Option<SandboxSpec>,
+        manager: Option<crate::types::ManagerLaunchPlan>,
         origin: InteractiveLaunchOrigin,
         placement: LaunchPlacement,
     ) -> bool {
@@ -532,7 +563,7 @@ impl App {
         } else {
             OwnedLaunchRequest::Standard(options)
         };
-        self.begin_interactive_launch(request, origin, placement)
+        self.begin_interactive_launch_with_manager(request, origin, placement, manager)
             .is_ok()
     }
 
@@ -739,6 +770,15 @@ impl App {
                 if let Some(message) = result.model_warning {
                     self.notify(message);
                 }
+                match result.manager {
+                    Some(Ok(summary)) => {
+                        self.manager_roster.request_refresh();
+                        self.notify_success(summary);
+                    }
+                    // The error already names the refused step and the retry.
+                    Some(Err(error)) => self.notify_error(error),
+                    None => {}
+                }
                 true
             }
             Err(error) => {
@@ -824,6 +864,7 @@ impl App {
             provider_override,
             None,
             sandbox,
+            None,
             InteractiveLaunchOrigin::Detached,
             LaunchPlacement::CurrentPane,
         )
@@ -841,6 +882,127 @@ impl App {
         if !self.poll.connected {
             self.notify_error("Not connected to daemon");
             return false;
+        }
+        if query == "/drain" {
+            match self.client.restart_daemon_drain().await {
+                Ok(status) => {
+                    self.notify(format!(
+                        "DRAIN restart requested; {} active session(s) finishing current turns",
+                        status["active_sessions"].as_array().map_or(0, Vec::len)
+                    ));
+                    return true;
+                }
+                Err(error) => self.notify_error(format!("DRAIN restart failed: {error}")),
+            }
+            return false;
+        }
+        if query == "/drain status" {
+            match self.client.get_drain_restart_status().await {
+                Ok(status) => {
+                    self.notify(format!("DRAIN status: {status}"));
+                    return true;
+                }
+                Err(error) => self.notify_error(format!("DRAIN status unavailable: {error}")),
+            }
+            return false;
+        }
+        if query == "/pending" {
+            match self.client.list_operator_messages(session_id).await {
+                Ok(messages) => {
+                    let queued: Vec<_> = messages
+                        .iter()
+                        .filter(|message| message.is_pending())
+                        .collect();
+                    if queued.is_empty() {
+                        self.notify("No pending messages for this session");
+                    } else {
+                        for message in &queued {
+                            self.notify(format!(
+                                "Pending {} ({}): {}",
+                                message.id,
+                                message.state,
+                                message.content.chars().take(100).collect::<String>()
+                            ));
+                        }
+                    }
+                    self.operator_messages.insert(session_id, messages);
+                    self.mark_dirty();
+                    return true;
+                }
+                Err(error) => self.notify_error(format!("Pending messages unavailable: {error}")),
+            }
+            return false;
+        }
+        if let Some(args) = query.strip_prefix("/pending edit ") {
+            let Some((id, content)) = args.split_once(' ') else {
+                self.notify_error("Use :pending edit <message-id> <new text>");
+                return false;
+            };
+            let Ok(id) = Uuid::parse_str(id) else {
+                self.notify_error("Invalid pending message ID");
+                return false;
+            };
+            match self.client.edit_operator_message(id, content).await {
+                Ok(message) if message.session_id == session_id => {
+                    if let Ok(messages) = self.client.list_operator_messages(session_id).await {
+                        self.operator_messages.insert(session_id, messages);
+                    }
+                    self.notify("Pending message edited");
+                    self.mark_dirty();
+                    return true;
+                }
+                Ok(_) => self.notify_error("Message belongs to another session"),
+                Err(error) => self.notify_error(format!("Edit failed: {error}")),
+            }
+            return false;
+        }
+        if let Some(id) = query.strip_prefix("/pending withdraw ") {
+            let Ok(id) = Uuid::parse_str(id.trim()) else {
+                self.notify_error("Invalid pending message ID");
+                return false;
+            };
+            match self.client.withdraw_operator_message(id).await {
+                Ok(message) if message.session_id == session_id => {
+                    if let Ok(messages) = self.client.list_operator_messages(session_id).await {
+                        self.operator_messages.insert(session_id, messages);
+                    }
+                    self.notify("Pending message withdrawn");
+                    self.mark_dirty();
+                    return true;
+                }
+                Ok(_) => self.notify_error("Message belongs to another session"),
+                Err(error) => self.notify_error(format!("Withdraw failed: {error}")),
+            }
+            return false;
+        }
+        let busy = self.sessions.get(&session_id).is_some_and(|state| {
+            matches!(
+                state.session.status,
+                rsi_common::types::SessionStatus::Starting
+                    | rsi_common::types::SessionStatus::Running
+                    | rsi_common::types::SessionStatus::WaitingApproval
+            )
+        });
+        if busy {
+            match self
+                .client
+                .queue_operator_message(session_id, query, Uuid::new_v4())
+                .await
+            {
+                Ok(message) => {
+                    self.operator_messages
+                        .entry(session_id)
+                        .or_default()
+                        .push(message);
+                    self.notify("Message queued; it reaches the agent at its next tool boundary (or next turn)");
+                    self.mark_dirty();
+                    return true;
+                }
+                Err(error) => {
+                    self.notify_error(format!("Queue failed: {error}"));
+                    return false;
+                }
+            }
         }
         match self.client.continue_session(session_id, query).await {
             Ok(()) => {
@@ -1317,14 +1479,28 @@ impl App {
         }
     }
 
-    /// Interrupt the session in the focused pane.
+    /// Interrupt the selected session, including the selected list row in detail view.
     pub async fn interrupt_focused_session(&mut self, hard: bool) {
-        if let Some(session_id) = self.selected_session_id() {
-            match self
-                .client
-                .interrupt_session_with_pause(session_id, hard)
-                .await
-            {
+        if let Some(session_id) = self.selected_session_id_for_lifecycle_action() {
+            if hard {
+                let confirmed = self.interrupt_now_confirmation.is_some_and(|(id, at)| {
+                    id == session_id && at.elapsed() < std::time::Duration::from_secs(5)
+                });
+                if !confirmed {
+                    self.interrupt_now_confirmation = Some((session_id, std::time::Instant::now()));
+                    self.notify("INTERRUPT NOW cancels the active turn. Press the interrupt key again within 5 seconds to confirm.");
+                    return;
+                }
+                self.interrupt_now_confirmation = None;
+            }
+            let result = if hard {
+                self.client.interrupt_session_now(session_id).await
+            } else {
+                self.client
+                    .interrupt_session_with_pause(session_id, false)
+                    .await
+            };
+            match result {
                 Ok(()) => {
                     self.operator_pauses.insert(
                         session_id,

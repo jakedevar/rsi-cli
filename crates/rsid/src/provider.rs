@@ -7,7 +7,21 @@ use crate::claude::StreamEvent;
 use crate::error::Result;
 use crate::model_control::ModelExecutionCapability;
 use crate::model_control::call_control::ModelCallSettlement;
+pub use crate::store_support::provider_settings::ApprovalDecision;
 use rsi_common::agent_coordination::MessageAttemptFenceV1;
+
+/// A recoverable diagnostic for an oversized CLI stdout frame. The bounded
+/// reader has drained that frame and can continue with the next event.
+pub(crate) fn stdout_line_truncated_event(limit: usize) -> StreamEvent {
+    StreamEvent {
+        event_type: "process_error".to_string(),
+        data: serde_json::json!({
+            "error": format!("[provider stdout line truncated at {limit} bytes]"),
+            "source": "stdout",
+            "terminal": false,
+        }),
+    }
+}
 
 /// A daemon-private, one-use native message turn (P2-01, C-P2-07).
 ///
@@ -145,17 +159,6 @@ pub enum AdmittedMessageTurnOutcome {
     Unsupported { settlement: ModelCallSettlement },
 }
 
-/// Decision type for structured approval responses.
-#[derive(Debug, Clone)]
-pub enum ApprovalDecision {
-    /// Approve for this single request.
-    Approve,
-    /// Approve for the remainder of the session.
-    ApproveForSession,
-    /// Deny the request.
-    Deny,
-}
-
 /// Configuration for starting a new turn on an existing session.
 #[derive(Debug, Clone)]
 pub struct TurnConfig {
@@ -248,7 +251,11 @@ pub trait ProviderSession: Send {
 
     /// Execute a dynamic tool call from the provider and return the result.
     /// Default: error (no tool support).
-    async fn send_tool_result(&mut self, _call_id: i64, _result: serde_json::Value) -> Result<()> {
+    async fn send_tool_result(
+        &mut self,
+        _call_id: &serde_json::Value,
+        _result: serde_json::Value,
+    ) -> Result<()> {
         Err(crate::error::DaemonError::Process(
             "send_tool_result requires app-server protocol".to_string(),
         ))

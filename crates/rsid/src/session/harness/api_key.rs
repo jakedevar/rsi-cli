@@ -49,6 +49,19 @@ impl std::fmt::Debug for ApiCredential {
 }
 
 impl ApiCredential {
+    /// Record a response for exactly the credential sent, never a rotated key.
+    pub fn mark_exhausted(&self, fingerprint: &str, status: u16) {
+        match self {
+            Self::Vault {
+                vault,
+                slot: Some(slot),
+            }
+            | Self::VaultSlotOnly { vault, slot } => {
+                let _ = vault.mark_exhausted(*slot, fingerprint, status);
+            }
+            _ => {}
+        }
+    }
     /// Explicit non-empty key wins (fixed); otherwise resolve `slot` through
     /// the daemon vault on every request.
     #[must_use]
@@ -334,5 +347,61 @@ mod tests {
         assert_eq!(fixed.current().unwrap().expose(), "sk-test-explicit");
         assert!(ApiCredential::explicit(Some("")).current().is_none());
         assert!(!format!("{fixed:?}").contains("sk-test-explicit"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn provider_402_marks_the_sent_vault_slot_exhausted() {
+        use crate::model_control::ModelExecutionCapability;
+        use crate::model_control::registry::RuntimeExecutionRoute;
+        use crate::session::harness::provider::ApiProvider;
+        use crate::session::harness::providers::openai_api::OpenAiApiProvider;
+        use crate::session::harness::types::{ChatMessage, ChatRequest, ProviderQuirks};
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(402))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let vault =
+            crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+                .dir(dir.path().join("vault"))
+                .env(|_| None)
+                .open()
+                .unwrap();
+        vault.set(Slot::Openai, "sk-test-credit").unwrap();
+        let provider = OpenAiApiProvider::with_config(
+            server.uri(),
+            ApiCredential::for_slot_in(&vault, None, Some(Slot::Openai)),
+            ProviderQuirks::default(),
+        )
+        .unwrap();
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user("ping")],
+            model: "test".into(),
+            temperature: None,
+            max_tokens: Some(8),
+            tools: vec![],
+            stream: false,
+            reasoning_effort: None,
+        };
+        let error = provider
+            .chat(
+                &request,
+                ModelExecutionCapability::for_test(RuntimeExecutionRoute::SessionHarnessOpenAiHttp),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::session::harness::errors::ProviderError::from_daemon_error(&error)
+                .unwrap()
+                .class,
+            crate::session::harness::errors::ProviderErrorClass::CreditExhausted,
+        );
+        let refusal = vault.admission(Slot::Openai).unwrap_err();
+        assert_eq!(refusal.check.detail_code, "live_credit_exhausted");
+        assert_eq!(refusal.check.http_status, Some(402));
     }
 }

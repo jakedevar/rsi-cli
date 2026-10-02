@@ -159,61 +159,8 @@ impl Executor {
         )
     }
 
-    fn ssh(&self) -> Command {
-        let mut cmd = Command::new("/usr/bin/ssh");
-        cmd.args([
-            "-F",
-            "/dev/null",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=2",
-            "-o",
-            "ForwardAgent=no",
-            "-i",
-        ])
-        .arg(&self.config.identity)
-        .arg(&self.config.target)
-        .args(["/bin/bash", "-s"]);
-        scrub_transport_env(&mut cmd);
-        cmd
-    }
-
     fn ssh_script(&self, script: &str, reason: &str) -> Result<Output, String> {
-        let mut child = self
-            .ssh()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("remote_unreachable: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or("remote_unreachable: SSH stdin unavailable")?
-            .write_all(script.as_bytes())
-            .map_err(|error| format!("remote_unreachable: {error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("remote_unreachable: {error}"))?;
-        if !output.status.success() {
-            let code = ssh_failure_code(reason, output.status.code());
-            return Err(format!(
-                "{code}: SSH exit {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        Ok(output)
+        ssh_script(&self.config, script, reason)
     }
 
     pub fn prepare(&mut self, sha: &str) -> Result<(), String> {
@@ -302,6 +249,22 @@ impl Executor {
         jobs: u32,
         command: &GuardCommand,
     ) -> Result<GuardCommandReport, String> {
+        self.plan_full_shard(sha, fingerprint_source_sha, base_sha, shard, jobs, command)?
+            .execute()
+    }
+
+    /// Prepares both commits and proves the remote fingerprint under the
+    /// executor lock. The returned run needs no executor state, so several
+    /// can execute on the gate host at once (#970).
+    pub fn plan_full_shard(
+        &mut self,
+        sha: &str,
+        fingerprint_source_sha: &str,
+        base_sha: &str,
+        shard: &str,
+        jobs: u32,
+        command: &GuardCommand,
+    ) -> Result<ShardRun, String> {
         if !valid_sha(sha)
             || !valid_sha(fingerprint_source_sha)
             || !valid_sha(base_sha)
@@ -331,34 +294,80 @@ impl Executor {
         }
         compare_host_fingerprints(&proof, &proof)?;
         let proof_key = (base_sha.to_owned(), shard.to_owned(), jobs);
-        if sha != base_sha {
+        if sha == base_sha {
+            // The probe proves the base executor; a candidate compares
+            // against it before either side's shard run finishes.
+            self.base_proofs.insert(proof_key, proof);
+        } else {
             let base = self
                 .base_proofs
                 .get(&proof_key)
                 .ok_or("remote_missing_evidence: no remote base fingerprint for candidate shard")?;
             compare_host_fingerprints(base, &proof)?;
         }
+        Ok(ShardRun {
+            config: self.config.clone(),
+            root,
+            sha: sha.to_owned(),
+            fingerprint_source_sha: fingerprint_source_sha.to_owned(),
+            shard: shard.to_owned(),
+            jobs,
+            fingerprint: remote_fingerprint,
+            command: command.clone(),
+        })
+    }
+}
+
+/// One proven remote shard execution. It carries only transport settings and
+/// the remote paths, so runs for different shards and sides may execute
+/// concurrently on the gate host (#970). Concurrent runs of one commit share
+/// its `CARGO_TARGET_DIR`: Cargo serializes their builds while the tests run
+/// in parallel, and `REMOTE_RUNNER` keeps rsid artifacts so no run cleans another
+/// run's binaries.
+#[derive(Clone, Debug)]
+pub(super) struct ShardRun {
+    config: Config,
+    root: String,
+    sha: String,
+    fingerprint_source_sha: String,
+    shard: String,
+    jobs: u32,
+    fingerprint: String,
+    command: GuardCommand,
+}
+
+impl ShardRun {
+    pub fn sha(&self) -> &str {
+        &self.sha
+    }
+
+    pub fn shard(&self) -> &str {
+        &self.shard
+    }
+
+    pub fn execute(&self) -> Result<GuardCommandReport, String> {
         let script = format!(
-            "set -euo pipefail\nhome=$(getent passwd {user} | cut -d: -f6)\nsudo -n -H -u {user} env PATH=\"{root}/bin:$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin\" CARGO_TARGET_DIR='{root}/targets/{sha}' CARGO_BUILD_JOBS='{jobs}' CARGO_PROFILE_DEV_DEBUG=line-tables-only python3.11 - '{sha}' '{shard}' '{remote_fingerprint}' '{root}/worktrees/{sha}' '{root}/worktrees/{fingerprint_source_sha}/scripts/rolling-shard-fingerprint.py' '{jobs}' '{}' <<'PY'\n{}\nPY\n",
-            command.timeout.as_secs(),
-            REMOTE_RUNNER,
+            "set -euo pipefail\nhome=$(getent passwd {user} | cut -d: -f6)\nsudo -n -H -u {user} env PATH=\"{root}/bin:$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin\" CARGO_TARGET_DIR='{root}/targets/{sha}' CARGO_BUILD_JOBS='{jobs}' CARGO_PROFILE_DEV_DEBUG=line-tables-only python3.11 - '{sha}' '{shard}' '{fingerprint}' '{root}/worktrees/{sha}' '{root}/worktrees/{fingerprint_source_sha}/scripts/rolling-shard-fingerprint.py' '{jobs}' '{timeout}' <<'PY'\n{runner}\nPY\n",
             user = self.config.run_as,
-            root = root
+            root = self.root,
+            sha = self.sha,
+            shard = self.shard,
+            fingerprint = self.fingerprint,
+            fingerprint_source_sha = self.fingerprint_source_sha,
+            jobs = self.jobs,
+            timeout = self.command.timeout.as_secs(),
+            runner = REMOTE_RUNNER,
         );
         let started = Instant::now();
-        let output = self.ssh_script(&script, "remote_missing_evidence")?;
-        let report = parse_result(
+        let output = ssh_script(&self.config, &script, "remote_missing_evidence")?;
+        parse_result(
             &output.stdout,
-            sha,
-            shard,
-            &remote_fingerprint,
-            command,
+            &self.sha,
+            &self.shard,
+            &self.fingerprint,
+            &self.command,
             started.elapsed(),
-        )?;
-        if sha == base_sha {
-            self.base_proofs.insert(proof_key, proof);
-        }
-        Ok(report)
+        )
     }
 }
 
@@ -372,6 +381,62 @@ impl Drop for Executor {
         );
         let _ = self.ssh_script(&cleanup, "remote_cleanup_failed");
     }
+}
+
+fn ssh(config: &Config) -> Command {
+    let mut cmd = Command::new("/usr/bin/ssh");
+    cmd.args([
+        "-F",
+        "/dev/null",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "ForwardAgent=no",
+        "-i",
+    ])
+    .arg(&config.identity)
+    .arg(&config.target)
+    .args(["/bin/bash", "-s"]);
+    scrub_transport_env(&mut cmd);
+    cmd
+}
+
+fn ssh_script(config: &Config, script: &str, reason: &str) -> Result<Output, String> {
+    let mut child = ssh(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("remote_unreachable: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("remote_unreachable: SSH stdin unavailable")?
+        .write_all(script.as_bytes())
+        .map_err(|error| format!("remote_unreachable: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("remote_unreachable: {error}"))?;
+    if !output.status.success() {
+        let code = ssh_failure_code(reason, output.status.code());
+        return Err(format!(
+            "{code}: SSH exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output)
 }
 
 fn ssh_failure_code<'a>(reason: &'a str, exit_code: Option<i32>) -> &'a str {
@@ -515,7 +580,7 @@ if actual.stdout.strip() != expected:
     emit({'kind': 'error', 'code': 'fingerprint_mismatch', 'actual': actual.stdout.strip()})
     sys.exit(0)
 try:
-    result = subprocess.run(['scripts/run-rsid-test-shards.sh', 'shard', shard, '--jobs', jobs], cwd=worktree, text=True, errors='replace', capture_output=True, timeout=int(timeout))
+    result = subprocess.run(['scripts/run-rsid-test-shards.sh', 'shard', shard, '--jobs', jobs, '--keep-rsid-artifacts'], cwd=worktree, text=True, errors='replace', capture_output=True, timeout=int(timeout))
 except subprocess.TimeoutExpired:
     emit({'kind': 'error', 'code': 'timeout'})
     sys.exit(0)
@@ -562,6 +627,13 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    /// #970: concurrent shard runs of one commit share its target dir, so
+    /// the remote runner must never clean rsid artifacts another run uses.
+    #[test]
+    fn remote_runner_keeps_rsid_artifacts_for_concurrent_shards() {
+        assert!(REMOTE_RUNNER.contains("'--keep-rsid-artifacts'"));
     }
 
     #[test]

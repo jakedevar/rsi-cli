@@ -92,8 +92,9 @@ fn initial_profiles_have_exact_grants_allowances_and_scope_behavior() {
                     if preset == ManagerPolicyPreset::Execute {
                         8
                     } else {
-                        // K14 (#672): Full also grants OperatorDelegation.
-                        10
+                        // K14 (#672) and 2026-09-30: Full grants every
+                        // capability.
+                        15
                     }
                 );
                 assert_eq!(
@@ -419,6 +420,44 @@ fn only_advertised_zero_operations_conflict_and_invalid_values_remain_visible() 
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
+fn full_saved_before_the_every_capability_widening_stays_exact_until_reapplied() {
+    // The ten grants Full carried before 2026-09-30.
+    let mut earlier = new_full();
+    earlier.capabilities.retain(|c| {
+        !matches!(
+            c,
+            ManagerCapabilityV2::GitEffect
+                | ManagerCapabilityV2::Automation
+                | ManagerCapabilityV2::StorageControl
+                | ManagerCapabilityV2::DaemonSettings
+                | ManagerCapabilityV2::Deploy
+        )
+    });
+    assert_eq!(earlier.capabilities.len(), 10);
+    let bytes = serde_json::to_vec(&earlier).unwrap();
+    // Never widened silently: it classifies as Custom and is unchanged.
+    assert_eq!(
+        classify_manager_policy(&earlier, HarnessManagerScopeModeV1::Project).preset,
+        ManagerPolicyPreset::Custom
+    );
+    assert_eq!(serde_json::to_vec(&earlier).unwrap(), bytes);
+    // Re-applying Full grants all fifteen and classifies as Full again.
+    let reapplied = apply(
+        &earlier,
+        ManagerPolicyPreset::FullProjectControl,
+        ManagerPolicyOrigin::Saved,
+        HarnessManagerScopeModeV1::Project,
+        &BTreeSet::new(),
+    );
+    assert_eq!(reapplied.capabilities.len(), 15);
+    assert_eq!(
+        classify_manager_policy(&reapplied, HarnessManagerScopeModeV1::Project).preset,
+        ManagerPolicyPreset::FullProjectControl
+    );
+}
+
+#[test]
 fn legacy_full_grants_stay_exact_until_the_operator_reapplies_the_preset() {
     // A Full policy saved before SessionControl/IssueCoordinate existed keeps
     // exactly its stored grants: granting the manager is operator-owned.
@@ -429,8 +468,8 @@ fn legacy_full_grants_stay_exact_until_the_operator_reapplies_the_preset() {
             ManagerCapabilityV2::SessionControl | ManagerCapabilityV2::IssueCoordinate
         )
     });
-    // Full's 10 grants (K14 added OperatorDelegation) minus the two removed.
-    assert_eq!(legacy.capabilities.len(), 8);
+    // Full's 15 grants (every capability since 2026-09-30) minus the two removed.
+    assert_eq!(legacy.capabilities.len(), 13);
     assert_eq!(legacy.validate(), Ok(()));
     let classified = classify_manager_policy(&legacy, HarnessManagerScopeModeV1::Project);
     assert_eq!(classified.preset, ManagerPolicyPreset::Custom);
@@ -467,6 +506,42 @@ fn full_preset_grants_operator_delegation_but_never_upgrades_a_saved_policy() {
         full.capabilities
             .contains(&ManagerCapabilityV2::OperatorDelegation)
     );
+    // Operator directive 2026-09-30: Full grants every capability, including
+    // the formerly operator-toggled GitEffect, Automation, StorageControl
+    // (#1043), DaemonSettings (#1046) and Deploy (#1045).
+    for grant in [
+        ManagerCapabilityV2::GitEffect,
+        ManagerCapabilityV2::Automation,
+        ManagerCapabilityV2::StorageControl,
+        ManagerCapabilityV2::DaemonSettings,
+        ManagerCapabilityV2::Deploy,
+    ] {
+        assert!(full.capabilities.contains(&grant), "Full grants {grant:?}");
+    }
+    // Execute grants none of them.
+    let execute = apply_manager_policy_preset(
+        &full,
+        ManagerPolicyPreset::Execute,
+        &ManagerPresetContext {
+            origin: ManagerPolicyOrigin::Saved,
+            scope_mode: HarnessManagerScopeModeV1::Project,
+            touched: &BTreeSet::new(),
+        },
+    )
+    .policy;
+    for grant in [
+        ManagerCapabilityV2::GitEffect,
+        ManagerCapabilityV2::Automation,
+        ManagerCapabilityV2::StorageControl,
+        ManagerCapabilityV2::DaemonSettings,
+        ManagerCapabilityV2::Deploy,
+        ManagerCapabilityV2::OperatorDelegation,
+    ] {
+        assert!(
+            !execute.capabilities.contains(&grant),
+            "Execute does not grant {grant:?}"
+        );
+    }
     assert_eq!(
         classify_manager_policy(&full, HarnessManagerScopeModeV1::Project).preset,
         ManagerPolicyPreset::FullProjectControl

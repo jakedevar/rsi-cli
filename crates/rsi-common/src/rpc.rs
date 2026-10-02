@@ -10,6 +10,7 @@ use crate::program_runs::{
     ProgramRunOperationalStatusV1, ProgramRunPageCursorV1, ProgramRunReconciliationPageV1,
     ProgramRunStatusV1, ProgramRunTransitionPageV1, ProgramRunV1, ResumeBlockedProgramRunRequestV1,
 };
+use crate::provider_credentials::{CredentialState, ProviderCredentialSlot};
 use crate::types::{
     ConversationEvent, IndexStatusValue, Issue, IssueArchiveFilterV1, IssueEventPageRequestV1,
     IssueEventPageV1, IssueSourceFindingRef, IssueStatus, OffloadEntry, PermissionLevel,
@@ -209,6 +210,18 @@ pub struct LaunchSessionParams {
     /// that omit it.
     #[serde(default)]
     pub workflow_id_override: Option<Uuid>,
+    /// Operator-only per-session Harness tool policy (#792): tool enablement,
+    /// `web_access` and budgets, enforced when the catalog is built and again
+    /// at execution. Refused for providers that do not run the Harness loop
+    /// (`tool_policy_unsupported_provider`). Agents cannot set it: no spawn
+    /// verb carries it, and a spawned child inherits its emitter's policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<crate::harness_tool_policy::HarnessToolPolicy>,
+    /// Operator-only per-session Harness completion gates (#794). Refused for
+    /// providers that do not run the Harness loop. No agent verb carries this
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_gates: Option<crate::completion_gates::CompletionGates>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1155,6 +1168,36 @@ pub struct WorkerSliceMemoryPressure {
     pub full_avg60: f64,
 }
 
+/// Daemon process memory for `GetHealthStatus` (#960).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessMemoryReport {
+    /// Resident set size now.
+    pub rss_bytes: u64,
+    /// Resident set size sampled once when the daemon became request-ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_at_ready_bytes: Option<u64>,
+    /// Allocator in use, for example `glibc`.
+    pub allocator: String,
+    /// Bytes the allocator has handed out and not freed (live heap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_in_use_bytes: Option<u64>,
+    /// Bytes the allocator holds free inside its arenas (retention).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_free_bytes: Option<u64>,
+    /// Arena cap applied at startup, when one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arena_max: Option<u32>,
+    /// Fixed allocator mmap threshold applied at startup, when one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmap_threshold_bytes: Option<u64>,
+    /// `Some(true)` when transparent huge pages are disabled for the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thp_disabled: Option<bool>,
+    /// Allocator arenas at the last heap sample (main plus thread arenas).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arena_count: Option<u32>,
+}
+
 /// Response payload for GetHealthStatus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatusResponse {
@@ -1192,6 +1235,10 @@ pub struct HealthStatusResponse {
     pub provider_codex_app_server_available: bool,
     #[serde(default)]
     pub provider_harness_available: bool,
+    /// Provider CLIs (`claude`, `codex`, `agy`) the daemon cannot find in its
+    /// PATH or the fixed fallback directories (#1087). Names only.
+    #[serde(default)]
+    pub provider_clis_missing: Vec<String>,
     /// Background queue: number of pending items.
     #[serde(default)]
     pub queue_pending: i64,
@@ -1220,6 +1267,29 @@ pub struct HealthStatusResponse {
     /// Aggregate worker-slice pressure; absent when cgroup telemetry is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_slice_memory_pressure: Option<WorkerSliceMemoryPressure>,
+    /// Daemon process memory; absent when the platform does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_memory: Option<ProcessMemoryReport>,
+    /// Secret-free provider-credential resolution summary; absent from older
+    /// daemon responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_credentials: Option<ProviderCredentialHealthSummary>,
+}
+
+/// One credential slot's resolved state and its accepted environment names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCredentialHealth {
+    pub slot: ProviderCredentialSlot,
+    pub state: CredentialState,
+    pub env_var_names: Vec<String>,
+}
+
+/// Secret-free view of every provider credential slot. `missing` names slots
+/// that currently resolve to `Absent` or `Cleared`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCredentialHealthSummary {
+    pub credentials: Vec<ProviderCredentialHealth>,
+    pub missing: Vec<ProviderCredentialSlot>,
 }
 
 /// One plan window (e.g. the rolling five-hour or seven-day window) and how
@@ -1951,6 +2021,41 @@ pub struct ToggleScheduledJobParams {
     pub id: Uuid,
 }
 
+/// Default page size for `ListScheduledJobs` (operator RPC, Issue #954 B).
+pub const LIST_SCHEDULED_JOBS_DEFAULT_LIMIT: u32 = 50;
+/// Largest page `ListScheduledJobs` will return; a larger `limit` is clamped.
+pub const LIST_SCHEDULED_JOBS_MAX_LIMIT: u32 = 200;
+
+/// Parameters for `ListScheduledJobs`. Every field is optional so a request
+/// with `null`/`{}` params (an older client) gets the default filter (enabled
+/// jobs plus jobs fired or disabled within the retention grace period) and the
+/// first page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListScheduledJobsParams {
+    /// `true` returns every row, including old disabled history.
+    #[serde(default)]
+    pub include_history: bool,
+    /// Page size; defaults to [`LIST_SCHEDULED_JOBS_DEFAULT_LIMIT`], clamped to
+    /// `1..=LIST_SCHEDULED_JOBS_MAX_LIMIT`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque cursor from a previous page's `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of `ListScheduledJobs`: one page, newest-created first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListScheduledJobsResult {
+    pub jobs: Vec<crate::types::ScheduledJob>,
+    /// Present when more rows follow; pass it back as `cursor`.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// Echo of the filter that produced this page.
+    #[serde(default)]
+    pub include_history: bool,
+}
+
 // --- Hierarchy RPC params (RSI hierarchical session organization) ---
 
 /// Parameters for `CreateContainer` RPC. Creates a Group/Epic organizational
@@ -2203,6 +2308,88 @@ pub struct GetUsageStatsParams {
     pub project_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EfficiencyMetricsGroupBy {
+    #[default]
+    Day,
+    DayEpic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetEfficiencyMetricsParams {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    #[serde(default)]
+    pub group_by: EfficiencyMetricsGroupBy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EfficiencyMetricTargets {
+    pub opus_tokens_per_landing: u64,
+    pub poll_turn_share: f64,
+}
+
+impl Default for EfficiencyMetricTargets {
+    fn default() -> Self {
+        Self {
+            opus_tokens_per_landing: 20_000_000,
+            poll_turn_share: 0.05,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EfficiencyMetricValues {
+    pub opus_input_tokens: u64,
+    pub opus_output_tokens: u64,
+    pub opus_estimated_cost_usd: f64,
+    pub landings: Option<u64>,
+    pub opus_tokens_per_landing: Option<f64>,
+    pub lead_turns: u64,
+    pub poll_turns: u64,
+    pub poll_turn_share: f64,
+    pub scheduled_wake_user_messages: u64,
+    pub terminal_watch_user_messages: u64,
+    pub manager_notice_user_messages: u64,
+    pub reviews_submitted: u64,
+    pub reviews_failed: u64,
+    pub reviews_superseded: u64,
+    pub reviewer_receipt_success_rate: Option<f64>,
+    /// Landing-job run time (`agent_jobs` kind `landing`, created to finished,
+    /// every outcome) divided by landings. `None` when no landing job finished
+    /// in the bucket or the landing count is unknown or zero; never estimated.
+    pub gate_hours_per_landing: Option<f64>,
+    /// Landing jobs that finished in the bucket.
+    #[serde(default)]
+    pub landing_jobs: u64,
+    /// Median time from a landed commit's committer time to the observed
+    /// publication of `origin/rolling` (the Work seal is not consulted).
+    #[serde(default)]
+    pub seal_to_rolling_p50_seconds: Option<f64>,
+    /// 90th percentile of the same latency.
+    #[serde(default)]
+    pub seal_to_rolling_p90_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EfficiencyMetricsRow {
+    pub day: String,
+    pub epic_id: Option<Uuid>,
+    pub epic_title: Option<String>,
+    #[serde(flatten)]
+    pub values: EfficiencyMetricValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EfficiencyMetricsResponse {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub group_by: EfficiencyMetricsGroupBy,
+    pub targets: EfficiencyMetricTargets,
+    pub rows: Vec<EfficiencyMetricsRow>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetModelControlStatusParams {
     #[serde(default = "default_model_control_recent_limit")]
@@ -2319,6 +2506,25 @@ pub struct AgentListIssuesRequestV1 {
     pub limit: Option<u32>,
     #[serde(default)]
     pub ready: bool,
+    /// Sort direction over `(display_number, id)`. Defaults to ascending so
+    /// existing callers are unchanged; the cursor works in both orders.
+    #[serde(default)]
+    pub order: IssueListOrderV1,
+    /// Optional case-insensitive substring filter over the Issue title.
+    #[serde(default)]
+    pub title_contains: Option<String>,
+}
+
+/// Maximum accepted length (bytes) of `AgentListIssuesRequestV1::title_contains`.
+pub const AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES: usize = 128;
+
+/// Sort direction for `AgentListIssues`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueListOrderV1 {
+    #[default]
+    Asc,
+    Desc,
 }
 
 impl Default for AgentListIssuesRequestV1 {
@@ -2329,6 +2535,8 @@ impl Default for AgentListIssuesRequestV1 {
             cursor: None,
             limit: None,
             ready: false,
+            order: IssueListOrderV1::Asc,
+            title_contains: None,
         }
     }
 }
@@ -2338,6 +2546,16 @@ impl AgentListIssuesRequestV1 {
         if let Some(cursor) = &self.cursor {
             if cursor.display_number < 1 || cursor.issue_id.is_nil() {
                 return Err("Issue list cursor is invalid".to_string());
+            }
+        }
+        if let Some(needle) = &self.title_contains {
+            if needle.is_empty()
+                || needle.len() > AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES
+                || needle.as_bytes().contains(&0)
+            {
+                return Err(format!(
+                    "title_contains must be 1..={AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES} NUL-free bytes"
+                ));
             }
         }
         let limit = self.limit.unwrap_or(64);
@@ -2352,12 +2570,16 @@ impl AgentListIssuesRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGetIssueRequestV1 {
-    pub issue_id: Uuid,
+    /// Exactly one of `issue_id` and `display_number` must be set.
+    #[serde(default)]
+    pub issue_id: Option<Uuid>,
+    #[serde(default)]
+    pub display_number: Option<i64>,
 }
 
 impl AgentGetIssueRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        validate_non_nil_issue_id(self.issue_id)
+        validate_issue_target(self.issue_id, self.display_number)
     }
 }
 
@@ -2366,7 +2588,11 @@ impl AgentGetIssueRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUpdateIssueRequestV1 {
-    pub issue_id: Uuid,
+    /// Exactly one of `issue_id` and `display_number` must be set.
+    #[serde(default)]
+    pub issue_id: Option<Uuid>,
+    #[serde(default)]
+    pub display_number: Option<i64>,
     pub expected_row_version: i64,
     pub idempotency_key: String,
     #[serde(default)]
@@ -2387,12 +2613,16 @@ pub struct AgentUpdateIssueRequestV1 {
 
 impl AgentUpdateIssueRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        validate_issue_mutation_identity(
-            self.issue_id,
-            self.expected_row_version,
-            &self.idempotency_key,
-        )?;
+        validate_issue_target(self.issue_id, self.display_number)?;
+        validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)?;
         self.content_patch().validate()
+    }
+
+    /// The concrete Issue id; errors while only `display_number` is set (the
+    /// daemon resolves the number to an id inside its transaction first).
+    pub fn resolved_issue_id(&self) -> Result<Uuid, String> {
+        self.issue_id
+            .ok_or_else(|| "issue_id must be resolved".to_string())
     }
 
     #[must_use]
@@ -2410,9 +2640,10 @@ impl AgentUpdateIssueRequestV1 {
 
     pub fn semantic_request(&self) -> Result<crate::types::IssueSemanticRequestV1, String> {
         self.validate()?;
+        let issue_id = self.resolved_issue_id()?;
         Ok(crate::types::IssueSemanticRequestV1::new(
             crate::types::IssueSemanticOperationV1::ContentUpdated {
-                issue_id: self.issue_id,
+                issue_id,
                 expected_row_version: self.expected_row_version,
                 patch: self.content_patch(),
             },
@@ -2424,7 +2655,11 @@ impl AgentUpdateIssueRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUpdateIssueStatusRequestV1 {
-    pub issue_id: Uuid,
+    /// Exactly one of `issue_id` and `display_number` must be set.
+    #[serde(default)]
+    pub issue_id: Option<Uuid>,
+    #[serde(default)]
+    pub display_number: Option<i64>,
     pub status: IssueStatus,
     pub expected_row_version: i64,
     pub idempotency_key: String,
@@ -2432,18 +2667,22 @@ pub struct AgentUpdateIssueStatusRequestV1 {
 
 impl AgentUpdateIssueStatusRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        validate_issue_mutation_identity(
-            self.issue_id,
-            self.expected_row_version,
-            &self.idempotency_key,
-        )
+        validate_issue_target(self.issue_id, self.display_number)?;
+        validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)
+    }
+
+    /// The concrete Issue id; errors while only `display_number` is set.
+    pub fn resolved_issue_id(&self) -> Result<Uuid, String> {
+        self.issue_id
+            .ok_or_else(|| "issue_id must be resolved".to_string())
     }
 
     pub fn semantic_request(&self) -> Result<crate::types::IssueSemanticRequestV1, String> {
         self.validate()?;
+        let issue_id = self.resolved_issue_id()?;
         Ok(crate::types::IssueSemanticRequestV1::new(
             crate::types::IssueSemanticOperationV1::StatusUpdated {
-                issue_id: self.issue_id,
+                issue_id,
                 expected_row_version: self.expected_row_version,
                 status: self.status,
             },
@@ -2463,11 +2702,8 @@ pub struct AgentArchiveIssueRequestV1 {
 
 impl AgentArchiveIssueRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        validate_issue_mutation_identity(
-            self.issue_id,
-            self.expected_row_version,
-            &self.idempotency_key,
-        )
+        validate_non_nil_issue_id(self.issue_id)?;
+        validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)
     }
 
     pub fn semantic_request(&self) -> Result<crate::types::IssueSemanticRequestV1, String> {
@@ -2492,11 +2728,8 @@ pub struct AgentRestoreIssueRequestV1 {
 
 impl AgentRestoreIssueRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        validate_issue_mutation_identity(
-            self.issue_id,
-            self.expected_row_version,
-            &self.idempotency_key,
-        )
+        validate_non_nil_issue_id(self.issue_id)?;
+        validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)
     }
 
     pub fn semantic_request(&self) -> Result<crate::types::IssueSemanticRequestV1, String> {
@@ -2582,6 +2815,9 @@ pub enum AgentIssueValidationFieldV1 {
     Assignee,
     ClearAssignee,
     AfterSequence,
+    DisplayNumber,
+    Order,
+    TitleContains,
 }
 
 /// One bounded, allowlisted hint for a malformed guarded Issue request.
@@ -2618,12 +2854,25 @@ fn validate_non_nil_issue_id(issue_id: Uuid) -> Result<(), String> {
     }
 }
 
+/// Exactly one of `issue_id` / `display_number`; ids must be non-nil and
+/// display numbers positive.
+fn validate_issue_target(
+    issue_id: Option<Uuid>,
+    display_number: Option<i64>,
+) -> Result<(), String> {
+    match (issue_id, display_number) {
+        (Some(_), Some(_)) => Err("exactly one of issue_id and display_number is allowed".into()),
+        (None, None) => Err("one of issue_id and display_number is required".into()),
+        (Some(id), None) => validate_non_nil_issue_id(id),
+        (None, Some(number)) if number < 1 => Err("display_number must be positive".into()),
+        (None, Some(_)) => Ok(()),
+    }
+}
+
 fn validate_issue_mutation_identity(
-    issue_id: Uuid,
     expected_row_version: i64,
     idempotency_key: &str,
 ) -> Result<(), String> {
-    validate_non_nil_issue_id(issue_id)?;
     if expected_row_version < 1 {
         return Err("expected_row_version must be positive".to_string());
     }
@@ -4224,5 +4473,65 @@ mod tests {
             serde_json::to_value(status).unwrap()["worker_slice_memory_pressure"],
             value["worker_slice_memory_pressure"]
         );
+    }
+
+    #[test]
+    fn health_status_round_trips_provider_credential_summary() {
+        let response = HealthStatusResponse {
+            persistence_queue_depth: 0,
+            persistence_queue_capacity: 1,
+            last_command_duration_ms: 0,
+            project_cache_size: 0,
+            project_cache_hits: 0,
+            project_cache_misses: 0,
+            last_poll_payload_bytes: 0,
+            last_poll_event_count: 0,
+            provider_claude_available: false,
+            provider_codex_available: false,
+            provider_pioneer_available: false,
+            provider_openrouter_available: false,
+            provider_bedrock_available: false,
+            provider_local_available: false,
+            provider_antigravity_available: false,
+            provider_codex_app_server_available: false,
+            provider_harness_available: false,
+            provider_clis_missing: Vec::new(),
+            queue_pending: 0,
+            queue_claimed: 0,
+            queue_completed: 0,
+            queue_failed: 0,
+            rate_limits: Vec::new(),
+            latest_daemon_restart: None,
+            worker_slice_memory_pressure: None,
+            process_memory: None,
+            provider_credentials: Some(ProviderCredentialHealthSummary {
+                credentials: vec![ProviderCredentialHealth {
+                    slot: crate::provider_credentials::ProviderCredentialSlot::Openrouter,
+                    state: crate::provider_credentials::CredentialState::Vault,
+                    env_var_names: vec![
+                        "OPEN_ROUTER".to_string(),
+                        "OPENROUTER_API_KEY".to_string(),
+                    ],
+                }],
+                missing: Vec::new(),
+            }),
+        };
+
+        let parsed: HealthStatusResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&response).unwrap()
+        );
+
+        let mut legacy = response;
+        legacy.provider_credentials = None;
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_credentials");
+        let parsed: HealthStatusResponse = serde_json::from_value(value).unwrap();
+        assert!(parsed.provider_credentials.is_none());
     }
 }

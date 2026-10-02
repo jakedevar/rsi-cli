@@ -22,6 +22,14 @@ pub(crate) struct TopologyForkSource {
 }
 
 impl TopologyForkSource {
+    #[cfg(test)]
+    pub(crate) fn for_test(origin: PathBuf, commit: &str) -> Self {
+        Self {
+            origin,
+            commit: commit.to_string(),
+        }
+    }
+
     pub(crate) fn origin(&self) -> &Path {
         &self.origin
     }

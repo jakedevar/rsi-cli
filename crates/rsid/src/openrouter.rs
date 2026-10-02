@@ -1,5 +1,6 @@
 //! OpenRouter Codex custom-provider and model-discovery primitives.
 
+pub use crate::store_support::provider_defaults::OPENROUTER_DEFAULT_MODEL;
 use futures::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde_json::Value;
@@ -12,7 +13,6 @@ pub const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 pub const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
 pub const OPENROUTER_ENV: &str = "OPEN_ROUTER";
-pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-5.2";
 pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 pub const OPENROUTER_PICKER_MAX_MODELS: usize = 100;
 

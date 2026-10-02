@@ -4,6 +4,9 @@
 //! primitives here. Phase 2 composes those primitives into first-class model
 //! discovery, health, and Codex launch paths without duplicating them.
 
+pub use crate::store_support::provider_defaults::{
+    PIONEER_DEFAULT_MODEL, PIONEER_RETIRED_AUTO_MODEL, pioneer_launch_model,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::Write;
@@ -22,8 +25,6 @@ pub const PIONEER_API_BASE_URL: &str = "https://api.pioneer.ai/v1";
 pub const PIONEER_MODELS_URL: &str = "https://api.pioneer.ai/v1/models";
 pub const PIONEER_PROVIDER_ID: &str = "pioneer";
 pub const PIONEER_PROVIDER_NAME: &str = "Pioneer";
-pub const PIONEER_DEFAULT_MODEL: &str = "claude-sonnet-5";
-pub const PIONEER_RETIRED_AUTO_MODEL: &str = "pioneer/auto";
 pub const PIONEER_PRIMARY_ENV: &str = "PIONEER_AI_INFERENCE";
 pub const PIONEER_FALLBACK_ENV: &str = "PIONEER_API_KEY";
 pub const PIONEER_CATALOG_CACHE_SUBDIR: &str = "model-catalogs";
@@ -32,14 +33,6 @@ pub const MAX_PIONEER_CATALOG_BYTES: usize = 1024 * 1024;
 pub const MAX_PIONEER_MODEL_SLUG_BYTES: usize = 256;
 pub const PIONEER_CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PIONEER_CATALOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[must_use]
-pub fn pioneer_launch_model(model: Option<&str>) -> &str {
-    match model {
-        None | Some(PIONEER_RETIRED_AUTO_MODEL) => PIONEER_DEFAULT_MODEL,
-        Some(model) => model,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PioneerCredentialSource {

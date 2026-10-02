@@ -44,6 +44,7 @@ fn build_manager() -> (SessionManager, TempDir, TempDir) {
 
 fn hermetic_cfg(query: &str, system_prompt: Option<&str>) -> LaunchConfig {
     LaunchConfig {
+        completion_gates: None,
         query: query.to_string(),
         title: None,
         agent_role: None,
@@ -85,6 +86,7 @@ fn hermetic_cfg(query: &str, system_prompt: Option<&str>) -> LaunchConfig {
         model_invocation_dedup_key: None,
         model_invocation_request_fingerprint: None,
         skip_project_model_default: false,
+        tool_policy: None,
         model_invocation_purpose:
             rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
         sandbox: None,

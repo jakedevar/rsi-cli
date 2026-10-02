@@ -204,6 +204,10 @@ pub enum CliExposureConsumer {
     SessionCodexCli,
     /// The memory LLM's Codex CLI.
     MemoryCodexCli,
+    /// A session's Claude Code launch on Bedrock (`CLAUDE_CODE_USE_BEDROCK`).
+    /// Claude Code has no tool-shell exclude usable under
+    /// `bypassPermissions`, so its tool shells can read the key.
+    SessionClaudeCli,
 }
 
 /// Why a key was injected into a CLI process.

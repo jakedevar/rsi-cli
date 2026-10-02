@@ -80,6 +80,9 @@ def main():
     nextest = command("cargo", "nextest", "--version")
     target = next(line.split(": ", 1)[1] for line in rustc.splitlines() if line.startswith("host: "))
     shard_jobs = 4  # cloud-sweep.sh passes --jobs 4 to the shard runner.
+    # cloud-sweep.sh exports CARGO_BUILD_JOBS=4 and a disk-backed TMPDIR under
+    # /srv/rsi; this is the environment the lander keys base results on (#994).
+    environment = {"spec_env": {"CARGO_BUILD_JOBS": str(shard_jobs)}, "tmpdir_class": "disk"}
     rows = status_rows(result)
     for shard in command(sys.executable, "scripts/check-rsid-test-shards.py", "--list-shards").splitlines():
         label = f"rsid-{shard}"
@@ -110,6 +113,7 @@ def main():
             "exit_code": rows[label],
             "failing_tests": failures(log),
             "fingerprint": {"digest": digest, "inputs": inputs},
+            "environment": environment,
         })
     lane_labels = {
         "integrations": "rsid-integrations",

@@ -1891,24 +1891,53 @@ fn fresh_enabled_job_path_dependencies(
             let Some(job) = load_job_dependency(connection, id)? else {
                 return Ok(Err("scheduled_job_projection_missing"));
             };
-            if !job.projection_is_current() {
-                return Ok(Err("scheduled_job_projection_unhealthy"));
-            }
-            if job
-                .raw_working_dir
-                .as_deref()
-                .is_some_and(|path| path_matches_roots(Path::new(path), roots))
-                || job
-                    .canonical_working_dir
+            let reaches_roots = if job.projection_is_current() {
+                job.raw_working_dir
                     .as_deref()
                     .is_some_and(|path| path_matches_roots(Path::new(path), roots))
-            {
+                    || job
+                        .canonical_working_dir
+                        .as_deref()
+                        .is_some_and(|path| path_matches_roots(Path::new(path), roots))
+            } else {
+                // Issue #955: a stale cached projection only matters for the
+                // roots this job can reach now. Unknowable reachability still
+                // refuses every candidate.
+                match job.fresh_path_reaches_roots(roots) {
+                    Some(reaches) => reaches,
+                    None => return Ok(Err("scheduled_job_projection_unhealthy")),
+                }
+            };
+            if reaches_roots {
                 dependencies.insert(id.clone());
             }
         }
         after = page.last().cloned();
     }
     Ok(Ok(dependencies))
+}
+
+/// Names the first Session row that makes the fresh path scan refuse every
+/// candidate (class: status, kind, cleanup and execution state) so an
+/// operator can see why a purge or adoption retained with
+/// `session_projection_unhealthy`. Returns the stable refusal reason.
+fn refuse_session_scan(
+    session: &SessionDependency,
+    relevance: SessionDependencyRelevance,
+    why: &'static str,
+) -> &'static str {
+    tracing::debug!(
+        session_id = %session.id,
+        status = %session.status,
+        session_kind = %session.session_kind,
+        sandbox_cleanup_state = ?session.sandbox_cleanup_state,
+        execution_state = ?session.execution_state,
+        root_state = ?session.root_state,
+        relevance = ?relevance,
+        why,
+        "source worktree session dependency scan refused every candidate"
+    );
+    "session_projection_unhealthy"
 }
 
 /// Session working directories and sandbox paths are mutable filesystem
@@ -1956,19 +1985,71 @@ fn fresh_session_path_dependencies(
             };
             let relevance = session.relevance();
             if relevance.database_code() != *stored_relevance {
-                return Ok(Err("session_projection_unhealthy"));
+                return Ok(Err(refuse_session_scan(
+                    &session,
+                    relevance,
+                    "stored_relevance_mismatch",
+                )));
             }
             match relevance {
                 SessionDependencyRelevance::ProvenIrrelevant => {
-                    return Ok(Err("session_projection_unhealthy"));
+                    return Ok(Err(refuse_session_scan(
+                        &session,
+                        relevance,
+                        "proven_irrelevant_stored_as_relevant",
+                    )));
                 }
                 SessionDependencyRelevance::Invalid => {
-                    return Ok(Err("session_projection_unhealthy"));
+                    // Issue #1086: historical invalid rows must not block
+                    // cleanup of roots they cannot reach. Only a terminal
+                    // Session whose every fresh path is provably outside the
+                    // candidate roots is skipped; reachable, unreadable or
+                    // non-terminal rows keep refusing the proof.
+                    match session.terminal_leaf_reaches_roots(roots) {
+                        Some(false) => continue,
+                        Some(true) => {
+                            return Ok(Err(refuse_session_scan(
+                                &session,
+                                relevance,
+                                "invalid_row_reaches_roots",
+                            )));
+                        }
+                        None => {
+                            return Ok(Err(refuse_session_scan(
+                                &session,
+                                relevance,
+                                "invalid_row_unobservable_or_nonterminal",
+                            )));
+                        }
+                    }
                 }
                 SessionDependencyRelevance::Relevant => {}
             }
             if !session.projection_is_current() {
-                return Ok(Err("session_projection_unhealthy"));
+                // Issue #1086 (acceptance 3): an archived or completed Session
+                // whose cached projection went stale (its working directory
+                // moved or vanished) only matters for the roots it can reach
+                // now, exactly like a stale scheduled-job projection (#955).
+                // A terminal leaf whose every fresh path is provably outside
+                // the candidate roots cannot execute in or be restored into
+                // them; reachable, unobservable or non-terminal rows refuse.
+                match session.terminal_leaf_reaches_roots(roots) {
+                    Some(false) => continue,
+                    Some(true) => {
+                        return Ok(Err(refuse_session_scan(
+                            &session,
+                            relevance,
+                            "stale_relevant_row_reaches_roots",
+                        )));
+                    }
+                    None => {
+                        return Ok(Err(refuse_session_scan(
+                            &session,
+                            relevance,
+                            "stale_relevant_row_unobservable_or_nonterminal",
+                        )));
+                    }
+                }
             }
             if [
                 Some(session.working_dir.as_str()),
@@ -2004,17 +2085,190 @@ fn participant_ids(connection: &Connection, custody_id: Uuid) -> Result<BTreeSet
 }
 
 fn path_matches_roots(path: &Path, roots: &DependencyRoots) -> bool {
+    path_matches_roots_with(path, roots, &|candidate| std::fs::canonicalize(candidate))
+}
+
+type Canonicalize<'a> = &'a dyn Fn(&Path) -> std::io::Result<PathBuf>;
+
+fn canonical_is_under_roots(canonical: &Path, roots: &DependencyRoots) -> bool {
+    roots
+        .canonical
+        .iter()
+        .any(|root| canonical == root.as_path() || canonical.starts_with(root))
+}
+
+fn path_matches_roots_with(path: &Path, roots: &DependencyRoots, canon: Canonicalize<'_>) -> bool {
     let raw_match = roots
         .raw
         .iter()
         .any(|root| path == root || path.starts_with(root));
-    let canonical_match = std::fs::canonicalize(path).ok().is_some_and(|canonical| {
-        roots
-            .canonical
-            .iter()
-            .any(|root| canonical == *root || canonical.starts_with(root))
-    });
+    let canonical_match = canon(path)
+        .ok()
+        .is_some_and(|canonical| canonical_is_under_roots(&canonical, roots));
     raw_match || canonical_match
+}
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+/// Decide from fresh filesystem evidence whether a raw path can reach the
+/// candidate roots. `None` means reachability cannot be proved: relative paths
+/// and paths or ancestors that cannot be observed. A path reaches the roots
+/// when its raw or fresh canonical form lies under a root or, for a missing
+/// path, when its nearest existing ancestor does (a symlinked ancestor that
+/// escapes into a root therefore still counts). A dangling symlink is followed
+/// by its target so a link to a root that is absent now, but could be restored,
+/// still counts. A missing path (or a dangling link target) containing a `..`
+/// component also counts: the `..` could hide a restorable directory, so
+/// `/p/missing/../sandbox/work` reaches `/p/sandbox` once `/p/missing` exists.
+fn fresh_raw_path_reaches_roots(raw: &Path, roots: &DependencyRoots) -> Option<bool> {
+    fresh_raw_path_reaches_roots_with(raw, roots, &|path| std::fs::canonicalize(path))
+}
+
+fn fresh_raw_path_reaches_roots_with(
+    raw: &Path,
+    roots: &DependencyRoots,
+    canon: Canonicalize<'_>,
+) -> Option<bool> {
+    fresh_raw_path_reaches_roots_bounded(raw, roots, 0, canon)
+}
+
+const MAX_DANGLING_SYMLINK_DEPTH: u8 = 16;
+
+fn fresh_raw_path_reaches_roots_bounded(
+    raw: &Path,
+    roots: &DependencyRoots,
+    depth: u8,
+    canon: Canonicalize<'_>,
+) -> Option<bool> {
+    if !raw.is_absolute() || depth > MAX_DANGLING_SYMLINK_DEPTH {
+        return None;
+    }
+    if path_matches_roots_with(raw, roots, canon) {
+        return Some(true);
+    }
+    // This is a second, fresh observation: the path may have been retargeted
+    // since the comparison above, so the returned canonical form is compared
+    // too instead of being discarded.
+    match canon(raw) {
+        Ok(canonical) => Some(canonical_is_under_roots(&canonical, roots)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Fail closed before any missing-ancestor fallback: a `..` after a
+            // missing component cannot be resolved lexically.
+            if has_parent_dir(raw) {
+                return Some(true);
+            }
+            for directory in raw.ancestors() {
+                match canon(directory) {
+                    Ok(canonical) => {
+                        return Some(canonical_is_under_roots(&canonical, roots));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match dangling_symlink_reaches_roots(raw, directory, roots, depth, canon) {
+                            DanglingLink::NotLink => {}
+                            DanglingLink::Resolved(reaches) => return reaches,
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
+enum DanglingLink {
+    /// The missing component is not a symlink; keep walking up.
+    NotLink,
+    /// The component is a dangling symlink (or could not be observed, `None`);
+    /// the path's reachability is decided by the link target.
+    Resolved(Option<bool>),
+}
+
+fn dangling_symlink_reaches_roots(
+    raw: &Path,
+    directory: &Path,
+    roots: &DependencyRoots,
+    depth: u8,
+    canon: Canonicalize<'_>,
+) -> DanglingLink {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DanglingLink::NotLink;
+        }
+        Err(_) => return DanglingLink::Resolved(None),
+    };
+    if !metadata.file_type().is_symlink() {
+        return DanglingLink::NotLink;
+    }
+    let resolved = std::fs::read_link(directory).ok().and_then(|target| {
+        if target.is_absolute() {
+            return Some(target);
+        }
+        directory.parent().map(|parent| parent.join(target))
+    });
+    let suffix = raw.strip_prefix(directory).ok();
+    let (Some(resolved), Some(suffix)) = (resolved, suffix) else {
+        return DanglingLink::Resolved(None);
+    };
+    // A `..` in the link target or the appended suffix cannot be resolved
+    // lexically while a prefix is missing; count it as reaching.
+    if has_parent_dir(&resolved) || has_parent_dir(suffix) {
+        return DanglingLink::Resolved(Some(true));
+    }
+    DanglingLink::Resolved(fresh_raw_path_reaches_roots_bounded(
+        &resolved.join(suffix),
+        roots,
+        depth + 1,
+        canon,
+    ))
+}
+
+impl SessionDependency {
+    /// Reachability of a historical Session whose dependency row is Invalid
+    /// or whose Relevant projection is stale.
+    /// `Some(false)` is returned only for a well-formed leaf Session in a
+    /// terminal status whose working directory, sandbox root and effective
+    /// cwd all provably resolve outside the candidate roots. Non-terminal or
+    /// malformed Sessions and any path that cannot be observed return `None`.
+    fn terminal_leaf_reaches_roots(&self, roots: &DependencyRoots) -> Option<bool> {
+        let terminal = matches!(
+            self.status.as_str(),
+            "Completed" | "Failed" | "Interrupted" | "Archived" | "Deleted"
+        );
+        let known_leaf = matches!(
+            self.session_kind.as_str(),
+            "Standard"
+                | "TaskRabbit"
+                | "Bug"
+                | "Story"
+                | "Task"
+                | "Feature"
+                | "Refactor"
+                | "Research"
+        );
+        if self.malformed || !terminal || !known_leaf {
+            return None;
+        }
+        let mut reaches = false;
+        for path in [
+            Some(self.working_dir.as_str()),
+            self.sandbox_root.as_deref(),
+            self.effective_cwd.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // Keep evaluating after a hit so an unobservable later path still
+            // fails closed rather than being masked.
+            reaches |= fresh_raw_path_reaches_roots(Path::new(path), roots)?;
+        }
+        Some(reaches)
+    }
 }
 
 #[derive(Debug)]
@@ -2038,6 +2292,38 @@ struct JobDependency {
 impl JobDependency {
     fn watched_session_id(&self) -> Option<&str> {
         self.wake_mode.strip_prefix("on_terminal:")
+    }
+
+    /// Decide from fresh filesystem evidence whether a job whose cached
+    /// projection is not current can reach the candidate roots. `None` means
+    /// reachability cannot be proved: malformed rows, noncanonical wake
+    /// authority (a disguised participant link), relative paths, and paths or
+    /// ancestors that cannot be observed. A job reaches the roots when its raw
+    /// path, its last recorded canonical path, its fresh canonical path or,
+    /// for a missing path, its nearest existing ancestor lies under a root.
+    fn fresh_path_reaches_roots(&self, roots: &DependencyRoots) -> Option<bool> {
+        if self.malformed
+            || !scheduled_job_wake_authority_is_canonical(
+                &self.wake_mode,
+                self.wake_session_id.as_deref(),
+            )
+        {
+            return None;
+        }
+        let recorded = [
+            self.canonical_working_dir.as_deref(),
+            self.projection_raw_working_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|path| path_matches_roots(Path::new(path), roots));
+        let Some(raw) = self.raw_working_dir.as_deref() else {
+            return Some(recorded);
+        };
+        if recorded {
+            return Some(true);
+        }
+        fresh_raw_path_reaches_roots(Path::new(raw), roots)
     }
 
     fn projection_is_current(&self) -> bool {
@@ -4046,7 +4332,7 @@ mod tests {
             .source_worktree_targeted_dependencies(custody_id, 1)
             .expect("read repointed alias evidence");
         assert!(!repointed.complete);
-        assert_eq!(repointed.reason, Some("scheduled_job_projection_unhealthy"));
+        assert_eq!(repointed.reason, Some("scheduled_job_projection_stale"));
         fs::remove_file(&alias).expect("remove repointed alias");
         std::os::unix::fs::symlink(&sandbox_root, &alias).expect("restore source-worktree alias");
         refresh_scheduled_job_path_projection(&store.conn, &alias_job.id.to_string())
@@ -4066,7 +4352,7 @@ mod tests {
             .source_worktree_targeted_dependencies(custody_id, 1)
             .expect("read stale digest evidence");
         assert!(!stale.complete);
-        assert_eq!(stale.reason, Some("scheduled_job_projection_unhealthy"));
+        assert_eq!(stale.reason, Some("scheduled_job_projection_stale"));
         refresh_scheduled_job_path_projection(&store.conn, &nested_job.id.to_string())
             .expect("repair stale digest evidence");
 
@@ -4156,7 +4442,7 @@ mod tests {
             .source_worktree_targeted_dependencies(custody_id, 1)
             .expect("read missing related projection evidence");
         assert!(!missing.complete);
-        assert_eq!(missing.reason, Some("scheduled_job_projection_unhealthy"));
+        assert_eq!(missing.reason, Some("scheduled_job_projection_stale"));
         refresh_scheduled_job_path_projection(&store.conn, &nested_job.id.to_string())
             .expect("repair missing related projection");
 
@@ -4176,6 +4462,598 @@ mod tests {
         assert_eq!(
             unhealthy_session.reason,
             Some("session_projection_unhealthy")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn source_worktree_stale_unrelated_job_projection_is_scoped_to_reachable_roots() {
+        // Issue #955: one enabled job whose directory was deleted elsewhere
+        // must not refuse every candidate; only jobs that can still reach the
+        // candidate roots count, and those fail closed.
+        let directory = tempfile::tempdir().expect("create scoped-projection fixture");
+        let repository_dir = directory.path().join("repository");
+        let elsewhere = directory.path().join("elsewhere");
+        let sandbox_root = directory.path().join("sandbox");
+        for path in [&repository_dir, &elsewhere, &sandbox_root] {
+            fs::create_dir_all(path).expect("create scoped-projection fixture directory");
+        }
+        let store = Store::open(&directory.path().join("scoped-projection.sqlite"))
+            .expect("open scoped-projection Store");
+        let owner = Uuid::from_u128(0x9a01);
+        let custody_id = Uuid::from_u128(0x9a02);
+        insert_test_session(&store.conn, owner, &repository_dir, "Archived");
+        insert_test_root(
+            &store.conn,
+            owner,
+            custody_id,
+            1,
+            "repo:v120:scoped-projection",
+            &repository_dir,
+            &sandbox_root,
+            "rsi/v120-scoped-projection",
+        );
+        link_test_session_to_root(
+            &store.conn,
+            owner,
+            custody_id,
+            &sandbox_root,
+            "rsi/v120-scoped-projection",
+        );
+        verify_test_session_projection(&store.conn, owner, &sandbox_root, Some((custody_id, 1)));
+
+        let deleted_dir = elsewhere.join("purged-sandbox");
+        fs::create_dir(&deleted_dir).expect("create unrelated job directory");
+        let unrelated = test_job(
+            "unrelated-deleted-dir",
+            Some(deleted_dir.join("work")),
+            WakeMode::Fresh,
+            None,
+            true,
+        );
+        store
+            .insert_scheduled_job(&unrelated)
+            .expect("insert unrelated job");
+        fs::remove_dir_all(&deleted_dir).expect("delete unrelated job directory");
+        reconcile_scheduled_job_path_projections(&store.conn)
+            .expect("reconcile stale unrelated projection");
+        let scoped = store
+            .source_worktree_targeted_dependencies(custody_id, 1)
+            .expect("read scoped dependency evidence");
+        assert!(scoped.complete, "{:?}", scoped.reason);
+        assert_eq!(scoped.scheduled_dependency_count, 0);
+
+        let inward_link = elsewhere.join("inward-link");
+        std::os::unix::fs::symlink(&sandbox_root, &inward_link)
+            .expect("create inward ancestor symlink");
+        let inward = test_job(
+            "missing-path-under-inward-ancestor",
+            Some(inward_link.join("missing").join("work")),
+            WakeMode::Fresh,
+            None,
+            true,
+        );
+        store
+            .insert_scheduled_job(&inward)
+            .expect("insert inward job");
+        let reachable = store
+            .source_worktree_targeted_dependencies(custody_id, 1)
+            .expect("read reachable stale projection evidence");
+        assert!(!reachable.complete);
+        assert_eq!(reachable.reason, Some("scheduled_job_projection_stale"));
+    }
+
+    fn assert_invalid_session_dependency(
+        store: &Store,
+        custody_id: Uuid,
+        session_id: Uuid,
+        expect_complete: bool,
+        label: &str,
+    ) {
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT relevance FROM source_worktree_session_dependency_health
+                  WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read stored Session dependency relevance");
+        assert_eq!(stored, 2, "{label}: fixture row must be Invalid");
+        for absent_root in [false, true] {
+            let evidence = if absent_root {
+                store.source_worktree_targeted_dependencies_for_absent_root(custody_id, 1)
+            } else {
+                store.source_worktree_targeted_dependencies(custody_id, 1)
+            }
+            .expect("read Invalid Session dependency evidence");
+            assert_eq!(
+                evidence.complete, expect_complete,
+                "{label} (absent_root={absent_root}): {:?}",
+                evidence.reason
+            );
+            if expect_complete {
+                assert_eq!(evidence.session_path_dependency_count, 0, "{label}");
+                continue;
+            }
+            assert_eq!(
+                evidence.reason,
+                Some("session_projection_unhealthy"),
+                "{label} (absent_root={absent_root})"
+            );
+        }
+    }
+
+    fn retire_test_session(store: &Store, session_id: Uuid) {
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET session_kind='Group' WHERE id=?1",
+                [session_id.to_string()],
+            )
+            .expect("retire Invalid Session fixture as a proven container");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn source_worktree_invalid_terminal_session_row_is_scoped_to_reachable_roots() {
+        // Issue #1086: a historical terminal Session whose dependency row is
+        // Invalid must not refuse candidates it cannot reach, while anything
+        // that could execute in or be restored into the root stays refused.
+        let directory = tempfile::tempdir().expect("create Invalid-Session fixture");
+        let repository_dir = directory.path().join("repository");
+        let elsewhere = directory.path().join("elsewhere");
+        let sandbox_root = directory.path().join("sandbox");
+        for path in [&repository_dir, &elsewhere, &sandbox_root] {
+            fs::create_dir_all(path).expect("create Invalid-Session fixture directory");
+        }
+        let store = Store::open(&directory.path().join("invalid-session.sqlite"))
+            .expect("open Invalid-Session Store");
+        let owner = Uuid::from_u128(0xa101);
+        let custody_id = Uuid::from_u128(0xa102);
+        insert_test_session(&store.conn, owner, &repository_dir, "Archived");
+        insert_test_root(
+            &store.conn,
+            owner,
+            custody_id,
+            1,
+            "repo:v120:invalid-session",
+            &repository_dir,
+            &sandbox_root,
+            "rsi/v120-invalid-session",
+        );
+        link_test_session_to_root(
+            &store.conn,
+            owner,
+            custody_id,
+            &sandbox_root,
+            "rsi/v120-invalid-session",
+        );
+        verify_test_session_projection(&store.conn, owner, &sandbox_root, Some((custody_id, 1)));
+
+        // 1) Invalid terminal row (unauthenticated projection) whose paths
+        // cannot reach the candidate: the proof proceeds.
+        let outside_dir = elsewhere.join("historical");
+        fs::create_dir(&outside_dir).expect("create historical directory");
+        let outside = Uuid::from_u128(0xa103);
+        insert_test_session(&store.conn, outside, &outside_dir, "Archived");
+        assert_invalid_session_dependency(&store, custody_id, outside, true, "outside");
+
+        // A terminal row whose directory is gone and whose ancestor is outside
+        // the candidate is still provably unreachable.
+        let gone = Uuid::from_u128(0xa104);
+        insert_test_session(
+            &store.conn,
+            gone,
+            &elsewhere.join("removed").join("work"),
+            "Deleted",
+        );
+        assert_invalid_session_dependency(&store, custody_id, gone, true, "missing outside path");
+        retire_test_session(&store, gone);
+
+        // 2) The same kind of row whose working directory is a symlink that
+        // escapes into the candidate root stays fail-closed.
+        let alias = elsewhere.join("alias-into-candidate");
+        std::os::unix::fs::symlink(&sandbox_root, &alias).expect("create inward alias");
+        let aliased = Uuid::from_u128(0xa105);
+        insert_test_session(&store.conn, aliased, &alias, "Completed");
+        assert_invalid_session_dependency(&store, custody_id, aliased, false, "inward symlink");
+        retire_test_session(&store, aliased);
+
+        // A missing path below an inward-pointing ancestor also reaches it.
+        let below = Uuid::from_u128(0xa106);
+        insert_test_session(
+            &store.conn,
+            below,
+            &alias.join("missing").join("work"),
+            "Failed",
+        );
+        assert_invalid_session_dependency(&store, custody_id, below, false, "missing under inward");
+        retire_test_session(&store, below);
+
+        // A raw path inside the candidate root reaches it.
+        let inside = Uuid::from_u128(0xa107);
+        insert_test_session(
+            &store.conn,
+            inside,
+            &sandbox_root.join("nested"),
+            "Interrupted",
+        );
+        assert_invalid_session_dependency(&store, custody_id, inside, false, "raw inside");
+        retire_test_session(&store, inside);
+
+        // An unreachable working_dir does not hide a reachable sandbox_root.
+        let mixed = Uuid::from_u128(0xa108);
+        insert_test_session(&store.conn, mixed, &outside_dir, "Archived");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_root=?1 WHERE id=?2",
+                params![alias.to_string_lossy().into_owned(), mixed.to_string()],
+            )
+            .expect("point Session sandbox_root through the inward alias");
+        assert_invalid_session_dependency(&store, custody_id, mixed, false, "sandbox_root alias");
+        retire_test_session(&store, mixed);
+
+        // Unobservable paths fail closed: a symlink loop and a relative path.
+        let loop_a = elsewhere.join("loop-a");
+        let loop_b = elsewhere.join("loop-b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).expect("create loop a");
+        std::os::unix::fs::symlink(&loop_a, &loop_b).expect("create loop b");
+        let looped = Uuid::from_u128(0xa109);
+        insert_test_session(&store.conn, looped, &loop_a, "Archived");
+        assert_invalid_session_dependency(&store, custody_id, looped, false, "symlink loop");
+        retire_test_session(&store, looped);
+
+        let relative = Uuid::from_u128(0xa10a);
+        insert_test_session(&store.conn, relative, Path::new("relative/dir"), "Archived");
+        assert_invalid_session_dependency(&store, custody_id, relative, false, "relative path");
+        retire_test_session(&store, relative);
+
+        // A dangling symlink to a path under the candidate root could be
+        // restored into it, so it stays refused; one that dangles elsewhere is
+        // unreachable.
+        let dangling_in = elsewhere.join("dangling-into-candidate");
+        std::os::unix::fs::symlink(sandbox_root.join("not-yet"), &dangling_in)
+            .expect("create dangling inward link");
+        let dangling = Uuid::from_u128(0xa10d);
+        insert_test_session(&store.conn, dangling, &dangling_in.join("work"), "Archived");
+        assert_invalid_session_dependency(&store, custody_id, dangling, false, "dangling inward");
+        retire_test_session(&store, dangling);
+
+        let dangling_out = elsewhere.join("dangling-elsewhere");
+        std::os::unix::fs::symlink(elsewhere.join("not-yet"), &dangling_out)
+            .expect("create dangling outward link");
+        let dangling = Uuid::from_u128(0xa10e);
+        insert_test_session(
+            &store.conn,
+            dangling,
+            &dangling_out.join("work"),
+            "Archived",
+        );
+        assert_invalid_session_dependency(&store, custody_id, dangling, true, "dangling outward");
+        retire_test_session(&store, dangling);
+
+        // A `..` after a missing prefix could hide a restorable directory:
+        // `<elsewhere>/missing/../../sandbox/work` reaches the candidate once
+        // `<elsewhere>/missing` is restored, so it stays refused.
+        let hidden = Uuid::from_u128(0xa10f);
+        let hidden_path = elsewhere
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("sandbox")
+            .join("work");
+        insert_test_session(&store.conn, hidden, &hidden_path, "Archived");
+        assert_invalid_session_dependency(&store, custody_id, hidden, false, "missing then ..");
+        retire_test_session(&store, hidden);
+
+        // The same holds when the `..` sits in the suffix after a dangling link.
+        let dangling_suffix = Uuid::from_u128(0xa110);
+        let suffix_path = dangling_out.join("..").join("sandbox").join("work");
+        insert_test_session(&store.conn, dangling_suffix, &suffix_path, "Archived");
+        assert_invalid_session_dependency(
+            &store,
+            custody_id,
+            dangling_suffix,
+            false,
+            "dangling link then ..",
+        );
+        retire_test_session(&store, dangling_suffix);
+
+        // A dangling symlink whose own target contains `..` is refused too.
+        let dotted_link = elsewhere.join("dangling-dotted");
+        let dotted_target = elsewhere
+            .join("not-yet")
+            .join("..")
+            .join("..")
+            .join("sandbox");
+        std::os::unix::fs::symlink(&dotted_target, &dotted_link)
+            .expect("create dangling link with a .. target");
+        let dotted = Uuid::from_u128(0xa111);
+        insert_test_session(&store.conn, dotted, &dotted_link.join("work"), "Archived");
+        assert_invalid_session_dependency(&store, custody_id, dotted, false, "dotted target");
+        retire_test_session(&store, dotted);
+
+        // A Session in a non-terminal or unrecognised status is never skipped,
+        // even when its paths are unreachable.
+        let unknown = Uuid::from_u128(0xa10b);
+        insert_test_session(&store.conn, unknown, &outside_dir, "Archived");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Bogus' WHERE id=?1",
+                [unknown.to_string()],
+            )
+            .expect("install unrecognised Session status");
+        assert_invalid_session_dependency(&store, custody_id, unknown, false, "unknown status");
+        retire_test_session(&store, unknown);
+
+        let running = Uuid::from_u128(0xa10c);
+        insert_test_session(&store.conn, running, &outside_dir, "Running");
+        for absent_root in [false, true] {
+            let evidence = if absent_root {
+                store.source_worktree_targeted_dependencies_for_absent_root(custody_id, 1)
+            } else {
+                store.source_worktree_targeted_dependencies(custody_id, 1)
+            }
+            .expect("read non-terminal Session evidence");
+            assert!(!evidence.complete, "running absent_root={absent_root}");
+            assert_eq!(evidence.reason, Some("session_projection_unhealthy"));
+        }
+        retire_test_session(&store, running);
+
+        // Nothing left refusing: the original outside row still proceeds.
+        assert_invalid_session_dependency(&store, custody_id, outside, true, "final outside");
+    }
+
+    fn assert_session_dependency_scan(
+        store: &Store,
+        custody_id: Uuid,
+        session_id: Uuid,
+        expected_relevance: i64,
+        expect_complete: bool,
+        label: &str,
+    ) {
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT relevance FROM source_worktree_session_dependency_health
+                  WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read stored Session dependency relevance");
+        assert_eq!(stored, expected_relevance, "{label}: fixture relevance");
+        for absent_root in [false, true] {
+            let evidence = if absent_root {
+                store.source_worktree_targeted_dependencies_for_absent_root(custody_id, 1)
+            } else {
+                store.source_worktree_targeted_dependencies(custody_id, 1)
+            }
+            .expect("read Session dependency evidence");
+            assert_eq!(
+                evidence.complete, expect_complete,
+                "{label} (absent_root={absent_root}): {:?}",
+                evidence.reason
+            );
+            if expect_complete {
+                assert_eq!(evidence.session_path_dependency_count, 0, "{label}");
+            } else {
+                assert_eq!(
+                    evidence.reason,
+                    Some("session_projection_unhealthy"),
+                    "{label} (absent_root={absent_root})"
+                );
+            }
+        }
+    }
+
+    /// Terminal Relevant Session (verified ordinary projection) whose working
+    /// directory is then removed, so the cached projection is stale.
+    fn insert_stale_relevant_session(
+        store: &Store,
+        session_id: Uuid,
+        working_dir: &Path,
+        status: &str,
+    ) {
+        fs::create_dir_all(working_dir).expect("create stale-projection working directory");
+        insert_test_session(&store.conn, session_id, working_dir, status);
+        verify_test_session_projection(&store.conn, session_id, working_dir, None);
+        fs::remove_dir_all(working_dir).expect("remove stale-projection working directory");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn source_worktree_stale_relevant_terminal_session_row_is_scoped_to_reachable_roots() {
+        // Issue #1086 acceptance 3: archived/completed Sessions whose cached
+        // execution projection went stale (the working directory vanished) are
+        // Relevant rows, not Invalid ones. On the hub they refused every
+        // candidate with `session_projection_unhealthy`. They block only when
+        // they can reach the candidate roots.
+        let directory = tempfile::tempdir().expect("create stale-Session fixture");
+        let repository_dir = directory.path().join("repository");
+        let elsewhere = directory.path().join("elsewhere");
+        let sandbox_root = directory.path().join("sandbox");
+        for path in [&repository_dir, &elsewhere, &sandbox_root] {
+            fs::create_dir_all(path).expect("create stale-Session fixture directory");
+        }
+        let store = Store::open(&directory.path().join("stale-session.sqlite"))
+            .expect("open stale-Session Store");
+        let owner = Uuid::from_u128(0xb101);
+        let custody_id = Uuid::from_u128(0xb102);
+        insert_test_session(&store.conn, owner, &repository_dir, "Archived");
+        insert_test_root(
+            &store.conn,
+            owner,
+            custody_id,
+            1,
+            "repo:v120:stale-session",
+            &repository_dir,
+            &sandbox_root,
+            "rsi/v120-stale-session",
+        );
+        link_test_session_to_root(
+            &store.conn,
+            owner,
+            custody_id,
+            &sandbox_root,
+            "rsi/v120-stale-session",
+        );
+        verify_test_session_projection(&store.conn, owner, &sandbox_root, Some((custody_id, 1)));
+
+        // Archived and Completed unsandboxed rows (hub classes 1|Archived|NULL
+        // and 1|Completed|NULL) with a vanished directory outside the candidate.
+        for (index, status) in ["Archived", "Completed", "Failed", "Interrupted"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = Uuid::from_u128(0xb110 + index as u128);
+            insert_stale_relevant_session(
+                &store,
+                id,
+                &elsewhere.join(format!("gone-{index}")),
+                status,
+            );
+            assert_session_dependency_scan(
+                &store,
+                custody_id,
+                id,
+                1,
+                true,
+                &format!("stale {status} outside"),
+            );
+        }
+        for (index, kind) in ["Bug", "Task", "TaskRabbit", "Research", "Feature", "Story"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = Uuid::from_u128(0xb120 + index as u128);
+            insert_stale_relevant_session(
+                &store,
+                id,
+                &elsewhere.join(format!("gone-{kind}")),
+                "Archived",
+            );
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET session_kind=?1 WHERE id=?2",
+                    params![kind, id.to_string()],
+                )
+                .expect("set stale Session kind");
+            assert_session_dependency_scan(
+                &store,
+                custody_id,
+                id,
+                1,
+                true,
+                &format!("stale {kind} outside"),
+            );
+        }
+
+        // A stale row that can reach the candidate root still blocks.
+        let reaching = Uuid::from_u128(0xb130);
+        insert_stale_relevant_session(&store, reaching, &sandbox_root.join("nested"), "Archived");
+        assert_session_dependency_scan(&store, custody_id, reaching, 1, false, "stale inside");
+        retire_test_session(&store, reaching);
+
+        // So does a row whose sandbox_root alias points into the candidate.
+        let alias = elsewhere.join("alias-into-candidate");
+        std::os::unix::fs::symlink(&sandbox_root, &alias).expect("create inward alias");
+        let aliased = Uuid::from_u128(0xb131);
+        insert_stale_relevant_session(&store, aliased, &elsewhere.join("gone-aliased"), "Archived");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_root=?1 WHERE id=?2",
+                params![alias.to_string_lossy().into_owned(), aliased.to_string()],
+            )
+            .expect("point stale Session sandbox_root through the inward alias");
+        assert_session_dependency_scan(&store, custody_id, aliased, 1, false, "stale aliased");
+        retire_test_session(&store, aliased);
+
+        // A non-terminal stale row is never skipped.
+        let running = Uuid::from_u128(0xb132);
+        insert_stale_relevant_session(&store, running, &elsewhere.join("gone-running"), "Running");
+        assert_session_dependency_scan(&store, custody_id, running, 1, false, "stale running");
+        retire_test_session(&store, running);
+
+        // Hub class 2|Archived|Failed: cleanup Failed, sandbox directory removed
+        // externally (outside the candidate) is Invalid and unreachable.
+        let removed = Uuid::from_u128(0xb140);
+        insert_test_session(&store.conn, removed, &repository_dir, "Archived");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_kind='GitWorktree',sandbox_cleanup_state='Failed',
+                        sandbox_root=?1,sandbox_branch='rsi/removed-elsewhere'
+                  WHERE id=?2",
+                params![
+                    elsewhere
+                        .join("sandboxes")
+                        .join("removed")
+                        .to_string_lossy()
+                        .into_owned(),
+                    removed.to_string()
+                ],
+            )
+            .expect("install Failed-cleanup Session with a removed sandbox");
+        assert_session_dependency_scan(&store, custody_id, removed, 2, true, "failed cleanup");
+        // The same shape pointing at the candidate root stays refused.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_root=?1 WHERE id=?2",
+                params![
+                    sandbox_root.join("child").to_string_lossy().into_owned(),
+                    removed.to_string()
+                ],
+            )
+            .expect("point Failed-cleanup Session into the candidate");
+        assert_session_dependency_scan(&store, custody_id, removed, 2, false, "failed inside");
+        retire_test_session(&store, removed);
+
+        // Hub class 2|Deleted|NULL: a Deleted unsandboxed row is Invalid.
+        let deleted = Uuid::from_u128(0xb150);
+        insert_test_session(&store.conn, deleted, &elsewhere.join("deleted"), "Deleted");
+        assert_session_dependency_scan(&store, custody_id, deleted, 2, true, "deleted");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn source_worktree_reachability_compares_the_second_canonical_observation() {
+        // A path whose canonical form was outside the roots at the first
+        // observation but is retargeted inward before the second must count as
+        // reaching. The seam returns a different answer on each call, so no
+        // timing is involved.
+        let inside = PathBuf::from("/p/sandbox");
+        let outside = PathBuf::from("/p/elsewhere");
+        let roots = DependencyRoots {
+            raw: vec![inside.clone()],
+            canonical: vec![inside.clone()],
+        };
+        let alias = Path::new("/p/alias");
+        let calls = std::cell::Cell::new(0_u32);
+        let retargeting = |_: &Path| {
+            let call = calls.get();
+            calls.set(call + 1);
+            Ok(if call == 0 {
+                outside.clone()
+            } else {
+                inside.join("work")
+            })
+        };
+        assert_eq!(
+            fresh_raw_path_reaches_roots_with(alias, &roots, &retargeting),
+            Some(true)
+        );
+        assert_eq!(calls.get(), 2, "both observations must be taken");
+
+        let stable = |_: &Path| Ok(outside.clone());
+        assert_eq!(
+            fresh_raw_path_reaches_roots_with(alias, &roots, &stable),
+            Some(false)
         );
     }
 
@@ -4234,7 +5112,7 @@ mod tests {
         assert!(!job_alias_result.complete);
         assert_eq!(
             job_alias_result.reason,
-            Some("scheduled_job_projection_unhealthy")
+            Some("scheduled_job_projection_stale")
         );
         store
             .conn
@@ -4265,7 +5143,7 @@ mod tests {
         assert!(!ordinary_job_result.complete);
         assert_eq!(
             ordinary_job_result.reason,
-            Some("scheduled_job_projection_unhealthy")
+            Some("scheduled_job_projection_stale")
         );
         store
             .conn
@@ -4304,7 +5182,7 @@ mod tests {
         assert!(!missing_result.complete);
         assert_eq!(
             missing_result.reason,
-            Some("scheduled_job_projection_unhealthy")
+            Some("scheduled_job_projection_stale")
         );
         store
             .conn

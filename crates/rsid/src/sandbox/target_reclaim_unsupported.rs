@@ -127,6 +127,7 @@ pub(crate) struct RegisteredTargetProbe {
 pub(crate) struct RegisteredTargetIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+    pub(crate) birth: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -12,7 +12,7 @@ the primary evidence; use prior notes to explain history. Describe behavior,
 ownership, and connections. Offer diagnoses or proposed changes only when the
 request calls for them.
 
-**Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=research` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
+**Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=research` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
 ## Five-Expert Research Lenses
 

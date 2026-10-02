@@ -264,10 +264,11 @@ impl SessionManager {
         code: &'static str,
     ) -> Result<()> {
         if let Some(successor) = settle_successor {
-            self.store
-                .lock()
-                .await
-                .update_session_status(successor, SessionStatus::Failed)?;
+            self.store.lock().await.set_session_terminal_status(
+                successor,
+                SessionStatus::Failed,
+                &format!("rotation_recovery:{code}"),
+            )?;
             if let Some(completed) = self.completed.write().await.get_mut(&successor) {
                 completed.session.status = SessionStatus::Failed;
             }

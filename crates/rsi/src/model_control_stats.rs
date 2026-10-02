@@ -20,6 +20,9 @@ pub(crate) struct StatsRow {
 
 pub(crate) fn stats_rows(app: &App) -> Vec<StatsRow> {
     let mut rows = summary_rows(app);
+    rows.extend(crate::efficiency_stats::efficiency_rows(
+        app.cached_efficiency_metrics.as_ref(),
+    ));
     let Some(control) = app.cached_model_control_status.as_ref() else {
         return rows;
     };
@@ -670,5 +673,37 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.label == "A1 auth" && row.value.contains("status:operator_cancelled")
         }));
+    }
+
+    #[test]
+    fn stats_rows_show_efficiency_section_loading_then_cached() {
+        use rsi_common::rpc::{
+            EfficiencyMetricTargets, EfficiencyMetricValues, EfficiencyMetricsGroupBy,
+            EfficiencyMetricsResponse, EfficiencyMetricsRow,
+        };
+        let mut app = test_app();
+        let label = "Efficiency (today, UTC)";
+        let find = |app: &App| {
+            stats_rows(app)
+                .into_iter()
+                .find(|row| row.label == label)
+                .map(|row| row.value)
+        };
+        assert_eq!(find(&app).as_deref(), Some("(loading…)"));
+        let from = chrono::Utc::now();
+        app.cached_efficiency_metrics = Some(EfficiencyMetricsResponse {
+            from,
+            to: from,
+            group_by: EfficiencyMetricsGroupBy::Day,
+            targets: EfficiencyMetricTargets::default(),
+            rows: vec![EfficiencyMetricsRow {
+                day: "2026-09-30".to_string(),
+                epic_id: None,
+                epic_title: None,
+                values: EfficiencyMetricValues::default(),
+            }],
+        });
+        assert_eq!(find(&app).as_deref(), Some("2026-09-30"));
+        assert!(stats_rows(&app).iter().any(|row| row.label == "Landings"));
     }
 }

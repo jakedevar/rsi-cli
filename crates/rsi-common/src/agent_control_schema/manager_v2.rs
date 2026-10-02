@@ -171,6 +171,7 @@ fn inspect() -> Value {
         "archive",
         "health",
         "migration_allocations",
+        "satellites",
     ]);
     section["default"] = json!("overview");
     let mut limit = integer(1, 64);
@@ -377,6 +378,28 @@ fn operator_call() -> Value {
         call("GetArchiveCleanupStatus", session(), &["method", "params"]),
         call("ListSessions", list, &["method"]),
         call("UnarchiveSession", session(), &["method", "params"]),
+        // #1043 (`StorageControl`): daemon storage status and one bounded
+        // build-cache reclaim pass under the configured limits.
+        call("GetSandboxStorageStatus", object(&[], &[]), &["method"]),
+        call(
+            "RunSandboxBuildCacheReclaim",
+            object(&[("dry_run", boolean())], &["dry_run"]),
+            &["method", "params"],
+        ),
+        // #1046 (`DaemonSettings`): one allowlisted setting inside the
+        // operator's bounds, with a reason.
+        call(
+            "ProposeDaemonSetting",
+            object(
+                &[
+                    ("key", string()),
+                    ("value", integer(0, 65_536)),
+                    ("reason", string()),
+                ],
+                &["key", "value", "reason"],
+            ),
+            &["method", "params"],
+        ),
     ]})
 }
 
@@ -610,6 +633,7 @@ fn update() -> Value {
                     ("priority", integer(0, 255)),
                     ("weight", integer(0, 65535)),
                     ("required_gates", array(stage())),
+                    ("risk_tier", enumeration(&["tier1", "tier2"])),
                 ],
                 vec![
                     "epic_id",
@@ -712,6 +736,8 @@ fn update() -> Value {
                     ),
                     ("query", string()),
                     ("launch", launch()),
+                    ("delta_of", optional(uuid())),
+                    ("finding_keys", array(string())),
                 ],
                 vec!["source_commit", "query", "launch"],
             ),

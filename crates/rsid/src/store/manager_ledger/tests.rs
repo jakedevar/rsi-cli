@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 #[path = "health_tests.rs"]
 mod health_tests;
+mod integration_refusal;
 #[path = "issue_541_tests.rs"]
 mod issue_541_tests;
 #[path = "lead_review_tests.rs"]
@@ -658,6 +659,7 @@ fn work(f: &Fixture, key: &str) -> ManagerMutationReceiptV2 {
                         ManagerWorkStageV2::Review,
                         ManagerWorkStageV2::Verification,
                     ],
+                    risk_tier: Default::default(),
                 },
                 key,
             ),
@@ -1779,6 +1781,7 @@ fn a_plan_revision_preserves_partial_source_and_reopens_acceptance() {
                     priority: 2,
                     weight: 3,
                     required_gates: w.required_gates,
+                    risk_tier: Default::default(),
                 },
                 "revise",
             ),
@@ -2559,7 +2562,12 @@ fn unsupported_nested_hierarchy_retains_parent_identity_and_reports_unknown_cove
 fn dependency_readiness_and_handoff_are_rehydrated_after_reopen() {
     let dir = tempfile::Builder::new()
         .prefix("reopen-")
-        .tempdir_in("/var/tmp/ham-v2-fd23a414")
+        // A fresh host has no shared root until a test creates it (Issue #935).
+        .tempdir_in({
+            let root = std::path::Path::new("/var/tmp/ham-v2-fd23a414");
+            std::fs::create_dir_all(root).unwrap();
+            root
+        })
         .unwrap();
     let path = dir.path().join("store.db");
     let f = fixture_using(Store::open(&path).unwrap());
@@ -2851,4 +2859,119 @@ fn harness_manager_empty_group_scope_is_visible_and_topology_requires_policy() {
             .id,
         epic.id
     );
+}
+
+/// #1017: Inspect shows one row per registered satellite peer. A peer with a
+/// good snapshot is reachable and carries the health it reported; an
+/// unreachable peer shows `reachable:false` with its last contact time.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn satellites_inspect_reports_health_and_unreachable_peers() {
+    use crate::satellite::poll::PeerSnapshot;
+    use crate::store::satellite_registry::SatelliteFailure;
+    use rsi_common::satellite::{
+        SatelliteHealthV1, SatellitePeerConfigV1, SatellitePutPeerRequestV1, SatelliteUuidV1,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture();
+    let temp = tempfile::Builder::new()
+        .prefix("sat-inspect-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().join("satellites");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut peers = Vec::new();
+    for label in ["laptop", "spare"] {
+        let peer_id = Uuid::new_v4();
+        let installation = Uuid::new_v4();
+        let revision = f.store.satellite_registry_revision().unwrap();
+        f.store
+            .put_satellite_peer(
+                &SatellitePutPeerRequestV1 {
+                    expected_registry_revision: revision,
+                    peer: SatellitePeerConfigV1 {
+                        peer_id: SatelliteUuidV1(peer_id),
+                        label: label.into(),
+                        expected_installation_id: Some(SatelliteUuidV1(installation)),
+                        enabled: true,
+                        read_enabled: true,
+                        dispatch_enabled: false,
+                    },
+                    repair_quarantine: false,
+                },
+                &root,
+            )
+            .unwrap();
+        f.store
+            .record_satellite_snapshot(
+                peer_id,
+                &PeerSnapshot {
+                    installation_id: installation,
+                    incarnation_id: Uuid::new_v4(),
+                    sessions: vec![],
+                    health: None,
+                },
+            )
+            .unwrap();
+        peers.push((peer_id, installation));
+    }
+    let (laptop, spare) = (peers[0].0, peers[1].0);
+    let health = SatelliteHealthV1 {
+        daemon_version: "1.2.3".into(),
+        binary_sha256: Some("ab".repeat(32)),
+        uptime_seconds: 3_600,
+        schema_version: Some(140),
+        sessions_running: 2,
+        sessions_waiting_approval: 1,
+        disk_free_bytes: Some(10_000_000),
+        load_avg_1m_milli: Some(1_500),
+        build_sha: None,
+        started_at: None,
+        supervisor_mode: None,
+        last_deploy: None,
+        missing_provider_clis: Vec::new(),
+    };
+    crate::satellite::record_reported_health(laptop, Some(&health));
+    // The spare peer went dark after its good snapshot above.
+    f.store
+        .record_satellite_failure(spare, SatelliteFailure::Offline)
+        .unwrap();
+
+    let page = inspect(&f, ManagerInspectSectionV2::Satellites);
+    assert_eq!(page.rows.len(), 2);
+    let laptop_row = page
+        .rows
+        .iter()
+        .find(|row| row["key"] == laptop.to_string())
+        .unwrap();
+    assert_eq!(laptop_row["label"], "laptop");
+    assert_eq!(laptop_row["reachable"], true);
+    assert_eq!(laptop_row["state"], "healthy");
+    assert!(laptop_row["last_contact_at"].is_string());
+    assert_eq!(laptop_row["health"]["daemon_version"], "1.2.3");
+    assert_eq!(laptop_row["health"]["binary_sha256"], "ab".repeat(32));
+    assert_eq!(laptop_row["health"]["uptime_seconds"], 3_600);
+    assert_eq!(laptop_row["health"]["schema_version"], 140);
+    assert_eq!(laptop_row["health"]["sessions_running"], 2);
+    assert_eq!(laptop_row["health"]["sessions_waiting_approval"], 1);
+    assert_eq!(laptop_row["health"]["disk_free_bytes"], 10_000_000);
+    assert_eq!(laptop_row["health"]["load_avg_1m"], 1.5);
+    assert!(laptop_row["health_reported_at"].is_string());
+
+    let spare_row = page
+        .rows
+        .iter()
+        .find(|row| row["key"] == spare.to_string())
+        .unwrap();
+    assert_eq!(spare_row["reachable"], false);
+    assert_eq!(spare_row["state"], "offline");
+    assert_eq!(spare_row["last_error"], "peer unavailable");
+    assert!(
+        spare_row["last_contact_at"].is_string(),
+        "the last good contact time survives the failure"
+    );
+    assert!(spare_row["health"].is_null());
+    assert!(page.complete);
 }

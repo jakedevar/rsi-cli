@@ -83,6 +83,7 @@ pub async fn replay_ticket(
 
 async fn launch(socket: &Path, ticket: &CorpusTicket, working_dir: PathBuf) -> Result<Uuid> {
     let params = LaunchSessionParams {
+        completion_gates: None,
         query: ticket.prompt.clone(),
         title: None,
         working_dir: Some(working_dir),
@@ -105,6 +106,7 @@ async fn launch(socket: &Path, ticket: &CorpusTicket, working_dir: PathBuf) -> R
         skip_context_pipeline: Some(true),
         tags: vec!["eval".to_string()],
         workflow_id_override: None,
+        tool_policy: None,
     };
     let request = RpcRequest::new(
         "LaunchSession",

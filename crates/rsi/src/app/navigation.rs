@@ -390,7 +390,9 @@ impl App {
         use crate::settings_registry::SettingsSection;
         match self.settings_state.focus {
             crate::types::SettingsFocus::Categories => {
+                let before = self.settings_state.section;
                 crate::settings_keys::nav_down(&mut self.settings_state, &self.settings);
+                self.refresh_settings_section_if_changed(before);
             }
             crate::types::SettingsFocus::Items => {
                 let max = match self.settings_state.section {
@@ -400,6 +402,10 @@ impl App {
                     SettingsSection::Budgets => {
                         crate::model_control_budgets::budget_row_count(self)
                     }
+                    SettingsSection::McpServers => self
+                        .cached_mcp_servers
+                        .as_ref()
+                        .map_or(1, |list| list.servers.len().max(1)),
                     section => crate::settings_keys::item_count(section, &self.settings),
                 };
                 if self.settings_state.selected_index + 1 < max {
@@ -410,7 +416,20 @@ impl App {
     }
 
     fn settings_nav_up(&mut self) {
+        let before = self.settings_state.section;
         crate::settings_keys::nav_up(&mut self.settings_state, &self.settings);
+        self.refresh_settings_section_if_changed(before);
+    }
+
+    /// The Settings rail opens each category on its first tab, which the
+    /// list shows at once; load that tab's data as entering it would.
+    fn refresh_settings_section_if_changed(
+        &mut self,
+        before: crate::settings_registry::SettingsSection,
+    ) {
+        if self.settings_state.section != before {
+            crate::settings_keys::refresh_entered_settings_section(self);
+        }
     }
 
     /// Enter a selected session's detail view (in the focused pane).
@@ -595,7 +614,7 @@ impl App {
     }
 
     /// Get the selected selected session ID from the session list state (bypasses interaction_pane_id).
-    fn selected_session_id_from_list(&self) -> Option<Uuid> {
+    pub(crate) fn selected_session_id_from_list(&self) -> Option<Uuid> {
         let tab = self.active_tab();
         // Check layout tree first
         for pid in tab.layout.leaf_ids() {
@@ -614,6 +633,20 @@ impl App {
             return *selected_session;
         }
         None
+    }
+
+    /// Session lifecycle commands use the selected list row in detail view.
+    /// Fall back to the displayed session when no list row is available.
+    pub(crate) fn selected_session_id_for_lifecycle_action(&self) -> Option<Uuid> {
+        match self.focused_pane()? {
+            Pane::SessionDetail { session_id } => {
+                self.selected_session_id_from_list().or(Some(*session_id))
+            }
+            Pane::SessionList {
+                selected_session, ..
+            } => *selected_session,
+            Pane::Settings | Pane::PromptCreator | Pane::Issues(_) => None,
+        }
     }
 
     /// Open a specific session in the current pane (without requiring selection).
@@ -960,6 +993,7 @@ mod focus_fetch_tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

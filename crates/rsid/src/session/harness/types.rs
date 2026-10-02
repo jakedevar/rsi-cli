@@ -6,6 +6,7 @@
 // Provider layer is built ahead of resolve_provider() wiring (Phase 6+).
 #![allow(dead_code)]
 
+pub use crate::store_support::compatible_table::{AuthStyle, ProviderQuirks};
 use serde::{Deserialize, Serialize};
 
 const TOOL_BLOCKS_PREFIX: &str = "\u{001e}rsi-tool-blocks-v1:";
@@ -15,8 +16,24 @@ const TOOL_BLOCKS_PREFIX: &str = "\u{001e}rsi-tool-blocks-v1:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolContentBlock {
-    Text { text: String },
-    Image { media_type: String, data: String },
+    Text {
+        text: String,
+    },
+    ServerToolResult {
+        result: serde_json::Value,
+    },
+    Image {
+        media_type: String,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
 }
 
 fn encode_tool_blocks(blocks: &[ToolContentBlock]) -> String {
@@ -37,10 +54,83 @@ fn visible_tool_text(blocks: &[ToolContentBlock]) -> String {
         .iter()
         .map(|block| match block {
             ToolContentBlock::Text { text } => text.clone(),
-            ToolContentBlock::Image { media_type, .. } => format!("[image: {media_type}]"),
+            ToolContentBlock::ServerToolResult { result } => {
+                let name = result
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("server_tool_result");
+                format!("[hosted tool result: {name}]")
+            }
+            ToolContentBlock::Image {
+                media_type,
+                detail,
+                reference,
+                width,
+                height,
+                ..
+            } => {
+                let mut line = format!("[image: {media_type}");
+                if let Some(reference) = reference {
+                    line.push_str(&format!(", reference: {reference}"));
+                }
+                if let Some(detail) = detail {
+                    line.push_str(&format!(", detail: {detail}"));
+                }
+                if let (Some(width), Some(height)) = (width, height) {
+                    line.push_str(&format!(", size: {width}x{height}"));
+                }
+                line.push(']');
+                line
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn image_event_metadata(blocks: &[ToolContentBlock]) -> Option<serde_json::Value> {
+    let images: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolContentBlock::Image {
+                media_type,
+                data,
+                detail,
+                reference,
+                width,
+                height,
+            } => Some(serde_json::json!({
+                "media_type": media_type,
+                "detail": detail,
+                "reference": reference,
+                "width": width,
+                "height": height,
+                "base64_chars": data.len(),
+            })),
+            ToolContentBlock::Text { .. } => None,
+            ToolContentBlock::ServerToolResult { .. } => None,
+        })
+        .collect();
+    let server_tool_results: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolContentBlock::ServerToolResult { result } => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    if images.is_empty() && server_tool_results.is_empty() {
+        return None;
+    }
+    let mut metadata = serde_json::Map::new();
+    if !images.is_empty() {
+        metadata.insert("images".into(), serde_json::Value::Array(images));
+    }
+    if !server_tool_results.is_empty() {
+        metadata.insert(
+            "server_tool_results".into(),
+            serde_json::Value::Array(server_tool_results),
+        );
+    }
+    Some(serde_json::Value::Object(metadata))
 }
 
 /// Role in a conversation message.
@@ -146,6 +236,10 @@ impl ChatMessage {
         visible_tool_text(&self.tool_blocks())
     }
 
+    pub fn event_metadata(&self) -> Option<serde_json::Value> {
+        image_event_metadata(&self.tool_blocks())
+    }
+
     /// Approximate token count using the 4-chars-per-token heuristic.
     pub fn estimated_tokens(&self) -> u64 {
         self.content.len().div_ceil(4) as u64
@@ -159,6 +253,12 @@ pub struct ToolCall {
     pub name: String,
     /// Raw JSON string of the arguments.
     pub arguments: String,
+    /// True for provider-hosted tools; the agent loop never executes these.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hosted: bool,
+    /// Exact provider result payload for a hosted tool, keyed by the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_result: Option<serde_json::Value>,
 }
 
 /// Specification for a tool the LLM can call.
@@ -168,6 +268,38 @@ pub struct HarnessToolSpec {
     pub description: String,
     /// JSON Schema string for the tool's input parameters.
     pub parameters_json: String,
+    /// Optional freeform representation for providers with custom tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeform: Option<HarnessFreeformToolFormat>,
+    /// Discriminates local function tools from provider-hosted wire tools.
+    #[serde(default = "default_tool_spec_kind")]
+    pub kind: HarnessToolSpecKind,
+}
+
+fn default_tool_spec_kind() -> HarnessToolSpecKind {
+    HarnessToolSpecKind::Function
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarnessToolSpecKind {
+    Function,
+    AnthropicWebSearch { wire_type: String },
+    AnthropicWebFetch { wire_type: String },
+    ResponsesWebSearch,
+}
+
+impl HarnessToolSpecKind {
+    pub fn is_hosted(&self) -> bool {
+        !matches!(self, Self::Function)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessFreeformToolFormat {
+    pub r#type: String,
+    pub syntax: String,
+    pub definition: String,
 }
 
 /// Request to send to an LLM provider.
@@ -200,6 +332,10 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// Provider-reported USD cost of this response (OpenRouter `usage.cost`).
+    /// `None` when the provider reported none; never an estimate.
+    pub cost_usd: Option<f64>,
 }
 
 /// A single chunk from a streaming response.
@@ -248,52 +384,15 @@ impl ToolResult {
     pub fn has_typed_blocks(&self) -> bool {
         decode_tool_blocks(&self.output).is_some()
     }
+
+    pub fn event_metadata(&self) -> Option<serde_json::Value> {
+        let blocks = decode_tool_blocks(&self.output)?;
+        image_event_metadata(&blocks)
+    }
 }
 
 fn is_false(value: &bool) -> bool {
     !value
-}
-
-/// Per-provider quirk flags for compatible providers.
-#[derive(Debug, Clone)]
-pub struct ProviderQuirks {
-    /// Merge system messages into the first user message as "[System: ...]".
-    pub merge_system_into_user: bool,
-    /// Disable streaming (broken tool_calls in streaming mode).
-    pub disable_streaming: bool,
-    /// Cap max_tokens for non-streaming requests.
-    pub max_tokens_non_streaming: Option<u32>,
-    /// Strip `<think>...</think>` blocks from streaming deltas.
-    pub strip_think_tags: bool,
-    /// Auth style override (default: Bearer token).
-    pub auth_style: AuthStyle,
-    /// Whether this provider supports native function-calling tool_calls.
-    pub native_tools: bool,
-}
-
-impl Default for ProviderQuirks {
-    fn default() -> Self {
-        Self {
-            merge_system_into_user: false,
-            disable_streaming: false,
-            max_tokens_non_streaming: None,
-            strip_think_tags: false,
-            auth_style: AuthStyle::Bearer,
-            native_tools: false,
-        }
-    }
-}
-
-/// Authentication style for API requests.
-#[derive(Debug, Clone, Default)]
-pub enum AuthStyle {
-    /// `Authorization: Bearer <key>` (default for most providers).
-    #[default]
-    Bearer,
-    /// `x-api-key: <key>` (Anthropic standard keys).
-    ApiKeyHeader,
-    /// No authentication required (local models).
-    None,
 }
 
 #[cfg(test)]
@@ -352,6 +451,8 @@ mod tests {
             id: "tc-1".into(),
             name: "read_file".into(),
             arguments: r#"{"path":"src/main.rs"}"#.into(),
+            hosted: false,
+            hosted_result: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: ToolCall = serde_json::from_str(&json).unwrap();
@@ -387,6 +488,10 @@ mod tests {
             ToolContentBlock::Image {
                 media_type: "image/png".into(),
                 data: "aGVsbG8=".into(),
+                detail: None,
+                reference: None,
+                width: None,
+                height: None,
             },
         ];
         let result = ToolResult::from_blocks(blocks.clone(), true);

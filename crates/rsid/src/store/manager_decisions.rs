@@ -262,14 +262,14 @@ impl Store {
                         "manager_v2_approval_answer_must_be_approve_or_deny",
                     ));
                 }
-                crate::codex_app_server::approval_response(
+                crate::store_support::app_server_approval::approval_response(
                     &delivery.target["request_id"],
                     delivery.target["method"].as_str().unwrap_or_default(),
                     &delivery.target["params"],
                     if delivery.answer.trim() == "approve" {
-                        crate::provider::ApprovalDecision::Approve
+                        crate::store_support::provider_settings::ApprovalDecision::Approve
                     } else {
-                        crate::provider::ApprovalDecision::Deny
+                        crate::store_support::provider_settings::ApprovalDecision::Deny
                     },
                 )?;
                 let actual = self

@@ -51,7 +51,7 @@ pub fn parse_timestamp(s: &str) -> std::result::Result<DateTime<Utc>, String> {
 pub(crate) const SESSION_COLUMNS: &str = "id, claude_session_id, query, working_dir, status, project_id, \
     pinned_at, created_at, updated_at, cost_usd, duration_ms, num_turns, model, input_tokens, \
     output_tokens, context_window, total_input_tokens, total_output_tokens, \
-    total_cache_creation_tokens, total_cache_read_tokens, stop_reason, session_kind, \
+    total_cache_creation_tokens, total_cache_read_tokens, total_prompt_tokens, stop_reason, session_kind, \
     continued_from, provider, handoff_filepath, rotation_depth, daemon_input_tokens, \
     daemon_output_tokens, title, description, pipeline_artifact, workflow_id, git_branch, active_task, group_id, \
     pending_archive, testing_needed_at, rotation_disabled_at, effort, retry_attempt, max_retries, \
@@ -76,7 +76,7 @@ pub(crate) const SESSION_COLUMNS: &str = "id, claude_session_id, query, working_
 /// because a `String` read landed on a nullable INTEGER column. Deriving the
 /// offset makes the next column addition a compile-time-stable change instead
 /// of a latent one.
-pub(crate) const SESSION_COLUMN_COUNT: usize = 81;
+pub(crate) const SESSION_COLUMN_COUNT: usize = 82;
 
 pub(crate) fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -100,67 +100,68 @@ pub(crate) fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRo
         total_output_tokens: row.get(17)?,
         total_cache_creation_tokens: row.get(18)?,
         total_cache_read_tokens: row.get(19)?,
-        stop_reason: row.get(20)?,
-        session_kind_str: row.get(21)?,
-        continued_from_str: row.get(22)?,
-        provider_str: row.get(23)?,
-        handoff_filepath: row.get(24)?,
-        rotation_depth: row.get(25)?,
-        daemon_input_tokens: row.get(26)?,
-        daemon_output_tokens: row.get(27)?,
-        title: row.get(28)?,
-        description: row.get(29)?,
-        pipeline_artifact: row.get(30)?,
-        workflow_id_str: row.get(31)?,
-        git_branch: row.get(32)?,
-        active_task: row.get(33)?,
-        group_id_str: row.get(34)?,
-        pending_archive: row.get(35)?,
-        testing_needed_at_str: row.get(36)?,
-        rotation_disabled_at_str: row.get(37)?,
-        effort: row.get(38)?,
-        retry_attempt: row.get(39)?,
-        max_retries: row.get(40)?,
-        issue_identifier: row.get(41)?,
-        issue_url: row.get(42)?,
-        issue_tracker_id: row.get(43)?,
-        scheduled_job_id_str: row.get(44)?,
-        rating: row.get(45)?,
-        harness_version_hash: row.get(46)?,
-        test_passed: row.get(47)?,
-        clippy_passed: row.get(48)?,
-        turn_count: row.get(49)?,
-        retry_count: row.get(50)?,
-        sandbox_kind_str: row.get(51)?,
-        sandbox_root_str: row.get(52)?,
-        sandbox_branch: row.get(53)?,
-        sandbox_cleanup_state_str: row.get(54)?,
-        parent_id_str: row.get(55)?,
-        approval_wait_ms: row.get(56)?,
-        lead_session_id_str: row.get(57)?,
-        is_eval: row.get(58)?,
-        capability_class_str: row.get(59)?,
-        topology_node_id: row.get(60)?,
-        topology_iteration: row.get(61)?,
-        pending_question_json: row.get(62)?,
-        work_time_ms: row.get(63)?,
-        provider_cli_version: row.get(64)?,
-        provider_capabilities_json: row.get(65)?,
-        thinking_tokens: row.get(66)?,
-        service_tier: row.get(67)?,
-        cache_creation_1h_tokens: row.get(68)?,
-        cache_creation_5m_tokens: row.get(69)?,
-        permission_denial_count: row.get(70)?,
-        subagent_stats_json: row.get(71)?,
-        queued_turn_count: row.get(72)?,
-        terminal_reason: row.get(73)?,
-        context_window_source: row.get(74)?,
-        context_window_source_version: row.get(75)?,
-        context_window_source_digest: row.get(76)?,
-        context_window_observed_at: row.get(77)?,
-        context_window_configured_tokens: row.get(78)?,
-        agent_role: row.get(79)?,
-        epic_spawn_ordinal: row.get(80)?,
+        total_prompt_tokens: row.get(20)?,
+        stop_reason: row.get(21)?,
+        session_kind_str: row.get(22)?,
+        continued_from_str: row.get(23)?,
+        provider_str: row.get(24)?,
+        handoff_filepath: row.get(25)?,
+        rotation_depth: row.get(26)?,
+        daemon_input_tokens: row.get(27)?,
+        daemon_output_tokens: row.get(28)?,
+        title: row.get(29)?,
+        description: row.get(30)?,
+        pipeline_artifact: row.get(31)?,
+        workflow_id_str: row.get(32)?,
+        git_branch: row.get(33)?,
+        active_task: row.get(34)?,
+        group_id_str: row.get(35)?,
+        pending_archive: row.get(36)?,
+        testing_needed_at_str: row.get(37)?,
+        rotation_disabled_at_str: row.get(38)?,
+        effort: row.get(39)?,
+        retry_attempt: row.get(40)?,
+        max_retries: row.get(41)?,
+        issue_identifier: row.get(42)?,
+        issue_url: row.get(43)?,
+        issue_tracker_id: row.get(44)?,
+        scheduled_job_id_str: row.get(45)?,
+        rating: row.get(46)?,
+        harness_version_hash: row.get(47)?,
+        test_passed: row.get(48)?,
+        clippy_passed: row.get(49)?,
+        turn_count: row.get(50)?,
+        retry_count: row.get(51)?,
+        sandbox_kind_str: row.get(52)?,
+        sandbox_root_str: row.get(53)?,
+        sandbox_branch: row.get(54)?,
+        sandbox_cleanup_state_str: row.get(55)?,
+        parent_id_str: row.get(56)?,
+        approval_wait_ms: row.get(57)?,
+        lead_session_id_str: row.get(58)?,
+        is_eval: row.get(59)?,
+        capability_class_str: row.get(60)?,
+        topology_node_id: row.get(61)?,
+        topology_iteration: row.get(62)?,
+        pending_question_json: row.get(63)?,
+        work_time_ms: row.get(64)?,
+        provider_cli_version: row.get(65)?,
+        provider_capabilities_json: row.get(66)?,
+        thinking_tokens: row.get(67)?,
+        service_tier: row.get(68)?,
+        cache_creation_1h_tokens: row.get(69)?,
+        cache_creation_5m_tokens: row.get(70)?,
+        permission_denial_count: row.get(71)?,
+        subagent_stats_json: row.get(72)?,
+        queued_turn_count: row.get(73)?,
+        terminal_reason: row.get(74)?,
+        context_window_source: row.get(75)?,
+        context_window_source_version: row.get(76)?,
+        context_window_source_digest: row.get(77)?,
+        context_window_observed_at: row.get(78)?,
+        context_window_configured_tokens: row.get(79)?,
+        agent_role: row.get(80)?,
+        epic_spawn_ordinal: row.get(81)?,
     })
 }
 
@@ -187,6 +188,7 @@ pub(crate) struct SessionRow {
     pub total_output_tokens: Option<i64>,
     pub total_cache_creation_tokens: Option<i64>,
     pub total_cache_read_tokens: Option<i64>,
+    pub total_prompt_tokens: Option<i64>,
     pub stop_reason: Option<String>,
     pub session_kind_str: Option<String>,
     pub continued_from_str: Option<String>,
@@ -520,6 +522,7 @@ impl SessionRow {
             total_output_tokens: self.total_output_tokens.map(|v| v as u64),
             total_cache_creation_tokens: self.total_cache_creation_tokens.map(|v| v as u64),
             total_cache_read_tokens: self.total_cache_read_tokens.map(|v| v as u64),
+            total_prompt_tokens: self.total_prompt_tokens.map(|v| v as u64),
             stop_reason: self.stop_reason,
             continued_from,
             context_usage_confidence: ContextUsageConfidence::Missing,
@@ -772,6 +775,48 @@ pub(crate) fn str_to_session_kind(s: &str) -> Result<SessionKind> {
     }
 }
 
+/// Provider identity the manager resource gates charge an admission to.
+///
+/// Background helper paths record the label `Remote` for an OpenAI-compatible
+/// endpoint that is not loopback (memory LLM and embedding targets). That is
+/// not a session provider, so parsing it alone would skip the manager pause,
+/// spend-cap and usage-limit gates for a paid helper (#1080). A remote
+/// OpenAI-compatible endpoint is a direct API call, so it is gated as
+/// `Harness`, the direct-API provider.
+pub(crate) fn admission_gate_provider(label: &str) -> Option<SessionProvider> {
+    if label == "Remote" {
+        return Some(SessionProvider::Harness);
+    }
+    str_to_session_provider(label).ok()
+}
+
+/// Provider labels a `model_invocations.provider` column may hold: the exact
+/// `SessionProvider` variant (= serde) strings plus the two helper labels
+/// background paths record for OpenAI-compatible endpoints.
+pub(crate) const CANONICAL_INVOCATION_PROVIDER_LABELS: [&str; 11] = [
+    "Claude",
+    "Codex",
+    "Pioneer",
+    "OpenRouter",
+    "Bedrock",
+    "Local",
+    "Antigravity",
+    "CodexAppServer",
+    "Harness",
+    "Remote",
+    "OpenAICompatible",
+];
+
+/// The exact stored spelling of a provider label that differs from a known
+/// label only by case (`codex` -> `Codex`); `None` when it is already exact or
+/// is not a known label (those pass through untouched).
+pub(crate) fn canonical_invocation_provider(label: &str) -> Option<&'static str> {
+    CANONICAL_INVOCATION_PROVIDER_LABELS
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(label) && *known != label)
+}
+
 pub(crate) fn str_to_session_provider(s: &str) -> Result<SessionProvider> {
     match s {
         "Claude" => Ok(SessionProvider::Claude),
@@ -821,6 +866,7 @@ pub(crate) fn event_type_to_str(e: EventType) -> &'static str {
         EventType::System => "System",
         EventType::Thinking => "Thinking",
         EventType::Compressed => "Compressed",
+        EventType::Plan => "Plan",
         _ => "System",
     }
 }
@@ -833,6 +879,7 @@ pub(crate) fn str_to_event_type(s: &str) -> Result<EventType> {
         "system" => Ok(EventType::System),
         "thinking" => Ok(EventType::Thinking),
         "compressed" => Ok(EventType::Compressed),
+        "plan" => Ok(EventType::Plan),
         _ => Err(DaemonError::Store(format!("Unknown event type: {}", s))),
     }
 }

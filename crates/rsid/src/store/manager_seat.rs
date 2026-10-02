@@ -17,7 +17,7 @@ use rsi_common::harness_manager::{
     HarnessManagerConfigV1, ManagerSeatConditionV1, ManagerSeatStateV1,
 };
 use rsi_common::harness_manager_v2::{HarnessManagerPolicyConfigV2, ManagerOperatingModeV2};
-use rsi_common::types::{Session, SessionStatus};
+use rsi_common::types::{Session, SessionProvider, SessionStatus};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 use uuid::Uuid;
@@ -34,6 +34,9 @@ pub(crate) const SEAT_MESSAGE_PREFIX: &str = "[manager-seat]";
 pub(crate) const SEAT_EXHAUSTED_REASON: &str = "manager_seat_recovery_budget_exhausted";
 pub(crate) const SEAT_DISABLED_REASON: &str = "manager_seat_recovery_disabled";
 pub(crate) const SEAT_UNCONFIRMED_REASON: &str = "manager_seat_recovery_unconfirmed";
+/// #754: the tip's provider account is on an authoritative usage-limit hold;
+/// recovery is withheld (and no attempt is charged) until the hold's deadline.
+pub(crate) const SEAT_USAGE_LIMIT_HOLD_REASON: &str = "manager_seat_usage_limit_hold";
 pub(crate) const SEAT_BUSY_OUTCOME: &str = "manager_seat_tip_busy";
 /// The tip's provider cannot be continued in place (e.g. `CodexAppServer`,
 /// or no captured provider session): K13's shared resumability predicate.
@@ -57,6 +60,9 @@ pub(crate) struct ManagerSeatObservationV1 {
     pub attempts: u16,
     pub max_attempts: u16,
     pub retry_delay_seconds: u32,
+    /// #754: authoritative provider usage-limit hold deadline for the tip's
+    /// account (the existing #572 tracker), if one is in force.
+    pub usage_hold_until: Option<DateTime<Utc>>,
     /// Start of the current down episode.
     pub down_since: DateTime<Utc>,
     /// Latest instant output must follow to prove the seat live again.
@@ -79,6 +85,8 @@ pub(crate) enum ManagerSeatVerdictV1 {
         attempt: u16,
         not_before: DateTime<Utc>,
         due: bool,
+        /// `not_before` was raised to a provider usage-limit deadline.
+        held: bool,
     },
     Exhausted,
 }
@@ -125,11 +133,14 @@ pub(crate) fn classify_manager_seat(o: &ManagerSeatObservationV1) -> ManagerSeat
         };
     }
     let attempt = o.attempts.saturating_add(1);
-    let not_before = o.down_since + seat_backoff(o.retry_delay_seconds, attempt);
+    let backoff_at = o.down_since + seat_backoff(o.retry_delay_seconds, attempt);
+    let held_until = o.usage_hold_until.filter(|until| *until > o.now);
+    let not_before = held_until.map_or(backoff_at, |until| until.max(backoff_at));
     ManagerSeatVerdictV1::Recovering {
         attempt,
         not_before,
         due: o.now >= not_before,
+        held: held_until.is_some(),
     }
 }
 
@@ -356,6 +367,17 @@ impl Store {
             }
             _ => now,
         };
+        // #754: reuse the #572 provider usage-limit tracker (no second
+        // breaker); only a Codex-family tip shares that account.
+        let usage_hold_until = if tip_failed
+            && matches!(
+                session.provider,
+                SessionProvider::Codex | SessionProvider::CodexAppServer
+            ) {
+            self.codex_usage_limit_hold(now)?.map(|hold| hold.until)
+        } else {
+            None
+        };
         let observation = ManagerSeatObservationV1 {
             tip_failed,
             in_flight: attempts.in_flight,
@@ -366,6 +388,7 @@ impl Store {
             attempts: attempts.counted,
             max_attempts,
             retry_delay_seconds: retry_delay,
+            usage_hold_until,
             down_since,
             evidence_after: previous.map(|p| p.since).max(attempts.last_attempt_at),
             last_output,
@@ -407,6 +430,7 @@ impl Store {
                 attempt,
                 not_before,
                 due,
+                held,
             } => {
                 let mut state = ManagerSeatStateV1 {
                     not_before: Some(not_before),
@@ -416,9 +440,19 @@ impl Store {
                     )),
                     ..base(
                         ManagerSeatConditionV1::Recovering,
-                        "manager_seat_recovery_scheduled",
+                        if held {
+                            SEAT_USAGE_LIMIT_HOLD_REASON
+                        } else {
+                            "manager_seat_recovery_scheduled"
+                        },
                     )
                 };
+                if held {
+                    state.next_action = Some(format!(
+                        "The provider account is out of usage; no recovery attempt is charged. rsid resumes the manager in place (attempt {attempt}/{max_attempts}) at or after {} (provider reset). Pending mail and notices are retained.",
+                        stamp(not_before)
+                    ));
+                }
                 if due
                     && let Some(grant) = grant.as_ref()
                     && let Some(claim) = self.manager_seat_claim(

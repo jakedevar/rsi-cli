@@ -43,6 +43,7 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
         provider_override,
         custom_provider_index,
         sandbox_enabled,
+        manager,
         typed,
         corrected_preview,
         overlay_id,
@@ -56,6 +57,7 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
             provider_override,
             model_dropdown,
             sandbox_enabled,
+            launch,
             ..
         } => (
             surface.content_for_send(),
@@ -65,6 +67,7 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
             *provider_override,
             model_dropdown.custom_provider_index,
             *sandbox_enabled,
+            launch.manager,
             surface.textarea.lines().to_vec(),
             surface.corrected_preview.clone(),
             *overlay_id,
@@ -132,6 +135,7 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
                 provider_override,
                 custom_provider_index,
                 sandbox,
+                manager,
                 InteractiveLaunchOrigin::LegacyPrompt {
                     overlay_id,
                     purpose,
@@ -261,6 +265,7 @@ async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPla
         provider_override,
         custom_provider_index,
         sandbox_enabled,
+        manager,
         draft_lines,
         corrected_preview,
         overlay_id,
@@ -274,6 +279,7 @@ async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPla
             provider_override,
             model_dropdown,
             sandbox_enabled,
+            launch,
             ..
         }) => (
             surface.content_for_send(),
@@ -283,6 +289,7 @@ async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPla
             *provider_override,
             model_dropdown.custom_provider_index,
             *sandbox_enabled,
+            launch.manager,
             surface.textarea.lines().to_vec(),
             surface.corrected_preview.clone(),
             *overlay_id,
@@ -329,6 +336,7 @@ async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPla
                 provider_override,
                 custom_provider_index,
                 sandbox,
+                manager,
                 InteractiveLaunchOrigin::StackedPrompt {
                     overlay_id,
                     purpose,
@@ -487,6 +495,7 @@ pub fn open_continue_popup(app: &mut App, session_id: uuid::Uuid) {
         provider_override: None,
         model_dropdown,
         sandbox_enabled: false,
+        launch: crate::types::PromptLaunchSettings::default(),
     };
 }
 
@@ -527,6 +536,7 @@ pub fn open_taskrabbit_popup(app: &mut App) {
             app.selected_model.as_deref(),
         ),
         sandbox_enabled: false,
+        launch: crate::types::PromptLaunchSettings::default(),
     };
 
     app.input_overlays.push(overlay);
@@ -575,6 +585,7 @@ pub fn open_typed_prompt(
             app.selected_model.as_deref(),
         ),
         sandbox_enabled: false,
+        launch: crate::types::PromptLaunchSettings::default(),
     };
 
     app.input_overlays.push(overlay);
@@ -621,6 +632,7 @@ pub fn open_blank_popup(app: &mut App) {
         // New blank sessions should be isolated unless the user explicitly
         // turns sandboxing off for this modal.
         sandbox_enabled: true,
+        launch: crate::types::PromptLaunchSettings::default(),
     };
 
     app.input_overlays.push(overlay);

@@ -26,14 +26,18 @@ The enforceable lever is **session attribution**, not cryptography:
   default-denied except for the `Agent*` verbs and an enumerated set of read
 verbs, and those verbs apply their own self/lead scoping.
 
-## Codex typed tools
+## Codex and Claude typed tools
 
-Standard Codex sessions receive the session-ephemeral `rsi-agent-mcp` stdio
-server. Its tool list is derived from the same closed native-agent catalog used
-by Harness and CodexAppServer; it intentionally excludes RPC-only
-`AgentContinueChild`. The daemon supplies its installed sibling path with
-per-process `-c mcp_servers.rsi-agent.*` overrides. RSI never runs `codex mcp
-add` or edits a user Codex configuration file.
+Standard Codex sessions and tokened Claude CLI sessions receive the
+session-ephemeral `rsi-agent-mcp` stdio server. Its tool list is derived from
+the same closed native-agent catalog used by Harness and CodexAppServer; it
+intentionally excludes RPC-only `AgentContinueChild`. The daemon supplies its
+installed sibling path (never a PATH lookup): Codex gets per-process
+`-c mcp_servers.rsi-agent.*` overrides, Claude gets one `--mcp-config` JSON
+argument (tools appear as `mcp__rsi-agent__rsi_control_*`). The token is
+inherited through the environment and never appears in argv. RSI never runs
+`codex mcp add`/`claude mcp add` or edits a user configuration file. A Claude
+launch without the installed gateway falls back to `rsi-rpc`.
 
 Tool input is locally validated before a socket call, then daemon authority and
 runtime gates still decide the request. `rsi-rpc` remains the compatible,
@@ -69,7 +73,29 @@ supplies in `params` can change *which* session it is acting as.
 
 ## The agent verb catalog
 
-These thirty-six `Agent*` RPC verbs form the closed agent control surface. The
+**Entry point: `AgentGetAuthorityCatalog`.** Every tokened session may call it
+(native `rsi_control_authority_catalog`). With `{}` it renders the caller's
+current `agent_authority_projection` (`crates/rsid/src/session/agent_authority.rs`)
+as an operator's manual: `roles`, role `guidance` (the binary-shipped
+`crates/rsid/src/session/guidance/*_v1.md` sections for exactly those roles),
+the permitted `controls` in catalog order, and, for managers, the permitted
+update variants, control/prepared actions and delegated operator methods.
+`{"verb": "<method | native tool | mcp__rsi-agent__ tool>"}` returns only the
+compact envelope (`schema_version`, `session_id`, `authority_revision`, `roles`,
+`pending`) and one `control` detail: `permitted`, the parameter `parameters`
+schema, one minimal valid `example` request (the schema fixture the tests
+validate with `validate_params`; `crates/rsi-common/src/agent_control_examples.rs`)
+and the stable `refusals` (`code`, `next_action`) the control returns. No
+`controls` list, `guidance` or manager lists repeat in a `verb` response. A
+pending initial role
+publication returns the worker baseline with `pending: true`. It is read-only
+and grants nothing; every other verb keeps its own guard. Refusals:
+`authority_catalog_unknown_verb`, `authority_catalog_invalid_request`. The
+startup prompt is a short role-independent frame that points here, so role
+rules and control lists are served from current authority instead of a static
+prompt.
+
+These `Agent*` RPC verbs (53, pinned by the schema catalog test) form the closed agent control surface. The
 separate, narrow read allowlist is unchanged; generic lifecycle and
 configuration methods remain denied to token-attributed callers.
 
@@ -94,15 +120,19 @@ unattributed (operator/TUI) reads are unchanged.
 
 | Verb | What it does | Who may call |
 |------|--------------|--------------|
+| `AgentGetAuthorityCatalog` | Return the caller's roles, role guidance and currently permitted controls; `verb` adds one control's schema. Read-only. | Any tokened session (self only) |
 | `AgentSpawnChild` | Reserve and enqueue a child session. An optional `provider` selects any supported child backend; omit it to preserve same-provider inheritance. Optional `agent_role` is normalized display metadata. For a different provider, supply a target-valid `model`/`effort` when needed; no model uses that provider's native default. A required stable `idempotency_key` makes exact retries return the same durable `spawn_request_id`, `child_session_id`, role, and server-reserved Epic ordinal; changed content conflicts. Durable launch automatically arms the owner's terminal watch. The parent is bound server-side. | A leaf-kind caller that is the **lead** of its owning Epic — the first Epic ascending its parent chain must have `lead_session_id` = the caller. A non-lead leaf, or a leaf with no Epic ancestor, is rejected `NotLead` ("emitter is not the Epic lead"); remedy: promote the caller via `SetEpicLead` (or spawn from the lead), then retry |
 | `AgentReserveSuccessor` | Reserve one stable, same-Epic successor for authority-preserving master turnover after the caller settles. Exact replay returns the same receipt; changed content under the same key conflicts. | A live spawnable leaf that is the current lead of exactly one owning Epic |
 | `AgentGetProgress` | Read one UUID-sorted durable snapshot for the caller's authorized child cohort: status counts, rotation-tip cursor/freshness, automatic-watch state, and message counts. The cursor's `lineage_tip_id`, `event_sequence`, and `custody_generation` are exactly the `AgentContinueChild` staleness-fence tuple, read from the same snapshot, so they may be used directly; `custody_generation` is omitted when the tip has no sandbox custody. Omit `session_ids` for the full cohort or pass at most 256 raw entries (duplicates still count) in an authorized subdivision. | Direct children and children of an Epic the caller leads; the current manager may also name sessions in its live scope |
 | `AgentSendMessage` | Enqueue durable owner-to-child mail. Sender identity is server-bound and a stable `idempotency_key` gives exact replay/conflict behavior. Delivery does not interrupt the child's active turn. | A direct reserved/started child, a child of an Epic the caller leads, or a manager-scoped leaf under `SessionControl` |
 | `AgentGetStatus` | Read status of the caller or a session it is authorized to observe. | Self, a direct child, a child of an Epic the caller leads, or a session in the current manager's live scope |
+| `AgentReadSessionEvents` | Read a bounded, byte-capped page of a session's conversation events (`session_id`; `after_sequence` for a forward page, else the newest `limit`; optional `event_types`, `max_bytes`) plus `final_message` (last assistant message of the rotation tip), `status`, `terminal_reason` and paging cursors. Read-only; content, tool input and metadata are clipped per event. An unknown target is refused identically to an out-of-scope one. | Same as `AgentGetStatus`: self, a direct child, a child of an Epic the caller leads, or a session in the current manager's live scope |
 | `AgentHalt` | Interrupt a session under the caller's authority. Omit the target to halt self. | Self, a direct child, a child of an Epic the caller leads, or a manager-scoped leaf under `SessionControl` |
 | `AgentContinueChild` | Continue an exact child session with a new prompt. Wraps the daemon's existing continuation engine; it does not reimplement one. Requires the observed continuation cursor `(expected_tip_session_id, expected_event_sequence, expected_custody_generation)` as an optimistic staleness fence — `Session` carries no `row_version`, so these three are what move when a child advances. The check is not atomic with dispatch and is not an idempotency key: concurrent or rapid sequential requests can both be delivered before either query event advances the cursor, and a query-event persistence failure can leave the cursor reusable. Treat an accepted continuation as delivered; never replay it from the receipt's pre-continuation `observed` cursor. A later stale refusal carries the observed witness to inspect before making a new decision. Bounds failures use `agent_continue_invalid_request`; self-targeting, a resolved `CodexAppServer` tip (it allocates a fresh id on continue), and a stale cursor are also typed refusals. A logical AppServer root that already rotated to an ordinary Codex tip is checked and continued at that effective tip. Continuing a running child interrupts its active turn through the existing continuation engine. A dirty sandbox is NOT a refusal. The caller's terminal watch is re-armed against the logical child, best-effort. RPC-only — no native `rsi_control` tool in slice 1. | A direct child, a child of an Epic the caller leads, or a manager-scoped leaf under `SessionControl`; never self |
 | `AgentArchiveChild` | Archive a terminal child of the Epic the caller currently leads, using the observed continuation cursor as a staleness fence. | Current lead of the child's Epic |
-| `AgentScheduleWake` | Schedule a future wake/callback. The resume target `wake_session_id` is bound to the caller server-side and is not in the JSON schema — it cannot be supplied or spoofed. `mode:"on_terminal"` + `watch_session_id` (A8) arms a daemon-owned [session watch](session-watches.md) on a watched subject scoped like `AgentGetStatus` targets; the wake target remains caller-bound. | Self (resume); watched subject: direct child, child of a led Epic, or a session in the current manager's live scope |
+| `AgentScheduleWake` | Schedule a future wake/callback. The resume target `wake_session_id` is bound to the caller server-side and is not in the JSON schema — it cannot be supplied or spoofed. `mode:"on_terminal"` + `watch_session_id` (A8) arms a daemon-owned [session watch](session-watches.md) on a watched subject scoped like `AgentGetStatus` targets; the wake target remains caller-bound. `mode:"when"` (#1006) arms a daemon-evaluated predicate wake: `when` is `{"jobs_terminal":[job ids you own]}` or `{"sha_on_rolling":"<40-hex>"}`, with optional `timeout_seconds`; the scheduler evaluates it (no model turn), it survives a restart, and it resumes the caller once with a bounded per-job report (`timed_out: true` on timeout). | Self (resume); watched subject: direct child, child of a led Epic, or a session in the current manager's live scope |
+| `AgentCancelWake` | Disable your own scheduled wake(s) by exactly one of `job_id` or `name`; the owner is the authenticated caller, so another session's job is reported as not found. Rows are disabled (`enabled=0`), never deleted; the daemon-owned program guard and manager watches are refused. RPC-only. Already-disabled own jobs are an idempotent no-op. | Self |
+| `AgentListWakes` | List your own scheduled wakes (id, name, mode, watch target, next_fire_at, enabled, created_at), bounded by `limit` (default 64, max 256); `include_disabled` adds cancelled or fired history. Caller-bound: no other session's jobs are visible. RPC-only. | Self |
 | `AgentCreateIssue` | Create a durable local issue follow-up. Strict content and idempotency fields only; creator identity is server-bound. | Self |
 | `AgentListIssues` / `AgentGetIssue` | Read bounded project Issue pages or one Issue by ID. | Current lead of one legal owning Epic, or the current appointed manager with the V2 `IssueCoordinate` grant |
 | `AgentUpdateIssue` | CAS-update active Issue content. | Current owning-Epic lead, or `IssueCoordinate` manager (recorded as actor `manager`) |
@@ -128,6 +158,12 @@ unattributed (operator/TUI) reads are unchanged.
 | `AgentTopologyGetExecution` | Read one execution's status, `row_version`, node attempts and a page of audit events (no payloads). | Same, for executions under an Epic in scope |
 | `AgentTopologyInterrupt` | Request interruption under a `row_version` CAS; idempotent on the key. Allowed while the manager is paused. | Same |
 | `AgentTopologyResolveAttempt` | Resolve preserved work: `inspect`, `accept`, `retry`, or `discard` with `confirm_preserved_commit` (full 40-hex, required iff discard; mismatch ⇒ `preserved_commit_mismatch`). | Same; `discard` is manager-only (`discard_requires_manager` for a lead) |
+| `AgentEnqueueLandingSource` | Enqueue one accepted source commit (`source_commit`, optional `test_filters` as `PACKAGE=FILTER`, `idempotency_key`) on the daemon-owned rolling merge queue (#1007). The daemon gates it with the lander, publishes one fast-forward and wakes the enqueuer exactly once with the landed SHA, refusal code or failing tests; refused `queue_disabled` while the operator has the queue off. No native tool. | Current appointed manager or current Epic lead; else `queue_not_authorized` |
+| `AgentSubmitJob` / `AgentGetJob` / `AgentListJobs` | Run a typed `test`, `build`, `landing`, `cloud_gate` or `cloud_sweep` (manager/lead only; typed GREEN/RED/INCOMPLETE verdict) operation as a daemon-owned durable job (#1002) in your own sandbox (`worktree` lets an appointed manager name another worktree of its repository); `{kind, params, name?, idempotency_key?, wake?}`. The job runs in a `systemd-run --user` unit outside every session scope and one resume wake carries the typed result; `wake:"none"` suppresses that per-job wake (the result stays readable) so a batch can share one `AgentScheduleWake` `mode:"when"` `jobs_terminal` wake. `Get`/`List` read your own jobs. | `test`/`build`: any live leaf session; `landing`/`cloud_gate`: current appointed manager or current Epic lead, else `job_kind_not_authorized` |
+| `AgentSendSatelliteMessage` | Queue one message (`peer_id`, `remote_session_id`, `message`, `idempotency_key`, optional `expires_at`) for an idle session on a paired satellite host. Current appointed manager only; the operator must enable per-satellite dispatch and declare the target in scope. Delivery waits until the remote session is idle and never interrupts; `queued` is acceptance, not delivery. Every refusal is the same `target_not_authorized`. |
+| `AgentGetDaemonInfo` | Read-only `{}`: the hub daemon's `build_sha`, `binary_sha256`, `started_at` (RFC3339 nanos), `uptime_secs`, `schema_version`, `disk_free` (data dir and sandbox base), `load` (1/5/15) and `supervisor_mode` (#1045), plus for the appointed manager `satellites`: each enabled paired peer read over the link now (`build_sha`, `binary_sha256`, `started_at`, `schema_version`, `supervisor_mode`, `last_deploy`, or `reachable:false`; #1017). Secret-free. Current appointed manager or Epic lead only (`daemon_info_not_authorized` otherwise). | Same |
+| `AgentRequestDeploy` | `{sha, binaries_dir, idempotency_key, max_wait_secs?, peer_id?}` (#1045; with `peer_id` the request runs the same deploy flow on that paired satellite over the hub link, #1017: `binaries_dir` is a path on the satellite, the hub stores nothing, and the outcome is read from `AgentGetDaemonInfo` `satellites`): stage and verify built binaries (`sha` must equal the staged `rsid --build-info`; the directory must be under the sandbox base, `~/.rsi/staging` or `~/.cargo/shared-target`), wait for a quiet point, swap them in and restart under `rsid-supervisor.sh`; the outcome wakes the caller once (`succeeded`, `failed`, `timed_out`). `build:true` is refused `deploy_build_not_supported`. Current appointed manager holding the operator-granted `Deploy` capability, Execute mode, not paused. | Same |
+| `AgentQueryFailureSignatures` | Read-only `{test_id?, digest?}` (at least one; `digest` is the 64-hex `rsi-known-failure block` digest): the known-failure signature records (#1016) that open Issues of your project carry, as `{records:[{record, issue_id, issue_status}], malformed_issues}`. `record.issue` is the owner Issue and `record.class` is `regression`, `flake`, `env` or `seed`. Records of a Closed, Cancelled or archived owner Issue are never returned, so expiry is live, and no Issue body is returned. An unknown query is `records: []`. Native `rsi_control_query_failure_signatures`. | Every live leaf session, scoped to its own project |
 
 Existing child-control scoping: **an Epic-lead may act on its Epic's children; any leaf may
 act on itself and its own direct children.** The current appointed manager may

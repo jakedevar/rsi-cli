@@ -786,6 +786,105 @@ mod p2_07_gate_permit_spine {
     const MAX_SOURCE_DEPTH: usize = 128;
     const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 
+    // V114's catalog convergence helper predates this source guard. Its only
+    // production entry point is the version-gated (`version <= 114`) call in
+    // `migrate_v115`. Re-audited for #392: the helper source is byte-identical
+    // to the pinned digest, and the only change is ownership: the #1012
+    // per-file migration split moved that call from store/mod.rs into
+    // store/migrations/v115.rs (still the single, version-gated caller).
+    // Pin the complete helper source before accepting its three catalog-only
+    // dynamic sinks; any edit must be audited as new source.
+    const FROZEN_V114_CATALOG_CALLER: &str = "store/migrations/v115.rs";
+    const FROZEN_V114_CATALOG_SHA256: &str =
+        "3fea5e3dbcdd8f2555ca422a17b57eb75871f7c9870e96068e67923c2214bb5a";
+    const FROZEN_V114_CATALOG_REJECTIONS: [&str; 3] = [
+        "store::catalog_convergence::rebuild_table: opaque dynamic SQL at an execution sink cannot prove either protected write absent (unsupported expression, unsupported expression)",
+        "store::catalog_convergence::rebuild_table: dynamic INSERT target could be agent_message_provider_effect_permits",
+        "store::catalog_convergence::rebuild_table: opaque dynamic SQL at an execution sink cannot prove either protected write absent (unsupported expression)",
+    ];
+
+    fn frozen_v114_catalog_rejections_match(
+        path: &std::path::Path,
+        rejections: &[String],
+    ) -> Result<bool, String> {
+        use sha2::Digest;
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("read {} failed ({error})", path.display()))?;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        Ok(digest == FROZEN_V114_CATALOG_SHA256
+            && rejections
+                .iter()
+                .map(String::as_str)
+                .eq(FROZEN_V114_CATALOG_REJECTIONS))
+    }
+
+    // #392: the released rolling-queue migration builds its catalog DDL with a
+    // local `oid` closure over a const, a shape the evaluator cannot inline, so
+    // `apply_migration` reports one opaque sink. Released migration code is
+    // immutable, so the scanner models its provenance from the released
+    // inventory instead of editing it: the sink is accepted only while the
+    // protected region's digest equals the inventory's pinned digest (so the
+    // audited bytes are exactly the released ones) and the region text never
+    // names a protected table. Every closure argument in the region is a
+    // string literal and the statement is DDL, so no protected write is
+    // reachable. Any other dynamic sink in the file is still reported.
+    const RELEASED_QUEUE_REGION: &str = "rolling-queue-migration";
+    const RELEASED_QUEUE_SOURCE: &str = "store/rolling_queue.rs";
+    const RELEASED_QUEUE_REJECTION: &str = "store::rolling_queue::apply_migration: opaque dynamic SQL at an execution sink cannot prove either protected write absent (unresolved or ambiguous helper call, unresolved or ambiguous helper call, unresolved or ambiguous helper call)";
+    const RELEASED_INVENTORY: &str = "tools/released-migrations.json";
+
+    /// The `RSI-RELEASED-MIGRATION-BEGIN/END: name` region, markers included,
+    /// exactly as `tools/check-released-migrations.py` hashes it.
+    fn released_migration_region(source: &str, name: &str) -> Option<String> {
+        let begin = format!("// RSI-RELEASED-MIGRATION-BEGIN: {name}");
+        let end = format!("// RSI-RELEASED-MIGRATION-END: {name}");
+        let mut region = String::new();
+        let mut inside = false;
+        for line in source.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if !inside && trimmed == begin {
+                inside = true;
+            }
+            if inside {
+                region.push_str(line);
+                if trimmed == end {
+                    return Some(region);
+                }
+            }
+        }
+        None
+    }
+
+    fn released_queue_rejections_are_proven(
+        source_root: &std::path::Path,
+        path: &std::path::Path,
+        rejections: &[String],
+    ) -> Result<bool, String> {
+        use sha2::Digest;
+        if rejections != [RELEASED_QUEUE_REJECTION.to_string()] {
+            return Ok(false);
+        }
+        let inventory_path = source_root.join("../../..").join(RELEASED_INVENTORY);
+        let Ok(inventory) = std::fs::read(&inventory_path) else {
+            return Ok(false);
+        };
+        let inventory: serde_json::Value = serde_json::from_slice(&inventory)
+            .map_err(|error| format!("parse {} failed ({error})", inventory_path.display()))?;
+        let section = &inventory["protected_sections"][RELEASED_QUEUE_REGION];
+        let source = std::fs::read_to_string(path)
+            .map_err(|error| format!("read {} failed ({error})", path.display()))?;
+        let Some(region) = released_migration_region(&source, RELEASED_QUEUE_REGION) else {
+            return Ok(false);
+        };
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(region.as_bytes()));
+        let lowered = region.to_ascii_lowercase();
+        Ok(section["path"] == "crates/rsid/src/store/rolling_queue.rs"
+            && section["sha256"] == digest.as_str()
+            && ["agent_message_provider", "effect_permits", "turn_gates"]
+                .iter()
+                .all(|protected| !lowered.contains(protected)))
+    }
+
     fn semantic_ident(ident: &syn::Ident) -> String {
         use syn::ext::IdentExt;
         ident.unraw().to_string()
@@ -907,6 +1006,16 @@ mod p2_07_gate_permit_spine {
             syn::Pat::Ident(pattern) => Some(semantic_ident(&pattern.ident)),
             syn::Pat::Reference(pattern) => simple_pattern_ident(&pattern.pat),
             syn::Pat::Type(pattern) => simple_pattern_ident(&pattern.pat),
+            _ => None,
+        }
+    }
+
+    fn immutable_pattern_ident(pattern: &syn::Pat) -> Option<String> {
+        match pattern {
+            syn::Pat::Ident(pattern) if pattern.mutability.is_none() => {
+                Some(semantic_ident(&pattern.ident))
+            }
+            syn::Pat::Type(pattern) => immutable_pattern_ident(&pattern.pat),
             _ => None,
         }
     }
@@ -1317,7 +1426,7 @@ mod p2_07_gate_permit_spine {
         finder.0
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct StaticCall {
         arguments: Vec<SqlValue>,
     }
@@ -1492,6 +1601,7 @@ mod p2_07_gate_permit_spine {
     struct SourceCatalog {
         constants: SymbolMap<StaticExpression>,
         helpers: SymbolMap<StaticHelper>,
+        impl_scopes: std::collections::HashSet<String>,
         macros: SymbolMap<StaticMacro>,
         calls: std::collections::HashMap<String, Vec<StaticCall>>,
         imports: std::collections::HashMap<String, Vec<Vec<String>>>,
@@ -2143,6 +2253,7 @@ mod p2_07_gate_permit_spine {
                     syn::Item::Impl(item) => {
                         let mut method_scope = scope.to_vec();
                         method_scope.push(impl_owner(item));
+                        self.impl_scopes.insert(method_scope.join("::"));
                         for member in &item.items {
                             match member {
                                 syn::ImplItem::Fn(method)
@@ -2251,13 +2362,26 @@ mod p2_07_gate_permit_spine {
                 catalog: &'a SourceCatalog,
                 scope: Vec<String>,
                 bindings: std::collections::HashMap<String, SqlValue>,
+                static_arrays: std::collections::HashMap<String, (Vec<syn::Expr>, Vec<String>)>,
                 calls: Vec<(String, StaticCall)>,
             }
 
             impl<'ast> syn::visit::Visit<'ast> for CallVisitor<'_> {
+                fn visit_block(&mut self, block: &'ast syn::Block) {
+                    let prior_bindings = self.bindings.clone();
+                    let prior_arrays = self.static_arrays.clone();
+                    for statement in &block.stmts {
+                        self.visit_stmt(statement);
+                    }
+                    self.bindings = prior_bindings;
+                    self.static_arrays = prior_arrays;
+                }
+
                 fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                     if let syn::Expr::Path(path) = &*call.func {
-                        if let Some(helper) = self.catalog.resolve_helper(&path.path, &self.scope) {
+                        if let Some(helper) = self.catalog.resolve_helper(&path.path, &self.scope)
+                            && call.args.len() == helper.parameters.len()
+                        {
                             self.calls.push((
                                 helper.key.clone(),
                                 StaticCall {
@@ -2282,7 +2406,9 @@ mod p2_07_gate_permit_spine {
 
                 fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
                     let method = [semantic_ident(&call.method)];
-                    if let Some(helper) = self.catalog.resolve_helper_parts(&method, &self.scope) {
+                    if let Some(helper) = self.catalog.resolve_helper_parts(&method, &self.scope)
+                        && call.args.len() == helper.parameters.len()
+                    {
                         self.calls.push((
                             helper.key.clone(),
                             StaticCall {
@@ -2320,6 +2446,22 @@ mod p2_07_gate_permit_spine {
                 }
 
                 fn visit_local(&mut self, local: &'ast syn::Local) {
+                    if let Some(name) = simple_pattern_ident(&local.pat) {
+                        // Only immutable, direct arrays are reusable at later
+                        // callsites. A shadowing declaration replaces the old
+                        // provenance even when its initializer is opaque.
+                        self.static_arrays.remove(&name);
+                        if let Some(initializer) = &local.init
+                            && immutable_pattern_ident(&local.pat).is_some()
+                            && let syn::Expr::Array(array) =
+                                transparent_expression(&initializer.expr)
+                        {
+                            self.static_arrays.insert(
+                                name,
+                                (array.elems.iter().cloned().collect(), self.scope.clone()),
+                            );
+                        }
+                    }
                     if let Some(initializer) = &local.init {
                         self.visit_expr(&initializer.expr);
                         if let Some(values) = self.catalog.helper_tuple_values(
@@ -2356,20 +2498,76 @@ mod p2_07_gate_permit_spine {
                     }
                 }
 
+                fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+                    if let syn::Stmt::Item(syn::Item::Const(item)) = statement {
+                        let name = semantic_ident(&item.ident);
+                        self.static_arrays.remove(&name);
+                        if let syn::Expr::Array(array) = transparent_expression(&item.expr) {
+                            self.static_arrays.insert(
+                                name.clone(),
+                                (array.elems.iter().cloned().collect(), self.scope.clone()),
+                            );
+                        }
+                        let value =
+                            self.catalog
+                                .evaluate(&item.expr, &self.bindings, &self.scope, 0);
+                        self.bindings.insert(name, value);
+                        return;
+                    }
+                    syn::visit::visit_stmt(self, statement);
+                }
+
                 fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
                     self.visit_expr(&expression.expr);
                     let outer = self.bindings.clone();
                     let expression_scope = self.scope.clone();
-                    let elements = match &*expression.expr {
-                        syn::Expr::Array(elements) => Some(&elements.elems),
+                    let direct = match &*expression.expr {
+                        syn::Expr::Array(elements) => {
+                            Some(elements.elems.iter().cloned().collect::<Vec<_>>())
+                        }
                         syn::Expr::Reference(reference) => match &*reference.expr {
-                            syn::Expr::Array(elements) => Some(&elements.elems),
+                            syn::Expr::Array(elements) => {
+                                Some(elements.elems.iter().cloned().collect::<Vec<_>>())
+                            }
                             _ => None,
                         },
                         _ => None,
                     };
-                    if let Some(elements) = elements {
-                        for element in elements {
+                    let known = direct
+                        .map(|elements| (elements, expression_scope))
+                        .or_else(|| {
+                            let syn::Expr::Path(path) = transparent_expression(&expression.expr)
+                            else {
+                                return None;
+                            };
+                            if path.path.segments.len() == 1 {
+                                let name = semantic_ident(&path.path.segments[0].ident);
+                                if let Some(array) = self.static_arrays.get(&name) {
+                                    return Some(array.clone());
+                                }
+                                // A local binding masks a constant of the same name.
+                                if self.bindings.contains_key(&name) {
+                                    return None;
+                                }
+                            }
+                            let constant = SourceCatalog::resolve(
+                                &self.catalog.constants,
+                                &path.path,
+                                &self.scope,
+                            )
+                            .ok()?;
+                            let syn::Expr::Array(array) =
+                                transparent_expression(&constant.expression)
+                            else {
+                                return None;
+                            };
+                            Some((
+                                array.elems.iter().cloned().collect(),
+                                constant.scope.clone(),
+                            ))
+                        });
+                    if let Some((elements, expression_scope)) = known {
+                        for element in &elements {
                             self.bindings = outer.clone();
                             if !bind_static_pattern(
                                 self.catalog,
@@ -2389,8 +2587,40 @@ mod p2_07_gate_permit_spine {
                         self.bindings = outer;
                         return;
                     }
-                    syn::visit::visit_expr_for_loop(self, expression);
+                    bind_pattern(
+                        &expression.pat,
+                        &SqlValue::dynamic("unsupported call-site loop pattern"),
+                        &mut self.bindings,
+                    );
+                    self.visit_block(&expression.body);
                     self.bindings = outer;
+                }
+
+                fn visit_expr_assign(&mut self, expression: &'ast syn::ExprAssign) {
+                    if let syn::Expr::Path(path) = transparent_expression(&expression.left)
+                        && path.path.segments.len() == 1
+                    {
+                        let name = semantic_ident(&path.path.segments[0].ident);
+                        self.static_arrays.remove(&name);
+                        self.bindings
+                            .insert(name, SqlValue::dynamic("assigned call-site binding"));
+                    }
+                    syn::visit::visit_expr_assign(self, expression);
+                }
+
+                fn visit_expr_reference(&mut self, expression: &'ast syn::ExprReference) {
+                    if expression.mutability.is_some()
+                        && let syn::Expr::Path(path) = transparent_expression(&expression.expr)
+                        && path.path.segments.len() == 1
+                    {
+                        let name = semantic_ident(&path.path.segments[0].ident);
+                        self.static_arrays.remove(&name);
+                        self.bindings.insert(
+                            name,
+                            SqlValue::dynamic("mutably borrowed call-site binding"),
+                        );
+                    }
+                    syn::visit::visit_expr_reference(self, expression);
                 }
             }
 
@@ -2410,6 +2640,7 @@ mod p2_07_gate_permit_spine {
                                 self,
                                 scope,
                             ),
+                            static_arrays: std::collections::HashMap::new(),
                             calls: Vec::new(),
                         };
                         visitor.visit_block(&function.block);
@@ -2436,6 +2667,7 @@ mod p2_07_gate_permit_spine {
                                         self,
                                         &method_scope,
                                     ),
+                                    static_arrays: std::collections::HashMap::new(),
                                     calls: Vec::new(),
                                 };
                                 visitor.visit_block(&method.block);
@@ -2465,6 +2697,7 @@ mod p2_07_gate_permit_spine {
                                         self,
                                         &method_scope,
                                     ),
+                                    static_arrays: std::collections::HashMap::new(),
                                     calls: Vec::new(),
                                 };
                                 visitor.visit_block(body);
@@ -2681,6 +2914,17 @@ mod p2_07_gate_permit_spine {
             parts: &[String],
             scope: &[String],
         ) -> Option<&'a StaticHelper> {
+            if parts.first().is_some_and(|part| part == "Self") {
+                if !self.impl_scopes.contains(&scope.join("::")) {
+                    return None;
+                }
+                let mut key = scope.to_vec();
+                key.extend(parts.iter().skip(1).cloned());
+                return match self.helpers.get(&key.join("::")) {
+                    Some([helper]) => Some(helper),
+                    _ => None,
+                };
+            }
             let terminal = parts.last()?;
             if let Ok(imported) = self.imported_parts(parts, scope)
                 && imported != parts
@@ -3212,6 +3456,15 @@ mod p2_07_gate_permit_spine {
                 }
                 return Err(format!("unresolved SQL-looking callable {terminal}"));
             }
+            // `Self::prepare` inside a declared local struct's impl is its
+            // inherent method, not rusqlite's associated function. Require
+            // the nominal type in this source catalog before ruling it out.
+            if parts.len() == 2
+                && parts[0] == "Self"
+                && self.structs.get(&scope.join("::")).is_some()
+            {
+                return Ok(None);
+            }
             let owner = syn::parse_str::<syn::Path>(&parts[..parts.len() - 1].join("::"))
                 .map_err(|error| format!("invalid callable owner path: {error}"))?;
             match self.rust_type_from_path(&owner, scope) {
@@ -3341,8 +3594,12 @@ mod p2_07_gate_permit_spine {
                     let values: Vec<_> = value
                         .arms
                         .iter()
+                        .filter(|arm| !exits_before_sql_sink(&arm.body))
                         .map(|arm| self.evaluate(&arm.body, bindings, scope, depth + 1))
                         .collect();
+                    if values.is_empty() {
+                        return SqlValue::dynamic("match has no continuing branch");
+                    }
                     if values
                         .iter()
                         .all(|value| value.fully_known_list().is_some())
@@ -3492,16 +3749,29 @@ mod p2_07_gate_permit_spine {
                         return SqlValue::dynamic("non-closure static map");
                     };
                     if values.is_none()
-                        && matches!(closure.inputs.first(), Some(syn::Pat::Wild(_)))
                         && closure.inputs.len() == 1
+                        && matches!(
+                            closure.inputs.first(),
+                            Some(syn::Pat::Wild(_) | syn::Pat::Ident(_))
+                        )
                     {
-                        return self
-                            .evaluate(&closure.body, bindings, scope, depth + 1)
-                            .fully_known()
-                            .map_or_else(
-                                || SqlValue::dynamic("dynamic constant map output"),
-                                |value| SqlValue(vec![SqlPiece::ProvenFragment(vec![value])]),
-                            );
+                        let mut map_bindings = bindings.clone();
+                        bind_pattern(
+                            &closure.inputs[0],
+                            &SqlValue::dynamic("runtime map element"),
+                            &mut map_bindings,
+                        );
+                        let output = self.evaluate(&closure.body, &map_bindings, scope, depth + 1);
+                        if output.0.iter().all(|piece| {
+                            matches!(piece, SqlPiece::Known(_) | SqlPiece::ProvenFragment(_))
+                        }) {
+                            return output
+                                .composed_variants()
+                                .map_or_else(SqlValue::dynamic, |values| {
+                                    SqlValue(vec![SqlPiece::ProvenFragment(values)])
+                                });
+                        }
+                        return SqlValue::dynamic("dynamic runtime map output");
                     }
                     let Some(values) = values else {
                         return SqlValue::dynamic("dynamic map receiver");
@@ -3575,6 +3845,18 @@ mod p2_07_gate_permit_spine {
                         {
                             return SqlValue::known_list(Vec::new());
                         }
+                        if name == "new"
+                            && value.args.is_empty()
+                            && path
+                                .path
+                                .segments
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .is_some_and(|segment| semantic_ident(&segment.ident) == "String")
+                        {
+                            return SqlValue::known("");
+                        }
                         if matches!(name.as_str(), "from" | "from_str") && value.args.len() == 1 {
                             return self.evaluate(&value.args[0], bindings, scope, depth + 1);
                         }
@@ -3611,6 +3893,28 @@ mod p2_07_gate_permit_spine {
                         result.append(self.evaluate(&argument, bindings, scope, depth + 1));
                     }
                     result
+                }
+                syn::Expr::Macro(value) if path_is_semantic_ident(&value.mac.path, "vec") => {
+                    use syn::parse::Parser;
+                    let parser =
+                        syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+                    let Ok(elements) = parser.parse2(value.mac.tokens.clone()) else {
+                        return SqlValue::dynamic("unsupported vec! initializer");
+                    };
+                    let mut values = Vec::new();
+                    for element in elements {
+                        let Some(mut alternatives) = self
+                            .evaluate(&element, bindings, scope, depth + 1)
+                            .static_alternatives()
+                        else {
+                            return SqlValue::dynamic("dynamic vec! element");
+                        };
+                        values.append(&mut alternatives);
+                        if values.len() > MAX_SQL_ALTERNATIVES {
+                            return SqlValue::dynamic("vec! initializer exceeds static limit");
+                        }
+                    }
+                    SqlValue::known_list(values)
                 }
                 syn::Expr::Macro(value) if path_is_semantic_ident(&value.mac.path, "format") => {
                     self.evaluate_format(&value.mac, bindings, scope, depth + 1)
@@ -3843,6 +4147,96 @@ mod p2_07_gate_permit_spine {
             )
         }
 
+        /// The true side of `if let Some((...)) = helper(...)` may use any
+        /// `Some` arm of a finite match, but cannot use its `None` arms.
+        fn helper_option_tuple_values(
+            &self,
+            expression: &syn::Expr,
+            bindings: &std::collections::HashMap<String, SqlValue>,
+            scope: &[String],
+        ) -> Option<Vec<SqlValue>> {
+            let mut source = transparent_expression(expression);
+            if let syn::Expr::Try(value) = source {
+                source = transparent_expression(&value.expr);
+                let syn::Expr::MethodCall(value) = source else {
+                    return None;
+                };
+                if !matches!(
+                    semantic_ident(&value.method).as_str(),
+                    "ok_or" | "ok_or_else"
+                ) || value.args.len() != 1
+                {
+                    return None;
+                }
+                source = transparent_expression(&value.receiver);
+            }
+            let syn::Expr::Call(call) = source else {
+                return None;
+            };
+            let syn::Expr::Path(path) = &*call.func else {
+                return None;
+            };
+            let helper = self.resolve_helper(&path.path, scope)?;
+            if helper.parameters.len() != call.args.len() {
+                return None;
+            }
+            let syn::Stmt::Expr(syn::Expr::Match(matched), _) = helper.body.stmts.last()? else {
+                return None;
+            };
+            let mut tuples = Vec::new();
+            for arm in &matched.arms {
+                if arm.guard.is_some() {
+                    return None;
+                }
+                match transparent_expression(&arm.body) {
+                    syn::Expr::Call(value)
+                        if matches!(&*value.func, syn::Expr::Path(path)
+                            if path_is_semantic_ident(&path.path, "Some"))
+                            && value.args.len() == 1 =>
+                    {
+                        let syn::Expr::Tuple(tuple) =
+                            transparent_expression(value.args.first().unwrap())
+                        else {
+                            return None;
+                        };
+                        tuples.push(tuple);
+                    }
+                    syn::Expr::Path(path) if path_is_semantic_ident(&path.path, "None") => {}
+                    _ => return None,
+                }
+            }
+            let width = tuples.first()?.elems.len();
+            if tuples.iter().any(|tuple| tuple.elems.len() != width) {
+                return None;
+            }
+            let helper_bindings: std::collections::HashMap<_, _> = helper
+                .parameters
+                .iter()
+                .zip(&call.args)
+                .map(|(name, argument)| (name.clone(), self.evaluate(argument, bindings, scope, 0)))
+                .collect();
+            Some(
+                (0..width)
+                    .map(|index| {
+                        merge_sql_branch_values(
+                            &format!("option tuple field {index}"),
+                            tuples
+                                .iter()
+                                .map(|tuple| {
+                                    self.evaluate(
+                                        &tuple.elems[index],
+                                        &helper_bindings,
+                                        &helper.scope,
+                                        0,
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
         fn evaluate_format(
             &self,
             format_macro: &syn::Macro,
@@ -4037,6 +4431,21 @@ mod p2_07_gate_permit_spine {
             _ => return None,
         };
         Some(value.to_string())
+    }
+
+    /// A branch that exits the enclosing function or loop cannot supply SQL
+    /// to a sink after the expression. Keep this syntactic: a call returning
+    /// `!` or a conditional early exit is not assumed here.
+    fn exits_before_sql_sink(expression: &syn::Expr) -> bool {
+        match expression {
+            syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_) => true,
+            syn::Expr::Block(block) => block.block.stmts.last().is_some_and(|statement| {
+                matches!(statement, syn::Stmt::Expr(value, _) if exits_before_sql_sink(value))
+            }),
+            syn::Expr::Paren(value) => exits_before_sql_sink(&value.expr),
+            syn::Expr::Group(value) => exits_before_sql_sink(&value.expr),
+            _ => false,
+        }
     }
 
     fn parameter_names(signature: &syn::Signature) -> Vec<String> {
@@ -4572,6 +4981,7 @@ mod p2_07_gate_permit_spine {
         }
 
         fn invalidate_binding(&mut self, name: &str, reason: impl Into<String>) {
+            self.static_arrays.remove(name);
             if self.bindings.contains_key(name) {
                 self.bindings
                     .insert(name.to_string(), SqlValue::dynamic(reason));
@@ -4941,6 +5351,9 @@ mod p2_07_gate_permit_spine {
         bindings: &mut std::collections::HashMap<String, SqlValue>,
     ) -> bool {
         match (pattern, expression) {
+            // A discarded tuple field still has a statically known source;
+            // it contributes no SQL binding to the loop body.
+            (syn::Pat::Wild(_), _) => true,
             (syn::Pat::Ident(pattern), expression) => {
                 let value = catalog.evaluate(expression, bindings, expression_scope, 0);
                 bindings.insert(semantic_ident(&pattern.ident), value);
@@ -4980,6 +5393,67 @@ mod p2_07_gate_permit_spine {
                 bindings,
             ),
             _ => false,
+        }
+    }
+
+    fn static_constant_iterator(
+        catalog: &SourceCatalog,
+        expression: &syn::Expr,
+        scope: &[String],
+        bindings: &std::collections::HashMap<String, SqlValue>,
+        depth: usize,
+    ) -> Option<Vec<(syn::Expr, Vec<String>)>> {
+        if depth > 16 {
+            return None;
+        }
+        match transparent_expression(expression) {
+            syn::Expr::MethodCall(call)
+                if semantic_ident(&call.method) == "iter" && call.args.is_empty() =>
+            {
+                static_constant_iterator(catalog, &call.receiver, scope, bindings, depth + 1)
+            }
+            syn::Expr::MethodCall(call)
+                if semantic_ident(&call.method) == "chain" && call.args.len() == 1 =>
+            {
+                let mut left =
+                    static_constant_iterator(catalog, &call.receiver, scope, bindings, depth + 1)?;
+                left.extend(static_constant_iterator(
+                    catalog,
+                    &call.args[0],
+                    scope,
+                    bindings,
+                    depth + 1,
+                )?);
+                Some(left)
+            }
+            syn::Expr::Reference(reference) => {
+                static_constant_iterator(catalog, &reference.expr, scope, bindings, depth + 1)
+            }
+            syn::Expr::Array(array) => Some(
+                array
+                    .elems
+                    .iter()
+                    .cloned()
+                    .map(|element| (element, scope.to_vec()))
+                    .collect(),
+            ),
+            syn::Expr::Path(path) => {
+                if path.path.segments.len() == 1
+                    && bindings.contains_key(&semantic_ident(&path.path.segments[0].ident))
+                {
+                    return None;
+                }
+                let constant =
+                    SourceCatalog::resolve(&catalog.constants, &path.path, scope).ok()?;
+                static_constant_iterator(
+                    catalog,
+                    &constant.expression,
+                    &constant.scope,
+                    bindings,
+                    depth + 1,
+                )
+            }
+            _ => None,
         }
     }
 
@@ -5115,6 +5589,20 @@ mod p2_07_gate_permit_spine {
             bind_pattern(pattern, &value, bindings);
         }
         true
+    }
+
+    fn bind_some_tuple_values(
+        pattern: &syn::Pat,
+        values: Vec<SqlValue>,
+        bindings: &mut std::collections::HashMap<String, SqlValue>,
+    ) -> bool {
+        let syn::Pat::TupleStruct(outer) = pattern else {
+            return false;
+        };
+        if !path_is_semantic_ident(&outer.path, "Some") || outer.elems.len() != 1 {
+            return false;
+        }
+        bind_tuple_values(&outer.elems[0], values, bindings)
     }
 
     fn parameter_bindings(
@@ -5363,9 +5851,11 @@ mod p2_07_gate_permit_spine {
                     outer_aliases.insert(name.clone(), *value);
                 }
             }
-            for (name, value) in &self.static_arrays {
-                if outer_arrays.contains_key(name) {
+            for name in outer_arrays.clone().keys() {
+                if let Some(value) = self.static_arrays.get(name) {
                     outer_arrays.insert(name.clone(), value.clone());
+                } else {
+                    outer_arrays.remove(name);
                 }
             }
             self.bindings = outer;
@@ -5380,6 +5870,17 @@ mod p2_07_gate_permit_spine {
                 self.maybe_invalidate_mutable_alias(&initializer.expr);
                 let initializer_expression = transparent_expression(&initializer.expr);
                 let pattern_name = simple_pattern_ident(&local.pat);
+                if let Some(name) = &pattern_name {
+                    self.static_arrays.remove(name);
+                }
+                if let Some(values) = self.catalog.helper_option_tuple_values(
+                    &initializer.expr,
+                    &self.bindings,
+                    &self.scope,
+                ) && bind_tuple_values(&local.pat, values, &mut self.bindings)
+                {
+                    return;
+                }
                 if let Some(values) =
                     self.catalog
                         .helper_tuple_values(&initializer.expr, &self.bindings, &self.scope)
@@ -5388,6 +5889,7 @@ mod p2_07_gate_permit_spine {
                     return;
                 }
                 if let Some(pattern_name) = &pattern_name
+                    && immutable_pattern_ident(&local.pat).is_some()
                     && let syn::Expr::Array(array) = initializer_expression
                 {
                     self.static_arrays
@@ -5488,13 +5990,26 @@ mod p2_07_gate_permit_spine {
             } else {
                 None
             };
+            let option_tuple = if let syn::Expr::Let(condition) = &*expression.cond {
+                self.catalog.helper_option_tuple_values(
+                    &condition.expr,
+                    &self.bindings,
+                    &self.scope,
+                )
+            } else {
+                None
+            };
             let let_is_none = let_value
                 .as_ref()
                 .and_then(|(_, value)| value.fully_known_list())
                 .is_some_and(|values| values.is_empty());
             if !let_is_none {
                 if let Some((pattern, value)) = &let_value {
-                    bind_pattern(pattern, value, &mut self.bindings);
+                    if !option_tuple.as_ref().is_some_and(|values| {
+                        bind_some_tuple_values(pattern, values.clone(), &mut self.bindings)
+                    }) {
+                        bind_pattern(pattern, value, &mut self.bindings);
+                    }
                 }
                 self.visit_block(&expression.then_branch);
             }
@@ -5621,6 +6136,33 @@ mod p2_07_gate_permit_spine {
         fn visit_expr_for_loop(&mut self, loop_expression: &'ast syn::ExprForLoop) {
             self.visit_expr(&loop_expression.expr);
             let outer = self.bindings.clone();
+            if let Some(elements) = static_constant_iterator(
+                self.catalog,
+                &loop_expression.expr,
+                &self.scope,
+                &self.bindings,
+                0,
+            ) {
+                for (element, element_scope) in elements {
+                    self.bindings = outer.clone();
+                    if !bind_static_pattern(
+                        self.catalog,
+                        &loop_expression.pat,
+                        &element,
+                        &element_scope,
+                        &mut self.bindings,
+                    ) {
+                        bind_pattern(
+                            &loop_expression.pat,
+                            &SqlValue::dynamic("unsupported constant iterator pattern"),
+                            &mut self.bindings,
+                        );
+                    }
+                    self.visit_block(&loop_expression.body);
+                }
+                self.bindings = outer;
+                return;
+            }
             if let syn::Expr::Array(elements) = &*loop_expression.expr {
                 let expression_scope = self.scope.clone();
                 for element in &elements.elems {
@@ -5674,6 +6216,10 @@ mod p2_07_gate_permit_spine {
                 }
                 if let Ok(iterable) =
                     SourceCatalog::resolve(&self.catalog.constants, &path.path, &self.scope)
+                    && !(path.path.segments.len() == 1
+                        && self
+                            .bindings
+                            .contains_key(&semantic_ident(&path.path.segments[0].ident)))
                 {
                     let expression = match &iterable.expression {
                         syn::Expr::Reference(reference) => &*reference.expr,
@@ -5853,9 +6399,17 @@ mod p2_07_gate_permit_spine {
 
         fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
             self.visit_expr(&assignment.right);
+            if let syn::Expr::Index(index) = &*assignment.left
+                && let syn::Expr::Path(path) = transparent_expression(&index.expr)
+                && path.path.segments.len() == 1
+            {
+                let name = semantic_ident(&path.path.segments[0].ident);
+                self.invalidate_binding(&name, format!("array {name} assigned by index"));
+            }
             if let syn::Expr::Path(path) = &*assignment.left {
                 if path.path.segments.len() == 1 {
                     let name = semantic_ident(&path.path.segments[0].ident);
+                    self.static_arrays.remove(&name);
                     let value =
                         self.catalog
                             .evaluate(&assignment.right, &self.bindings, &self.scope, 0);
@@ -6752,13 +7306,126 @@ mod p2_07_gate_permit_spine {
         Ok(resolved)
     }
 
-    fn include_target(
+    /// Recognize `concat!(env!("OUT_DIR"), "/store_migrations.rs")`, the
+    /// build-generated include that `build.rs` fills with one
+    /// `include!(.../src/store/migrations/vNNN.rs)` per migration file.
+    fn is_generated_store_migrations_include(invocation: &syn::Macro) -> bool {
+        use syn::parse::Parser;
+        let Ok(expression) = syn::parse2::<syn::Expr>(invocation.tokens.clone()) else {
+            return false;
+        };
+        let syn::Expr::Macro(concat) = expression else {
+            return false;
+        };
+        if !path_is_semantic_ident(&concat.mac.path, "concat") {
+            return false;
+        }
+        let Ok(arguments) =
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(concat.mac.tokens.clone())
+        else {
+            return false;
+        };
+        let arguments: Vec<_> = arguments.into_iter().collect();
+        let [syn::Expr::Macro(env), syn::Expr::Lit(file)] = arguments.as_slice() else {
+            return false;
+        };
+        let syn::Lit::Str(file) = &file.lit else {
+            return false;
+        };
+        path_is_semantic_ident(&env.mac.path, "env")
+            && syn::parse2::<syn::LitStr>(env.mac.tokens.clone())
+                .is_ok_and(|name| name.value() == "OUT_DIR")
+            && file.value() == "/store_migrations.rs"
+    }
+
+    /// Expand the generated migrations include exactly as `build.rs` does:
+    /// every `store/migrations/vNNN.rs` (three-digit, contiguous from v000),
+    /// in ascending order, so every migration body stays audited.
+    fn generated_store_migration_targets(
+        declaring_source: &std::path::Path,
+        source_root: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        let canonical_root = source_root
+            .canonicalize()
+            .map_err(|error| format!("canonicalize {} failed: {error}", source_root.display()))?;
+        let store_directory = canonical_root.join("store");
+        let declaring_directory = declaring_source
+            .parent()
+            .ok_or_else(|| "generated migrations include has no declaring directory".to_string())?
+            .canonicalize()
+            .map_err(|error| format!("canonicalize declaring directory failed: {error}"))?;
+        if declaring_directory != store_directory {
+            return Err(format!(
+                "generated migrations include outside store/: {}",
+                declaring_source.display()
+            ));
+        }
+        let directory = store_directory.join("migrations");
+        let mut versions = Vec::new();
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|error| format!("read {} failed: {error}", directory.display()))?
+        {
+            let name = entry
+                .map_err(|error| format!("read migrations entry failed: {error}"))?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            let Some(number) = name
+                .strip_prefix('v')
+                .and_then(|rest| rest.strip_suffix(".rs"))
+            else {
+                continue;
+            };
+            let Ok(version) = number.parse::<u32>() else {
+                continue;
+            };
+            if format!("{version:03}") != number {
+                return Err(format!(
+                    "migration file {name} must be named v{version:03}.rs"
+                ));
+            }
+            versions.push(version);
+        }
+        versions.sort_unstable();
+        if versions.first() != Some(&0) {
+            return Err("store migrations must start at v000.rs".to_string());
+        }
+        let mut targets = Vec::new();
+        for version in versions {
+            let target = directory.join(format!("v{version:03}.rs"));
+            let metadata = std::fs::symlink_metadata(&target)
+                .map_err(|error| format!("metadata {} failed: {error}", target.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "include! target is a source symlink: {}",
+                    target.display()
+                ));
+            }
+            let canonical_target = target
+                .canonicalize()
+                .map_err(|error| format!("canonicalize {} failed: {error}", target.display()))?;
+            if !canonical_target.starts_with(&canonical_root) {
+                return Err(format!(
+                    "include! target escapes source root: {}",
+                    canonical_target.display()
+                ));
+            }
+            targets.push(canonical_target);
+        }
+        Ok(targets)
+    }
+
+    fn include_targets(
         invocation: &syn::Macro,
         declaring_source: &std::path::Path,
         source_root: &std::path::Path,
-    ) -> Result<Option<std::path::PathBuf>, String> {
+    ) -> Result<Vec<std::path::PathBuf>, String> {
         if !path_is_semantic_ident(&invocation.path, "include") {
-            return Ok(None);
+            return Ok(Vec::new());
+        }
+        if is_generated_store_migrations_include(invocation) {
+            return generated_store_migration_targets(declaring_source, source_root);
         }
         let literal = syn::parse2::<syn::LitStr>(invocation.tokens.clone())
             .map_err(|error| format!("include! requires one string literal: {error}"))?;
@@ -6786,7 +7453,24 @@ mod p2_07_gate_permit_spine {
                 canonical_target.display()
             ));
         }
-        Ok(Some(canonical_target))
+        Ok(vec![canonical_target])
+    }
+
+    /// Expression-position includes splice one expression, so exactly one
+    /// target is legal there.
+    fn include_target(
+        invocation: &syn::Macro,
+        declaring_source: &std::path::Path,
+        source_root: &std::path::Path,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        let mut targets = include_targets(invocation, declaring_source, source_root)?;
+        match targets.len() {
+            0 => Ok(None),
+            1 => Ok(targets.pop()),
+            count => Err(format!(
+                "include! expands to {count} source files in expression position"
+            )),
+        }
     }
 
     fn validate_cfg_items(items: &[syn::Item]) -> Result<(), String> {
@@ -6954,9 +7638,7 @@ mod p2_07_gate_permit_spine {
                     }
                 }
                 syn::Item::Macro(invocation) => {
-                    if let Some(target) =
-                        include_target(&invocation.mac, declaring_source, source_root)?
-                    {
+                    for target in include_targets(&invocation.mac, declaring_source, source_root)? {
                         traverse_source(
                             root,
                             &target,
@@ -7174,11 +7856,55 @@ mod p2_07_gate_permit_spine {
         })
     }
 
+    fn frozen_v114_catalog_has_only_versioned_caller(discovered: &DiscoveredSources) -> bool {
+        struct Calls(usize);
+
+        impl<'ast> syn::visit::Visit<'ast> for Calls {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if !attributes_are_cfg_test(&item.attrs) {
+                    syn::visit::visit_item_mod(self, item);
+                }
+            }
+
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                if semantic_ident(&call.method) == "converge_v114_deployed_additive_catalog" {
+                    self.0 += 1;
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+
+        use syn::visit::Visit;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0;
+        for source in &discovered.units {
+            if !seen.insert(&source.path) {
+                continue;
+            }
+            let mut calls = Calls(0);
+            for item in source
+                .file
+                .items
+                .iter()
+                .filter(|item| !item_is_cfg_test(item))
+            {
+                calls.visit_item(item);
+            }
+            if calls.0 > 0 && source.relative != FROZEN_V114_CATALOG_CALLER {
+                return false;
+            }
+            total += calls.0;
+        }
+        total == 1
+    }
+
     fn scan_crate_production_writers_inner(
         source_root: &std::path::Path,
         limits: ExecutableIncludeLimits,
     ) -> Result<CrateWriterScan, String> {
         let discovered = discover_crate_sources(source_root)?;
+        let frozen_catalog_caller_is_versioned =
+            frozen_v114_catalog_has_only_versioned_caller(&discovered);
         let mut report = WriterScan::default();
         let mut include_context = ExecutableIncludeContext::new(limits);
         let mut by_root: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
@@ -7186,6 +7912,7 @@ mod p2_07_gate_permit_spine {
             by_root.entry(source.root.clone()).or_default().push((
                 source.scope.clone(),
                 source.path.clone(),
+                source.relative.clone(),
                 source
                     .file
                     .items
@@ -7198,10 +7925,12 @@ mod p2_07_gate_permit_spine {
         for units in by_root.values() {
             let catalog_units: Vec<_> = units
                 .iter()
-                .map(|(scope, _, items)| (scope.clone(), items.clone()))
+                .map(|(scope, _, _, items)| (scope.clone(), items.clone()))
                 .collect();
             let catalog = SourceCatalog::collect_units(&catalog_units);
-            for (scope, path, items) in units {
+            for (scope, path, relative, items) in units {
+                let prior_rejections = report.dynamic_rejections.len();
+                let prior_writers = report.writers.len();
                 scan_items(
                     items,
                     &catalog,
@@ -7212,6 +7941,33 @@ mod p2_07_gate_permit_spine {
                     &mut report,
                     0,
                 );
+                if relative == RELEASED_QUEUE_SOURCE
+                    && report.writers.len() == prior_writers
+                    && released_queue_rejections_are_proven(
+                        source_root,
+                        path,
+                        &report.dynamic_rejections[prior_rejections..],
+                    )?
+                {
+                    report.dynamic_rejections.truncate(prior_rejections);
+                }
+                if relative == "store/catalog_convergence.rs" {
+                    let expected = frozen_v114_catalog_rejections_match(
+                        path,
+                        &report.dynamic_rejections[prior_rejections..],
+                    )?;
+                    if expected
+                        && frozen_catalog_caller_is_versioned
+                        && report.writers.len() == prior_writers
+                    {
+                        report.dynamic_rejections.truncate(prior_rejections);
+                    } else {
+                        report.dynamic_rejections.push(
+                            "V114 catalog convergence source or migration ownership changed; re-audit its dynamic SQL"
+                                .to_string(),
+                        );
+                    }
+                }
             }
         }
         Ok(CrateWriterScan {
@@ -8228,6 +8984,32 @@ mod p2_07_gate_permit_spine {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
+    fn scanner_expands_generated_migrations_include_to_every_collected_file() {
+        let source_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let declaring = source_root.join("store/mod.rs");
+        let invocation: syn::Macro = syn::parse_quote! {
+            include!(concat!(env!("OUT_DIR"), "/store_migrations.rs"))
+        };
+        let targets = include_targets(&invocation, &declaring, &source_root)
+            .expect("generated migrations include resolves");
+        let on_disk = std::fs::read_dir(source_root.join("store/migrations"))
+            .expect("read migrations")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                let number = name.strip_prefix('v')?.strip_suffix(".rs")?;
+                number.parse::<u32>().ok().map(|_| name)
+            })
+            .count();
+        assert_eq!(targets.len(), on_disk);
+        assert!(targets.len() > 1);
+        assert!(targets.windows(2).all(|pair| pair[0] < pair[1]));
+        let other: syn::Macro =
+            syn::parse_quote! { include!(concat!(env!("OUT_DIR"), "/other.rs")) };
+        assert!(include_targets(&other, &declaring, &source_root).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
     fn scanner_enforces_crate_wide_executable_include_source_ceiling() {
         let root = tempfile::tempdir().expect("create source-ceiling tree");
         let includes = root.path().join("includes");
@@ -8878,7 +9660,7 @@ mod p2_07_gate_permit_spine {
             use std::ops::Deref;
             use std::sync::Arc;
             type Db = Connection;
-            fn runtime() -> String { String::new() }
+            fn runtime() -> String { std::env::var("RSI_PROTECTED_DML_AUDIT_FIXTURE").unwrap_or_default() }
             fn open_alias() -> Db { Db::open_in_memory().unwrap() }
             struct Wrapper(Db);
             impl Deref for Wrapper { type Target = Connection; fn deref(&self) -> &Connection { &self.0 } }
@@ -9054,6 +9836,276 @@ mod p2_07_gate_permit_spine {
                 .collect(),
         );
         assert!(matches!(collection.0.as_slice(), [SqlPiece::Dynamic(_)]));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_callsite_arrays_prove_all_immutable_sql_and_reject_alias_drift() {
+        let fixed_source = r#"
+            fn sink(db: &rusqlite::Connection, sql: &str) {
+                db.execute_batch(sql).unwrap();
+            }
+            fn run(db: &rusqlite::Connection) {
+                const TARGET: &str = "agent_message_provider_effect_permits";
+                const OTHER: [&str; 1] = ["SELECT 1"];
+                let probes: [(&str, String); 2] = [
+                    ("read", "SELECT 1".to_string()),
+                    ("write", format!("INSERT INTO {TARGET} DEFAULT VALUES")),
+                ];
+                for (_, sql) in probes { sink(db, &sql); }
+                for sql in OTHER { sink(db, sql); }
+            }
+            "#;
+        let parsed = syn::parse_file(fixed_source).expect("parse fixed fixture");
+        let catalog = SourceCatalog::collect(&parsed.items);
+        let calls = catalog.calls.get("sink").expect("resolve sink calls");
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.arguments[1].static_alternatives().is_some()),
+            "{calls:?}"
+        );
+        let fixed = scan_production_writers(fixed_source).expect("scan fixed callsites");
+        assert_eq!(fixed.writers.len(), 1, "{fixed:#?}");
+        assert!(fixed.dynamic_rejections.is_empty(), "{fixed:#?}");
+
+        for source in [
+            r#"
+            fn sink(db: &rusqlite::Connection, sql: &str) { db.execute_batch(sql).unwrap(); }
+            fn run(db: &rusqlite::Connection, unknown: &[&str]) {
+                let probes = ["SELECT 1"];
+                { let probes = unknown; for sql in probes { sink(db, sql); } }
+            }
+            "#,
+            r#"
+            fn sink(db: &rusqlite::Connection, sql: &str) { db.execute_batch(sql).unwrap(); }
+            fn run(db: &rusqlite::Connection, unknown: &str) {
+                let mut probes = ["SELECT 1"];
+                probes[0] = unknown;
+                for sql in probes { sink(db, sql); }
+            }
+            "#,
+        ] {
+            let report = scan_production_writers(source).expect("scan adversarial callsite");
+            assert_eq!(report.dynamic_rejections.len(), 1, "{report:#?}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_resolves_self_helper_only_in_its_impl_scope() {
+        let report = scan_production_writers(
+            r#"
+            struct Writer;
+            impl Writer {
+                fn sql(table: &str) -> String {
+                    format!("INSERT INTO {table} DEFAULT VALUES")
+                }
+                fn run(db: &rusqlite::Connection) {
+                    db.execute_batch(&Self::sql("agent_message_provider_effect_permits"));
+                }
+            }
+            "#,
+        )
+        .expect("scan Self helper");
+        assert_eq!(report.writers.len(), 1, "{report:#?}");
+        assert!(report.dynamic_rejections.is_empty(), "{report:#?}");
+
+        let opaque = scan_production_writers(
+            r#"
+            fn run(db: &rusqlite::Connection) {
+                db.execute_batch(&Self::sql("agent_message_provider_effect_permits"));
+            }
+            "#,
+        )
+        .expect("scan unscoped Self");
+        assert_eq!(opaque.dynamic_rejections.len(), 1, "{opaque:#?}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_proves_all_some_tuple_match_arms_at_sql_sink() {
+        for (branch, expected_rejections) in [
+            ("Some((\"kind='first'\", \"one\"))", 0),
+            ("Some((kind, \"one\"))", 2),
+        ] {
+            let fixture = format!(
+                r#"
+                fn class(kind: &str) -> Option<(&str, &str)> {{
+                    match kind {{
+                        "first" => Some(("kind='first'", "one")),
+                        "second" => {branch},
+                        _ => None,
+                    }}
+                }}
+                fn run(db: &rusqlite::Connection, kind: &str) {{
+                    if let Some((predicate, _)) = class(kind) {{
+                        db.prepare(&format!("SELECT count(*) FROM ordinary WHERE {{predicate}}"));
+                    }}
+                }}
+                fn run_checked(db: &rusqlite::Connection, kind: &str) -> Result<(), ()> {{
+                    let (predicate, _) = class(kind).ok_or_else(|| ())?;
+                    db.prepare(&format!("SELECT count(*) FROM ordinary WHERE {{predicate}}"));
+                    Ok(())
+                }}
+                "#
+            );
+            let report = scan_production_writers(&fixture).expect("scan tuple match arms");
+            assert_eq!(
+                report.dynamic_rejections.len(),
+                expected_rejections,
+                "{report:#?}"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_traces_chained_constant_tuple_sql() {
+        let report = scan_production_writers(
+            r#"
+            const FIRST: &[(&str, &str)] = &[("read", "SELECT 1")];
+            const SECOND: &[(&str, &str)] = &[
+                ("write", "INSERT INTO agent_message_provider_effect_permits DEFAULT VALUES")
+            ];
+            fn run(db: &rusqlite::Connection) {
+                for (_, sql) in FIRST.iter().chain(SECOND) {
+                    db.execute_batch(sql).unwrap();
+                }
+            }
+            "#,
+        )
+        .expect("scan chained constant SQL");
+        assert_eq!(report.writers.len(), 1, "{report:#?}");
+        assert!(report.dynamic_rejections.is_empty(), "{report:#?}");
+
+        let opaque = scan_production_writers(
+            r#"
+            const FIRST: &[(&str, &str)] = &[("read", "SELECT 1")];
+            fn run(db: &rusqlite::Connection, other: &[(&str, &str)]) {
+                for (_, sql) in FIRST.iter().chain(other) {
+                    db.execute_batch(sql).unwrap();
+                }
+            }
+            "#,
+        )
+        .expect("scan dynamic chained SQL");
+        assert_eq!(opaque.dynamic_rejections.len(), 1, "{opaque:#?}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_merges_empty_string_with_fixed_cursor_clause() {
+        for (assignment, expected_rejections) in
+            [("format!(\" AND id={id}\")", 0), ("unknown.to_string()", 1)]
+        {
+            let fixture = format!(
+                r#"
+                fn run(db: &rusqlite::Connection, enabled: bool, unknown: &str) {{
+                    let mut clause = String::new();
+                    let id = "?1";
+                    if enabled {{ clause = {assignment}; }}
+                    db.prepare(&format!("SELECT * FROM ordinary WHERE 1=1{{clause}}"));
+                }}
+                "#
+            );
+            let report = scan_production_writers(&fixture).expect("scan cursor branch");
+            assert_eq!(
+                report.dynamic_rejections.len(),
+                expected_rejections,
+                "{report:#?}"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_vec_clauses_keep_every_pushed_fragment_visible() {
+        for (addition, expected_rejections, expected_writers) in [
+            ("\"i.status='Open'\".to_string()", 0, 0),
+            ("unknown.to_string()", 1, 0),
+            (
+                "\"agent_message_provider_effect_permits DEFAULT VALUES\".to_string()",
+                0,
+                1,
+            ),
+        ] {
+            let prefix = if expected_writers == 1 {
+                "INSERT INTO"
+            } else {
+                "i.project_id=?1"
+            };
+            let template = if expected_writers == 1 {
+                "{clauses}"
+            } else {
+                "SELECT * FROM ordinary WHERE {clauses}"
+            };
+            let separator = if expected_writers == 1 { " " } else { " AND " };
+            let fixture = format!(
+                r#"
+                fn run(db: &rusqlite::Connection, flag: bool, unknown: &str) {{
+                    let mut clauses = vec!["{prefix}".to_string()];
+                    if flag {{ clauses.push({addition}); }}
+                    let clauses = clauses.join("{separator}");
+                    db.execute_batch(&format!("{template}"));
+                }}
+                "#
+            );
+            let report = scan_production_writers(&fixture).expect("scan clause vector");
+            assert_eq!(
+                report.dynamic_rejections.len(),
+                expected_rejections,
+                "{report:#?}"
+            );
+            assert_eq!(report.writers.len(), expected_writers, "{report:#?}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn scanner_runtime_map_requires_proven_output_for_sql_fragments() {
+        let fixed = scan_production_writers(
+            r#"
+            fn bind(values: &mut Vec<String>, value: String) -> String {
+                values.push(value);
+                format!("?{}", values.len())
+            }
+            fn run(db: &rusqlite::Connection, ids: &[String]) {
+                let mut values = Vec::<String>::new();
+                let binds = ids.iter().map(|id| bind(&mut values, id.clone()))
+                    .collect::<Vec<_>>().join(",");
+                db.prepare(&format!("SELECT id FROM ordinary WHERE id IN ({binds})"));
+            }
+            "#,
+        )
+        .expect("scan fixed runtime map");
+        assert!(fixed.dynamic_rejections.is_empty(), "{fixed:#?}");
+
+        let opaque = scan_production_writers(
+            r#"
+            fn run(db: &rusqlite::Connection, fragments: &[String]) {
+                let sql = fragments.iter().map(|fragment| fragment.clone())
+                    .collect::<Vec<_>>().join(" ");
+                db.execute_batch(&sql);
+            }
+            "#,
+        )
+        .expect("scan opaque runtime map");
+        assert_eq!(opaque.dynamic_rejections.len(), 1, "{opaque:#?}");
+
+        let protected = scan_production_writers(
+            r#"
+            fn run(db: &rusqlite::Connection, inputs: &[String]) {
+                let sql = inputs.iter()
+                    .map(|_| "INSERT INTO agent_message_provider_effect_permits DEFAULT VALUES".to_string())
+                    .collect::<Vec<_>>().join(" ");
+                db.execute_batch(&sql);
+            }
+            "#,
+        )
+        .expect("scan protected runtime map");
+        assert!(!protected.writers.is_empty(), "{protected:#?}");
     }
 
     /// Mutation sensitivity for the terminal-segment index that replaced the
@@ -9376,6 +10428,129 @@ mod p2_07_gate_permit_spine {
             vec!["PERMIT".to_string(), "GATE".to_string()],
             "capture names must be deduplicated and exclude positional and indexed placeholders"
         );
+    }
+
+    /// #392: a read whose optional filter is one bound JSON parameter over a
+    /// static statement is provable; assembling the filter's SQL text from
+    /// runtime values, where the value could name a protected table, is not.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn static_bound_filter_read_is_provable_and_dynamic_filter_sql_is_rejected() {
+        let provable = r#"
+            struct Store;
+            use rusqlite::Connection as Tx;
+            impl Store {
+                fn page(&self, tx: &Tx, filter: Option<String>) {
+                    let mut stmt = tx.prepare(concat!(
+                        "SELECT id FROM conversation_events WHERE session_id = ?1 ",
+                        "AND (?2 IS NULL OR event_type IN (SELECT value FROM json_each(?2)))"
+                    )).unwrap();
+                    stmt.query_map(rusqlite::params!["s", filter], |_| Ok(())).unwrap();
+                }
+            }
+        "#;
+        let report = scan_production_writers(provable).expect("scan provable fixture");
+        assert!(
+            report.dynamic_rejections.is_empty() && report.writers.is_empty(),
+            "a static bound-filter read is provably free of protected writes: {report:?}"
+        );
+
+        let adversarial = r#"
+            struct Store;
+            use rusqlite::Connection as Tx;
+            impl Store {
+                fn page(&self, tx: &Tx, names: &[String], table: &str) {
+                    let clause = match names.len() {
+                        0 => String::new(),
+                        _ => format!("; INSERT INTO {table} VALUES (1); SELECT 1 WHERE 1 IN ({})", names.join(",")),
+                    };
+                    tx.execute_batch(&format!("SELECT 1 {clause}"));
+                }
+            }
+        "#;
+        let report = scan_production_writers(adversarial).expect("scan adversarial fixture");
+        assert!(
+            !report.dynamic_rejections.is_empty(),
+            "runtime-assembled SQL that could target a protected table must be reported"
+        );
+    }
+
+    /// #392: the released rolling-queue migration is accepted only by its
+    /// released-inventory provenance; any drift or a different sink set fails
+    /// closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn released_queue_migration_provenance_fails_closed_on_drift() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = repo.join("crates/rsid/src/store/rolling_queue.rs");
+        let expected = [RELEASED_QUEUE_REJECTION.to_string()];
+        let real_root = repo.join("crates/rsid/src");
+        assert!(
+            released_queue_rejections_are_proven(&real_root, &source, &expected).unwrap(),
+            "the released queue region must match its inventory digest"
+        );
+        assert!(
+            !released_queue_rejections_are_proven(&real_root, &source, &[]).unwrap(),
+            "a different sink set is not the audited one"
+        );
+        let extra = [
+            RELEASED_QUEUE_REJECTION.to_string(),
+            "store::rolling_queue::other: dynamic INSERT target could be agent_message_provider_effect_permits"
+                .to_string(),
+        ];
+        assert!(!released_queue_rejections_are_proven(&real_root, &source, &extra).unwrap());
+
+        // A tree without the inventory proves nothing.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_root = bare.path().join("a/b/src");
+        std::fs::create_dir_all(&bare_root).unwrap();
+        assert!(!released_queue_rejections_are_proven(&bare_root, &source, &expected).unwrap());
+
+        // A one-byte edit inside the released region no longer matches the
+        // inventory digest.
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().join("crates/rsid/src");
+        std::fs::create_dir_all(tree.path().join("tools")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::copy(
+            repo.join(RELEASED_INVENTORY),
+            tree.path().join(RELEASED_INVENTORY),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&source).unwrap();
+        let edited = root.join("rolling_queue.rs");
+        std::fs::write(&edited, &text).unwrap();
+        assert!(released_queue_rejections_are_proven(&root, &edited, &expected).unwrap());
+        std::fs::write(
+            &edited,
+            text.replacen(
+                "pub(crate) fn apply_migration(store: &Store, version: i32) -> Result<()> {",
+                "pub(crate) fn apply_migration(store: &Store, version: i32) -> Result<()> {\n    // INSERT INTO agent_message_provider_effect_permits",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(!released_queue_rejections_are_proven(&root, &edited, &expected).unwrap());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn frozen_v114_catalog_provenance_fails_closed_on_source_or_sink_drift() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/store/catalog_convergence.rs");
+        let expected = FROZEN_V114_CATALOG_REJECTIONS.map(str::to_string);
+        assert!(
+            frozen_v114_catalog_rejections_match(&source, &expected).unwrap(),
+            "the reviewed V114 helper must still match its exact source fence"
+        );
+
+        let changed = tempfile::tempdir().unwrap();
+        let changed_source = changed.path().join("catalog_convergence.rs");
+        let mut bytes = std::fs::read(&source).unwrap();
+        bytes.extend_from_slice(b"\n// changed migration helper\n");
+        std::fs::write(&changed_source, bytes).unwrap();
+        assert!(!frozen_v114_catalog_rejections_match(&changed_source, &expected).unwrap());
+        assert!(!frozen_v114_catalog_rejections_match(&source, &expected[..2]).unwrap());
     }
 
     /// R2 / A1's other half: the closing transition and permit insert each
@@ -11201,7 +12376,9 @@ fn admission(
 ) -> BoundaryAdmissionV1 {
     BoundaryAdmissionV1 {
         provider_kind: BoundaryProviderKindV1::Harness,
-        capability_kind: BoundaryCapabilityKindV1::TerminalOneTurn,
+        // The in-memory admission kind for Harness (#793); it persists as
+        // `terminal_one_turn`.
+        capability_kind: BoundaryCapabilityKindV1::HarnessToolBoundary,
         delivery_session_id: fence.delivery_session_id,
         session_generation: fence.delivery_session_generation,
         model_invocation_id: fence.delivery_model_invocation_id,
@@ -16213,7 +17390,7 @@ fn reconciliation_stops_on_its_wall_clock_budget_and_still_advances_every_pass()
 async fn app_server_full_evidence_queue_cannot_block_response_or_terminal_latch() {
     use crate::app_server_control::{
         AppServerControlPlane, AttemptKey, AttemptRegistrationOutcome, IngressOverflowAction,
-        ProviderLifecycleKind, ProviderLifecycleSignal, QuarantineSealReason,
+        JsonRpcId, ProviderLifecycleKind, ProviderLifecycleSignal, QuarantineSealReason,
     };
     use crate::claude::StreamEvent;
     use crate::codex_app_server::{
@@ -16244,7 +17421,7 @@ async fn app_server_full_evidence_queue_cannot_block_response_or_terminal_latch(
     let _router_is_synchronous: fn(
         Value,
         &AppServerControlPlane,
-        &mpsc::Sender<(i64, AppServerResponse)>,
+        &mpsc::Sender<(JsonRpcId, AppServerResponse)>,
         &mpsc::Sender<AppServerNotification>,
         &mpsc::Sender<StreamEvent>,
         &mut Option<String>,
@@ -16253,11 +17430,11 @@ async fn app_server_full_evidence_queue_cannot_block_response_or_terminal_latch(
     // Capacity-1 mailboxes, each primed to capacity so every subsequent
     // offer reports Full rather than Closed.
     let plane = Arc::new(AppServerControlPlane::new());
-    let (response_tx, _response_rx) = mpsc::channel::<(i64, AppServerResponse)>(1);
+    let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(1);
     let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(1);
     let (event_tx, _event_rx) = mpsc::channel::<StreamEvent>(1);
     response_tx
-        .try_send((1, AppServerResponse::Result(json!({}))))
+        .try_send((JsonRpcId::Number(1), AppServerResponse::Result(json!({}))))
         .expect("prime the response mailbox to capacity");
     notification_tx
         .try_send((
@@ -16701,5 +17878,57 @@ async fn non_epic_parent_with_lead_pointer_does_not_grant_authority() {
         message_rows(&store).await,
         1,
         "the accepted send must persist exactly one row"
+    );
+}
+
+/// #793 regression: Harness mail claims write `harness_tool_boundary` as the
+/// in-memory admission kind, but the released `agent_message_delivery_attempts`
+/// CHECK admits only `native_multi_turn` and `terminal_one_turn`. The stored
+/// column must carry the released value for a Harness Session (as it did
+/// before #793), and a claim must commit through the real store path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn harness_mail_claim_persists_the_released_capability_kind() {
+    use rsi_common::agent_coordination::BoundaryCapabilityKindV1;
+
+    let store = Store::open_in_memory().expect("open store");
+    let owner = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    live_session(&store, owner, SessionStatus::Running);
+    live_session(&store, target, SessionStatus::Running);
+    let invocation = Uuid::new_v4();
+    admitted_invocation(&store, invocation, target);
+    let message_id = accepted_message(&store, owner, target, "harness-capability-key");
+    let request = claim_request(message_id, owner, target, invocation, None);
+    assert_eq!(
+        request.provider_kind.capability_kind(),
+        BoundaryCapabilityKindV1::HarnessToolBoundary,
+        "the in-memory admission kind is the Harness tool boundary"
+    );
+
+    let outcome = store
+        .claim_agent_message_exact(&request)
+        .expect("a Harness mail claim must not violate the released CHECK");
+    assert!(matches!(outcome, ClaimAgentMessageOutcome::Claimed(_)));
+
+    let (provider, capability, boundary, correlation): (String, String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT provider_kind, capability_kind, boundary_kind, correlation_state
+               FROM agent_message_delivery_attempts WHERE message_id=?1",
+            rusqlite::params![message_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read the claimed attempt");
+    assert_eq!(
+        (provider.as_str(), capability.as_str(), boundary.as_str()),
+        ("harness", "terminal_one_turn", "model_invocation")
+    );
+    assert_eq!(correlation, "not_applicable");
+    // The stored form maps back to the in-memory admission kind, so a row
+    // written before #793 (also `terminal_one_turn`) behaves identically.
+    assert_eq!(
+        BoundaryCapabilityKindV1::from_persisted_str(request.provider_kind, &capability),
+        Some(BoundaryCapabilityKindV1::HarnessToolBoundary)
     );
 }

@@ -18,7 +18,9 @@ SHARD = re.compile(r"^(store|session|memory|other)-[0-9]{2}$")
 
 def output(*command):
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=True)
-    return (result.stdout + result.stderr).strip()
+    # Version probes only: rustup-style progress and warnings go to stderr, and on
+    # hosts where one is emitted the fingerprint must still match a clean host.
+    return result.stdout.strip()
 
 
 def fingerprint(sha, shard, jobs):

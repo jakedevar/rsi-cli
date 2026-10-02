@@ -62,6 +62,19 @@ pub const OPTIONAL_ORDER: [NavigatorOptionalColumn; 8] = [
     NavigatorOptionalColumn::Created,
 ];
 
+/// Full ordering of the optional columns: `saved` first (duplicates dropped),
+/// then any column the saved list omits in the default order. Old or partial
+/// persisted state therefore always resolves to a complete permutation.
+pub fn normalize_order(saved: &[NavigatorOptionalColumn]) -> Vec<NavigatorOptionalColumn> {
+    let mut order: Vec<NavigatorOptionalColumn> = Vec::with_capacity(OPTIONAL_ORDER.len());
+    for column in saved.iter().chain(OPTIONAL_ORDER.iter()) {
+        if !order.contains(column) {
+            order.push(*column);
+        }
+    }
+    order
+}
+
 pub const fn required_floor(ordinal_width: usize) -> usize {
     36 + ordinal_width
 }
@@ -145,6 +158,25 @@ pub fn resolve(
     preset: NavigatorPreset,
     overrides: Option<&[NavigatorOptionalColumn]>,
 ) -> NavigatorLayout {
+    resolve_ordered(
+        inner_width,
+        ordinal_width,
+        preset,
+        overrides,
+        &OPTIONAL_ORDER,
+    )
+}
+
+/// `resolve` with an explicit left-to-right order for the optional columns
+/// (the operator's saved order for the active preset). Enabled columns render
+/// in `order`; when the width runs out the trailing ones are dropped.
+pub fn resolve_ordered(
+    inner_width: usize,
+    ordinal_width: usize,
+    preset: NavigatorPreset,
+    overrides: Option<&[NavigatorOptionalColumn]>,
+    order: &[NavigatorOptionalColumn],
+) -> NavigatorLayout {
     let floor = required_floor(ordinal_width);
     if inner_width < floor {
         return degraded(inner_width, ordinal_width);
@@ -154,7 +186,7 @@ pub fn resolve(
         .unwrap_or_else(|| preset_columns(preset));
     let mut visible = required_columns(ordinal_width).to_vec();
     let mut used = floor;
-    for optional in OPTIONAL_ORDER {
+    for optional in normalize_order(order) {
         if enabled.contains(&optional) {
             let group = optional_columns(optional);
             let next = group.iter().map(|(_, width, _)| width + 1).sum::<usize>();
@@ -535,5 +567,57 @@ mod tests {
             assert_eq!(display_width(&align_cells(glyph, 1, Alignment::Center)), 1);
         }
         assert_eq!(truncate_cells_with_ellipsis("very-long-model", 5), "very…");
+    }
+
+    fn optional_sequence(layout: &NavigatorLayout) -> Vec<NavigatorColumn> {
+        columns(layout).into_iter().skip(7).collect()
+    }
+
+    #[test]
+    fn t21_saved_order_positions_optional_columns_per_preset() {
+        use NavigatorColumn as C;
+        use NavigatorOptionalColumn as O;
+        // Default order: identical to the historical fixed order.
+        let dense = resolve(200, 2, NavigatorPreset::Dense, None);
+        assert_eq!(
+            optional_sequence(&dense),
+            vec![C::Age, C::Provider, C::Model, C::Effort]
+        );
+        // Dense with a saved order that puts model/effort before age.
+        let dense_order = normalize_order(&[O::ModelEffort, O::Age]);
+        let dense = resolve_ordered(200, 2, NavigatorPreset::Dense, None, &dense_order);
+        assert_eq!(
+            optional_sequence(&dense),
+            vec![C::Provider, C::Model, C::Effort, C::Age]
+        );
+        // Operations has its own order, independent of Dense.
+        let operations_order = normalize_order(&[O::Project, O::Work, O::Retry]);
+        let operations =
+            resolve_ordered(200, 2, NavigatorPreset::Operations, None, &operations_order);
+        assert_eq!(
+            optional_sequence(&operations),
+            vec![
+                C::Project,
+                C::Work,
+                C::Retry,
+                C::Age,
+                C::Provider,
+                C::Model,
+                C::Effort
+            ]
+        );
+        // Column starts stay strictly increasing (no overlap after reordering).
+        for pair in operations.columns.windows(2) {
+            assert!(pair[0].start + pair[0].width < pair[1].start);
+        }
+    }
+
+    #[test]
+    fn t22_normalize_order_completes_partial_and_dedupes() {
+        use NavigatorOptionalColumn as O;
+        let order = normalize_order(&[O::Created, O::Created, O::Age]);
+        assert_eq!(order.len(), OPTIONAL_ORDER.len());
+        assert_eq!(&order[..2], &[O::Created, O::Age]);
+        assert_eq!(normalize_order(&[]), OPTIONAL_ORDER.to_vec());
     }
 }

@@ -84,7 +84,7 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"action":"operator_call","call":{"method":"ListSessions","params":{"status_in":["Completed"],"after":{"updated_at":"2026-09-07T00:00:00.000000000Z","id":id},"limit":10}},"expected":{"session_updated_at":"2026-09-07T00:00:00.000000000Z"}}),
     ];
     let updates = vec![
-        json!({"update":"work","key":"w","expected_row_version":0,"epic_id":id,"title":"Deliverable","kind":"product","priority":1,"weight":1,"required_gates":["verification"]}),
+        json!({"update":"work","key":"w","expected_row_version":0,"epic_id":id,"title":"Deliverable","kind":"product","priority":1,"weight":1,"required_gates":["verification"],"risk_tier":"tier2"}),
         json!({"update":"stage","key":"w","expected_row_version":1,"stage":"verification","state":"passed","note":"proof","evidence":evidence}),
         json!({"update":"dependency","key":"w","expected_row_version":1,"prerequisite":"base","require_integrated":true,"enabled":true}),
         json!({"update":"ownership","key":"w","expected_row_version":1,"domain":"domain","mode":"exclusive","files":["file.rs"],"active":true}),
@@ -94,7 +94,7 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"update":"migration_seal_transfer","key":"w","expected_row_version":1,"claim_id":id,"source_commit":"a".repeat(40),"new_source_commit":"b".repeat(40),"expires_at":"2026-09-27T10:00:00.000000000Z"}),
         json!({"update":"migration_transfer","key":"new-holder","expected_row_version":1,"version":105}),
         json!({"update":"migration_release","key":"w","expected_row_version":2,"version":105}),
-        json!({"update":"request_review","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"query":"Review exact source","launch":launch}),
+        json!({"update":"request_review","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"query":"Review exact source","launch":launch,"delta_of":id,"finding_keys":["finding-1"]}),
         json!({"update":"accept","key":"w","expected_row_version":1}),
         json!({"update":"integration","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"target_commit":"b".repeat(40),"verification":evidence}),
         json!({"update":"request","request_id":id,"expected_row_version":1,"state":"accepted","message":"accepted","work_key":"w"}),

@@ -144,6 +144,7 @@ async fn ownership_expansion_still_refuses_an_exclusive_domain_conflict() -> Res
                         ManagerWorkStageV2::Review,
                         ManagerWorkStageV2::Verification,
                     ],
+                    risk_tier: Default::default(),
                 },
                 "other-work-plan",
             ),
@@ -305,6 +306,8 @@ fn source_bound_update_classification_is_explicit() {
                 model: "test".into(),
                 effort: None,
             },
+            delta_of: None,
+            finding_keys: vec![],
         }
     ));
 }

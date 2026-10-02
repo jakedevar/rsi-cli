@@ -119,6 +119,19 @@ impl VimState {
         self.desired_col = None;
     }
 
+    /// No command is half-typed: no pending operator, count, prefix, char
+    /// search target or visual selection. A plain key typed now starts a new
+    /// command instead of completing one (so `f?` still searches for `?`).
+    pub fn is_idle(&self) -> bool {
+        self.pending_operator.is_none()
+            && self.pending_count.is_none()
+            && self.visual.is_none()
+            && !self.pending_g
+            && !self.pending_replace
+            && self.pending_textobj_prefix.is_none()
+            && self.pending_char_search_dir.is_none()
+    }
+
     /// Start recording a change for dot repeat.
     pub(super) fn start_recording(&mut self, key: KeyEvent) {
         if self.replaying {

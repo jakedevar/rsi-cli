@@ -96,8 +96,8 @@ attempt. Wait for the linked provider session to reach `Completed`, then run
 `make dev-commit-live-dogfood` to validate and commit the output.
 
 These targets only enable `recursive_dag_live_scheduler_control_enabled`. They
-do not enable `recursive_dag_live_executor_enabled`, do not enable
-`recursive_dag_background_loop_enabled`, do not make live execution reachable by
+do not enable `recursive_dag_fixed_live_executor_enabled`, do not enable
+`recursive_dag_fixed_background_loop_enabled`, do not make live execution reachable by
 default, and do not add topology-linked live delegation. The lower-level
 `make recursive-dag-live-dogfood-*` targets expose the same steps individually
 (`setup`, `env`, `daemon`, `gate`, `tui`, `claude-login`, `status`, `commit`,
@@ -225,11 +225,11 @@ Standalone live executor and background loop attempts should still fail:
 
 "$TARGET_DIR/debug/rsi-rpc" --socket "$RSI_EXISTING_SOCKET" \
   UpdateDaemonConfig \
-  --params '{"field":"recursive_dag_live_executor_enabled","value":true}'
+  --params '{"field":"recursive_dag_fixed_live_executor_enabled","value":true}'
 
 "$TARGET_DIR/debug/rsi-rpc" --socket "$RSI_EXISTING_SOCKET" \
   UpdateDaemonConfig \
-  --params '{"field":"recursive_dag_background_loop_enabled","value":true}'
+  --params '{"field":"recursive_dag_fixed_background_loop_enabled","value":true}'
 ```
 
 ## Read-Only Recursive Graph Rendering In `gv`
@@ -352,7 +352,7 @@ Fixture-backed operator flow:
 4. Confirm `recursive_dag_live_scheduler_control=true` and
    `recursive_dag_live_execution=true` in `GetDaemonCapabilities`, while
    `recursive_dag_background_loop=false` in capabilities and
-   `recursive_dag_live_executor_enabled=false` in `GetDaemonConfig`.
+   `recursive_dag_fixed_live_executor_enabled=false` in `GetDaemonConfig`.
 5. Open `:dag`, select the graph whose ID matches
    `.ids.live_dogfood_graph_id`, and press `Enter` to hydrate detail.
 6. Press uppercase `L`, enter `1`, and press `Enter`.
@@ -493,11 +493,11 @@ report true while `recursive_dag_background_loop` remains false.
 
 These config values should remain false, except
 `recursive_dag_live_scheduler_control_enabled` when intentionally enabled and
-`recursive_dag_fake_executor_only` which should remain true:
+`recursive_dag_fixed_fake_executor_only` which should remain true:
 
-- `recursive_dag_live_executor_enabled=false`
-- `recursive_dag_background_loop_enabled=false`
-- `recursive_dag_fake_executor_only=true`
+- `recursive_dag_fixed_live_executor_enabled=false`
+- `recursive_dag_fixed_background_loop_enabled=false`
+- `recursive_dag_fixed_fake_executor_only=true`
 
 `RunRecursiveLiveScheduler` should return a disabled-gate error until
 `recursive_dag_live_scheduler_control_enabled=true`.

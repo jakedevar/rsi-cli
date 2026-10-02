@@ -156,6 +156,7 @@ pub(crate) async fn launch_source(
         model_invocation_id: None,
     };
     let launch = LaunchConfig {
+        completion_gates: None,
         query: request.query.clone(),
         title: Some(request.title.clone()),
         agent_role: None,
@@ -187,6 +188,7 @@ pub(crate) async fn launch_source(
         issue_tracker_id: None,
         scheduled_job_id: None,
         skip_project_model_default: false,
+        tool_policy: None,
         model_invocation_purpose: ModelInvocationPurpose::SessionLaunchFresh,
         model_invocation_owner: None,
         model_invocation_dedup_key: Some(format!(

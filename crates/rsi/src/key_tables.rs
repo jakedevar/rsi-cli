@@ -242,7 +242,7 @@ pub enum GlobalGuard {
     /// `UnobstructedOtherPane`, except an Issues editor showing a stale-version
     /// conflict (which keeps Ctrl-L for its own reload).
     UnobstructedOtherPaneNoStaleIssueEditor,
-    /// An overlay with movable geometry (launch prompt, input modal) is open.
+    /// An overlay with movable geometry is open.
     GeometryOverlay,
     /// Normal mode and no overlay (the input bar may be inserting).
     NormalNoOverlay,
@@ -262,7 +262,7 @@ impl GuardLabel for GlobalGuard {
             Self::UnobstructedOtherPaneNoStaleIssueEditor => {
                 "other pane focused (normal mode, no overlay; not a stale Issues editor)"
             }
-            Self::GeometryOverlay => "launch prompt or input modal open",
+            Self::GeometryOverlay => "movable overlay open",
             Self::NormalNoOverlay => "normal mode, no overlay",
         }
     }

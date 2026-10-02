@@ -646,7 +646,7 @@ async fn generate_ollama_admitted(
     };
     let started_at = Instant::now();
     let result = generate_ollama(http, prompt, num_predict, model).await;
-    let completion = match &result {
+    let mut completion = match &result {
         Ok(_) => completion_with_wall_time(started_at, None, ModelUsageConfidence::Partial),
         Err(_) => completion_with_wall_time(
             started_at,
@@ -654,6 +654,9 @@ async fn generate_ollama_admitted(
             ModelUsageConfidence::Partial,
         ),
     };
+    if let Ok(reply) = &result {
+        crate::memory::llm::apply_estimated_usage(&mut completion, prompt, reply);
+    }
     crate::model_control::settle_result(
         store,
         &permit,
@@ -679,7 +682,9 @@ async fn generate_cli_fallback(prompt: &str, model: &str) -> Result<String> {
 // Reached only through `generate_cli_fallback`, which is currently unwired.
 #[allow(dead_code)]
 fn title_cli_command(prompt: &str, model: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("claude");
+    let mut command = tokio::process::Command::new(
+        crate::provider_cli::resolve("claude").unwrap_or_else(|| "claude".into()),
+    );
     command.args([
         "-p",
         prompt,
@@ -967,6 +972,58 @@ mod http_tests {
             body.get("keep_alive").is_none(),
             "keep_alive key must be absent"
         );
+    }
+
+    /// #586/#587: the Local Ollama title call settles with token figures
+    /// (estimated: Ollama's reply carries none here) and the effort label.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn title_ollama_invocation_settles_estimated_tokens_and_effort() {
+        let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/api/generate$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"response\":\"Title: X\\nDesc: Y\",\"done\":true}"),
+            )
+            .mount(&server)
+            .await;
+        // SAFETY: TEST_OLLAMA_URL_LOCK is held above.
+        unsafe {
+            std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
+        }
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::store::Store::open_in_memory().expect("store"),
+        ));
+        let bus = std::sync::Arc::new(crate::bus::EventBus::new(8));
+        let http = reqwest::Client::new();
+        super::generate_ollama_admitted(
+            &store,
+            &bus,
+            uuid::Uuid::new_v4(),
+            &http,
+            "name this session",
+            512,
+            "qwen3:14b",
+        )
+        .await
+        .expect("admitted Ollama title call");
+        let guard = store.lock().await;
+        let row: (Option<i64>, Option<i64>, String, Option<String>) = guard
+            .conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, usage_confidence, effort
+                 FROM model_invocations WHERE trigger_source = 'session_title'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("settled title row");
+        assert!(row.0.is_some_and(|tokens| tokens > 0), "{row:?}");
+        assert!(row.1.is_some_and(|tokens| tokens > 0), "{row:?}");
+        assert_eq!(row.2, "estimated");
+        assert_eq!(row.3.as_deref(), Some("default"));
     }
 }
 

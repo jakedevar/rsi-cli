@@ -101,7 +101,7 @@
 
 - **L129** — *"**avoid excessive code snippets**. While a brief snippet to describe some key change is important..."* — qualified away. Every loophole like this becomes an LLM excuse. Compare to the shared preamble's blanket ban: *"Code snippets of any length. The master reads `git diff`, file:line refs, and on-disk artifacts for details."* Adopt verbatim.
 
-- **Missing throughout** — No reference to `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md`. Every post-Phase-4 command in the refactor set opens with a "Worker preamble (binding)" reference paragraph (see `create_plan.md` L10, `master_implement.md` L28). This file was not touched in the Phase 4 pass and still contains no anchor to the shared contract. Adding it is one sentence of work and eliminates the duplicate forbidden-content / commit-push / restatement boilerplate by reference.
+- **Missing throughout** — No reference to `~/rsi/.claude/commands/_shared/worker_preamble.md`. Every post-Phase-4 command in the refactor set opens with a "Worker preamble (binding)" reference paragraph (see `create_plan.md` L10, `master_implement.md` L28). This file was not touched in the Phase 4 pass and still contains no anchor to the shared contract. Adding it is one sentence of work and eliminates the duplicate forbidden-content / commit-push / restatement boilerplate by reference.
 
 - **Missing throughout** — No `<handoff_contract>` block defining the minimal fields `resume_handoff` receives. The document IS the handoff, and yet the command that writes it has no contract specifying what fields `resume_handoff` treats as load-bearing. Compare `master_implement.md` L16-26. Same pattern belongs here.
 

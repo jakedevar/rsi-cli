@@ -6,7 +6,7 @@ description: Write the handoff that lets the next session continue this work
 
 You are the closing agent for a pipeline stage, tasked with producing a handoff document for the next session. The handoff is a channel, not a diary — every word in it is read-tax on the resuming agent. The shared worker preamble governs read and return budgets; the `<handoff_document>` schema below governs the document you write.
 
-**Worker preamble (binding):** This command MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=handoff` before acting. That file defines the read budget (Grep-then-Read targeted ranges; full-file reads only for files <400 lines; ≤8k-token read budget before acting), the forbidden-content rules, and the failure-mode contract. The return-budget section of the preamble is INAPPLICABLE to this command — handoff commands write to disk or drive a live session rather than return a bounded blob to a master orchestrator. The rules below COMPOSE ON TOP of the preamble and may tighten (never loosen) any limit declared there.
+**Worker preamble (binding):** This command MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=handoff` before acting. That file defines the read budget (Grep-then-Read targeted ranges; full-file reads only for files <400 lines; ≤8k-token read budget before acting), the forbidden-content rules, and the failure-mode contract. The return-budget section of the preamble is INAPPLICABLE to this command — handoff commands write to disk or drive a live session rather than return a bounded blob to a master orchestrator. The rules below COMPOSE ON TOP of the preamble and may tighten (never loosen) any limit declared there.
 
 <handoff_contract>
   <required>

@@ -154,19 +154,16 @@ fn assistant_event_from_output(output: &str) -> Option<StreamEvent> {
 impl AgyClient {
     /// Create a new client, finding the Antigravity binary in PATH.
     pub fn new() -> Result<Self> {
-        let binary_path = which::which("agy")
-            .or_else(|_| which::which("antigravity"))
-            .or_else(|_| which::which("antigravity-cli"))
-            .map_err(|_| DaemonError::AgyBinaryNotFound)?;
+        let binary_path =
+            crate::provider_cli::resolve_any(&["agy", "antigravity", "antigravity-cli"])
+                .ok_or(DaemonError::AgyBinaryNotFound)?;
         tracing::info!(path = %binary_path.display(), "Found Antigravity binary");
         Ok(Self { binary_path })
     }
 
     /// Check if the Antigravity binary is available without creating a client.
     pub fn is_available() -> bool {
-        which::which("agy").is_ok()
-            || which::which("antigravity").is_ok()
-            || which::which("antigravity-cli").is_ok()
+        crate::provider_cli::resolve_any(&["agy", "antigravity", "antigravity-cli"]).is_some()
     }
 
     /// Discover available models.
@@ -293,25 +290,26 @@ impl AgyClient {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args([
             "-p",
-            &config.query,
             "--dangerously-skip-permissions",
             "--print-timeout",
             "60m",
         ]);
         if let Some(model) = &config.model {
-            cmd.args(["--model", model]);
+            cmd.args([format!("--model={model}")]);
         }
         if let Some(effort) = &config.effort {
-            cmd.args(["--effort", effort]);
+            cmd.args([format!("--effort={effort}")]);
         }
         if let Some(resume_id) = &config.resume_session_id {
-            cmd.args(["--conversation", resume_id]);
+            cmd.args([format!("--conversation={resume_id}")]);
         }
 
         // Set working directory
         if let Some(dir) = &config.working_dir {
             cmd.current_dir(dir);
         }
+
+        cmd.arg("--").arg(&config.query);
 
         // System prompt injection via temp file + GEMINI_SYSTEM_MD env var.
         // Antigravity has no --system-prompt flag; we write to .gemini/system.md in the
@@ -375,25 +373,31 @@ impl AgyClient {
             let mut buf = String::new();
 
             loop {
-                let line = match lines.next_line().await {
+                let next_line = match lines.next_line().await {
+                    Err(BoundedLineError::Exceeded { limit }) => {
+                        match lines.drain_oversized_line().await {
+                            Ok(()) => Ok(Some(format!(
+                                "[provider stdout line truncated at {limit} bytes]"
+                            ))),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    other => other,
+                };
+                let line = match next_line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
                         if let Some(pid) = child_pid {
                             terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
                         }
-                        let error_class = if matches!(error, BoundedLineError::Exceeded { .. }) {
-                            "provider_output_overflow"
-                        } else {
-                            "provider_output_read_error"
-                        };
                         let _ = event_tx.try_send(StreamEvent {
                             event_type: "process_error".to_string(),
                             data: serde_json::json!({
                                 "error": error.to_string(),
                                 "source": "stdout",
                                 "terminal": true,
-                                "error_class": error_class,
+                                "error_class": "provider_output_read_error",
                             }),
                         });
                         return;
@@ -521,6 +525,7 @@ mod tests {
 
     fn test_launch_config(query: &str) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query: query.to_string(),
             title: None,
             agent_role: None,
@@ -555,6 +560,7 @@ mod tests {
             model_invocation_dedup_key: None,
             model_invocation_request_fingerprint: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
             sandbox: None,
@@ -598,6 +604,48 @@ printf 'agy ok\n'
         (binary_path, args_path, env_path)
     }
 
+    #[cfg(unix)]
+    fn install_prompt_parsing_agy(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let binary_path = dir.join("agy-prompt-parser");
+        let args_path = dir.join("agy_prompt_args.bin");
+        let output_path = dir.join("agy_prompt_output.txt");
+        fs::write(
+            &binary_path,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+: > "{args_path}"
+for arg in "$@"; do
+  printf '%s\0' "$arg" >> "{args_path}"
+done
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --) shift; break ;;
+    -p|--dangerously-skip-permissions) ;;
+    --print-timeout)
+      [[ "$#" -ge 2 ]] || {{ echo "missing option value" >&2; exit 2; }}
+      shift
+      ;;
+    --*=*) ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ "$#" -eq 1 ]] || {{ echo "expected exactly one prompt after --" >&2; exit 2; }}
+printf '%s\n' "$1" > {output}
+printf '%s\n' "$1"
+"#,
+                args_path = args_path.display(),
+                output = output_path.display(),
+            ),
+        )
+        .expect("write prompt-parsing fake agy");
+        let mut perms = fs::metadata(&binary_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&binary_path, perms).unwrap();
+        (binary_path, args_path, output_path)
+    }
+
     fn read_nul_args(path: &std::path::Path) -> Vec<String> {
         let bytes = fs::read(path).expect("read captured args");
         bytes
@@ -616,6 +664,32 @@ printf 'agy ok\n'
             args.get(pos + 1).map(String::as_str),
             Some(expected_value),
             "wrong value for {flag}; args: {args:?}"
+        );
+    }
+
+    fn assert_prompt_is_final_verbatim(args: &[String], prompt: &str) {
+        assert!(
+            args.iter().any(|arg| arg == "-p"),
+            "print mode must remain a flag: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--"),
+            "end-of-options separator must be present: {args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(prompt),
+            "prompt must be final argv, byte-for-byte: {args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == prompt).count(),
+            1,
+            "prompt must not appear before its final position: {args:?}"
+        );
+        assert_eq!(
+            args.get(args.len() - 2).map(String::as_str),
+            Some("--"),
+            "end-of-options separator must immediately precede prompt: {args:?}"
         );
     }
 
@@ -676,7 +750,7 @@ worker prompt body\n\
         assert!(status.success(), "fake agy failed: {status}");
 
         let args = read_nul_args(&args_path);
-        assert_arg_pair(&args, "-p", "worker prompt body");
+        assert_prompt_is_final_verbatim(&args, "worker prompt body");
         assert!(
             !args
                 .iter()
@@ -716,9 +790,43 @@ worker prompt body\n\
         assert!(status.success(), "fake agy failed: {status}");
 
         let args = read_nul_args(&args_path);
-        assert_arg_pair(&args, "--conversation", "conversation-123");
-        assert_arg_pair(&args, "--model", "gemini-3.6-flash-high");
-        assert_arg_pair(&args, "--effort", "high");
+        assert!(args.contains(&"--conversation=conversation-123".to_string()));
+        assert!(args.contains(&"--model=gemini-3.6-flash-high".to_string()));
+        assert!(args.contains(&"--effort=high".to_string()));
+        assert_prompt_is_final_verbatim(&args, "next turn");
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn antigravity_launch_passes_leading_dash_prompts_after_options() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let (binary_path, args_path, output_path) = install_prompt_parsing_agy(tmp.path());
+        let client = AgyClient { binary_path };
+
+        for prompt in ["---\ndate: test\n---\n# Handoff", "-x", "--help"] {
+            let mut config = test_launch_config(prompt);
+            config.working_dir = Some(workdir.clone());
+            let (mut process, mut rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::AntigravityCli),
+                )
+                .expect("launch fake agy");
+            let status = process.wait().await.expect("wait fake agy");
+            assert!(status.success(), "prompt {prompt:?} failed: {status}");
+            let event = rx.recv().await.expect("assistant event");
+            assert_eq!(event.data["message"]["content"][0]["text"], prompt);
+            assert_eq!(
+                fs::read_to_string(&output_path).expect("read echoed prompt"),
+                format!("{prompt}\n")
+            );
+
+            let args = read_nul_args(&args_path);
+            assert_prompt_is_final_verbatim(&args, prompt);
+        }
     }
 
     #[cfg(unix)]
@@ -810,10 +918,13 @@ worker prompt body\n\
             parts[1],
             std::env::var(rsi_common::identity::ENV_TMPDIR).unwrap_or_default()
         );
+        // Every rsi-launched provider process carries the daemon's ownership
+        // namespace, even on an ordinary (non-scratch) launch. Compare with the
+        // namespace the launcher stamps, not the caller's ambient variable,
+        // which is empty outside an rsi session (#881).
         assert_eq!(
             parts[2],
-            std::env::var(rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE)
-                .unwrap_or_default()
+            rsi_common::identity::process_ownership_namespace()
         );
         assert_eq!(parts[3], session_id.to_string());
         assert!(!parts[4].is_empty());

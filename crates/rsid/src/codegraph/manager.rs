@@ -23,6 +23,10 @@ use super::{
 
 const INGRESS_CAPACITY: usize = 128;
 const MAX_REGISTERED_WORKSPACES: usize = 128;
+// One codegraph `ExtractionCache` keeps ~340-390 MB live per rsi checkout and a
+// pass peaks near 750 MB (#960 dhat probe), so only the workspace indexed last
+// keeps its incremental cache; the others re-extract from their sources.
+const MAX_RESIDENT_WORKER_STATES: usize = 1;
 const RESCAN_TICK: Duration = Duration::from_secs(1);
 const FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -55,9 +59,16 @@ pub struct IndexHandle {
     slots: Arc<Mutex<HashMap<Uuid, Arc<Slot>>>>,
     statuses: Arc<Mutex<HashMap<Uuid, IndexStatus>>>,
     enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    resident_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl IndexHandle {
+    #[cfg(test)]
+    fn resident_worker_state_count(&self) -> usize {
+        self.resident_count.load(Ordering::Relaxed)
+    }
+
     /// Change admission immediately. Enabling wakes a full reconciliation of
     /// every current registration; disabling invalidates an active worker.
     pub fn set_enabled(&self, enabled: bool) {
@@ -250,6 +261,8 @@ pub struct IndexManager {
     pending_set: HashSet<Uuid>,
     events: Option<Arc<EventBus>>,
     enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    resident_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl IndexManager {
@@ -322,12 +335,16 @@ impl IndexManager {
         let slots = Arc::new(Mutex::new(slots));
         let statuses = Arc::new(Mutex::new(statuses));
         let (tx, rx) = mpsc::channel(INGRESS_CAPACITY);
+        #[cfg(test)]
+        let resident_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handle = IndexHandle {
             index_root: index_root.clone(),
             tx,
             slots: slots.clone(),
             statuses: statuses.clone(),
             enabled: enabled.clone(),
+            #[cfg(test)]
+            resident_count: resident_count.clone(),
         };
         let manager = Self {
             index_root,
@@ -340,6 +357,8 @@ impl IndexManager {
             pending_set: HashSet::new(),
             events: None,
             enabled,
+            #[cfg(test)]
+            resident_count,
         };
         Ok((manager, handle))
     }
@@ -482,6 +501,11 @@ impl IndexManager {
             } else {
                 WorkerState::default()
             };
+            // Drop every other resident cache before this run builds its own,
+            // so a pass never holds another workspace's ~340 MB on top of its
+            // own ~750 MB extraction peak (#960 dhat probe).
+            self.worker_states.clear();
+            self.worker_roots.clear();
             self.worker_roots.insert(id, workspace.root.clone());
             self.update_status(id, |status| {
                 status.phase = IndexPhase::Building;
@@ -509,12 +533,21 @@ impl IndexManager {
                 } else {
                     None
                 };
+                // A pass frees most of its ~750 MB peak here; return those
+                // arena pages instead of keeping them resident (#960).
+                crate::process_memory::release_free_memory();
                 (state, result, ready_on_error)
             })
             .await;
             let (result, ready_on_error) = match outcome {
                 Ok((state, result, ready_on_error)) => {
+                    // The run began with no other resident state, and this
+                    // insert is the only one, so at most one cache stays live.
                     self.worker_states.insert(id, state);
+                    debug_assert!(self.worker_states.len() <= MAX_RESIDENT_WORKER_STATES);
+                    #[cfg(test)]
+                    self.resident_count
+                        .store(self.worker_states.len(), Ordering::Relaxed);
                     (result, ready_on_error)
                 }
                 Err(error) => (
@@ -957,6 +990,57 @@ mod tests {
             primary_ready.snapshot_digest,
             external_ready.snapshot_digest
         );
+        drop(handle);
+        task.abort();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn sequential_indices_keep_one_resident_state() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(b.path().join("lib.rs"), "pub fn b() {}\n").unwrap();
+        let first = RegisteredWorkspace::primary(Uuid::new_v4(), a.path()).unwrap();
+        let second = RegisteredWorkspace::primary(Uuid::new_v4(), b.path()).unwrap();
+        let (manager, handle) = IndexManager::new(
+            indexes.path().to_path_buf(),
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        handle.set_enabled(true);
+        let task = tokio::spawn(manager.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let a_status = handle.status(first.workspace_id).unwrap();
+                let b_status = handle.status(second.workspace_id).unwrap();
+                if a_status.phase == IndexPhase::Ready && b_status.phase == IndexPhase::Ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Both workspaces reached Ready.
+        let a_store = rsi_codegraph::CodegraphStore::open(
+            &worker::project_db_path(indexes.path(), first.project_id),
+            first.project_id,
+        )
+        .unwrap();
+        let b_store = rsi_codegraph::CodegraphStore::open(
+            &worker::project_db_path(indexes.path(), second.project_id),
+            second.project_id,
+        )
+        .unwrap();
+        let a_ready = a_store.current_ready(first.workspace_id).unwrap();
+        let b_ready = b_store.current_ready(second.workspace_id).unwrap();
+        assert_eq!(a_ready.workspace_id, first.workspace_id);
+        assert_eq!(b_ready.workspace_id, second.workspace_id);
+        // The retention gate fires after each index, so at most one state is resident.
+        let resident = handle.resident_worker_state_count();
+        assert_eq!(resident, 1);
         drop(handle);
         task.abort();
     }

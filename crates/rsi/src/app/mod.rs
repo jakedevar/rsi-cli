@@ -115,8 +115,10 @@ impl SortOrder {
 /// carries each model's context window, so the daemon can no longer advertise
 /// "Fable 5 (1M)" here while computing fill against 128k.
 ///
-/// Still used as the static fallback for the daemon-unreachable case: live
-/// discovery (`DiscoverModels` RPC) returns the same list.
+/// Static fallback only. The daemon's `DiscoverModels` normally asks the
+/// installed Claude CLI which models this account can use (its stream-json
+/// `initialize` reply) and returns that list; this catalog is what the picker
+/// shows when the daemon is unreachable or the probe fails.
 pub const CLAUDE_MODELS: &[(&str, &str)] = rsi_common::claude_catalog::CLAUDE_MODEL_MENU;
 
 /// Available Codex models: (model_id, display_name).
@@ -354,6 +356,7 @@ pub(crate) struct PendingClassifierConfig {
 pub struct ModelDiscoveryResult {
     pub provider: SessionProvider,
     pub models: Vec<(String, String)>,
+    pub effort_capabilities: Vec<rsi_common::model_utils::ModelEffortCapabilities>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -411,6 +414,8 @@ pub struct App {
     /// Persisted operator pause markers read separately from Session snapshots.
     pub operator_pauses: HashMap<Uuid, crate::client::OperatorPauseLevel>,
     pub(crate) operator_pause_probe_cursor: usize,
+    pub operator_messages: HashMap<Uuid, Vec<crate::client::OperatorMessageView>>,
+    pub(crate) interrupt_now_confirmation: Option<(Uuid, std::time::Instant)>,
 
     /// Index from `parent_id` -> ordered list of direct children. Key `None`
     /// means top-level sessions (no parent); key `Some(uuid)` means children
@@ -429,6 +434,12 @@ pub struct App {
     /// the "Recursive graphs" picker can index by position). Populated only when
     /// the `gv_render_recursive_origin` cap is observed true.
     pub recursive_graphs: Vec<rsi_common::recursive_dag::RecursiveTaskGraphSummary>,
+    /// History filter the Scheduled Jobs view last loaded with, so returning
+    /// from the schedule form restores it (#954 B).
+    pub schedule_include_history: bool,
+    /// Held scheduled wakes by job id, refreshed when the schedule browser opens (#794 S3).
+    pub schedule_holds:
+        std::collections::HashMap<uuid::Uuid, rsi_common::child_autonomy::ScheduledJobHoldV1>,
     /// Graph editor drafts keyed by primary draft identity.
     pub graph_drafts: HashMap<Uuid, GraphDraft>,
     /// Most recently active graph draft. Reopened by `gv` until an explicit open/clone flow exists.
@@ -603,14 +614,19 @@ pub struct App {
     pub provider_rate_limits: HashMap<SessionProvider, ProviderRateLimitSnapshot>,
     /// Latest bounded background Health read for the aggregate worker slice.
     pub(crate) worker_slice_memory_pressure: Option<rsi_common::rpc::WorkerSliceMemoryPressure>,
-    pub(crate) worker_pressure_refresh_handle: Option<
-        tokio::task::JoinHandle<Result<Option<rsi_common::rpc::WorkerSliceMemoryPressure>, String>>,
-    >,
+    pub(crate) worker_pressure_refresh_handle:
+        Option<tokio::task::JoinHandle<Result<polling::DaemonHealthRead, String>>>,
     pub(crate) worker_pressure_next_refresh_at: std::time::Instant,
+    /// rsid resource usage from the same background Health read, for the
+    /// session browser's live-activity pane.
+    pub(crate) daemon_resources: Option<crate::daemon_resources::DaemonResourceView>,
 
     /// Dynamically discovered models (model_id, display_name) for selected provider.
     /// Falls back to provider-specific static model lists if discovery fails.
     pub available_models: Vec<(String, String)>,
+    /// Live effort metadata keyed by provider; discovery replaces that provider's catalog.
+    pub model_effort_capabilities:
+        HashMap<SessionProvider, Vec<rsi_common::model_utils::ModelEffortCapabilities>>,
     /// Dynamically discovered local (Ollama) models, independent of selected_provider.
     /// Always reflects what Ollama reports via GET /v1/models.
     pub local_models: Vec<(String, String)>,
@@ -887,6 +903,10 @@ pub struct App {
     /// entry (mirrors `daemon_features`/`RefreshDaemonFeatures`).
     pub cached_usage_stats: Option<rsi_common::types::UsageStats>,
 
+    /// Cached `GetEfficiencyMetrics` for today (UTC) in Settings -> Stats
+    /// (#1018). Refreshed with `cached_usage_stats`.
+    pub cached_efficiency_metrics: Option<rsi_common::rpc::EfficiencyMetricsResponse>,
+
     /// Cached model-control/operator status for Settings -> Stats and
     /// Settings -> Daemon Features live controls.
     pub cached_model_control_status: Option<rsi_common::model_control::ModelControlStatusReport>,
@@ -898,6 +918,8 @@ pub struct App {
     /// — `ListProviderCredentialsResult` is metadata-only by construction.
     pub cached_provider_credentials:
         Option<rsi_common::provider_credentials::ListProviderCredentialsResult>,
+    /// Cached MCP server definitions and secret-free credential metadata.
+    pub cached_mcp_servers: Option<rsi_common::mcp::ListMcpServersResult>,
 }
 
 /// Replace any `Pane::Settings` leaves with `SessionList` so settings panes
@@ -1186,8 +1208,12 @@ impl App {
             session_order: Vec::new(),
             operator_pauses: HashMap::new(),
             operator_pause_probe_cursor: 0,
+            operator_messages: HashMap::new(),
+            interrupt_now_confirmation: None,
             workflows: HashMap::new(),
             recursive_graphs: Vec::new(),
+            schedule_include_history: false,
+            schedule_holds: std::collections::HashMap::new(),
             graph_drafts: restored_graph_drafts,
             active_graph_draft_id,
             graph_executions: HashMap::new(),
@@ -1248,7 +1274,9 @@ impl App {
             worker_slice_memory_pressure: None,
             worker_pressure_refresh_handle: None,
             worker_pressure_next_refresh_at: std::time::Instant::now(),
+            daemon_resources: None,
             available_models: models_for_provider(selected_provider),
+            model_effort_capabilities: HashMap::new(),
             local_models: models_for_provider(SessionProvider::Local),
             model_dropdown: crate::types::ModelDropdownState::default(),
             model_segment_rect: None,
@@ -1318,8 +1346,10 @@ impl App {
             cached_hook_rows: Vec::new(),
             cached_user_skills: None,
             cached_usage_stats: None,
+            cached_efficiency_metrics: None,
             cached_model_control_status: None,
             cached_provider_credentials: None,
+            cached_mcp_servers: None,
             children_by_parent: HashMap::new(),
             focus_fetch_inflight: HashSet::new(),
             focus_fetch_tx,
@@ -1845,6 +1875,9 @@ impl App {
         if matches!(self.overlay, OverlayState::InputModal { .. }) {
             return Some("InputModal".to_string());
         }
+        if !matches!(self.overlay, OverlayState::None) {
+            return Self::regular_overlay_geometry_key(&self.overlay).map(str::to_string);
+        }
         // Then check focused input overlay
         if let Some(OverlayState::Prompt { purpose, .. }) = self.focused_input_overlay() {
             return Some(Self::geometry_key_for_purpose(purpose));
@@ -1856,6 +1889,64 @@ impl App {
             return Some("InputModal".to_string());
         }
         None
+    }
+
+    /// Stable saved-geometry key for each standalone overlay window.
+    /// Drawers and gutter focus are pane surfaces, so they keep their layout.
+    pub(crate) fn regular_overlay_geometry_key(overlay: &OverlayState) -> Option<&'static str> {
+        Some(match overlay {
+            OverlayState::ThemePicker { .. } => "ThemePicker",
+            OverlayState::ThemeRoleEditor { .. } => "ThemeRoleEditor",
+            OverlayState::ColorCustomizer { .. } => "ColorCustomizer",
+            OverlayState::TextAreaBgEditor { .. } => "TextAreaBgEditor",
+            OverlayState::ProjectPicker { .. } => "ProjectPicker",
+            OverlayState::KeybindingsHelp { .. } => "KeybindingsHelp",
+            OverlayState::SortPicker { .. } => "SortPicker",
+            OverlayState::PromptPreview { .. } => "PromptPreview",
+            OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
+            OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
+            OverlayState::HarnessManagerV2(..) => "HarnessManagerV2",
+            OverlayState::HarnessManagerScope(..) => "HarnessManagerScope",
+            OverlayState::TrashBrowser { .. } => "TrashBrowser",
+            OverlayState::NotificationBrowser { .. } => "NotificationBrowser",
+            OverlayState::ProjectForm { .. } => "ProjectForm",
+            OverlayState::ProviderForm { .. } => "ProviderForm",
+            OverlayState::MessageBridgeForm { .. } => "MessageBridgeForm",
+            OverlayState::HookForm { .. } => "HookForm",
+            OverlayState::HookConflictPrompt { .. } => "HookConflictPrompt",
+            OverlayState::BudgetPolicyForm { .. } => "BudgetPolicyForm",
+            OverlayState::ProviderCredentialForm { .. } => "ProviderCredentialForm",
+            OverlayState::McpServerForm { .. } => "McpServerForm",
+            OverlayState::McpServerSecretForm { .. } => "McpServerSecretForm",
+            OverlayState::SkillPreview { .. } => "SkillPreview",
+            OverlayState::Diagnostics => "Diagnostics",
+            OverlayState::RecursiveDagBrowser(..) => "RecursiveDagBrowser",
+            OverlayState::MemorySearch { .. } => "MemorySearch",
+            OverlayState::RenameSession { .. } => "RenameSession",
+            OverlayState::QuestionModal { .. } => "QuestionModal",
+            OverlayState::LabelPicker { .. } => "LabelPicker",
+            OverlayState::LabelForm { .. } => "LabelForm",
+            OverlayState::EspSquare { .. } => "EspSquare",
+            OverlayState::AiCommand { .. } => "AiCommand",
+            OverlayState::AiChat { .. } => "AiChat",
+            OverlayState::GraphReview { .. } => "GraphReview",
+            OverlayState::Telescope { .. } => "Telescope",
+            OverlayState::CommandPalette { .. } => "CommandPalette",
+            OverlayState::CardEditor { .. } => "CardEditor",
+            OverlayState::Dialectic { .. } => "Dialectic",
+            OverlayState::ScheduleBrowser { .. } => "ScheduleBrowser",
+            OverlayState::ScheduleForm { .. } => "ScheduleForm",
+            OverlayState::Terminal => "Terminal",
+            OverlayState::RatingOverlay { .. } => "RatingOverlay",
+            OverlayState::SessionInfoPanel { .. } => "SessionInfoPanel",
+            OverlayState::CreateEntityForm { .. } => "CreateEntityForm",
+            OverlayState::ParentPicker { .. } => "ParentPicker",
+            OverlayState::None
+            | OverlayState::Prompt { .. }
+            | OverlayState::InputModal { .. }
+            | OverlayState::FileExplorer { .. }
+            | OverlayState::RecentCompletions { .. } => return None,
+        })
     }
 
     /// Convert a PromptPurpose to its geometry persistence key.

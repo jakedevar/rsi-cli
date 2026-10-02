@@ -21,6 +21,7 @@ module "rsid_host" {
   secret_names                = var.secret_names
   operator_secrets            = var.operator_secrets
   secret_versions             = var.secret_versions
+  provider_cli_npm_packages   = var.provider_cli_npm_packages
   enable_tailscale            = var.enable_tailscale
   stop_when_idle_minutes      = var.stop_when_idle_minutes
   shutdown_at_utc             = var.shutdown_at_utc

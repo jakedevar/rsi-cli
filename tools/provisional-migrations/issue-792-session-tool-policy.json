@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "version": 143,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v143.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:2c8b8890fce0e00e2abaa2a7ff93eb3a34d459f6c9509fa528c947c7829b0fdc",
+      "sites": [
+        {
+          "anchor": "fn migrate_v143(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 143 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "session_tool_policy::apply_migration(self, 143)?;",
+          "replacement": "session_tool_policy::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/session_tool_policy.rs",
+      "path_template": "crates/rsid/src/store/session_tool_policy.rs",
+      "source_blob": "sha256:b0448bcaa69d912516dcb4a83e9a52d4f47568564b0c55247b7ccabf2191725e",
+      "sites": [
+        {
+          "anchor": "pub(crate) const SESSION_TOOL_POLICY_SCHEMA_VERSION: i32 = 143;",
+          "replacement": "pub(crate) const SESSION_TOOL_POLICY_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

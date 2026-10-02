@@ -1,4 +1,17 @@
-//! #628: fail closed before publishing a candidate that touches coordinated files.
+//! #628, revised by the operator P0 directive of 2026-09-29 04:20Z: the
+//! landing policy is mechanical and runs before any test gate, so a refusal
+//! costs seconds instead of a full gate.
+//!
+//! - No ledger admission: no Work binding, seal, hot-file claim or migration
+//!   reservation is required. Fast-forward-only publication serializes
+//!   landings; a conflicting tip fails the merge in seconds.
+//! - Released migrations stay immutable (`tools/check-released-migrations.py`).
+//! - A candidate that raises `LATEST_SCHEMA_VERSION` must append a contiguous
+//!   run of migrations starting at exactly the rolling tip's version + 1, each
+//!   version carrying its `if version < N` block. The refusal names the number
+//!   the source needs.
+//! - The Work binding is still reported (`source_binding=`) when the ledger is
+//!   readable; it never refuses a landing.
 
 use super::{AcceptedPair, git_output};
 use chrono::{DateTime, Duration, Utc};
@@ -8,6 +21,8 @@ use std::path::Path;
 use std::process::Command;
 
 const STORE: &str = "crates/rsid/src/store/mod.rs";
+/// Each schema version is one `vNNN.rs` here; the head is the highest number.
+const MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
 const MAX_CHANGED_PATHS: usize = 1024;
 const MAX_WORK_PAGES: usize = 16;
 const RELEASED_MANIFEST: &str = "tools/released-migrations.json";
@@ -17,11 +32,7 @@ pub enum PolicyFence {
     PathInspection,
     ReleasedMigration,
     SchemaVersion,
-    LedgerUnavailable,
-    SourceUnbound,
-    HotFileUnowned,
-    MigrationUnreserved,
-    MigrationOutOfOrder,
+    MigrationNumber,
 }
 
 impl PolicyFence {
@@ -30,11 +41,7 @@ impl PolicyFence {
             Self::PathInspection => "path_inspection",
             Self::ReleasedMigration => "released_migration",
             Self::SchemaVersion => "schema_version",
-            Self::LedgerUnavailable => "ledger_unavailable",
-            Self::SourceUnbound => "source_unbound",
-            Self::HotFileUnowned => "hot_file_unowned",
-            Self::MigrationUnreserved => "migration_unreserved",
-            Self::MigrationOutOfOrder => "migration_out_of_order",
+            Self::MigrationNumber => "migration_number",
         }
     }
 }
@@ -60,22 +67,6 @@ impl PolicyRefusal {
     }
 }
 
-fn is_hot_file(path: &str) -> bool {
-    matches!(
-        path,
-        "crates/rsid/src/rpc.rs"
-            | "crates/rsi-common/src/agent_control_schema.rs"
-            | "crates/rsi-common/src/bin/rsi-rpc.rs"
-            | "crates/rsid/src/session/harness/tools/mod.rs"
-            | "crates/rsid/src/session/harness/tools/rsi_control.rs"
-            | "crates/rsid/src/tool_registry.rs"
-            | STORE
-            | "AGENTS.md"
-    ) || path.ends_with("/AGENTS.md")
-        || path.ends_with("/harness_manager_v2.rs")
-        || path.starts_with(".claude/skills/rsi-")
-}
-
 fn protected_migration_paths(repo: &Path, revision: &str) -> Result<HashSet<String>, String> {
     let output = git_output(repo, &["show", &format!("{revision}:{RELEASED_MANIFEST}")])?;
     if !output.status.success() {
@@ -86,10 +77,17 @@ fn protected_migration_paths(repo: &Path, revision: &str) -> Result<HashSet<Stri
     let manifest: Value = serde_json::from_slice(&output.stdout)
         .map_err(|_| format!("released-migration manifest is invalid at {revision}"))?;
     let mut paths = HashSet::from([RELEASED_MANIFEST.to_string()]);
-    let migration_file = manifest["migration_file"]
-        .as_str()
-        .ok_or("released-migration manifest has no migration file")?;
-    paths.insert(migration_file.to_string());
+    match (
+        manifest["migration_dir"].as_str(),
+        manifest["migration_file"].as_str(),
+    ) {
+        // A trailing slash marks a directory prefix (see `is_protected`).
+        (Some(directory), _) => paths.insert(format!("{}/", directory.trim_end_matches('/'))),
+        (None, Some(file)) => paths.insert(file.to_string()),
+        (None, None) => {
+            return Err("released-migration manifest has no migration file or directory".into());
+        }
+    };
     let sections = manifest["protected_sections"]
         .as_object()
         .ok_or("released-migration manifest has no protected sections")?;
@@ -100,6 +98,48 @@ fn protected_migration_paths(repo: &Path, revision: &str) -> Result<HashSet<Stri
         paths.insert(path.to_string());
     }
     Ok(paths)
+}
+
+fn is_protected(protected: &HashSet<String>, path: &str) -> bool {
+    protected.contains(path)
+        || protected
+            .iter()
+            .any(|entry| entry.ends_with('/') && path.starts_with(entry.as_str()))
+}
+
+/// `NNN` of a `migrations/vNNN.rs` path, else `None`.
+fn migration_file_version(path: &str) -> Option<u32> {
+    let name = path.strip_prefix(MIGRATION_DIR)?.strip_prefix('/')?;
+    let number = name.strip_prefix('v')?.strip_suffix(".rs")?;
+    if number.contains('/') {
+        None
+    } else {
+        number.parse().ok()
+    }
+}
+
+fn is_migration_path(path: &str) -> bool {
+    path == STORE || migration_file_version(path).is_some()
+}
+
+/// The highest `migrations/vNNN.rs` at `revision`, if the layout is per-file.
+fn migration_file_head(repo: &Path, revision: &str) -> Result<Option<u32>, String> {
+    let output = git_output(
+        repo,
+        &[
+            "ls-tree",
+            "--name-only",
+            revision,
+            &format!("{MIGRATION_DIR}/"),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err("cannot inspect landing migration files".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(migration_file_version)
+        .max())
 }
 
 fn changed_paths(repo: &Path, target: &str, candidate: &str) -> Result<Vec<String>, String> {
@@ -133,14 +173,20 @@ fn changed_paths(repo: &Path, target: &str, candidate: &str) -> Result<Vec<Strin
     Ok(paths)
 }
 
-fn schema_version(repo: &Path, revision: &str) -> Result<u32, String> {
+fn store_source(repo: &Path, revision: &str) -> Result<String, String> {
     let path = format!("{revision}:{STORE}");
     let output = git_output(repo, &["show", &path])?;
     if !output.status.success() {
         return Err("cannot inspect landing migration source".into());
     }
-    let source = String::from_utf8(output.stdout)
-        .map_err(|_| "landing migration source is not UTF-8".to_string())?;
+    String::from_utf8(output.stdout).map_err(|_| "landing migration source is not UTF-8".into())
+}
+
+fn schema_version(repo: &Path, revision: &str) -> Result<u32, String> {
+    if let Some(head) = migration_file_head(repo, revision)? {
+        return Ok(head);
+    }
+    let source = store_source(repo, revision)?;
     let versions = source
         .lines()
         .filter_map(|line| {
@@ -155,6 +201,79 @@ fn schema_version(repo: &Path, revision: &str) -> Result<u32, String> {
     versions[0]
         .parse::<u32>()
         .map_err(|_| "invalid landing schema version".into())
+}
+
+/// Whether `revision`'s store carries the `if version < N {` migration block.
+fn has_migration_block(repo: &Path, revision: &str, version: u32) -> Result<bool, String> {
+    let block = format!("if version < {version} {{");
+    if migration_file_head(repo, revision)?.is_some() {
+        let output = git_output(
+            repo,
+            &[
+                "show",
+                &format!("{revision}:{MIGRATION_DIR}/v{version:03}.rs"),
+            ],
+        )?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == block));
+    }
+    Ok(store_source(repo, revision)?
+        .lines()
+        .any(|line| line.trim() == block))
+}
+
+/// The mechanical migration-number rule: a candidate that raises the schema
+/// version appends a contiguous run of migrations starting at exactly the
+/// target tip's version + 1, and every version in the run carries its block
+/// (one landing may carry several already-renumbered migrations in order).
+fn check_migration_number(
+    repo: &Path,
+    target: &str,
+    candidate: &str,
+) -> Result<Vec<u32>, PolicyRefusal> {
+    let schema = |revision| {
+        schema_version(repo, revision)
+            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))
+    };
+    let old = schema(target)?;
+    let new = schema(candidate)?;
+    if new < old {
+        return Err(PolicyRefusal::new(
+            PolicyFence::SchemaVersion,
+            "landing candidate lowers the released schema version",
+        ));
+    }
+    if new == old {
+        return Ok(Vec::new());
+    }
+    let needed = old + 1;
+    let mut appended = Vec::new();
+    for version in needed..=new {
+        let has_block = has_migration_block(repo, candidate, version)
+            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))?;
+        if !has_block {
+            let message = if version == needed && new != needed {
+                format!(
+                    "migration must be V{needed}: rolling LATEST_SCHEMA_VERSION is {old}, \
+                     the candidate declares {new} without a V{needed} block; renumber the \
+                     new blocks to start at V{needed} with no gaps"
+                )
+            } else {
+                format!(
+                    "migration V{version} has no `if version < {version} {{` block in \
+                     {MIGRATION_DIR}/v{version:03}.rs (or {STORE}); new migrations must run \
+                     contiguously from V{needed} to the declared head V{new}"
+                )
+            };
+            return Err(PolicyRefusal::new(PolicyFence::MigrationNumber, message));
+        }
+        appended.push(version);
+    }
+    Ok(appended)
 }
 
 pub(super) fn check_released_migrations(
@@ -210,122 +329,6 @@ fn inspect_work() -> Result<Vec<Value>, String> {
     })
 }
 
-fn inspect_allocations() -> Result<Vec<Value>, String> {
-    #[cfg(test)]
-    if let Some(path) = std::env::var_os("RSI_LANDER_TEST_ALLOCATION_ROWS") {
-        let data = std::fs::read(path).map_err(|error| error.to_string())?;
-        return serde_json::from_slice(&data).map_err(|error| error.to_string());
-    }
-    if std::env::var_os("RSI_SESSION_TOKEN").is_none() {
-        return Err("migration landing requires an rsi-managed Epic lead".into());
-    }
-    let mut cursor = Value::Null;
-    let mut seen = HashSet::new();
-    let mut rows = Vec::new();
-    for _ in 0..MAX_WORK_PAGES {
-        let response = rsi_common::agent_rpc_client::dispatch_from_env(
-            "AgentManagerInspect",
-            json!({"section":"migration_allocations","cursor":cursor,"limit":64}),
-        )
-        .map_err(|error| format!("cannot read migration allocations: {error}"))?;
-        if let Some(error) = response.error {
-            return Err(format!(
-                "migration allocation inspection refused: {}",
-                error.message
-            ));
-        }
-        let result = response
-            .result
-            .ok_or_else(|| "migration allocation inspection returned no result".to_string())?;
-        if result["section"] != "migration_allocations" {
-            return Err("migration allocation inspection returned the wrong section".into());
-        }
-        let page = result["rows"]
-            .as_array()
-            .ok_or("migration allocation inspection returned invalid rows")?;
-        if page.len() > 64 {
-            return Err("migration allocation inspection exceeded its page bound".into());
-        }
-        rows.extend(page.iter().cloned());
-        cursor = result["next_cursor"].clone();
-        if cursor.is_null() {
-            if result["complete"] != true {
-                return Err("migration allocation inspection is incomplete".into());
-            }
-            return Ok(rows);
-        }
-        if !seen.insert(cursor.to_string()) {
-            return Err("migration allocation inspection repeated a page cursor".into());
-        }
-    }
-    Err("migration allocation inspection exceeded its traversal bound".into())
-}
-
-fn check_allocation_rows(
-    rows: &[Value],
-    accepted: &[AcceptedPair],
-    proved_versions: &[u32],
-    mut predecessor_landed: impl FnMut(&str) -> Result<bool, String>,
-) -> Result<(), PolicyRefusal> {
-    for version in proved_versions {
-        let matches = rows
-            .iter()
-            .filter(|row| {
-                row["version"].as_u64() == Some(u64::from(*version))
-                    && matches!(row["state"].as_str(), Some("active" | "publishing"))
-                    && accepted
-                        .iter()
-                        .any(|pair| row["source_commit"] == pair.source)
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(PolicyRefusal::new(
-                PolicyFence::MigrationOutOfOrder,
-                format!("migration V{version} lacks one live exact-source seal in landing order"),
-            ));
-        }
-        let predecessors = matches[0]["predecessor_sources"]
-            .as_array()
-            .ok_or_else(|| {
-                PolicyRefusal::new(
-                    PolicyFence::LedgerUnavailable,
-                    "migration allocation lacks predecessor evidence",
-                )
-            })?;
-        if predecessors.len() > 256 {
-            return Err(PolicyRefusal::new(
-                PolicyFence::MigrationOutOfOrder,
-                "migration predecessor traversal exceeds its bound",
-            ));
-        }
-        for prior in predecessors {
-            let source = prior
-                .as_str()
-                .filter(|source| {
-                    source.len() == 40
-                        && source
-                            .bytes()
-                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                })
-                .ok_or_else(|| {
-                    PolicyRefusal::new(
-                        PolicyFence::LedgerUnavailable,
-                        "invalid migration predecessor source",
-                    )
-                })?;
-            if !predecessor_landed(source)
-                .map_err(|message| PolicyRefusal::new(PolicyFence::LedgerUnavailable, message))?
-            {
-                return Err(PolicyRefusal::new(
-                    PolicyFence::MigrationOutOfOrder,
-                    format!("migration V{version} precedes an unlanded lower seal"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn inspect_work_with_page(
     mut page_source: impl FnMut(Value) -> Result<Value, String>,
 ) -> Result<Vec<Value>, String> {
@@ -357,139 +360,6 @@ fn inspect_work_with_page(
         }
     }
     Err("landing ownership ledger exceeded its traversal bound".into())
-}
-
-fn check_rows(
-    rows: &[Value],
-    accepted: &[AcceptedPair],
-    hot_paths: &[String],
-    new_versions: &[u32],
-    migration_requires_binding: bool,
-) -> Result<(), PolicyRefusal> {
-    let mut matched = Vec::new();
-    let mut epic = None;
-    if migration_requires_binding {
-        for pair in accepted {
-            let source_rows = rows
-                .iter()
-                .filter(|row| {
-                    row["source_commit"] == pair.source
-                        && row["source_accepted"] == true
-                        && live_unintegrated(row)
-                })
-                .collect::<Vec<_>>();
-            if source_rows.is_empty() {
-                let hint = recorded_work_hint(rows, new_versions);
-                return Err(PolicyRefusal::new(
-                    PolicyFence::SourceUnbound,
-                    format!(
-                        "accepted source {} lacks a visible live Work record{hint}",
-                        pair.source,
-                    ),
-                ));
-            }
-            for row in source_rows {
-                let row_epic = row["epic_id"].as_str().ok_or_else(|| {
-                    PolicyRefusal::new(
-                        PolicyFence::SourceUnbound,
-                        "accepted Work has no owning Epic",
-                    )
-                })?;
-                if epic.is_some_and(|current| current != row_epic) {
-                    return Err(PolicyRefusal::new(
-                        PolicyFence::SourceUnbound,
-                        "accepted sources belong to different Epics",
-                    ));
-                }
-                epic = Some(row_epic);
-                matched.push(row);
-            }
-        }
-    }
-    for path in hot_paths {
-        let blocked = rows.iter().any(|work| {
-            if !live_unintegrated(work) {
-                return false;
-            }
-            let own_source = accepted.iter().any(|pair| {
-                pair.source == work["source_commit"].as_str().unwrap_or_default()
-                    && work["source_accepted"] == true
-            });
-            !own_source
-                && work["ownership"].as_array().is_some_and(|claims| {
-                    claims.iter().any(|claim| {
-                        claim["active"] == true
-                            && claim["mode"] == "exclusive"
-                            && claim["domain"] == *path
-                            && claim["work_key"] == work["key"]
-                            && claim["files"].as_array().is_some_and(|files| {
-                                files.iter().any(|file| file.as_str() == Some(path))
-                            })
-                    })
-                })
-        });
-        if blocked {
-            return Err(PolicyRefusal::new(
-                PolicyFence::HotFileUnowned,
-                format!("hot file is claimed by another live unintegrated Work: {path}"),
-            ));
-        }
-    }
-    for version in new_versions {
-        let reserved = matched.iter().any(|work| {
-            work["migration_reservations"]
-                .as_array()
-                .is_some_and(|claims| {
-                    claims.iter().any(|claim| {
-                        claim["version"].as_u64() == Some(u64::from(*version))
-                            && claim["active"] != false
-                            && claim["work_key"] == work["key"]
-                            && claim["row_version"].as_i64().is_some_and(|v| v > 0)
-                    })
-                })
-        });
-        if !reserved {
-            return Err(PolicyRefusal::new(
-                PolicyFence::MigrationUnreserved,
-                format!("migration V{version} is not reserved to the landing Epic"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn recorded_work_hint(rows: &[Value], new_versions: &[u32]) -> String {
-    let recorded = rows
-        .iter()
-        .filter(|row| live_unintegrated(row))
-        .filter(|row| {
-            new_versions.is_empty()
-                || row["migration_reservations"]
-                    .as_array()
-                    .is_some_and(|claims| {
-                        claims.iter().any(|claim| {
-                            claim["version"].as_u64().is_some_and(|version| {
-                                new_versions
-                                    .iter()
-                                    .any(|candidate| u64::from(*candidate) == version)
-                            })
-                        })
-                    })
-        })
-        .filter_map(|row| {
-            Some(format!(
-                "{} source_commit={}",
-                row["key"].as_str()?,
-                row["source_commit"].as_str()?
-            ))
-        })
-        .take(4)
-        .collect::<Vec<_>>();
-    if recorded.is_empty() {
-        String::new()
-    } else {
-        format!("; recorded Work: {}", recorded.join(", "))
-    }
 }
 
 fn live_unintegrated(work: &Value) -> bool {
@@ -532,22 +402,6 @@ fn source_bindings(
         .collect()
 }
 
-/*
- * Migration reservations remain bound to accepted Work. Hot-file conflicts
- * are checked independently against all live Work claims, so an otherwise
- * eligible unbound landing can proceed when no other Work owns the path.
- */
-
-pub fn check(
-    repo: &Path,
-    source_repo: &Path,
-    target: &str,
-    candidate: &str,
-    accepted: &[AcceptedPair],
-) -> Result<(), PolicyRefusal> {
-    check_with_proof(repo, source_repo, target, candidate, accepted, &[]).map(|_| ())
-}
-
 pub fn check_with_proof(
     repo: &Path,
     source_repo: &Path,
@@ -556,7 +410,7 @@ pub fn check_with_proof(
     accepted: &[AcceptedPair],
     proved_versions: &[u32],
 ) -> Result<Vec<SourceBinding>, PolicyRefusal> {
-    let bindings = check_with_work_and_proof(
+    check_with_work_and_proof(
         repo,
         source_repo,
         target,
@@ -564,17 +418,10 @@ pub fn check_with_proof(
         accepted,
         proved_versions,
         inspect_work,
-    )?;
-    if !proved_versions.is_empty() {
-        let rows = inspect_allocations()
-            .map_err(|message| PolicyRefusal::new(PolicyFence::LedgerUnavailable, message))?;
-        check_allocation_rows(&rows, accepted, proved_versions, |source| {
-            super::git_is_ancestor(repo, source, target)
-        })?;
-    }
-    Ok(bindings)
+    )
 }
 
+#[cfg(test)]
 pub fn check_with_work(
     repo: &Path,
     source_repo: &Path,
@@ -605,35 +452,21 @@ pub fn check_with_work_and_proof(
 ) -> Result<Vec<SourceBinding>, PolicyRefusal> {
     let paths = changed_paths(repo, target, candidate)
         .map_err(|message| PolicyRefusal::new(PolicyFence::PathInspection, message))?;
-    let hot_paths = paths
-        .iter()
-        .filter(|path| is_hot_file(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut new_versions = Vec::new();
     let protected = protected_migration_paths(repo, target)
         .and_then(|mut paths| {
             paths.extend(protected_migration_paths(repo, candidate)?);
             Ok(paths)
         })
         .map_err(|message| PolicyRefusal::new(PolicyFence::ReleasedMigration, message))?;
-    if paths.iter().any(|path| protected.contains(path)) {
+    if paths.iter().any(|path| is_protected(&protected, path)) {
         check_released_migrations(repo, source_repo, target, candidate)
             .map_err(|message| PolicyRefusal::new(PolicyFence::ReleasedMigration, message))?;
     }
-    if paths.iter().any(|path| path == STORE) {
-        let old = schema_version(repo, target)
-            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))?;
-        let new = schema_version(repo, candidate)
-            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))?;
-        if new < old {
-            return Err(PolicyRefusal::new(
-                PolicyFence::SchemaVersion,
-                "landing candidate lowers the released schema version",
-            ));
-        }
-        new_versions.extend(old + 1..=new);
-    }
+    let new_versions = if paths.iter().any(|path| is_migration_path(path)) {
+        check_migration_number(repo, target, candidate)?
+    } else {
+        Vec::new()
+    };
     if proved_versions
         .iter()
         .any(|version| !new_versions.contains(version))
@@ -643,52 +476,20 @@ pub fn check_with_work_and_proof(
             "provisional proof version is outside the candidate's appended migration range",
         ));
     }
-    new_versions.retain(|version| !proved_versions.contains(version));
-    check_work_requirements(
-        accepted,
-        &hot_paths,
-        &new_versions,
-        proved_versions,
-        work_rows,
-    )
+    Ok(report_bindings(accepted, work_rows))
 }
 
-fn check_work_requirements(
+/// Report each source's Work binding. The lookup is informational: an
+/// unreadable ledger (no lead token, daemon down) reports `unknown` and never
+/// refuses the landing.
+fn report_bindings(
     accepted: &[AcceptedPair],
-    hot_paths: &[String],
-    unproved_versions: &[u32],
-    proved_versions: &[u32],
     work_rows: impl FnOnce() -> Result<Vec<Value>, String>,
-) -> Result<Vec<SourceBinding>, PolicyRefusal> {
-    let required =
-        !hot_paths.is_empty() || !unproved_versions.is_empty() || !proved_versions.is_empty();
-    let should_inspect = required || std::env::var_os("RSI_SESSION_TOKEN").is_some();
-    let (rows, lookup_unknown) = inspect_work_or_mark_unknown(required, should_inspect, work_rows)?;
-    check_rows(
-        &rows,
-        accepted,
-        hot_paths,
-        unproved_versions,
-        !unproved_versions.is_empty() || !proved_versions.is_empty(),
-    )?;
-    Ok(source_bindings(accepted, &rows, lookup_unknown))
-}
-
-fn inspect_work_or_mark_unknown(
-    required: bool,
-    should_inspect: bool,
-    work_rows: impl FnOnce() -> Result<Vec<Value>, String>,
-) -> Result<(Vec<Value>, bool), PolicyRefusal> {
-    if !should_inspect {
-        return Ok((Vec::new(), true));
-    }
-    match work_rows() {
-        Ok(rows) => Ok((rows, false)),
-        Err(message) if required => {
-            Err(PolicyRefusal::new(PolicyFence::LedgerUnavailable, message))
-        }
-        Err(_) => Ok((Vec::new(), true)),
-    }
+) -> Vec<SourceBinding> {
+    work_rows().map_or_else(
+        |_| source_bindings(accepted, &[], true),
+        |rows| source_bindings(accepted, &rows, false),
+    )
 }
 
 #[cfg(test)]
@@ -704,186 +505,25 @@ mod tests {
         }
     }
 
-    fn row(active: bool, mode: &str, domain: &str, version: u32) -> Value {
+    fn row(integrated: bool) -> Value {
         json!({
             "key":"landing-work", "epic_id":"epic-j", "source_commit":SOURCE,
-            "source_accepted":true, "integrated":false, "archived":false,
+            "source_accepted":true, "integrated":integrated, "archived":false,
             "updated_at":Utc::now().to_rfc3339(),
-            "ownership":[{"work_key":"landing-work","active":active,"mode":mode,
-                          "domain":domain,"files":[STORE]}],
-            "migration_reservations":[{"work_key":"landing-work","version":version,
-                                       "row_version":1}]
         })
     }
 
     #[test]
-    fn catalog_marks_registered_paths() {
-        for path in [
-            STORE,
-            "crates/rsid/src/rpc.rs",
-            "crates/rsi-common/src/agent_control_schema.rs",
-            "crates/rsi-common/src/bin/rsi-rpc.rs",
-            "crates/rsid/src/session/harness/tools/mod.rs",
-            "crates/rsid/src/session/harness/tools/rsi_control.rs",
-            "crates/rsid/src/tool_registry.rs",
-            "crates/rsi-common/src/harness_manager_v2.rs",
-            "AGENTS.md",
-            "crates/rsid/AGENTS.md",
-            ".claude/skills/rsi-agent-control/SKILL.md",
-        ] {
-            assert!(is_hot_file(path), "{path}");
-        }
-        assert!(!is_hot_file("scripts/rolling-landing-guard.py"));
-    }
-
-    #[test]
-    fn exact_exclusive_claim_and_next_migration_pass() {
-        let rows = [row(true, "exclusive", STORE, 125)];
-        check_rows(&rows, &[pair()], &[STORE.into()], &[125], true).unwrap();
-    }
-
-    #[test]
-    fn proved_migration_requires_accepted_work_without_a_number_reservation() {
-        let mut accepted = row(true, "exclusive", STORE, 125);
-        accepted["migration_reservations"] = json!([]);
-        let check = |rows| check_work_requirements(&[pair()], &[], &[], &[125], || Ok(rows));
-        check(vec![accepted.clone()]).expect("live accepted Work authorizes the proved unit");
-        assert_eq!(check(vec![]).unwrap_err().fence, PolicyFence::SourceUnbound);
-        accepted["source_accepted"] = json!(false);
-        assert_eq!(
-            check(vec![accepted]).unwrap_err().fence,
-            PolicyFence::SourceUnbound
-        );
-    }
-
-    #[test]
-    fn unrelated_nonmigration_change_needs_no_work_lookup() {
-        let binding = check_work_requirements(&[pair()], &[], &[], &[], || Ok(vec![]))
-            .expect("ordinary source has a binding status");
-        assert!(matches!(binding[0].state, "unbound" | "unknown"));
-    }
-
-    #[test]
-    fn skipped_work_lookup_reports_binding_unknown() {
-        let (rows, lookup_unknown) =
-            inspect_work_or_mark_unknown(false, false, || panic!("lookup was skipped"))
-                .expect("skipping an optional lookup is not a refusal");
-        let binding = source_bindings(&[pair()], &rows, lookup_unknown);
-        assert_eq!(binding[0].state, "unknown");
-    }
-
-    #[test]
-    fn missing_wrong_domain_shared_and_inactive_claims_refuse() {
-        for (active, mode, domain) in [
-            (false, "exclusive", STORE),
-            (true, "shared", STORE),
-            (true, "exclusive", "other-domain"),
-        ] {
-            let mut other = row(active, mode, domain, 125);
-            other["key"] = json!("other-work");
-            other["source_commit"] = json!("2222222222222222222222222222222222222222");
-            assert!(check_rows(&[other], &[pair()], &[STORE.into()], &[], false).is_ok());
-        }
-        assert!(check_rows(&[], &[pair()], &[STORE.into()], &[], false).is_ok());
-    }
-
-    #[test]
-    fn unbound_hot_file_source_passes_and_is_reported_when_no_work_claims_it() {
-        let binding = check_work_requirements(&[pair()], &[STORE.into()], &[], &[], || Ok(vec![]))
-            .expect("an unbound source is allowed without a conflicting live claim");
-        assert_eq!(binding[0].source, SOURCE);
-        assert_eq!(binding[0].state, "unbound");
-    }
-
-    #[test]
-    fn hot_file_claims_only_block_for_other_live_unintegrated_work() {
-        let mut other = row(true, "exclusive", STORE, 125);
-        other["key"] = json!("other-work");
-        other["source_commit"] = json!("2222222222222222222222222222222222222222");
-        other["ownership"][0]["work_key"] = json!("other-work");
-        let pairs = [pair()];
-        assert_eq!(
-            check_rows(&[other.clone()], &pairs, &[STORE.into()], &[], false)
-                .unwrap_err()
-                .fence,
-            PolicyFence::HotFileUnowned
-        );
-        other["integrated"] = json!(true);
-        check_rows(&[other.clone()], &pairs, &[STORE.into()], &[], false)
-            .expect("integrated claim is void");
-        other["integrated"] = json!(false);
-        other["archived"] = json!(true);
-        check_rows(&[other.clone()], &pairs, &[STORE.into()], &[], false)
-            .expect("archived claim is void");
-        other["archived"] = json!(false);
-        other["updated_at"] = json!((Utc::now() - Duration::hours(25)).to_rfc3339());
-        check_rows(&[other], &pairs, &[STORE.into()], &[], false).expect("idle claim is void");
-    }
-
-    #[test]
-    fn reservation_and_source_binding_refuse_mismatch() {
-        let rows = [row(true, "exclusive", STORE, 125)];
-        assert_eq!(
-            check_rows(&rows, &[pair()], &[STORE.into()], &[126], true)
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationUnreserved
-        );
-        let mut different = pair();
-        different.source = "2".repeat(40);
-        let refusal = check_rows(&rows, &[different], &[], &[125], true).unwrap_err();
-        assert_eq!(refusal.fence, PolicyFence::SourceUnbound);
-        assert!(refusal.message.contains(&format!("source_commit={SOURCE}")));
-    }
-
-    #[test]
-    fn transferred_reservation_passes_and_released_reservation_refuses() {
-        let mut former = row(true, "exclusive", STORE, 125);
-        former["key"] = json!("former-work");
-        former["migration_reservations"] = json!([]);
-        let current = row(true, "exclusive", STORE, 125);
-        check_rows(
-            &[former.clone(), current.clone()],
-            &[pair()],
-            &[],
-            &[125],
-            true,
-        )
-        .unwrap();
-        let mut released = current;
-        released["migration_reservations"][0]["active"] = json!(false);
-        assert_eq!(
-            check_rows(&[former, released], &[pair()], &[], &[125], true)
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationUnreserved
-        );
-    }
-
-    #[test]
-    fn mixed_epic_sources_refuse_with_source_fence() {
-        let mut other = row(true, "exclusive", STORE, 125);
-        other["source_commit"] = json!("2222222222222222222222222222222222222222");
-        other["epic_id"] = json!("epic-other");
-        let pairs = [
-            pair(),
-            AcceptedPair {
-                base: "0".repeat(40),
-                source: "2".repeat(40),
-            },
-        ];
-        assert_eq!(
-            check_rows(
-                &[row(true, "exclusive", STORE, 125), other],
-                &pairs,
-                &[],
-                &[],
-                true
-            )
-            .unwrap_err()
-            .fence,
-            PolicyFence::SourceUnbound
-        );
+    fn binding_report_is_bound_unbound_or_unknown_and_never_refuses() {
+        let bound = report_bindings(&[pair()], || Ok(vec![row(false)]));
+        assert_eq!(bound[0].source, SOURCE);
+        assert_eq!(bound[0].state, "bound");
+        let unbound = report_bindings(&[pair()], || Ok(vec![]));
+        assert_eq!(unbound[0].state, "unbound");
+        let integrated = report_bindings(&[pair()], || Ok(vec![row(true)]));
+        assert_eq!(integrated[0].state, "unbound");
+        let unknown = report_bindings(&[pair()], || Err("no lead token".into()));
+        assert_eq!(unknown[0].state, "unknown");
     }
 
     #[test]
@@ -926,59 +566,5 @@ mod tests {
             .unwrap_err()
             .contains("traversal bound")
         );
-    }
-
-    #[test]
-    fn proved_migration_requires_its_exact_source_and_allocated_version() {
-        let sealed =
-            json!({"source_commit":SOURCE,"version":125,"state":"active","predecessor_sources":[]});
-        check_allocation_rows(&[sealed.clone()], &[pair()], &[125], |_| Ok(true)).unwrap();
-        assert_eq!(
-            check_allocation_rows(&[sealed.clone()], &[pair()], &[126], |_| Ok(true))
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationOutOfOrder
-        );
-        let wrong_source = json!({"source_commit":"2222222222222222222222222222222222222222","version":125,"state":"active","predecessor_sources":[]});
-        assert_eq!(
-            check_allocation_rows(&[wrong_source], &[pair()], &[125], |_| Ok(true))
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationOutOfOrder
-        );
-        let mut released = sealed.clone();
-        released["state"] = json!("released");
-        assert_eq!(
-            check_allocation_rows(&[released], &[pair()], &[125], |_| Ok(true))
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationOutOfOrder
-        );
-        assert_eq!(
-            check_allocation_rows(
-                &[sealed.clone(), sealed.clone()],
-                &[pair()],
-                &[125],
-                |_| Ok(true)
-            )
-            .unwrap_err()
-            .fence,
-            PolicyFence::MigrationOutOfOrder
-        );
-        let earlier = "3333333333333333333333333333333333333333";
-        let blocked = json!({"source_commit":SOURCE,"version":125,"state":"active","predecessor_sources":[earlier]});
-        assert_eq!(
-            check_allocation_rows(&[blocked.clone()], &[pair()], &[125], |_| Ok(false))
-                .unwrap_err()
-                .fence,
-            PolicyFence::MigrationOutOfOrder
-        );
-        check_allocation_rows(
-            &[blocked],
-            &[pair()],
-            &[125],
-            |source| Ok(source == earlier),
-        )
-        .unwrap();
     }
 }

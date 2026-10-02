@@ -19,8 +19,18 @@ use std::{path::PathBuf, process::Command, sync::Arc};
 use tempfile::TempDir;
 
 mod bookkeeping_cas;
+mod local_only_git;
 mod review_end;
 mod review_infra_retry;
+
+/// Disk-backed (never tmpfs) and outside every repository, so the
+/// GIT_CEILING_DIRECTORIES fence in `command` holds. A fresh host has no such
+/// directory until a test creates it (Issue #935).
+fn evidence_temp_root() -> &'static Path {
+    const ROOT: &str = "/var/tmp/ham-v2-fd23a414";
+    std::fs::create_dir_all(ROOT).expect("create the evidence temp root");
+    Path::new(ROOT)
+}
 
 fn command(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -58,7 +68,7 @@ async fn fixture() -> Fixture {
 async fn fixture_with_merged_source(merge_rolling: bool) -> Fixture {
     let dir = tempfile::Builder::new()
         .prefix("evidence-")
-        .tempdir_in("/var/tmp/ham-v2-fd23a414")
+        .tempdir_in(evidence_temp_root())
         .unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir(&root).unwrap();
@@ -264,6 +274,7 @@ async fn fixture_with_merged_source(merge_rolling: bool) -> Fixture {
                         ManagerWorkStageV2::Review,
                         ManagerWorkStageV2::Verification,
                     ],
+                    risk_tier: Default::default(),
                 },
                 "work",
             ),
@@ -934,6 +945,8 @@ async fn request_db_review(f: &Fixture, idempotency_key: &str) -> Uuid {
                         model: "claude-sonnet-5".into(),
                         effort: None,
                     },
+                    delta_of: None,
+                    finding_keys: vec![],
                 },
                 idempotency_key,
             ),
@@ -965,6 +978,8 @@ async fn request_review_uses_live_head_after_sandbox_advances_past_allocation() 
                         model: "claude-sonnet-5".into(),
                         effort: None,
                     },
+                    delta_of: None,
+                    finding_keys: vec![],
                 },
                 "review-advanced-allocation",
             ),
@@ -1754,6 +1769,125 @@ async fn archived_db_reviewed_source_integrates_from_exact_remote_repository() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
+async fn quarantined_custody_db_reviewed_source_integrates_from_exact_remote_repository() {
+    let f = fixture().await;
+    let assignment_id = request_and_activate_db_review(&f, "quarantine-review").await;
+    f.handle
+        .agent_submit_review_receipt(
+            f.reviewer,
+            AgentSubmitReviewReceiptRequestV1 {
+                assignment_id,
+                verdict: ManagerReviewVerdictV1::Accepted,
+                findings: vec![],
+                idempotency_key: "quarantine-accepted-receipt".into(),
+            },
+        )
+        .await
+        .unwrap();
+    {
+        let store = f.handle.store.lock().await;
+        store
+            .update_session_status(f.reviewer, SessionStatus::Completed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE model_invocations SET status='completed',completed_at=?2 WHERE id=?1",
+                params![
+                    f.invocation.to_string(),
+                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        // The source stays Completed, but its custody root is quarantined so
+        // it can no longer hold live custody (`validation_error_code=root_missing`).
+        assert!(store.live_custody_for_session(f.source).is_ok());
+        let (custody_id, generation, event_sequence): (String, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT r.custody_id,r.generation,r.event_sequence FROM sandbox_custody_roots r JOIN sessions s ON s.sandbox_custody_id=r.custody_id WHERE s.id=?1",
+                [f.source.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO sandbox_custody_events(event_id,custody_id,sequence,event_kind,cause,from_generation,to_generation,from_owner_session_id,to_owner_session_id,prior_state,next_state,error_code,occurred_at) VALUES(?1,?2,?3,'quarantined','cleanup_failure',?4,?5,?6,NULL,'live','quarantined','root_missing',?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    custody_id,
+                    event_sequence + 1,
+                    generation,
+                    generation + 1,
+                    f.source.to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+        let quarantined = store
+            .conn
+            .execute(
+                "UPDATE sandbox_custody_roots SET state='quarantined',owner_session_id=NULL,generation=?2,event_sequence=?3,validation_state='invalid',validated_generation=?2,validated_at=?4,validation_error_code='root_missing',updated_at=?4 WHERE custody_id=?1",
+                params![custody_id, generation + 1, event_sequence + 1, now],
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+        assert!(store.live_custody_for_session(f.source).is_err());
+    }
+
+    let root = f.dir.path().join("repo");
+    let remote = f.dir.path().join("origin.git");
+    std::fs::create_dir(&remote).unwrap();
+    command(&remote, &["init", "--bare"]);
+    command(
+        &root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    command(
+        &root,
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/rolling", f.source_head),
+        ],
+    );
+
+    f.handle
+        .agent_manager_update(
+            f.manager,
+            req(
+                ManagerUpdateV2::Integration {
+                    key: "product".into(),
+                    expected_row_version: 2,
+                    source_commit: f.source_head.clone(),
+                    target_commit: f.source_head.clone(),
+                    verification: None,
+                },
+                "quarantine-remote-integrated",
+            ),
+        )
+        .await
+        .unwrap();
+    let rows = f
+        .handle
+        .agent_manager_inspect(
+            f.manager,
+            AgentManagerInspectRequestV2 {
+                section: ManagerInspectSectionV2::Work,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(rows[0]["integrated"], true);
+    assert_eq!(rows[0]["integration"]["target_commit"], f.source_head);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
 async fn completed_db_review_receipt_survives_manager_seat_rotation() {
     let f = fixture().await;
     let assignment_id = request_and_activate_db_review(&f, "rotation-review").await;
@@ -1933,6 +2067,8 @@ async fn manager_seat_rotation_preserves_the_durable_review_assignment_budget() 
                     model: "claude-sonnet-5".into(),
                     effort: None,
                 },
+                delta_of: None,
+                finding_keys: vec![],
             },
             key,
             scope_version,
@@ -2150,6 +2286,8 @@ async fn rotated_manager_supersedes_active_review_and_old_reviewer_loses_authori
                         model: "z-ai/glm-5.3-flashx".into(),
                         effort: None,
                     },
+                    delta_of: None,
+                    finding_keys: vec![],
                 },
                 "rotation-reassigned-review",
                 scope_version,
@@ -2231,6 +2369,8 @@ async fn db_review_restart_failpoints_preserve_one_assignment_receipt_and_effect
                     model: "claude-sonnet-5".into(),
                     effort: None,
                 },
+                delta_of: None,
+                finding_keys: vec![],
             },
             "restart-review",
         )
@@ -2416,6 +2556,57 @@ async fn db_review_restart_failpoints_preserve_one_assignment_receipt_and_effect
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
+async fn reserved_review_journals_before_claim_after_restart_without_premature_failure() {
+    use crate::store::manager_reviews::{ManagerReviewFault, manager_review_fail_next};
+
+    let f = fixture().await;
+    record_db_review_source(&f, "reserved-review-before-claim").await;
+    manager_review_fail_next(ManagerReviewFault::AfterAllocationJournal);
+    let assignment_id = request_db_review(&f, "reserved-review-before-claim").await;
+    assert_eq!(
+        review_state(&*f.handle.store.lock().await, assignment_id).0,
+        "reserved"
+    );
+
+    let reopened = Store::open(&f.dir.path().join("rsi.db")).unwrap();
+    assert_eq!(
+        reopened
+            .reconcile_reserved_manager_reviews_once()
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(review_state(&reopened, assignment_id).0, "allocating");
+    // The journal has a reserved reviewer identity, but no session until its
+    // CreateSession action runs. Refresh must preserve that pending owner.
+    assert_eq!(
+        reopened
+            .reconcile_manager_review_assignments_once()
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(review_state(&reopened, assignment_id).0, "allocating");
+    let action_id: String = reopened
+        .conn
+        .query_row(
+            "SELECT action_operation_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .claim_manager_action(Uuid::new_v4())
+            .unwrap()
+            .unwrap()
+            .id(),
+        Uuid::parse_str(&action_id).unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
 async fn db_review_enrollment_blocks_legacy_override_and_retains_superseded_history() {
     let f = fixture().await;
     let first = request_and_activate_db_review(&f, "blocked-review").await;
@@ -2477,6 +2668,8 @@ async fn db_review_enrollment_blocks_legacy_override_and_retains_superseded_hist
                         model: "z-ai/glm-5.3-flashx".into(),
                         effort: None,
                     },
+                    delta_of: None,
+                    finding_keys: vec![],
                 },
                 "review-again",
             ),
@@ -2918,10 +3111,18 @@ async fn independent_acceptance_and_combined_evidence_record_real_integration() 
     );
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
-#[tokio::test]
-async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released_code() {
-    let f = fixture().await;
+/// A scratch repo whose `rolling` baseline is the current per-file store layout:
+/// the manifest, `store/mod.rs`, every file under the manifest's
+/// `migration_dir`, and every protected-section file.
+struct MigrationScratch {
+    root: PathBuf,
+    baseline: String,
+    digest: String,
+    inventory: Value,
+    migration_dir: String,
+}
+
+async fn migration_scratch(f: &Fixture) -> MigrationScratch {
     let root = f.dir.path().join("repo");
     let remote = f.dir.path().join("origin.git");
     std::fs::create_dir(&remote).unwrap();
@@ -2933,10 +3134,15 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let inventory_bytes = std::fs::read(repo.join("tools/released-migrations.json")).unwrap();
     let inventory: Value = serde_json::from_slice(&inventory_bytes).unwrap();
+    let migration_dir = inventory["migration_dir"].as_str().unwrap().to_string();
     let mut paths = std::collections::BTreeSet::from([
         "tools/released-migrations.json".to_string(),
         "crates/rsid/src/store/mod.rs".to_string(),
     ]);
+    for entry in std::fs::read_dir(repo.join(&migration_dir)).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        paths.insert(format!("{migration_dir}/{name}"));
+    }
     for pin in inventory["protected_sections"]
         .as_object()
         .unwrap()
@@ -2952,11 +3158,30 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
     command(&root, &["commit", "-m", "canonical migration catalog"]);
     let baseline = command(&root, &["rev-parse", "HEAD"]);
     command(&root, &["push", "origin", "rolling:refs/heads/rolling"]);
+    MigrationScratch {
+        root,
+        baseline,
+        digest: format!("sha256:{:x}", Sha256::digest(&inventory_bytes)),
+        inventory,
+        migration_dir,
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released_code() {
+    let f = fixture().await;
+    let MigrationScratch {
+        root,
+        baseline,
+        digest,
+        inventory,
+        migration_dir,
+    } = migration_scratch(&f).await;
     std::fs::write(root.join("local-only.txt"), "local rolling advanced\n").unwrap();
     command(&root, &["add", "local-only.txt"]);
     command(&root, &["commit", "-m", "local rolling advanced"]);
     let local_head = command(&root, &["rev-parse", "HEAD"]);
-    let digest = format!("sha256:{:x}", Sha256::digest(&inventory_bytes));
     git::migration(&f.source_root, &baseline, &digest)
         .await
         .unwrap();
@@ -2972,10 +3197,11 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
             .to_string()
             .contains("manager_v2_stale_migration_baseline")
     );
-    let path = "crates/rsid/src/store/mod.rs";
-    let old = std::fs::read_to_string(root.join(path)).unwrap();
+    // The V0 region lives in v000.rs in the per-file layout.
+    let path = format!("{migration_dir}/v000.rs");
+    let old = std::fs::read_to_string(root.join(&path)).unwrap();
     std::fs::write(
-        root.join(path),
+        root.join(&path),
         old.replace("// V0: Original schema", "// V0: Original schema changed"),
     )
     .unwrap();
@@ -3004,6 +3230,123 @@ async fn canonical_migration_inventory_requires_every_pin_and_unchanged_released
             .to_string()
             .contains("released_inventory_changed")
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn a_changed_released_per_file_migration_is_refused() {
+    let f = fixture().await;
+    let scratch = migration_scratch(&f).await;
+    let path = format!("{}/v005.rs", scratch.migration_dir);
+    let old = std::fs::read_to_string(scratch.root.join(&path)).unwrap();
+    assert!(old.contains("if version < 5 {"));
+    std::fs::write(
+        scratch.root.join(&path),
+        old.replace(
+            "if version < 5 {",
+            "if version < 5 {\n            // edited",
+        ),
+    )
+    .unwrap();
+    command(&scratch.root, &["commit", "-am", "edit released v005"]);
+    let changed = command(&scratch.root, &["rev-parse", "HEAD"]);
+    command(
+        &scratch.root,
+        &["push", "origin", "rolling:refs/heads/rolling"],
+    );
+    let error = git::migration(&f.source_root, &changed, &scratch.digest)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_released_source_changed"),
+        "{error}"
+    );
+    assert_eq!(scratch.inventory["migration_dir"], scratch.migration_dir);
+}
+
+fn scratch_store_repo(dir: &Path, files: &[(&str, &str)]) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    command(dir, &["init", "-q"]);
+    command(dir, &["config", "user.email", "t@example.com"]);
+    command(dir, &["config", "user.name", "t"]);
+    for (path, text) in files {
+        std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(path), text).unwrap();
+        command(dir, &["add", path]);
+    }
+    command(dir, &["commit", "-q", "-m", "scratch store"]);
+    let tip = command(dir, &["rev-parse", "HEAD"]);
+    command(dir, &["update-ref", "refs/remotes/origin/rolling", &tip]);
+    tip
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn the_schema_head_follows_the_store_layout_of_the_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = |latest: u32| format!("{{\"latest_schema_version\": {latest}}}");
+    let per_file = scratch_store_repo(
+        &dir.path().join("per-file"),
+        &[
+            ("tools/released-migrations.json", &manifest(7)),
+            ("crates/rsid/src/store/mod.rs", "// no declaration here\n"),
+            ("crates/rsid/src/store/migrations/v000.rs", "// v0\n"),
+            ("crates/rsid/src/store/migrations/v007.rs", "// v7\n"),
+        ],
+    );
+    let legacy = scratch_store_repo(
+        &dir.path().join("legacy"),
+        &[
+            ("tools/released-migrations.json", &manifest(7)),
+            (
+                "crates/rsid/src/store/mod.rs",
+                "pub const LATEST_SCHEMA_VERSION: i32 = 7;\n",
+            ),
+        ],
+    );
+    let stale = scratch_store_repo(
+        &dir.path().join("stale"),
+        &[
+            ("tools/released-migrations.json", &manifest(8)),
+            ("crates/rsid/src/store/mod.rs", "// no declaration here\n"),
+            ("crates/rsid/src/store/migrations/v007.rs", "// v7\n"),
+        ],
+    );
+    // A per-file tip takes its head from the highest vNNN.rs file.
+    assert_eq!(
+        git::migration_seal_head(&dir.path().join("per-file"))
+            .await
+            .unwrap(),
+        (per_file, 7)
+    );
+    // A legacy tip still needs the LATEST_SCHEMA_VERSION declaration.
+    assert_eq!(
+        git::migration_seal_head(&dir.path().join("legacy"))
+            .await
+            .unwrap(),
+        (legacy.clone(), 7)
+    );
+    let error = git::migration_seal_head(&dir.path().join("stale"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("manager_v2_schema_head_changed"),
+        "{error}"
+    );
+    assert!(matches!(
+        git::migration_layout(&dir.path().join("legacy"), &legacy)
+            .await
+            .unwrap(),
+        git::MigrationLayout::Legacy { .. }
+    ));
+    assert!(matches!(
+        git::migration_layout(&dir.path().join("stale"), "HEAD")
+            .await
+            .unwrap(),
+        git::MigrationLayout::PerFile { head: 7 }
+    ));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

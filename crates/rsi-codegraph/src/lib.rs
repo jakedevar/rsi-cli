@@ -14,6 +14,7 @@ const SCHEMA_VERSION: i64 = 6;
 
 pub mod cargo_metadata;
 pub mod extract;
+pub mod impact;
 pub mod invalidate;
 pub mod lifecycle;
 pub mod query;

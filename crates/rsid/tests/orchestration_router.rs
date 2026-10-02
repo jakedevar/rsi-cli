@@ -37,7 +37,7 @@ fn load_orchestration_router_returns_committed_skill_body() {
     let file = std::fs::read_to_string(root.join(".claude/commands/orchestration_router.md"))
         .expect("router file");
     assert_eq!(
-        preamble::load_orchestration_router().as_deref(),
+        preamble::load_orchestration_router(root).as_deref(),
         Some(file.as_str())
     );
     assert!(file.starts_with("---\ndescription: "));

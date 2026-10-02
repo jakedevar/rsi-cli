@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub mod fence;
 mod operator_delegation;
 mod recovery;
+mod superseded_wakes;
 
 const ACTION_KIND: &str = "lifecycle_action";
 const CONTEXT_KIND: &str = "lifecycle_context";
@@ -95,6 +96,17 @@ pub(crate) enum RecoveryOwnerMode {
     /// interrupted-resume exception, and no hold on the C5 marker that the
     /// archive commit settles itself.
     AgentArchive,
+    /// #953: an explicit manager `replace_lead`/`retry_lead` of the current
+    /// lead. The outgoing lead's own ordinary resume wakes are superseded (the
+    /// lead CAS disables them atomically), so they do not hold the handover.
+    /// Every genuine human/operator owner (question, approval, hard operator
+    /// pause, C5, capacity incident) and the program gate still refuse, as
+    /// for [`Self::ManagerAction`] with a soft-pause exception.
+    ManagerLeadHandover,
+    /// #1042: a manager `pause_lead`. The lead's own ordinary resume wakes do
+    /// not hold the pause: the action suspends them (recorded, restored by
+    /// `resume_lead`). Every genuine human/operator owner still refuses.
+    ManagerLeadPause,
 }
 
 // Alias `a` is an operation row. Lost effects fence their still-live lead
@@ -1150,6 +1162,18 @@ impl Store {
         )
     }
 
+    /// #953: gate for an explicit manager `replace_lead`/`retry_lead` of the
+    /// current lead; see [`RecoveryOwnerMode::ManagerLeadHandover`].
+    pub(crate) fn manager_lead_handover_human_gate(&self, target: Uuid) -> Result<()> {
+        self.recovery_owner_gate(target, RecoveryOwnerMode::ManagerLeadHandover)
+    }
+
+    /// #1042: gate for a manager `pause_lead`; see
+    /// [`RecoveryOwnerMode::ManagerLeadPause`].
+    pub(crate) fn manager_lead_pause_human_gate(&self, target: Uuid) -> Result<()> {
+        self.recovery_owner_gate(target, RecoveryOwnerMode::ManagerLeadPause)
+    }
+
     /// The one recovery-owner check shared by manager lifecycle actions and
     /// `AgentArchiveChild`: the held-row SQL plus the program gate.
     ///
@@ -1177,6 +1201,8 @@ impl Store {
             ),
             RecoveryOwnerMode::ManagerArchive => (false, false, false, false, false),
             RecoveryOwnerMode::AgentArchive => (false, true, true, false, false),
+            RecoveryOwnerMode::ManagerLeadHandover => (true, true, false, false, true),
+            RecoveryOwnerMode::ManagerLeadPause => (true, true, false, false, false),
         };
         let held: bool = self.conn.query_row(
             "SELECT pending_question_json IS NOT NULL OR pending_archive=1 OR status='WaitingApproval'
@@ -1247,7 +1273,7 @@ impl Store {
         )?;
         // #633: sessions launched by topology executions this manager
         // requested in the current scope are charged to the same quota.
-        let topology = crate::topology::agent::topology_created_usage(
+        let topology = crate::store_support::topology_usage::topology_created_usage(
             &self.conn,
             config.project_id,
             config.row_version,
@@ -1758,6 +1784,30 @@ impl Store {
         Ok(receipt)
     }
 
+    /// #1084: launch targets of terminal manager actions whose failed-launch
+    /// cleanup is still owed: the row is still Starting, or already Failed with
+    /// its model invocation still open. Read-only; the settlement itself runs
+    /// under the session manager's fences.
+    pub(crate) fn manager_launch_cleanup_candidates(&self, limit: i64) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.target_session_id
+             FROM harness_manager_v2_operations o
+             JOIN sessions s ON s.id = o.target_session_id
+             LEFT JOIN model_invocations mi ON mi.id = s.model_invocation_id
+             WHERE o.kind = ?1
+               AND o.state IN ('failed','blocked','revoked','uncertain')
+               AND json_extract(o.payload_json,'$.request.operation.action')
+                   IN ('create_session','replace_lead','retry_lead')
+               AND (s.status = 'Starting'
+                    OR (s.status = 'Failed'
+                        AND mi.status IN ('running','cancellation_requested')))
+             ORDER BY o.updated_at
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ACTION_KIND, limit], |row| row.get::<_, String>(0))?;
+        rows.map(|row| parse_id(&row?)).collect()
+    }
+
     pub(crate) fn manager_action_operation(
         &self,
         id: Uuid,
@@ -1799,18 +1849,45 @@ impl Store {
         &self,
         boot_id: Uuid,
     ) -> Result<Option<ManagerActionClaimV2>> {
+        self.claim_manager_action_holding(boot_id, false)
+    }
+
+    /// `hold_worker_starts` (#1073 deploy drain) leaves every action that
+    /// would start a worker turn queued and unclaimed, so a restart re-admits
+    /// it instead of finding a `running` claim it must mark uncertain.
+    pub(crate) fn claim_manager_action_holding(
+        &self,
+        boot_id: Uuid,
+        hold_worker_starts: bool,
+    ) -> Result<Option<ManagerActionClaimV2>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // One active command per project, even across independent daemon handles.
         // An uncertain command fences only conflicting targets, not all future work.
+        // Preserve the oldest eligible claim except when that claim is
+        // automatic lead recovery and a due agent-created child in the same
+        // project is ready. Review allocations use that same CreateSession
+        // journal; the original conflict and due predicates apply to both.
         let id:Option<String>=self.conn.query_row(
-            &format!("SELECT o.id FROM harness_manager_v2_operations o WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
+            &format!("WITH eligible AS (
+             SELECT o.id,o.project_id,o.not_before,
+                    json_extract(o.payload_json,'$.origin.origin') AS origin,
+                    json_extract(o.payload_json,'$.request.operation.action') AS action
+               FROM harness_manager_v2_operations o WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
+             AND (?3=0 OR json_extract(o.payload_json,'$.request.operation.action') NOT IN ('create_session','replace_lead','retry_lead','resume_lead'))
              AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations a WHERE a.project_id=o.project_id AND a.kind=?1
                 AND a.id IS NOT json_extract(o.payload_json,'$.request.operation.operation_id') AND (a.state='running' OR (a.state='uncertain' AND (a.target_session_id=o.target_session_id OR (json_extract(a.payload_json,'$.request.operation.epic_id')=json_extract(o.payload_json,'$.request.operation.epic_id') AND {UNCERTAINTY_CURRENT_AUTHORITY})))))
              AND NOT EXISTS(SELECT 1 FROM manager_root_successions r JOIN sessions p ON p.id=r.predecessor_session_id
                 WHERE r.operation_id=o.id AND r.state='reserved' AND p.status IN ('Starting','Running','WaitingApproval')
                   AND r.authority_epoch=(SELECT epoch FROM manager_authority_epochs WHERE project_id=r.project_id)
                   AND EXISTS(SELECT 1 FROM harness_manager_scopes h WHERE h.project_id=r.project_id AND h.row_version=r.scope_version))
-             ORDER BY o.not_before,o.id LIMIT 1"),params![ACTION_KIND,now()],|r|r.get(0)).optional()?;
+             ), oldest AS (SELECT * FROM eligible ORDER BY not_before,id LIMIT 1)
+             SELECT e.id FROM eligible e CROSS JOIN oldest first
+              WHERE e.id=first.id OR (
+                    first.origin='operating_intent'
+                AND first.action IN ('resume_lead','retry_lead','replace_lead')
+                AND e.project_id=first.project_id
+                AND e.origin='agent' AND e.action='create_session')
+              ORDER BY CASE WHEN e.id=first.id THEN 1 ELSE 0 END,e.not_before,e.id LIMIT 1"),params![ACTION_KIND,now(),i64::from(hold_worker_starts)],|r|r.get(0)).optional()?;
         let Some(id) = id else {
             return Ok(None);
         };
@@ -1829,6 +1906,39 @@ impl Store {
         self.claim_manager_succession_on(id, boot_id)?;
         tx.commit()?;
         Ok(Some(ManagerActionClaimV2 { operation, boot_id }))
+    }
+
+    /// #1073: hand a claimed action back to the queue when the deploy drain
+    /// engaged after the claim and before any provider effect. Returns `false`
+    /// (leaving the claim untouched) once an effect started: that outcome is
+    /// no longer safe to replay.
+    pub(crate) fn requeue_held_manager_action(&self, claim: &ManagerActionClaimV2) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let op = self.manager_action_assert_claim(claim)?;
+        if op.effect_started {
+            return Ok(false);
+        }
+        let mut receipt = op.receipt;
+        receipt.state = ManagerActionStateV2::Queued;
+        receipt.outcome = None;
+        receipt.row_version += 1;
+        receipt.refresh_action_metadata(&op.context.request.operation);
+        let changed = self.conn.execute(
+            "UPDATE harness_manager_v2_operations SET state='queued',row_version=?2,outcome_json=?3,attempts=MAX(attempts-1,0),claim_boot_id=NULL,updated_at=?4 WHERE id=?1 AND state='running' AND row_version=?5 AND claim_boot_id=?6",
+            params![
+                claim.id().to_string(),
+                receipt.row_version,
+                serde_json::to_string(&receipt)?,
+                now(),
+                claim.operation.receipt.row_version,
+                claim.boot_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(refused("manager_v2_claim_changed"));
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub(crate) fn recover_manager_actions_startup(&self, boot_id: Uuid) -> Result<usize> {
@@ -1927,6 +2037,9 @@ impl Store {
         claim: &ManagerActionClaimV2,
     ) -> Result<ManagerAuthorityV2> {
         let op = self.manager_action_assert_claim(claim)?;
+        // #967: a DB review launch whose assignment already ended must not
+        // start (or continue toward) a reviewer provider turn.
+        self.require_manager_review_launch_live(&op)?;
         let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
         // An appointment rotation cannot make a stored daemon intent act under a
         // newer principal even if its numeric scope/policy versions coincide.
@@ -2069,9 +2182,14 @@ impl Store {
                     if matches!(op.context.origin, ManagerActionOriginV2::Agent { .. })
                         && matches!(
                             action,
+                            ManagerActionV2::RetryLead { .. } | ManagerActionV2::ReplaceLead { .. }
+                        )
+                    {
+                        self.manager_lead_handover_human_gate(target.id)?;
+                    } else if matches!(op.context.origin, ManagerActionOriginV2::Agent { .. })
+                        && matches!(
+                            action,
                             ManagerActionV2::ResumeLead { .. }
-                                | ManagerActionV2::RetryLead { .. }
-                                | ManagerActionV2::ReplaceLead { .. }
                                 | ManagerActionV2::AssignLead {
                                     session_id: Some(_),
                                     ..
@@ -2090,7 +2208,7 @@ impl Store {
         } else if let Some(target) = target.as_ref() {
             // Pausing may stop a running turn, but never answers or cancels a
             // pending approval/question or takes an independent recovery owner.
-            self.manager_action_human_gate(target.id)?;
+            self.manager_lead_pause_human_gate(target.id)?;
         }
         if let Some(choice) = &op.context.launch {
             let exclude = if matches!(
@@ -2211,6 +2329,27 @@ impl Store {
         Ok(receipt)
     }
 
+    /// #1042: a succeeded `pause_lead` suspends the fenced lead's resume
+    /// wakes and a succeeded `resume_lead` restores exactly those. Shared by the
+    /// normal finish and the settlement of an uncertain pause.
+    pub(super) fn apply_lead_wake_effect(
+        &self,
+        action: &ManagerActionV2,
+        action_id: Uuid,
+    ) -> Result<()> {
+        let lead = action_fence(action).and_then(|f| f.lead_session_id);
+        match (action, lead) {
+            (ManagerActionV2::PauseLead { .. }, Some(lead)) => {
+                self.suspend_lead_resume_wakes(lead, action_id)?;
+            }
+            (ManagerActionV2::ResumeLead { .. }, Some(lead)) => {
+                self.restore_lead_suspended_wakes(lead)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(super) fn finish_manager_action_on(
         &self,
         claim: &ManagerActionClaimV2,
@@ -2249,6 +2388,11 @@ impl Store {
         let changed=self.conn.execute("UPDATE harness_manager_v2_operations SET state=?2,row_version=?3,outcome_json=?4,updated_at=?5 WHERE id=?1 AND state='running' AND row_version=?6 AND claim_boot_id=?7",params![claim.id().to_string(),state_name(state),receipt.row_version,serde_json::to_string(&receipt)?,now(),claim.operation.receipt.row_version,claim.boot_id.to_string()])?;
         if changed != 1 {
             return Err(refused("manager_v2_claim_changed"));
+        }
+        // #1042: the pause's success and the suspension of the lead's resume
+        // wakes commit together; `resume_lead` restores exactly that record.
+        if state == ManagerActionStateV2::Succeeded {
+            self.apply_lead_wake_effect(&op.context.request.operation, claim.id())?;
         }
         if state == ManagerActionStateV2::Succeeded
             && matches!(op.context.origin, ManagerActionOriginV2::Agent { .. })
@@ -2449,7 +2593,8 @@ impl Store {
             }
             RestoreSession { .. } => {
                 let changed = self.conn.execute(
-                    "UPDATE sessions SET status='Completed',pending_archive=0,updated_at=?2
+                    "UPDATE sessions SET status='Completed',pending_archive=0,
+                     stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'completed:restored'),updated_at=?2
                      WHERE id=?1 AND status='Archived'",
                     params![id.to_string(), stamp],
                 )?;
@@ -2585,7 +2730,8 @@ impl Store {
             {
                 let previous_status = status.as_deref().unwrap_or("Archived");
                 let changed = self.conn.execute(
-                    "UPDATE sessions SET status='Completed',pending_archive=0,lead_session_id=NULL,updated_at=?2 WHERE id=?1 AND status=?3",
+                    "UPDATE sessions SET status='Completed',pending_archive=0,lead_session_id=NULL,
+                     stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'completed:restored'),updated_at=?2 WHERE id=?1 AND status=?3",
                     params![member.to_string(), stamp, previous_status],
                 )?;
                 if changed == 1 {
@@ -2654,6 +2800,11 @@ impl Store {
             ManagerActionV2::RetryLead { .. } | ManagerActionV2::ReplaceLead { .. }
         ) {
             self.manager_action_bind_entity(claim, "session")?;
+            // #953: the superseded lineage never keeps a live resume wake,
+            // atomically with the lead CAS above.
+            if let Some(old) = expected.lead_session_id.filter(|old| Some(*old) != target) {
+                self.retire_handover_lineage_resume_wakes_on(claim, old)?;
+            }
         }
         self.finish_manager_action_on(claim, ManagerActionStateV2::Succeeded, "lead_committed")?;
         tx.commit()?;

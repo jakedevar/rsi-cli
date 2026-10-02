@@ -3,22 +3,59 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::App;
 use crate::types::OverlayState;
 
+/// Fresh open: always the default (active) filter.
 pub async fn open_schedule_browser(app: &mut App) {
+    load_schedule_browser(app, false).await;
+}
+
+/// Returns to the browser (e.g. after the schedule form) with the filter the
+/// operator last had active.
+pub async fn reopen_schedule_browser(app: &mut App) {
+    let include_history = app.schedule_include_history;
+    load_schedule_browser(app, include_history).await;
+}
+
+/// (Re)loads the first page with the given history filter. `H` and `r` reuse it
+/// so a refresh keeps the operator's filter.
+async fn load_schedule_browser(app: &mut App, include_history: bool) {
+    app.schedule_include_history = include_history;
+    let paging = crate::types::SchedulePaging {
+        include_history,
+        next_cursor: None,
+    };
     app.overlay = OverlayState::ScheduleBrowser {
         jobs: Vec::new(),
         selected_index: 0,
         loading: true,
         pending_delete: false,
+        paging: paging.clone(),
     };
 
-    // Fetch jobs from daemon
-    match app.client.list_scheduled_jobs().await {
-        Ok(jobs) => {
+    // Held wakes are a best-effort read-side annotation: an older daemon without
+    // the method simply shows none.
+    app.schedule_holds = app
+        .client
+        .list_scheduled_job_holds()
+        .await
+        .map(|holds| holds.into_iter().map(|hold| (hold.job_id, hold)).collect())
+        .unwrap_or_default();
+
+    // Fetch the first page from the daemon (default filter unless history).
+    match app
+        .client
+        .list_scheduled_jobs_page(include_history, None)
+        .await
+    {
+        Ok(page) => {
             app.overlay = OverlayState::ScheduleBrowser {
-                jobs,
+                jobs: page.jobs,
                 selected_index: 0,
                 loading: false,
                 pending_delete: false,
+                paging: crate::types::SchedulePaging {
+                    include_history,
+                    next_cursor: page.next_cursor,
+                },
             };
         }
         Err(e) => {
@@ -28,9 +65,55 @@ pub async fn open_schedule_browser(app: &mut App) {
                 selected_index: 0,
                 loading: false,
                 pending_delete: false,
+                paging,
             };
         }
     }
+}
+
+/// Appends the next page. Rows already loaded (a job that moved across the
+/// filter between pages) are skipped so the list never shows a duplicate.
+async fn load_more_schedule_jobs(app: &mut App) {
+    let request = match &app.overlay {
+        OverlayState::ScheduleBrowser { paging, .. } => paging
+            .next_cursor
+            .clone()
+            .map(|cursor| (paging.include_history, cursor)),
+        _ => None,
+    };
+    let Some((include_history, cursor)) = request else {
+        app.notify("All scheduled jobs are loaded");
+        return;
+    };
+    let page = match app
+        .client
+        .list_scheduled_jobs_page(include_history, Some(cursor))
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            app.notify_error(format!("Failed to load more scheduled jobs: {e}"));
+            return;
+        }
+    };
+    let OverlayState::ScheduleBrowser { jobs, paging, .. } = &mut app.overlay else {
+        return;
+    };
+    append_page(jobs, paging, page);
+}
+
+fn append_page(
+    jobs: &mut Vec<rsi_common::types::ScheduledJob>,
+    paging: &mut crate::types::SchedulePaging,
+    page: rsi_common::rpc::ListScheduledJobsResult,
+) {
+    let loaded: std::collections::HashSet<uuid::Uuid> = jobs.iter().map(|job| job.id).collect();
+    jobs.extend(
+        page.jobs
+            .into_iter()
+            .filter(|job| !loaded.contains(&job.id)),
+    );
+    paging.next_cursor = page.next_cursor;
 }
 
 pub async fn handle_schedule_browser_key(app: &mut App, key: KeyEvent) -> bool {
@@ -168,7 +251,21 @@ pub async fn handle_schedule_browser_key(app: &mut App, key: KeyEvent) -> bool {
             crate::overlay::schedule_form::open_schedule_form_new(app);
         }
         KeyCode::Char('r') => {
-            open_schedule_browser(app).await;
+            let include_history = matches!(
+                &app.overlay,
+                OverlayState::ScheduleBrowser { paging, .. } if paging.include_history
+            );
+            load_schedule_browser(app, include_history).await;
+        }
+        KeyCode::Char('H') => {
+            let include_history = matches!(
+                &app.overlay,
+                OverlayState::ScheduleBrowser { paging, .. } if paging.include_history
+            );
+            load_schedule_browser(app, !include_history).await;
+        }
+        KeyCode::Char('m') => {
+            load_more_schedule_jobs(app).await;
         }
         _ => {}
     }

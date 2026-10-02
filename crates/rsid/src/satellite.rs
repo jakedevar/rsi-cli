@@ -1,20 +1,29 @@
 //! Bounded, process-local snapshots for operator-only satellite reads.
 
+pub(crate) mod delivery;
+pub(crate) mod deploy_link;
+pub(crate) mod dispatch;
+pub(crate) mod hub;
 pub(crate) mod link;
 pub(crate) mod poll;
 pub(crate) mod registry;
 
 use crate::error::{DaemonError, Result};
+#[allow(unused_imports)]
+pub(crate) use crate::store_support::satellite::{
+    ReportedHealth, record_reported_health, reported_health,
+};
 use chrono::{DateTime, Utc};
 use rsi_common::Session;
 use rsi_common::satellite::{
     SATELLITE_MAX_RESPONSE_BYTES, SATELLITE_MAX_SESSIONS, SATELLITE_PROTOCOL_MAJOR,
     SATELLITE_PROTOCOL_MINOR, SATELLITE_WIRE_VERSION_V1, SatelliteCapabilitiesV1,
-    SatelliteIdentityV1, SatelliteProtocolVersionV1, SatelliteReadLimitsV1,
+    SatelliteHealthV1, SatelliteIdentityV1, SatelliteProtocolVersionV1, SatelliteReadLimitsV1,
     SatelliteSessionPageRequestV1, SatelliteSessionPageV1, SatelliteSessionSummaryV1,
     SatelliteUuidV1,
 };
 use std::collections::{HashSet, VecDeque};
+use std::sync::{LazyLock, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -77,7 +86,90 @@ pub(crate) fn identity(installation_id: Uuid, incarnation_id: Uuid) -> Satellite
             session_read: true,
             limits: SatelliteReadLimitsV1::default(),
         },
+        health: None,
     }
+}
+
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+static BINARY_DIGEST: OnceLock<Option<String>> = OnceLock::new();
+static BINARY_DIGEST_STARTED: Once = Once::new();
+/// Refuse to hash an implausibly large binary (a debug build) at all.
+const MAX_HASHED_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Pin the process start so uptime counts from daemon start, not first probe.
+pub(crate) fn note_process_start() {
+    LazyLock::force(&PROCESS_START);
+}
+
+fn hash_running_binary() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
+    if file.metadata().ok()?.len() > MAX_HASHED_BINARY_BYTES {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// The digest of the running binary, hashed once on a background thread so a
+/// probe never waits on it; `None` until the hash finishes.
+fn binary_digest() -> Option<String> {
+    BINARY_DIGEST_STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let _ = BINARY_DIGEST.set(hash_running_binary());
+        });
+    });
+    BINARY_DIGEST.get().cloned().flatten()
+}
+
+fn load_avg_1m_milli() -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let load: f64 = text.split_whitespace().next()?.parse().ok()?;
+    if !load.is_finite() || load < 0.0 {
+        return None;
+    }
+    Some((load * 1000.0).min(f64::from(u32::MAX)) as u32)
+}
+
+fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    let stats = nix::sys::statvfs::statvfs(path).ok()?;
+    Some(u64::from(stats.blocks_available()).saturating_mul(u64::from(stats.fragment_size())))
+}
+
+/// Bounded, non-secret health report carried on the satellite identity.
+pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
+    let (sessions_running, sessions_waiting_approval, schema_version) =
+        store.satellite_health_counts()?;
+    Ok(SatelliteHealthV1 {
+        daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+        binary_sha256: binary_digest(),
+        uptime_seconds: PROCESS_START.elapsed().as_secs(),
+        schema_version: Some(schema_version),
+        sessions_running,
+        sessions_waiting_approval,
+        disk_free_bytes: disk_free_bytes(&rsi_common::identity::data_dir()),
+        load_avg_1m_milli: load_avg_1m_milli(),
+        build_sha: Some(crate::daemon_info::BUILD_SHA.to_owned()),
+        started_at: Some(crate::daemon_info::DaemonInfoService::global().started_at_rfc3339()),
+        supervisor_mode: crate::daemon_info::supervisor_mode(),
+        missing_provider_clis: crate::provider_cli::missing_provider_clis(),
+        last_deploy: store.latest_agent_deploy()?.map(|row| {
+            rsi_common::satellite::SatelliteDeployStatusV1 {
+                deploy_id: SatelliteUuidV1(row.id),
+                state: row.state,
+                sha: row.sha,
+            }
+        }),
+    })
 }
 
 fn parse_cursor(cursor: &str) -> Result<(Uuid, usize)> {

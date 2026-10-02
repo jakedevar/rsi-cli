@@ -13,12 +13,11 @@ use crate::store::manager_actions::{
 };
 use rsi_common::harness_manager_v2::*;
 use rsi_common::types::{Session, SessionProvider, SessionStatus};
-use std::sync::{LazyLock, atomic::Ordering};
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 mod recovery;
 
-static RECONCILE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 const BATCH: usize = 4;
 
 impl AgentControlHandle {
@@ -86,7 +85,7 @@ impl SessionManager {
     }
 
     pub async fn reconcile_manager_actions_once(&self) -> Result<usize> {
-        let Ok(_flight) = RECONCILE.try_lock() else {
+        let Ok(_flight) = self.manager_action_reconcile.try_lock() else {
             return Ok(0);
         };
         let mut count = self
@@ -102,14 +101,40 @@ impl SessionManager {
         // predecessor is terminal and process-absent before claiming, so an
         // exact queued resume/repair is no longer fenced by a visible effect.
         count += self.reconcile_uncertain_lead_actions().await?;
+        // Reserved DB reviews journal their CreateSession before the claim
+        // loop. After restart, they then compete for the same last slot as
+        // already-queued children, ahead of automatic lead recovery.
+        let (reviews_changed, review_notice_jobs) = self
+            .store
+            .lock()
+            .await
+            .reconcile_reserved_manager_reviews_once()?;
+        count += reviews_changed;
+        for job_id in review_notice_jobs {
+            self.event_bus
+                .publish(DaemonEvent::ManagerNoticeQueued { job_id });
+        }
         for _ in 0..BATCH {
-            let claim = self
-                .store
-                .lock()
-                .await
-                .claim_manager_action(self.program_run_boot_id)?;
+            let claim = self.store.lock().await.claim_manager_action_holding(
+                self.program_run_boot_id,
+                self.deploy_drain.is_draining(),
+            )?;
             let Some(claim) = claim else { break };
             if let Err(error) = self.execute_manager_action(&claim).await {
+                // #1073: the deploy drain engaged after the claim and before
+                // any provider effect. Hand the action back to the queue so it
+                // runs after the deploy settles (or is re-admitted by a
+                // restart); it is never blocked or made uncertain.
+                if crate::deploy_drain::is_draining_error(&error)
+                    && self
+                        .store
+                        .lock()
+                        .await
+                        .requeue_held_manager_action(&claim)?
+                {
+                    self.deploy_drain.note_manager_action_held();
+                    continue;
+                }
                 let code = safe_action_error(&error);
                 let is_integrate = matches!(claim.action(), ManagerActionV2::Integrate { .. });
                 // RME-S2A-003: For integrate actions with effect_started,
@@ -135,6 +160,7 @@ impl SessionManager {
                             } else if matches!(
                                 code,
                                 "manager_v2_scope_changed"
+                                    | "manager_review_assignment_terminal"
                                     | "manager_v2_policy_changed"
                                     | "manager_v2_capability_denied"
                                     | "manager_v2_epic_out_of_scope"
@@ -211,6 +237,11 @@ impl SessionManager {
             self.event_bus
                 .publish(DaemonEvent::ManagerNoticeQueued { job_id });
         }
+        // #985: the halt awaits stop_manager_candidate. Build it in a
+        // non-async helper so neither its state nor a poll-frame temporary
+        // grows this reconcile future (debug test threads have 2 MiB stacks).
+        count += self.boxed_halt_orphaned_manager_reviewers().await?;
+        count += self.reconcile_failed_manager_launch_cleanup().await;
         count += self.reconcile_manager_succession_cleanup().await?;
         Ok(count)
     }
@@ -331,6 +362,10 @@ impl SessionManager {
                 )?;
             }
             CreateSession { .. } | ReplaceLead { .. } | RetryLead { .. } => {
+                // #1073: a create waits behind a draining deploy before the
+                // predecessor guard, fork or any other effect.
+                self.deploy_drain
+                    .refuse_if_draining(claim.operation.context.target_session_id, true)?;
                 let predecessor = action_fence(claim.action()).and_then(|f| f.lead_session_id);
                 // Held until CAS: an operator/worker continuation cannot restart
                 // the old process between quiescence and assignment.
@@ -376,7 +411,7 @@ impl SessionManager {
                     .target_session_id
                     .expect("reserved candidate");
                 let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                self.launch_manager_action_candidate(
+                self.boxed_launch_manager_action_candidate(
                     config,
                     ManagerActionLaunchContext {
                         claim: claim.clone(),
@@ -403,7 +438,8 @@ impl SessionManager {
                 if result.is_err() {
                     // Keep the allocated source and durable uncertain result;
                     // stop a losing candidate instead of leaving an unowned writer.
-                    self.stop_manager_candidate(target, generation).await?;
+                    self.boxed_stop_manager_candidate(target, generation)
+                        .await?;
                 }
                 result?;
             }
@@ -429,6 +465,41 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+
+    /// #1084: retry the fenced launch cleanup of a terminal manager action
+    /// whose target row is still Starting (or Failed with an open invocation).
+    /// The durable pending state is exactly that pair; a live launch keeps its
+    /// spawn guard, so it is never raced.
+    async fn reconcile_failed_manager_launch_cleanup(&self) -> usize {
+        let targets = match self
+            .store
+            .lock()
+            .await
+            .manager_launch_cleanup_candidates(32)
+        {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(%error, "manager launch cleanup scan failed");
+                return 0;
+            }
+        };
+        let mut settled = 0;
+        for target in targets {
+            let Some(_guard) = super::spawn_single_flight::try_acquire_spawn_guard(target) else {
+                continue;
+            };
+            if self.active.read().await.contains_key(&target) {
+                continue;
+            }
+            match self.settle_failed_manager_launch_target(target).await {
+                Ok(()) => settled += 1,
+                Err(error) => {
+                    tracing::warn!(session_id = %target, %error, "manager launch cleanup remains owed");
+                }
+            }
+        }
+        settled
     }
 
     /// Guard of the container's current lead (K2 authority gate).
@@ -752,10 +823,15 @@ impl SessionManager {
             .await
             .get(&predecessor)
             .map(|s| s.spawn_generation);
+        let deadline = tokio::time::Instant::now() + Self::CONTINUE_INTERRUPT_WAIT;
         if generation.is_some() {
             self.check_manager_action_runtime(claim, true).await?;
-            super::lifecycle::interrupt_active_in_maps(&self.active, predecessor).await?;
-            let deadline = tokio::time::Instant::now() + Self::CONTINUE_INTERRUPT_WAIT;
+            super::lifecycle::interrupt_active_in_maps_from(
+                &self.active,
+                predecessor,
+                crate::terminal_cause::InterruptSource::ManagerAction,
+            )
+            .await?;
             loop {
                 let active = self.active.read().await;
                 match active.get(&predecessor) {
@@ -772,6 +848,19 @@ impl SessionManager {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
+        // #1033: leaving `active` is not the end of the exit. The terminal
+        // finalizer still persists final status and the terminal-sandbox
+        // observation event (which advances the lead's event fence) after it
+        // removes the entry. Accepting the settled fence before that lands
+        // would freeze a fence the finalizer then invalidates
+        // (`manager_v2_lead_changed`). Wait for the settlement guard, which is
+        // registered under the same lock that removes the entry.
+        while crate::reconciliation::terminal_settlement_in_progress(predecessor) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(refused("manager_v2_predecessor_unsettled"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Map removal alone is not an OS-process settlement witness. Reprove
         // the exact daemon-owned cohort to a bounded two-empty-pass fixed point.
         tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor))
@@ -781,6 +870,58 @@ impl SessionManager {
             .lock()
             .await
             .manager_action_accept_settled_fence(claim)
+    }
+
+    /// #985: heap future for [`Self::halt_orphaned_manager_reviewers`].
+    #[inline(never)]
+    fn boxed_halt_orphaned_manager_reviewers(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>> {
+        Box::pin(self.halt_orphaned_manager_reviewers())
+    }
+
+    /// #967: a reviewer whose DB review assignment already failed, was
+    /// cancelled or was superseded can never record its receipt. Stop any such
+    /// reviewer process still running so it does not keep spending money.
+    pub(super) async fn halt_orphaned_manager_reviewers(&self) -> Result<usize> {
+        let reviewers = self
+            .store
+            .lock()
+            .await
+            .manager_review_orphaned_reviewers()?;
+        let mut halted = 0;
+        for reviewer in reviewers {
+            let generation = self
+                .active
+                .read()
+                .await
+                .get(&reviewer)
+                .map(|s| s.spawn_generation);
+            let Some(generation) = generation else {
+                continue;
+            };
+            match self.stop_manager_candidate(reviewer, generation).await {
+                Ok(()) => {
+                    halted += 1;
+                    tracing::info!(%reviewer, "halted reviewer of a terminal review assignment");
+                }
+                Err(error) => {
+                    tracing::warn!(%reviewer, %error, "orphaned reviewer halt deferred");
+                }
+            }
+        }
+        Ok(halted)
+    }
+
+    /// #985: heap future for [`Self::stop_manager_candidate`], which awaits
+    /// interrupt, guarded quiescence and spawn-blocking reaping.
+    #[inline(never)]
+    fn boxed_stop_manager_candidate(
+        &self,
+        target: Uuid,
+        generation: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(self.stop_manager_candidate(target, generation))
     }
 
     async fn stop_manager_candidate(&self, target: Uuid, generation: u64) -> Result<()> {
@@ -794,7 +935,12 @@ impl SessionManager {
         {
             return Ok(());
         }
-        super::lifecycle::interrupt_active_in_maps(&self.active, target).await?;
+        super::lifecycle::interrupt_active_in_maps_from(
+            &self.active,
+            target,
+            crate::terminal_cause::InterruptSource::ManagerAction,
+        )
+        .await?;
         let deadline = tokio::time::Instant::now() + Self::CONTINUE_INTERRUPT_WAIT;
         loop {
             if !self
@@ -1296,6 +1442,7 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_succession_unavailable",
     "manager_succession_unresolved",
     "manager_succession_unsettled_predecessor",
+    "manager_review_assignment_terminal",
     "manager_v2_scope_changed",
     "manager_v2_policy_changed",
     "manager_v2_capability_denied",
@@ -1355,7 +1502,47 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_v2_lead_active",
 ];
 
+/// Static receipt classes for every typed pre-provider launch refusal. Only
+/// fixed strings are returned: no path, environment value or credential text.
+fn launch_refusal_code(error: &DaemonError) -> Option<&'static str> {
+    match error {
+        DaemonError::ExecutionScratchUnavailable(_) => {
+            Some("manager_v2_execution_scratch_unavailable")
+        }
+        DaemonError::ClaudeBinaryNotFound => Some("manager_v2_claude_binary_not_found"),
+        DaemonError::CodexBinaryNotFound => Some("manager_v2_codex_binary_not_found"),
+        DaemonError::AgyBinaryNotFound => Some("manager_v2_agy_binary_not_found"),
+        DaemonError::CodexResumeToolHistory(_) => {
+            Some("manager_v2_codex_resume_tool_history_invalid")
+        }
+        DaemonError::CodexResumeTornTail => Some("manager_v2_codex_resume_rollout_torn_tail"),
+        DaemonError::OpenRouterRoutePreflight { cause } => Some(match *cause {
+            "missing_credential" => "manager_v2_provider_credential_missing_openrouter",
+            "no_tool_support" => "manager_v2_openrouter_route_no_tool_support",
+            "unsupported_model" => "manager_v2_openrouter_route_unsupported_model",
+            _ => "manager_v2_openrouter_route_preflight_failed",
+        }),
+        _ => {
+            let text = error.to_string();
+            if text.contains("OpenRouter credential") {
+                Some("manager_v2_provider_credential_missing_openrouter")
+            } else if text.contains("Bedrock API key") {
+                Some("manager_v2_provider_credential_missing_bedrock")
+            } else if text.contains("Pioneer credential") {
+                Some("manager_v2_provider_credential_missing_pioneer")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 pub(super) fn safe_action_error(error: &DaemonError) -> &'static str {
+    // #981/#1084: a typed launch refusal keeps its own static class in the
+    // receipt, so a manager can read why a launch failed without the daemon log.
+    if let Some(code) = launch_refusal_code(error) {
+        return code;
+    }
     let message = error.to_string();
     if message.contains("manager_notice_deferred") {
         return "manager_v2_human_or_recovery_owner";
@@ -1420,6 +1607,7 @@ fn manager_launch_config(claim: &ManagerActionClaimV2, source: &Session) -> Resu
         branch: None,
     });
     Ok(LaunchConfig {
+        completion_gates: None,
         query,
         title: None,
         agent_role: predecessor.and_then(|_| source.agent_role.clone()),
@@ -1458,6 +1646,7 @@ fn manager_launch_config(claim: &ManagerActionClaimV2, source: &Session) -> Resu
         // The reservation freezes the effective provider/model witness.
         // A later project-default edit must not rewrite an exact replay.
         skip_project_model_default: true,
+        tool_policy: None,
         model_invocation_purpose:
             rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
         sandbox,

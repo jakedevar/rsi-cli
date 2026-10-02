@@ -386,9 +386,14 @@ pub struct Session {
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_context_budget: Option<ResolvedContextBudget>,
-    // Accumulated totals across all turns (for aggregate analytics)
+    /// Per-call peak full prompt (context-fill numerator). Not an accumulated
+    /// total. For cumulative prompt across all calls, see `total_prompt_tokens`.
     #[serde(default)]
     pub total_input_tokens: Option<u64>,
+    /// Cumulative full prompt of every model call (uncached input +
+    /// cache_creation + cache_read), fed per provider.
+    #[serde(default)]
+    pub total_prompt_tokens: Option<u64>,
     #[serde(default)]
     pub total_output_tokens: Option<u64>,
     #[serde(default)]
@@ -1075,6 +1080,25 @@ pub struct ConversationEvent {
     pub metadata: Option<Box<serde_json::Value>>,
 }
 
+/// `metadata.source` value marking a user-role transcript event as an operator
+/// message the daemon delivered to a running session at a tool boundary (#1062).
+pub const OPERATOR_EVENT_SOURCE: &str = "operator";
+
+impl ConversationEvent {
+    /// True for a user-role event that carries an operator message delivered
+    /// at a tool boundary; the TUI labels it "Operator" instead of "You".
+    #[must_use]
+    pub fn is_operator_message(&self) -> bool {
+        self.role == Some(Role::User)
+            && self
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some(OPERATOR_EVENT_SOURCE)
+    }
+}
+
 /// Severity stored for a session-attributed daemon diagnostic. Deliberately
 /// narrower than `tracing::Level`; this is not a mirror of daemon logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1130,6 +1154,11 @@ pub enum EventType {
     /// Event whose content has been offloaded (compressed).
     /// Original content stored separately; event shows `[[OFFLOAD:id]]` marker + summary.
     Compressed,
+    /// Durable agent task-plan update.
+    Plan,
+    /// Operator-configured completion gate result.
+    #[serde(rename = "CompletionGate", alias = "completiongate")]
+    CompletionGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5723,6 +5752,7 @@ mod tests {
                 },
             }),
             total_input_tokens: Some(45000),
+            total_prompt_tokens: None,
             session_kind: SessionKind::Standard,
             total_output_tokens: Some(2500),
             total_cache_creation_tokens: Some(10000),
@@ -6437,6 +6467,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             session_kind: SessionKind::Standard,
             total_output_tokens: None,
             total_cache_creation_tokens: None,

@@ -39,7 +39,7 @@ pub(super) fn render_recursive_dag_browser(
     app: &App,
     state: &RecursiveDagBrowserState,
 ) {
-    let popup = browser_rect(area);
+    let popup = super::scoped_popup_rect(browser_rect(area), area);
     frame.render_widget(Clear, popup);
 
     let title = format!(

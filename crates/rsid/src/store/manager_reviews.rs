@@ -9,16 +9,19 @@ use super::{
 #[cfg(test)]
 use crate::error::DaemonError;
 use crate::error::Result;
+use crate::model_control::classify_model_tier;
 use chrono::{DateTime, Utc};
 use rsi_common::{
     harness_manager::HarnessManagerConfigV1,
     harness_manager_v2::*,
+    model_control::ModelTier,
     review_model_family::{ReviewModelFamily, review_model_family},
     types::{SessionKind, SessionStatus},
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 mod contributors;
@@ -27,8 +30,140 @@ const MAX_ASSIGNMENTS_PER_WORK: i64 = 64;
 const MAX_REVIEW_ROUNDS_PER_REVISION: usize = 3;
 const REVIEW_RECONCILE_BATCH: usize = 16;
 const MAX_INFRA_RELAUNCHES: usize = 2;
+/// #967: how long an `allocating` assignment waits for its queued or running
+/// launch action to create the reviewer session before failing.
+const REVIEWER_ESTABLISHMENT_DEADLINE_MINUTES: i64 = 30;
+/// #967: how far back the reconciler looks for failed assignments whose
+/// reviewer process may still be running.
+const ORPHAN_REVIEWER_LOOKBACK_MINUTES: i64 = 120;
+
+fn review_tier_rank(tier: ModelTier) -> u8 {
+    match tier {
+        ModelTier::Local => 0,
+        ModelTier::Standard => 1,
+        ModelTier::Premium => 2,
+    }
+}
 
 impl Store {
+    fn review_delta_family(
+        &self,
+        project: Uuid,
+        work: &WorkRecord,
+        source_sha: &str,
+        delta_of: Option<Uuid>,
+        finding_keys: &[String],
+    ) -> Result<Option<ReviewModelFamily>> {
+        let Some(prior_id) = delta_of else {
+            if !finding_keys.is_empty() {
+                return Err(refused("manager_review_invalid_delta"));
+            }
+            return Ok(None);
+        };
+        if finding_keys.is_empty() || finding_keys.len() > MANAGER_REVIEW_MAX_FINDINGS {
+            return Err(refused("manager_review_invalid_delta"));
+        }
+        let prior = self
+            .manager_review_assignment(prior_id)
+            .map_err(|_| refused("manager_review_invalid_delta"))?;
+        if prior.project_id != project
+            || prior.epic_id != work.epic_id
+            || prior.work_key != work.key
+            || prior.spec_revision != work.spec_revision
+            || Some(prior.author_session_id) != work.source_session_id
+            || prior.source_sha == source_sha
+            || !matches!(prior.state.as_str(), "submitted" | "superseded")
+        {
+            return Err(refused("manager_review_invalid_delta"));
+        }
+        let receipt: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT receipt_id,verdict,reviewer_session_id FROM manager_review_receipts
+             WHERE assignment_id=?1 AND source_sha=?2",
+                params![prior_id.to_string(), prior.source_sha],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((receipt_id, verdict, reviewer)) = receipt else {
+            return Err(refused("manager_review_invalid_delta"));
+        };
+        if verdict != "changes_requested"
+            || prior.reviewer_session_id != Some(parse_uuid(reviewer.clone())?)
+        {
+            return Err(refused("manager_review_invalid_delta"));
+        }
+        for key in finding_keys {
+            let found: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM manager_review_findings
+                 WHERE receipt_id=?1 AND finding_key=?2)",
+                params![receipt_id, key],
+                |row| row.get(0),
+            )?;
+            if !found {
+                return Err(refused("manager_review_invalid_delta"));
+            }
+        }
+        let family = self.recorded_review_family(parse_uuid(reviewer)?)?;
+        Ok(Some(family))
+    }
+
+    /// #967: whether a reviewer launch action has been in flight past the
+    /// establishment deadline since it was queued. An unreadable clock counts
+    /// as expired so a malformed row cannot pin a review forever.
+    fn manager_review_establishment_expired(&self, action_id: Uuid) -> Result<bool> {
+        let since: String = self.conn.query_row(
+            "SELECT created_at FROM harness_manager_v2_operations WHERE id=?1",
+            [action_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(DateTime::parse_from_rfc3339(&since).map_or(true, |since| {
+            Utc::now().signed_duration_since(since)
+                > chrono::Duration::minutes(REVIEWER_ESTABLISHMENT_DEADLINE_MINUTES)
+        }))
+    }
+
+    /// #967: a DB review launch action never outlives its assignment. Once the
+    /// assignment is terminal, the launch is refused before any provider turn.
+    pub(crate) fn require_manager_review_launch_live(
+        &self,
+        action: &ManagerActionOperationV2,
+    ) -> Result<()> {
+        let state: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM manager_review_assignments WHERE action_operation_id=?1",
+                [action.receipt.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match state.as_deref() {
+            None | Some("allocating" | "active") => Ok(()),
+            Some(_) => Err(refused("manager_review_assignment_terminal")),
+        }
+    }
+
+    /// #967: reviewer sessions of recently failed, cancelled or superseded
+    /// assignments that hold no other in-flight assignment. The caller halts
+    /// any of them still running so no provider turn outlives its review.
+    pub(crate) fn manager_review_orphaned_reviewers(&self) -> Result<Vec<Uuid>> {
+        let since = (Utc::now() - chrono::Duration::minutes(ORPHAN_REVIEWER_LOOKBACK_MINUTES))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT a.reviewer_session_id FROM manager_review_assignments a
+              WHERE a.state IN ('failed','cancelled','superseded')
+                AND a.reviewer_session_id IS NOT NULL
+                AND COALESCE(a.terminal_at,a.updated_at)>=?1
+                AND NOT EXISTS(SELECT 1 FROM manager_review_assignments live
+                                WHERE live.reviewer_session_id=a.reviewer_session_id
+                                  AND live.state IN ('reserved','allocating','active'))",
+        )?;
+        statement
+            .query_map([since], |row| row.get::<_, String>(0))?
+            .map(|id| parse_uuid(id?))
+            .collect()
+    }
+
     /// A live DB review owns this reviewer's next turn. Generic continuation
     /// has no review origin and must be refused before it interrupts the turn.
     /// The restart reconciler also uses this predicate to leave recovery with
@@ -212,8 +347,16 @@ struct ReviewAllocationRequest {
     contributor_session_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     contributor_families: Vec<String>,
+    /// #984: descendants proven path-disjoint from the sealed range. Set only
+    /// by the daemon from observation, never from caller input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unrelated_session_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     family_override_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delta_of: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    finding_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,12 +446,21 @@ fn review_allocation_request(
     assignment_id: Uuid,
     assignment: &ReviewAssignment,
 ) -> AgentManagerControlRequestV2 {
+    let query = if let Some(prior) = assignment.request.delta_of {
+        format!(
+            "Finding-focused delta review of prior assignment {prior}. Resolve finding keys: {}. Check the changed source against those findings, then perform every required review check.\n\n{}",
+            assignment.request.finding_keys.join(", "),
+            assignment.request.query
+        )
+    } else {
+        assignment.request.query.clone()
+    };
     let prompt = manager_review_launch_prompt(
         assignment_id,
         &assignment.source_sha,
         &assignment.work_key,
         assignment.spec_revision,
-        &assignment.request.query,
+        &query,
     );
     AgentManagerControlRequestV2 {
         fence: assignment.request.fence.clone(),
@@ -831,6 +983,8 @@ impl Store {
             source_commit,
             query,
             launch,
+            delta_of,
+            finding_keys,
             ..
         } = &request.change
         else {
@@ -855,6 +1009,19 @@ impl Store {
         }
         if *expected_row_version != work_row_version {
             return Err(refused("manager_review_work_version_changed"));
+        }
+        if work.risk_tier == ManagerWorkRiskTierV2::Tier2 {
+            let policy = self
+                .get_harness_manager_policy(config.project_id)?
+                .filter(|policy| policy.row_version == request.fence.policy_version)
+                .ok_or_else(|| refused("manager_v2_policy_changed"))?;
+            let model = launch.model.rsplit('/').next().unwrap_or(&launch.model);
+            let tier =
+                classify_model_tier(Some(&format!("{:?}", launch.provider)), None, Some(model));
+            if review_tier_rank(tier) < review_tier_rank(policy.policy.minimum_tier2_reviewer_tier)
+            {
+                return Err(refused("manager_review_reviewer_tier_below_minimum"));
+            }
         }
         let author = work
             .source_session_id
@@ -931,20 +1098,34 @@ impl Store {
         }
         let contributors = self.review_contributors(
             config.project_id,
-            work.epic_id,
-            &work.key,
             author,
-            None,
+            &observed
+                .review_unrelated
+                .iter()
+                .copied()
+                .collect::<BTreeSet<Uuid>>(),
             &[],
             &[],
         )?;
+        let mut admissible = contributors.clone();
+        if let Some(family) = self.review_delta_family(
+            config.project_id,
+            work,
+            source_commit,
+            *delta_of,
+            finding_keys,
+        )? {
+            admissible
+                .families
+                .remove(contributors::family_name(family));
+        }
         let override_key =
             self.review_family_override(config, &work.key, work.spec_revision, None)?;
         self.require_review_contributor_family(
             config.project_id,
             &work.key,
             work.spec_revision,
-            &contributors,
+            &admissible,
             override_key.as_deref(),
             review_model_family(launch.provider, Some(launch.model.as_str())),
         )?;
@@ -971,7 +1152,10 @@ impl Store {
             infra_retry_of: None,
             contributor_session_ids: contributors.sessions.iter().copied().collect(),
             contributor_families: contributors.families.iter().cloned().collect(),
+            unrelated_session_ids: observed.review_unrelated.clone(),
             family_override_key: override_key,
+            delta_of: *delta_of,
+            finding_keys: finding_keys.clone(),
         };
         let request_json = serde_json::to_value(&allocation)?;
         self.conn.execute(
@@ -1033,7 +1217,7 @@ impl Store {
             .get_harness_manager(assignment.project_id)?
             .ok_or_else(|| refused("manager_review_scope_changed"))?;
         let tx = self.conn.unchecked_transaction()?;
-        let contributors = self.review_contributors_for_assignment(&assignment)?;
+        let contributors = self.admissible_review_contributors_for_assignment(&assignment)?;
         self.require_review_contributor_family(
             assignment.project_id,
             &assignment.work_key,
@@ -1290,7 +1474,7 @@ impl Store {
                 "manager_review_infra_relaunch_refused",
             );
         };
-        let contributors = match self.review_contributors_for_assignment(assignment) {
+        let contributors = match self.admissible_review_contributors_for_assignment(assignment) {
             Ok(set) => set,
             Err(crate::error::DaemonError::InvalidParam(code)) => {
                 return self.fail_manager_review_assignment(assignment, &code);
@@ -1596,10 +1780,25 @@ impl Store {
             return Ok(changed);
         }
         let Some(session) = self.get_session(reviewer)? else {
-            let changed = self.fail_manager_review_assignment(
-                &assignment,
-                "manager_review_reviewer_unavailable",
-            )?;
+            // #967: the reserved reviewer has no session row until its launch
+            // action creates it. While that action is still queued or running
+            // the review is pending, not failed. Fail only once the launch
+            // settled without a session or the establishment deadline passed,
+            // and name the observed launch state in the failure code.
+            let launch = action_state.as_ref().map(|(state, _)| state.as_str());
+            let in_flight = matches!(launch, Some("queued" | "running"));
+            if in_flight && !self.manager_review_establishment_expired(action_id)? {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let code = match launch {
+                Some(state) if in_flight => {
+                    format!("manager_review_reviewer_unavailable_launch_{state}_timeout")
+                }
+                Some(state) => format!("manager_review_reviewer_unavailable_launch_{state}"),
+                None => "manager_review_reviewer_unavailable_launch_missing".to_owned(),
+            };
+            let changed = self.fail_manager_review_assignment(&assignment, &code)?;
             tx.commit()?;
             return Ok(changed);
         };
@@ -1798,16 +1997,32 @@ impl Store {
     /// and every review-terminal notice transport queued by this pass, which
     /// the caller publishes after the store lock is released.
     pub(crate) fn reconcile_manager_review_assignments_once(&self) -> Result<(usize, Vec<Uuid>)> {
+        self.reconcile_manager_review_assignments(false)
+    }
+
+    /// Journal reserved reviewer launches before manager actions claim the
+    /// available slot. Allocating and active assignments still refresh after
+    /// the action loop has had a chance to establish the reviewer session.
+    pub(crate) fn reconcile_reserved_manager_reviews_once(&self) -> Result<(usize, Vec<Uuid>)> {
+        self.reconcile_manager_review_assignments(true)
+    }
+
+    fn reconcile_manager_review_assignments(
+        &self,
+        reserved_only: bool,
+    ) -> Result<(usize, Vec<Uuid>)> {
         let ids = {
             let mut statement = self.conn.prepare(
                 "SELECT assignment_id,state FROM manager_review_assignments
                   WHERE state IN ('reserved','allocating','active')
+                    AND (?2=0 OR state='reserved')
                   ORDER BY created_at,assignment_id LIMIT ?1",
             )?;
             statement
-                .query_map([REVIEW_RECONCILE_BATCH as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
+                .query_map(
+                    params![REVIEW_RECONCILE_BATCH as i64, reserved_only],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut changed = 0;
@@ -2311,7 +2526,10 @@ mod tests {
                 infra_retry_of: None,
                 contributor_session_ids: Vec::new(),
                 contributor_families: Vec::new(),
+                unrelated_session_ids: Vec::new(),
                 family_override_key: None,
+                delta_of: None,
+                finding_keys: vec![],
             },
         }
     }

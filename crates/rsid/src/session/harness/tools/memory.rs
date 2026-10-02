@@ -12,7 +12,7 @@
 //! project's indexed memory; when the host session has no project, the tool
 //! degrades to global search (matches manual TUI behavior).
 
-use super::{HarnessTool, truncation::truncate_text};
+use super::{HarnessTool, ToolContext, truncation::truncate_text};
 use crate::memory::worker::MemoryHandle;
 use crate::session::harness::types::ToolResult;
 use std::path::Path;
@@ -33,6 +33,14 @@ impl MemorySearchTool {
             project_id,
         }
     }
+
+    async fn execute_limited(
+        &self,
+        args: serde_json::Value,
+        max_output_bytes: usize,
+    ) -> ToolResult {
+        memory_search(self, args, max_output_bytes.min(100_000)).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -51,44 +59,69 @@ impl HarnessTool for MemorySearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let max = args
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5)
-            .min(10) as usize;
+        self.execute_limited(args, 100_000).await
+    }
 
-        match self
-            .handle
-            .search(query, Some(max), None, self.project_id)
-            .await
-        {
-            Ok(results) => {
-                let output: String = results
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "Source: {} (lines {}-{}, score: {:.2})\n{}\n",
-                            r.path, r.start_line, r.end_line, r.score, r.snippet
-                        )
-                    })
-                    .collect();
-
-                ToolResult {
-                    success: true,
-                    output: if output.is_empty() {
-                        "No results found.".into()
-                    } else {
-                        truncate_text(&output, 100_000, false).content
-                    },
-                    error_msg: None,
-                }
-            }
-            Err(e) => ToolResult {
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolResult {
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => ToolResult {
                 success: false,
                 output: String::new(),
-                error_msg: Some(format!("Memory search error: {e}")),
+                error_msg: Some("Tool execution cancelled".into()),
             },
+            result = self.execute_limited(args, context.policy.max_output_bytes) => result,
         }
+    }
+}
+
+async fn memory_search(
+    tool: &MemorySearchTool,
+    args: serde_json::Value,
+    max_output_bytes: usize,
+) -> ToolResult {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let max = args
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .min(10) as usize;
+
+    match tool
+        .handle
+        .search(query, Some(max), None, tool.project_id)
+        .await
+    {
+        Ok(results) => {
+            let output: String = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "Source: {} (lines {}-{}, score: {:.2})\n{}\n",
+                        r.path, r.start_line, r.end_line, r.score, r.snippet
+                    )
+                })
+                .collect();
+
+            let output = if output.is_empty() {
+                "No results found.".to_string()
+            } else {
+                output
+            };
+            ToolResult {
+                success: true,
+                output: truncate_text(&output, max_output_bytes, false).content,
+                error_msg: None,
+            }
+        }
+        Err(e) => ToolResult {
+            success: false,
+            output: String::new(),
+            error_msg: Some(format!("Memory search error: {e}")),
+        },
     }
 }

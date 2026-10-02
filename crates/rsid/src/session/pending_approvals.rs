@@ -136,6 +136,264 @@ pub(super) fn live_incarnations() -> Vec<Uuid> {
         .collect()
 }
 
+fn remote_preview(
+    raw: Option<&str>,
+    cap: usize,
+) -> crate::remote_read::Result<Option<crate::remote_read::BoundedText>> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let mut end = raw.len().min(cap);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(Some(crate::remote_read::BoundedText {
+        text: raw[..end].to_owned(),
+        observed_bytes: u64::try_from(raw.len())
+            .map_err(|_| crate::remote_read::ReadError::ResourceLimit)?,
+        truncated: end < raw.len(),
+    }))
+}
+
+/// Inspect one exact native publication witness. Upgrade only the selected
+/// session's registry entry, release that mutex, then try-lock its bounded
+/// pending set. No target JSON or writer handle leaves this read-only helper.
+/// Missing and replaced observations never establish a tombstone or complete
+/// coverage; the caller separately checks project ownership and Store state.
+pub(super) fn remote_selected_native_approval(
+    session: Uuid,
+    selected: Uuid,
+) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalSnapshot> {
+    use crate::remote_read::{
+        NativeRuntimeApprovalRow, NativeRuntimeApprovalSnapshot, NativeRuntimeApprovalState,
+        ReadError,
+    };
+    let started = std::time::Instant::now();
+    let runtime = {
+        let registry = WRITERS.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ReadError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ReadError::SourceUnavailable,
+        })?;
+        registry.get(&session).and_then(Weak::upgrade)
+    };
+    let Some(runtime) = runtime else {
+        return Ok(NativeRuntimeApprovalSnapshot {
+            session,
+            selected,
+            observed_at: chrono::Utc::now(),
+            state: NativeRuntimeApprovalState::Missing,
+        });
+    };
+    if !runtime.live.load(Ordering::SeqCst) {
+        return Ok(NativeRuntimeApprovalSnapshot {
+            session,
+            selected,
+            observed_at: chrono::Utc::now(),
+            state: NativeRuntimeApprovalState::SourceChanged,
+        });
+    }
+    let pending = runtime.pending.try_lock().map_err(|_| ReadError::Busy)?;
+    if pending.len() > crate::store::pending_approvals::MAX_PENDING_APPROVALS {
+        return Err(ReadError::ResourceLimit);
+    }
+    let capacity = if runtime.capacity_sealed.load(Ordering::SeqCst) {
+        0
+    } else {
+        u32::try_from(crate::store::pending_approvals::MAX_PENDING_APPROVALS - pending.len())
+            .map_err(|_| ReadError::ResourceLimit)?
+    };
+    let mut found = None;
+    for approval in pending.values() {
+        let raw_id = approval.target["publication_id"]
+            .as_str()
+            .ok_or(ReadError::InvalidSource)?;
+        let id = crate::remote_read::source_uuid(raw_id)?;
+        if id != selected {
+            continue;
+        }
+        if found.is_some() {
+            return Err(ReadError::InvalidSource);
+        }
+        found = Some(NativeRuntimeApprovalRow {
+            id,
+            incarnation_id: runtime.incarnation,
+            spawn_generation: runtime.generation,
+            method: remote_preview(approval.target["method"].as_str(), 512)?,
+            description: remote_preview(approval.target["description"].as_str(), 2048)?,
+            resolution_observed: approval.resolution.is_some(),
+            resolution_persisted: approval.resolution_persisted,
+            writer_live: true,
+            writer_capacity: capacity,
+        });
+    }
+    drop(pending);
+    let observed_at = chrono::Utc::now();
+    let current = {
+        let registry = WRITERS.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ReadError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ReadError::SourceUnavailable,
+        })?;
+        registry.get(&session).and_then(Weak::upgrade)
+    };
+    let state = if !runtime.live.load(Ordering::SeqCst)
+        || current
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &runtime))
+    {
+        NativeRuntimeApprovalState::SourceChanged
+    } else {
+        found.map_or(
+            NativeRuntimeApprovalState::Missing,
+            NativeRuntimeApprovalState::Present,
+        )
+    };
+    if started.elapsed() > Duration::from_millis(5) {
+        return Err(ReadError::ResourceLimit);
+    }
+    Ok(NativeRuntimeApprovalSnapshot {
+        session,
+        selected,
+        observed_at,
+        state,
+    })
+}
+
+/// Reobserve after Store work, with no overlapping lock. Equality reports
+/// only no bounded change; a missing or replaced witness is always changed.
+pub(super) fn remote_selected_native_approval_recheck(
+    before: &crate::remote_read::NativeRuntimeApprovalSnapshot,
+) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalRecheckObservation> {
+    use crate::remote_read::{
+        NativeRuntimeApprovalRecheck, NativeRuntimeApprovalRecheckObservation,
+        NativeRuntimeApprovalState,
+    };
+    let after = remote_selected_native_approval(before.session, before.selected)?;
+    Ok(NativeRuntimeApprovalRecheckObservation {
+        state: if matches!(&before.state, NativeRuntimeApprovalState::Present(_))
+            && before.state == after.state
+        {
+            NativeRuntimeApprovalRecheck::NoObservedChange
+        } else {
+            NativeRuntimeApprovalRecheck::Changed
+        },
+        observed_at: after.observed_at,
+    })
+}
+
+/// Capture the bounded native runtime source for one session without cloning
+/// target JSON or retaining a writer. A missing/replaced registry entry is
+/// unavailable source evidence, not an empty complete list. Project scope and
+/// Store ownership must be established separately by the read caller.
+pub(super) fn remote_native_approval_list(
+    session: Uuid,
+) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalListSnapshot> {
+    use crate::remote_read::{
+        NativeRuntimeApprovalListSnapshot, NativeRuntimeApprovalListState,
+        NativeRuntimeApprovalRow, ReadError,
+    };
+    let started = std::time::Instant::now();
+    let runtime = {
+        let registry = WRITERS.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ReadError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ReadError::SourceUnavailable,
+        })?;
+        registry.get(&session).and_then(Weak::upgrade)
+    };
+    let Some(runtime) = runtime else {
+        return Ok(NativeRuntimeApprovalListSnapshot {
+            session,
+            observed_at: chrono::Utc::now(),
+            state: NativeRuntimeApprovalListState::Missing,
+        });
+    };
+    if !runtime.live.load(Ordering::SeqCst) {
+        return Ok(NativeRuntimeApprovalListSnapshot {
+            session,
+            observed_at: chrono::Utc::now(),
+            state: NativeRuntimeApprovalListState::SourceChanged,
+        });
+    }
+    let pending = runtime.pending.try_lock().map_err(|_| ReadError::Busy)?;
+    if pending.len() > crate::store::pending_approvals::MAX_PENDING_APPROVALS {
+        return Err(ReadError::ResourceLimit);
+    }
+    let capacity = if runtime.capacity_sealed.load(Ordering::SeqCst) {
+        0
+    } else {
+        u32::try_from(crate::store::pending_approvals::MAX_PENDING_APPROVALS - pending.len())
+            .map_err(|_| ReadError::ResourceLimit)?
+    };
+    let mut rows = Vec::with_capacity(pending.len());
+    for approval in pending.values() {
+        let raw_id = approval.target["publication_id"]
+            .as_str()
+            .ok_or(ReadError::InvalidSource)?;
+        rows.push(NativeRuntimeApprovalRow {
+            id: crate::remote_read::source_uuid(raw_id)?,
+            incarnation_id: runtime.incarnation,
+            spawn_generation: runtime.generation,
+            method: remote_preview(approval.target["method"].as_str(), 512)?,
+            description: remote_preview(approval.target["description"].as_str(), 2048)?,
+            resolution_observed: approval.resolution.is_some(),
+            resolution_persisted: approval.resolution_persisted,
+            writer_live: true,
+            writer_capacity: capacity,
+        });
+    }
+    drop(pending);
+    rows.sort_unstable_by_key(|row| row.id);
+    if rows.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(ReadError::InvalidSource);
+    }
+    let observed_at = chrono::Utc::now();
+    let current = {
+        let registry = WRITERS.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ReadError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ReadError::SourceUnavailable,
+        })?;
+        registry.get(&session).and_then(Weak::upgrade)
+    };
+    let state = if !runtime.live.load(Ordering::SeqCst)
+        || current
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &runtime))
+    {
+        NativeRuntimeApprovalListState::SourceChanged
+    } else {
+        NativeRuntimeApprovalListState::Present(rows)
+    };
+    if started.elapsed() > Duration::from_millis(5) {
+        return Err(ReadError::ResourceLimit);
+    }
+    Ok(NativeRuntimeApprovalListSnapshot {
+        session,
+        observed_at,
+        state,
+    })
+}
+
+/// A matching post-Store reread reports no bounded change only. It is not a
+/// transaction or proof that the runtime source stayed stable between reads.
+pub(super) fn remote_native_approval_list_recheck(
+    before: &crate::remote_read::NativeRuntimeApprovalListSnapshot,
+) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalListRecheckObservation> {
+    use crate::remote_read::{
+        NativeRuntimeApprovalListRecheckObservation, NativeRuntimeApprovalListState,
+        NativeRuntimeApprovalRecheck,
+    };
+    let after = remote_native_approval_list(before.session)?;
+    Ok(NativeRuntimeApprovalListRecheckObservation {
+        state: if matches!(&before.state, NativeRuntimeApprovalListState::Present(_))
+            && before.state == after.state
+        {
+            NativeRuntimeApprovalRecheck::NoObservedChange
+        } else {
+            NativeRuntimeApprovalRecheck::Changed
+        },
+        observed_at: after.observed_at,
+    })
+}
+
 /// Called directly by the production monitor on the normalized provider frame.
 /// Update the runtime witness before awaiting FIFO persistence, preventing an
 /// old answer from passing while a reused ID/new publication is not yet durable.

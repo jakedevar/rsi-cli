@@ -8,6 +8,7 @@ use crate::claude::LaunchConfig;
 use crate::error::Result;
 use crate::model_control::hash_request_fingerprint;
 use crate::store::Store;
+pub use crate::store_support::issue_tracker::UnconsumedDelivery;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -56,36 +57,6 @@ pub enum WatchFireOutcome {
     AbandonUnconsumed(UnconsumedDelivery),
 }
 
-/// Typed give-up fact for a terminal-watch delivery the wake tip never
-/// consumed (issue #648). `reason()` renders the historical log/warning text
-/// byte-for-byte so the non-manager path is unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnconsumedDelivery {
-    /// Rotation-lineage tip the delivery was addressed to.
-    pub tip: Uuid,
-    /// Watched child whose terminal row anchors the give-up clock.
-    pub watched: Uuid,
-    /// Whole minutes between the watched child's terminal row and give-up.
-    pub minutes: i64,
-}
-
-impl UnconsumedDelivery {
-    #[must_use]
-    pub fn reason(&self) -> String {
-        let Self {
-            tip,
-            watched,
-            minutes,
-        } = self;
-        format!(
-            "delivery to {tip} was never consumed: no provider output after \
-             {minutes} min of re-delivery attempts for watched child {watched}. The \
-             notification is being dropped; resume {tip} manually to pick the \
-             work back up"
-        )
-    }
-}
-
 /// Thin interface over SessionManager::launch_session for testability.
 #[async_trait]
 pub trait SessionLauncher: Send + Sync {
@@ -121,6 +92,23 @@ pub trait SessionLauncher: Send + Sync {
         _job_ids: Vec<Uuid>,
     ) -> Result<Uuid> {
         self.resume_scheduled(target, query).await
+    }
+
+    /// Reconcile a fast provider failure after the scheduler has consumed its
+    /// heal wake. The lifecycle owner checks live state under the spawn guard.
+    async fn reconcile_transient_heal_after_resume(&self, _target: Uuid) {}
+
+    /// #1073: true while a waiting deploy holds a scheduled resume of
+    /// `target` (a child session). The wake stays due and is retried next tick.
+    async fn deploy_holds_resume(&self, _target: Uuid) -> bool {
+        false
+    }
+
+    /// #572: the instant until which a provider usage-limit hold keeps an
+    /// automated dispatch to `target` from running, if one is in force. The
+    /// scheduler re-arms the wake at that instant instead of attempting it.
+    async fn provider_usage_hold(&self, _target: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+        None
     }
 
     async fn resume_capacity_scheduled(
@@ -314,6 +302,7 @@ pub async fn tick(
         );
 
         let launch_config = LaunchConfig {
+            completion_gates: None,
             query: query.clone(),
             title: None,
             agent_role: None,
@@ -361,6 +350,7 @@ pub async fn tick(
                 &query,
             ])),
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::IssueTrackerDispatch,
             sandbox: None,

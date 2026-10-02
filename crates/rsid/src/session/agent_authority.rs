@@ -11,7 +11,9 @@ use rsi_common::harness_manager_v2::{
     AgentSubmitReviewReceiptRequestV1, ManagerActionKindV2 as Action,
     ManagerCapabilityV2 as Capability, ManagerOperatingModeV2, ManagerReviewVerdictV1,
 };
-use rsi_common::manager_operator_delegation::DELEGABLE_OPERATOR_METHODS;
+use rsi_common::manager_operator_delegation::{
+    DAEMON_SETTINGS_OPERATOR_METHODS, OPERATOR_DELEGATION_METHODS, STORAGE_CONTROL_OPERATOR_METHODS,
+};
 use rsi_common::types::{SessionKind, SessionStatus};
 use rusqlite::{Transaction, TransactionBehavior, params};
 use serde_json::json;
@@ -148,18 +150,33 @@ struct VerbRights {
     control: bool,
     prepared: bool,
     topology_manager: bool,
+    deploy: bool,
+}
+
+/// Whether every live leaf session holds `verb` regardless of role. This is
+/// the baseline a pending role publication keeps advertising.
+pub(crate) fn is_baseline_verb(verb: Verb) -> bool {
+    permitted_verb(verb, &VerbRights::default())
 }
 
 fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
     match verb {
         Verb::SpawnChild | Verb::ReserveSuccessor | Verb::ArchiveChild => rights.lead,
-        Verb::GetProgress
+        Verb::GetAuthorityCatalog
+        | Verb::GetProgress
         | Verb::SendMessage
         | Verb::GetStatus
         | Verb::Halt
         | Verb::ContinueChild
         | Verb::ScheduleWake
-        | Verb::CreateIssue => true,
+        | Verb::CancelWake
+        | Verb::ListWakes
+        | Verb::ReadSessionEvents
+        | Verb::CreateIssue
+        | Verb::SubmitJob
+        | Verb::GetJob
+        | Verb::ListJobs
+        | Verb::QueryFailureSignatures => true,
         Verb::ListIssues
         | Verb::GetIssue
         | Verb::UpdateIssue
@@ -169,10 +186,19 @@ fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         | Verb::ListIssueEvents => rights.issue_lead || rights.issue_manager,
         Verb::ManagerInbox => rights.managed_lead || rights.manager,
         Verb::ManagerReply | Verb::ManagerNotify => rights.managed_lead,
+        Verb::EnqueueLandingSource | Verb::GetProviderStatus | Verb::GetDaemonInfo => {
+            rights.lead || rights.manager
+        }
+        Verb::SendSatelliteMessage => rights.manager,
+        Verb::RequestDeploy => rights.deploy,
         Verb::ManagerWorkView => rights.managed_worker,
         Verb::ManagerProgress
         | Verb::ManagerSend
         | Verb::ManagerInspect
+        | Verb::ManagerDelegateNode
+        | Verb::ManagerEscalate
+        | Verb::ManagerListEscalations
+        | Verb::ManagerResolveEscalation
         | Verb::ManagerGetAction => rights.manager,
         Verb::ManagerUpdate => rights.work_writer,
         Verb::ManagerControl => rights.control,
@@ -266,7 +292,11 @@ impl Store {
         let control_actions = ACTIONS
             .iter()
             .filter_map(|(action, capability)| {
-                (has(*capability)
+                // #1043/#1046: `StorageControl` or `DaemonSettings` alone reach
+                // `operator_call` for the methods each unlocks.
+                ((has(*capability)
+                    || (*action == Action::OperatorCall
+                        && (has(Capability::StorageControl) || has(Capability::DaemonSettings))))
                     && (*action != Action::SucceedManager
                         || (session.session_kind == SessionKind::Standard
                             && session.parent_id.is_none())))
@@ -277,11 +307,17 @@ impl Store {
             .iter()
             .filter_map(|(name, capability)| has(*capability).then_some(*name))
             .collect::<Vec<_>>();
-        let delegated_operator_methods = if has(Capability::OperatorDelegation) {
-            DELEGABLE_OPERATOR_METHODS.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut delegated_operator_methods = Vec::new();
+        if has(Capability::OperatorDelegation) {
+            delegated_operator_methods.extend_from_slice(OPERATOR_DELEGATION_METHODS);
+        }
+        if has(Capability::StorageControl) {
+            delegated_operator_methods.extend_from_slice(STORAGE_CONTROL_OPERATOR_METHODS);
+        }
+        if has(Capability::DaemonSettings) {
+            delegated_operator_methods.extend_from_slice(DAEMON_SETTINGS_OPERATOR_METHODS);
+        }
+        delegated_operator_methods.sort_unstable();
         let update_variants = active_grant.map_or_else(Vec::new, |g| {
             permitted_updates(&g.policy.capabilities, is_manager, lead_in_manager_scope)
         });
@@ -402,6 +438,7 @@ impl Store {
             work_writer: !update_variants.is_empty(),
             control: !control_actions.is_empty(),
             prepared: !prepared_actions.is_empty(),
+            deploy: has(Capability::Deploy),
             topology_manager: manager_grant
                 .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation)),
         };
@@ -457,6 +494,22 @@ mod tests {
     use rsi_common::types::Project;
     use std::path::PathBuf;
 
+    /// The authority catalog is every session's entry point, so it must be in
+    /// the role-independent baseline; role controls stay role-gated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn authority_catalog_is_in_every_sessions_baseline() {
+        assert!(is_baseline_verb(Verb::GetAuthorityCatalog));
+        assert!(is_baseline_verb(Verb::GetStatus));
+        for role_verb in [
+            Verb::SpawnChild,
+            Verb::ManagerControl,
+            Verb::SubmitReviewReceipt,
+        ] {
+            assert!(!is_baseline_verb(role_verb), "{role_verb:?}");
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn manager_action_grants_cover_new_variants_and_closed_delegation() {
@@ -472,7 +525,9 @@ mod tests {
         ] {
             assert!(ACTIONS.contains(&(action, Capability::LeadControl)));
         }
-        assert_eq!(DELEGABLE_OPERATOR_METHODS.len(), 4);
+        assert_eq!(OPERATOR_DELEGATION_METHODS.len(), 4);
+        assert_eq!(STORAGE_CONTROL_OPERATOR_METHODS.len(), 2);
+        assert_eq!(DAEMON_SETTINGS_OPERATOR_METHODS.len(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -860,7 +915,7 @@ mod tests {
         );
         assert_eq!(
             manager_after.delegated_operator_methods,
-            DELEGABLE_OPERATOR_METHODS
+            OPERATOR_DELEGATION_METHODS
         );
 
         let lead_after = store.agent_authority_projection(lead_id).unwrap();

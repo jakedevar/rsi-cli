@@ -48,15 +48,15 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-H` | other pane focused (normal mode, no overlay) | focus the pane to the left |
 | `Ctrl-L` | session list focused (normal mode, no overlay) | next session-list zone (Main → TaskRabbit → Jobs → Archive, wrapping) |
 | `Ctrl-L` | other pane focused (normal mode, no overlay; not a stale Issues editor) | focus the pane to the right |
-| `Ctrl-Shift-Up` | launch prompt or input modal open | make the overlay shorter |
-| `Ctrl-Shift-Down` | launch prompt or input modal open | make the overlay taller |
-| `Ctrl-Shift-Left` | launch prompt or input modal open | make the overlay narrower |
-| `Ctrl-Shift-Right` | launch prompt or input modal open | make the overlay wider |
-| `Ctrl-Up` | launch prompt or input modal open | move the overlay up |
-| `Ctrl-Down` | launch prompt or input modal open | move the overlay down |
-| `Ctrl-Left` | launch prompt or input modal open | move the overlay left |
-| `Ctrl-Right` | launch prompt or input modal open | move the overlay right |
-| `Ctrl-0` | launch prompt or input modal open | reset the overlay's size and position |
+| `Ctrl-Shift-Up` | movable overlay open | make the overlay shorter |
+| `Ctrl-Shift-Down` | movable overlay open | make the overlay taller |
+| `Ctrl-Shift-Left` | movable overlay open | make the overlay narrower |
+| `Ctrl-Shift-Right` | movable overlay open | make the overlay wider |
+| `Ctrl-Up` | movable overlay open | move the overlay up |
+| `Ctrl-Down` | movable overlay open | move the overlay down |
+| `Ctrl-Left` | movable overlay open | move the overlay left |
+| `Ctrl-Right` | movable overlay open | move the overlay right |
+| `Ctrl-0` | movable overlay open | reset the overlay's size and position |
 | `Ctrl-Shift-Right` | normal mode, no overlay | widen the session-list sidebar |
 | `Ctrl-Shift-Left` | normal mode, no overlay | narrow the session-list sidebar |
 | `Ctrl-Left` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column left (snaps to Left Aligned at the edge) |
@@ -139,7 +139,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>gd` | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `yy` | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
 | `x` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
-| `X` | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `X` | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
 | `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
@@ -1123,7 +1123,26 @@ Toggled with `Ctrl+\` or `:term` / `:shell` commands. Shell persists when overla
 
 ### Prompt Overlay (New Session / Continue Session)
 
+The prompt keeps its bottom row for the editing mode alone (`NORMAL`, `INSERT`, `VISUAL`, ...) plus a dim `? help` pointer when `?` would open help. Every key lives in the prompt's contextual help: press `?` in normal mode (or `Ctrl-Alt-G` in any mode). Its generated tables are [New Session Prompt](#new-session-prompt), [New Session Settings](#new-session-settings) and [Continue Prompt](#continue-prompt). `?` still types a `?` in insert mode and still completes a half-typed vim command such as `f?`.
+
+The header row of a new-session prompt summarizes the launch: working directory, model, effort bars with the effort level (dim while it is the model default), `⊡ sandbox` or `⊡ no sandbox` (shown when the daemon supports sandboxes), and `★ manager · <policy>` when a manager appointment is planned (peach when it replaces the project's current manager).
+
 Clipboard paste works from either mode and switches to insert mode automatically if needed.
+
+#### Settings Side (`Ctrl+O`, or `Tab` in normal mode)
+
+New-session prompts (blank and TaskRabbit) flip to a settings side where the launch is adjusted before it is sent. Flipping keeps the prompt's text and editing mode, so `Ctrl+O` from insert mode, a change, and `Ctrl+O` again resumes typing. `Esc` or `Tab` also flips back. `Ctrl+Enter`, `Ctrl+T`, `Ctrl+S`, `Ctrl+Q`, `Ctrl+E`, `Ctrl+B` and `Ctrl+M` keep working on the settings side; other keys never edit the hidden text.
+
+| Row | Keys | Effect |
+|-----|------|--------|
+| Model | `Space` / `Enter` / `h` / `l` | Open the model picker for this launch |
+| Effort | `h` / `l` (`Space` = forward) | Step the effort level down / up the model's ladder (shared with `Ctrl+E`) |
+| Sandbox | `Space` / `Enter` / `h` / `l` | Toggle git-worktree isolation (capability-gated, like `Ctrl+B`) |
+| Manager | `Space` / `Enter` / `h` / `l` | Blank prompts only: appoint the launched session as the current project's manager (needs a selected project) |
+| Scope | `h` / `l` (`Space` = forward) | Whole project, then each live Group followed by its live Epics |
+| Policy | `h` / `l` (`Space` = forward) | `Observe`, `Execute` (default) or `Full project control` |
+
+The appointment runs after the daemon accepts the launch, through the same operator RPCs as `:manager appoint` and `:manager policy`: `ConfigureHarnessManager` with the chosen scope, then `ConfigureHarnessManagerPolicy` with the preset applied to a fresh policy (the editor's suggested allowances included). Appointing replaces the project's current manager. A refused step is reported in a notification; the session is launched either way and can be appointed later with `:manager appoint`.
 
 #### Insert Mode (default when opened)
 
@@ -1162,13 +1181,15 @@ Overlay normal mode supports the full vim text editing feature set documented in
 | Key | Action | Description |
 |-----|--------|-------------|
 | `Ctrl+Q` | Close | Close overlay without submitting (normal or insert mode) |
+| `?` | Help | Contextual help for the prompt (normal mode with no pending command) |
+| `Ctrl+O` | Settings Side | Flip to / from the launch settings side (Blank/TaskRabbit only); `Tab` does the same in normal mode |
 | `Ctrl+E` | Cycle Effort | Cycle effort level (Blank/TaskRabbit only; `None` starts at the selected model default, then follows the ordered ladder: Opus 5 / Opus 4.7+ / Sonnet 5 `low`→`medium`→`high`→`xhigh`→`max`; Opus/Sonnet 4.6 `low`→`medium`→`high`→`max`; Codex GPT-5.6 Sol/Terra `low`→`medium`→`high`→`xhigh`→`max`→`ultra`; GPT-5.6 Luna through `max`; GPT-5.5/5.2 through `xhigh`) |
 | `Ctrl+M` | Model Selector | Open model selector (Blank/TaskRabbit only) — selection sets per-modal override |
 | `Ctrl+B` | Toggle Sandbox | Toggle sandbox (git-worktree isolation) for this launch (Blank/TaskRabbit only; capability-gated — no-op against daemons without sandbox support) |
 
 #### Modal Geometry (Any Mode)
 
-These keys work when any Prompt overlay (Blank, TaskRabbit, ContinueSession) or the `Ctrl+G` input modal is active, in both insert and normal mode.
+These keys work in centered modal windows, including prompts, pickers, forms, help, previews, Notifications, graph review, and Terminal. They work in insert and normal mode where applicable. The file-explorer drawer and recent-completions gutter follow their pane layouts.
 
 | Key | Action | Description |
 |-----|--------|-------------|
@@ -1182,7 +1203,7 @@ These keys work when any Prompt overlay (Blank, TaskRabbit, ContinueSession) or 
 | `Ctrl+Up` | Move Up | Move modal up |
 | `Ctrl+0` | Reset Geometry | Reset modal position/size to defaults |
 
-Geometry changes persist across sessions, keyed by modal purpose (Blank, TaskRabbit, ContinueSession, InputModal). Terminal resize recomputes the base rect; deltas apply on top.
+Geometry changes persist across sessions, keyed by modal purpose (for example Blank, TaskRabbit, ContinueSession, InputModal, NotificationBrowser, SortPicker). Terminal resize recomputes the base rect; deltas apply on top.
 
 ### Question Panel
 
@@ -1467,7 +1488,25 @@ For `.md` files, `Space+m` toggles between raw source view (with tree-sitter syn
 
 ### Settings Pane (`<Space>,` or `:set`)
 
-The settings pane replaces the focused pane content. Categories on the left, items on the right.
+The settings pane replaces the focused pane content and reads like a game settings menu:
+
+- a **category rail** on the left, one row per category, each with its own glyph and color (`◐` Appearance, `▤` Workspace, `✦` Models, `$` Safety & Spend, `↺` Agent Automation, `⊡` Providers & Sandboxes, `⇄` Integrations);
+- the selected category's **settings list**, with one **tab per section** (for example Appearance has `Theme & Colors` and `Screen`);
+- an **info card** for the selected setting: what it does, what `Enter` does, when a change applies (`✓ applies now`, `◷ next spawn`, `↻ after daemon restart`, ...), where it is stored, and every option of a choice;
+- a footer of key prompts for the focused panel and the selected row.
+
+Values render as widgets: `━━● ON` / `○── OFF` switches, `◂ value ▸` selectors with position pips (`○●○`, or a slider for long ranges), color swatches, `▾` pickers and buttons. A `↻` after a value marks a change that applies only after a daemon restart.
+
+Layout keys (decoded by the settings pane itself; the table below lists the registry keys):
+
+| Keys | Action | What it does |
+| --- | --- | --- |
+| `j` / `k` (rail focused) | Category | Select the next / previous category; it opens on its first tab |
+| `Tab` / `Shift+Tab`, `]` / `[` | Section tab | Next / previous section tab of the selected category, wrapping inside it; works from the rail or the list |
+| `>` / `<` | Resize | Widen / narrow the focused panel: the rail when it is focused, otherwise the list, which takes room from the info card beside it (or from the rail) |
+| `=` | Reset layout | Restore the automatic panel widths |
+
+Panel widths persist in `state.json`. Below 72 columns one panel shows at a time; below 110 columns the rail collapses to its icons while the list is focused; from 150 columns the info card sits beside the list instead of below it.
 
 <!-- rsi:generated:begin settings -->
 Keys of the settings pane (category rail and items).
@@ -1488,6 +1527,8 @@ Keys of the settings pane (category rail and items).
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
+| `K` | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
+| `J` | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -1824,6 +1865,22 @@ The Recursive Graphs picker (`R`) renders a recursive task graph's **structure**
 
 ---
 
+### Satellite Registry Browser
+
+Open **Settings → Integrations → Satellites → Satellite registry**. The browser reads only the hub daemon; cached remote sessions have no local session actions.
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Cycle peers, links, and cached sessions |
+| `j` / `k` | Select a row in the active tab |
+| `a` / `e` | Add or edit a peer or link (`Tab` moves form focus; `Space` toggles; `Enter` saves; `Esc` cancels) |
+| `d` | Enable or disable the selected peer or link |
+| `R` | Open an explicit quarantine repair edit for the selected peer |
+| `p` | Probe the selected link and show installation/incarnation identity |
+| `n` / `b` | Next or previous cached remote-session page |
+| `r` | Refresh the registry and cached page |
+| `Esc` / `q` | Close the browser |
+
 ## Overlay Key Reference (generated)
 
 Generated from the overlay help catalog: the same rows `?` shows inside each overlay. The hand-written overlay sections above explain behavior; these tables list every key.
@@ -1847,6 +1904,8 @@ Keys of the scheduled jobs browser.
 | `d` | Begin delete chord | First `d` of `dd`: arms deletion of the selected scheduled job. |
 | `dd` | Delete selected job | Deletes the selected scheduled job (`dd`). |
 | `r` | Refresh scheduled jobs | Re-reads the scheduled jobs from the daemon. |
+| `H` | Toggle scheduled job history | Switches between active jobs and every job including old disabled history. |
+| `m` | Load more scheduled jobs | Loads the next page of scheduled jobs from the daemon. |
 | `q` | Close or cancel | Closes the current view or cancels the pending action. |
 | `Esc` | Close or cancel | Closes the current view or cancels the pending action. |
 <!-- rsi:generated:end -->
@@ -2191,10 +2250,13 @@ Keys of the theme role editor.
 | --- | --- |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
-| `x` | Dismiss selected notification |
+| `x` | Dismiss selected active notification |
 | `N` | Dismiss all active notifications |
-| `Enter` | Open source session |
+| `Enter` | Open linked session |
 | `Esc / q` | Close |
+| `Ctrl+Arrows` | Move modal |
+| `Ctrl+Shift+Arrows` | Resize modal |
+| `Ctrl+0` | Reset modal geometry |
 | `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
@@ -2689,6 +2751,68 @@ Keys of the theme role editor.
 | `h j k l, w b` | Move cursor (normal mode) |
 <!-- rsi:generated:end -->
 
+### New Session Prompt
+
+<!-- rsi:generated:begin overlay-new-session-prompt -->
+| Keys | Action |
+| --- | --- |
+| `Ctrl-Enter` | Launch the session |
+| `Ctrl-T / Ctrl-S` | Launch into a new tab / split |
+| `Ctrl-O, Tab (normal)` | Flip to launch settings: model, effort, sandbox, manager |
+| `Ctrl-M` | Open model picker |
+| `Ctrl-E` | Cycle effort level |
+| `Ctrl-B` | Toggle sandbox (isolated git worktree) |
+| `? (normal)` | Show this help |
+| `Ctrl-J / Ctrl-K` | Focus next / previous stacked prompt |
+| `Space o / Space N (normal)` | Stack a TaskRabbit / blank prompt |
+| `Ctrl-Q` | Close and keep the draft |
+| `Ctrl-Y` | Compile prompt |
+| `a / d` | Accept / discard the compiled preview |
+| `Ctrl-Shift-G` | Grammar and spelling correction |
+| `Ctrl-A` | AI command on text |
+| `Ctrl-Shift-A` | Ask AI about text |
+| `Ctrl-V` | Paste from clipboard (images become @path references) |
+| `i / a / o` | Enter insert mode (normal mode) |
+| `Esc` | Return to normal mode (insert mode) |
+| `h j k l, w b` | Move cursor (normal mode) |
+<!-- rsi:generated:end -->
+
+### New Session Settings
+
+<!-- rsi:generated:begin overlay-new-session-settings -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move between settings |
+| `h / l, Left / Right` | Change the selected setting |
+| `Space / Enter` | Toggle or open the selected setting |
+| `Ctrl-E / Ctrl-B` | Cycle effort / toggle sandbox |
+| `Ctrl-M` | Open model picker |
+| `Ctrl-Enter` | Launch the session |
+| `Ctrl-T / Ctrl-S` | Launch into a new tab / split |
+| `?` | Show this help |
+| `Ctrl-O / Tab / Esc` | Flip back to the prompt |
+| `Ctrl-Q` | Close and keep the draft |
+<!-- rsi:generated:end -->
+
+### Continue Prompt
+
+<!-- rsi:generated:begin overlay-continue-prompt -->
+| Keys | Action |
+| --- | --- |
+| `Ctrl-Enter` | Send the follow-up |
+| `? (normal)` | Show this help |
+| `Ctrl-Q` | Close without sending |
+| `Ctrl-Y` | Compile prompt |
+| `a / d` | Accept / discard the compiled preview |
+| `Ctrl-Shift-G` | Grammar and spelling correction |
+| `Ctrl-A` | AI command on text |
+| `Ctrl-Shift-A` | Ask AI about text |
+| `Ctrl-V` | Paste from clipboard (images become @path references) |
+| `i / a / o` | Enter insert mode (normal mode) |
+| `Esc` | Return to normal mode (insert mode) |
+| `h j k l, w b` | Move cursor (normal mode) |
+<!-- rsi:generated:end -->
+
 ### Screens Without an Overlay Catalog
 
 <!-- rsi:generated:begin overlay-exemptions -->
@@ -2699,12 +2823,12 @@ Screens without an overlay key catalog, and where their keys are documented.
 | no overlay open | The focused pane's keys apply; see the Normal-mode table. | generated table `normal` |
 | Scheduled Jobs browser | Its keys are registry routes, rendered as their own generated table. | generated table `schedule-browser` |
 | Theme role editor | Its keys are registry routes, rendered as their own generated table. | generated table `theme-role-editor` |
-| Launch / continue prompt | A text editor surface; its keys are documented by hand. | keybindings.md § Prompt Overlay (New Session / Continue Session) |
 | Keybindings help | Help documents its own scroll, search and close keys. | keybindings.md § Keybindings Help Overlay |
 | ESP Square game | A game with its own single-screen key legend. | keybindings.md § ESP Square Overlay (`<Space>gc`) |
 | Manager policy: launch-choice catalog picker | A picker sub-mode of the manager policy editor with its own key handling. | keybindings.md § Harness Manager Policy (`:manager policy`) |
 | Source-worktree settlement: authorization | A confirmation sub-mode of the settlement browser with its own key handling. | keybindings.md § Source-Worktree Settlement Authorization |
 | Graph review: info dashboard focused | The dashboard panel owns keys while focused, separate from graph editing. | keybindings.md § Graph Review Overlay (`<Space>v` or `:graph`) |
+| Satellite registry browser | The browser owns its peer, link and cached session keys. | keybindings.md § Satellite Registry Browser |
 <!-- rsi:generated:end -->
 
 ### Surfaces Documented by Hand
@@ -2994,6 +3118,27 @@ Normal Session List and Settings views do not reserve a persistent command-hint 
 - **Input Bar**: Inline bottom bar in session detail view for quick follow-ups
 
 Both support vim-style modal editing and slash command suggestions.
+
+### Operator messages and restart
+
+Composing a follow-up for a busy session queues it for the next safe turn
+boundary. Session detail shows the pending count. These command-mode actions
+operate on the selected session:
+
+| Command | Effect |
+| --- | --- |
+| `:pending` | Show queued, dispatching, and uncertain message IDs and previews. |
+| `:pending edit <id> <text>` | Replace a queued message before delivery. |
+| `:pending withdraw <id>` | Withdraw a queued message before delivery. |
+| `:drain` | Request a daemon restart after current turns settle, with a bounded wait. |
+| `:drain status` | Show the per-session drain state. |
+
+An `uncertain` message may have reached the provider before a restart. It stays
+visible and blocks automatic replay, since replay could send it twice.
+
+`X` is the emergency **INTERRUPT NOW** action. Press it twice within five
+seconds to cancel the selected active turn. The ordinary hard restart path
+remains available through the daemon's normal shutdown signals.
 
 ### Vim Integration
 

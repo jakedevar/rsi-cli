@@ -279,6 +279,17 @@ fn apply_staleness(
 /// clobbered mid-session. We only accept:
 /// - the first announced model when the session has no model yet, or
 /// - a `system/init` event, which is the provider's launch-time handshake.
+///
+/// The returned id is canonical (#273): the Claude CLI announces the
+/// context-variant form (`claude-opus-5[1m]`) even for a session launched with
+/// the bare catalog id, and that suffix matches no catalog entry, so it is
+/// stripped before it can reach `sessions.model` (abbreviation, effort ladder
+/// and model-control routing all key on the stored id). The variant is not
+/// kept in the model id: the window the session actually got is
+/// environment-dependent (`CLAUDE_CODE_DISABLE_1M_CONTEXT=1` yields 200k for
+/// the same id), so the reported `contextWindow` (`context_window` and the
+/// resolved context budget) is the sole record of it, and the launch path
+/// re-derives the tag from the bare id (`claude_launch_model`).
 fn authoritative_model_update<'a>(
     current_model: Option<&str>,
     stream_event: &'a StreamEvent,
@@ -287,7 +298,9 @@ fn authoritative_model_update<'a>(
     let is_init_event = stream_event.event_type == "system"
         && stream_event.data.get("subtype").and_then(|v| v.as_str()) == Some("init");
     if current_model.is_none() || is_init_event {
-        Some(model)
+        Some(rsi_common::claude_catalog::strip_context_variant_suffix(
+            model,
+        ))
     } else {
         None
     }
@@ -863,6 +876,52 @@ pub(super) fn context_fill_pct_for_tracked(tracked: &TrackedSession) -> Option<f
     measured.then_some(pct)
 }
 
+/// #1000: per-monitor state for the cumulative full-prompt total
+/// (`Session.total_prompt_tokens`), which sums every model call's prompt
+/// (uncached input + cache creation + cache read). `total_input_tokens` stays
+/// the largest single-call prompt (the context numerator).
+#[derive(Debug, Default)]
+pub(super) struct PromptTotals {
+    /// Claude repeats one call's usage on each content-block `assistant`
+    /// event; a message id is counted once.
+    last_message_id: Option<String>,
+    /// The Harness loop reports a cumulative prompt for its own launch; it
+    /// is added to the total the session had when this monitor started.
+    harness_base: Option<u64>,
+}
+
+impl PromptTotals {
+    /// The session's cumulative prompt after one usage-bearing event.
+    pub(super) fn observe(
+        &mut self,
+        provider: SessionProvider,
+        current: u64,
+        message_id: Option<String>,
+        usage: &monitor::TokenUsage,
+    ) -> u64 {
+        if provider == SessionProvider::Harness {
+            let base = *self.harness_base.get_or_insert(current);
+            return base.saturating_add(usage.prompt_tokens_total);
+        }
+        let repeated = message_id.is_some() && message_id == self.last_message_id;
+        if message_id.is_some() {
+            self.last_message_id = message_id;
+        }
+        if repeated {
+            return current;
+        }
+        // Codex CLI/AppServer carry the raw turn prompt (cached included) in
+        // `prompt_tokens_total`; Claude's `total_input` is already
+        // input + cache creation + cache read.
+        let call = if usage.prompt_tokens_total > 0 {
+            usage.prompt_tokens_total
+        } else {
+            usage.total_input
+        };
+        current.saturating_add(call)
+    }
+}
+
 /// Derive `Session.context_fill_pct` for an IDLE/persisted session (no live
 /// `TrackedSession`) from its stored token fields. Denominator is resolved
 /// through the canonical capability resolver. Codex
@@ -1067,65 +1126,123 @@ async fn maybe_start_memory_flush_turn(
     Ok(true)
 }
 
+/// #959: percentage points below the rotation threshold at which a handled
+/// automatic crossing re-arms (the session compacted in place).
+const AUTOMATIC_THRESHOLD_REARM_POINTS: f64 = 5.0;
+
+/// #959: what an automatic threshold crossing does for this session.
+enum AutomaticThresholdGate {
+    /// Not a coordinator: keep working, no rotation.
+    Worker,
+    /// A coordinator: its succession request is due (`false` when one was
+    /// already due for this seat).
+    SuccessionRequested(bool),
+    /// Durable review or source ownership defers the request.
+    Deferred(&'static str),
+}
+
+fn automatic_threshold_gate(
+    store: &Store,
+    session_id: Uuid,
+    pct: f64,
+    threshold_pct: f64,
+) -> crate::error::Result<AutomaticThresholdGate> {
+    let Some(coordinator) = super::context_succession::coordinator_role(store, session_id)? else {
+        return Ok(AutomaticThresholdGate::Worker);
+    };
+    if let Some(reason) = store.automatic_rotation_protection(session_id)? {
+        return Ok(AutomaticThresholdGate::Deferred(reason));
+    }
+    Ok(AutomaticThresholdGate::SuccessionRequested(
+        super::context_succession::record_succession_due(
+            store,
+            session_id,
+            coordinator,
+            pct,
+            threshold_pct,
+            chrono::Utc::now(),
+        )?,
+    ))
+}
+
 async fn advance_context_rotation_threshold(
     tracked: &mut TrackedSession,
     session_id: Uuid,
     pct: f64,
-    persistence: &PersistenceHandle,
     runtime_config: &crate::config::RuntimeConfig,
     store: &Arc<tokio::sync::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
 ) {
     let threshold_pct = runtime_config.context_rotation_threshold_pct(tracked.session.provider);
+    if pct < threshold_pct - AUTOMATIC_THRESHOLD_REARM_POINTS
+        && tracked.rotation.automatic_threshold_latched()
+    {
+        tracked.rotation.rearm_automatic_threshold();
+        // #959: the session compacted in place; a pending succession request
+        // for its seat is settled.
+        let settled = super::context_succession::clear_succession(
+            &*store.lock().await,
+            session_id,
+            "context_compacted",
+        );
+        if let Err(error) = settled {
+            tracing::warn!(%session_id, %error, "Context succession request not settled");
+        }
+    }
     if pct >= threshold_pct
+        && tracked.rotation.is_enabled()
         && tracked.authorizes_threshold_rotation()
         && matches!(tracked.rotation.state(), RotationState::Idle)
     {
-        match store.lock().await.automatic_rotation_protection(session_id) {
-            Ok(Some(reason)) => {
-                tracing::info!(%session_id, reason, "Automatic context rotation deferred");
-                return;
+        if tracked.rotation.automatic_threshold_latched() {
+            return;
+        }
+        let gate = {
+            let store = store.lock().await;
+            automatic_threshold_gate(&store, session_id, pct, threshold_pct)
+        };
+        match gate {
+            // #959: a worker is never force-rotated at a context threshold. It
+            // keeps its task through provider-native (Claude, Codex) or Harness
+            // in-loop compaction; manual rotation is unchanged.
+            Ok(AutomaticThresholdGate::Worker) => {
+                tracked.rotation.latch_automatic_threshold();
+                tracing::info!(
+                    %session_id,
+                    context_pct = pct,
+                    threshold_pct,
+                    "Context threshold reached by a worker; no forced rotation, native compaction continues"
+                );
             }
-            Ok(None) => {}
+            // #959: a coordinator is not interrupted either. One durable
+            // request per crossing; the idle-boundary pass asks it to pass
+            // its seat (`deliver_due_context_successions`).
+            Ok(AutomaticThresholdGate::SuccessionRequested(recorded)) => {
+                tracked.rotation.latch_automatic_threshold();
+                if recorded {
+                    tracing::info!(
+                        %session_id,
+                        context_pct = pct,
+                        threshold_pct,
+                        "Context threshold reached by a coordinator; succession requested at its next idle boundary"
+                    );
+                }
+            }
+            Ok(AutomaticThresholdGate::Deferred(reason)) => {
+                tracing::info!(%session_id, reason, "Automatic context succession deferred");
+            }
             Err(error) => {
                 tracing::error!(%session_id, %error, "Automatic context rotation protection read failed; deferring");
                 event_bus.publish(DaemonEvent::SystemMessage {
                     level: "error".into(),
                     message: format!("Automatic context rotation deferred for {session_id}: protection read failed: {error}"),
                 });
-                return;
             }
         }
     }
-    let action = context_rotation_threshold_action(tracked, pct, threshold_pct);
-    if matches!(action, RotationAction::InterruptForRotation) {
-        let depth = tracked.session.rotation_depth;
-        let rid = tracked
-            .rotation
-            .rotation_id()
-            .unwrap_or("unknown")
-            .to_string();
-        tracing::info!(
-            session_id = %session_id,
-            context_pct = pct,
-            rotation_depth = depth,
-            rotation_id = %rid,
-            "Context rotation threshold reached, interrupting for handoff write"
-        );
-        let _ = tracked.stop_tx.try_send(());
-        let metadata = format!("{{\"pct\":{pct:.1}}}");
-        let _ = persistence
-            .log_rotation_event(
-                session_id,
-                &rid,
-                "pending_interrupt",
-                "entered",
-                Some(metadata),
-            )
-            .await;
-    }
 }
 
+#[cfg(test)]
 fn context_rotation_threshold_action(
     tracked: &mut TrackedSession,
     pct: f64,
@@ -1678,6 +1795,15 @@ impl SessionManager {
         custody_runtime: crate::sandbox::custody::CustodyExecutionRuntime,
     ) {
         let mut sequence: i32 = initial_sequence;
+        // Boundary-delivered operator messages (#1062) are written here, by the
+        // one owner of this session's sequence counter.
+        let operator_inbox = active
+            .read()
+            .await
+            .get(&session_id)
+            .filter(|tracked| tracked.spawn_generation == expected_generation)
+            .map(|tracked| tracked.operator_inbox.clone())
+            .unwrap_or_default();
         // The invocation is durable before the monitor starts. If legacy or
         // corrupt state lacks it, provider events remain readable but receive
         // no provenance and Closure therefore fails closed.
@@ -1724,6 +1850,9 @@ impl SessionManager {
         let mut memory_flush_attempted_compaction_count: Option<u32> = None;
         let mut terminal_reason: Option<MonitorBreakReason> = None;
         let mut current_result = TerminalResult::None;
+        // AppServer enqueue is not provider receipt. Keep the effect-possible
+        // row open until this monitor observes the next turn's result frame.
+        let mut inflight_operator_message: Option<Uuid> = None;
         let mut turn_outcome = TerminalTurnOutcome::NotMultiTurn;
         let mut stream_drained = false;
         let mut terminal_deadline: Option<tokio::time::Instant> = None;
@@ -1769,6 +1898,8 @@ impl SessionManager {
         // Codex cache-read totals can advance while the context numerator stays
         // constant, so include them in the session-metadata flush gate.
         let mut last_snapshot_cache_read_tokens: Option<u64> = None;
+        // #1000: cumulative full-prompt accounting for this monitor.
+        let mut prompt_totals = PromptTotals::default();
         // Cached model string to avoid read-lock on every token usage event.
         let mut cached_model: Option<String> = None;
         // Accumulated assistant content since the last user event, for pipeline path scanning.
@@ -2178,6 +2309,11 @@ impl SessionManager {
                         });
                     }
                 }
+                _ = operator_inbox.notified() => {
+                    super::boundary_mail::drain_operator_transcript_inbox(
+                        &operator_inbox, &store, &active, &event_bus, session_id, &mut sequence,
+                    ).await;
+                }
                 _ = optional_deadline(producer_close_deadline), if producer_close_deadline.is_some() => {
                     post_settlement_deadline = None;
                     if !stream_drained {
@@ -2278,6 +2414,8 @@ impl SessionManager {
                                         }
                                     } else if source == "codex_event" && !terminal_provider_error {
                                         "Provider diagnostic (codex_event)".to_string()
+                                    } else if source == "stdout" && !terminal_provider_error {
+                                        "Provider diagnostic (stdout)".to_string()
                                     } else if source == "stderr" {
                                         "Process Error (stderr)".to_string()
                                     } else if source == "codex_event" {
@@ -2305,7 +2443,10 @@ impl SessionManager {
                                         created_at: chrono::Utc::now(),
                                         offload_id: None,
                                         tool_use_id: None,
-                                        metadata: None,
+                                        metadata: Some(Box::new(rsi_common::agent_session_events::provider_diagnostic_metadata(
+                                            source,
+                                            terminal_provider_error,
+                                        ))),
                                     };
                                     {
                                         let mut active_guard = active.write().await;
@@ -2347,7 +2488,23 @@ impl SessionManager {
                                             && tracked.spawn_generation == expected_generation
                                         {
                                             tracked.session.stop_reason =
-                                                Some(stop_reason.into_owned());
+                                                Some(stop_reason.to_string());
+                                        }
+                                        // #572: one durable, operator-visible
+                                        // condition with the exact provider text;
+                                        // the dispatch hold keeps it from repeating.
+                                        if stop_reason == crate::codex::CODEX_USAGE_LIMIT_STOP_REASON {
+                                            event_bus.publish(DaemonEvent::SystemMessage {
+                                                level: "error".into(),
+                                                message: format!(
+                                                    "Codex usage limit reached (session {session_id}); automated dispatch is held: {}",
+                                                    stream_event
+                                                        .data
+                                                        .get("error")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .unwrap_or("provider usage limit")
+                                                ),
+                                            });
                                         }
                                     }
                                     // App-server failed/interrupted turn
@@ -2648,7 +2805,6 @@ impl SessionManager {
                                                 tracked,
                                                 session_id,
                                                 pct,
-                                                &persistence,
                                                 &runtime_config,
                                                 &store,
                                                 &event_bus,
@@ -2805,6 +2961,29 @@ impl SessionManager {
                                                     .unwrap_or(0)
                                                     + usage.cache_read,
                                             );
+
+                                            // Cumulative full-prompt tokens per model call.
+                                            // Per-provider feeding:
+                                            // - Claude: usage.total_input already includes cache
+                                            //   (input + cc + cr), so the accumulator is correct.
+                                            // - Codex/AppServer: mapper adds prompt_tokens_total
+                                            //   (raw turn.completed input before cache subtraction).
+                                            // - Harness: agent loop emits a cumulative total; the
+                                            //   monitor copies it directly.
+                                            let message_id = stream_event
+                                                .data
+                                                .get("message")
+                                                .and_then(|message| message.get("id"))
+                                                .and_then(|id| id.as_str())
+                                                .map(str::to_owned);
+                                            tracked.live_prompt_tokens = prompt_totals.observe(
+                                                tracked.session.provider,
+                                                tracked.live_prompt_tokens,
+                                                message_id,
+                                                &usage,
+                                            );
+                                            tracked.session.total_prompt_tokens =
+                                                Some(tracked.live_prompt_tokens);
                                         }
 
                                         if let Some(metric) = metric.as_ref() {
@@ -2822,7 +3001,6 @@ impl SessionManager {
                                             tracked,
                                             session_id,
                                             pct,
-                                            &persistence,
                                             &runtime_config,
                                             &store,
                                             &event_bus,
@@ -2881,6 +3059,38 @@ impl SessionManager {
                             // Daemon token counting for user events (tool results) and
                             // OpenAI-compat content_block_delta streaming chunks.
                             match stream_event.event_type.as_str() {
+                                super::harness::tools::utility::ROTATION_REQUEST_STREAM_EVENT => {
+                                    let mut active_guard = active.write().await;
+                                    if let Some(tracked) =
+                                        active_guard.get_mut(&session_id)
+                                        && tracked.spawn_generation == expected_generation
+                                    {
+                                        match tracked
+                                            .rotation
+                                            .advance(RotationEvent::ManualTrigger)
+                                        {
+                                            RotationAction::InterruptForRotation => {
+                                                if let Some(ref process) = tracked.process
+                                                    && let Err(error) = process.interrupt()
+                                                {
+                                                    tracing::warn!(
+                                                        session_id = %session_id,
+                                                        error = %error,
+                                                        "Failed to interrupt Harness for rotation"
+                                                    );
+                                                }
+                                                let _ = tracked.stop_tx.try_send(());
+                                            }
+                                            action => {
+                                                tracing::warn!(
+                                                    session_id = %session_id,
+                                                    ?action,
+                                                    "Harness fresh-window rotation was not started"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 "user" => {
                                     let delta = counter.count_user_event(&stream_event.data);
                                     if delta > 0 {
@@ -3000,11 +3210,21 @@ impl SessionManager {
                             // "tool_use" (CLI stdout). When the provider calls a dynamic tool,
                             // dispatch to the registry and send the result back.
                             if stream_event.event_type == "tool_call" {
+                                // The provider's exact JSON-RPC id (number or string),
+                                // echoed back unchanged. A frame with no usable id
+                                // cannot be answered, so it is not executed.
                                 let call_id = stream_event
                                     .data
                                     .get("call_id")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                if !(call_id.is_i64() || call_id.is_string()) {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "Dropping provider tool_call without a usable JSON-RPC id"
+                                    );
+                                    continue;
+                                }
                                 let tool_name = stream_event
                                     .data
                                     .get("name")
@@ -3026,7 +3246,7 @@ impl SessionManager {
                                 let registry_result = tool_registry.execute(&tool_name, tool_args).await;
                                 match registry_result {
                                     Ok(result) => {
-                                        if let Err(e) = provider_session.send_tool_result(call_id, result).await {
+                                        if let Err(e) = provider_session.send_tool_result(&call_id, result).await {
                                             tracing::warn!(
                                                 session_id = %session_id,
                                                 tool = %tool_name,
@@ -3045,7 +3265,7 @@ impl SessionManager {
                                         let error_result = serde_json::json!({
                                             "error": e.to_string()
                                         });
-                                        let _ = provider_session.send_tool_result(call_id, error_result).await;
+                                        let _ = provider_session.send_tool_result(&call_id, error_result).await;
                                     }
                                 }
                                 // tool_call is an internal protocol event; continue the loop
@@ -3558,6 +3778,16 @@ impl SessionManager {
 
                             // Handle result event (turn or session complete)
                             if stream_event.event_type == "result" {
+                                if let Some(message_id) = inflight_operator_message.take() {
+                                    if let Err(error) = store
+                                        .lock()
+                                        .await
+                                        .settle_operator_message(message_id, true)
+                                    {
+                                        tracing::error!(%error, %message_id,
+                                            "Operator message provider result could not be persisted");
+                                    }
+                                }
                                 let result = result_evidence(&stream_event);
                                 let session_model = active
                                     .read()
@@ -3599,6 +3829,24 @@ impl SessionManager {
                                 } else {
                                     false
                                 };
+                                // #584: a provider that reports no `total_cost_usd`
+                                // (Codex, Harness, OpenRouter, Local) totals the
+                                // costs its settled invocations recorded.
+                                let invocation_cost_total = match store
+                                    .lock()
+                                    .await
+                                    .session_model_invocation_cost_total(session_id)
+                                {
+                                    Ok(total) => total,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            session_id = %session_id,
+                                            %error,
+                                            "Failed to total session invocation cost"
+                                        );
+                                        None
+                                    }
+                                };
                                 let working_dir = {
                                     let mut active_guard = active.write().await;
                                     let mut wd: Option<std::path::PathBuf> = None;
@@ -3615,9 +3863,11 @@ impl SessionManager {
                                         if let Some(duration) = meta.duration_ms {
                                             tracked.session.duration_ms = Some(duration);
                                         }
-                                        if let Some(cost) = meta.cost_usd {
-                                            tracked.session.cost_usd = Some(cost);
-                                        }
+                                        tracked.session.cost_usd = session_cost_after_result(
+                                            meta.cost_usd,
+                                            invocation_cost_total,
+                                            tracked.session.cost_usd,
+                                        );
                                         if let Some(turns) = meta.num_turns {
                                             tracked.session.num_turns = Some(turns);
                                         }
@@ -3692,7 +3942,6 @@ impl SessionManager {
                                                 tracked,
                                                 session_id,
                                                 pct,
-                                                &persistence,
                                                 &runtime_config,
                                                 &store,
                                                 &event_bus,
@@ -3739,6 +3988,7 @@ impl SessionManager {
                                 // count suppresses recursion and the original policy resumes.
                                 if terminal_reason.is_none()
                                     && matches!(result, TerminalResult::Success)
+                                    && !agent_message_arbiter.turn_admission_closed()
                                 {
                                     match maybe_start_memory_flush_turn(
                                         provider_session.as_mut(),
@@ -3781,8 +4031,58 @@ impl SessionManager {
                                 if terminal_reason.is_none()
                                     && matches!(result, TerminalResult::Success)
                                     && supports_multi_turn
+                                    && !agent_message_arbiter.turn_admission_closed()
                                     && turn_controller.turn_completed()
                                 {
+                                    // Operator follow-ups take the next native idle boundary.
+                                    // Claim is recoverable until the durable effect boundary
+                                    // below. Once crossed, a crash cannot prove whether the
+                                    // provider received turn/start.
+                                    let operator_message = {
+                                        let mut guard = store.lock().await;
+                                        guard.claim_operator_message(session_id)
+                                    };
+                                    match operator_message {
+                                        Ok(Some(message)) => {
+                                            let effect_boundary = {
+                                                let mut guard = store.lock().await;
+                                                guard.mark_operator_message_effect_possible(message.id)
+                                            };
+                                            if let Err(error) = effect_boundary {
+                                                tracing::error!(%error, message_id=%message.id,
+                                                    "Operator message effect boundary could not be persisted");
+                                                current_result = TerminalResult::ProviderError;
+                                                turn_outcome = TerminalTurnOutcome::Terminal;
+                                                terminal_reason = Some(MonitorBreakReason::Result);
+                                                terminal_deadline = Some(tokio::time::Instant::now());
+                                                continue;
+                                            }
+                                            let turn_config = crate::provider::TurnConfig {
+                                                input: message.content,
+                                                working_dir: working_dir.clone(),
+                                            };
+                                            let dispatched = provider_session.start_turn(&turn_config).await;
+                                            if let Err(error) = dispatched {
+                                                if let Err(settle_error) = store.lock().await.settle_operator_message(message.id, false) {
+                                                    tracing::error!(%settle_error, message_id=%message.id,
+                                                        "Operator message failure could not be persisted");
+                                                }
+                                                tracing::warn!(%error, message_id=%message.id,
+                                                    "Operator message turn failed to start");
+                                                current_result = TerminalResult::ProviderError;
+                                                turn_outcome = TerminalTurnOutcome::Terminal;
+                                                terminal_reason = Some(MonitorBreakReason::Result);
+                                                terminal_deadline = Some(tokio::time::Instant::now());
+                                            } else {
+                                                inflight_operator_message = Some(message.id);
+                                                turn_outcome = TerminalTurnOutcome::Continued;
+                                            }
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => tracing::warn!(%error, session_id=%session_id,
+                                            "Operator queue boundary deferred"),
+                                    }
                                     // ── P2-04 / P2-05b / C-P2-08: idle-boundary delivery ──
                                     //
                                     // The monitor that owns `ProviderSession` is the sole
@@ -4031,6 +4331,28 @@ impl SessionManager {
             }
         };
 
+        // A delivery queued as the monitor ends still gets its transcript line.
+        super::boundary_mail::drain_operator_transcript_inbox(
+            &operator_inbox,
+            &store,
+            &active,
+            &event_bus,
+            session_id,
+            &mut sequence,
+        )
+        .await;
+
+        if let Some(message_id) = inflight_operator_message.take() {
+            if let Err(error) = store
+                .lock()
+                .await
+                .settle_operator_message(message_id, false)
+            {
+                tracing::error!(%error, %message_id,
+                    "Operator message unresolved at monitor exit");
+            }
+        }
+
         // ── Pre-finalization: flush monitor-local state and capture coordinator action ──
         // The coordinator must be queried BEFORE finalize_session() removes
         // the TrackedSession from the active map.
@@ -4179,6 +4501,7 @@ impl SessionManager {
             persistence.clone(),
             memory_handle.clone(),
             runtime_config.clone(),
+            Some(spawn_coordinator.process_registry_manager()),
         )
         .await
         else {
@@ -4216,6 +4539,15 @@ impl SessionManager {
         } else {
             PostFinalizeRotationOutcome::ContinueNormalCompletion
         };
+
+        // A rotated predecessor never resumes, so it cannot keep the
+        // background processes a normal completion retains.
+        if matches!(post_finalize_outcome, PostFinalizeRotationOutcome::Handled) {
+            spawn_coordinator
+                .process_registry_manager()
+                .shutdown_session(session_id)
+                .await;
+        }
 
         if matches!(
             post_finalize_outcome,
@@ -4583,12 +4915,192 @@ impl SessionManager {
     /// caller emits the unrecognized-type diagnostic. `Some(vec![])` means the
     /// type IS recognized and simply carried nothing worth persisting; that
     /// case must stay silent.
+    /// #796: a Harness auto-compaction becomes one `Compressed` event: the
+    /// summary as content (empty when the middle was only truncated) and the
+    /// kept-tail size in metadata, which the continuation rebuild replays.
+    fn compaction_event(
+        stream: &StreamEvent,
+        session_id: Uuid,
+        sequence: &mut i32,
+    ) -> ConversationEvent {
+        *sequence += 1;
+        ConversationEvent {
+            id: 0,
+            session_id,
+            sequence: *sequence,
+            event_type: EventType::Compressed,
+            role: None,
+            content: stream
+                .data
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: Some(Box::new(serde_json::json!({
+                "kept_messages": stream.data.get("kept_messages").cloned().unwrap_or_default(),
+                "messages_before": stream.data.get("messages_before").cloned().unwrap_or_default(),
+                "tokens_before": stream.data.get("tokens_before").cloned().unwrap_or_default(),
+                "summarized": stream.data.get("summary").is_some_and(serde_json::Value::is_string),
+                "fallback": stream.data.get("fallback").cloned().unwrap_or(serde_json::Value::Null),
+            }))),
+        }
+    }
+
     pub(super) fn convert_recognized_stream_event(
         stream: &StreamEvent,
         session_id: Uuid,
         sequence: &mut i32,
     ) -> Option<Vec<ConversationEvent>> {
         let event_type = match stream.event_type.as_str() {
+            super::harness::agent_loop::COMPLETION_GATE_STREAM_EVENT => {
+                *sequence += 1;
+                let output = stream
+                    .data
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let gate = stream
+                    .data
+                    .get("gate")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("completion gates");
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::CompletionGate,
+                    role: None,
+                    content: output.to_string(),
+                    tool_name: Some(gate.to_string()),
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "gate": stream.data.get("gate").cloned().unwrap_or_default(),
+                        "status": stream.data.get("status").cloned().unwrap_or_default(),
+                        "attempt": stream.data.get("attempt").cloned().unwrap_or_default(),
+                        "exit": stream.data.get("exit").cloned().unwrap_or_default(),
+                        "tree_digest": stream.data.get("tree_digest").cloned().unwrap_or_default(),
+                        "tree_digest_after": stream.data.get("tree_digest_after").cloned().unwrap_or_default(),
+                        "skipped": stream.data.get("skipped").cloned().unwrap_or_default(),
+                        "timed_out": stream.data.get("timed_out").cloned().unwrap_or_default(),
+                    }))),
+                }]);
+            }
+            super::harness::agent_loop::COMPACTION_STREAM_EVENT => {
+                return Some(vec![Self::compaction_event(stream, session_id, sequence)]);
+            }
+            // #1039: the Harness loop repaired an unpaired tool call or result
+            // before a provider request. Persist a visible System row so the
+            // repair is auditable; the continuation rebuild ignores System rows.
+            "history_repaired" => {
+                *sequence += 1;
+                let count = |key: &str| {
+                    stream
+                        .data
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                };
+                let (synthesized, dropped) = (count("synthesized"), count("dropped"));
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::System,
+                    role: None,
+                    content: format!(
+                        "[harness] repaired conversation history before the next model request: \
+                         {synthesized} tool result(s) synthesized, {dropped} message(s) dropped"
+                    ),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "history_repaired": { "synthesized": synthesized, "dropped": dropped },
+                    }))),
+                }]);
+            }
+            // #1061: the Harness loop retried an empty, output-limited final
+            // response once; record it as a visible System row.
+            super::harness::agent_loop::FINAL_ANSWER_RETRY_STREAM_EVENT => {
+                *sequence += 1;
+                let provider_stop_reason = stream
+                    .data
+                    .get("provider_stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("length")
+                    .to_string();
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::System,
+                    role: None,
+                    content: format!(
+                        "[harness] the model's final response was empty (provider stop reason: \
+                         {provider_stop_reason}); retrying once with a final-answer nudge"
+                    ),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "final_answer_retry": { "provider_stop_reason": provider_stop_reason },
+                    }))),
+                }]);
+            }
+            super::harness::tools::utility::PLAN_STREAM_EVENT => {
+                let mut content = stream
+                    .data
+                    .get("explanation")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|explanation| format!("Plan updated: {explanation}"))
+                    .unwrap_or_else(|| "Plan updated.".to_string());
+                if let Some(plan) = stream
+                    .data
+                    .get("plan")
+                    .and_then(serde_json::Value::as_array)
+                    && !plan.is_empty()
+                {
+                    for step in plan {
+                        if let Some(step_text) =
+                            step.get("step").and_then(serde_json::Value::as_str)
+                            && let Some(status) =
+                                step.get("status").and_then(serde_json::Value::as_str)
+                        {
+                            content.push_str(&format!("\n- [{status}] {step_text}"));
+                        }
+                    }
+                }
+                *sequence += 1;
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::Plan,
+                    role: None,
+                    content,
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(stream.data.clone())),
+                }]);
+            }
+            super::harness::tools::utility::ROTATION_REQUEST_STREAM_EVENT => {
+                return Some(Vec::new());
+            }
             "assistant" => EventType::Message,
             "user" => {
                 // CLI "user" events contain tool result echo-backs in verbose mode.
@@ -4925,14 +5437,9 @@ impl SessionManager {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             metadata: (event_type == EventType::ToolResult)
-                .then(|| {
-                    stream
-                        .data
-                        .get("is_error")
-                        .and_then(|value| value.as_bool())
-                })
+                .then(|| tool_result_event_metadata(stream))
                 .flatten()
-                .map(|is_error| Box::new(serde_json::json!({ "is_error": is_error }))),
+                .map(Box::new),
         }])
     }
 
@@ -5052,6 +5559,34 @@ fn classify_retry_eligibility(
     })
 }
 
+/// Build persisted tool-result metadata without carrying image payloads.
+///
+/// The synthetic Harness event provides image references and bounded size
+/// metadata separately from its visible text; only that structured metadata is
+/// persisted. Legacy events continue to persist only `is_error`.
+fn tool_result_event_metadata(stream: &StreamEvent) -> Option<serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(is_error) = stream
+        .data
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+    {
+        metadata.insert("is_error".into(), serde_json::Value::Bool(is_error));
+    }
+    if let Some(source) = stream
+        .data
+        .get("metadata")
+        .and_then(|value| value.as_object())
+    {
+        for (key, value) in source {
+            if key != "is_error" {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    (!metadata.is_empty()).then(|| serde_json::Value::Object(metadata))
+}
+
 /// Calculate backoff delay in milliseconds for a given retry attempt.
 /// Formula: min(10_000 * 2^(attempt-1), max_backoff_ms)
 /// attempt=1 -> 10s, attempt=2 -> 20s, attempt=3 -> 40s, attempt=4 -> 80s, capped at max_backoff_ms.
@@ -5059,6 +5594,90 @@ pub(crate) fn backoff_ms(attempt: u8, max_backoff_ms: u64) -> u64 {
     let base: u64 = 10_000;
     let delay = base.saturating_mul(1u64 << (attempt.saturating_sub(1)));
     delay.min(max_backoff_ms)
+}
+
+/// #584: the session's `cost_usd` after a result event. A provider-reported
+/// `total_cost_usd` (the Claude path) wins unchanged; otherwise the total of
+/// the session's settled invocation costs; otherwise the current value, so an
+/// unpriced model stays NULL instead of becoming a fabricated 0.
+fn session_cost_after_result(
+    reported: Option<f64>,
+    invocation_total: Option<f64>,
+    current: Option<f64>,
+) -> Option<f64> {
+    reported.or(invocation_total).or(current)
+}
+
+#[cfg(test)]
+mod session_cost_tests {
+    use super::session_cost_after_result;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn claude_reported_total_cost_wins_over_the_invocation_total() {
+        assert_eq!(
+            session_cost_after_result(Some(0.0123), Some(9.0), Some(0.01)),
+            Some(0.0123)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn providers_without_a_reported_total_use_the_invocation_total() {
+        assert_eq!(
+            session_cost_after_result(None, Some(0.42), None),
+            Some(0.42)
+        );
+        assert_eq!(
+            session_cost_after_result(None, Some(0.0), None),
+            Some(0.0),
+            "a Local session's real zero is recorded"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn unpriced_model_session_cost_stays_null() {
+        assert_eq!(session_cost_after_result(None, None, None), None);
+        assert_eq!(session_cost_after_result(None, None, Some(1.5)), Some(1.5));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_metadata_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn image_tool_result_metadata_persists_reference_without_payload() {
+        let stream = StreamEvent {
+            event_type: "tool_result".into(),
+            data: json!({
+                "content": "Viewed /tmp/shot.png (source 4x3, output 4x3).",
+                "is_error": false,
+                "metadata": {
+                    "images": [{
+                        "media_type": "image/png",
+                        "reference": "/tmp/shot.png",
+                        "detail": "high",
+                        "width": 4,
+                        "height": 3,
+                        "base64_chars": 48
+                    }]
+                }
+            }),
+        };
+
+        let metadata = tool_result_event_metadata(&stream).expect("metadata");
+        assert_eq!(metadata["is_error"], false);
+        assert_eq!(metadata["images"][0]["reference"], "/tmp/shot.png");
+        assert_eq!(metadata["images"][0]["width"], 4);
+        assert_eq!(metadata["images"][0]["base64_chars"], 48);
+        let serialized = metadata.to_string();
+        assert!(!serialized.contains("data"), "{serialized}");
+        assert!(!serialized.contains("base64,"), "{serialized}");
+    }
 }
 
 #[cfg(test)]
@@ -5603,7 +6222,7 @@ mod handoff_path_detection_tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn assistant_doc_path_declares_handoff() {
-        let text = format!("doc_path: /home/jakedevar/rsi/{NEW_HANDOFF}\nstatus: complete");
+        let text = format!("doc_path: /home/user/rsi/{NEW_HANDOFF}\nstatus: complete");
         assert!(assistant_text_declares_handoff_path(&text, NEW_HANDOFF));
     }
 
@@ -5645,6 +6264,43 @@ mod model_update_tests {
         assert_eq!(
             authoritative_model_update(Some("opus"), &event),
             Some("claude-opus-4-8")
+        );
+    }
+
+    /// #273: init announces the context-variant form; the stored identity is
+    /// the canonical catalog id, so a session launched with the bare id sees no
+    /// model change and one that persisted the suffix converges on the bare id.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn init_variant_suffixed_model_is_stored_as_the_canonical_id() {
+        let event = StreamEvent {
+            event_type: "system".to_string(),
+            data: json!({
+                "subtype": "init",
+                "model": "claude-sonnet-5-5[1m]",
+            }),
+        };
+
+        assert_eq!(
+            authoritative_model_update(None, &event),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            authoritative_model_update(Some("claude-sonnet-5-5[1m]"), &event),
+            Some("claude-sonnet-5-5")
+        );
+        let candidate = authoritative_model_candidate(
+            SessionProvider::Claude,
+            Some("claude-sonnet-5-5"),
+            Some(1_000_000),
+            None,
+            &event,
+        )
+        .expect("init is authoritative");
+        assert_eq!(candidate.model, "claude-sonnet-5-5");
+        assert!(
+            !candidate.model_changed,
+            "the variant tag alone is not a model change"
         );
     }
 
@@ -6064,6 +6720,58 @@ mod unrecognized_stream_event_tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
+    fn plan_updates_become_typed_persisted_events() {
+        let session_id = Uuid::new_v4();
+        let mut sequence = 0;
+        let stream = StreamEvent {
+            event_type: crate::session::harness::tools::utility::PLAN_STREAM_EVENT.into(),
+            data: serde_json::json!({
+                "explanation": "Keep the mailbox work",
+                "plan": [
+                    {"step": "Inspect mailbox", "status": "completed"},
+                    {"step": "Inject mail", "status": "in_progress"}
+                ]
+            }),
+        };
+
+        let converted =
+            SessionManager::convert_recognized_stream_event(&stream, session_id, &mut sequence)
+                .expect("plan stream event is recognized");
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(sequence, 1);
+        assert_eq!(converted[0].event_type, EventType::Plan);
+        assert_eq!(
+            converted[0].content,
+            "Plan updated: Keep the mailbox work\n- [completed] Inspect mailbox\n- [in_progress] Inject mail"
+        );
+        assert_eq!(
+            converted[0].metadata.as_ref().expect("plan metadata")["plan"][0]["step"],
+            "Inspect mailbox"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn fresh_window_rotation_requests_do_not_become_conversation_events() {
+        let session_id = Uuid::new_v4();
+        let mut sequence = 7;
+        let stream = StreamEvent {
+            event_type: crate::session::harness::tools::utility::ROTATION_REQUEST_STREAM_EVENT
+                .into(),
+            data: serde_json::json!({"focus": "fresh worktree handoff"}),
+        };
+
+        let converted =
+            SessionManager::convert_recognized_stream_event(&stream, session_id, &mut sequence)
+                .expect("rotation request is recognized");
+
+        assert!(converted.is_empty());
+        assert_eq!(sequence, 7);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
     fn a_distinct_unknown_type_is_reported_exactly_once() {
         let mut gate = UnrecognizedStreamEvents::default();
         assert_eq!(
@@ -6412,6 +7120,7 @@ mod live_context_state_tests {
             context_window,
             resolved_context_budget,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -6467,11 +7176,14 @@ mod live_context_state_tests {
             process: None,
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             rotation: RotationCoordinator::new(session_id, 0, false),
             live_input_tokens,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence,
             daemon_input_tokens,
             daemon_output_tokens,
@@ -6591,6 +7303,142 @@ mod live_context_state_tests {
             "Codex: numerator must come from event_msg/token_count total_tokens, not turn.completed"
         );
         assert!(matches!(confidence, ContextUsageConfidence::Full));
+    }
+
+    fn usage_event(
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> (Option<String>, monitor::TokenUsage) {
+        let event = StreamEvent {
+            event_type: event_type.into(),
+            data,
+        };
+        let message_id = event
+            .data
+            .get("message")
+            .and_then(|message| message.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_owned);
+        (
+            message_id,
+            monitor::extract_token_usage(&event).expect("usage-bearing event"),
+        )
+    }
+
+    /// #1000: Claude's cumulative prompt sums each model call once, even when
+    /// the CLI repeats a call's usage on every content-block event.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn prompt_totals_sum_each_claude_call_once() {
+        let call = |id: &str, input: u64, created: u64, read: u64| {
+            usage_event(
+                "assistant",
+                serde_json::json!({"message":{"id":id,"usage":{
+                    "input_tokens":input,
+                    "cache_creation_input_tokens":created,
+                    "cache_read_input_tokens":read,
+                    "output_tokens":10}}}),
+            )
+        };
+        let mut totals = PromptTotals::default();
+        let mut total = 0;
+        for (id, usage) in [
+            call("msg_1", 100, 1_000, 0),
+            call("msg_1", 100, 1_000, 0),
+            call("msg_2", 50, 200, 1_000),
+            call("msg_3", 20, 0, 1_300),
+        ] {
+            total = totals.observe(SessionProvider::Claude, total, id, &usage);
+        }
+        assert_eq!(total, 1_100 + 1_250 + 1_320);
+    }
+
+    /// #1000: Codex CLI and CodexAppServer count each turn's raw prompt,
+    /// cached tokens included, and a resumed session keeps counting from its
+    /// restored total.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn prompt_totals_sum_codex_turn_prompts_with_cached_tokens() {
+        let turn = |uncached: u64, raw: u64| {
+            usage_event(
+                "result",
+                serde_json::json!({"subtype":"turn_completed","usage":{
+                    "input_tokens":uncached,
+                    "output_tokens":10,
+                    "prompt_tokens_total":raw}}),
+            )
+        };
+        let mut totals = PromptTotals::default();
+        let restored = 5_000;
+        let mut total = restored;
+        for (id, usage) in [turn(300, 40_300), turn(500, 60_500)] {
+            total = totals.observe(SessionProvider::Codex, total, id, &usage);
+        }
+        assert_eq!(total, restored + 40_300 + 60_500);
+    }
+
+    /// #1000: the Harness loop reports its launch's cumulative prompt on both
+    /// its assistant and result events; the session total adds it to the
+    /// total restored when the monitor started, without double counting.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn prompt_totals_add_the_harness_launch_total_to_the_restored_total() {
+        let harness = |event_type: &str, cumulative: u64| {
+            let data = serde_json::json!({"message":{"usage":{
+                "input_tokens":10,
+                "output_tokens":5,
+                "prompt_tokens_total":cumulative}},
+                "subtype":"turn_completed","usage":{
+                "input_tokens":10,
+                "output_tokens":5,
+                "prompt_tokens_total":cumulative}});
+            usage_event(event_type, data)
+        };
+        let mut totals = PromptTotals::default();
+        let restored = 9_000;
+        let mut total = restored;
+        for (id, usage) in [
+            harness("assistant", 1_200),
+            harness("assistant", 2_700),
+            harness("result", 2_700),
+        ] {
+            total = totals.observe(SessionProvider::Harness, total, id, &usage);
+        }
+        assert_eq!(total, restored + 2_700);
+    }
+
+    /// #1000: invocation accounting reads the cumulative prompt (legacy rows
+    /// fall back to the old peak), and a resumed incarnation is measured from
+    /// the same total the monitor restores.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn session_prompt_total_and_baseline_follow_the_cumulative_field() {
+        let mut session = build_tracked(
+            SessionProvider::Claude,
+            0,
+            0,
+            0,
+            0,
+            ContextUsageConfidence::Full,
+            None,
+        )
+        .session;
+        session.total_input_tokens = Some(80_000);
+        session.total_prompt_tokens = None;
+        assert_eq!(
+            super::super::types::session_prompt_total(&session),
+            Some(80_000)
+        );
+        assert_eq!(super::super::types::session_prompt_baseline(&session), 0);
+        session.total_prompt_tokens = Some(410_000);
+        assert_eq!(
+            super::super::types::session_prompt_total(&session),
+            Some(410_000)
+        );
+        assert_eq!(
+            super::super::types::session_prompt_baseline(&session),
+            410_000
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -6786,6 +7634,7 @@ mod live_context_state_tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
+    #[allow(clippy::unwrap_used)]
     async fn automatic_rotation_threshold_protects_reviewer_and_defers_read_error() {
         let mut tracked = build_tracked(
             SessionProvider::Codex,
@@ -6804,6 +7653,13 @@ mod live_context_state_tests {
         {
             let guard = store.lock().await;
             guard.insert_session(&tracked.session).unwrap();
+            // #959: only a coordinator (here an Epic lead) still acts on an
+            // automatic threshold; the protection reads gate that path.
+            let mut epic = tracked.session.clone();
+            epic.id = Uuid::new_v4();
+            epic.session_kind = SessionKind::Epic;
+            epic.lead_session_id = Some(session_id);
+            guard.insert_session(&epic).unwrap();
             guard.conn.execute_batch(
                 "CREATE TEMP TABLE manager_review_assignments(reviewer_session_id TEXT,state TEXT);
                  INSERT INTO manager_review_assignments VALUES('placeholder','allocating');",
@@ -6816,7 +7672,6 @@ mod live_context_state_tests {
                 )
                 .unwrap();
         }
-        let persistence = PersistenceHandle::new(store.clone());
         let event_bus = Arc::new(crate::bus::EventBus::new(16));
         let runtime_config =
             crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
@@ -6827,7 +7682,6 @@ mod live_context_state_tests {
             &mut tracked,
             session_id,
             68.0,
-            &persistence,
             &runtime_config,
             &store,
             &event_bus,
@@ -6845,7 +7699,6 @@ mod live_context_state_tests {
             &mut tracked,
             session_id,
             68.0,
-            &persistence,
             &runtime_config,
             &store,
             &event_bus,
@@ -6867,7 +7720,6 @@ mod live_context_state_tests {
             &mut tracked,
             session_id,
             68.0,
-            &persistence,
             &runtime_config,
             &store,
             &event_bus,
@@ -6889,16 +7741,174 @@ mod live_context_state_tests {
             &mut tracked,
             session_id,
             68.0,
-            &persistence,
             &runtime_config,
             &store,
             &event_bus,
         )
         .await;
+        // #959: unprotected, the lead is still not interrupted; its seat has
+        // one due succession request for the idle-boundary pass.
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        assert_eq!(
+            super::super::context_succession::succession_request(&*store.lock().await, session_id)
+                .unwrap()
+                .map(|request| request.state),
+            Some(super::super::context_succession::RequestState::Due)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn automatic_threshold_never_force_rotates_a_worker() {
+        let mut tracked = build_tracked(
+            SessionProvider::Codex,
+            180_000,
+            0,
+            0,
+            0,
+            ContextUsageConfidence::Full,
+            Some(258_400),
+        );
+        tracked.session.model = Some("gpt-6-astra".into());
+        tracked.codex_context_tokens = 180_000;
+        tracked.rotation.set_enabled(true);
+        let session_id = tracked.session.id;
+        let task = tracked.session.query.clone();
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        store.lock().await.insert_session(&tracked.session).unwrap();
+        let event_bus = Arc::new(crate::bus::EventBus::new(16));
+        let runtime_config =
+            crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime_config
+            .context_rotation_global_pct
+            .store(65, std::sync::atomic::Ordering::Relaxed);
+        for pct in [68.0, 72.0, 90.0] {
+            advance_context_rotation_threshold(
+                &mut tracked,
+                session_id,
+                pct,
+                &runtime_config,
+                &store,
+                &event_bus,
+            )
+            .await;
+            assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        }
+        assert!(tracked.rotation.automatic_threshold_latched());
+        assert_eq!(tracked.session.query, task);
+        // Compaction brought occupancy well below the threshold: re-armed, and
+        // the next crossing is again handled without a rotation.
+        for pct in [50.0, 68.0] {
+            advance_context_rotation_threshold(
+                &mut tracked,
+                session_id,
+                pct,
+                &runtime_config,
+                &store,
+                &event_bus,
+            )
+            .await;
+            assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        }
+        assert!(tracked.rotation.automatic_threshold_latched());
+        // An explicit rotation request still rotates the same worker.
         assert!(matches!(
-            tracked.rotation.state(),
-            RotationState::PendingInterrupt { .. }
+            tracked.rotation.advance(RotationEvent::ManualTrigger),
+            RotationAction::InterruptForRotation
         ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn lead_at_the_threshold_gets_one_succession_request_and_no_interrupt() {
+        let mut tracked = build_tracked(
+            SessionProvider::Codex,
+            180_000,
+            0,
+            0,
+            0,
+            ContextUsageConfidence::Full,
+            Some(258_400),
+        );
+        tracked.session.model = Some("gpt-6-astra".into());
+        tracked.codex_context_tokens = 180_000;
+        tracked.rotation.set_enabled(false);
+        let session_id = tracked.session.id;
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        {
+            let guard = store.lock().await;
+            guard.insert_session(&tracked.session).unwrap();
+            let mut epic = tracked.session.clone();
+            epic.id = Uuid::new_v4();
+            epic.session_kind = SessionKind::Epic;
+            epic.lead_session_id = Some(session_id);
+            guard.insert_session(&epic).unwrap();
+        }
+        let event_bus = Arc::new(crate::bus::EventBus::new(16));
+        let runtime_config =
+            crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        runtime_config
+            .context_rotation_global_pct
+            .store(65, std::sync::atomic::Ordering::Relaxed);
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            90.0,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        assert_eq!(
+            super::super::context_succession::succession_request(&*store.lock().await, session_id)
+                .unwrap(),
+            None
+        );
+        tracked.rotation.set_enabled(true);
+        advance_context_rotation_threshold(
+            &mut tracked,
+            session_id,
+            90.0,
+            &runtime_config,
+            &store,
+            &event_bus,
+        )
+        .await;
+        assert!(matches!(tracked.rotation.state(), RotationState::Idle));
+        let request =
+            super::super::context_succession::succession_request(&*store.lock().await, session_id)
+                .unwrap()
+                .expect("one request for the crossing");
+        assert_eq!(
+            request.state,
+            super::super::context_succession::RequestState::Due
+        );
+        assert_eq!(request.deliveries, 0);
+        // Later usage events in the same crossing add nothing; compaction
+        // below the threshold settles the request.
+        for pct in [95.0, 50.0] {
+            advance_context_rotation_threshold(
+                &mut tracked,
+                session_id,
+                pct,
+                &runtime_config,
+                &store,
+                &event_bus,
+            )
+            .await;
+        }
+        let settled =
+            super::super::context_succession::succession_request(&*store.lock().await, session_id)
+                .unwrap()
+                .expect("kept as a cleared record");
+        assert_eq!(
+            settled.state,
+            super::super::context_succession::RequestState::Cleared
+        );
+        assert_eq!(settled.crossed_at, request.crossed_at);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -7763,6 +8773,7 @@ mod retry_tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

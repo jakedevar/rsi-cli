@@ -401,9 +401,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn live_context_recorded_manager_trace_preserves_cached_and_compaction_totals() {
-        let trace = include_str!(
-            "../../../../thoughts/shared/handoffs/issue-542/manager-context.sanitized.jsonl"
-        );
+        let trace = include_str!("fixtures/manager-context.sanitized.jsonl");
         let mut file = tempfile::NamedTempFile::new().unwrap();
         let mut reader = LiveContextReader::new(&CodexTranscriptBoundary::Fresh);
         let mut samples = Vec::new();

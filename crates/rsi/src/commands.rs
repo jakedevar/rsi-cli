@@ -25,12 +25,20 @@ pub fn parse_command(input: &str) -> CommandResult {
         return CommandResult::Unhandled(String::new());
     }
 
+    if trimmed == "pending" || trimmed.starts_with("pending ") {
+        return CommandResult::LcAction(LcAction::ContinueSession(Some(format!("/{trimmed}"))));
+    }
+    if trimmed == "drain" || trimmed == "drain status" {
+        return CommandResult::LcAction(LcAction::ContinueSession(Some(format!("/{trimmed}"))));
+    }
+
     let Some((descriptor, args)) = resolve_command(trimmed) else {
         return CommandResult::Unhandled(trimmed.to_string());
     };
     if !args.is_empty() && descriptor.command_aliases[0].starts_with("manager ") {
         return CommandResult::Unhandled(
-            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect]".to_string(),
+            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
+                .to_string(),
         );
     }
     if !args.is_empty()
@@ -252,8 +260,12 @@ pub fn parse_command(input: &str) -> CommandResult {
 
         ActionId::Manager => match args {
             None => CommandResult::LcAction(LcAction::OpenHarnessManager),
+            Some("node") => CommandResult::LcAction(LcAction::ManagerNodeCommand("list".into())),
+            Some(command) if command.starts_with("node ") => CommandResult::LcAction(
+                LcAction::ManagerNodeCommand(command[5..].trim().to_string()),
+            ),
             Some(_) => CommandResult::Unhandled(
-                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect]"
+                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
                     .to_string(),
             ),
         },
@@ -395,6 +407,7 @@ mod tests {
             ("manager decisions", LcAction::OpenHarnessManagerDecisions),
             ("manager inbox", LcAction::OpenHarnessManagerInbox),
             ("manager inspect", LcAction::OpenHarnessManagerInspect),
+            ("manager node", LcAction::ManagerNodeCommand("list".into())),
         ] {
             assert_eq!(parse_command(command), CommandResult::LcAction(action));
         }
@@ -402,11 +415,15 @@ mod tests {
             assert_eq!(
                 parse_command(command),
                 CommandResult::Unhandled(
-                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect]"
+                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
                         .to_string()
                 )
             );
         }
+        assert_eq!(
+            parse_command("manager node get 123"),
+            CommandResult::LcAction(LcAction::ManagerNodeCommand("get 123".into()))
+        );
     }
 
     // --- :continue / :cont ---
@@ -435,6 +452,22 @@ mod tests {
             parse_command("continue"),
             CommandResult::LcAction(LcAction::ContinueSession(None))
         );
+    }
+
+    #[test]
+    fn pending_and_drain_commands_reach_operator_actions() {
+        for command in [
+            "pending",
+            "pending edit abc new text",
+            "pending withdraw abc",
+            "drain",
+            "drain status",
+        ] {
+            assert_eq!(
+                parse_command(command),
+                CommandResult::LcAction(LcAction::ContinueSession(Some(format!("/{command}"))))
+            );
+        }
     }
 
     // --- :kill / :ki ---

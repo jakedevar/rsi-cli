@@ -15,8 +15,10 @@ pub mod hook_form;
 pub mod keybindings_help;
 pub mod label_form;
 pub mod label_picker;
+pub(crate) mod launch_settings;
 pub mod list;
 pub mod manager_v2;
+pub(crate) mod mcp_server_form;
 pub mod memory_search;
 pub mod message_bridge_form;
 pub mod parent_picker;
@@ -36,6 +38,7 @@ pub mod rating;
 mod recent_completions;
 pub mod recursive_dag;
 mod rename_session;
+pub mod satellite_registry;
 pub mod schedule_browser;
 pub mod schedule_form;
 pub mod session_info;
@@ -117,6 +120,8 @@ pub use trash_browser::open_trash_browser;
 
 fn text_overlay_is_in_normal_mode(overlay: &OverlayState) -> bool {
     match overlay {
+        // The settings side owns Space (toggle) and every plain key.
+        OverlayState::Prompt { launch, .. } if launch.open => false,
         OverlayState::Prompt { surface, .. } | OverlayState::InputModal { surface, .. } => {
             surface.mode == PopupMode::Normal
         }
@@ -141,6 +146,8 @@ const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
             | OverlayState::HookForm { .. }
             | OverlayState::BudgetPolicyForm { .. }
             | OverlayState::ProviderCredentialForm { .. }
+            | OverlayState::McpServerForm { .. }
+            | OverlayState::McpServerSecretForm { .. }
             | OverlayState::MemorySearch { .. }
             | OverlayState::RenameSession { .. }
             | OverlayState::LabelForm { .. }
@@ -172,6 +179,7 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
             | OverlayState::HarnessManagerV2(..)
             | OverlayState::ScheduleBrowser { .. }
             | OverlayState::FileExplorer { .. }
+            | OverlayState::SatelliteRegistry(..)
     ) {
         app.overlay_leader_pending = false;
         return false;
@@ -332,8 +340,8 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         match action {
             ModelDropdownAction::Selected(model_id) => {
                 app.selected_model = Some(model_id);
-                if let Some(model) = app.selected_model.as_deref() {
-                    rsi_common::model_utils::reconcile_effort(model, &mut app.selected_effort);
+                if let Some(model) = app.selected_model.clone() {
+                    app.reconcile_model_effort(app.selected_provider, &model);
                 }
                 app.model_dropdown.close();
             }
@@ -342,8 +350,8 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
                 app.custom_provider_index = app.model_dropdown.custom_provider_index;
                 app.available_models = app.model_dropdown.models.clone();
                 app.selected_model = app.available_models.first().map(|(id, _)| id.clone());
-                if let Some(model) = app.selected_model.as_deref() {
-                    rsi_common::model_utils::reconcile_effort(model, &mut app.selected_effort);
+                if let Some(model) = app.selected_model.clone() {
+                    app.reconcile_model_effort(app.selected_provider, &model);
                 } else {
                     // Harness/custom catalogs may be empty until discovery;
                     // without a selected model, no effort remains compatible.
@@ -464,6 +472,14 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             provider_credential_form::handle_provider_credential_form_key(app, key);
             return true;
         }
+        OverlayState::McpServerForm { .. } => {
+            mcp_server_form::handle_mcp_server_form_key(app, key);
+            return true;
+        }
+        OverlayState::McpServerSecretForm { .. } => {
+            mcp_server_form::handle_mcp_server_secret_form_key(app, key);
+            return true;
+        }
         OverlayState::HookConflictPrompt { .. } => {
             hook_form::handle_hook_conflict_key(app, key);
             return true;
@@ -484,6 +500,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             cohort_settlement::handle_source_worktree_settlement_key(app, key).await;
             return true;
         }
+        OverlayState::SatelliteRegistry(..) => {
+            satellite_registry::handle_key(app, key).await;
+            return true;
+        }
         OverlayState::HarnessManagerV2(..) => {
             manager_v2::handle_key(app, key).await;
         }
@@ -500,7 +520,7 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         OverlayState::NotificationBrowser { .. } => {
-            notification_browser::handle_notification_browser_key(app, key);
+            notification_browser::handle_notification_browser_key(app, key).await;
             return true;
         }
         OverlayState::FileExplorer {
@@ -662,7 +682,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
             let consumed = !matches!(action, ModelDropdownAction::Ignored);
             match action {
                 ModelDropdownAction::Selected(model_id) => {
-                    selected_override_model = Some(model_id.clone());
+                    selected_override_model = Some((model_dropdown.provider, model_id.clone()));
                     *model_override = Some(model_id);
                     *provider_override = Some(model_dropdown.provider);
                     model_dropdown.close();
@@ -675,12 +695,17 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
                 ModelDropdownAction::Consumed | ModelDropdownAction::Ignored => {}
             }
             if consumed {
-                if let Some(model) = selected_override_model.as_deref() {
-                    rsi_common::model_utils::reconcile_effort(model, &mut app.selected_effort);
+                if let Some((provider, model)) = selected_override_model.as_ref() {
+                    app.reconcile_model_effort(*provider, model);
                 }
                 return true;
             }
         }
+    }
+
+    // `?` help, the settings flip and every settings-side key.
+    if launch_settings::handle_prompt_launch_keys(app, launch_settings::PromptSlot::Regular, key) {
+        return true;
     }
 
     // Ctrl+T submits and opens in new tab
@@ -1105,7 +1130,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
             let consumed = !matches!(action, ModelDropdownAction::Ignored);
             match action {
                 ModelDropdownAction::Selected(model_id) => {
-                    selected_override_model = Some(model_id.clone());
+                    selected_override_model = Some((model_dropdown.provider, model_id.clone()));
                     *model_override = Some(model_id);
                     *provider_override = Some(model_dropdown.provider);
                     model_dropdown.close();
@@ -1118,12 +1143,18 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
                 ModelDropdownAction::Consumed | ModelDropdownAction::Ignored => {}
             }
             if consumed {
-                if let Some(model) = selected_override_model.as_deref() {
-                    rsi_common::model_utils::reconcile_effort(model, &mut app.selected_effort);
+                if let Some((provider, model)) = selected_override_model.as_ref() {
+                    app.reconcile_model_effort(*provider, model);
                 }
                 return true;
             }
         }
+    }
+
+    // `?` help, the settings flip and every settings-side key.
+    if launch_settings::handle_prompt_launch_keys(app, launch_settings::PromptSlot::Input(idx), key)
+    {
+        return true;
     }
 
     // Ctrl+T: submit in new tab
@@ -1766,6 +1797,18 @@ fn cycle_effort(
     model_override: Option<&str>,
     provider_override: Option<rsi_common::types::SessionProvider>,
 ) {
+    step_effort(app, model_override, provider_override, true);
+}
+
+/// Step the effort level for new sessions, wrapping at either end of the
+/// model's ladder. Forward from None selects the model default; backward from
+/// None selects the level below it.
+fn step_effort(
+    app: &mut App,
+    model_override: Option<&str>,
+    provider_override: Option<rsi_common::types::SessionProvider>,
+    forward: bool,
+) {
     let model = model_override
         .filter(|m| !m.is_empty())
         .or(app.selected_model.as_deref())
@@ -1778,23 +1821,39 @@ fn cycle_effort(
         | rsi_common::types::SessionProvider::OpenRouter
         | rsi_common::types::SessionProvider::Bedrock
         | rsi_common::types::SessionProvider::CodexAppServer => {
-            rsi_common::model_utils::effort_ladder(model)
+            app.model_effort_ladder(provider, model)
         }
-        _ => &[],
+        _ => Vec::new(),
     };
     if ladder.is_empty() {
         app.selected_effort = None;
         return;
     }
 
+    let len = ladder.len();
+    let step = |index: usize| {
+        if forward {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }
+    };
     let next = if let Some(index) = app
         .selected_effort
         .as_deref()
         .and_then(|effort| ladder.iter().position(|level| *level == effort))
     {
-        ladder[(index + 1) % ladder.len()]
+        ladder[step(index)]
     } else {
-        rsi_common::model_utils::default_effort_level(model).unwrap_or("high")
+        let default_index = app
+            .model_default_effort(provider, model)
+            .and_then(|effort| ladder.iter().position(|level| *level == effort))
+            .unwrap_or(0);
+        if forward {
+            ladder[default_index]
+        } else {
+            ladder[step(default_index)]
+        }
     };
     app.selected_effort = Some(next.to_string());
 }
@@ -1858,6 +1917,12 @@ fn paste_into_overlay(app: &mut App) {
 /// Paste pre-read text into the active overlay textarea with normalization and wrapping.
 fn paste_text_into_overlay(app: &mut App, text: &str) {
     let normalized = crate::input_surface::normalize_pasted_text(text);
+    if matches!(&app.overlay, OverlayState::SatelliteRegistry(..)) {
+        if satellite_registry::paste_text(app, &normalized) {
+            app.mark_dirty();
+        }
+        return;
+    }
     let mut handled = false;
 
     match &mut app.overlay {
@@ -1963,6 +2028,29 @@ fn paste_text_into_overlay(app: &mut App, text: &str) {
             // masking is purely a rendering-time concern (see
             // `ui::overlay::provider_credential_form`), so the underlying
             // buffer accepts pasted text like every other plain-text field.
+            secret.push_str(&normalized);
+            handled = true;
+        }
+        OverlayState::McpServerForm {
+            focused_field,
+            id,
+            command,
+            args,
+            secret_env_names,
+            working_dir,
+            ..
+        } => {
+            match focused_field {
+                0 => id.push_str(&normalized),
+                1 => command.push_str(&normalized),
+                2 => args.push_str(&normalized),
+                3 => secret_env_names.push_str(&normalized),
+                4 => working_dir.push_str(&normalized),
+                _ => {}
+            }
+            handled = true;
+        }
+        OverlayState::McpServerSecretForm { secret, .. } => {
             secret.push_str(&normalized);
             handled = true;
         }
@@ -2083,6 +2171,10 @@ fn paste_image_into_overlay(app: &mut App, reference: &str) {
         | OverlayState::ScheduleForm { .. }
         | OverlayState::CreateEntityForm { .. } => {
             app.notify("Image paste isn't supported here");
+            handled = true;
+        }
+        OverlayState::SatelliteRegistry(..) => {
+            app.notify("Image paste isn't supported in the satellite registry");
             handled = true;
         }
         _ => {}

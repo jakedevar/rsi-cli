@@ -317,7 +317,8 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
                 .capabilities
                 .contains(&ManagerCapabilityV2::SelfSuccession)
         );
-        assert_eq!(execute.policy.capabilities.len(), 6);
+        // Execute's eight grants (SessionControl and IssueCoordinate joined it).
+        assert_eq!(execute.policy.capabilities.len(), 8);
         assert!(!execute.policy.allow_create_groups);
         fs::write(
             h.artifacts_dir.join("execute-screen.txt"),
@@ -341,7 +342,8 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
             .await?
             .unwrap();
         assert_eq!(full.row_version, 2);
-        assert_eq!(full.policy.capabilities.len(), 7);
+        // Full project control grants every capability (2026-09-30).
+        assert_eq!(full.policy.capabilities.len(), 15);
         assert!(full.policy.allow_create_groups);
         assert_eq!(
             (

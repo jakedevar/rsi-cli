@@ -192,7 +192,13 @@ pub(super) fn render_create_entity_form(
         y += 2;
     }
     if visibility_list.contains(&CreateEntityField::Effort) {
-        render_effort_row(frame, inner, y, effort.as_deref(), focused_field);
+        let ladder = crate::overlay::create_entity_form::effort_ladder_for_selection(
+            provider,
+            model.as_deref(),
+            app.selected_provider,
+            app.selected_model.as_deref(),
+        );
+        render_effort_row(frame, inner, y, effort.as_deref(), ladder, focused_field);
         y += 2;
     }
     if visibility_list.contains(&CreateEntityField::Sandbox) {
@@ -759,12 +765,25 @@ fn render_model_row(
     );
 }
 
+/// Short cell label for an effort level; unknown levels show verbatim.
+fn effort_cell_label(level: &str) -> &str {
+    match level {
+        "medium" => "med",
+        "xhigh" => "xhi",
+        other => other,
+    }
+}
+
 /// Render the Effort segmented row (leaf only). Pattern 1.
+///
+/// Cells are `none` plus the selected model's own ladder, in ladder order,
+/// so a model without `xhigh` (or without effort at all) never shows it.
 fn render_effort_row(
     frame: &mut Frame,
     inner: Rect,
     y: u16,
     effort: Option<&str>,
+    ladder: &[&'static str],
     focused_field: CreateEntityField,
 ) {
     let label_style = Style::default()
@@ -772,14 +791,11 @@ fn render_effort_row(
         .add_modifier(Modifier::BOLD);
     let focused = focused_field == CreateEntityField::Effort;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("  Effort: ", label_style)];
-    let cells: [(&str, Option<&str>); 6] = [
-        ("none", None),
-        ("low", Some("low")),
-        ("med", Some("medium")),
-        ("high", Some("high")),
-        ("max", Some("max")),
-        ("xhi", Some("xhigh")),
-    ];
+    let cells = std::iter::once(("none", None)).chain(
+        ladder
+            .iter()
+            .map(|level| (effort_cell_label(level), Some(*level))),
+    );
     for (label, value) in cells {
         let selected = effort == value;
         let mut style = Style::default().fg(theme::text());

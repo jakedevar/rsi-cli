@@ -30,8 +30,20 @@ impl Store {
         caller: Uuid,
         query: &AgentManagerInspectRequestV2,
     ) -> Result<ManagerInspectionV2> {
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (mut config, is_manager, mut is_area) = match self.manager_config_for_caller(caller) {
+            Ok((config, is_manager)) => (config, is_manager, false),
+            Err(legacy_denial) => {
+                let Some(authority) = self.manager_area_authority_current(caller)? else {
+                    return Err(legacy_denial);
+                };
+                (authority.config, true, true)
+            }
+        };
         let mut q = query.clone();
+        if is_manager && !is_area {
+            config.epic_ids = self.manager_direct_epics(&config, config.manager_session_id)?;
+            config.selected_epic_ids = Some(config.epic_ids.clone());
+        }
         if !is_manager {
             if q.section == ManagerInspectSectionV2::Archive {
                 return Err(refused("manager_v2_scope_denied"));
@@ -44,6 +56,18 @@ impl Store {
                 return Err(refused("manager_v2_epic_out_of_scope"));
             }
             q.epic_id = Some(epic);
+            if let Some(seat) = self.manager_node_seat_for_epic(&config, epic)? {
+                config = self
+                    .manager_area_authority_current(seat)?
+                    .ok_or_else(|| refused("manager_node_authority_changed"))?
+                    .config;
+                is_area = true;
+            }
+        }
+        // Area inspection is confined to one current Epic. The legacy
+        // unfiltered overview and resource views aggregate the whole project.
+        if is_area && q.epic_id.is_none() {
+            return Err(refused("manager_v2_epic_filter_required"));
         }
         let mut result = self.manager_v2_inspect_config(&config, &q)?;
         if is_manager
@@ -107,7 +131,7 @@ impl Store {
             self.manager_v2_refresh_question_decisions(config)?;
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        let policy = self.get_harness_manager_policy(config.project_id)?;
+        let policy = self.manager_policy_for_config(config)?;
         let revision:i64=self.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM harness_manager_v2_events WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind != 'decision_retrieval'",params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version],|r|r.get(0))?;
         let leaf_scope = if matches!(
             q.section,
@@ -161,7 +185,8 @@ impl Store {
                 &json!({"decision_keyset":1,"policy":policy.as_ref().map(|p|(p.row_version,p.revoked))}),
             )?)
         } else if q.section == ManagerInspectSectionV2::Requests {
-            let sequence: i64 = self.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM harness_manager_messages WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND (?4 IS NULL OR epic_id=?4)",params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,q.epic_id.map(|id|id.to_string())],|r|r.get(0))?;
+            let (mail_config, _) = self.manager_mail_route_for_config(config)?;
+            let sequence: i64 = self.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM harness_manager_messages WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND (?4 IS NULL OR epic_id=?4)",params![mail_config.project_id.to_string(),mail_config.manager_session_id.to_string(),mail_config.row_version,q.epic_id.map(|id|id.to_string())],|r|r.get(0))?;
             let mut leads = Vec::new();
             for epic in config
                 .epic_ids
@@ -190,6 +215,7 @@ impl Store {
                     ManagerInspectSectionV2::Events
                         | ManagerInspectSectionV2::Decisions
                         | ManagerInspectSectionV2::Health
+                        | ManagerInspectSectionV2::Satellites
                 ) && leaf_scope.is_none()
                     && c.revision != revision)
             {
@@ -221,6 +247,9 @@ impl Store {
                     .all(|row| row["complete"] == true);
                 rows
             }
+            // Satellite peers are a daemon-wide registry, not Epic-scoped; the
+            // rows are read-only health, so any appointed manager may read them.
+            ManagerInspectSectionV2::Satellites => self.manager_v2_satellite_rows()?,
             ManagerInspectSectionV2::MigrationAllocations => {
                 let (rows, complete) = self.manager_v2_migration_allocation_rows(
                     config,
@@ -576,6 +605,52 @@ impl Store {
         })
     }
 
+    /// One bounded health row per registered satellite peer. Reachability is
+    /// the hub's own observation; the `health` object is what the satellite last
+    /// reported and is `null` until a poll succeeds after hub start.
+    fn manager_v2_satellite_rows(&self) -> Result<Vec<Value>> {
+        let view = self.satellite_registry_view()?;
+        let mut rows = Vec::new();
+        for peer in view.peers {
+            let peer_id = peer.config.peer_id.0;
+            let observation = peer.observation.as_ref();
+            let state = observation.map_or("unconfigured", |o| o.state.as_str());
+            let reported = crate::store_support::satellite::reported_health(peer_id);
+            rows.push(json!({
+                "type":"satellite",
+                "key":peer_id.to_string(),
+                "label":peer.config.label,
+                "reachable":state == "healthy",
+                "state":state,
+                "stale":observation.is_none_or(|o| o.stale),
+                "polling":peer.config.enabled
+                    && peer.config.read_enabled
+                    && peer.config.expected_installation_id.is_some(),
+                "last_contact_at":observation.and_then(|o| o.last_observed_at),
+                "last_error":observation.and_then(|o| o.last_error.clone()),
+                "installation_id":observation.and_then(|o| o.installation_id).map(|id| id.0),
+                "incarnation_id":observation.and_then(|o| o.incarnation_id).map(|id| id.0),
+                "cached_session_count":observation.map_or(0, |o| o.cached_session_count),
+                "health_reported_at":reported.as_ref().map(|r| r.received_at),
+                "health":reported.map(|r| json!({
+                    "daemon_version":r.health.daemon_version,
+                    "binary_sha256":r.health.binary_sha256,
+                    "uptime_seconds":r.health.uptime_seconds,
+                    "schema_version":r.health.schema_version,
+                    "sessions_running":r.health.sessions_running,
+                    "sessions_waiting_approval":r.health.sessions_waiting_approval,
+                    "disk_free_bytes":r.health.disk_free_bytes,
+                    "load_avg_1m":r.health.load_avg_1m_milli.map(|m| f64::from(m) / 1000.0),
+                    "build_sha":r.health.build_sha,
+                    "started_at":r.health.started_at,
+                    "supervisor_mode":r.health.supervisor_mode,
+                    "last_deploy":r.health.last_deploy,
+                })),
+            }));
+        }
+        Ok(rows)
+    }
+
     /// Read bounded allocations for the manager's project and exact Epic scope.
     /// The tables land with the migration allocator; keeping absence explicit lets
     /// this reader deploy first without presenting missing schema as empty data.
@@ -823,6 +898,7 @@ impl Store {
         ownership.extend(self.manager_v2_facts_of_works(project, "ownership", &history)?);
         let mut migrations = self.manager_v2_records(config, "migration")?;
         migrations.extend(self.manager_v2_facts_of_works(project, "migration", &history)?);
+        let refusals = self.manager_v2_records(config, INTEGRATION_REFUSAL_KIND)?;
         for record in records {
             let w: WorkRecord = decode(&record)?;
             if epic.is_some_and(|e| e != w.epic_id) || !config.epic_ids.contains(&w.epic_id) {
@@ -942,6 +1018,22 @@ impl Store {
             }
             if let Some(decision) = &w.pending_acceptance {
                 blockers.push(format!("decision:{decision}"));
+            }
+            if accepted
+                && !integrated
+                && let Some(refusal) = refusals.iter().find(|r| {
+                    r.key == w.key
+                        && r.payload["source_commit"].as_str() == w.source_commit.as_deref()
+                })
+            {
+                let code = refusal.payload["code"].as_str().unwrap_or("unknown");
+                blockers.push(format!("integration_refused:{code}"));
+                value["integration_refusal"] = json!({
+                    "code": refusal.payload["code"],
+                    "source_commit": refusal.payload["source_commit"],
+                    "target_commit": refusal.payload["target_commit"],
+                    "recorded_at": refusal.payload["recorded_at"],
+                });
             }
             value["ready"] = json!(blockers.is_empty() && !integrated);
             value["integration_ready"] = json!(accepted && !integrated && blockers.is_empty());
@@ -1158,7 +1250,7 @@ impl Store {
     ) -> Result<Option<String>> {
         let check = (|| {
             let grant = self
-                .get_harness_manager_policy(config.project_id)?
+                .manager_policy_for_config(config)?
                 .ok_or_else(|| refused("manager_v2_grant_required"))?;
             let caller = config
                 .current_session_id
@@ -1369,20 +1461,27 @@ impl Store {
         limit: usize,
         unanswered_only: bool,
     ) -> Result<Vec<Value>> {
+        let (mail_config, node) = self.manager_mail_route_for_config(config)?;
         // `unanswered_only` selects the shared #664 attention predicate: the
         // open set plus reopened (`failed -> accepted`) requests, which stay
         // visible here but never reclaim a capacity slot.
-        let mut stmt=self.conn.prepare(&format!("SELECT id,epic_id,recipient_session_id,message,created_at FROM harness_manager_messages m WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND {} AND (?4 IS NULL OR epic_id=?4) AND id>?5 AND (?7=0 OR ({})) ORDER BY id LIMIT ?6", super::super::harness_manager::MANAGER_REQUEST_ROW, super::super::harness_manager::manager_request_unanswered_sql()))?;
+        let mut stmt=self.conn.prepare(&format!("SELECT id,epic_id,recipient_session_id,message,created_at FROM harness_manager_messages m WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND {} AND (?4 IS NULL OR epic_id=?4) AND id>?5 AND (?7=0 OR ({}))
+            AND epic_id IN (SELECT value FROM json_each(?9))
+            AND ((?8 IS NULL AND NOT EXISTS (SELECT 1 FROM harness_manager_v2_events e WHERE e.project_id=m.project_id AND e.manager_session_id=m.manager_session_id AND e.scope_version=m.scope_version AND e.kind='node_mail_address' AND e.record_key=m.id))
+              OR (?8 IS NOT NULL AND EXISTS (SELECT 1 FROM harness_manager_v2_events e WHERE e.project_id=m.project_id AND e.manager_session_id=m.manager_session_id AND e.scope_version=m.scope_version AND e.kind='node_mail_address' AND e.record_key=m.id AND json_extract(e.payload_json,'$.node_id')=?8)))
+            ORDER BY id LIMIT ?6", super::super::harness_manager::MANAGER_REQUEST_ROW, super::super::harness_manager::manager_request_unanswered_sql()))?;
         let raw = stmt
             .query_map(
                 params![
-                    config.project_id.to_string(),
-                    config.manager_session_id.to_string(),
-                    config.row_version,
+                    mail_config.project_id.to_string(),
+                    mail_config.manager_session_id.to_string(),
+                    mail_config.row_version,
                     epic.map(|id| id.to_string()),
                     after,
                     limit as i64,
                     unanswered_only,
+                    node.map(|id| id.to_string()),
+                    serde_json::to_string(&config.epic_ids)?,
                 ],
                 |r| {
                     Ok((
@@ -1396,7 +1495,7 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let timeout = self
-            .get_harness_manager_policy(config.project_id)?
+            .manager_policy_for_config(config)?
             .map_or(900, |p| p.policy.request_timeout_seconds);
         let mut rows = Vec::new();
         for (id, epic, recipient, message, created) in raw {
@@ -1406,16 +1505,16 @@ impl Store {
             let current = self.manager_lead(config.project_id, epic).ok();
             let request_id =
                 Uuid::parse_str(&id).map_err(|_| refused("manager_v2_invalid_stored_identity"))?;
-            let readdressed_to = self.manager_request_readdressed(config, request_id)?;
-            let readdressed_from = self.manager_readdress_origin_id(config, request_id)?;
-            let settlement = self.manager_request_settlement(config, request_id)?;
+            let readdressed_to = self.manager_request_readdressed(&mail_config, request_id)?;
+            let readdressed_from = self.manager_readdress_origin_id(&mail_config, request_id)?;
+            let settlement = self.manager_request_settlement(&mail_config, request_id)?;
             // Operator audit remains readable if the manager lineage itself is
             // unavailable. Mutation authorization still propagates that denial.
             let live = config.current_session_id.is_some()
-                && self.manager_v2_operator_request_live(config, epic, request_id)?;
+                && self.manager_v2_operator_request_live(&mail_config, epic, request_id)?;
             let effective_recipient = current.as_ref().filter(|_| live).map(|s| s.id);
             let retrieved = if let Some(reader) = effective_recipient {
-                self.manager_v2_record(config, "retrieval", &format!("{id}:{reader}"))?
+                self.manager_v2_record(&mail_config, "retrieval", &format!("{id}:{reader}"))?
                     .is_some()
             } else {
                 false
@@ -1441,13 +1540,14 @@ impl Store {
             );
             let reply: Option<String> = self.conn.query_row("SELECT id FROM harness_manager_messages WHERE request_id=?1 ORDER BY sequence DESC LIMIT 1",[&id],|r|r.get(0)).optional()?;
             let replied = reply.is_some();
-            let reply_retrieved =
-                if let (Some(reply), Some(manager)) = (&reply, config.current_session_id) {
-                    self.manager_v2_record(config, "retrieval", &format!("{reply}:{manager}"))?
-                        .is_some()
-                } else {
-                    false
-                };
+            let reply_retrieved = if let (Some(reply), Some(manager)) =
+                (&reply, config.current_session_id)
+            {
+                self.manager_v2_record(&mail_config, "retrieval", &format!("{reply}:{manager}"))?
+                    .is_some()
+            } else {
+                false
+            };
             rows.push(json!({"type":"request","key":id,"request_id":id,"epic_id":epic,"recipient_session_id":recipient,"effective_recipient_session_id":effective_recipient,"message":bounded(&message,2048),"state":state,"readdressed_to":readdressed_to,"readdressed_from":readdressed_from,"row_version":record.as_ref().map_or(0,|r|r.row_version),"execution":record.map(|r|r.payload),"retrieved":retrieved,"replied":replied,"reply_message_id":reply,"reply_retrieved":reply_retrieved,"accepted":matches!(state.as_str(),Some("accepted"|"running"|"completed")),"deadline":deadline,"settlement":settlement,"overdue":!terminal&&!acknowledged&&settlement.is_none()&&Utc::now()>deadline,"unanswered":!replied&&!acknowledged&&!terminal&&readdressed_to.is_none()&&settlement.is_none(),"delivery_issue":if readdressed_to.is_some(){None}else if lead_changed{Some("lead_changed")}else if current.as_ref().is_some_and(|s|matches!(s.status,SessionStatus::Failed|SessionStatus::Interrupted)){Some("lead_unavailable")}else if replied&&!reply_retrieved{Some("reply_unretrieved")}else{None}}));
         }
         Ok(rows)

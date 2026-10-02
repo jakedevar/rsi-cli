@@ -232,6 +232,8 @@
 <tr><td>Scheduled jobs: <code>d</code></td><td></td><td>Begin delete chord</td><td>First <code>d</code> of <code>dd</code>: arms deletion of the selected scheduled job.</td></tr>
 <tr><td>Scheduled jobs: <code>dd</code></td><td></td><td>Delete selected job</td><td>Deletes the selected scheduled job (<code>dd</code>).</td></tr>
 <tr><td>Scheduled jobs: <code>r</code></td><td></td><td>Refresh scheduled jobs</td><td>Re-reads the scheduled jobs from the daemon.</td></tr>
+<tr><td>Scheduled jobs: <code>H</code></td><td></td><td>Toggle scheduled job history</td><td>Switches between active jobs and every job including old disabled history.</td></tr>
+<tr><td>Scheduled jobs: <code>m</code></td><td></td><td>Load more scheduled jobs</td><td>Loads the next page of scheduled jobs from the daemon.</td></tr>
 <tr><td><code>&lt;Space&gt;K</code></td><td></td><td>Scheduled jobs</td><td>Opens the scheduled jobs browser.</td></tr>
 </tbody>
 </table>
@@ -245,7 +247,7 @@
 <tbody>
 <tr><td><code>yy</code></td><td></td><td>Copy Session UUID</td><td>Copies the selected session's UUID; in a transcript <code>yy</code> copies the selected event's content instead.</td></tr>
 <tr><td><code>x</code></td><td><code>:kill</code> <code>:ki</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
-<tr><td><code>X</code></td><td></td><td>Hard interrupt running session</td><td>Immediately interrupts the selected session and marks it HARD; only the operator may clear it.</td></tr>
+<tr><td><code>X</code></td><td></td><td>INTERRUPT NOW</td><td>Press twice within five seconds to cancel the active turn and mark it HARD.</td></tr>
 <tr><td><code>&lt;Space&gt;hs</code></td><td><code>:pause soft</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
 <tr><td><code>&lt;Space&gt;hc</code></td><td><code>:pause clear</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker.</td></tr>
 <tr><td><code>&lt;Space&gt;c</code></td><td><code>:continue [arg]</code> <code>:cont [arg]</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
@@ -362,6 +364,8 @@
 <tr><td>Settings: <code>a</code></td><td></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
 <tr><td>Settings: <code>d</code></td><td></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td>Settings: <code>e</code></td><td></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
+<tr><td>Settings: <code>K</code></td><td></td><td>Move navigator column earlier</td><td>Moves the selected optional navigator column one place left; the order is saved per navigator preset.</td></tr>
+<tr><td>Settings: <code>J</code></td><td></td><td>Move navigator column later</td><td>Moves the selected optional navigator column one place right; the order is saved per navigator preset.</td></tr>
 <tr><td>Settings: <code>R</code></td><td></td><td>Refresh daemon-backed state</td><td>Re-reads daemon-backed settings state (config, hooks, skills, storage).</td></tr>
 <tr><td>Settings: <code>s</code></td><td></td><td>Set provider key</td><td>Opens the masked Set form for the selected provider key slot.</td></tr>
 <tr><td>Settings: <code>r</code></td><td></td><td>Rotate provider key</td><td>Opens the masked Rotate form for the selected provider key slot.</td></tr>
@@ -396,7 +400,7 @@
 <tr><td>Background color</td><td>Sets the hex color used when the text area background is on.</td><td>edit</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Formulation animation</td><td>Reveals each new live message with a top-to-bottom wipe. Off by default.</td><td>toggle</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Formulation speed</td><td>Sets how long the formulation reveal runs when the animation is on.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
-<tr><td>Activity indicator</td><td>Chooses the working-indicator style: Semantic, Rainbow Classic or Rainbow Compact.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Activity indicator</td><td>Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Detail column</td><td>Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 </tbody>
 </table>
@@ -407,7 +411,7 @@
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
 <tr><td>Navigator preset</td><td>Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
-<tr><td>Navigator optional columns</td><td>Turns individual optional navigator columns on or off. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. Required columns cannot be hidden.</td><td>list</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Navigator optional columns</td><td>Turns optional navigator columns on or off; J/K move the selected column, saved per preset. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden.</td><td>list</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Card fields</td><td>Chooses which facts render on session-list cards. Card fields: Context bar, Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date.</td><td>list</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Automatic session archive</td><td>Archives delivered or issue-filed terminal sessions after an idle window.</td><td>toggle</td><td>daemon field <code>session_retention_enabled</code></td><td>immediately</td></tr>
 <tr><td>Archive idle hours</td><td>Idle hours before an eligible terminal session is archived.</td><td>choice</td><td>daemon field <code>session_retention_window_hours</code></td><td>immediately</td></tr>
@@ -510,7 +514,7 @@
 <tr><td>Retry max backoff</td><td>Upper bound, in milliseconds, on the delay between automatic retries.</td><td>choice</td><td>daemon field <code>retry_max_backoff_ms</code></td><td>immediately</td></tr>
 <tr><td>Retry on stall</td><td>Runs the stall-retry handler that relaunches stalled sessions.</td><td>toggle</td><td>daemon field <code>retry_on_stall</code></td><td>after daemon restart</td></tr>
 <tr><td>Reconciliation loop</td><td>Runs the background loop that reconciles session liveness and consistency.</td><td>toggle</td><td>daemon field <code>reconciliation_enabled</code></td><td>after daemon restart</td></tr>
-<tr><td>Context rotation</td><td>Rotates a session into a fresh context near its limit, carrying a handoff forward.</td><td>toggle</td><td>daemon field <code>context_rotation_enabled</code></td><td>new launches now · resumed sessions after restart</td></tr>
+<tr><td>Context rotation</td><td>Near its limit, asks a manager or Epic lead to pass its seat at the next idle boundary; workers keep going on native compaction. Manual rotation still works for any session.</td><td>toggle</td><td>daemon field <code>context_rotation_enabled</code></td><td>new launches now · resumed sessions after restart</td></tr>
 <tr><td>Context rotation threshold (global)</td><td>Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_global_pct</code></td><td>immediately</td></tr>
 <tr><td>Context rotation threshold (Claude Code)</td><td>Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_claude_pct</code></td><td>immediately</td></tr>
 <tr><td>Context rotation threshold (Codex)</td><td>Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_codex_pct</code></td><td>immediately</td></tr>
@@ -535,7 +539,7 @@
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
-<tr><td>Memory system</td><td>OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync.</td><td>toggle</td><td>daemon field <code>memory_enabled</code></td><td>after daemon restart</td></tr>
+<tr><td>Memory system</td><td>OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync.</td><td>toggle</td><td>daemon field <code>memory_enabled</code></td><td>off now · on after restart</td></tr>
 <tr><td>Dream consolidation</td><td>Enables periodic memory consolidation (dreaming).</td><td>toggle</td><td>daemon field <code>dream_enabled</code></td><td>immediately</td></tr>
 <tr><td>Observation threshold</td><td>Number of new observations that triggers a consolidation cycle.</td><td>edit</td><td>daemon field <code>dream_observation_threshold</code></td><td>after daemon restart</td></tr>
 <tr><td>Dream cooldown</td><td>Minimum seconds between consolidation cycles.</td><td>edit</td><td>daemon field <code>dream_cooldown_secs</code></td><td>after daemon restart</td></tr>
@@ -569,6 +573,30 @@
 <tr><td>Worker slice MemoryMax (MiB)</td><td>Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_max_mib</code></td><td>after daemon restart</td></tr>
 <tr><td>Worker slice MemorySwapMax (MiB)</td><td>Aggregate worker swap ceiling; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_swap_max_mib</code></td><td>after daemon restart</td></tr>
 <tr><td>Worker slice CPUWeight</td><td>Relative CPU weight of the aggregate worker slice; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_cpu_weight</code></td><td>after daemon restart</td></tr>
+<tr><td>Rolling merge queue</td><td>Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish.</td><td>toggle</td><td>daemon field <code>rolling_queue_enabled</code></td><td>immediately</td></tr>
+<tr><td>Hold new work while a deploy waits</td><td>While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs. Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything.</td><td>toggle</td><td>daemon field <code>deploy_drain_enabled</code></td><td>immediately</td></tr>
+<tr><td>Merge queue batch size</td><td>Maximum ready sources merged into one candidate and gated once (1-8); the current runner gates one source at a time.</td><td>choice</td><td>daemon field <code>rolling_queue_batch_size</code></td><td>immediately</td></tr>
+<tr><td>Merge queue speculation depth</td><td>How many candidates are prepared on top of the batch being gated (0-2).</td><td>choice</td><td>daemon field <code>rolling_queue_speculation_depth</code></td><td>immediately</td></tr>
+<tr><td>Hold program wakes while children run</td><td>Program-mode masters' due resume wakes wait while their spawned children run, then deliver once per keep-alive window; the wake stays armed meanwhile. The held wake stays enabled and exact, so the no-idle invariant is unchanged. It delivers when the last child settles (the child watch wakes the master) or once when the window elapses; an operator trigger-now bypasses the hold. Non-program wakes are never held.</td><td>toggle</td><td>daemon field <code>program_hold_while_children_run</code></td><td>immediately</td></tr>
+<tr><td>Child keep-alive valve</td><td>Off by default. When on, an idle parent whose children keep running gets one same-session resume per window so it can unblock hung children. The valve inserts at most one daemon-owned one-shot Resume row per window, only for a Completed parent with no other enabled resume wake, pending question, approval, pause or capacity incident, and retires it undelivered if every child settled first. It never launches a Fresh session.</td><td>toggle</td><td>daemon field <code>child_keepalive_enabled</code></td><td>immediately</td></tr>
+<tr><td>Child keep-alive window (s)</td><td>Length of the keep-alive and hold window (300-21600 seconds, default 1500).</td><td>choice</td><td>daemon field <code>child_keepalive_window_secs</code></td><td>immediately</td></tr>
+<tr><td>Build slots</td><td>Concurrent cargo build/test runs the resource governor admits (1-16); default 4.</td><td>choice</td><td>daemon field <code>governor_build_slots</code></td><td>immediately</td></tr>
+<tr><td>Lander slots</td><td>Concurrent rsi-rolling-land runs the resource governor admits (1-16); default 5.</td><td>choice</td><td>daemon field <code>governor_lander_slots</code></td><td>immediately</td></tr>
+<tr><td>Governor max load (0 auto)</td><td>1-minute load at or above which no new build or lander starts; 0 means 1.25 x cores.</td><td>choice</td><td>daemon field <code>governor_max_load</code></td><td>immediately</td></tr>
+<tr><td>Governor min free disk (GB)</td><td>Free space on / below which no new build or lander starts; default 30.</td><td>choice</td><td>daemon field <code>governor_min_free_disk_gb</code></td><td>immediately</td></tr>
+<tr><td>Governor min available memory (GB)</td><td>MemAvailable below which no new build or lander starts; default 16.</td><td>choice</td><td>daemon field <code>governor_min_avail_mem_gb</code></td><td>immediately</td></tr>
+<tr><td>Governor max workers-slice memory (GB)</td><td>Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30.</td><td>choice</td><td>daemon field <code>governor_max_workers_slice_gb</code></td><td>immediately</td></tr>
+<tr><td>Harness web access</td><td>Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it.</td><td>choice</td><td>daemon field <code>harness_web_access</code></td><td>next spawn</td></tr>
+<tr><td>Harness network egress</td><td>Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it.</td><td>choice</td><td>daemon field <code>harness_egress_mode</code></td><td>next spawn</td></tr>
+<tr><td>Harness search call cap</td><td>Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues.</td><td>choice</td><td>daemon field <code>harness_max_search_calls</code></td><td>next spawn</td></tr>
+<tr><td>Harness fetch call cap</td><td>Default cap on hosted web fetches per Harness session; 0 is unlimited.</td><td>choice</td><td>daemon field <code>harness_max_fetch_calls</code></td><td>next spawn</td></tr>
+<tr><td>Harness completion gates</td><td>Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794).</td><td>toggle</td><td>daemon field <code>completion_gates_enabled</code></td><td>next spawn</td></tr>
+<tr><td>Harness tool output cap (bytes)</td><td>Default cap on total tool output bytes per Harness session; 0 is unlimited. Once used up, further tool calls return a typed error.</td><td>choice</td><td>daemon field <code>harness_max_result_bytes</code></td><td>next spawn</td></tr>
+<tr><td>Harness web cost cap (micro-USD)</td><td>Default cap on estimated hosted web cost per Harness session (1000000 = 1 USD, searches estimated at 0.01 USD); 0 is unlimited.</td><td>choice</td><td>daemon field <code>harness_max_web_cost_usd_micros</code></td><td>next spawn</td></tr>
+<tr><td>MCP deferred tool threshold</td><td>Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable. Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap.</td><td>choice</td><td>daemon field <code>mcp.deferred_tool_threshold</code></td><td>next spawn</td></tr>
+<tr><td>Cloud spend</td><td>Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC.</td><td>read-only</td><td>daemon (cloud spend)</td><td>immediately</td></tr>
+<tr><td>Cloud spend stop line (USD)</td><td>Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes.</td><td>choice</td><td>daemon field <code>cloud_spend_stop_line_usd</code></td><td>immediately</td></tr>
+<tr><td>Cloud spend daily cap (USD)</td><td>Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop.</td><td>choice</td><td>daemon field <code>cloud_spend_daily_cap_usd</code></td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>Code Intelligence</h4>
@@ -590,7 +618,10 @@
 <tr><td>Vault: legacy env fallback</td><td>Allow provider keys from legacy environment variables when no vault credential exists.</td><td>toggle</td><td>daemon field <code>vault.env_compat</code></td><td>immediately</td></tr>
 <tr><td>Vault: check TTL</td><td>Cache provider key check results for this many seconds.</td><td>choice</td><td>daemon field <code>vault.check_ttl_secs</code></td><td>immediately</td></tr>
 <tr><td>OpenRouter engine</td><td>Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route &lt;model&gt; [codex_cli|harness|default].</td><td>choice</td><td>daemon field <code>api_route.openrouter</code></td><td>next spawn</td></tr>
+<tr><td>Bedrock engine</td><td>Choose the engine for new Bedrock sessions: codex_cli runs GPT in Codex and Claude in Claude Code; harness runs both in RSI's Harness.</td><td>choice</td><td>daemon field <code>api_route.bedrock</code></td><td>next spawn</td></tr>
 <tr><td>API route fallback</td><td>Allow a failed Harness preflight to launch OpenRouter through Codex CLI.</td><td>toggle</td><td>daemon field <code>api_route.fallback</code></td><td>next spawn</td></tr>
+<tr><td>OpenRouter context budget (0 off)</td><td>Live-context tokens at which an OpenRouter session compacts; 0 keeps the model's own limit.</td><td>choice</td><td>daemon field <code>openrouter_context_budget_tokens</code></td><td>next spawn</td></tr>
+<tr><td>Harness iterations per turn</td><td>Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000).</td><td>choice</td><td>daemon field <code>harness_max_iterations_per_turn</code></td><td>next spawn</td></tr>
 </tbody>
 </table>
 <h4>Sandbox Storage</h4>
@@ -613,6 +644,9 @@
 <tr><td>Preview cache reclaim</td><td>Runs a dry-run reclaim pass and reports what it would free.</td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Reclaim sandbox caches now</td><td>Runs a real reclaim pass now and reports the result. <strong>Destructive.</strong></td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Source-worktree settlement</td><td>Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. <strong>Destructive.</strong></td><td>action</td><td>daemon (source-worktree settlement)</td><td>immediately</td></tr>
+<tr><td>Maximum sandbox roots</td><td>Maximum direct source roots under the sandbox base before a new allocation is refused.</td><td>choice</td><td>daemon field <code>sandbox_max_source_roots</code></td><td>immediately</td></tr>
+<tr><td>Minimum free space (GiB)</td><td>Free filesystem space required before a new sandbox is allocated.</td><td>choice</td><td>daemon field <code>sandbox_min_free_gib</code></td><td>immediately</td></tr>
+<tr><td>Purge archived sandboxes</td><td>Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. <strong>Destructive.</strong></td><td>toggle</td><td>daemon field <code>archived_sandbox_purge_enabled</code></td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>Claude Hooks</h4>
@@ -639,6 +673,23 @@
 <tbody>
 <tr><td>Signal bridge</td><td>Signal bridge connection, account and sender allowlist.</td><td>edit</td><td>file <code>signal.toml</code></td><td>immediately</td></tr>
 <tr><td>iMessage bridge</td><td>iMessage bridge connection, account and sender allowlist.</td><td>edit</td><td>file <code>imessage.toml</code></td><td>immediately</td></tr>
+</tbody>
+</table>
+<h4>Satellites</h4>
+<p>Registered peers, local links and cached remote sessions.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>Satellite registry</td><td>Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads.</td><td>action</td><td>daemon (satellite_registry)</td><td>immediately</td></tr>
+<tr><td>Satellite polling</td><td>Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on.</td><td>toggle</td><td>daemon field <code>satellite_polling_enabled</code></td><td>immediately</td></tr>
+</tbody>
+</table>
+<h4>MCP Servers</h4>
+<p>MCP server definitions and credential metadata.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>MCP servers</td><td>Daemon-configured MCP server definitions and credential metadata; a adds, Enter edits, t enables or disables. Server definitions remain disabled until enabled. Credentials are entered through a masked form and stored only in the operator vault.</td><td>list</td><td>daemon (mcp servers)</td><td>immediately</td></tr>
 </tbody>
 </table>
 <h3>Persisted daemon settings without a TUI editor</h3>
@@ -745,7 +796,7 @@
 <tr><td><code>&lt;Space&gt;gd</code></td><td>Open manager decisions</td><td>Opens the harness manager decisions queue awaiting the operator.</td></tr>
 <tr><td><code>yy</code></td><td>Copy Session UUID</td><td>Copies the selected session's UUID; in a transcript <code>yy</code> copies the selected event's content instead.</td></tr>
 <tr><td><code>x</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
-<tr><td><code>X</code></td><td>Hard interrupt running session</td><td>Immediately interrupts the selected session and marks it HARD; only the operator may clear it.</td></tr>
+<tr><td><code>X</code></td><td>INTERRUPT NOW</td><td>Press twice within five seconds to cancel the active turn and mark it HARD.</td></tr>
 <tr><td><code>&lt;Space&gt;hs</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
 <tr><td><code>&lt;Space&gt;hc</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker.</td></tr>
 <tr><td><code>&lt;Space&gt;c</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
@@ -894,6 +945,8 @@
 <tr><td><code>a</code></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
 <tr><td><code>d</code></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td><code>e</code></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
+<tr><td><code>K</code></td><td>Move navigator column earlier</td><td>Moves the selected optional navigator column one place left; the order is saved per navigator preset.</td></tr>
+<tr><td><code>J</code></td><td>Move navigator column later</td><td>Moves the selected optional navigator column one place right; the order is saved per navigator preset.</td></tr>
 <tr><td><code>R</code></td><td>Refresh daemon-backed state</td><td>Re-reads daemon-backed settings state (config, hooks, skills, storage).</td></tr>
 <tr><td><code>s</code></td><td>Set provider key</td><td>Opens the masked Set form for the selected provider key slot.</td></tr>
 <tr><td><code>r</code></td><td>Rotate provider key</td><td>Opens the masked Rotate form for the selected provider key slot.</td></tr>
@@ -974,6 +1027,8 @@
 <tr><td><code>d</code></td><td>Begin delete chord</td><td>First <code>d</code> of <code>dd</code>: arms deletion of the selected scheduled job.</td></tr>
 <tr><td><code>dd</code></td><td>Delete selected job</td><td>Deletes the selected scheduled job (<code>dd</code>).</td></tr>
 <tr><td><code>r</code></td><td>Refresh scheduled jobs</td><td>Re-reads the scheduled jobs from the daemon.</td></tr>
+<tr><td><code>H</code></td><td>Toggle scheduled job history</td><td>Switches between active jobs and every job including old disabled history.</td></tr>
+<tr><td><code>m</code></td><td>Load more scheduled jobs</td><td>Loads the next page of scheduled jobs from the daemon.</td></tr>
 <tr><td><code>q</code></td><td>Close or cancel</td><td>Closes the current view or cancels the pending action.</td></tr>
 <tr><td><code>Esc</code></td><td>Close or cancel</td><td>Closes the current view or cancels the pending action.</td></tr>
 </tbody>
@@ -1029,15 +1084,15 @@
 <tr><td><code>Ctrl-H</code></td><td>other pane focused (normal mode, no overlay)</td><td>focus the pane to the left</td></tr>
 <tr><td><code>Ctrl-L</code></td><td>session list focused (normal mode, no overlay)</td><td>next session-list zone (Main → TaskRabbit → Jobs → Archive, wrapping)</td></tr>
 <tr><td><code>Ctrl-L</code></td><td>other pane focused (normal mode, no overlay; not a stale Issues editor)</td><td>focus the pane to the right</td></tr>
-<tr><td><code>Ctrl-Shift-Up</code></td><td>launch prompt or input modal open</td><td>make the overlay shorter</td></tr>
-<tr><td><code>Ctrl-Shift-Down</code></td><td>launch prompt or input modal open</td><td>make the overlay taller</td></tr>
-<tr><td><code>Ctrl-Shift-Left</code></td><td>launch prompt or input modal open</td><td>make the overlay narrower</td></tr>
-<tr><td><code>Ctrl-Shift-Right</code></td><td>launch prompt or input modal open</td><td>make the overlay wider</td></tr>
-<tr><td><code>Ctrl-Up</code></td><td>launch prompt or input modal open</td><td>move the overlay up</td></tr>
-<tr><td><code>Ctrl-Down</code></td><td>launch prompt or input modal open</td><td>move the overlay down</td></tr>
-<tr><td><code>Ctrl-Left</code></td><td>launch prompt or input modal open</td><td>move the overlay left</td></tr>
-<tr><td><code>Ctrl-Right</code></td><td>launch prompt or input modal open</td><td>move the overlay right</td></tr>
-<tr><td><code>Ctrl-0</code></td><td>launch prompt or input modal open</td><td>reset the overlay's size and position</td></tr>
+<tr><td><code>Ctrl-Shift-Up</code></td><td>movable overlay open</td><td>make the overlay shorter</td></tr>
+<tr><td><code>Ctrl-Shift-Down</code></td><td>movable overlay open</td><td>make the overlay taller</td></tr>
+<tr><td><code>Ctrl-Shift-Left</code></td><td>movable overlay open</td><td>make the overlay narrower</td></tr>
+<tr><td><code>Ctrl-Shift-Right</code></td><td>movable overlay open</td><td>make the overlay wider</td></tr>
+<tr><td><code>Ctrl-Up</code></td><td>movable overlay open</td><td>move the overlay up</td></tr>
+<tr><td><code>Ctrl-Down</code></td><td>movable overlay open</td><td>move the overlay down</td></tr>
+<tr><td><code>Ctrl-Left</code></td><td>movable overlay open</td><td>move the overlay left</td></tr>
+<tr><td><code>Ctrl-Right</code></td><td>movable overlay open</td><td>move the overlay right</td></tr>
+<tr><td><code>Ctrl-0</code></td><td>movable overlay open</td><td>reset the overlay's size and position</td></tr>
 <tr><td><code>Ctrl-Shift-Right</code></td><td>normal mode, no overlay</td><td>widen the session-list sidebar</td></tr>
 <tr><td><code>Ctrl-Shift-Left</code></td><td>normal mode, no overlay</td><td>narrow the session-list sidebar</td></tr>
 <tr><td><code>Ctrl-Left</code></td><td>session detail focused (normal mode, no overlay, not inserting)</td><td>move the transcript column left (snaps to Left Aligned at the edge)</td></tr>
@@ -1137,10 +1192,13 @@
 <tbody>
 <tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
 <tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
-<tr><td><code>x</code></td><td>Dismiss selected notification</td></tr>
+<tr><td><code>x</code></td><td>Dismiss selected active notification</td></tr>
 <tr><td><code>N</code></td><td>Dismiss all active notifications</td></tr>
-<tr><td><code>Enter</code></td><td>Open source session</td></tr>
+<tr><td><code>Enter</code></td><td>Open linked session</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
+<tr><td><code>Ctrl+Arrows</code></td><td>Move modal</td></tr>
+<tr><td><code>Ctrl+Shift+Arrows</code></td><td>Resize modal</td></tr>
+<tr><td><code>Ctrl+0</code></td><td>Reset modal geometry</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
 <tr><td><code>Space N</code></td><td>Close and open a blank session prompt</td></tr>
 <tr><td><code>Space ;</code></td><td>Open the command palette</td></tr>
@@ -1708,6 +1766,71 @@
 </tbody>
 </table>
 </div>
+<h4>New Session Prompt</h4>
+<div class="region" id="overlay-new-session-prompt">
+<table>
+<thead><tr><th>Keys</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Ctrl-Enter</code></td><td>Launch the session</td></tr>
+<tr><td><code>Ctrl-T / Ctrl-S</code></td><td>Launch into a new tab / split</td></tr>
+<tr><td><code>Ctrl-O, Tab (normal)</code></td><td>Flip to launch settings: model, effort, sandbox, manager</td></tr>
+<tr><td><code>Ctrl-M</code></td><td>Open model picker</td></tr>
+<tr><td><code>Ctrl-E</code></td><td>Cycle effort level</td></tr>
+<tr><td><code>Ctrl-B</code></td><td>Toggle sandbox (isolated git worktree)</td></tr>
+<tr><td><code>? (normal)</code></td><td>Show this help</td></tr>
+<tr><td><code>Ctrl-J / Ctrl-K</code></td><td>Focus next / previous stacked prompt</td></tr>
+<tr><td><code>Space o / Space N (normal)</code></td><td>Stack a TaskRabbit / blank prompt</td></tr>
+<tr><td><code>Ctrl-Q</code></td><td>Close and keep the draft</td></tr>
+<tr><td><code>Ctrl-Y</code></td><td>Compile prompt</td></tr>
+<tr><td><code>a / d</code></td><td>Accept / discard the compiled preview</td></tr>
+<tr><td><code>Ctrl-Shift-G</code></td><td>Grammar and spelling correction</td></tr>
+<tr><td><code>Ctrl-A</code></td><td>AI command on text</td></tr>
+<tr><td><code>Ctrl-Shift-A</code></td><td>Ask AI about text</td></tr>
+<tr><td><code>Ctrl-V</code></td><td>Paste from clipboard (images become @path references)</td></tr>
+<tr><td><code>i / a / o</code></td><td>Enter insert mode (normal mode)</td></tr>
+<tr><td><code>Esc</code></td><td>Return to normal mode (insert mode)</td></tr>
+<tr><td><code>h j k l, w b</code></td><td>Move cursor (normal mode)</td></tr>
+</tbody>
+</table>
+</div>
+<h4>New Session Settings</h4>
+<div class="region" id="overlay-new-session-settings">
+<table>
+<thead><tr><th>Keys</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>j / k, Down / Up</code></td><td>Move between settings</td></tr>
+<tr><td><code>h / l, Left / Right</code></td><td>Change the selected setting</td></tr>
+<tr><td><code>Space / Enter</code></td><td>Toggle or open the selected setting</td></tr>
+<tr><td><code>Ctrl-E / Ctrl-B</code></td><td>Cycle effort / toggle sandbox</td></tr>
+<tr><td><code>Ctrl-M</code></td><td>Open model picker</td></tr>
+<tr><td><code>Ctrl-Enter</code></td><td>Launch the session</td></tr>
+<tr><td><code>Ctrl-T / Ctrl-S</code></td><td>Launch into a new tab / split</td></tr>
+<tr><td><code>?</code></td><td>Show this help</td></tr>
+<tr><td><code>Ctrl-O / Tab / Esc</code></td><td>Flip back to the prompt</td></tr>
+<tr><td><code>Ctrl-Q</code></td><td>Close and keep the draft</td></tr>
+</tbody>
+</table>
+</div>
+<h4>Continue Prompt</h4>
+<div class="region" id="overlay-continue-prompt">
+<table>
+<thead><tr><th>Keys</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Ctrl-Enter</code></td><td>Send the follow-up</td></tr>
+<tr><td><code>? (normal)</code></td><td>Show this help</td></tr>
+<tr><td><code>Ctrl-Q</code></td><td>Close without sending</td></tr>
+<tr><td><code>Ctrl-Y</code></td><td>Compile prompt</td></tr>
+<tr><td><code>a / d</code></td><td>Accept / discard the compiled preview</td></tr>
+<tr><td><code>Ctrl-Shift-G</code></td><td>Grammar and spelling correction</td></tr>
+<tr><td><code>Ctrl-A</code></td><td>AI command on text</td></tr>
+<tr><td><code>Ctrl-Shift-A</code></td><td>Ask AI about text</td></tr>
+<tr><td><code>Ctrl-V</code></td><td>Paste from clipboard (images become @path references)</td></tr>
+<tr><td><code>i / a / o</code></td><td>Enter insert mode (normal mode)</td></tr>
+<tr><td><code>Esc</code></td><td>Return to normal mode (insert mode)</td></tr>
+<tr><td><code>h j k l, w b</code></td><td>Move cursor (normal mode)</td></tr>
+</tbody>
+</table>
+</div>
 <h3>Overlays: Diagnostics and tools</h3>
 <h4>Graph Review</h4>
 <div class="region" id="overlay-graph-review">
@@ -2014,12 +2137,12 @@
 <tr><td>no overlay open</td><td>The focused pane's keys apply; see the Normal-mode table.</td><td>generated table <code>normal</code></td></tr>
 <tr><td>Scheduled Jobs browser</td><td>Its keys are registry routes, rendered as their own generated table.</td><td>generated table <code>schedule-browser</code></td></tr>
 <tr><td>Theme role editor</td><td>Its keys are registry routes, rendered as their own generated table.</td><td>generated table <code>theme-role-editor</code></td></tr>
-<tr><td>Launch / continue prompt</td><td>A text editor surface; its keys are documented by hand.</td><td>keybindings.md § Prompt Overlay (New Session / Continue Session)</td></tr>
 <tr><td>Keybindings help</td><td>Help documents its own scroll, search and close keys.</td><td>keybindings.md § Keybindings Help Overlay</td></tr>
 <tr><td>ESP Square game</td><td>A game with its own single-screen key legend.</td><td>keybindings.md § ESP Square Overlay (<code>&lt;Space&gt;gc</code>)</td></tr>
 <tr><td>Manager policy: launch-choice catalog picker</td><td>A picker sub-mode of the manager policy editor with its own key handling.</td><td>keybindings.md § Harness Manager Policy (<code>:manager policy</code>)</td></tr>
 <tr><td>Source-worktree settlement: authorization</td><td>A confirmation sub-mode of the settlement browser with its own key handling.</td><td>keybindings.md § Source-Worktree Settlement Authorization</td></tr>
 <tr><td>Graph review: info dashboard focused</td><td>The dashboard panel owns keys while focused, separate from graph editing.</td><td>keybindings.md § Graph Review Overlay (<code>&lt;Space&gt;v</code> or <code>:graph</code>)</td></tr>
+<tr><td>Satellite registry browser</td><td>The browser owns its peer, link and cached session keys.</td><td>keybindings.md § Satellite Registry Browser</td></tr>
 </tbody>
 </table>
 </div>

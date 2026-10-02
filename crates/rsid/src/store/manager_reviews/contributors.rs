@@ -1,24 +1,29 @@
 //! Review contributor provenance from daemon rows. This module never inspects Git.
 
 use super::*;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_LINEAGE: usize = 64;
 const MAX_CONTRIBUTORS: usize = 256;
 const MAX_SPAWN_DEPTH: usize = 8;
 
-#[derive(Debug, Default)]
+/// #984: a spawned descendant with its custody fork commit and sandbox branch.
+pub(crate) type ReviewCandidate = (Uuid, Option<String>, Option<String>);
+
+#[derive(Clone, Debug, Default)]
 pub(super) struct ContributorSet {
     pub sessions: BTreeSet<Uuid>,
     pub families: BTreeSet<String>,
     lineage_families: BTreeSet<String>,
+    /// #984: which sessions barred each family, for the refusal detail.
+    pub barring: BTreeMap<String, BTreeSet<Uuid>>,
 }
 
 fn unbounded() -> crate::error::DaemonError {
     refused("manager_review_contributors_unbounded")
 }
 
-fn family_name(family: ReviewModelFamily) -> &'static str {
+pub(super) fn family_name(family: ReviewModelFamily) -> &'static str {
     match family {
         ReviewModelFamily::Anthropic => "anthropic",
         ReviewModelFamily::OpenAI => "openai",
@@ -72,16 +77,16 @@ impl Store {
         Ok(members)
     }
 
-    /// `root_rowid` orders assignment rows in their own table. Spawn rows have
-    /// no cross-table order witness, so include every recorded spawn edge.
-    /// This covers clock reversal and legacy requests without stored Σ.
+    /// #984: contributors are the sessions that authored the reviewed range.
+    /// A session recorded as a reviewer on any assignment in this project never
+    /// contributes, and `unrelated` names descendants the daemon proved at
+    /// request time to be path-disjoint from the sealed range. Spawn rows have
+    /// no cross-table order witness, so every recorded spawn edge is walked.
     pub(super) fn review_contributors(
         &self,
         project: Uuid,
-        epic: Uuid,
-        work_key: &str,
         author: Uuid,
-        root_rowid: Option<i64>,
+        unrelated: &BTreeSet<Uuid>,
         stored_ids: &[Uuid],
         stored_families: &[String],
     ) -> Result<ContributorSet> {
@@ -91,104 +96,43 @@ impl Store {
             let family = self
                 .recorded_review_family(*member)
                 .map_err(|_| unbounded())?;
-            set.lineage_families.insert(family_name(family).into());
+            let family = family_name(family).to_string();
+            set.lineage_families.insert(family.clone());
+            set.barring.entry(family).or_default().insert(*member);
         }
         let mut queue = VecDeque::new();
-        for member in lineage {
-            queue.push_back((member, 0));
+        for member in &lineage {
+            queue.push_back((*member, 0));
         }
 
-        let mut prior = self.conn.prepare(
-            "SELECT a.reviewer_session_id FROM manager_review_assignments a
-             WHERE a.project_id=?1 AND a.epic_id=?2 AND a.work_key=?3
-               AND (?4 IS NULL OR a.rowid<?4) AND a.reviewer_session_id IS NOT NULL
-               -- A blocked/revoked pre-effect launch cannot have contributed bytes.
-               -- Every missing or conflicting witness keeps the reviewer in the set.
-               AND NOT (a.state IN ('failed','cancelled','superseded')
-                 AND a.reviewer_invocation_id IS NULL
-                 AND a.reviewer_custody_id IS NULL
-                 AND a.reviewer_custody_generation IS NULL
-                 AND EXISTS (SELECT 1 FROM harness_manager_v2_operations o
-                     WHERE o.id=a.action_operation_id AND o.kind='lifecycle_action'
-                       AND o.project_id=a.project_id
-                       AND o.manager_session_id=a.manager_session_id
-                       AND o.scope_version=a.scope_version
-                       AND o.target_session_id=a.reviewer_session_id
-                       AND o.state IN ('blocked','revoked')
-                       AND json_extract(o.outcome_json,'$.operation_id')=o.id
-                       AND json_extract(o.outcome_json,'$.target_session_id')=a.reviewer_session_id
-                       AND json_extract(o.outcome_json,'$.state')=o.state
-                       AND json_type(o.outcome_json,'$.outcome')='text'
-                       AND length(json_extract(o.outcome_json,'$.outcome'))>0
-                       AND json_extract(o.payload_json,'$.request.operation.action')='create_session'
-                       AND EXISTS (SELECT 1 FROM harness_manager_v2_records c
-                           WHERE c.project_id=o.project_id
-                             AND c.manager_session_id=o.manager_session_id
-                             AND c.scope_version=o.scope_version
-                             AND c.kind='lifecycle_context' AND c.record_key=o.id
-                             AND json_extract(c.payload_json,'$.request.operation.action')='create_session')
-                       AND NOT EXISTS (SELECT 1 FROM harness_manager_v2_records e
-                           WHERE e.project_id=o.project_id
-                             AND e.manager_session_id=o.manager_session_id
-                             AND e.scope_version=o.scope_version
-                             AND e.kind='lifecycle_execution' AND e.record_key=o.id))
-                 AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=a.reviewer_session_id)
-                 AND NOT EXISTS (SELECT 1 FROM model_invocations i
-                     WHERE i.session_id=a.reviewer_session_id)
-                 AND NOT EXISTS (SELECT 1 FROM sandbox_custody_roots c
-                     WHERE c.owner_session_id=a.reviewer_session_id
-                        OR c.allocation_id=a.reviewer_session_id)
-                 AND NOT EXISTS (SELECT 1 FROM manager_review_receipts r
-                     WHERE r.assignment_id=a.assignment_id
-                        OR r.reviewer_session_id=a.reviewer_session_id))
-             LIMIT ?5",
-        )?;
-        let reviewers = prior
-            .query_map(
-                params![
-                    project.to_string(),
-                    epic.to_string(),
-                    work_key,
-                    root_rowid,
-                    (MAX_CONTRIBUTORS + 1) as i64
-                ],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if reviewers.len() > MAX_CONTRIBUTORS {
-            return Err(unbounded());
-        }
-        for reviewer in reviewers {
-            let reviewer = Uuid::parse_str(&reviewer).map_err(|_| unbounded())?;
-            for member in self.review_lineage(reviewer)? {
-                queue.push_back((member, 0));
-            }
-        }
+        let mut visited: BTreeSet<Uuid> = BTreeSet::new();
         while let Some((id, depth)) = queue.pop_front() {
-            if !set.sessions.insert(id) {
+            if !visited.insert(id) {
                 continue;
             }
-            if set.sessions.len() > MAX_CONTRIBUTORS {
+            if visited.len() > MAX_CONTRIBUTORS {
                 return Err(unbounded());
             }
-            let family = self.recorded_review_family(id).map_err(|_| unbounded())?;
-            set.families.insert(family_name(family).into());
-            let mut spawn = self.conn.prepare(
-                "SELECT child_session_id FROM agent_spawn_requests WHERE owner_session_id=?1 LIMIT ?2",
-            )?;
-            let children = spawn
-                .query_map(
-                    params![id.to_string(), (MAX_CONTRIBUTORS + 1) as i64],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if children.len() > MAX_CONTRIBUTORS
-                || (depth == MAX_SPAWN_DEPTH && !children.is_empty())
-            {
+            // #984: a reviewer never contributes. A proven-unrelated descendant
+            // contributes nothing either. Both are still traversed so their own
+            // children are judged individually. The author lineage always counts.
+            let barred = !lineage.contains(&id)
+                && (unrelated.contains(&id) || self.is_project_reviewer(project, id)?);
+            if !barred {
+                set.sessions.insert(id);
+                if set.sessions.len() > MAX_CONTRIBUTORS {
+                    return Err(unbounded());
+                }
+                let family = self.recorded_review_family(id).map_err(|_| unbounded())?;
+                let family = family_name(family).to_string();
+                set.families.insert(family.clone());
+                set.barring.entry(family).or_default().insert(id);
+            }
+            let children = self.spawned_children(id)?;
+            if depth == MAX_SPAWN_DEPTH && !children.is_empty() {
                 return Err(unbounded());
             }
             for child in children {
-                let child = Uuid::parse_str(&child).map_err(|_| unbounded())?;
                 for member in self.review_lineage(child)? {
                     queue.push_back((member, depth + 1));
                 }
@@ -200,7 +144,9 @@ impl Store {
                 return Err(unbounded());
             }
             let family = self.recorded_review_family(*id).map_err(|_| unbounded())?;
-            set.families.insert(family_name(family).into());
+            let family = family_name(family).to_string();
+            set.families.insert(family.clone());
+            set.barring.entry(family).or_default().insert(*id);
         }
         if stored_families.iter().any(|family| {
             !matches!(
@@ -218,11 +164,101 @@ impl Store {
         }) {
             return Err(unbounded());
         }
+        for family in stored_families {
+            set.barring.entry(family.clone()).or_default();
+        }
         set.families.extend(stored_families.iter().cloned());
         if set.families.contains("unknown") || set.lineage_families.contains("unknown") {
             return Err(refused("manager_review_family_conflict"));
         }
         Ok(set)
+    }
+
+    /// #984: the spawned descendants of the author's lineage, each with the
+    /// custody fork commit and branch a caller can diff to prove its own
+    /// changes are path-disjoint from the reviewed range. The author lineage
+    /// is never a candidate.
+    pub(crate) fn review_contributor_candidates(
+        &self,
+        _project: Uuid,
+        _epic: Uuid,
+        author: Uuid,
+    ) -> Result<Vec<ReviewCandidate>> {
+        let lineage = self.review_lineage(author)?;
+        let mut queue = VecDeque::new();
+        for member in &lineage {
+            for child in self.spawned_children(*member)? {
+                for member in self.review_lineage(child)? {
+                    queue.push_back((member, 1));
+                }
+            }
+        }
+        let mut visited: BTreeSet<Uuid> = BTreeSet::new();
+        let mut candidates = Vec::new();
+        while let Some((id, depth)) = queue.pop_front() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if visited.len() > MAX_CONTRIBUTORS {
+                return Err(unbounded());
+            }
+            if !lineage.contains(&id) {
+                let custody: Option<(Option<String>, Option<String>)> = self
+                    .conn
+                    .query_row(
+                        "SELECT r.source_commit,r.sandbox_branch FROM sessions s
+                           LEFT JOIN sandbox_custody_roots r
+                             ON r.custody_id=s.sandbox_custody_id
+                          WHERE s.id=?1",
+                        [id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let (fork, branch) = custody.unwrap_or((None, None));
+                candidates.push((id, fork, branch));
+            }
+            let children = self.spawned_children(id)?;
+            if depth == MAX_SPAWN_DEPTH && !children.is_empty() {
+                return Err(unbounded());
+            }
+            for child in children {
+                for member in self.review_lineage(child)? {
+                    queue.push_back((member, depth + 1));
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// #984: a session recorded as the reviewer of any review in this project
+    /// never contributes, whatever became of that assignment.
+    fn is_project_reviewer(&self, project: Uuid, id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_review_assignments
+              WHERE project_id=?1 AND reviewer_session_id=?2)",
+            params![project.to_string(), id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    /// Bounded spawn edges from one owner; more than the contributor budget is
+    /// not traversable, so it refuses rather than silently truncating.
+    fn spawned_children(&self, id: Uuid) -> Result<Vec<Uuid>> {
+        let mut spawn = self.conn.prepare(
+            "SELECT child_session_id FROM agent_spawn_requests WHERE owner_session_id=?1 LIMIT ?2",
+        )?;
+        let rows = spawn
+            .query_map(
+                params![id.to_string(), (MAX_CONTRIBUTORS + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > MAX_CONTRIBUTORS {
+            return Err(unbounded());
+        }
+        rows.into_iter()
+            .map(|value| Uuid::parse_str(&value).map_err(|_| unbounded()))
+            .collect()
     }
 
     pub(super) fn review_contributors_for_assignment(
@@ -232,6 +268,8 @@ impl Store {
         let mut root = assignment.clone();
         let mut stored_ids = root.request.contributor_session_ids.clone();
         let mut stored_families = root.request.contributor_families.clone();
+        let mut stored_unrelated: BTreeSet<Uuid> =
+            root.request.unrelated_session_ids.iter().copied().collect();
         for _ in 0..=MAX_INFRA_RELAUNCHES {
             let Some(id) = root.request.infra_retry_of else {
                 break;
@@ -272,29 +310,42 @@ impl Store {
             }
             stored_ids.extend(prior.request.contributor_session_ids.iter().copied());
             stored_families.extend(prior.request.contributor_families.iter().cloned());
+            stored_unrelated.extend(prior.request.unrelated_session_ids.iter().copied());
             root = prior;
         }
         if root.request.infra_retry_of.is_some() {
             return Err(unbounded());
         }
-        let rowid: i64 = self
-            .conn
-            .query_row(
-                "SELECT rowid FROM manager_review_assignments WHERE assignment_id=?1",
-                [root.assignment_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(unbounded)?;
         self.review_contributors(
             assignment.project_id,
-            assignment.epic_id,
-            &assignment.work_key,
             assignment.author_session_id,
-            Some(rowid),
+            &stored_unrelated,
             &stored_ids,
             &stored_families,
         )
+    }
+
+    pub(super) fn admissible_review_contributors_for_assignment(
+        &self,
+        assignment: &ReviewAssignment,
+    ) -> Result<ContributorSet> {
+        let mut set = self.review_contributors_for_assignment(assignment)?;
+        if assignment.request.delta_of.is_some() {
+            let config = self
+                .get_harness_manager(assignment.project_id)?
+                .ok_or_else(unbounded)?;
+            let (_, work) = self.manager_v2_work(&config, &assignment.work_key)?;
+            if let Some(family) = self.review_delta_family(
+                assignment.project_id,
+                &work,
+                &assignment.source_sha,
+                assignment.request.delta_of,
+                &assignment.request.finding_keys,
+            )? {
+                set.families.remove(family_name(family));
+            }
+        }
+        Ok(set)
     }
 
     /// A decision is usable only when its current version was written by the
@@ -372,7 +423,7 @@ impl Store {
         reviewer: ReviewModelFamily,
     ) -> Result<()> {
         if reviewer == ReviewModelFamily::Unknown {
-            return Err(refused("manager_review_family_conflict"));
+            return Err(refused("manager_review_reviewer_family_unknown"));
         }
         let config = self.get_harness_manager(project)?.ok_or_else(unbounded)?;
         let verified = override_key
@@ -394,10 +445,38 @@ impl Store {
                 family == ReviewModelFamily::Unknown || barred.contains(family_name(family))
             })
         {
-            return Err(refused("manager_review_family_exhausted"));
+            let detail = set
+                .barring
+                .iter()
+                .map(|(family, ids)| {
+                    let ids = ids
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{family}:{ids}")
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            return Err(refused(&format!(
+                "manager_review_family_exhausted: barred={detail}"
+            )));
         }
         if barred.contains(family_name(reviewer)) {
-            return Err(refused("manager_review_family_conflict"));
+            let family = family_name(reviewer);
+            let detail = set
+                .barring
+                .get(family)
+                .map(|ids| {
+                    ids.iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            return Err(refused(&format!(
+                "manager_review_family_conflict: family={family} barred_by={detail}"
+            )));
         }
         Ok(())
     }
@@ -407,7 +486,7 @@ impl Store {
         assignment: &ReviewAssignment,
         caller: Uuid,
     ) -> Result<()> {
-        let set = self.review_contributors_for_assignment(assignment)?;
+        let set = self.admissible_review_contributors_for_assignment(assignment)?;
         self.require_review_contributor_family(
             assignment.project_id,
             &assignment.work_key,
@@ -571,7 +650,10 @@ mod tests {
                 .iter()
                 .map(|id| family_name(f.store.recorded_review_family(*id).unwrap()).to_string())
                 .collect(),
+            unrelated_session_ids: Vec::new(),
             family_override_key: None,
+            delta_of: None,
+            finding_keys: vec![],
         };
         let mut value = serde_json::to_value(request).unwrap();
         if legacy {
@@ -684,7 +766,7 @@ mod tests {
 
     fn contributors(f: &Fixture) -> ContributorSet {
         f.store
-            .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
+            .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[])
             .unwrap()
     }
 
@@ -744,13 +826,105 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
-    fn prior_reviewer_family_stays_even_after_an_accepted_verdict_or_cherry_picked_fix() {
+    fn review_candidates_are_the_spawned_descendants_outside_the_author_lineage() {
+        let f = fixture();
+        let child = session(&f, "claude-sonnet-5");
+        let grandchild = session(&f, "gpt-6-sol");
+        spawn(&f, f.author, child, &now());
+        spawn(&f, child, grandchild, &now());
+        let ids: BTreeSet<Uuid> = f
+            .store
+            .review_contributor_candidates(f.project, f.epic, f.author)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(ids, BTreeSet::from([child, grandchild]));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn a_proven_unrelated_child_does_not_bar_its_family() {
+        let f = fixture();
+        let child = session(&f, "claude-sonnet-5");
+        spawn(&f, f.author, child, &now());
+        let unrelated = BTreeSet::from([child]);
+        let set = f
+            .store
+            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .unwrap();
+        assert!(!set.sessions.contains(&child));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn a_grandchild_under_an_unlisted_unrelated_child_still_bars() {
+        let f = fixture();
+        let child = session(&f, "z-ai/glm-5.3-flashx");
+        spawn(&f, f.author, child, &now());
+        let grandchild = session(&f, "claude-sonnet-5");
+        spawn(&f, child, grandchild, &now());
+        let unrelated = BTreeSet::from([child]);
+        let set = f
+            .store
+            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .unwrap();
+        assert!(!set.sessions.contains(&child));
+        assert!(set.sessions.contains(&grandchild));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn the_author_lineage_bars_even_when_listed_as_unrelated() {
+        let f = fixture();
+        let unrelated = BTreeSet::from([f.author]);
+        let set = f
+            .store
+            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .unwrap();
+        assert!(set.sessions.contains(&f.author));
+        assert!(check(&f, &set, ReviewModelFamily::OpenAI).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn a_halted_orphan_reviewer_does_not_bar_its_family() {
+        let f = fixture();
+        let reviewer = session(&f, "claude-sonnet-5");
+        assignment(&f, Some(reviewer), false, &now());
+        let set = contributors(&f);
+        assert!(!set.sessions.contains(&reviewer));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn the_family_conflict_refusal_names_the_barring_session() {
+        let f = fixture();
+        let child = session(&f, "claude-sonnet-5");
+        spawn(&f, f.author, child, &now());
+        let set = contributors(&f);
+        let message = check(&f, &set, ReviewModelFamily::Anthropic)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("family=anthropic"));
+        assert!(message.contains("barred_by="));
+        assert!(message.contains(&child.to_string()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn a_prior_reviewer_family_is_admissible_after_the_verdict() {
+        // #984: independence means "did not author this source", not "no
+        // session of that family ever reviewed anything in the Epic".
         let f = fixture();
         let reviewer = session(&f, "claude-sonnet-5");
         assignment(&f, Some(reviewer), true, &now());
         let set = contributors(&f);
-        assert!(set.sessions.contains(&reviewer));
-        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
+        assert!(!set.sessions.contains(&reviewer));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
@@ -782,7 +956,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
-    fn missing_reviewer_without_terminal_zero_effect_proof_refuses_traversal() {
+    fn a_missing_reviewer_is_ignored_by_contributor_traversal() {
         for (action_state, receipt_state) in [
             ("running", Some("running")),
             ("failed", Some("failed")),
@@ -790,61 +964,51 @@ mod tests {
             ("blocked", None),
         ] {
             let f = fixture();
-            prelaunch_assignment(&f, Uuid::new_v4(), "failed", action_state, receipt_state);
-            assert!(
-                f.store
-                    .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("contributors_unbounded")
-            );
+            let missing = Uuid::new_v4();
+            prelaunch_assignment(&f, missing, "failed", action_state, receipt_state);
+            let set = contributors(&f);
+            assert_eq!(set.sessions, BTreeSet::from([f.author]));
+            assert!(!set.sessions.contains(&missing));
         }
         let f = fixture();
-        assignment(&f, Some(Uuid::new_v4()), false, &now());
-        assert!(
-            f.store
-                .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
-                .unwrap_err()
-                .to_string()
-                .contains("contributors_unbounded")
-        );
+        let missing = Uuid::new_v4();
+        assignment(&f, Some(missing), false, &now());
+        let set = contributors(&f);
+        assert_eq!(set.sessions, BTreeSet::from([f.author]));
+        assert!(!set.sessions.contains(&missing));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
-    fn apparent_prelaunch_failure_with_an_effect_witness_refuses_traversal() {
+    fn an_effect_witness_on_a_prelaunch_review_does_not_bar_its_family() {
         let f = fixture();
-        let (_, action) =
-            prelaunch_assignment(&f, Uuid::new_v4(), "failed", "blocked", Some("blocked"));
+        let missing = Uuid::new_v4();
+        let (_, action) = prelaunch_assignment(&f, missing, "failed", "blocked", Some("blocked"));
         f.store.conn.execute(
             "INSERT INTO harness_manager_v2_records(project_id,manager_session_id,scope_version,
              kind,record_key,row_version,payload_json,created_at,updated_at)
              VALUES(?1,?2,1,'lifecycle_execution',?3,1,'{\"effect_started\":true}',?4,?4)",
             params![f.project.to_string(), f.manager.to_string(), action.to_string(), now()],
         ).unwrap();
-        assert!(
-            f.store
-                .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
-                .unwrap_err()
-                .to_string()
-                .contains("contributors_unbounded")
-        );
+        let set = contributors(&f);
+        assert_eq!(set.sessions, BTreeSet::from([f.author]));
+        assert!(!set.sessions.contains(&missing));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
-    fn terminal_action_with_a_persisted_reviewer_keeps_its_family() {
+    fn a_persisted_terminal_reviewer_does_not_keep_its_family() {
         let f = fixture();
         let reviewer = session(&f, "claude-sonnet-5");
         prelaunch_assignment(&f, reviewer, "failed", "blocked", Some("blocked"));
         let set = contributors(&f);
-        assert!(set.sessions.contains(&reviewer));
-        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_err());
+        assert!(!set.sessions.contains(&reviewer));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
-    fn prior_reviewers_follow_assignment_rowid_when_timestamps_reverse() {
+    fn reviewers_are_excluded_regardless_of_assignment_rowid_order() {
         let f = fixture();
         let prior = session(&f, "claude-sonnet-5");
         let later = session(&f, "z-ai/glm-5.3-flashx");
@@ -866,14 +1030,9 @@ mod tests {
 
         let root = f.store.manager_review_assignment(root_id).unwrap();
         let set = f.store.review_contributors_for_assignment(&root).unwrap();
-        assert!(set.sessions.contains(&prior));
-        assert!(
-            f.store
-                .review_receipt_contributor_gate(&root, prior)
-                .unwrap_err()
-                .to_string()
-                .contains("family_conflict")
-        );
+        assert!(!set.sessions.contains(&prior));
+        assert!(!set.sessions.contains(&later));
+        assert_eq!(set.sessions, BTreeSet::from([f.author]));
         assert!(check(&f, &set, ReviewModelFamily::ZAi).is_ok());
     }
 
@@ -933,7 +1092,7 @@ mod tests {
         }
         assert!(
             f.store
-                .review_contributors(f.project, f.epic, "work", f.author, None, &[], &[])
+                .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("contributors_unbounded")
@@ -958,11 +1117,29 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
+    fn unknown_reviewer_family_has_distinct_refusal_from_author_family() {
+        let f = fixture();
+        let set = contributors(&f);
+        assert!(matches!(
+            check(&f, &set, ReviewModelFamily::Unknown),
+            Err(crate::error::DaemonError::InvalidParam(code))
+                if code == "manager_review_reviewer_family_unknown"
+        ));
+        assert!(matches!(
+            check(&f, &set, ReviewModelFamily::OpenAI),
+            Err(crate::error::DaemonError::InvalidParam(code))
+                if code.starts_with("manager_review_family_conflict")
+        ));
+        assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
     fn manager_override_admits_a_family_for_one_revision_but_never_the_lineage_family_and_lead_key_is_ignored()
      {
         let f = fixture();
-        let reviewer = session(&f, "claude-sonnet-5");
-        assignment(&f, Some(reviewer), true, &now());
+        let child = session(&f, "claude-sonnet-5");
+        spawn(&f, f.author, child, &now());
         let set = contributors(&f);
         let lead = session(&f, "gpt-6-luna");
         let lead_key = override_decision(&f, lead, "anthropic");
@@ -1048,8 +1225,8 @@ mod tests {
             .unwrap();
         let openai = session(&f, "gpt-6-sol");
         let zai = session(&f, "z-ai/glm-5.3-flashx");
-        assignment(&f, Some(openai), true, &now());
-        assignment(&f, Some(zai), true, &now());
+        spawn(&f, f.author, openai, &now());
+        spawn(&f, f.author, zai, &now());
         let set = contributors(&f);
         let policy = f
             .store
@@ -1154,7 +1331,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(code, "manager_review_family_conflict");
+        assert!(code.contains("manager_review_family_conflict"));
         assert_eq!(
             f.store
                 .conn
@@ -1206,3 +1383,5 @@ mod tests {
         assert!(request.contributor_families.contains(&"zai".to_string()));
     }
 }
+// #984: reviewers never contribute, so a reviewer row whose session is
+// missing (or whose launch was merely blocked) no longer fails traversal.

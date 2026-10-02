@@ -23,8 +23,14 @@ pub struct VerificationManifest {
 }
 
 impl VerificationManifest {
-    /// The set of every plan/research linkage key covered by any item in any
-    /// phase (union of each item's `satisfies` and `covers`).
+    /// The set of every plan/research linkage key covered by a *successful*
+    /// item in any phase (union of each `Pass` or `Checked` item's
+    /// `satisfies` and `covers`).
+    ///
+    /// Items that are `Fail`, `Pending`, `Unchecked` or statusless still parse
+    /// and serialize (an unfinished manifest is a valid document) but cover
+    /// nothing: a research finding is not verified by a check that failed or
+    /// has not run.
     ///
     /// The cross-stage VERIFY pass in [`crate::agent_contract`] uses this to
     /// decide whether a declared plan/research key is satisfied by the
@@ -36,6 +42,7 @@ impl VerificationManifest {
         self.phases
             .iter()
             .flat_map(|phase| phase.items.iter())
+            .filter(|item| item.is_successful())
             .flat_map(VerificationItem::linkage_keys)
             .map(str::to_string)
             .collect()
@@ -129,6 +136,13 @@ pub struct VerificationItem {
 }
 
 impl VerificationItem {
+    /// True only for `Pass` and `Checked`. Statusless, `Fail`, `Pending` and
+    /// `Unchecked` items are not successful verification evidence.
+    #[must_use]
+    pub const fn is_successful(&self) -> bool {
+        matches!(self.status, Some(ItemStatus::Pass | ItemStatus::Checked))
+    }
+
     /// The union of this item's `satisfies` and `covers` linkage keys.
     ///
     /// The cross-stage VERIFY pass treats both fields as coverage — an item
@@ -843,12 +857,12 @@ status: pending_verification
 ## Phase 1 - linkage
 
 ### Automated
-- cross-stage linkage round-trips
+- [PASS] cross-stage linkage round-trips
   satisfies: F-001, PLAN-3
   covers: [F-002]
 
 ### Daemon-level
-- [PENDING] rsi-rpc ListSessions returns JSON
+- [PASS] rsi-rpc ListSessions returns JSON
   - check: RSI_DAEMON_SOCKET_PATH=/tmp/rsi.sock rsi-rpc ListSessions
   - expected: stdout parses as JSON object with result key
   - satisfies: F-003
@@ -881,6 +895,37 @@ status: pending_verification
             Err(err) => panic!("linkage manifest should deserialize: {err}"),
         };
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn only_pass_and_checked_items_cover_linkage_keys() {
+        for (prefix, covers) in [
+            ("[PASS]", true),
+            ("[x]", true),
+            ("[FAIL]", false),
+            ("[PENDING]", false),
+            ("[ ]", false),
+            ("", false),
+        ] {
+            let doc = format!(
+                "---\nticket: S6\nplan_doc: p.md\ngenerated: 2026-06-29T14:23:00Z\n\
+                 phases_sealed: [1]\nstatus: pending_verification\n---\n\n\
+                 ## Phase 1 - linkage\n\n### Automated\n- {prefix} item\n  satisfies: F-001\n\n\
+                 ### Daemon-level\n- (none)\n\n### TUI manual\n- (none)\n"
+            );
+            let manifest = match parse(&doc) {
+                Ok(manifest) => manifest,
+                Err(err) => panic!("`{prefix}` manifest should parse: {err}"),
+            };
+            let item = &manifest.phases[0].items[0];
+            assert_eq!(item.satisfies.as_deref(), Some(&["F-001".to_string()][..]));
+            assert_eq!(
+                manifest.covered_linkage_keys().contains("F-001"),
+                covers,
+                "prefix `{prefix}` status {:?}",
+                item.status
+            );
+        }
     }
 
     #[test]

@@ -116,6 +116,107 @@ pub struct SatelliteIdentityV1 {
     pub daemon_incarnation_id: SatelliteUuidV1,
     pub protocol: SatelliteProtocolVersionV1,
     pub capabilities: SatelliteCapabilitiesV1,
+    /// Bounded operational health (#1017). Absent from older satellites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<SatelliteHealthV1>,
+}
+
+pub const SATELLITE_MAX_HEALTH_TEXT_BYTES: usize = 64;
+/// Bound on the provider CLI names a satellite health report may list.
+pub const SATELLITE_MAX_MISSING_PROVIDER_CLIS: usize = 8;
+
+/// Non-secret operational facts a satellite reports beside its identity.
+/// Every field is optional or bounded; the hub only displays them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteHealthV1 {
+    /// Cargo package version of the satellite's rsid.
+    pub daemon_version: String,
+    /// Lowercase hex SHA-256 of the running rsid binary, once computed.
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    pub uptime_seconds: u64,
+    /// SQLite `user_version` of the satellite database.
+    #[serde(default)]
+    pub schema_version: Option<i32>,
+    pub sessions_running: u32,
+    pub sessions_waiting_approval: u32,
+    /// Free bytes on the filesystem holding the rsi data directory.
+    #[serde(default)]
+    pub disk_free_bytes: Option<u64>,
+    /// One-minute load average times 1000 (Linux `/proc/loadavg`).
+    #[serde(default)]
+    pub load_avg_1m_milli: Option<u32>,
+    /// Commit SHA embedded in the running rsid (#1017 slice 2).
+    #[serde(default)]
+    pub build_sha: Option<String>,
+    /// Daemon start time, RFC3339 with nanoseconds.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// `rsid-supervisor.sh` or `none`.
+    #[serde(default)]
+    pub supervisor_mode: Option<String>,
+    /// The satellite's most recent deploy (staged, restarting or settled).
+    #[serde(default)]
+    pub last_deploy: Option<SatelliteDeployStatusV1>,
+    /// Provider CLIs (`claude`, `codex`, `agy`) the satellite cannot find
+    /// (#1087). Names only, never paths; absent when all are found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_provider_clis: Vec<String>,
+}
+
+/// The newest `agent_deploys` row of a satellite, without any path or reason
+/// text: id, state and the commit it was built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteDeployStatusV1 {
+    pub deploy_id: SatelliteUuidV1,
+    pub state: crate::agent_deploy::DeployState,
+    pub sha: String,
+}
+
+impl SatelliteHealthV1 {
+    /// # Errors
+    /// Returns an error when a text field is unbounded or not printable ASCII.
+    pub fn validate(&self) -> Result<(), SatelliteValidationError> {
+        let text_ok = |value: &str| {
+            !value.is_empty()
+                && value.len() <= SATELLITE_MAX_HEALTH_TEXT_BYTES
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        };
+        if !text_ok(&self.daemon_version) {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        for text in [&self.build_sha, &self.started_at, &self.supervisor_mode]
+            .into_iter()
+            .flatten()
+        {
+            if !text_ok(text) {
+                return Err(SatelliteValidationError::InvalidIdentity);
+            }
+        }
+        if self.missing_provider_clis.len() > SATELLITE_MAX_MISSING_PROVIDER_CLIS
+            || !self.missing_provider_clis.iter().all(|name| text_ok(name))
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if let Some(deploy) = &self.last_deploy
+            && !(deploy.sha.len() == 40
+                && deploy
+                    .sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if let Some(digest) = &self.binary_sha256
+            && !(digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        Ok(())
+    }
 }
 
 impl SatelliteIdentityV1 {
@@ -131,6 +232,9 @@ impl SatelliteIdentityV1 {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
         self.capabilities.limits.validate()?;
+        if let Some(health) = &self.health {
+            health.validate()?;
+        }
         Ok(())
     }
 
@@ -163,6 +267,137 @@ pub enum SatelliteCompatibility {
 pub struct SatelliteSessionKeyV1 {
     pub peer_id: SatelliteUuidV1,
     pub remote_session_id: SatelliteUuidV1,
+}
+
+/// Operator-owned registry data. The socket path names a listener on this hub;
+/// it does not grant the remote daemon any authority by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SatelliteLinkDirectionV1 {
+    DialHomeReverse,
+    DirectLocalForward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteLinkConfigV1 {
+    pub link_id: SatelliteUuidV1,
+    pub direction: SatelliteLinkDirectionV1,
+    pub socket_path: String,
+    pub ssh_target: Option<String>,
+    pub trust_reference: String,
+    pub enabled: bool,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatellitePeerConfigV1 {
+    pub peer_id: SatelliteUuidV1,
+    pub label: String,
+    pub expected_installation_id: Option<SatelliteUuidV1>,
+    pub enabled: bool,
+    pub read_enabled: bool,
+    /// Operator switch for queued hub-manager delivery (#1017 slice 3).
+    /// Default off; it requires an enabled, paired, read-enabled peer.
+    #[serde(default)]
+    pub dispatch_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatellitePutPeerRequestV1 {
+    pub expected_registry_revision: u64,
+    pub peer: SatellitePeerConfigV1,
+    /// An explicit operator acknowledgement after repairing SSH trust or
+    /// replacing a peer. Metadata and link edits preserve quarantine.
+    #[serde(default)]
+    pub repair_quarantine: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatellitePutLinkRequestV1 {
+    pub expected_registry_revision: u64,
+    pub peer_id: SatelliteUuidV1,
+    pub link: SatelliteLinkConfigV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteObservationV1 {
+    pub state: String,
+    pub installation_id: Option<SatelliteUuidV1>,
+    pub incarnation_id: Option<SatelliteUuidV1>,
+    #[serde(with = "canonical_optional_timestamp")]
+    pub last_observed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub cached_session_count: u32,
+    /// Cached data is stale after a hub restart until a fresh identity check.
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatellitePeerV1 {
+    pub config: SatellitePeerConfigV1,
+    pub row_version: u64,
+    pub links: Vec<SatelliteLinkConfigV1>,
+    pub observation: Option<SatelliteObservationV1>,
+    /// Operator-declared remote sessions the hub manager may message.
+    #[serde(default)]
+    pub dispatch_scope: Vec<SatelliteUuidV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteRegistryV1 {
+    pub revision: u64,
+    pub peers: Vec<SatellitePeerV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteHubSessionV1 {
+    pub key: SatelliteSessionKeyV1,
+    pub summary: SatelliteSessionSummaryV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteHubSessionsPageV1 {
+    pub peer_id: SatelliteUuidV1,
+    pub observation: SatelliteObservationV1,
+    pub offset: u32,
+    pub sessions: Vec<SatelliteHubSessionV1>,
+    pub next_offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteHubSessionsRequestV1 {
+    pub peer_id: SatelliteUuidV1,
+    pub offset: u32,
+    pub limit: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteProbeLinkRequestV1 {
+    pub peer_id: SatelliteUuidV1,
+    pub link_id: SatelliteUuidV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteProbeLinkResultV1 {
+    pub peer_id: SatelliteUuidV1,
+    pub link_id: SatelliteUuidV1,
+    pub direction: SatelliteLinkDirectionV1,
+    pub trust_reference: String,
+    pub identity: SatelliteIdentityV1,
+    /// None when the peer is not paired yet; false is a continuity conflict.
+    pub matches_expected: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +587,43 @@ mod canonical_timestamp {
     }
 }
 
+mod canonical_optional_timestamp {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(
+        value: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(time) => {
+                serializer.serialize_some(&time.to_rfc3339_opts(SecondsFormat::Nanos, true))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Some(value) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let parsed = DateTime::parse_from_rfc3339(&value).map_err(serde::de::Error::custom)?;
+        let utc = parsed.with_timezone(&Utc);
+        if utc.to_rfc3339_opts(SecondsFormat::Nanos, true) != value {
+            return Err(serde::de::Error::custom(
+                "timestamp must be canonical RFC3339 UTC with nanoseconds",
+            ));
+        }
+        Ok(Some(utc))
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SatelliteValidationError {
     #[error("unsupported satellite wire version {0}")]
@@ -409,6 +681,7 @@ mod tests {
                 session_read: true,
                 limits: SatelliteReadLimitsV1::default(),
             },
+            health: None,
         }
     }
 

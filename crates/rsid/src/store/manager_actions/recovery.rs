@@ -115,6 +115,22 @@ impl Store {
                 return Err(refused("scheduled_wake_retired_or_disabled"));
             }
         }
+        // A daemon heal may only resume a still-failed transient target.
+        // Recheck under the spawn guard: an operator resume/interrupt/archive
+        // or rotation can race the scheduler's due-list snapshot.
+        for id in job_ids {
+            if let Some(state) = self.transient_heal_state(*id)? {
+                let session = self
+                    .get_session(target)?
+                    .ok_or_else(|| refused("scheduled_wake_target_retired"))?;
+                if state.exhausted
+                    || session.status != rsi_common::types::SessionStatus::Failed
+                    || !self.transient_failure_verdict(&session)?.is_transient()
+                {
+                    return Err(refused("scheduled_wake_target_retired"));
+                }
+            }
+        }
         if self.manager_lead_program_outcome_superseded(target)? {
             return Err(refused("scheduled_wake_target_retired"));
         }
@@ -148,7 +164,7 @@ impl Store {
                         ACTION_KIND,
                         UNCERTAIN_RECOVERY_BATCH,
                         "codex_resume_rollout_torn_tail",
-                        crate::codex::CODEX_TOOL_HISTORY_ERROR_CLASS,
+                        crate::store_support::provider_defaults::CODEX_TOOL_HISTORY_ERROR_CLASS,
                     ],
                     |r| r.get(0),
                 )?
@@ -293,6 +309,9 @@ impl Store {
         )?;
         if changed != 1 {
             return Err(refused("manager_v2_action_changed"));
+        }
+        if state == ManagerActionStateV2::Succeeded {
+            self.apply_lead_wake_effect(&op.context.request.operation, operation_id)?;
         }
         let config = HarnessManagerConfigV1 {
             project_id: op.project_id,

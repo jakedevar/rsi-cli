@@ -204,7 +204,12 @@ pub(crate) fn short_model_label(model: Option<&str>) -> Option<String> {
 /// Build effort-level bars: filled = yellow ▮, empty = dimmed ▯.
 /// Returns empty vec if model doesn't support effort.
 pub(crate) fn build_effort_bars(effort: Option<&str>, model: Option<&str>) -> Vec<Span<'static>> {
-    let (total_bars, filled) = effort_bar_counts(effort, model);
+    build_effort_bars_from_counts(effort_bar_counts(effort, model))
+}
+
+pub(crate) fn build_effort_bars_from_counts(
+    (total_bars, filled): (usize, usize),
+) -> Vec<Span<'static>> {
     if total_bars == 0 {
         return vec![];
     }
@@ -233,6 +238,18 @@ pub(crate) fn effort_bar_counts(effort: Option<&str>, model: Option<&str>) -> (u
         None => return (0, 0),
     };
     let ladder = rsi_common::model_utils::effort_ladder(m);
+    effort_bar_counts_for_ladder(
+        effort,
+        ladder,
+        rsi_common::model_utils::default_effort_level(m),
+    )
+}
+
+pub(crate) fn effort_bar_counts_for_ladder(
+    effort: Option<&str>,
+    ladder: &[&str],
+    default_effort: Option<&str>,
+) -> (usize, usize) {
     if ladder.is_empty() {
         return (0, 0);
     }
@@ -242,9 +259,7 @@ pub(crate) fn effort_bar_counts(effort: Option<&str>, model: Option<&str>) -> (u
             .position(|candidate| *candidate == level)
             .map(|index| index + 1)
     };
-    let default_filled = rsi_common::model_utils::default_effort_level(m)
-        .and_then(position)
-        .unwrap_or(ladder.len());
+    let default_filled = default_effort.and_then(position).unwrap_or(ladder.len());
     let filled = effort.and_then(position).unwrap_or(default_filled);
     (ladder.len(), filled)
 }
@@ -958,11 +973,18 @@ fn render_navigator_header(
     ordinal_width: usize,
     preset: crate::types::NavigatorPreset,
     overrides: Option<&[crate::types::NavigatorOptionalColumn]>,
+    order: &[crate::types::NavigatorOptionalColumn],
 ) {
     if area.height == 0 {
         return;
     }
-    let layout = navigator_layout::resolve(area.width as usize, ordinal_width, preset, overrides);
+    let layout = navigator_layout::resolve_ordered(
+        area.width as usize,
+        ordinal_width,
+        preset,
+        overrides,
+        order,
+    );
     let mut spans = vec![fixed_span("", 1, header_style(bg))];
     if layout.leading_gap > 0 {
         spans.push(fixed_span("", layout.leading_gap, header_style(bg)));
@@ -1269,11 +1291,12 @@ fn render_navigator_row(
         })
         .bg(row_bg)
         .add_modifier(Modifier::BOLD);
-    let layout = navigator_layout::resolve(
+    let layout = navigator_layout::resolve_ordered(
         area.width as usize,
         ordinal_width,
         settings.navigator_preset,
         settings.navigator_optional_columns.as_deref(),
+        &settings.navigator_column_order_for(settings.navigator_preset),
     );
     let mut spans = vec![fixed_span(rail, 1, rail_style)];
     if layout.leading_gap > 0 {
@@ -1368,11 +1391,11 @@ fn render_navigator_row(
             ),
             navigator_layout::NavigatorColumn::Turns => (
                 row.turns_text.clone().unwrap_or_default(),
-                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+                Style::default().fg(theme::count_text()).bg(row_bg),
             ),
             navigator_layout::NavigatorColumn::Age => (
                 operational_age(&time_text(&row.time)),
-                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+                Style::default().fg(theme::time_text()).bg(row_bg),
             ),
             navigator_layout::NavigatorColumn::Provider => {
                 let provider = session
@@ -1394,7 +1417,7 @@ fn render_navigator_row(
                     .and_then(|session| session.model.as_deref())
                     .map(|model| glyphs::list_model_label(model).to_string())
                     .unwrap_or_default(),
-                Style::default().fg(theme::subtext1()).bg(row_bg),
+                Style::default().fg(theme::model_text()).bg(row_bg),
             ),
             navigator_layout::NavigatorColumn::Effort => {
                 let effort = session
@@ -1419,11 +1442,11 @@ fn render_navigator_row(
             ),
             navigator_layout::NavigatorColumn::Cost => (
                 cost_text(&row.cost),
-                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+                Style::default().fg(theme::cost_text()).bg(row_bg),
             ),
             navigator_layout::NavigatorColumn::Work => (
                 row.work_time_text.clone().unwrap_or_default(),
-                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+                Style::default().fg(theme::time_text()).bg(row_bg),
             ),
             navigator_layout::NavigatorColumn::Rotation => (
                 row.rotation_suffix.trim().to_string(),
@@ -1435,7 +1458,7 @@ fn render_navigator_row(
             ),
             navigator_layout::NavigatorColumn::Created => (
                 row.created_text.clone().unwrap_or_default(),
-                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+                Style::default().fg(theme::time_text()).bg(row_bg),
             ),
         };
         let text = navigator_layout::align_cells(&text, cell.width, cell.align);
@@ -1657,6 +1680,49 @@ fn function_cell_spans(
     row_bg: Color,
 ) -> Vec<Span<'static>> {
     const BADGE_CELLS: usize = 3;
+    // Container rows retain their own title and running-count suffix while
+    // gaining a kind mark. Skip the mark when it would leave no title cell.
+    let container_glyph = match row.session_kind {
+        SessionKind::Group => Some(glyphs::GROUP_CONTAINER),
+        SessionKind::Epic => Some(glyphs::EPIC_CONTAINER),
+        _ => None,
+    };
+    if let Some(container_glyph) = container_glyph.filter(|_| width >= 3) {
+        let marker_width = 2;
+        let content_width = width - marker_width;
+        let (title, suffix) = container_function_parts(row, content_width);
+        let title = if suffix.is_some() {
+            title
+        } else {
+            navigator_layout::truncate_cells_with_ellipsis(&row.display_title, content_width)
+        };
+        let used = marker_width
+            + navigator_layout::display_width(&title)
+            + suffix.as_deref().map_or(0, navigator_layout::display_width);
+        let mut spans = vec![
+            Span::styled(
+                container_glyph,
+                Style::default()
+                    .fg(row.kind_color.unwrap_or_else(theme::dim_metadata))
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(title, title_style),
+        ];
+        if let Some(suffix) = suffix {
+            spans.push(Span::styled(
+                suffix,
+                Style::default().fg(theme::dim_metadata()).bg(row_bg),
+            ));
+        }
+        spans.push(fixed_span(
+            "",
+            width.saturating_sub(used),
+            Style::default().bg(row_bg),
+        ));
+        return spans;
+    }
     // Group/Epic rows with running work append a dim running-count suffix
     // after their OWN title; the suffix degrades before the title does.
     if let (title, Some(suffix)) = container_function_parts(row, width) {
@@ -1821,27 +1887,27 @@ fn render_session_inspector(
     };
 
     let width = inner.width as usize;
-    let mut lines = vec![
-        inspector_header_line(inspector, width, bg),
-        Line::from(Span::styled(
-            "─".repeat(width),
-            Style::default()
-                .fg(theme::browser_decorative_separator())
-                .bg(bg),
-        )),
-    ];
-    let mut title_lines = inspector_title_lines(inspector, bg);
-    if let Some(execution) = inspector_execution_line(inspector, source_session, bg) {
-        title_lines.insert(1, execution);
-    }
-    lines.extend(title_lines);
+    // Header block: identity, then every model fact (model, effort, context
+    // budget and its provenance). The rule closes it, so the title (the first
+    // prompt of an untitled session) starts directly underneath.
+    let mut lines = vec![inspector_header_line(inspector, width, bg)];
+    lines.extend(inspector_execution_line(inspector, source_session, bg));
+    render_inspector_context(&mut lines, inspector, width, bg);
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default()
+            .fg(theme::browser_decorative_separator())
+            .bg(bg),
+    )));
+    lines.extend(inspector_title_lines(inspector, bg));
     if let Some(chips) = inspector_signal_line(&inspector.signals, bg) {
         lines.push(chips);
     }
     lines.push(Line::default());
 
-    render_inspector_body(&mut lines, &inspector.body, width, bg);
     render_inspector_facts(&mut lines, inspector, width, bg);
+    lines.push(Line::default());
+    render_inspector_body(&mut lines, &inspector.body, width, bg);
 
     // Blocks are pre-wrapped so glyph gutters and quote rails survive
     // wrapping; the paragraph only wraps lines that are still too long.
@@ -1853,12 +1919,16 @@ fn render_session_inspector(
     );
 }
 
-/// `01  ● running                  Rsi › Root`
+/// `01  ● running  # f5e808ce                Rsi › Root`
+///
+/// The session ID shows as its short form; the full ID stays in F3 Session
+/// Info and the sandbox path. It yields before the location is cut short.
 fn inspector_header_line(
     inspector: &SessionInspectorViewModel,
     width: usize,
     bg: Color,
 ) -> Line<'static> {
+    const MIN_LOCATION_CELLS: usize = 12;
     let status_color = status_color(inspector.status);
     let ordinal = format!("{:02}", inspector.ordinal);
     let status = format!(
@@ -1866,14 +1936,23 @@ fn inspector_header_line(
         crate::types::row::navigator_lifecycle_icon(inspector.status),
         glyphs::status_word(inspector.status)
     );
-    let used =
+    let short_id = short_display_id(inspector.session_id);
+    let id_cells = navigator_layout::display_width(glyphs::SESSION_ID)
+        + 1
+        + navigator_layout::display_width(&short_id);
+    let location_text = inspector_location_text(&inspector.location);
+    let base =
         navigator_layout::display_width(&ordinal) + 2 + navigator_layout::display_width(&status);
-    let location = truncate_chars(
-        &inspector_location_text(&inspector.location),
-        width.saturating_sub(used + 2),
-    );
+    let show_id = base
+        + 2
+        + id_cells
+        + 2
+        + navigator_layout::display_width(&location_text).min(MIN_LOCATION_CELLS)
+        <= width;
+    let used = base + if show_id { 2 + id_cells } else { 0 };
+    let location = truncate_chars(&location_text, width.saturating_sub(used + 2));
     let gap = width.saturating_sub(used + navigator_layout::display_width(&location));
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             ordinal,
             Style::default()
@@ -1889,13 +1968,51 @@ fn inspector_header_line(
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ".repeat(gap), Style::default().bg(bg)),
-        Span::styled(location, Style::default().fg(theme::dim_metadata()).bg(bg)),
-    ])
+    ];
+    if show_id {
+        spans.push(Span::styled("  ", Style::default().bg(bg)));
+        spans.push(Span::styled(
+            format!("{} ", glyphs::SESSION_ID),
+            Style::default().fg(theme::dim_metadata()).bg(bg),
+        ));
+        spans.push(Span::styled(
+            short_id,
+            Style::default().fg(theme::mauve()).bg(bg),
+        ));
+    }
+    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(bg)));
+    spans.extend(location_spans(&location, bg));
+    Line::from(spans)
 }
 
 fn inspector_location_text(location: &str) -> String {
     location.replace(" / ", &format!(" {} ", glyphs::LOCATION))
+}
+
+/// `Rsi › Epic › Root`: the project leads in its accent, deeper segments in
+/// muted text, separators as faint chrome.
+fn location_spans(location: &str, bg: Color) -> Vec<Span<'static>> {
+    let separator = format!(" {} ", glyphs::LOCATION);
+    let mut spans = Vec::new();
+    for (index, segment) in location.split(separator.as_str()).enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                separator.clone(),
+                Style::default().fg(theme::overlay0()).bg(bg),
+            ));
+        }
+        spans.push(Span::styled(
+            segment.to_string(),
+            Style::default()
+                .fg(if index == 0 {
+                    theme::blue()
+                } else {
+                    theme::subtext0()
+                })
+                .bg(bg),
+        ));
+    }
+    spans
 }
 
 /// Title (role code + subject) and a dim identity line (full role word and
@@ -1959,7 +2076,7 @@ fn inspector_signal_line(
         ));
         spans.push(Span::styled(
             signal.label(),
-            Style::default().fg(theme::subtext1()).bg(bg),
+            Style::default().fg(color).bg(bg),
         ));
     }
     Some(Line::from(spans))
@@ -2414,8 +2531,9 @@ fn render_inspector_summary_description(
     }
 }
 
-/// Execution, runtime, context, timestamps, then identity paths — five to
-/// eight glyph-led lines instead of eleven labelled sections.
+/// Runtime and timestamps as packed chips, then identity paths — between the
+/// title and the session narrative. Model and context facts sit in the header
+/// block above the title; the session ID is in the header as its short form.
 fn render_inspector_facts(
     lines: &mut Vec<Line<'static>>,
     inspector: &SessionInspectorViewModel,
@@ -2425,24 +2543,34 @@ fn render_inspector_facts(
     let runtime = &inspector.runtime;
     let glyph_style = Style::default().fg(theme::subtext0()).bg(bg);
     let value_style = Style::default().fg(theme::subtext1()).bg(bg);
-    let dim_style = Style::default().fg(theme::dim_metadata()).bg(bg);
 
+    let mut chips: Vec<Vec<Span<'static>>> = Vec::new();
     if runtime.provider.is_some() {
-        let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
         if let Some(turns) = runtime.turns {
-            parts.push(vec![
+            chips.push(vec![
                 Span::styled(format!("{} ", glyphs::TURNS), glyph_style),
-                Span::styled(turns.to_string(), value_style),
+                Span::styled(
+                    turns.to_string(),
+                    value_style.fg(if theme::uses_terminal_default_backgrounds() {
+                        theme::count_text()
+                    } else {
+                        theme::subtext1()
+                    }),
+                ),
             ]);
         }
         if let Some(cost) = runtime.cost_usd {
-            parts.push(vec![Span::styled(
+            chips.push(vec![Span::styled(
                 if cost < 0.01 {
                     "$<.01".to_string()
                 } else {
                     format!("${cost:.2}")
                 },
-                value_style,
+                value_style.fg(if theme::uses_terminal_default_backgrounds() {
+                    theme::cost_text()
+                } else {
+                    theme::subtext1()
+                }),
             )]);
         }
         let times = [
@@ -2457,26 +2585,20 @@ fn render_inspector_facts(
         .flatten()
         .collect::<Vec<_>>();
         if !times.is_empty() {
-            parts.push(vec![
+            chips.push(vec![
                 Span::styled(format!("{} ", glyphs::WORK_TIME), glyph_style),
-                Span::styled(times.join(" · "), value_style),
+                Span::styled(
+                    times.join(" · "),
+                    value_style.fg(if theme::uses_terminal_default_backgrounds() {
+                        theme::time_text()
+                    } else {
+                        theme::subtext1()
+                    }),
+                ),
             ]);
         }
-        if !parts.is_empty() {
-            let mut spans = Vec::new();
-            for (index, part) in parts.into_iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled("   ", Style::default().bg(bg)));
-                }
-                spans.extend(part);
-            }
-            lines.push(Line::from(spans));
-        }
     }
-
-    render_inspector_context(lines, inspector, width, bg);
-
-    lines.push(Line::from(vec![
+    chips.push(vec![
         Span::styled(format!("{} ", glyphs::CREATED), glyph_style),
         Span::styled(
             runtime
@@ -2484,28 +2606,26 @@ fn render_inspector_facts(
                 .with_timezone(&chrono::Local)
                 .format("%m-%d %H:%M")
                 .to_string(),
-            dim_style,
+            Style::default().fg(theme::time_text()).bg(bg),
         ),
-        Span::styled("   ", Style::default().bg(bg)),
+    ]);
+    chips.push(vec![
         Span::styled(format!("{} ", glyphs::UPDATED), glyph_style),
-        Span::styled(format_relative_time(runtime.updated_at), dim_style),
-    ]));
-    lines.push(Line::default());
+        Span::styled(
+            format_relative_time(runtime.updated_at),
+            Style::default()
+                .fg(recency_color(runtime.updated_at))
+                .bg(bg),
+        ),
+    ]);
+    lines.extend(pack_chip_lines(chips, width, 0, bg));
 
-    push_glyph_line(
-        lines,
-        glyphs::SESSION_ID,
-        theme::subtext0(),
-        inspector.session_id.to_string(),
-        theme::subtext1(),
-        bg,
-    );
     push_glyph_line(
         lines,
         glyphs::WORKING_DIR,
         theme::subtext0(),
         glyphs::home_relative(&inspector.working_dir),
-        theme::subtext1(),
+        theme::path_text(),
         bg,
     );
     match (&inspector.sandbox_root, &inspector.sandbox_branch) {
@@ -2516,7 +2636,7 @@ fn render_inspector_facts(
                 &format!("{} {}", glyphs::SANDBOX, glyphs::BRANCH),
                 theme::subtext0(),
                 glyphs::home_relative(root),
-                theme::subtext1(),
+                theme::path_text(),
                 bg,
             );
         }
@@ -2527,7 +2647,7 @@ fn render_inspector_facts(
                     glyphs::SANDBOX,
                     theme::subtext0(),
                     glyphs::home_relative(root),
-                    theme::subtext1(),
+                    theme::path_text(),
                     bg,
                 );
             }
@@ -2537,12 +2657,67 @@ fn render_inspector_facts(
                     glyphs::BRANCH,
                     theme::subtext0(),
                     branch.clone(),
-                    theme::subtext1(),
+                    theme::mauve(),
                     bg,
                 );
             }
         }
     }
+}
+
+/// Last-update recency: live green within five minutes, the time role within
+/// the hour, then muted.
+fn recency_color(updated_at: DateTime<Utc>) -> Color {
+    let secs = Utc::now()
+        .signed_duration_since(updated_at)
+        .num_seconds()
+        .max(0);
+    if secs < 300 {
+        theme::status_running()
+    } else if secs < 3600 {
+        theme::time_text()
+    } else {
+        theme::dim_metadata()
+    }
+}
+
+/// Pack chips onto lines `width` cells wide, three cells apart, after an
+/// `indent`. A chip never splits across lines; one wider than a line gets its
+/// own line and the paragraph wraps it.
+fn pack_chip_lines(
+    chips: Vec<Vec<Span<'static>>>,
+    width: usize,
+    indent: usize,
+    bg: Color,
+) -> Vec<Line<'static>> {
+    const GAP: usize = 3;
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut on_line = 0usize;
+    for chip in chips {
+        let chip_width = chip.iter().map(Span::width).sum::<usize>();
+        if on_line > 0 && used + GAP + chip_width > width {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            on_line = 0;
+        }
+        if on_line == 0 {
+            used = indent;
+            if indent > 0 {
+                current.push(Span::styled(" ".repeat(indent), Style::default().bg(bg)));
+            }
+        } else {
+            current.push(Span::styled(" ".repeat(GAP), Style::default().bg(bg)));
+            used += GAP;
+        }
+        used += chip_width;
+        on_line += 1;
+        current.extend(chip);
+    }
+    if on_line > 0 {
+        lines.push(Line::from(current));
+    }
+    lines
 }
 
 /// `✻ claude-opus-5-5  ▮▮▮▮▮ max` — the inspector keeps the full canonical
@@ -2567,7 +2742,7 @@ fn inspector_execution_line(
                 .model
                 .clone()
                 .unwrap_or_else(|| inspector_provider_label(provider).to_string()),
-            Style::default().fg(theme::subtext1()).bg(bg),
+            Style::default().fg(theme::model_text()).bg(bg),
         ),
     ];
     if let Some((effort, bars)) = source_session.and_then(|session| {
@@ -2590,14 +2765,14 @@ fn inspector_execution_line(
         }
         spans.push(Span::styled(
             effort,
-            Style::default().fg(theme::dim_metadata()).bg(bg),
+            Style::default().fg(theme::effort_text()).bg(bg),
         ));
     }
     Some(Line::from(spans))
 }
 
-/// `◔ ▮▮▮▮▯▯▯▯▯▯ 42%  421k / 1m repository fallback` plus one dim line with
-/// the remaining provenance (source, version, freshness, …).
+/// `◔ ▮▮▮▮▯▯▯▯▯▯ 42%  421k / 1m repository fallback`, then the remaining
+/// provenance (capacity, version, freshness, …) as labelled chips.
 fn render_inspector_context(
     lines: &mut Vec<Line<'static>>,
     inspector: &SessionInspectorViewModel,
@@ -2615,15 +2790,17 @@ fn render_inspector_context(
     )];
     match context.percent {
         Some(percent) => {
+            let fill = theme::context_border_color(percent);
             spans.push(Span::styled(
                 glyphs::percent_gauge(percent, 10),
-                Style::default()
-                    .fg(theme::context_border_color(percent))
-                    .bg(bg),
+                Style::default().fg(fill).bg(bg),
             ));
             spans.push(Span::styled(
                 format!(" {:.0}%", percent.clamp(0.0, 100.0)),
-                Style::default().fg(theme::subtext1()).bg(bg),
+                Style::default()
+                    .fg(fill)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         None => spans.push(Span::styled(
@@ -2641,16 +2818,15 @@ fn render_inspector_context(
                     .strip_prefix(&format!("{:.0}% ", percent.clamp(0.0, 100.0)))
             })
             .unwrap_or(&row.value);
-        spans.push(Span::styled(
-            format!("  {value}"),
-            Style::default().fg(theme::subtext1()).bg(bg),
-        ));
+        spans.push(Span::styled("  ", Style::default().bg(bg)));
+        spans.extend(context_headline_spans(value, bg));
     }
     lines.push(Line::from(spans));
 
-    // One provenance row per line: joining them would let provider capacity
-    // (`default · max · factor`) read as part of the active budget.
-    for row in rows
+    // Each provenance row is one labelled chip that never splits across
+    // lines, so provider capacity (`default · max · factor`) cannot read as
+    // part of the active budget above it.
+    let chips = rows
         .iter()
         .filter(|row| row.label != "context")
         // The headline already names the active budget's source.
@@ -2658,16 +2834,63 @@ fn render_inspector_context(
             !(row.label == "source"
                 && headline.is_some_and(|head| head.value.ends_with(&row.value)))
         })
-    {
-        for line in wrap_plain(
-            &format!("{}: {}", row.label, row.value),
-            width.saturating_sub(2).max(1),
-        ) {
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(theme::dim_metadata()).bg(bg),
-            )));
-        }
+        .map(|row| {
+            vec![
+                Span::styled(
+                    format!("{}: ", row.label),
+                    Style::default().fg(theme::dim_metadata()).bg(bg),
+                ),
+                Span::styled(
+                    row.value.clone(),
+                    Style::default()
+                        .fg(provenance_value_color(row.label, &row.value))
+                        .bg(bg),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.extend(pack_chip_lines(chips, width, 2, bg));
+}
+
+/// `421k / 1m repository fallback`: token counts in the count role, the
+/// active budget's source label muted.
+fn context_headline_spans(value: &str, bg: Color) -> Vec<Span<'static>> {
+    let muted = Style::default().fg(theme::dim_metadata()).bg(bg);
+    let counts = Style::default()
+        .fg(if theme::uses_terminal_default_backgrounds() {
+            theme::count_text()
+        } else {
+            theme::subtext1()
+        })
+        .bg(bg);
+    let Some((usage, rest)) = value.split_once(" / ") else {
+        return vec![Span::styled(value.to_string(), muted)];
+    };
+    let (active, label) = rest.split_once(' ').unwrap_or((rest, ""));
+    let mut spans = vec![
+        Span::styled(usage.to_string(), counts),
+        Span::styled(" / ", muted),
+        Span::styled(active.to_string(), counts),
+    ];
+    if !label.is_empty() {
+        spans.push(Span::styled(format!(" {label}"), muted));
+    }
+    spans
+}
+
+/// Freshness carries its evidence quality in color; capacity rows use the
+/// count role; the rest stay neutral.
+fn provenance_value_color(label: &str, value: &str) -> Color {
+    match label {
+        "freshness" => match value.split_whitespace().next().unwrap_or_default() {
+            "fresh" => theme::status_completed(),
+            "verified" => theme::teal(),
+            "cold" => theme::sky(),
+            "degraded" => theme::peach(),
+            _ => theme::status_failed(),
+        },
+        "provider" | "API" | "compaction" => theme::count_text(),
+        _ => theme::subtext0(),
     }
 }
 
@@ -2941,6 +3164,7 @@ fn render_session_activity(
     frame: &mut Frame,
     area: Rect,
     activity: Option<&SessionActivityViewModel>,
+    resources: Option<&crate::daemon_resources::DaemonResourceView>,
     selected_id: Option<uuid::Uuid>,
     bg: Color,
 ) {
@@ -3024,7 +3248,10 @@ fn render_session_activity(
             .fg(theme::browser_decorative_separator())
             .bg(bg),
     )));
-    lines.extend(legend_lines(width, bg));
+    lines.push(Line::default());
+    lines.extend(running_lines(&activity.running, width, bg));
+    lines.push(Line::default());
+    lines.extend(daemon_resource_lines(resources, width, bg));
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().bg(bg))
@@ -3047,6 +3274,279 @@ fn activity_section_label(glyph: &str, color: Color, name: &str, bg: Color) -> L
             Style::default().fg(theme::subtext0()).bg(bg),
         ),
     ])
+}
+
+/// `left` and a right-aligned `right` on one line when both fit two cells
+/// apart; otherwise `right` drops to its own indented line.
+fn spread_lines(
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+    bg: Color,
+) -> Vec<Line<'static>> {
+    let left_width = left.iter().map(Span::width).sum::<usize>();
+    let right_width = right.iter().map(Span::width).sum::<usize>();
+    if right_width == 0 {
+        return vec![Line::from(left)];
+    }
+    if left_width + 2 + right_width <= width {
+        let mut spans = left;
+        spans.push(Span::styled(
+            " ".repeat(width - left_width - right_width),
+            Style::default().bg(bg),
+        ));
+        spans.extend(right);
+        return vec![Line::from(spans)];
+    }
+    let mut indented = vec![Span::styled("     ", Style::default().bg(bg))];
+    indented.extend(right);
+    vec![Line::from(left), Line::from(indented)]
+}
+
+/// `✻ claude  3   opus-5-5 ×2  sonnet-5`: fleet-wide live sessions by
+/// provider, each provider's models beside it (wrapping under the first).
+fn running_lines(
+    running: &[crate::types::RunningProviderSummary],
+    width: usize,
+    bg: Color,
+) -> Vec<Line<'static>> {
+    let total = running.iter().map(|summary| summary.count).sum::<usize>();
+    let mut lines = spread_lines(
+        activity_section_label("●", theme::status_running(), "RUNNING", bg).spans,
+        vec![Span::styled(
+            total.to_string(),
+            Style::default()
+                .fg(theme::status_running())
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )],
+        width,
+        bg,
+    );
+    if running.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no live sessions",
+            Style::default().fg(theme::dim_metadata()).bg(bg),
+        )));
+        return lines;
+    }
+    let word_cells = running
+        .iter()
+        .map(|summary| provider_legend_word(summary.provider).len())
+        .max()
+        .unwrap_or(0);
+    let count_cells = running
+        .iter()
+        .map(|summary| summary.count.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let prefix = 2 + word_cells + 2 + count_cells + 3;
+    for summary in running {
+        let color = glyphs::provider_color(summary.provider);
+        let mut spans = vec![
+            Span::styled(
+                format!("{} ", glyphs::provider_glyph(summary.provider)),
+                Style::default()
+                    .fg(color)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<word_cells$}  ", provider_legend_word(summary.provider)),
+                Style::default().fg(color).bg(bg),
+            ),
+            Span::styled(
+                format!("{:>count_cells$}", summary.count),
+                Style::default()
+                    .fg(theme::text())
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ", Style::default().bg(bg)),
+        ];
+        let mut used = prefix;
+        let mut on_line = 0usize;
+        for (model, count) in &summary.models {
+            let label = model
+                .as_deref()
+                .map_or("default", glyphs::list_model_label)
+                .to_string();
+            let suffix = if *count > 1 {
+                format!(" ×{count}")
+            } else {
+                String::new()
+            };
+            let chip_cells =
+                navigator_layout::display_width(&label) + navigator_layout::display_width(&suffix);
+            if on_line > 0 && used + 2 + chip_cells > width {
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                spans.push(Span::styled(" ".repeat(prefix), Style::default().bg(bg)));
+                used = prefix;
+                on_line = 0;
+            }
+            if on_line > 0 {
+                spans.push(Span::styled("  ", Style::default().bg(bg)));
+                used += 2;
+            }
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(theme::model_text()).bg(bg),
+            ));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(
+                    suffix,
+                    Style::default().fg(theme::count_text()).bg(bg),
+                ));
+            }
+            used += chip_cells;
+            on_line += 1;
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// rsid's own footprint: CPU over the last Health refresh, memory, threads
+/// and descriptors, its background queue, and the store's write path.
+fn daemon_resource_lines(
+    resources: Option<&crate::daemon_resources::DaemonResourceView>,
+    width: usize,
+    bg: Color,
+) -> Vec<Line<'static>> {
+    use crate::daemon_resources::{format_bytes, format_uptime};
+    let label = activity_section_label("≡", theme::sapphire(), "RSID", bg).spans;
+    let dim = Style::default().fg(theme::dim_metadata()).bg(bg);
+    let Some(view) = resources else {
+        let mut lines = vec![Line::from(label)];
+        lines.push(Line::from(Span::styled("waiting for daemon health", dim)));
+        return lines;
+    };
+    let sample = &view.sample;
+    let colored =
+        |text: String, color: Color| Span::styled(text, Style::default().fg(color).bg(bg));
+
+    let uptime = sample
+        .uptime_secs
+        .map(|secs| {
+            vec![
+                Span::styled("up ", dim),
+                colored(format_uptime(secs), theme::time_text()),
+            ]
+        })
+        .unwrap_or_default();
+    let mut lines = spread_lines(label, uptime, width, bg);
+
+    let mut cpu = vec![Span::styled("cpu   ", dim)];
+    if let Some(percent) = view.cpu_percent {
+        let fill = theme::context_border_color(percent.min(100.0));
+        cpu.push(colored(glyphs::percent_gauge(percent.min(100.0), 10), fill));
+        cpu.push(Span::styled(
+            format!(" {percent:.1}%"),
+            Style::default()
+                .fg(fill)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        cpu.push(Span::styled("sampling…", dim));
+    }
+    let threads = sample
+        .proc_counters
+        .map(|counters| {
+            vec![
+                colored(counters.threads.to_string(), theme::count_text()),
+                Span::styled(" thr", dim),
+            ]
+        })
+        .unwrap_or_default();
+    lines.extend(spread_lines(cpu, threads, width, bg));
+
+    let mut memory = vec![Span::styled("mem   ", dim)];
+    match sample.rss_bytes {
+        Some(rss) => {
+            memory.push(colored(format_bytes(rss), theme::peach()));
+            memory.push(Span::styled(" rss", dim));
+            if let Some(heap) = sample.heap_in_use_bytes {
+                memory.push(Span::styled(" · ", dim));
+                memory.push(colored(format_bytes(heap), theme::peach()));
+                memory.push(Span::styled(" heap", dim));
+            }
+        }
+        None => memory.push(Span::styled("unreported", dim)),
+    }
+    let fds = sample
+        .open_fds
+        .map(|fds| {
+            vec![
+                colored(fds.to_string(), theme::count_text()),
+                Span::styled(" fd", dim),
+            ]
+        })
+        .unwrap_or_default();
+    lines.extend(spread_lines(memory, fds, width, bg));
+
+    let count_color = |count: i64, active: Color| {
+        if count > 0 {
+            active
+        } else {
+            theme::dim_metadata()
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("queue ", dim),
+        colored(
+            sample.queue_pending.to_string(),
+            count_color(sample.queue_pending, theme::status_waiting()),
+        ),
+        Span::styled(" wait · ", dim),
+        colored(
+            sample.queue_claimed.to_string(),
+            count_color(sample.queue_claimed, theme::status_running()),
+        ),
+        Span::styled(" run · ", dim),
+        colored(
+            sample.queue_failed.to_string(),
+            count_color(sample.queue_failed, theme::status_failed()),
+        ),
+        Span::styled(" fail", dim),
+    ]));
+
+    let backlog = sample.persistence_queue_depth;
+    lines.push(Line::from(vec![
+        Span::styled("store ", dim),
+        colored(
+            format!("{}ms", sample.last_command_duration_ms),
+            theme::time_text(),
+        ),
+        Span::styled(" write · ", dim),
+        colored(
+            format!("{backlog}/{}", sample.persistence_queue_capacity),
+            if backlog > 0 {
+                theme::status_waiting()
+            } else {
+                theme::count_text()
+            },
+        ),
+        Span::styled(" queued", dim),
+    ]));
+    lines
+}
+
+/// Lowercase provider word shared by the symbol key and the RUNNING section.
+const fn provider_legend_word(provider: rsi_common::types::SessionProvider) -> &'static str {
+    use rsi_common::types::SessionProvider;
+    match provider {
+        SessionProvider::Claude => "claude",
+        SessionProvider::Codex => "codex",
+        SessionProvider::CodexAppServer => "codex as",
+        SessionProvider::OpenRouter => "openrouter",
+        SessionProvider::Bedrock => "bedrock",
+        SessionProvider::Local => "local",
+        SessionProvider::Antigravity => "antigravity",
+        SessionProvider::Pioneer => "pioneer",
+        SessionProvider::Harness => "harness",
+        _ => "other",
+    }
 }
 
 /// FLOW segments: needs you, in flight, recent, quiet. Each segment has its
@@ -3142,8 +3642,8 @@ fn flow_counts_line(flow: &crate::types::SessionFlowSummary, bg: Color) -> Line<
     Line::from(spans)
 }
 
-/// Dim symbol key packed into the activity pane's spare rows: lifecycle,
-/// attention, provider, then role families.
+/// Dim symbol key for the navigator footer, under the list it explains:
+/// lifecycle, attention, provider, then role families.
 fn legend_lines(width: usize, bg: Color) -> Vec<Line<'static>> {
     use rsi_common::types::SessionProvider;
     let lifecycle = [
@@ -3173,20 +3673,20 @@ fn legend_lines(width: usize, bg: Color) -> Vec<Line<'static>> {
     ]
     .map(|(glyph, color, word)| (glyph.to_string(), color, word));
     let providers = [
-        (SessionProvider::Claude, "claude"),
-        (SessionProvider::Codex, "codex"),
-        (SessionProvider::CodexAppServer, "codex as"),
-        (SessionProvider::OpenRouter, "openrouter"),
-        (SessionProvider::Local, "local"),
-        (SessionProvider::Antigravity, "antigravity"),
-        (SessionProvider::Pioneer, "pioneer"),
-        (SessionProvider::Harness, "harness"),
+        SessionProvider::Claude,
+        SessionProvider::Codex,
+        SessionProvider::CodexAppServer,
+        SessionProvider::OpenRouter,
+        SessionProvider::Local,
+        SessionProvider::Antigravity,
+        SessionProvider::Pioneer,
+        SessionProvider::Harness,
     ]
-    .map(|(provider, word)| {
+    .map(|provider| {
         (
             glyphs::provider_glyph(provider).to_string(),
             glyphs::provider_color(provider),
-            word,
+            provider_legend_word(provider),
         )
     });
     let roles = [
@@ -3289,7 +3789,7 @@ fn activity_item_line(
             AGE_CELLS,
             navigator_layout::Alignment::Right,
         ),
-        Style::default().fg(theme::dim_metadata()).bg(bg),
+        Style::default().fg(theme::time_text()).bg(bg),
     ));
     Line::from(spans)
 }
@@ -3430,6 +3930,7 @@ pub fn render_session_list(
         app.refresh_session_activity();
     }
     let activity = app.session_list_render.activity.clone();
+    let daemon_resources = app.daemon_resources.clone();
 
     if let Some(signal_area) = browser_layout.selected_signal {
         render_selected_signal(frame, signal_area, inspector.as_ref(), bg);
@@ -3543,7 +4044,14 @@ pub fn render_session_list(
         );
     }
     if let Some(activity_area) = browser_layout.activity {
-        render_session_activity(frame, activity_area, activity.as_ref(), selected_id, bg);
+        render_session_activity(
+            frame,
+            activity_area,
+            activity.as_ref(),
+            daemon_resources.as_ref(),
+            selected_id,
+            bg,
+        );
     }
 }
 
@@ -3593,6 +4101,7 @@ fn render_zone_table(
             operational_ordinal_width,
             settings.navigator_preset,
             settings.navigator_optional_columns.as_deref(),
+            &settings.navigator_column_order_for(settings.navigator_preset),
         );
     }
 
@@ -3654,7 +4163,7 @@ fn render_zone_table(
             area,
             order.len(),
             zone_render,
-            body_area.height as usize,
+            body_area,
             presentation,
             bg,
         );
@@ -3667,13 +4176,14 @@ fn render_operational_summary(
     area: Rect,
     order_len: usize,
     zone: &crate::types::ZoneRenderState,
-    viewport_h: usize,
+    body_area: Rect,
     presentation: SessionListPresentation,
     bg: Color,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let viewport_h = body_area.height as usize;
     let (first, last) = visible_session_range(zone, viewport_h, order_len);
     let visible = if first == 0 { 0 } else { last - first + 1 };
     let below = order_len.saturating_sub(last);
@@ -3693,7 +4203,35 @@ fn render_operational_summary(
     if area.height < 7 {
         return;
     }
-    let rule_y = area.y.saturating_add(area.height.saturating_sub(5));
+    // Footer, bottom up: two margin rows, then (when the rows below the list
+    // body allow) the symbol key and a blank, the count line, a blank, the
+    // rule. The key explains the list's glyphs right under the list.
+    let inner_width = area.width.saturating_sub(4);
+    let legend = legend_lines(inner_width as usize, bg);
+    let legend_rows = u16::try_from(legend.len()).unwrap_or(u16::MAX);
+    let body_bottom = body_area.y.saturating_add(body_area.height);
+    let legend_rule_y = area
+        .y
+        .saturating_add(area.height)
+        .checked_sub(5u16.saturating_add(legend_rows).saturating_add(1));
+    let (rule_y, legend) = match legend_rule_y {
+        Some(rule_y) if !legend.is_empty() && rule_y >= body_bottom => (rule_y, legend),
+        _ => (
+            area.y.saturating_add(area.height.saturating_sub(5)),
+            Vec::new(),
+        ),
+    };
+    if !legend.is_empty() {
+        frame.render_widget(
+            Paragraph::new(legend).style(Style::default().bg(bg)),
+            Rect::new(
+                area.x.saturating_add(2),
+                rule_y.saturating_add(4),
+                inner_width,
+                legend_rows,
+            ),
+        );
+    }
     frame.render_widget(
         Paragraph::new("─".repeat(area.width.saturating_sub(4) as usize)).style(
             Style::default()
@@ -3781,6 +4319,24 @@ fn detail_header_metadata(app: &App, state: &SessionState) -> Line<'static> {
     ];
     if let Some(meta) = status::render_session_meta_segment_for(app, state.session.id) {
         spans.extend(meta);
+    }
+    let queued = app
+        .operator_messages
+        .get(&state.session.id)
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|message| message.is_pending())
+                .count()
+        });
+    if queued > 0 {
+        spans.push(Span::styled(
+            format!(
+                "  ·  {queued} pending message{}",
+                if queued == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(theme::overlay1()),
+        ));
     }
     if let Some(context) = status::render_context_percent_segment_for(app, state.session.id) {
         spans.push(Span::styled(
@@ -5343,19 +5899,7 @@ pub fn render_input_bar(
 
     let is_insert = focused && state.input_bar.surface.mode == PopupMode::Insert;
 
-    // T5/Decision 4: adopt the same AccentFocusOnly-vs-FullBorders policy the
-    // pane frame already uses (`theme::pane_block`), instead of an
-    // unconditionally-colored border regardless of theme/focus.
-    let border_color = match theme::active_border_policy() {
-        theme::BorderPolicy::FullBorders => theme::session_detail_border(),
-        theme::BorderPolicy::AccentFocusOnly => {
-            if focused {
-                theme::focused_border()
-            } else {
-                theme::tier_panel()
-            }
-        }
-    };
+    let border_color = theme::input_bar_border(focused);
     let border_style = if is_insert {
         Style::default()
             .fg(border_color)
@@ -5998,6 +6542,9 @@ pub const fn activity_indicator_height(style: ActivityIndicatorStyle) -> u16 {
         ActivityIndicatorStyle::Semantic => 1,
         ActivityIndicatorStyle::RainbowClassic => LOADING_CONTAINER_HEIGHT,
         ActivityIndicatorStyle::RainbowCompact => COMPACT_RAINBOW_HEIGHT,
+        ActivityIndicatorStyle::RainbowClassicCompact
+        | ActivityIndicatorStyle::SonicSpeedUp
+        | ActivityIndicatorStyle::RainbowStarlight => COMPACT_RAINBOW_HEIGHT,
     }
 }
 
@@ -6012,6 +6559,9 @@ pub fn render_activity_indicator(
         ActivityIndicatorStyle::Semantic => render_semantic_activity_indicator(frame, area, state),
         ActivityIndicatorStyle::RainbowClassic => render_loading_container(frame, area),
         ActivityIndicatorStyle::RainbowCompact => render_compact_rainbow_container(frame, area),
+        ActivityIndicatorStyle::RainbowClassicCompact => render_loading_strip(frame, area),
+        ActivityIndicatorStyle::SonicSpeedUp => render_sonic_speed_up(frame, area),
+        ActivityIndicatorStyle::RainbowStarlight => render_rainbow_starlight(frame, area),
     }
 }
 
@@ -6080,6 +6630,52 @@ fn render_compact_rainbow_container(frame: &mut Frame, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_sonic_speed_up(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let palette = theme::rainbow_palette();
+    let tick = (chrono::Utc::now().timestamp_millis() / 24) as usize;
+    let spans = (0..area.width as usize)
+        .map(|column| {
+            let phase = (column * 3 + tick) % 16;
+            let (symbol, color_offset) = match phase {
+                0..=2 => ('>', 0),
+                3..=6 => ('=', 1),
+                7..=11 => ('-', 2),
+                _ => ('.', 3),
+            };
+            let color = palette[(column + tick / 4 + color_offset) % palette.len()];
+            Span::styled(symbol.to_string(), Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_rainbow_starlight(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let palette = theme::rainbow_palette();
+    let tick = (chrono::Utc::now().timestamp_millis() / 90) as usize;
+    let spans = (0..area.width as usize)
+        .map(|column| {
+            let sparkle = (column * 7 + tick * 3) % 19;
+            let symbol = match sparkle {
+                0 => '*',
+                1..=3 => '+',
+                4..=8 => ':',
+                _ => '.',
+            };
+            let color = palette[(column + tick / 2 + sparkle % 3) % palette.len()];
+            Span::styled(symbol.to_string(), Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -6212,6 +6808,108 @@ mod tests {
             Color::Rgb(0, 0, 255),
         );
         assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn truly_transparent_browser_metadata_keeps_colors_and_terminal_background() {
+        use crate::app::app_test_helpers::{baseline_session, with_session_list};
+        use rsi_common::types::{SessionKind, SessionProvider};
+        let _guard = theme::pin_theme_state();
+        let mut app = with_session_list(1);
+        theme::set_theme_by_name("truly-transparent");
+        theme::clear_theme_role_overrides();
+        let id = app.filtered_session_order[0];
+        let mut session = baseline_session(id, SessionKind::Task);
+        session.provider = SessionProvider::Codex;
+        session.model = Some("gpt-6-astra".into());
+        session.effort = Some("high".into());
+        session.num_turns = Some(17);
+        session.cost_usd = Some(1.23);
+        session.work_time_ms = Some(3_720_000);
+        session.working_dir = "/tmp/color-probe".into();
+        app.sessions.insert(id, SessionState::new(session.clone()));
+        let row = crate::types::row::compute_session_row(&app, id, &app.settings);
+        for selected in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_navigator_row(
+                        frame,
+                        frame.area(),
+                        &row,
+                        Some(&session),
+                        &app.settings,
+                        2,
+                        selected,
+                        false,
+                        true,
+                        theme::accent(),
+                        theme::glass_panel_bg(),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (label, color) in [
+                ("6-astra", Color::LightMagenta),
+                (
+                    glyphs::provider_glyph(SessionProvider::Codex),
+                    Color::LightGreen,
+                ),
+            ] {
+                let (x, y) = buffer_text_position(buffer, label).unwrap();
+                assert_eq!(buffer[(x, y)].fg, color, "{label}");
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    if selected {
+                        theme::selected_row_bg()
+                    } else {
+                        Color::Reset
+                    }
+                );
+            }
+            let layout = navigator_layout::resolve_ordered(
+                120,
+                2,
+                app.settings.navigator_preset,
+                app.settings.navigator_optional_columns.as_deref(),
+                &app.settings
+                    .navigator_column_order_for(app.settings.navigator_preset),
+            );
+            let age = layout
+                .columns
+                .iter()
+                .find(|c| c.column == navigator_layout::NavigatorColumn::Age)
+                .unwrap();
+            assert_eq!(buffer[(age.start as u16, 0)].fg, Color::LightCyan);
+        }
+        let inspector = crate::types::compute_session_inspector(&app, id, 1).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_inspector(
+                    frame,
+                    frame.area(),
+                    Some(&inspector),
+                    Some(&session),
+                    theme::glass_panel_bg(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let turns = format!("{} 17", glyphs::TURNS);
+        for (label, offset, color) in [
+            ("gpt-6-astra", 0, Color::LightMagenta),
+            ("high", 0, Color::LightYellow),
+            ("1h2m work", 0, Color::LightCyan),
+            (turns.as_str(), 2, Color::LightBlue),
+            ("$1.23", 0, Color::LightGreen),
+            ("/tmp/color-probe", 0, Color::LightCyan),
+        ] {
+            let (x, y) = buffer_text_position(buffer, label)
+                .unwrap_or_else(|| panic!("missing {label}: {}", buffer_text(buffer)));
+            assert_eq!(buffer[(x + offset, y)].fg, color, "{label}");
+            assert_eq!(buffer[(x + offset, y)].bg, Color::Reset, "{label}");
+        }
     }
 
     #[test]
@@ -6365,8 +7063,12 @@ mod tests {
             for (width, title, count, override_counts) in [
                 (20, "Group", "1A", None),
                 (120, "Group Alpha", "0 epics · 1 agent", None),
+                // The Group kind mark takes two FUNCTION cells (ec89e1781) and
+                // counts degrade before the title. FUNCTION stays 12 cells wide
+                // up to a 38-column row, so the compact "140A" first fits beside
+                // the six-cell title minimum at 40 columns (#1026).
                 (
-                    20,
+                    40,
                     "Group",
                     "140A",
                     Some(crate::types::row::ContainerCounts {
@@ -7021,6 +7723,7 @@ mod tests {
                     2,
                     settings.navigator_preset,
                     None,
+                    &navigator_layout::OPTIONAL_ORDER,
                 );
                 render_navigator_row(
                     frame,
@@ -7089,14 +7792,20 @@ mod tests {
     }
 
     #[test]
-    fn t12_selected_inspector_renders_known_uuid_cwd_sandbox_root_and_branch() {
+    fn t12_selected_inspector_places_model_in_header_and_location_facts_before_session_summary() {
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
-        use rsi_common::types::{SandboxKind, SessionKind};
+        use rsi_common::types::{SandboxKind, SessionKind, SessionProvider};
 
         let mut app = with_session_list(1);
         let session_id = app.filtered_session_order[0];
         let mut session = baseline_session(session_id, SessionKind::Task);
+        session.provider = SessionProvider::Codex;
+        session.model = Some("gpt-6-sol".to_string());
+        session.effort = Some("high".to_string());
+        session.work_time_ms = Some(193_000);
+        session.context_fill_pct = Some(42.0);
+        session.short_summary = Some("Known session summary".to_string());
         session.working_dir = std::path::PathBuf::from("/known/cwd");
         session.sandbox_kind = Some(SandboxKind::GitWorktree);
         session.sandbox_root = Some(std::path::PathBuf::from("/known/sandbox/root"));
@@ -7124,17 +7833,43 @@ mod tests {
             })
             .expect("render inspector");
         let text = buffer_text(terminal.backend().buffer());
+        let short_id = format!("# {}", short_display_id(session_id));
         for expected in [
-            session_id.to_string(),
+            short_id.clone(),
+            "gpt-6-sol".to_string(),
+            "high".to_string(),
+            "3m work".to_string(),
+            "42%".to_string(),
             "/known/cwd".to_string(),
             "/known/sandbox/root".to_string(),
             "feature/known-branch".to_string(),
+            "Known session summary".to_string(),
         ] {
             assert!(
                 text.contains(&expected),
                 "inspector missing {expected:?}: {text}"
             );
         }
+        let buffer = terminal.backend().buffer();
+        let facts = [
+            short_id,
+            "gpt-6-sol".to_string(),
+            "42%".to_string(),
+            "3m work".to_string(),
+            "/known/cwd".to_string(),
+            "/known/sandbox/root".to_string(),
+            "feature/known-branch".to_string(),
+            "Known session summary".to_string(),
+        ];
+        let rows = facts.map(|value| {
+            buffer_text_position(buffer, &value)
+                .unwrap_or_else(|| panic!("inspector missing {value:?}: {text}"))
+                .1
+        });
+        assert!(
+            rows.windows(2).all(|pair| pair[0] < pair[1]),
+            "header ID, model, context, runtime, paths, then session summary: {text}"
+        );
     }
 
     #[test]
@@ -8136,6 +8871,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -8364,6 +9100,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -8511,6 +9248,7 @@ mod tests {
                 context_window: None,
                 resolved_context_budget: None,
                 total_input_tokens: None,
+                total_prompt_tokens: None,
                 total_output_tokens: None,
                 total_cache_creation_tokens: None,
                 total_cache_read_tokens: None,
@@ -8765,6 +9503,62 @@ mod tests {
             activity_indicator_height(ActivityIndicatorStyle::RainbowCompact),
             COMPACT_RAINBOW_HEIGHT
         );
+        for style in [
+            ActivityIndicatorStyle::RainbowClassicCompact,
+            ActivityIndicatorStyle::SonicSpeedUp,
+            ActivityIndicatorStyle::RainbowStarlight,
+        ] {
+            assert_eq!(activity_indicator_height(style), COMPACT_RAINBOW_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn new_rainbow_indicators_fill_one_row_with_theme_palette() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        use crate::app::app_test_helpers;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (app, session_id) = app_test_helpers::with_session_detail();
+        let state = app.sessions.get(&session_id).expect("fixture state");
+        let width = 40;
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, COMPACT_RAINBOW_HEIGHT)).expect("test terminal");
+
+        for style in [
+            ActivityIndicatorStyle::RainbowClassicCompact,
+            ActivityIndicatorStyle::SonicSpeedUp,
+            ActivityIndicatorStyle::RainbowStarlight,
+        ] {
+            terminal
+                .draw(|frame| {
+                    render_activity_indicator(
+                        frame,
+                        Rect::new(0, 0, width, COMPACT_RAINBOW_HEIGHT),
+                        state,
+                        style,
+                    );
+                })
+                .expect("rainbow indicator render");
+
+            let buffer = terminal.backend().buffer();
+            for x in 0..width {
+                let cell = &buffer[(x, 0)];
+                assert!(
+                    theme::rainbow_palette().contains(&cell.fg),
+                    "{style:?} cell ({x},0) should use the theme rainbow palette"
+                );
+                let symbol = cell.symbol();
+                let valid_symbol = match style {
+                    ActivityIndicatorStyle::RainbowClassicCompact => symbol == "▀",
+                    ActivityIndicatorStyle::SonicSpeedUp => matches!(symbol, ">" | "=" | "-" | "."),
+                    ActivityIndicatorStyle::RainbowStarlight => {
+                        matches!(symbol, "*" | "+" | ":" | ".")
+                    }
+                    _ => false,
+                };
+                assert!(valid_symbol, "unexpected {style:?} symbol {symbol:?}");
+            }
+        }
     }
 
     #[test]
@@ -9374,7 +10168,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_inspector_places_model_under_title_and_renders_aligned_context_gauge() {
+    fn selected_inspector_places_model_above_title_and_renders_aligned_context_gauge() {
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::{SessionKind, SessionProvider};
@@ -9406,15 +10200,23 @@ mod tests {
             .expect("selected inspector render");
         let buffer = terminal.backend().buffer();
         let text = buffer_text(buffer);
+        let (_, header_y) = buffer_text_position(buffer, "running").expect(&text);
         let (_, title_y) = buffer_text_position(buffer, "Inspector layout probe").expect(&text);
         let (_, model_y) = buffer_text_position(buffer, "gpt-6-luna").expect(&text);
+        let (_, gauge_y) = buffer_text_position(buffer, "▮▮▮▮▯▯▯▯▯▯ 40%").expect(&text);
         let (_, summary_y) = buffer_text_position(buffer, "Visible task summary").expect(&text);
-        assert_eq!(model_y, title_y + 1, "model follows title: {text}");
-        assert!(summary_y > model_y, "summary follows model: {text}");
-        assert!(
-            text.contains("▮▮▮▮▯▯▯▯▯▯ 40%"),
-            "aligned context gauge: {text}"
+        assert_eq!(model_y, header_y + 1, "model sits under the header: {text}");
+        assert_eq!(
+            gauge_y,
+            model_y + 1,
+            "context gauge follows the model: {text}"
         );
+        assert_eq!(
+            title_y,
+            gauge_y + 2,
+            "the rule closes the model block and the title follows it: {text}"
+        );
+        assert!(summary_y > title_y, "summary follows the title: {text}");
     }
 
     #[test]
@@ -9669,9 +10471,19 @@ mod tests {
         let tether = layout.tether.expect("240-wide tether");
         let activity = layout.activity.expect("240-wide activity");
         let inspector_inner_x = inspector.x + 3;
-        let inspector_header_y = inspector.y + 1;
+        let inspector_rule_y = (inspector.y..inspector.y + inspector.height)
+            .find(|y| buffer[(inspector_inner_x, *y)].symbol() == "─")
+            .expect("inspector header rule");
         let navigator_rule_x = layout.navigator.x + 2;
-        let navigator_rule_y = layout.navigator.y + layout.navigator.height.saturating_sub(5);
+        // The symbol key and a blank row sit between the count line and the
+        // bottom margin, so the rule sits that much higher.
+        let legend_rows = legend_lines(
+            layout.navigator.width.saturating_sub(4) as usize,
+            theme::glass_panel_bg(),
+        )
+        .len() as u16;
+        let navigator_rule_y =
+            layout.navigator.y + layout.navigator.height.saturating_sub(5 + legend_rows + 1);
         let selected_row_y = app
             .session_list_render
             .cards_area
@@ -9695,9 +10507,14 @@ mod tests {
             "the navigator bottom rule must use muted decorative chrome"
         );
         assert_eq!(
-            buffer[(inspector_inner_x, inspector_header_y + 1)].fg,
+            buffer[(inspector_inner_x, inspector_rule_y)].fg,
             theme::browser_decorative_separator(),
             "the inspector header rule must use muted decorative chrome"
+        );
+        assert_eq!(
+            buffer[(navigator_rule_x, navigator_rule_y)].symbol(),
+            "─",
+            "the navigator bottom rule sits above the count line and symbol key"
         );
         assert_eq!(
             buffer[(activity.x, activity.y)].fg,

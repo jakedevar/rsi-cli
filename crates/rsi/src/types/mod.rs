@@ -38,8 +38,8 @@ pub use row::{
     compute_session_row,
 };
 pub use session_activity::{
-    OPERATOR_QUEUE_CACHE_LIMIT, RECENT_CHANGES_CACHE_LIMIT, SessionActivityItem,
-    SessionActivityViewModel, SessionFlowSummary, compute_session_activity,
+    OPERATOR_QUEUE_CACHE_LIMIT, RECENT_CHANGES_CACHE_LIMIT, RunningProviderSummary,
+    SessionActivityItem, SessionActivityViewModel, SessionFlowSummary, compute_session_activity,
 };
 pub use session_display::{
     RoleTitle, SessionDisplayIdentity, resolve_session_display_identity, split_role_title,
@@ -202,6 +202,9 @@ pub struct SettingsState {
     pub query_active: bool,
     /// Armed clear of one provider credential slot.
     pub provider_key_clear_confirmation: Option<ProviderKeyClearConfirmation>,
+    /// Panel geometry of the last rendered frame; the resize keys (`<` /
+    /// `>`) step from what the operator actually sees.
+    pub rendered_layout: SettingsRenderedLayout,
 }
 
 impl Default for SettingsState {
@@ -215,8 +218,22 @@ impl Default for SettingsState {
             query: String::new(),
             query_active: false,
             provider_key_clear_confirmation: None,
+            rendered_layout: SettingsRenderedLayout::default(),
         }
     }
+}
+
+/// Resizable Settings panel widths as last rendered (runtime only).
+///
+/// `rail_width == 0` means the pane was too narrow for side-by-side panels,
+/// so nothing is resizable. `info_width` is `Some` only while the info card
+/// sits beside the settings list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettingsRenderedLayout {
+    pub rail_width: u16,
+    pub rail_max: u16,
+    pub info_width: Option<u16>,
+    pub info_max: u16,
 }
 
 /// Armed clear-credential confirmation (Settings -> Provider Keys, `d`).
@@ -327,7 +344,7 @@ impl CardField {
 
 /// Width policy for the session navigator's optional columns. Required columns
 /// are deliberately not represented here and therefore cannot be disabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum NavigatorPreset {
     #[default]
     Dense,
@@ -336,6 +353,8 @@ pub enum NavigatorPreset {
 }
 
 impl NavigatorPreset {
+    pub const ALL: [Self; 3] = [Self::Dense, Self::Operations, Self::Cost];
+
     pub const fn next(self) -> Self {
         match self {
             Self::Dense => Self::Operations,
@@ -1347,6 +1366,43 @@ pub enum PromptPurpose {
     },
 }
 
+/// Launch-only choices made on the settings side ("back") of a new-session
+/// prompt. The prompt text lives on the front; `Ctrl+O` (or `Tab` in normal
+/// mode) flips between the two. Nothing here outlives the prompt: a reopened
+/// prompt starts on its front with no manager appointment planned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptLaunchSettings {
+    /// The prompt is flipped to its settings side.
+    pub open: bool,
+    /// Selected row on the settings side.
+    pub selected: usize,
+    /// Appoint the launched session as its project's manager.
+    pub manager: Option<ManagerLaunchPlan>,
+}
+
+/// Operator choice to appoint a new session as its project's manager once
+/// the daemon accepts the launch: the appointment scope plus the policy
+/// preset granted to it (`ConfigureHarnessManager` then
+/// `ConfigureHarnessManagerPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagerLaunchPlan {
+    /// Project the manager is appointed for (the launch's project).
+    pub project_id: uuid::Uuid,
+    pub scope: ManagerLaunchScope,
+    pub preset: rsi_common::harness_manager_presets::ManagerPolicyPreset,
+}
+
+/// What an appointed-at-launch manager supervises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerLaunchScope {
+    /// The whole project, including future Epics.
+    Project,
+    /// One Group and every Epic it holds.
+    Group(uuid::Uuid),
+    /// One Epic.
+    Epic(uuid::Uuid),
+}
+
 /// One tag chip in the unified entity-creation modal's tag row.
 /// `Pending` is the live input buffer; `Committed` is post-`normalize_tag`;
 /// `Invalid` carries the normalization error for inline display.
@@ -1575,6 +1631,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -2330,11 +2387,122 @@ pub struct SourceWorktreeSettlementOverlayState {
     pub last_error: Option<String>,
 }
 
+/// Operator satellite browser. Remote session rows remain display-only and
+/// never enter the local session action path.
+pub struct SatelliteRegistryOverlayState {
+    pub registry: rsi_common::satellite::SatelliteRegistryV1,
+    pub selected_peer: usize,
+    pub selected_link: usize,
+    pub selected_session: usize,
+    pub tab: SatelliteRegistryTab,
+    pub sessions: Option<rsi_common::satellite::SatelliteHubSessionsPageV1>,
+    pub form: Option<SatelliteRegistryForm>,
+    pub last_probe: Option<rsi_common::satellite::SatelliteProbeLinkResultV1>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatelliteRegistryTab {
+    Peers,
+    Links,
+    Sessions,
+}
+
+pub enum SatelliteRegistryForm {
+    Peer {
+        peer_id: rsi_common::satellite::SatelliteUuidV1,
+        label: String,
+        expected_installation_id: String,
+        enabled: bool,
+        read_enabled: bool,
+        /// Queued hub-manager delivery switch (#1017 slice 3).
+        dispatch_enabled: bool,
+        /// Comma-separated remote session ids the hub manager may message.
+        dispatch_scope: String,
+        repair_quarantine: bool,
+        field: usize,
+    },
+    Link {
+        peer_id: rsi_common::satellite::SatelliteUuidV1,
+        link_id: rsi_common::satellite::SatelliteUuidV1,
+        socket_path: String,
+        ssh_target: String,
+        trust_reference: String,
+        direction: rsi_common::satellite::SatelliteLinkDirectionV1,
+        enabled: bool,
+        priority: u8,
+        field: usize,
+    },
+    /// Satellite-side inbound delivery policy (#1017 slice 3): which hub
+    /// installations may message this host and the scope roots they reach.
+    Inbound {
+        /// Comma-separated hub installation ids.
+        hubs: String,
+        /// Comma-separated scope-root session ids.
+        roots: String,
+        field: usize,
+    },
+}
+
+/// A zeroized-on-drop MCP credential buffer whose debug output is redacted.
+#[derive(Clone, Default, Eq)]
+pub(crate) struct McpSecretString {
+    value: zeroize::Zeroizing<String>,
+}
+
+impl McpSecretString {
+    #[must_use]
+    pub(crate) fn new(value: String) -> Self {
+        Self {
+            value: zeroize::Zeroizing::new(value),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn expose(&self) -> &str {
+        self.value.as_str()
+    }
+
+    pub(crate) fn push(&mut self, character: char) {
+        self.value.push(character);
+    }
+
+    pub(crate) fn push_str(&mut self, value: &str) {
+        self.value.push_str(value);
+    }
+
+    pub(crate) fn pop(&mut self) {
+        self.value.pop();
+    }
+
+    pub(crate) fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
+    pub(crate) fn into_exposed(mut self) -> String {
+        std::mem::take(&mut *self.value)
+    }
+}
+
+impl std::fmt::Debug for McpSecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("McpSecretString(<redacted>)")
+    }
+}
+
+impl PartialEq for McpSecretString {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
 /// Active overlay state. Only one overlay can be active at a time.
 /// When `OverlayState` is not `None`, the overlay captures all key input.
 pub enum OverlayState {
     /// No overlay active — normal app operation.
     None,
+    /// Hub-owned satellite registry, local link controls and cached remote reads.
+    SatelliteRegistry(Box<SatelliteRegistryOverlayState>),
     /// Fuzzy command finder, with the context captured below this overlay.
     CommandPalette {
         query: String,
@@ -2404,6 +2572,9 @@ pub enum OverlayState {
         /// Whether sandbox mode is requested for this launch.
         /// Only meaningful when `PromptPurpose::Blank | TaskRabbit`. Default: false.
         sandbox_enabled: bool,
+        /// Settings side of a launch prompt (flip state, selection and the
+        /// planned manager appointment). Unused by ContinueSession prompts.
+        launch: PromptLaunchSettings,
     },
     /// Project picker popup (telescope-style).
     ProjectPicker {
@@ -2606,6 +2777,25 @@ pub enum OverlayState {
         rotate: bool,
         /// Typed secret buffer. Masked in the renderer; scrubbed on submit.
         secret: String,
+    },
+    /// MCP server definition form (Settings -> MCP Servers). All fields are
+    /// nonsecret and are validated by the daemon on submit.
+    McpServerForm {
+        focused_field: usize,
+        id: String,
+        command: String,
+        args: String,
+        secret_env_names: String,
+        working_dir: String,
+        enabled: bool,
+        editing: Option<usize>,
+    },
+    /// MCP credential set/rotate form. The secret is fully masked while
+    /// rendered and scrubbed before the overlay is closed.
+    McpServerSecretForm {
+        id: String,
+        rotate: bool,
+        secret: McpSecretString,
     },
     /// Three-choice confirm modal for external-edit conflicts (Q7).
     HookConflictPrompt {
@@ -2843,6 +3033,8 @@ pub enum OverlayState {
         loading: bool,
         /// True after the first `d`, waiting for the second key of the `dd` delete chord.
         pending_delete: bool,
+        /// Filter and paging state for the daemon's paged `ListScheduledJobs` (#954 B).
+        paging: SchedulePaging,
     },
     /// Schedule Form — create/edit a scheduled job.
     ScheduleForm {
@@ -2982,4 +3174,15 @@ mod graph_view_origin_tests {
             GraphViewOrigin::AuthoredWorkflow
         );
     }
+}
+
+/// Filter and cursor state of the Scheduled Jobs view (Issue #954 B). The
+/// default view shows enabled plus recently fired jobs; `include_history`
+/// asks the daemon for old disabled rows too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulePaging {
+    /// `true` requests old disabled history as well.
+    pub include_history: bool,
+    /// Cursor for the next page; `None` once every row is loaded.
+    pub next_cursor: Option<String>,
 }

@@ -4,9 +4,9 @@
 
 This directory contains the results of exhaustive static code analysis comparing AI agent orchestration tools across three distinct architectural layers:
 
-- **Flywheel** (`/home/jakedevar/flywheel`) — A Vim-like TUI for managing multiple AI coding sessions across providers. Built in Rust using ratatui + crossterm + modalkit. **Layer: Interface/Observation.**
-- **Gastown** (`/home/jakedevar/gastown`) — A multi-agent orchestration system for Claude Code with persistent work tracking. Built in Go using cobra + charmbracelet/bubbletea. **Layer: Operational Orchestration.**
-- **ChatDev 2.0 (DevAll)** (`/home/jakedevar/ChatDev`) — A zero-code multi-agent platform for building and executing customized multi-agent systems through YAML graph definitions. Built in Python using FastAPI + Vue 3. **Layer: Computational Graph/Workflow Definition.**
+- **Flywheel** (`~/flywheel`) — A Vim-like TUI for managing multiple AI coding sessions across providers. Built in Rust using ratatui + crossterm + modalkit. **Layer: Interface/Observation.**
+- **Gastown** (`~/gastown`) — A multi-agent orchestration system for Claude Code with persistent work tracking. Built in Go using cobra + charmbracelet/bubbletea. **Layer: Operational Orchestration.**
+- **ChatDev 2.0 (DevAll)** (`~/ChatDev`) — A zero-code multi-agent platform for building and executing customized multi-agent systems through YAML graph definitions. Built in Python using FastAPI + Vue 3. **Layer: Computational Graph/Workflow Definition.**
 
 The analysis covers all source files across all three projects.
 
@@ -156,24 +156,24 @@ Key findings:
 Analysis was performed by reading all source files across all three projects:
 
 **Flywheel (Rust):**
-- `/home/jakedevar/flywheel/CLAUDE.md` and all `/home/jakedevar/flywheel/docs/*.md`
-- All files in `/home/jakedevar/flywheel/crates/flywheel/src/` (including action_handler/, overlay/, ui/ subdirectories)
-- All files in `/home/jakedevar/flywheel/crates/flywheeld/src/`
-- All files in `/home/jakedevar/flywheel/crates/flywheel-common/src/`
+- `~/flywheel/CLAUDE.md` and all `~/flywheel/docs/*.md`
+- All files in `~/flywheel/crates/flywheel/src/` (including action_handler/, overlay/, ui/ subdirectories)
+- All files in `~/flywheel/crates/flywheeld/src/`
+- All files in `~/flywheel/crates/flywheel-common/src/`
 
 **Gastown (Go):**
-- `/home/jakedevar/gastown/README.md`, `AGENTS.md`, `CHANGELOG.md`, `go.mod`, `Makefile`
-- All files in `/home/jakedevar/gastown/docs/`
-- All files in `/home/jakedevar/gastown/internal/cmd/` (500+ .go files)
+- `~/gastown/README.md`, `AGENTS.md`, `CHANGELOG.md`, `go.mod`, `Makefile`
+- All files in `~/gastown/docs/`
+- All files in `~/gastown/internal/cmd/` (500+ .go files)
 
 **ChatDev 2.0 (Python):**
-- `/home/jakedevar/ChatDev/README.md`, `pyproject.toml`, `run.py`, `server_main.py`
-- All files in `/home/jakedevar/ChatDev/runtime/` (node types, executors, edge conditions, memory, providers)
-- All files in `/home/jakedevar/ChatDev/workflow/` (graph executor, topology builder, cycle manager, strategies)
-- All files in `/home/jakedevar/ChatDev/entity/` (config loader, graph config, node/edge configs, messages)
-- All files in `/home/jakedevar/ChatDev/server/` (FastAPI app, routes, services, WebSocket manager)
-- All files in `/home/jakedevar/ChatDev/functions/` (function calling tools, edge conditions)
-- All files in `/home/jakedevar/ChatDev/docs/user_guide/en/` (all English documentation)
+- `~/ChatDev/README.md`, `pyproject.toml`, `run.py`, `server_main.py`
+- All files in `~/ChatDev/runtime/` (node types, executors, edge conditions, memory, providers)
+- All files in `~/ChatDev/workflow/` (graph executor, topology builder, cycle manager, strategies)
+- All files in `~/ChatDev/entity/` (config loader, graph config, node/edge configs, messages)
+- All files in `~/ChatDev/server/` (FastAPI app, routes, services, WebSocket manager)
+- All files in `~/ChatDev/functions/` (function calling tools, edge conditions)
+- All files in `~/ChatDev/docs/user_guide/en/` (all English documentation)
 
 ---
 

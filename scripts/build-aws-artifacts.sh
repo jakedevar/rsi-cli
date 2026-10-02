@@ -4,6 +4,8 @@ set -euo pipefail
 usage() {
   echo "Usage: $0 <full-source-commit> <output-directory> [both|x86_64|arm64]" >&2
   echo "Run in a clean checkout at that commit. Requires cargo and cross for non-native targets." >&2
+  echo "Set RSI_ARTIFACT_BUILDER=zigbuild to build both targets with cargo-zigbuild against" >&2
+  echo "glibc RSI_ARTIFACT_GLIBC (default 2.34, Amazon Linux 2023) from any Linux host." >&2
   exit 2
 }
 
@@ -34,6 +36,25 @@ output_dir="$(cd "$output_dir" && pwd -P)"
 }
 cd "$repo_dir"
 target_dir="${CARGO_TARGET_DIR:-target}"
+builder_mode="${RSI_ARTIFACT_BUILDER:-auto}"
+glibc_version="${RSI_ARTIFACT_GLIBC:-2.34}"
+case "$builder_mode" in
+  auto) ;;
+  zigbuild)
+    [[ "$glibc_version" =~ ^2\.[0-9]+$ ]] || {
+      echo 'RSI_ARTIFACT_GLIBC must look like 2.34.' >&2
+      exit 1
+    }
+    command -v zig >/dev/null && cargo zigbuild --help >/dev/null 2>&1 || {
+      echo 'RSI_ARTIFACT_BUILDER=zigbuild requires zig and cargo-zigbuild.' >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo 'RSI_ARTIFACT_BUILDER must be auto or zigbuild.' >&2
+    exit 1
+    ;;
+esac
 
 host_target=''
 if [[ "$(uname -s)" == Linux ]]; then
@@ -48,17 +69,24 @@ for architecture in "${architectures[@]}"; do
     x86_64) target=x86_64-unknown-linux-gnu ;;
     arm64) target=aarch64-unknown-linux-gnu ;;
   esac
-  if [[ "$target" == "$host_target" ]]; then
-    builder=cargo
+  if [[ "$builder_mode" == zigbuild ]]; then
+    # zig links against the requested glibc symbol versions, so a bundle built
+    # on a newer distribution still loads on the host's older glibc.
+    cargo zigbuild --locked --release --target "$target.$glibc_version" \
+      --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp
   else
-    builder=cross
-    command -v cross >/dev/null || {
-      echo "cross is required to build $target on this machine." >&2
-      exit 1
-    }
+    if [[ "$target" == "$host_target" ]]; then
+      builder=cargo
+    else
+      builder=cross
+      command -v cross >/dev/null || {
+        echo "cross is required to build $target on this machine." >&2
+        exit 1
+      }
+    fi
+    "$builder" build --locked --release --target "$target" \
+      --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp
   fi
-  "$builder" build --locked --release --target "$target" \
-    --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp
   staging="$(mktemp -d)"
   for binary in rsi rsid rsi-rpc rsi-agent-mcp; do
     install -m 755 "$target_dir/$target/release/$binary" "$staging/$binary"

@@ -96,6 +96,41 @@ impl ModelInvocationPurpose {
     }
 }
 
+/// Background helper purposes: short in-daemon side calls (title refinement,
+/// summaries, memory extraction/embedding, consolidation, classifiers) that
+/// never own a session slot. They must not count against, or be refused by,
+/// the manager's lead concurrency cap (#940): a failed helper whose
+/// settlement is contended cannot starve real leads of spawn capacity.
+pub const BACKGROUND_HELPER_PURPOSES: [ModelInvocationPurpose; 7] = [
+    ModelInvocationPurpose::SessionTitle,
+    ModelInvocationPurpose::SessionSummary,
+    ModelInvocationPurpose::MemoryObservationExtract,
+    ModelInvocationPurpose::MemoryEmbeddingIndex,
+    ModelInvocationPurpose::DreamConsolidation,
+    ModelInvocationPurpose::StallClassifier,
+    ModelInvocationPurpose::DialecticQuery,
+];
+
+impl ModelInvocationPurpose {
+    /// True for a background helper purpose exempt from the lead cohort cap.
+    pub fn is_background_helper(self) -> bool {
+        BACKGROUND_HELPER_PURPOSES.contains(&self)
+    }
+
+    /// JSON array of the helper purpose names, bound as SQL data in
+    /// `purpose IN (SELECT value FROM json_each(?N))` so every statement stays
+    /// a static literal the protected-DML audit can prove.
+    pub fn background_helper_json_array() -> String {
+        serde_json::to_string(
+            &BACKGROUND_HELPER_PURPOSES
+                .iter()
+                .map(|purpose| purpose.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .expect("purpose names serialize")
+    }
+}
+
 impl std::fmt::Display for ModelInvocationPurpose {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

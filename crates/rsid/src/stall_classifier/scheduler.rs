@@ -234,7 +234,7 @@ pub(crate) async fn classify_once<C: ClassifierCompleter + ?Sized>(
         }
         Err(error) => Err(error),
     };
-    let completion = match &llm_result {
+    let mut completion = match &llm_result {
         Ok(_) => completion_with_wall_time(started_at, None, ModelUsageConfidence::Partial),
         Err(error) => completion_with_wall_time(
             started_at,
@@ -242,6 +242,13 @@ pub(crate) async fn classify_once<C: ClassifierCompleter + ?Sized>(
             ModelUsageConfidence::Partial,
         ),
     };
+    if let Ok(reply) = &llm_result {
+        crate::memory::llm::apply_estimated_usage(
+            &mut completion,
+            &format!("{CLASSIFIER_SYSTEM_PROMPT}\n\n{user_prompt}"),
+            reply,
+        );
+    }
     let raw = settle_result(
         store,
         &permit,
@@ -640,6 +647,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

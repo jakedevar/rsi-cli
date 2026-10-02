@@ -24,10 +24,19 @@ CAPTURE_STOP_ON_FIRST_RED=0
 
 die() { echo "${SCRIPT_NAME}: $*" >&2; exit 2; }
 
+# The pinned account home is read from the account database, never from the
+# (hostile) inherited environment, so no personal path is baked into the script.
+pinned_home() {
+    local home
+    home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)" || return 1
+    [[ "$home" = /* && "$home" != *:* && "$home" != */ ]] || return 1
+    printf '%s' "$home"
+}
+
 usage() {
     cat <<'EOF'
 Usage:
-  /usr/bin/env -i HOME=/home/jakedevar CARGO_HOME=/home/jakedevar/.cargo RUSTUP_HOME=/home/jakedevar/.rustup PATH=/home/jakedevar/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:/home/jakedevar/.cargo/bin:/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC TMPDIR=<repo>/target/test-suite-benchmark/tmp CARGO_TARGET_DIR=<repo>/target XDG_CONFIG_HOME=<repo>/target/test-suite-benchmark/xdg-empty NEXTEST_CONFIG_FILE=<repo>/.config/nextest.toml /usr/bin/bash --noprofile --norc -p <repo>/scripts/test-suite-benchmark.sh calibrate-baseline
+  /usr/bin/env -i HOME=$HOME CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup PATH=$HOME/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:$HOME/.cargo/bin:/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC TMPDIR=<repo>/target/test-suite-benchmark/tmp CARGO_TARGET_DIR=<repo>/target XDG_CONFIG_HOME=<repo>/target/test-suite-benchmark/xdg-empty NEXTEST_CONFIG_FILE=<repo>/.config/nextest.toml /usr/bin/bash --noprofile --norc -p <repo>/scripts/test-suite-benchmark.sh calibrate-baseline
   scripts/test-suite-benchmark.sh capture --label LABEL --probe PROBE --repeat N --threads N|auto --out target/test-suite-benchmark/FILE.json
   scripts/test-suite-benchmark.sh capture --label LABEL --probe PROBE --repeat N --threads N|auto --stop-on-first-red --out target/test-suite-benchmark/FILE.json
   scripts/test-suite-benchmark.sh capture --label LABEL --probe PROBE --repeat N --threads N|auto --external-output-root ABSOLUTE_ROOT --out ABSOLUTE_ROOT/FILE.json
@@ -949,7 +958,7 @@ reject_public_fixture_environment() {
 # operation executes any external program.
 validate_sterile_launch() {
     local operation="$1"; shift
-    local script_abs="$0" repo expected_path name expected_value index
+    local script_abs="$0" repo expected_path name expected_value index phome
     local -a allowed=(HOME CARGO_HOME RUSTUP_HOME PATH LANG LC_ALL TZ TMPDIR CARGO_TARGET_DIR XDG_CONFIG_HOME NEXTEST_CONFIG_FILE PWD SHLVL _)
     local -a actual_cmdline expected_cmdline
 
@@ -959,12 +968,13 @@ validate_sterile_launch() {
     [[ "$repo" = /* && "$repo" != *'/../'* && "$repo" != *'/./'* && "$repo" != *'//' ]] || die "$operation rejects a noncanonical repository path"
     [[ -f "$script_abs" && ! -L "$script_abs" ]] || die "$operation rejects a replaced or symlinked script"
 
-    expected_path="/home/jakedevar/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:/home/jakedevar/.cargo/bin:/usr/bin:/bin"
+    phome="$(pinned_home)" || die "$operation cannot resolve the account home"
+    expected_path="$phome/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:$phome/.cargo/bin:/usr/bin:/bin"
     [[ ${PATH-} = "$expected_path" ]] || die "public calibration operation rejects PATH replacement"
     [[ /proc/$$/exe -ef /usr/bin/bash && "$-" = *p* && ":$SHELLOPTS:" = *:privileged:* ]] || die "$operation requires /usr/bin/bash privileged mode"
-    [[ ${HOME-} = /home/jakedevar ]] || die "$operation rejects HOME"
-    [[ ${CARGO_HOME-} = /home/jakedevar/.cargo ]] || die "$operation rejects CARGO_HOME"
-    [[ ${RUSTUP_HOME-} = /home/jakedevar/.rustup ]] || die "$operation rejects RUSTUP_HOME"
+    [[ ${HOME-} = "$phome" ]] || die "$operation rejects HOME"
+    [[ ${CARGO_HOME-} = "$phome/.cargo" ]] || die "$operation rejects CARGO_HOME"
+    [[ ${RUSTUP_HOME-} = "$phome/.rustup" ]] || die "$operation rejects RUSTUP_HOME"
     [[ ${LANG-} = C && ${LC_ALL-} = C && ${TZ-} = UTC ]] || die "$operation requires LANG=C LC_ALL=C TZ=UTC"
     [[ ${TMPDIR-} = "$repo/$OUTPUT_ROOT/tmp" ]] || die "$operation rejects TMPDIR"
     [[ ${CARGO_TARGET_DIR-} = "$repo/target" ]] || die "$operation rejects CARGO_TARGET_DIR"
@@ -2360,26 +2370,28 @@ calibrate_baseline() {
     [ "$#" -eq 0 ] || die "calibrate-baseline accepts no arguments"
     validate_sterile_launch calibrate-baseline
     reject_legacy_monolithic_calibration "$PWD/crates/rsid/Cargo.toml"
-    local repo="$PWD" env_fd bash_fd python_fd script_fd repo_fd
+    local repo="$PWD" env_fd bash_fd python_fd script_fd repo_fd phome
+    phome="$(pinned_home)" || die "calibrate-baseline cannot resolve the account home"
     [[ -L /usr/bin/python3 && "$(/usr/bin/readlink /usr/bin/python3)" = python3.14 && /usr/bin/python3 -ef /usr/bin/python3.14 && -x /usr/bin/python3.14 && ! -L /usr/bin/python3.14 ]] || die "calibrate-baseline cannot authenticate /usr/bin/python3"
     exec {env_fd}</usr/bin/env {bash_fd}</usr/bin/bash {python_fd}</usr/bin/python3.14 {script_fd}<"$0" {repo_fd}<"$repo"
     "/proc/self/fd/$env_fd" -i \
-        HOME=/home/jakedevar CARGO_HOME=/home/jakedevar/.cargo RUSTUP_HOME=/home/jakedevar/.rustup \
-        PATH=/home/jakedevar/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:/home/jakedevar/.cargo/bin:/usr/bin:/bin \
+        HOME="$phome" CARGO_HOME="$phome/.cargo" RUSTUP_HOME="$phome/.rustup" \
+        PATH="$phome/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:$phome/.cargo/bin:/usr/bin:/bin" \
         LANG=C LC_ALL=C TZ=UTC TMPDIR="$repo/$OUTPUT_ROOT/tmp" CARGO_TARGET_DIR="$repo/target" \
         XDG_CONFIG_HOME="$repo/$OUTPUT_ROOT/xdg-empty" NEXTEST_CONFIG_FILE="$repo/.config/nextest.toml" \
         "/proc/self/fd/$python_fd" - "$repo" "$0" "$CUSTODY_THREAT_STATEMENT" "$env_fd" "$bash_fd" "$python_fd" "$script_fd" "$repo_fd" <<'PY'
-import ctypes, dataclasses, datetime, errno, hashlib, json, math, os, re, resource, selectors, secrets, signal, stat, struct, sys, time, tomllib
+import ctypes, dataclasses, datetime, errno, hashlib, json, math, os, pwd, re, resource, selectors, secrets, signal, stat, struct, sys, time, tomllib
 
 REPO, SCRIPT, THREAT = sys.argv[1:4]
 INHERITED_FDS={name:int(value) for name,value in zip(("env","bash","python3","script","repository"),sys.argv[4:9])}
 UID, GID = os.getuid(), os.getgid()
+ACCOUNT_HOME = pwd.getpwuid(UID).pw_dir  # pinned from the account database, not the environment
 RAW_LIMIT = 64 * 1024 * 1024
 TOTAL_LIMIT = 1024 * 1024 * 1024
 CHUNK = 64 * 1024
 EXPECTED_ENV = {
-    "HOME":"/home/jakedevar", "CARGO_HOME":"/home/jakedevar/.cargo", "RUSTUP_HOME":"/home/jakedevar/.rustup",
-    "PATH":"/home/jakedevar/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:/home/jakedevar/.cargo/bin:/usr/bin:/bin",
+    "HOME":ACCOUNT_HOME, "CARGO_HOME":f"{ACCOUNT_HOME}/.cargo", "RUSTUP_HOME":f"{ACCOUNT_HOME}/.rustup",
+    "PATH":f"{ACCOUNT_HOME}/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin:{ACCOUNT_HOME}/.cargo/bin:/usr/bin:/bin",
     "LANG":"C", "LC_ALL":"C", "TZ":"UTC", "TMPDIR":f"{REPO}/target/test-suite-benchmark/tmp",
     "CARGO_TARGET_DIR":f"{REPO}/target", "XDG_CONFIG_HOME":f"{REPO}/target/test-suite-benchmark/xdg-empty",
     "NEXTEST_CONFIG_FILE":f"{REPO}/.config/nextest.toml",
@@ -2598,17 +2610,17 @@ class RunCustody:
         if tuple(tracked)!=self.tracked_paths: fail("source tracked-path set changed")
 
     def authenticate_graph(self):
-        pinned="/home/jakedevar/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin"
+        pinned=f"{ACCOUNT_HOME}/.rustup/toolchains/1.94.1-x86_64-unknown-linux-gnu/bin"
         paths={
           "env":"/usr/bin/env","bash":"/usr/bin/bash","git":"/usr/bin/git","find":"/usr/bin/find","nproc":"/usr/bin/nproc",
           "uname":"/usr/bin/uname","lscpu":"/usr/bin/lscpu","make":"/usr/bin/make","python3":"/usr/bin/python3.14",
           "jq":"/usr/bin/jq","stat":"/usr/bin/stat","sha256sum":"/usr/bin/sha256sum","clang":"/usr/bin/clang-22","mold":"/usr/bin/mold",
           "cargo":f"{pinned}/cargo","rustc":f"{pinned}/rustc","rustdoc":f"{pinned}/rustdoc",
-          "cargo-nextest":"/home/jakedevar/.cargo/bin/cargo-nextest",
+          "cargo-nextest":f"{ACCOUNT_HOME}/.cargo/bin/cargo-nextest",
         }
         self.tools={name:self.open_node(path,os.O_RDONLY|os.O_NOFOLLOW,f"tool:{name}") for name,path in paths.items()}
         configs={"script":SCRIPT,"Makefile":f"{REPO}/Makefile","nextest":f"{REPO}/.config/nextest.toml",
-                 "cargo-repo":f"{REPO}/.cargo/config.toml","cargo-account":"/home/jakedevar/.cargo/config.toml",
+                 "cargo-repo":f"{REPO}/.cargo/config.toml","cargo-account":f"{ACCOUNT_HOME}/.cargo/config.toml",
                  "toolchain":f"{REPO}/rust-toolchain.toml","workspace-manifest":f"{REPO}/Cargo.toml","lockfile":f"{REPO}/Cargo.lock","gitfile":f"{REPO}/.git"}
         self.configs={name:self.open_node(path,os.O_RDONLY|os.O_NOFOLLOW,f"config:{name}") for name,path in configs.items()}
         gitfile=self.read_held(self.configs["gitfile"],4096).decode("utf-8","strict")

@@ -29,7 +29,7 @@ metadata_for_new_command() {
             printf '%s\n%s\n' opus architect ;;
         auto_implement|create_handoff|debug|feature_status|implement|implement_plan|oneshot_plan|ralph_impl|resume_handoff|ship_small|validate_plan|verify_phase)
             printf '%s\n%s\n' sonnet implementer ;;
-        ci_commit|ci_describe_pr|commit|create_worktree|db|describe_pr|describe_pr_nt|linear|local_review)
+        ci_commit|ci_describe_pr|commit|create_worktree|db|describe_pr|describe_pr_nt|intake|linear|local_review)
             printf '%s\n%s\n' haiku lookup_fast ;;
         *)
             printf 'missing Claude routing metadata for: %s\n' "$1" >&2

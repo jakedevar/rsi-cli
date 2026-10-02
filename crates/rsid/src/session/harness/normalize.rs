@@ -83,6 +83,8 @@ mod tests {
                 id: (*id).into(),
                 name: "test".into(),
                 arguments: "{}".into(),
+                hosted: false,
+                hosted_result: None,
             })
             .collect();
         message

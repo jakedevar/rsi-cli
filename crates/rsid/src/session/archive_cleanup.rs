@@ -9,6 +9,7 @@ use crate::store::archive_cleanup::{
     ArchiveCleanupRecoveryCursor, ArchiveCleanupRun, ArchiveProjectionConsumer,
     NewArchiveCleanupIntent, archive_topology_digest, digest_field,
 };
+use crate::store::custody_lock_order::BlockingStoreLockExt;
 use crate::store::sandbox_custody::PersistedCustody;
 use rsi_common::archive_cleanup::{
     ARCHIVE_CLEANUP_SCHEMA_VERSION, ArchiveCleanupErrorV1, ArchiveCleanupPhaseV1,
@@ -43,18 +44,35 @@ static ARCHIVE_PROJECTION_DISPATCH_FAULT: std::sync::Mutex<
     )>,
 > = std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 static ARCHIVE_CLEANUP_TEST_HOLDER_PROCS: std::sync::Mutex<Vec<(Uuid, PathBuf, PathBuf, u32)>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 pub struct ArchiveCleanupTestHolderProc {
     session_id: Uuid,
     sandbox_base: PathBuf,
     _proc: super::reaper::SyntheticQuarantineHolderProc,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
+impl ArchiveCleanupTestHolderProc {
+    /// Add a same-UID synthetic process that holds `path` open, so the proof
+    /// must refuse the archive.
+    #[doc(hidden)]
+    pub fn add_fd_holder(&self, path: &Path) {
+        self._proc.add_fd_holder(path);
+    }
+
+    /// Add a same-UID synthetic process whose inventory is unreadable, so the
+    /// proof must refuse the archive (unknown holder, fail closed).
+    #[doc(hidden)]
+    pub fn add_unreadable_process(&self) {
+        self._proc.add_unreadable_process();
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
 impl Drop for ArchiveCleanupTestHolderProc {
     fn drop(&mut self) {
         let mut contexts = ARCHIVE_CLEANUP_TEST_HOLDER_PROCS
@@ -71,8 +89,8 @@ impl Drop for ArchiveCleanupTestHolderProc {
     }
 }
 
-#[cfg(test)]
-fn archive_cleanup_test_holder_proc(
+#[cfg(any(test, feature = "test-seam"))]
+pub(super) fn archive_cleanup_test_holder_proc(
     session_id: Uuid,
     sandbox_base: &Path,
 ) -> Option<(PathBuf, u32)> {
@@ -82,6 +100,39 @@ fn archive_cleanup_test_holder_proc(
         .iter()
         .find(|(id, base, _, _)| *id == session_id && base == sandbox_base)
         .map(|(_, _, proc_root, uid)| (proc_root.clone(), *uid))
+}
+
+/// Test seam: pause one session's archive proof while it holds its custody
+/// stripe and the repository mutex (Issue #606). `reached` fires once the proof
+/// is paused; the proof resumes when `release` yields.
+#[cfg(test)]
+struct ArchiveProofPause {
+    session_id: Uuid,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static ARCHIVE_PROOF_PAUSE: std::sync::Mutex<Option<ArchiveProofPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_archive_proof_if_requested(session_id: Uuid) {
+    let pause = {
+        let mut slot = ARCHIVE_PROOF_PAUSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(pause) if pause.session_id == session_id => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause
+            .release
+            .recv_timeout(std::time::Duration::from_secs(60));
+    }
 }
 
 #[cfg(test)]
@@ -149,8 +200,9 @@ struct ArchiveRemovalAuthorityV1 {
 }
 
 impl SessionManager {
-    #[cfg(test)]
-    pub(crate) fn install_archive_cleanup_test_holder_proc(
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn install_archive_cleanup_test_holder_proc(
         &self,
         session_id: Uuid,
     ) -> ArchiveCleanupTestHolderProc {
@@ -231,13 +283,13 @@ impl SessionManager {
                 true,
             ));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let test_holder_proc =
             archive_cleanup_test_holder_proc(session_id, self.sandbox_allocator.base_dir());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let test_provider_proc = test_holder_proc.clone();
         tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             if let Some((proc_root, uid)) = test_provider_proc {
                 return super::reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
                     super::reaper::prove_archive_cleanup_has_no_provider_processes(&[session_id])
@@ -259,7 +311,7 @@ impl SessionManager {
         let store = Arc::clone(&self.store);
         let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
         let receipt = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             if let Some((proc_root, uid)) = test_holder_proc {
                 return super::reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
                     resume_or_start_cleanup_blocking(&store, &sandbox_base, session_id)
@@ -353,7 +405,9 @@ impl SessionManager {
     ) -> Result<ArchiveCleanupStatusV1> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            store.blocking_lock().archive_cleanup_status(session_id)
+            store
+                .blocking_lock_checked()?
+                .archive_cleanup_status(session_id)
         })
         .await
         .map_err(|error| DaemonError::Store(error.to_string()))?
@@ -365,10 +419,12 @@ impl SessionManager {
             let store = Arc::clone(&self.store);
             let page_cursor = cursor.clone();
             let page = tokio::task::spawn_blocking(move || {
-                store.blocking_lock().archive_cleanup_recovery_page(
-                    page_cursor.as_ref(),
-                    crate::store::archive_cleanup::ARCHIVE_CLEANUP_RECOVERY_BATCH,
-                )
+                store
+                    .blocking_lock_checked()?
+                    .archive_cleanup_recovery_page(
+                        page_cursor.as_ref(),
+                        crate::store::archive_cleanup::ARCHIVE_CLEANUP_RECOVERY_BATCH,
+                    )
             })
             .await
             .map_err(|error| DaemonError::Store(error.to_string()))??;
@@ -436,7 +492,7 @@ impl SessionManager {
     ) -> Result<Option<ArchiveCleanupReceiptV1>> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
+            let store = store.blocking_lock_checked()?;
             store.current_settled_archive_cleanup_receipt(session_id)
         })
         .await
@@ -449,7 +505,7 @@ impl SessionManager {
             let store = Arc::clone(&self.store);
             let projections = tokio::task::spawn_blocking(move || {
                 store
-                    .blocking_lock()
+                    .blocking_lock_checked()?
                     .archive_cleanup_projection_recovery_page(
                         memory_available,
                         crate::store::archive_cleanup::ARCHIVE_CLEANUP_RECOVERY_BATCH,
@@ -478,7 +534,7 @@ impl SessionManager {
             let store = Arc::clone(&self.store);
             let projections = tokio::task::spawn_blocking(move || {
                 store
-                    .blocking_lock()
+                    .blocking_lock_checked()?
                     .archive_cleanup_projection_session_page(
                         session_id,
                         memory_available,
@@ -498,7 +554,7 @@ impl SessionManager {
                     let projection_id = projection.projection_id;
                     let claimed = tokio::task::spawn_blocking(move || {
                         store
-                            .blocking_lock()
+                            .blocking_lock_checked()?
                             .begin_archive_cleanup_projection_consumer(projection_id, consumer)
                     })
                     .await
@@ -569,7 +625,7 @@ impl SessionManager {
                     let store = Arc::clone(&self.store);
                     tokio::task::spawn_blocking(move || {
                         store
-                            .blocking_lock()
+                            .blocking_lock_checked()?
                             .complete_archive_cleanup_projection_consumer(projection_id, consumer)
                     })
                     .await
@@ -601,14 +657,14 @@ fn resume_or_start_cleanup_blocking(
     session_id: Uuid,
 ) -> Result<ArchiveCleanupReceiptV1> {
     let settled = {
-        let store = store.blocking_lock();
+        let store = store.blocking_lock_checked()?;
         store.current_settled_archive_cleanup_receipt(session_id)?
     };
     if let Some(receipt) = settled {
         return Ok(receipt);
     }
     let existing = {
-        let store = store.blocking_lock();
+        let store = store.blocking_lock_checked()?;
         store.latest_archive_cleanup_for_session(session_id)?
     };
     if let Some(run) = existing {
@@ -628,13 +684,16 @@ fn resume_or_start_cleanup_blocking(
 
     let (session, custody) = load_candidate(store, session_id)?;
     let origin = PathBuf::from(&custody.canonical_repo_dir);
+    // Lock order (Issue #606): custody stripe before repository mutex, so this
+    // pass never waits for a stripe while holding the repository. The Store is
+    // only ever taken through the bounded `blocking_lock_checked` beneath both.
+    let _root_guard = crate::store::sandbox_custody::lock_custody_root(custody.custody_id);
     git_worktree::with_repository_mutation(&origin, || {
-        let _root_guard = crate::store::sandbox_custody::lock_custody_root(custody.custody_id);
         let run_id = Uuid::new_v4();
         let proof = prove_original_candidate(store, sandbox_base, &session, &custody, run_id)
             .map_err(|error| classify_preintent_error(error, None))?;
         let run = store
-            .blocking_lock()
+            .blocking_lock_checked()?
             .insert_archive_cleanup_intent(&proof.intent)?;
         if run.run_id != run_id {
             return resume_run_locked(store, sandbox_base, run);
@@ -649,10 +708,8 @@ fn resume_run_with_repository_lock(
     run: ArchiveCleanupRun,
 ) -> Result<ArchiveCleanupReceiptV1> {
     let origin = PathBuf::from(&run.canonical_repo_dir);
-    git_worktree::with_repository_mutation(&origin, || {
-        let _root_guard = crate::store::sandbox_custody::lock_custody_root(run.custody_id);
-        resume_run_locked(store, sandbox_base, run)
-    })
+    let _root_guard = crate::store::sandbox_custody::lock_custody_root(run.custody_id);
+    git_worktree::with_repository_mutation(&origin, || resume_run_locked(store, sandbox_base, run))
 }
 
 fn resume_run_locked(
@@ -671,6 +728,9 @@ fn resume_run_locked(
         let (session, custody) = match load_candidate(store, run.session_id) {
             Ok(candidate) => candidate,
             Err(error) => {
+                if let Some(retry) = busy_retry(&error, &run) {
+                    return Err(retry);
+                }
                 terminalize_run(
                     store,
                     &run,
@@ -683,6 +743,11 @@ fn resume_run_locked(
         };
         let original_proof =
             prove_original_candidate(store, sandbox_base, &session, &custody, run.run_id);
+        if let Err(error) = &original_proof {
+            if let Some(retry) = busy_retry(error, &run) {
+                return Err(retry);
+            }
+        }
         if original_proof
             .as_ref()
             .is_ok_and(|proof| intent_matches_run(&proof.intent, &run))
@@ -734,7 +799,7 @@ fn resume_run_locked(
                 return Err(classify_effect_error(error, &run));
             }
             run = store
-                .blocking_lock()
+                .blocking_lock_checked()?
                 .advance_archive_cleanup_phase(
                     run.run_id,
                     run.phase,
@@ -751,9 +816,15 @@ fn resume_run_locked(
                     )
                 })?;
         } else {
-            if prove_quarantine_candidate(store, &run).is_ok() {
+            let quarantine_reproof = prove_quarantine_candidate(store, &run);
+            if let Err(error) = &quarantine_reproof {
+                if let Some(retry) = busy_retry(error, &run) {
+                    return Err(retry);
+                }
+            }
+            if quarantine_reproof.is_ok() {
                 run = store
-                    .blocking_lock()
+                    .blocking_lock_checked()?
                     .advance_archive_cleanup_phase(
                         run.run_id,
                         run.phase,
@@ -790,6 +861,9 @@ fn resume_run_locked(
         let marker = match prove_quarantine_candidate(store, &run) {
             Ok(marker) => marker,
             Err(error) => {
+                if let Some(retry) = busy_retry(&error, &run) {
+                    return Err(retry);
+                }
                 terminalize_run(
                     store,
                     &run,
@@ -811,7 +885,7 @@ fn resume_run_locked(
         })?;
         let marker_digest = digest_field("archive-removal-authority-v1", &marker_json);
         run = store
-            .blocking_lock()
+            .blocking_lock_checked()?
             .advance_archive_cleanup_phase(
                 run.run_id,
                 run.phase,
@@ -857,7 +931,7 @@ fn resume_run_locked(
         })?;
         if already_removed {
             run = store
-                .blocking_lock()
+                .blocking_lock_checked()?
                 .advance_archive_cleanup_phase(
                     run.run_id,
                     run.phase,
@@ -886,6 +960,9 @@ fn resume_run_locked(
             let current = match prove_quarantine_candidate(store, &run) {
                 Ok(current) => current,
                 Err(error) => {
+                    if let Some(retry) = busy_retry(&error, &run) {
+                        return Err(retry);
+                    }
                     terminalize_run(
                         store,
                         &run,
@@ -983,7 +1060,7 @@ fn resume_run_locked(
                 )
             })?;
             run = store
-                .blocking_lock()
+                .blocking_lock_checked()?
                 .advance_archive_cleanup_phase(
                     run.run_id,
                     run.phase,
@@ -1052,7 +1129,7 @@ fn resume_run_locked(
             ));
         }
         return store
-            .blocking_lock()
+            .blocking_lock_checked()?
             .finalize_archive_cleanup(run.run_id, run.row_version)
             .map_err(|_| {
                 error_for_run(
@@ -1075,7 +1152,7 @@ fn load_candidate(
     store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Result<(Session, PersistedCustody)> {
-    let store = store.blocking_lock();
+    let store = store.blocking_lock_checked()?;
     let session = store
         .get_session(session_id)?
         .ok_or(DaemonError::SessionNotFound(session_id))?;
@@ -1100,6 +1177,8 @@ fn prove_original_candidate(
     custody: &PersistedCustody,
     run_id: Uuid,
 ) -> Result<ArchiveProof> {
+    #[cfg(test)]
+    pause_archive_proof_if_requested(session.id);
     let inventory = candidate_inventory(store, session, custody)?;
     let origin = Path::new(&custody.canonical_repo_dir);
     let root = Path::new(&custody.sandbox_root);
@@ -1240,7 +1319,7 @@ fn candidate_inventory(
     session: &Session,
     custody: &PersistedCustody,
 ) -> Result<crate::store::cohort_settlement::SourceWorktreeInventoryRow> {
-    let store = store.blocking_lock();
+    let store = store.blocking_lock_checked()?;
     if store.archive_cleanup_lineage_successor_count(session.id)? != 0 {
         return Err(DaemonError::Process(
             "archive cleanup Session has a later lineage successor".into(),
@@ -1477,7 +1556,7 @@ fn run_dependency_digest(
     store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
 ) -> Result<String> {
-    let store = store.blocking_lock();
+    let store = store.blocking_lock_checked()?;
     let rows = store.source_worktree_inventory(
         &run.repository_identity,
         SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
@@ -1587,17 +1666,27 @@ fn terminalize_run(
     code: ArchiveCleanupSafeCodeV1,
     detail: &str,
 ) -> Result<()> {
-    store.blocking_lock().terminate_archive_cleanup_run(
-        run.run_id,
-        run.phase,
-        run.row_version,
-        phase,
-        code,
-        Some(detail),
-    )
+    store
+        .blocking_lock_checked()?
+        .terminate_archive_cleanup_run(
+            run.run_id,
+            run.phase,
+            run.row_version,
+            phase,
+            code,
+            Some(detail),
+        )
 }
 
 fn classify_preintent_error(error: DaemonError, run: Option<&ArchiveCleanupRun>) -> DaemonError {
+    if crate::store::custody_lock_order::is_lock_order_busy_error(&error) {
+        return match run {
+            Some(run) => error_for_run(run, ArchiveCleanupSafeCodeV1::ProofUnavailable, true),
+            None => {
+                archive_cleanup_error(ArchiveCleanupSafeCodeV1::ProofUnavailable, None, None, true)
+            }
+        };
+    }
     let rendered = error.to_string();
     let text = match &error {
         DaemonError::Process(detail) => detail.as_str(),
@@ -1637,7 +1726,20 @@ fn preintent_message_has_word(text: &str, expected: &str) -> bool {
         .any(|word| word == expected)
 }
 
-fn classify_effect_error(_error: DaemonError, run: &ArchiveCleanupRun) -> DaemonError {
+/// The retryable archive error for a bounded-lock surrender, or `None` for any
+/// other error. Callers return it BEFORE any terminalization so a transient
+/// timeout never turns an intact intent or quarantine into `RecoveryRequired`.
+fn busy_retry(error: &DaemonError, run: &ArchiveCleanupRun) -> Option<DaemonError> {
+    crate::store::custody_lock_order::is_lock_order_busy_error(error)
+        .then(|| error_for_run(run, ArchiveCleanupSafeCodeV1::ProofUnavailable, true))
+}
+
+fn classify_effect_error(error: DaemonError, run: &ArchiveCleanupRun) -> DaemonError {
+    // A bounded Store/stripe wait that surrendered left durable state at the
+    // last committed phase: report it as retryable, not as ambiguous evidence.
+    if crate::store::custody_lock_order::is_lock_order_busy_error(&error) {
+        return error_for_run(run, ArchiveCleanupSafeCodeV1::ProofUnavailable, true);
+    }
     error_for_run(
         run,
         ArchiveCleanupSafeCodeV1::RecoveryEvidenceAmbiguous,
@@ -1650,8 +1752,13 @@ fn terminal_effect_error(
     run: &ArchiveCleanupRun,
     code: ArchiveCleanupSafeCodeV1,
     detail: &str,
-    _error: DaemonError,
+    error: DaemonError,
 ) -> DaemonError {
+    // A bounded Store/stripe surrender is a transient wait, not evidence: leave
+    // the durable phase untouched so a later attempt replays it normally.
+    if let Some(retry) = busy_retry(&error, run) {
+        return retry;
+    }
     let _ = terminalize_run(
         store,
         run,
@@ -1770,7 +1877,15 @@ mod tests {
             // worker after retry. An ambient daemon policy must not disable it.
             config.memory_enabled = true;
             config.memory_dir = self._temp.path().join("memory");
-            RuntimeConfig::from_config(&config)
+            let runtime = RuntimeConfig::from_config(&config);
+            // The lander places test fixtures under its private TMPDIR, which
+            // may be a small tmpfs. Repeated unarchive cycles allocate fresh
+            // fixture worktrees, but these tests do not exercise host capacity
+            // admission, so keep the free-space floor out of their outcome.
+            runtime
+                .sandbox_min_free_gib
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            runtime
         }
 
         fn new() -> Self {
@@ -2544,6 +2659,191 @@ mod tests {
         fixture.assert_settled(&receipt, &fixture.allocation_oid);
         let replay = fixture.settle();
         assert_eq!(replay, receipt);
+    }
+
+    /// Issue #606 review: a bounded Store surrender while replaying an intact
+    /// intent is a retryable wait. It must leave the run at IntentCommitted (not
+    /// RecoveryRequired), and a replay after the Store frees must settle it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn store_timeout_during_intent_replay_stays_retryable_and_replays_after_release() {
+        for pause_inside_proof in [false, true] {
+            let fixture = CleanupFixture::new();
+            let run = fixture.with_process_fixture(|| {
+                git_worktree::with_repository_mutation(&fixture.repository, || {
+                    let (session, custody) = load_candidate(&fixture.store, fixture.session_id)?;
+                    let _root_guard =
+                        crate::store::sandbox_custody::lock_custody_root(custody.custody_id);
+                    let proof = prove_original_candidate(
+                        &fixture.store,
+                        &fixture.sandbox_base,
+                        &session,
+                        &custody,
+                        Uuid::new_v4(),
+                    )?;
+                    fixture
+                        .store
+                        .blocking_lock()
+                        .insert_archive_cleanup_intent(&proof.intent)
+                })
+                .expect("commit fixture intent only")
+            });
+            assert_eq!(run.phase, ArchiveCleanupPhaseV1::IntentCommitted);
+
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            if pause_inside_proof {
+                *ARCHIVE_PROOF_PAUSE.lock().unwrap() = Some(ArchiveProofPause {
+                    session_id: fixture.session_id,
+                    reached: reached_tx,
+                    release: release_rx,
+                });
+            }
+            // Without a mid-proof pause the Store is pinned before replay starts,
+            // so the first checked acquisition deterministically surrenders.
+            let early_pin = (!pause_inside_proof).then(|| fixture.store.blocking_lock());
+            let result = std::thread::scope(|scope| {
+                let replay = scope.spawn(|| {
+                    crate::store::custody_lock_order::set_bounded_wait_for_test(Some(
+                        std::time::Duration::from_millis(60),
+                    ));
+                    fixture.with_process_fixture(|| {
+                        resume_run_with_repository_lock(
+                            &fixture.store,
+                            &fixture.sandbox_base,
+                            run.clone(),
+                        )
+                    })
+                });
+                // Pin the Store (mid-proof variant: once the proof, which already
+                // read its candidate, is paused inside it).
+                let pinned = if pause_inside_proof {
+                    reached_rx
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .expect("proof reached its pause");
+                    let pinned = fixture.store.blocking_lock();
+                    release_tx.send(()).expect("resume the proof");
+                    Some(pinned)
+                } else {
+                    early_pin
+                };
+                let result = replay.join().expect("replay thread");
+                drop(pinned);
+                result
+            });
+            let error = result.err().expect("Store timeout surrenders the replay");
+            let data = cleanup_error(error);
+            assert!(
+                data.retryable,
+                "pause_inside_proof={pause_inside_proof}: {data:?}"
+            );
+            assert_eq!(data.safe_code, ArchiveCleanupSafeCodeV1::ProofUnavailable);
+            let after = fixture
+                .store
+                .blocking_lock()
+                .latest_archive_cleanup_for_session(fixture.session_id)
+                .expect("read run")
+                .expect("run");
+            assert_eq!(
+                after.phase,
+                ArchiveCleanupPhaseV1::IntentCommitted,
+                "pause_inside_proof={pause_inside_proof}: intact intent must not terminalize"
+            );
+
+            let receipt = fixture.settle();
+            fixture.assert_settled(&receipt, &fixture.allocation_oid);
+        }
+    }
+
+    /// Issue #606: a paused archive proof holds its custody stripe and the
+    /// repository mutex. A contended effect admission on the same custody must
+    /// wait for the stripe WITHOUT holding the Store, so an unrelated Store RPC
+    /// completes; releasing the proof settles both with no deadlock.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn paused_archive_proof_neither_pins_store_nor_deadlocks_contended_admission() {
+        let fixture = CleanupFixture::new();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *ARCHIVE_PROOF_PAUSE.lock().unwrap() = Some(ArchiveProofPause {
+            session_id: fixture.session_id,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let custody_id = fixture
+            .store
+            .blocking_lock()
+            .live_custody_for_session(fixture.session_id)
+            .expect("fixture custody")
+            .custody_id;
+        let session = runtime
+            .block_on(async { fixture.store.lock().await.get_session(fixture.session_id) })
+            .expect("session query")
+            .expect("fixture session");
+        let custody = {
+            let (settlements, _worker) = runtime
+                .block_on(async {
+                    crate::sandbox::custody::CustodySettlementService::new(Arc::clone(
+                        &fixture.store,
+                    ))
+                })
+                .expect("settlement service");
+            crate::sandbox::custody::CustodyExecutionRuntime::new(
+                Arc::clone(&fixture.store),
+                settlements,
+                fixture.sandbox_base.clone(),
+                Uuid::new_v4(),
+            )
+        };
+        std::thread::scope(|scope| {
+            let archive = scope.spawn(|| fixture.cleanup_result());
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("archive proof reached its pause while holding the stripe");
+
+            // Contended effect admission on the same custody stripe; the
+            // handshake proves it reached the busy stripe and released the Store.
+            let contended =
+                crate::store::custody_lock_order::admission_contention_signal(custody_id);
+            let mut admission = runtime
+                .spawn(async move { custody.prepare_handoff_resume(&session).await.map(|_| ()) });
+            contended
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("admission reached the busy stripe");
+            assert!(
+                !admission.is_finished(),
+                "admission waits for the stripe the paused proof holds"
+            );
+            runtime.block_on(async {
+                for _ in 0..5 {
+                    let store = Arc::clone(&fixture.store);
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                        store.lock().await.get_session(Uuid::new_v4())
+                    })
+                    .await
+                    .expect("an unrelated Store RPC is not pinned by the queued admission")
+                    .expect("unrelated query");
+                }
+            });
+
+            release_tx.send(()).expect("release the proof");
+            let receipt = archive
+                .join()
+                .expect("archive thread")
+                .expect("archive settles after the proof resumes");
+            fixture.assert_settled(&receipt, &fixture.allocation_oid);
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(60), admission).await
+                })
+                .expect("admission settles after the stripe frees")
+                .expect("admission task");
+        });
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

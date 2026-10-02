@@ -24,9 +24,20 @@ pub fn dispatch_from_env(method: &str, params: Value) -> std::io::Result<RpcResp
 }
 
 pub fn dispatch(socket: &Path, method: &str, params: Value) -> std::io::Result<RpcResponse> {
+    dispatch_with_timeout(socket, method, params, Duration::from_secs(30))
+}
+
+/// Like [`dispatch`], with an explicit per-operation I/O timeout (#1049: the
+/// tool-boundary hook must never wait long on the daemon).
+pub fn dispatch_with_timeout(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> std::io::Result<RpcResponse> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let request = RpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(Value::Number(1.into())),

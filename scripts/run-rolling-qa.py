@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -14,6 +15,14 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SLOT = Path.home() / ".rsi/bin/cargo-slot"
+# QA sweeps build each sha once; incremental state written into the shared
+# target is never reused and grew it to 63 GB (#1063). Set in the process
+# environment only, not SHARD_SPEC_ENV, so the base-cache key is unchanged.
+os.environ.setdefault("CARGO_INCREMENTAL", "0")
+# The spec env rsi-rolling-land hashes into its base-cache key (#988) at its
+# default CARGO_BUILD_JOBS; cargo-slot forces the same values. Shards run under
+# it and record it so their results can seed same-environment landings (#994).
+SHARD_SPEC_ENV = {"CARGO_BUILD_JOBS": "4", "CARGO_PROFILE_DEV_DEBUG": "line-tables-only"}
 NEXTTEST_FAILURE = re.compile(
     r"^\s*(?:FAIL|SIG[A-Z0-9]+) \[[^]]+\] \([^)]*\) (.+)$", re.MULTILINE
 )
@@ -26,6 +35,58 @@ def failures(output):
     return sorted(set(NEXTTEST_FAILURE.findall(output) + CARGO_FAILURE.findall(output)))
 
 
+def parse_signature_matches(lines):
+    """Parse `rsi-known-failure classify` output into a per-test map."""
+    matches = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("KNOWN?"):
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            issues = [int(value.lstrip("#")) for value in parts[1].split(",") if value]
+            matches[parts[2]] = {"state": "known?", "issues": issues}
+        elif line.startswith("KNOWN "):
+            parts = line.split(None, 3)
+            if len(parts) != 4:
+                continue
+            matches[parts[3]] = {"state": "known", "issues": [int(parts[1].lstrip("#"))],
+                                 "class": parts[2]}
+        elif line.startswith("NEW "):
+            matches[line[4:].strip()] = {"state": "new"}
+    return matches
+
+
+def known_failure_binary():
+    """Path to the shared classifier, building it once when missing."""
+    target = os.environ.get("CARGO_TARGET_DIR")
+    binary = Path(target) / "debug/rsi-known-failure" if target else None
+    if binary is not None and binary.exists():
+        return binary
+    subprocess.check_call(
+        [str(SLOT), "cargo", "build", "-p", "rsi-common", "--bin", "rsi-known-failure"],
+        cwd=ROOT,
+    )
+    if binary is None or not binary.exists():
+        raise RuntimeError("rsi-known-failure binary missing after build")
+    return binary
+
+
+def classify_lane(binary, row):
+    """Run the classifier over a lane log; failure to run yields no matches."""
+    if not row["failures"]:
+        return {}
+    log = ROOT / row["log"]
+    if not log.exists():
+        return {}
+    output = subprocess.check_output(
+        [str(binary), "classify", "--log", str(log)], cwd=ROOT, text=True
+    )
+    return parse_signature_matches(output.splitlines())
+
+
 def git(*args):
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
@@ -35,6 +96,19 @@ def shard_fingerprint(tip, jobs, shard="store-01"):
         [sys.executable, "scripts/rolling-shard-fingerprint.py", "--sha", tip,
          "--shard", shard, "--jobs", str(jobs), "--json"], cwd=ROOT, text=True
     ))
+
+
+def tmpdir_class(path):
+    """Filesystem class of a TMPDIR, as the lander classes its gate scratch."""
+    fstype = subprocess.check_output(["stat", "-f", "-c", "%T", str(path)], text=True).strip()
+    return "tmpfs" if fstype in {"tmpfs", "ramfs"} else "disk"
+
+
+def shard_environment(spec_env):
+    """The environment class inputs a shard ran under. Test binaries resolve
+    their scratch like Rust `std::env::temp_dir()`: TMPDIR, else /tmp."""
+    return {"spec_env": dict(spec_env),
+            "tmpdir_class": tmpdir_class(os.environ.get("TMPDIR") or "/tmp")}
 
 
 def shard_counts(summary):
@@ -84,7 +158,7 @@ def closed_issues_since(since):
             return issues
 
 
-def run(label, argv, directory):
+def run(label, argv, directory, spec_env=None):
     log = directory / f"{label}.log"
     started = time.monotonic()
     print(f"running {label}: {' '.join(map(str, argv))}", flush=True)
@@ -92,6 +166,7 @@ def run(label, argv, directory):
         process = subprocess.Popen(
             [str(part) for part in argv], cwd=ROOT, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env={**os.environ, **spec_env} if spec_env is not None else None,
         )
         assert process.stdout is not None
         for line in process.stdout:
@@ -102,6 +177,8 @@ def run(label, argv, directory):
     result = {"label": label, "exit": code, "seconds": round(time.monotonic() - started, 3),
               "log": str(log.relative_to(ROOT)), "summary": SUMMARY.findall(output)[-1:] or [],
               "failures": failures(output)}
+    if spec_env is not None:
+        result["environment"] = shard_environment(spec_env)
     print(f"finished {label}: exit={code} failures={len(result['failures'])}", flush=True)
     return result
 
@@ -152,12 +229,12 @@ def main():
         parser.error("tracked worktree changes would contaminate the QA sweep")
     results = state["results"]
 
-    def record(label, command):
+    def record(label, command, spec_env=None):
         prior = next((row for row in results if row["label"] == label), None)
         if prior:
             print(f"reusing completed {label}: exit={prior['exit']}", flush=True)
             return prior
-        result = run(label, command, directory)
+        result = run(label, command, directory, spec_env)
         results.append(result)
         save_state(directory, state)
         return result
@@ -178,7 +255,7 @@ def main():
             if shard_dir.exists() and not any(row["label"] == shard for row in results):
                 shard_dir = directory / f"{shard}-retry-{time.time_ns()}"
             record(shard, [SLOT, "scripts/run-rsid-test-shards.sh", "shard", shard,
-                   "--jobs", args.jobs, "--evidence-dir", shard_dir])
+                   "--jobs", args.jobs, "--evidence-dir", shard_dir], SHARD_SPEC_ENV)
         integrations = sorted(path.stem for path in (ROOT / "crates/rsid/tests").glob("*.rs"))
         record("integrations", [SLOT, "cargo", "nextest", "run", "--profile", "rsid-fast",
                "-p", "rsid", *(part for name in integrations for part in ("--test", name)),
@@ -194,10 +271,22 @@ def main():
             record(label, [SLOT, *command])
     git("fetch", "origin")
     final_tip = git("rev-parse", "origin/rolling")
+    # Known-failure annotation (#1016) must never break a sweep.
+    signature_matches = {}
+    try:
+        classifier = known_failure_binary()
+        for row in results:
+            matches = classify_lane(classifier, row)
+            if matches:
+                signature_matches[row["label"]] = matches
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"known_failures=unavailable: {error}", file=sys.stderr)
+        signature_matches = {}
     report = {"tip": tip, "final_rolling": final_tip, "tip_stable": tip == final_tip,
               "jobs": args.jobs, "fingerprint": state["fingerprint"],
               "sweep_finished_at": datetime.now(timezone.utc).isoformat(),
               "closed_since": args.closed_since, "closed_issues": closed_issues_since(args.closed_since),
+              "signature_matches": signature_matches,
               "results": results}
     (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     shard_rows = []
@@ -207,10 +296,15 @@ def main():
         counts = shard_counts(row["summary"])
         shard_rows.append({"name": row["label"], **(counts or {"run": 0, "passed": 0, "failed": 0, "skipped": 0}),
                            "exit_code": row["exit"], "failing_tests": row["failures"],
-                           "fingerprint": shard_fingerprint(tip, args.jobs, row["label"])})
+                           "fingerprint": shard_fingerprint(tip, args.jobs, row["label"]),
+                           **({"environment": row["environment"]} if "environment" in row else {}),
+                           **({"known_failures": signature_matches[row["label"]]}
+                              if row["label"] in signature_matches else {})})
     lane_names = {"integrations", "bins", "rsid-doc", "rsi", "rsi-common"}
     lane_rows = [{"name": row["label"], "exit_code": row["exit"],
-                  "failing_tests": row["failures"]}
+                  "failing_tests": row["failures"],
+                  **({"known_failures": signature_matches[row["label"]]}
+                     if row["label"] in signature_matches else {})}
                  for row in results if row["label"] in lane_names]
     complete = (static["exit"] == 0 and len(shard_rows) == 16 and len(lane_rows) == 5
                 and all(shard_counts(row["summary"]) is not None
@@ -225,6 +319,11 @@ def main():
         "shards": shard_rows, "lanes": lane_rows,
     }
     (directory / "sweep-report.json").write_text(json.dumps(sweep_report, indent=2) + "\n")
+    totals = {"known": 0, "known?": 0, "new": 0}
+    for matches in signature_matches.values():
+        for match in matches.values():
+            totals[match["state"]] += 1
+    print(f"known={totals['known']} known?={totals['known?']} new={totals['new']}")
     print(f"report: {directory / 'report.json'}")
     return 0 if all(row["exit"] == 0 for row in results) else 1
 

@@ -10,7 +10,7 @@ Input: a plan under `thoughts/shared/plans/`. Each phase lists its changes and
 its success criteria. Your job is to land the phases in order and prove each
 one before moving on.
 
-**Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=implementation` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
+**Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=implementation` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
 ## Five-Expert Verification Framework
 

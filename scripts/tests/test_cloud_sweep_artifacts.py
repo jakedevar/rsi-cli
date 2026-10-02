@@ -1,6 +1,7 @@
 """Cloud QA artifacts must account for every executed lane and seed state."""
 
 from contextlib import redirect_stdout
+import gzip
 import importlib.util
 import io
 import json
@@ -71,6 +72,8 @@ class CloudSweepArtifactsTest(unittest.TestCase):
             report = self.json_report(root)
             self.assertTrue(report["complete"])
             self.assertIn("@", report["shards"][0]["fingerprint"]["inputs"]["host_class"])
+            self.assertEqual(report["shards"][0]["environment"],
+                             {"spec_env": {"CARGO_BUILD_JOBS": "4"}, "tmpdir_class": "disk"})
             self.assertEqual(report["extra_lanes"], [
                 {"name": "other-workspace", "exit_code": 100,
                  "failing_tests": ["other::fails"]},
@@ -106,6 +109,121 @@ class CloudSweepArtifactsTest(unittest.TestCase):
             )
             self.assertIn("Names absent from seed set: 0", seeded.stdout)
             self.assertIn("- `other::fails`", seeded.stdout)
+
+    def test_failed_lane_log_excerpts_survive_collect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "status").mkdir()
+            (root / "logs").mkdir()
+            self.write_lane(root, "other-05", 100,
+                            "noise\nFAIL [ 00:01 ] (1/1) sandbox::t::shared\n"
+                            "thread 'x' panicked at src/t.rs:1:1:\nassertion failed\n")
+            self.write_lane(root, "session-01", 0, "all green\n")
+            packed = subprocess.run(
+                ["bash", str(ROOT / "scripts/cloud-sweep-excerpts.sh"), str(root)],
+                check=True, capture_output=True,
+            ).stdout
+            out = root / "unpacked"
+            out.mkdir()
+            subprocess.run(["tar", "-xf", "-", "-C", str(out)], input=packed, check=True)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["other-05.log.gz", "other-05.txt"])
+            excerpt = (out / "other-05.txt").read_text()
+            self.assertIn("lane=other-05 exit=100", excerpt)
+            self.assertIn("sandbox::t::shared", excerpt)
+            self.assertIn("assertion failed", excerpt)
+            with gzip.open(out / "other-05.log.gz", "rt") as full:
+                self.assertIn("sandbox::t::shared", full.read())
+
+    def collected_sweep(self, root, lanes, failures=(), harness=(), log=""):
+        """A collected result dir: QA.md as the host report prints it, plus the
+        failure-logs collect brings back."""
+        (root / "failure-logs").mkdir(parents=True)
+        names = list(failures) + [f"{lane}:build_or_harness_failure" for lane in harness]
+        body = ["# Cloud QA sweep", "", "Tip SHA: `" + "a" * 40 + "`  ", f"Lanes: {lanes}  ", "",
+                "Seed set: absent; classification unavailable",
+                "Unclassified failing names (seed names alone do not verify failure signatures):"]
+        body += [f"- `{name}`" for name in names] or ["- none"]
+        body += ["FLAKE lines:", "- none observed", ""]
+        (root / "QA.md").write_text("\n".join(body))
+        if failures:
+            with gzip.open(root / "failure-logs/other-05.log.gz", "wt") as handle:
+                handle.write(log)
+
+    def fake_classifier(self, root, known=()):
+        """A classifier stub: KNOWN #7 for `known` names, NEW for the rest."""
+        script = root / "fake-classifier"
+        script.write_text(
+            "#!/bin/sh\nlog=$3\n"
+            "grep -o 'FAIL .*) test .*' \"$log\" | sed 's/.*) test //' | while read t; do\n"
+            "  case \" " + " ".join(known) + " \" in *\" $t \"*) echo \"KNOWN #7 flake $t\";;"
+            " *) echo \"NEW $t\";; esac\ndone\n")
+        script.chmod(0o755)
+        (root / "snapshot.json").write_text("{}")
+        return script
+
+    def run_verdict(self, root, classifier=None, snapshot=None):
+        argv = [sys.executable, str(ROOT / "scripts/cloud-sweep-verdict.py"), str(root),
+                "--snapshot", str(snapshot or root / "snapshot.json"),
+                "--classifier", str(classifier or root / "missing-classifier")]
+        run = subprocess.run(argv, check=True, capture_output=True, text=True,
+                             env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+        return (root / "QA.md").read_text(), run.stdout
+
+    FAIL_LOG = ("FAIL [ 00:01 ] (1/2) test a::known\n"
+                "FAIL [ 00:01 ] (2/2) test b::other\n")
+
+    def test_verdict_green_when_every_red_is_known(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7, ["a::known", "b::other"], log=self.FAIL_LOG)
+            qa, _ = self.run_verdict(root, self.fake_classifier(root, ["a::known", "b::other"]))
+            self.assertIn("- KNOWN #7 `a::known`", qa)
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT GREEN {'a' * 40} new=0")
+            self.assertIn("Known only: #7", qa)
+
+    def test_verdict_red_counts_unknown_reds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7, ["a::known", "b::other"], log=self.FAIL_LOG)
+            qa, _ = self.run_verdict(root, self.fake_classifier(root, ["a::known"]))
+            self.assertIn("- NEW `b::other`", qa)
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT RED {'a' * 40} new=1")
+
+    def test_verdict_green_with_no_reds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7)
+            qa, _ = self.run_verdict(root, self.fake_classifier(root))
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT GREEN {'a' * 40} new=0")
+
+    def test_verdict_incomplete_on_build_failure_or_no_lanes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7, harness=["other-05"])
+            qa, _ = self.run_verdict(root, self.fake_classifier(root))
+            self.assertIn("other-05:build_or_harness_failure", qa)
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT INCOMPLETE {'a' * 40} new=0")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 0)
+            qa, _ = self.run_verdict(root, self.fake_classifier(root))
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT INCOMPLETE {'a' * 40} new=0")
+
+    def test_verdict_states_missing_classifier_and_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7, ["a::known"], log=self.FAIL_LOG)
+            qa, _ = self.run_verdict(root)
+            self.assertIn("Classification unavailable: rsi-known-failure CLI not found", qa)
+            self.assertIn("- NEW `a::known`", qa)
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT RED {'a' * 40} new=1")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.collected_sweep(root, 7, ["a::known"], log=self.FAIL_LOG)
+            classifier = self.fake_classifier(root, ["a::known"])
+            qa, _ = self.run_verdict(root, classifier, snapshot=root / "absent.json")
+            self.assertIn("Classification unavailable: snapshot", qa)
+            self.assertIn("VERDICT RED", qa.strip().splitlines()[-1])
 
 
 if __name__ == "__main__":

@@ -4067,7 +4067,7 @@ impl Store {
         after_observation: Option<&str>,
         refusal_code: Option<&str>,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let now = timestamp();
         let changed = tx.execute(
             "UPDATE source_worktree_settlement_items SET phase=?1,

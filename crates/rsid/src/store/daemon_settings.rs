@@ -395,7 +395,7 @@ impl Store {
                 })?;
         let changed = tx
             .execute(
-                "UPDATE sessions SET status = 'Failed', stop_reason = COALESCE(stop_reason, ?1), updated_at = ?2 WHERE id = ?3",
+                "UPDATE sessions SET status = 'Failed', stop_reason = COALESCE(NULLIF(TRIM(stop_reason), ''), ?1), updated_at = ?2 WHERE id = ?3",
                 params![stop_reason, now, session_id.to_string()],
             )
             .map_err(|source| C5TransitionError::Retryable {
@@ -815,6 +815,23 @@ impl Store {
         }
     }
 
+    /// Read every settings key beginning with `prefix`, ordered lexically.
+    /// Callers parse and validate each value; this accessor never invents a
+    /// default.
+    pub fn list_daemon_settings_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT key, value FROM daemon_settings WHERE key >= ?1 AND key < ?2 ORDER BY key",
+        )?;
+        let mut upper = prefix.to_owned();
+        upper.push('\u{10ffff}');
+        let rows = statement
+            .query_map(params![prefix, upper], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// UPSERT a `daemon_settings` row. Caller MUST pre-validate `value` —
     /// this is a raw write. Timestamp is `chrono::Utc::now().to_rfc3339()`
     /// per the daemon's timestamp convention (CLAUDE.md "Database Rules").
@@ -831,7 +848,7 @@ impl Store {
 }
 
 fn daemon_setting_text_to_json(field: &str, raw: &str) -> serde_json::Value {
-    if field.starts_with("api_route.openrouter") {
+    if field.starts_with("api_route.openrouter") || field.starts_with("api_route.bedrock") {
         return if raw == "null" {
             serde_json::Value::Null
         } else {
@@ -1128,7 +1145,7 @@ pub fn apply_persisted_runtime_config(
         }
     }
     let mut routes = store.conn.prepare(
-        "SELECT key, value FROM daemon_settings WHERE key LIKE 'api_route.openrouter.%'",
+        "SELECT key, value FROM daemon_settings WHERE key LIKE 'api_route.openrouter.%' OR key LIKE 'api_route.bedrock.%'",
     )?;
     let rows = routes.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

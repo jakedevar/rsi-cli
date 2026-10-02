@@ -66,6 +66,7 @@ fn source_work(f: &Fixture, key: &str, epic: Uuid, author: Uuid) -> i64 {
                 ManagerWorkStageV2::Review,
                 ManagerWorkStageV2::Verification,
             ],
+            risk_tier: Default::default(),
         },
         key,
     );
@@ -111,6 +112,8 @@ fn review(
                 model: model.into(),
                 effort: None,
             },
+            delta_of: None,
+            finding_keys: vec![],
         },
         &format!("review-{key}-{model}"),
     );
@@ -171,6 +174,66 @@ fn current_lead_request_review_reserves_with_itself_as_requester() {
         )
         .unwrap();
     assert_eq!(state, "allocating");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn tier2_work_requires_configured_reviewer_model_tier() {
+    let f = fixture();
+    let policy_version = review_policy(&f, false);
+    let mut policy = f
+        .store
+        .get_harness_manager_policy(f.project)
+        .unwrap()
+        .unwrap();
+    policy.policy.minimum_tier2_reviewer_tier = rsi_common::model_control::ModelTier::Premium;
+    policy.policy.allowed_launches.push(ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-haiku-4-5".into(),
+        effort: None,
+    });
+    f.store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: f.project,
+            expected_scope_version: 1,
+            expected_policy_version: policy_version,
+            idempotency_key: "tier2-review-policy".into(),
+            policy: policy.policy,
+        })
+        .unwrap();
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    source_work(&f, "tier2", f.epic, f.lead);
+    let (row, mut work) = f.store.manager_v2_work(&config, "tier2").unwrap();
+    work.risk_tier = ManagerWorkRiskTierV2::Tier2;
+    let version = f
+        .store
+        .manager_v2_put_record(
+            &config,
+            "work",
+            "tier2",
+            Some(f.epic),
+            row.row_version,
+            &json!(work),
+        )
+        .unwrap()
+        .row_version;
+    let error = reserve(
+        &f,
+        f.lead,
+        &review("tier2", version, policy_version + 1, "claude-haiku-4-5"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("manager_review_reviewer_tier_below_minimum"),
+        "{error}"
+    );
+    reserve(
+        &f,
+        f.lead,
+        &review("tier2", version, policy_version + 1, "claude-sonnet-5"),
+    )
+    .unwrap();
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -368,6 +431,7 @@ fn lead_review_does_not_grant_manager_only_updates() {
                 ManagerWorkStageV2::Review,
                 ManagerWorkStageV2::Verification,
             ],
+            risk_tier: Default::default(),
         },
         ManagerUpdateV2::Dependency {
             key: "restricted".into(),

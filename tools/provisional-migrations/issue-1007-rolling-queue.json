@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": 140,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/mod.rs",
+      "path_template": "crates/rsid/src/store/mod.rs",
+      "source_blob": "sha256:33db1fd5a7eb5e4e726c6a6b707fd51b18ce915fe7b7d792dc1abcc9ac59fc0b",
+      "sites": [
+        {
+          "anchor": "pub const LATEST_SCHEMA_VERSION: i32 = 140;",
+          "replacement": "pub const LATEST_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if version < 140 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "rolling_queue::apply_migration(self, 140)?;",
+          "replacement": "rolling_queue::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/rolling_queue.rs",
+      "path_template": "crates/rsid/src/store/rolling_queue.rs",
+      "source_blob": "sha256:9cd801642dcfe379498ba90a40fd2b9816be182d651b0a6173ee9a107721845c",
+      "sites": [
+        {
+          "anchor": "pub(crate) const ROLLING_QUEUE_SCHEMA_VERSION: i32 = 140;",
+          "replacement": "pub(crate) const ROLLING_QUEUE_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:7c0efe8e461dfeffa0bc1023d9d423dd07033566791ec73d2b44a493210fd0b8",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 140;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

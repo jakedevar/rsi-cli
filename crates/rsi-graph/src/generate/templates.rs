@@ -6,6 +6,8 @@ use crate::format::{
     GraphViewVisualEdge, GraphViewVisualEdgeKind, NodeDef, WorkflowDefinition,
 };
 
+mod skill_demos;
+
 /// Marks a workflow entry whose instructions must flow to the next node as
 /// internal context instead of being repeated in the entry session's response.
 pub const PIPELINE_ENTRY_CONTEXT_TAG: &str = "pipeline-entry-context";
@@ -89,6 +91,21 @@ const STARTER_TEMPLATES: &[StarterTemplateSpec] = &[
             "Research + plan + implement + review + verify + docs",
         ],
     },
+    StarterTemplateSpec {
+        name: "rsi_project_manager",
+        label: "RSI Project Manager",
+        description: "Learning demo: manager seat -> workers -> integrate -> verify -> rolling -> QA -> handoff.",
+        use_cases: &[
+            "Agentic development walkthrough",
+            "rsi-project-manager skill",
+        ],
+    },
+    StarterTemplateSpec {
+        name: "rsi_agent_control",
+        label: "RSI Agent Control",
+        description: "Learning demo: authority -> transport -> dispatch -> receipts, retries and event wakes.",
+        use_cases: &["Agent control walkthrough", "rsi-agent-control skill"],
+    },
 ];
 
 pub fn starter_templates() -> &'static [StarterTemplateSpec] {
@@ -107,6 +124,8 @@ pub fn build_starter_workflow(name: &str) -> Option<WorkflowDefinition> {
         "master_implement" => Some(master_implement_template()),
         "master_improve" => Some(master_improve_template()),
         "master_orchestrate" => Some(master_orchestrate_template()),
+        "rsi_project_manager" => Some(skill_demos::project_manager()),
+        "rsi_agent_control" => Some(skill_demos::agent_control()),
         _ => None,
     }
 }
@@ -893,7 +912,24 @@ mod tests {
 
     #[test]
     fn starter_templates_expose_all_patterns() {
-        assert_eq!(starter_templates().len(), 10);
+        let names: Vec<_> = starter_templates().iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "horizontal",
+                "pingpong",
+                "hub",
+                "vertical",
+                "vertical_decision",
+                "brainstorm",
+                "instructor_assistant",
+                "master_implement",
+                "master_improve",
+                "master_orchestrate",
+                "rsi_project_manager",
+                "rsi_agent_control",
+            ]
+        );
     }
 
     #[test]

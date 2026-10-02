@@ -437,6 +437,43 @@ pub(crate) struct RegisteredTargetProbe {
 pub(crate) struct RegisteredTargetIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+    /// The directory's birth time where the filesystem reports one. A
+    /// recreated `target/` can reuse the device and inode of a reclaimed one
+    /// but never its birth time (#1040).
+    pub(crate) birth: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[cfg(test)]
+pub(crate) fn directory_birth_time_for_test(
+    directory: &std::fs::File,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    directory_birth_time(directory.as_raw_fd())
+}
+
+/// The statx birth time of an open directory, or `None` when the kernel or
+/// filesystem does not report one.
+fn directory_birth_time(fd: RawFd) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut buf = std::mem::MaybeUninit::<nix::libc::statx>::zeroed();
+    // SAFETY: `fd` is a live descriptor, the empty path with AT_EMPTY_PATH
+    // names the descriptor itself, and `buf` is a valid statx out-parameter.
+    let rc = unsafe {
+        nix::libc::statx(
+            fd,
+            c"".as_ptr(),
+            nix::libc::AT_EMPTY_PATH,
+            nix::libc::STATX_BTIME,
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: statx returned success, so the kernel initialized the struct.
+    let buf = unsafe { buf.assume_init() };
+    if buf.stx_mask & nix::libc::STATX_BTIME == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(buf.stx_btime.tv_sec, buf.stx_btime.tv_nsec)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -607,6 +644,7 @@ impl PinnedSandboxRoot {
         Ok(RegisteredTargetIdentity {
             device: opened.st_dev as u64,
             inode: opened.st_ino as u64,
+            birth: directory_birth_time(target.as_raw_fd()),
         })
     }
 
@@ -4488,9 +4526,41 @@ mod tests {
         );
     }
 
-    fn available_bytes(path: &Path) -> u64 {
-        let stats = nix::sys::statvfs::statvfs(path).unwrap();
-        (stats.blocks_available() as u64).saturating_mul(stats.fragment_size() as u64)
+    /// Allocated bytes of one inode, read the way the reclaim ledger reads it
+    /// (`st_blocks * 512`). On filesystems with speculative preallocation (XFS,
+    /// the cloud gate host's root) this value is transient after a write, so a
+    /// test that needs the charge must bracket the moment the code under test
+    /// reads it with `AllocationWindow` instead of trusting one early sample.
+    fn allocated_bytes(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    /// The closed range of allocations one inode showed while the code under
+    /// test ran. The reclaim ledger's charge for the inode must fall inside it.
+    struct AllocationWindow {
+        lo: u64,
+        hi: u64,
+    }
+
+    impl AllocationWindow {
+        fn start(path: &Path) -> Self {
+            let now = allocated_bytes(path);
+            Self { lo: now, hi: now }
+        }
+
+        fn observe(&mut self, path: &Path) {
+            let now = allocated_bytes(path);
+            self.lo = self.lo.min(now);
+            self.hi = self.hi.max(now);
+        }
+    }
+
+    /// The external namespace still holds the one inode, untouched by reclaim.
+    fn assert_external_link_retained(external: &Path, ino: u64, len: u64) {
+        let meta = std::fs::metadata(external).unwrap();
+        assert_eq!(meta.ino(), ino, "external link must keep the same inode");
+        assert_eq!(meta.len(), len, "external link content must be intact");
+        assert_eq!(meta.nlink(), 1, "only the external link may remain");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -4774,31 +4844,35 @@ mod tests {
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
         let external = temp.path().join("external-link");
         std::fs::hard_link(&file, &external).unwrap();
-        let allocated = std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut allocated = AllocationWindow::start(&file);
+        let external_meta = std::fs::metadata(&external).unwrap();
+        let (ino, len) = (external_meta.ino(), external_meta.len());
 
         let pass = ReclaimPassState::new();
         let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
         let inspected = with_reclaim_pass_state(&pass, || pinned.inspect_target());
+        allocated.observe(&external);
         let (reclaimable, _) = pass.reclaimable_summary();
         assert_eq!(inspected.kind, TargetReclaimKind::Inspected);
         assert!(
-            inspected.bytes.saturating_sub(reclaimable) >= allocated,
-            "external file blocks must stay out of preview: {inspected:?}, reclaimable={reclaimable}, allocated={allocated}"
+            inspected.bytes.saturating_sub(reclaimable) >= allocated.lo,
+            "external file blocks must stay out of preview: {inspected:?}, reclaimable={reclaimable}, allocated={}..{}",
+            allocated.lo,
+            allocated.hi
         );
 
-        let before = available_bytes(&base);
         let actual_pass = ReclaimPassState::new();
         let removed = with_reclaim_pass_state(&actual_pass, || pinned.reclaim_target(id, 11));
-        let after = available_bytes(&base);
         assert_eq!(removed.kind, TargetReclaimKind::StagedRemoved);
-        assert!(external.exists());
-        assert_eq!(
-            std::fs::metadata(&external).unwrap().blocks() * 512,
-            allocated
-        );
+        // Ledger-level, not statvfs: the external link still owns the inode,
+        // so the actual pass may not claim its blocks as freed.
+        assert_external_link_retained(&external, ino, len);
+        let (claimed, _) = actual_pass.reclaimable_summary();
         assert!(
-            after.saturating_sub(before) < allocated,
-            "statvfs must not report the externally retained file's blocks as reclaimed"
+            removed.bytes.saturating_sub(claimed) >= allocated.lo,
+            "the retained inode's blocks must stay out of the claimed reclaim: {removed:?}, claimed={claimed}, allocated={}..{}",
+            allocated.lo,
+            allocated.hi
         );
     }
 
@@ -4809,7 +4883,7 @@ mod tests {
         let file = root.join("target/raced");
         std::fs::write(&file, vec![8_u8; 8 * 1024 * 1024]).unwrap();
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
-        let allocated = std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut allocated = AllocationWindow::start(&file);
         let external = temp.path().join("post-sizing-external-link");
         let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
         let pass = ReclaimPassState::new();
@@ -4827,11 +4901,14 @@ mod tests {
         let outcome = with_reclaim_pass_state(&pass, || pinned.reclaim_target(id, 111));
         attacker.join().unwrap();
         let (estimate, _) = pass.reclaimable_summary();
+        allocated.observe(&external);
         assert_eq!(outcome.kind, TargetReclaimKind::StagedRemoved);
         assert!(external.exists(), "external namespace must not be deleted");
         assert!(
-            outcome.bytes.saturating_sub(estimate) >= allocated,
-            "the drifted inode contributes zero estimated capacity: outcome={outcome:?}, estimate={estimate}, allocated={allocated}"
+            outcome.bytes.saturating_sub(estimate) >= allocated.lo,
+            "the drifted inode contributes zero estimated capacity: outcome={outcome:?}, estimate={estimate}, allocated={}..{}",
+            allocated.lo,
+            allocated.hi
         );
     }
 
@@ -4855,29 +4932,41 @@ mod tests {
             .sync_all()
             .unwrap();
         std::fs::hard_link(&first_file, &second_file).unwrap();
-        let allocated = std::fs::metadata(&first_file).unwrap().blocks() * 512;
+        // The ledger charges st_blocks at inspect time. On XFS that value is
+        // transient (speculative preallocation), so bracket both inspections
+        // and require the one-inode charge to fall inside the observed range.
+        let mut allocated = AllocationWindow::start(&first_file);
         let first = PinnedSandboxRoot::open(&base, &first_root, first_id).unwrap();
         let second = PinnedSandboxRoot::open(&base, &second_root, second_id).unwrap();
 
         let pass = ReclaimPassState::new();
         let first_outcome = with_reclaim_pass_state(&pass, || first.inspect_target());
+        allocated.observe(&first_file);
         let (first_claim, _) = pass.reclaimable_summary();
         assert!(
-            first_outcome.bytes.saturating_sub(first_claim) >= allocated,
+            first_outcome.bytes.saturating_sub(first_claim) >= allocated.lo,
             "one retaining candidate link is not yet the full deletion set"
         );
         let second_outcome = with_reclaim_pass_state(&pass, || second.inspect_target());
+        allocated.observe(&first_file);
         let (complete_claim, _) = pass.reclaimable_summary();
-        assert_eq!(
-            complete_claim,
-            first_outcome
-                .bytes
-                .saturating_add(second_outcome.bytes)
-                .saturating_sub(allocated),
-            "the shared inode contributes exactly one allocated-block charge"
+        let charged_once = first_outcome
+            .bytes
+            .saturating_add(second_outcome.bytes)
+            .saturating_sub(complete_claim);
+        assert!(
+            (allocated.lo..=allocated.hi).contains(&charged_once),
+            "the shared inode contributes exactly one allocated-block charge: charged={charged_once}, allocated={}..{}",
+            allocated.lo,
+            allocated.hi
+        );
+        assert!(
+            allocated.lo > 0 && charged_once < allocated.lo.saturating_mul(2),
+            "the shared inode must not be charged twice"
         );
 
-        let before = available_bytes(&base);
+        // Ledger-level end state instead of a machine-wide statvfs reading,
+        // which races with every other test writing to the same filesystem.
         let actual = ReclaimPassState::new();
         assert_eq!(
             with_reclaim_pass_state(&actual, || first.reclaim_target(first_id, 12)).kind,
@@ -4887,12 +4976,7 @@ mod tests {
             with_reclaim_pass_state(&actual, || second.reclaim_target(second_id, 13)).kind,
             TargetReclaimKind::StagedRemoved
         );
-        let after = available_bytes(&base);
         assert!(!first_file.exists() && !second_file.exists());
-        assert!(
-            after >= before,
-            "actual statvfs availability cannot regress"
-        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

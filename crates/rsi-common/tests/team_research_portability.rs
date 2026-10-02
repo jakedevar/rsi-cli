@@ -41,7 +41,7 @@ fn team_research_discovers_domains_without_rsi_checkout_assumptions() {
     let relevant = format!("{preamble}\n{decomposition}");
 
     for forbidden in [
-        "/home/jakedevar/rsi",
+        "/home/",
         "crates/rsi/src",
         "crates/rsid/src",
         "crates/rsi-common",

@@ -6,6 +6,7 @@ use crate::app::App;
 use crate::claude_config;
 use crate::modalkit_types::LcAction;
 use crate::model_control_stats::stats_row_action;
+use crate::overlay::mcp_server_form::{open_mcp_server_form, open_mcp_server_secret_form};
 use crate::overlay::{
     open_budget_policy_form, open_hook_form, open_message_bridge_form,
     open_provider_credential_form, open_provider_form, open_skill_preview,
@@ -16,7 +17,9 @@ use crate::settings::{
 };
 #[cfg(test)]
 use crate::settings::{DaemonFeatureValue, OBSERVATION_THRESHOLDS};
-use crate::settings_registry::{SETTINGS, SettingId, SettingOwner, SettingSpec, SettingsSection};
+use crate::settings_registry::{
+    SETTINGS, SettingId, SettingOwner, SettingSpec, SettingsGroup, SettingsSection,
+};
 use crate::types::{
     HookFormEditingTarget, Pane, ProviderKeyClearConfirmation, SettingsFocus, SettingsState,
 };
@@ -42,11 +45,12 @@ pub const DAEMON_FEATURE_SECTIONS: &[SettingsSection] = &[
 /// registry classes its owner `Daemon` (persisted runtime config) or
 /// `DaemonState` (model control / sandbox storage, reached through the same
 /// generic toggle path even though it is a different RPC family).
-fn daemon_feature_field_for(id: SettingId) -> Option<&'static str> {
+pub(crate) fn daemon_feature_field_for(id: SettingId) -> Option<&'static str> {
     match id {
         SettingId::ModelControlMode => Some("model_control_mode"),
         SettingId::EmergencyStop => Some("model_control_stop_all"),
         SettingId::SandboxStorageStatus => Some("sandbox_storage_status"),
+        SettingId::CloudSpendStatus => Some("cloud_spend_status"),
         SettingId::PreviewReclaim => Some("sandbox_build_cache_dry_run"),
         SettingId::ReclaimNow => Some("sandbox_build_cache_reclaim_now"),
         SettingId::SourceWorktreeSettlement => Some("source_worktree_settlement"),
@@ -76,13 +80,13 @@ pub fn memory_dreaming_row_count() -> usize {
 
 /// Every registry row for `section` that is backed by a flat
 /// `app.daemon_features` entry, paired with that entry's index, in registry
-/// (`SettingId::index()`) order.
+/// (`SETTINGS` declaration) order.
 #[must_use]
 pub fn daemon_feature_rows_for_section(
     app: &App,
     section: SettingsSection,
 ) -> Vec<(&'static SettingSpec, usize)> {
-    let mut rows: Vec<(&'static SettingSpec, usize)> = SETTINGS
+    SETTINGS
         .iter()
         .filter(|spec| spec.section == section)
         .filter_map(|spec| {
@@ -90,9 +94,7 @@ pub fn daemon_feature_rows_for_section(
             let vec_idx = app.daemon_features.iter().position(|e| e.field == field)?;
             Some((spec, vec_idx))
         })
-        .collect();
-    rows.sort_by_key(|(spec, _)| spec.id.index());
-    rows
+        .collect()
 }
 
 /// Resolve a within-section row index to its `app.daemon_features` index.
@@ -503,6 +505,32 @@ fn import_provider_credentials_from_env(app: &mut App) {
         .push(LcAction::ImportProviderCredentialsFromEnv);
 }
 
+fn selected_mcp_summary(app: &App) -> Option<&rsi_common::mcp::McpServerSummary> {
+    app.cached_mcp_servers
+        .as_ref()
+        .and_then(|list| list.servers.get(app.settings_state.selected_index))
+}
+
+fn open_mcp_server_form_for_selected(app: &mut App) {
+    let summary = selected_mcp_summary(app).cloned();
+    open_mcp_server_form(app, summary.as_ref());
+}
+
+fn open_mcp_secret_form_for_selected(app: &mut App, rotate: bool) {
+    if let Some(summary) = selected_mcp_summary(app) {
+        open_mcp_server_secret_form(app, summary.definition.id.clone(), rotate);
+    }
+}
+
+fn toggle_selected_mcp_server(app: &mut App) {
+    if let Some(summary) = selected_mcp_summary(app) {
+        app.pending_lc_actions.push(LcAction::SetMcpServerEnabled {
+            id: summary.definition.id.clone(),
+            enabled: !summary.definition.enabled,
+        });
+    }
+}
+
 // --- Skills helpers --------------------------------------------------------
 
 /// Open the read-only SKILL.md viewer for the currently selected skill row.
@@ -715,6 +743,15 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 handle_api_models_enter(app);
             } else if section == SettingsSection::MessageBridges {
                 handle_message_bridges_enter(app);
+            } else if section == SettingsSection::Satellites {
+                if idx == 0 {
+                    app.pending_lc_actions.push(LcAction::OpenSatelliteRegistry);
+                } else if let Some(field) = daemon_feature_field_for(SettingId::SatellitePolling)
+                    && let Some(vec_idx) = app.daemon_features.iter().position(|e| e.field == field)
+                {
+                    app.pending_lc_actions
+                        .push(LcAction::ToggleDaemonFeature(vec_idx));
+                }
             } else if section == SettingsSection::ClaudeHooks {
                 open_hook_edit_for_selected_index(app);
             } else if section == SettingsSection::ClaudeSkills {
@@ -739,6 +776,8 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 handle_budgets_enter(app);
             } else if section == SettingsSection::ProviderKeys {
                 open_provider_credential_form_for_selected(app, false);
+            } else if section == SettingsSection::McpServers {
+                open_mcp_server_form_for_selected(app);
             } else if section == SettingsSection::ModelRoles {
                 // All Model Roles items use the model dropdown.
                 if app.settings_state.model_dropdown.open {
@@ -823,6 +862,21 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Session List: J / K move the selected optional navigator column
+        // later / earlier in the active preset's saved order.
+        KeyCode::Char(c @ ('J' | 'K'))
+            if app.settings_state.section == SettingsSection::SessionList
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            let delta = if c == 'J' { 1 } else { -1 };
+            let row = app.settings_state.selected_index;
+            if let Some(new_row) = app.settings.move_navigator_column(row, delta) {
+                app.settings_state.selected_index = new_row;
+                app.invalidate_card_cache();
+            }
+            true
+        }
+
         // Skills-specific: 'e' to enable/disable selected skill
         KeyCode::Char('e')
             if app.settings_state.section == SettingsSection::ClaudeSkills
@@ -903,6 +957,53 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         {
             app.pending_lc_actions
                 .push(LcAction::RefreshProviderCredentials);
+            true
+        }
+
+        KeyCode::Char('a')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            open_mcp_server_form(app, None);
+            true
+        }
+        KeyCode::Char('t')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            toggle_selected_mcp_server(app);
+            true
+        }
+        KeyCode::Char('s')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            open_mcp_secret_form_for_selected(app, false);
+            true
+        }
+        KeyCode::Char('r')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            open_mcp_secret_form_for_selected(app, true);
+            true
+        }
+        KeyCode::Char('d')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            if let Some(summary) = selected_mcp_summary(app) {
+                app.pending_lc_actions.push(LcAction::ClearMcpServerSecret {
+                    id: summary.definition.id.clone(),
+                });
+            }
+            true
+        }
+        KeyCode::Char('R')
+            if app.settings_state.section == SettingsSection::McpServers
+                && app.settings_state.focus == SettingsFocus::Items =>
+        {
+            app.pending_lc_actions.push(LcAction::RefreshMcpServers);
             true
         }
 
@@ -1000,6 +1101,33 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Section tabs of the selected category: Tab / Shift-Tab, or `]` / `[`
+        // (the Issues workspace's tab keys). Works from the rail and the list.
+        KeyCode::Tab | KeyCode::Char(']') => {
+            cycle_section_tab(app, 1);
+            true
+        }
+        KeyCode::BackTab | KeyCode::Char('[') => {
+            cycle_section_tab(app, -1);
+            true
+        }
+
+        // Panel resizing: `>` widens the focused panel, `<` narrows it, `=`
+        // restores the automatic widths. Widths persist in `UserSettings`.
+        KeyCode::Char('>') => {
+            resize_settings_panels(app, true);
+            true
+        }
+        KeyCode::Char('<') => {
+            resize_settings_panels(app, false);
+            true
+        }
+        KeyCode::Char('=') => {
+            app.settings.settings_rail_width = None;
+            app.settings.settings_info_width = None;
+            true
+        }
+
         // Consume l/Right in items panel (already in right panel)
         KeyCode::Char('l') | KeyCode::Right => true,
 
@@ -1007,14 +1135,83 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+/// Move to the next (`step > 0`) or previous section tab of the selected
+/// category, wrapping inside the category. The list cursor resets to the new
+/// tab's first row and the tab's daemon-backed data is refreshed, exactly as
+/// when the section is entered from the rail.
+fn cycle_section_tab(app: &mut App, step: isize) {
+    let current = app.settings_state.section;
+    let tabs: Vec<SettingsSection> = current.group().sections().collect();
+    let Some(position) = tabs.iter().position(|section| *section == current) else {
+        return;
+    };
+    let count = tabs.len() as isize;
+    let next = tabs[(position as isize + step).rem_euclid(count) as usize];
+    if next == current {
+        return;
+    }
+    app.settings_state.model_dropdown.close();
+    app.settings_state.active_dropdown_item = None;
+    enter_settings_section(app, next, 0);
+}
+
+/// Resize the focused Settings panel by one step.
+///
+/// With the rail focused, `grow` widens the rail. With the list focused,
+/// `grow` widens the list: the info card beside it narrows, or the rail
+/// narrows when the card sits below the list. Steps start from the last
+/// rendered width (`SettingsState::rendered_layout`) and clamp to what the
+/// pane allows, so every press moves a visible divider.
+fn resize_settings_panels(app: &mut App, grow: bool) {
+    use crate::ui::settings::{INFO_MIN_WIDTH, RAIL_MIN_WIDTH, RESIZE_STEP};
+
+    let layout = app.settings_state.rendered_layout;
+    if layout.rail_width == 0 {
+        app.notify("Widen the Settings pane to resize its panels");
+        return;
+    }
+    let step = i32::from(RESIZE_STEP);
+    let resize = |stored: Option<u16>, rendered: u16, delta: i32, min: u16, max: u16| {
+        let max = max.max(min);
+        let current = i32::from(stored.unwrap_or(rendered).clamp(min, max));
+        let next = (current + delta).clamp(i32::from(min), i32::from(max));
+        u16::try_from(next).unwrap_or(min)
+    };
+    match (app.settings_state.focus, layout.info_width) {
+        (SettingsFocus::Items, Some(info_width)) => {
+            let delta = if grow { -step } else { step };
+            app.settings.settings_info_width = Some(resize(
+                app.settings.settings_info_width,
+                info_width,
+                delta,
+                INFO_MIN_WIDTH,
+                layout.info_max,
+            ));
+        }
+        (focus, _) => {
+            let widen_rail = (focus == SettingsFocus::Categories) == grow;
+            let delta = if widen_rail { step } else { -step };
+            app.settings.settings_rail_width = Some(resize(
+                app.settings.settings_rail_width,
+                layout.rail_width,
+                delta,
+                RAIL_MIN_WIDTH,
+                layout.rail_max,
+            ));
+        }
+    }
+}
+
 /// Navigate down within settings pane (called from App::nav_down).
+///
+/// The rail lists categories (`SettingsGroup`), so `j` on the rail selects
+/// the next category and opens it on its first section tab.
 pub fn nav_down(state: &mut SettingsState, settings: &UserSettings) {
     match state.focus {
         SettingsFocus::Categories => {
-            let max = SettingsSection::ALL.len().saturating_sub(1);
-            let idx = section_index(state.section);
-            if idx < max {
-                state.section = SettingsSection::ALL[idx + 1];
+            let position = state.section.group().position();
+            if let Some(next) = SettingsGroup::ALL.get(position + 1) {
+                state.section = next.first_section();
                 state.selected_index = 0;
             }
         }
@@ -1031,9 +1228,12 @@ pub fn nav_down(state: &mut SettingsState, settings: &UserSettings) {
 pub fn nav_up(state: &mut SettingsState, _settings: &UserSettings) {
     match state.focus {
         SettingsFocus::Categories => {
-            let idx = section_index(state.section);
-            if idx > 0 {
-                state.section = SettingsSection::ALL[idx - 1];
+            let position = state.section.group().position();
+            if let Some(previous) = position
+                .checked_sub(1)
+                .and_then(|previous| SettingsGroup::ALL.get(previous))
+            {
+                state.section = previous.first_section();
                 state.selected_index = 0;
             }
         }
@@ -1112,6 +1312,7 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         SettingsSection::ClaudeHooks => 1,
         SettingsSection::ClaudeSkills => 1,
         SettingsSection::MessageBridges => 2,
+        SettingsSection::Satellites => 2,
         SettingsSection::SystemPrompt => 1,
         // Baseline row floor; live rendering/navigation expands this through
         // `model_control_stats::stats_row_count`.
@@ -1121,6 +1322,7 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         // `model_control_budgets::budget_row_count`.
         SettingsSection::Budgets => 1,
         SettingsSection::ProviderKeys => ProviderCredentialSlot::ALL.len(),
+        SettingsSection::McpServers => 1,
         SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
@@ -1142,13 +1344,6 @@ pub fn hook_row_count(app: &mut App) -> usize {
 /// I/O-backed item count for the Skills section. Forces a cache load.
 pub fn skill_row_count(app: &mut App) -> usize {
     app.cached_user_skills().len().max(1)
-}
-
-fn section_index(section: SettingsSection) -> usize {
-    SettingsSection::ALL
-        .iter()
-        .position(|&c| c == section)
-        .unwrap_or(0)
 }
 
 pub fn theme_role_for_settings_index(index: usize) -> Option<crate::ui::theme_roles::ThemeRole> {
@@ -1229,10 +1424,11 @@ fn maybe_queue_daemon_features_refresh(app: &mut App) {
     }
 }
 
-fn refresh_entered_settings_section(app: &mut App) {
+pub(crate) fn refresh_entered_settings_section(app: &mut App) {
     maybe_queue_daemon_features_refresh(app);
     maybe_queue_usage_stats_refresh(app);
     maybe_queue_provider_credentials_refresh(app);
+    maybe_queue_mcp_servers_refresh(app);
     ensure_claude_caches_for_category(app);
 }
 
@@ -1240,6 +1436,12 @@ fn maybe_queue_provider_credentials_refresh(app: &mut App) {
     if app.settings_state.section == SettingsSection::ProviderKeys {
         app.pending_lc_actions
             .push(LcAction::RefreshProviderCredentials);
+    }
+}
+
+fn maybe_queue_mcp_servers_refresh(app: &mut App) {
+    if app.settings_state.section == SettingsSection::McpServers {
+        app.pending_lc_actions.push(LcAction::RefreshMcpServers);
     }
 }
 
@@ -1559,10 +1761,7 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
                 // enabled subsequence. Advanced toggles remain immediate, but
                 // must not mask future preset changes.
                 settings.navigator_optional_columns = None;
-            } else if let Some(column) = crate::types::NavigatorOptionalColumn::ALL
-                .get(idx.saturating_sub(1))
-                .copied()
-            {
+            } else if let Some(column) = settings.navigator_column_at_row(idx) {
                 settings.toggle_navigator_optional_column(column);
             } else if let Some(entry) = settings
                 .card_fields
@@ -1585,6 +1784,7 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         SettingsSection::ModelRoles => {}
         // Message bridge rows open an editor form.
         SettingsSection::MessageBridges => {}
+        SettingsSection::Satellites => {}
         // Hooks/Skills mutate ~/.claude/ on disk via dedicated handlers; toggle is a no-op here.
         SettingsSection::ClaudeHooks => {}
         SettingsSection::ClaudeSkills => {}
@@ -1598,13 +1798,25 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         SettingsSection::Usage => {}
         // Budgets rows are add/edit/delete via dedicated 'a'/'d'/Enter
         // handlers (RPC round-trip); toggle is a no-op here.
-        SettingsSection::Budgets | SettingsSection::ProviderKeys => {}
+        SettingsSection::Budgets | SettingsSection::ProviderKeys | SettingsSection::McpServers => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn satellite_registry_setting_opens_the_operator_browser() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::Satellites;
+        app.settings_state.focus = SettingsFocus::Items;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::OpenSatelliteRegistry)
+        );
+    }
 
     #[test]
     fn provider_keys_actions_target_the_selected_slot() {
@@ -1781,7 +1993,7 @@ mod tests {
     fn settings_n_and_n_cycle_matches_with_wrap() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         app.settings_state.focus = SettingsFocus::Items;
-        app.settings_state.section = SettingsSection::MessageBridges; // last section
+        app.settings_state.section = SettingsSection::Satellites; // last section
         app.settings_state.selected_index = 1;
         app.settings_state.query = "hex".to_string();
 
@@ -1827,8 +2039,8 @@ mod tests {
 
     #[test]
     fn test_settings_category_all_count() {
-        // Epic M design D.1: 21 sections under 7 rail groups.
-        assert_eq!(SettingsSection::ALL.len(), 22);
+        // Seven rail groups, including the satellite integration section.
+        assert_eq!(SettingsSection::ALL.len(), 24);
     }
 
     #[test]
@@ -1848,36 +2060,28 @@ mod tests {
         assert_eq!(item_count(SettingsSection::Budgets, &settings), 1);
     }
 
+    /// The rail lists categories: `j` / `k` step between them and open each
+    /// on its first section tab, clamped at both ends.
     #[test]
     fn test_nav_down_categories() {
         let settings = UserSettings::default();
         let mut state = SettingsState::default();
         assert_eq!(state.section, SettingsSection::ThemeColors);
         for expected in [
-            SettingsSection::Screen,
             SettingsSection::SessionList,
-            SettingsSection::TranscriptDefaults,
-            SettingsSection::InputPrompts,
             SettingsSection::ModelRoles,
-            SettingsSection::ApiProviders,
-            SettingsSection::SystemPrompt,
             SettingsSection::ModelControl,
-            SettingsSection::Budgets,
-            SettingsSection::Usage,
-            SettingsSection::ProviderKeys,
             SettingsSection::RetriesRecovery,
-            SettingsSection::StallDetection,
-            SettingsSection::MemoryDreaming,
-            SettingsSection::Orchestration,
-            SettingsSection::CodeIntelligence,
             SettingsSection::ProviderIsolation,
-            SettingsSection::SandboxStorage,
-            SettingsSection::ClaudeHooks,
-            SettingsSection::ClaudeSkills,
             SettingsSection::MessageBridges,
         ] {
+            state.selected_index = 3;
             nav_down(&mut state, &settings);
             assert_eq!(state.section, expected);
+            assert_eq!(
+                state.selected_index, 0,
+                "a new category starts at its first row"
+            );
         }
         nav_down(&mut state, &settings);
         assert_eq!(state.section, SettingsSection::MessageBridges); // clamped at last
@@ -1887,17 +2091,134 @@ mod tests {
     fn test_nav_up_categories() {
         let settings = UserSettings::default();
         let mut state = SettingsState {
+            section: SettingsSection::StallDetection,
+            ..Default::default()
+        };
+        nav_up(&mut state, &settings);
+        assert_eq!(state.section, SettingsSection::ModelControl);
+        let mut state = SettingsState {
             section: SettingsSection::TranscriptDefaults,
             ..Default::default()
         };
         nav_up(&mut state, &settings);
-        assert_eq!(state.section, SettingsSection::SessionList);
-        nav_up(&mut state, &settings);
-        assert_eq!(state.section, SettingsSection::Screen);
-        nav_up(&mut state, &settings);
         assert_eq!(state.section, SettingsSection::ThemeColors);
         nav_up(&mut state, &settings);
-        assert_eq!(state.section, SettingsSection::ThemeColors);
+        assert_eq!(state.section, SettingsSection::ThemeColors); // clamped at first
+    }
+
+    /// `Tab` / `Shift-Tab` and `]` / `[` switch the selected category's
+    /// section tabs, wrapping inside the category, from the list or the rail.
+    #[test]
+    fn tab_keys_cycle_sections_within_the_category() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.section = SettingsSection::StallDetection;
+        app.settings_state.selected_index = 3;
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
+        assert_eq!(app.settings_state.section, SettingsSection::MemoryDreaming);
+        assert_eq!(app.settings_state.selected_index, 0);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Items);
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::RefreshDaemonFeatures),
+            "entering a daemon-backed tab refreshes it"
+        );
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::BackTab)));
+        assert_eq!(app.settings_state.section, SettingsSection::StallDetection);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
+        assert_eq!(app.settings_state.section, SettingsSection::RetriesRecovery);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
+        assert_eq!(
+            app.settings_state.section,
+            SettingsSection::CodeIntelligence,
+            "wraps backward inside the category"
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char(']'))));
+        assert_eq!(
+            app.settings_state.section,
+            SettingsSection::RetriesRecovery,
+            "wraps forward inside the category"
+        );
+
+        app.settings_state.focus = SettingsFocus::Categories;
+        app.settings_state.section = SettingsSection::ThemeColors;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
+        assert_eq!(app.settings_state.section, SettingsSection::Screen);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Categories);
+    }
+
+    /// `>` widens the focused panel and `<` narrows it, stepping from the
+    /// rendered width and clamping to what the pane allows; `=` restores the
+    /// automatic widths.
+    #[test]
+    fn resize_keys_step_the_focused_panel_and_equals_resets() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings = UserSettings::default();
+        app.settings_state.rendered_layout = crate::types::SettingsRenderedLayout {
+            rail_width: 30,
+            rail_max: 44,
+            info_width: Some(63),
+            info_max: 90,
+        };
+
+        app.settings_state.focus = SettingsFocus::Categories;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(app.settings.settings_rail_width, Some(32));
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(app.settings.settings_rail_width, Some(34));
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('<'))));
+        assert_eq!(app.settings.settings_rail_width, Some(32));
+
+        app.settings_state.focus = SettingsFocus::Items;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(
+            app.settings.settings_info_width,
+            Some(61),
+            "widening the list narrows the info card beside it"
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('<'))));
+        assert_eq!(app.settings.settings_info_width, Some(63));
+
+        app.settings_state.rendered_layout.info_width = None;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(
+            app.settings.settings_rail_width,
+            Some(30),
+            "without a side card the list widens into the rail"
+        );
+
+        app.settings_state.focus = SettingsFocus::Categories;
+        app.settings.settings_rail_width = Some(44);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(
+            app.settings.settings_rail_width,
+            Some(44),
+            "clamped to the widest rail the pane allows"
+        );
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('='))));
+        assert_eq!(app.settings.settings_rail_width, None);
+        assert_eq!(app.settings.settings_info_width, None);
+    }
+
+    #[test]
+    fn resize_keys_explain_when_the_pane_is_too_narrow() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings = UserSettings::default();
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.rendered_layout = crate::types::SettingsRenderedLayout::default();
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('>'))));
+        assert_eq!(app.settings.settings_rail_width, None);
+        assert_eq!(app.settings.settings_info_width, None);
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|n| n.message.contains("Widen the Settings pane")),
+            "{:?}",
+            app.notifications.back()
+        );
     }
 
     #[test]
@@ -1986,16 +2307,16 @@ mod tests {
             settings.activity_indicator_style,
             crate::settings::ActivityIndicatorStyle::Semantic
         );
-        toggle_setting(&mut settings, &state);
-        assert_eq!(
-            settings.activity_indicator_style,
-            crate::settings::ActivityIndicatorStyle::RainbowClassic
-        );
-        toggle_setting(&mut settings, &state);
-        assert_eq!(
-            settings.activity_indicator_style,
-            crate::settings::ActivityIndicatorStyle::RainbowCompact
-        );
+        for style in [
+            crate::settings::ActivityIndicatorStyle::RainbowClassic,
+            crate::settings::ActivityIndicatorStyle::RainbowCompact,
+            crate::settings::ActivityIndicatorStyle::RainbowClassicCompact,
+            crate::settings::ActivityIndicatorStyle::SonicSpeedUp,
+            crate::settings::ActivityIndicatorStyle::RainbowStarlight,
+        ] {
+            toggle_setting(&mut settings, &state);
+            assert_eq!(settings.activity_indicator_style, style);
+        }
         toggle_setting(&mut settings, &state);
         assert_eq!(
             settings.activity_indicator_style,
@@ -2062,6 +2383,38 @@ mod tests {
         assert!(!settings.card_fields[0].enabled);
         toggle_setting(&mut settings, &state);
         assert!(settings.card_fields[0].enabled);
+    }
+
+    #[test]
+    fn shift_j_and_k_move_the_selected_navigator_column_within_the_active_preset() {
+        use crate::types::{NavigatorOptionalColumn as O, NavigatorPreset as P};
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::SessionList;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings.navigator_preset = P::Dense;
+        app.settings_state.selected_index = 3; // Retry
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('K'))));
+        assert_eq!(app.settings_state.selected_index, 2);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('K'))));
+        assert_eq!(app.settings_state.selected_index, 1);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('K'))));
+        assert_eq!(app.settings_state.selected_index, 1, "top edge stays");
+        assert_eq!(app.settings.navigator_column_at_row(1), Some(O::Retry));
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('J'))));
+        assert_eq!(app.settings_state.selected_index, 2);
+        assert_eq!(
+            app.settings.navigator_column_order_for(P::Dense)[..3],
+            [O::Age, O::Retry, O::ModelEffort]
+        );
+        // Another preset keeps the default order.
+        assert_eq!(
+            app.settings.navigator_column_order_for(P::Cost),
+            crate::ui::navigator_layout::OPTIONAL_ORDER.to_vec()
+        );
+        // The preset row is not a column: J does nothing there.
+        app.settings_state.selected_index = 0;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('J'))));
+        assert_eq!(app.settings_state.selected_index, 0);
     }
 
     #[test]

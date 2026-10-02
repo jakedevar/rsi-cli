@@ -1174,13 +1174,14 @@ impl BoundaryProviderKindV1 {
         })
     }
 
-    /// The frozen provider matrix in P2-05: only CodexAppServer is a genuine
-    /// native multi-turn boundary; every other provider delivers exactly one
-    /// terminal turn per durable model invocation.
+    /// The frozen provider matrix in P2-05: CodexAppServer is a native
+    /// multi-turn boundary, Harness can be steered between tool-loop model
+    /// invocations, and every CLI provider delivers one terminal turn.
     #[must_use]
     pub const fn capability_kind(self) -> BoundaryCapabilityKindV1 {
         match self {
             Self::CodexAppServer => BoundaryCapabilityKindV1::NativeMultiTurn,
+            Self::Harness => BoundaryCapabilityKindV1::HarnessToolBoundary,
             _ => BoundaryCapabilityKindV1::TerminalOneTurn,
         }
     }
@@ -1216,6 +1217,7 @@ impl BoundaryProviderKindV1 {
 #[serde(rename_all = "snake_case")]
 pub enum BoundaryCapabilityKindV1 {
     NativeMultiTurn,
+    HarnessToolBoundary,
     TerminalOneTurn,
 }
 
@@ -1224,7 +1226,41 @@ impl BoundaryCapabilityKindV1 {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NativeMultiTurn => "native_multi_turn",
+            Self::HarnessToolBoundary => "harness_tool_boundary",
             Self::TerminalOneTurn => "terminal_one_turn",
+        }
+    }
+
+    /// The value stored in `agent_message_delivery_attempts.capability_kind`.
+    ///
+    /// The released table CHECK admits only `native_multi_turn` and
+    /// `terminal_one_turn`, and released rows for a Harness Session already
+    /// carry `terminal_one_turn`. `HarnessToolBoundary` is an in-memory
+    /// admission kind (it decides how the boundary is claimed); it persists as
+    /// `terminal_one_turn` at every write. Its boundary kind
+    /// (`model_invocation`) and `not_applicable` correlation are unchanged.
+    /// Use this, never [`Self::as_str`], for the stored column.
+    #[must_use]
+    pub const fn persisted_str(self) -> &'static str {
+        match self {
+            Self::HarnessToolBoundary => "terminal_one_turn",
+            Self::NativeMultiTurn => "native_multi_turn",
+            Self::TerminalOneTurn => "terminal_one_turn",
+        }
+    }
+
+    /// Parse a stored `capability_kind` for `provider`. A stored
+    /// `terminal_one_turn` on a Harness row is the persisted form of
+    /// `HarnessToolBoundary` (rows written before and after #793 alike).
+    #[must_use]
+    pub fn from_persisted_str(provider: BoundaryProviderKindV1, value: &str) -> Option<Self> {
+        match (provider, value) {
+            (BoundaryProviderKindV1::Harness, "terminal_one_turn") => {
+                Some(Self::HarnessToolBoundary)
+            }
+            (_, "native_multi_turn") => Some(Self::NativeMultiTurn),
+            (_, "terminal_one_turn") => Some(Self::TerminalOneTurn),
+            _ => None,
         }
     }
 
@@ -1232,6 +1268,7 @@ impl BoundaryCapabilityKindV1 {
     pub fn from_str_exact(value: &str) -> Option<Self> {
         Some(match value {
             "native_multi_turn" => Self::NativeMultiTurn,
+            "harness_tool_boundary" => Self::HarnessToolBoundary,
             "terminal_one_turn" => Self::TerminalOneTurn,
             _ => return None,
         })
@@ -1242,6 +1279,7 @@ impl BoundaryCapabilityKindV1 {
     pub const fn boundary_kind(self) -> BoundaryKindV1 {
         match self {
             Self::NativeMultiTurn => BoundaryKindV1::NativeTurn,
+            Self::HarnessToolBoundary => BoundaryKindV1::ModelInvocation,
             Self::TerminalOneTurn => BoundaryKindV1::ModelInvocation,
         }
     }
@@ -1884,7 +1922,7 @@ impl BoundaryAdmissionV1 {
         if self.provider_kind.capability_kind() != self.capability_kind {
             return Err("agent_message_boundary_capability_kind_mismatch");
         }
-        if self.capability_kind == BoundaryCapabilityKindV1::TerminalOneTurn
+        if self.capability_kind != BoundaryCapabilityKindV1::NativeMultiTurn
             && self.native_turn_id.is_some()
         {
             return Err("agent_message_terminal_provider_must_have_null_native_turn");
@@ -2087,6 +2125,9 @@ pub enum AgentContinueErrorCodeV1 {
     /// Authority and staleness both passed, but the underlying
     /// `continue_session` call failed.
     ContinuationFailed,
+    /// A deploy is waiting for its quiet point and holds new worker turns.
+    /// Nothing was started or dropped: retry once the deploy settles.
+    DeployDraining,
 }
 
 impl AgentContinueErrorCodeV1 {
@@ -2104,6 +2145,7 @@ impl AgentContinueErrorCodeV1 {
             Self::RelaunchAbandoned => "relaunch_abandoned",
             Self::RelaunchInProgress => "relaunch_in_progress",
             Self::ContinuationFailed => "agent_continue_failed",
+            Self::DeployDraining => "deploy_draining",
         }
     }
 }
@@ -2635,9 +2677,19 @@ mod agent_message_tests {
         assert_eq!(base.validate(), Ok(()));
         assert_eq!(base.boundary_value(), Some("turn_abc".to_string()));
 
-        // Only CodexAppServer is a native multi-turn boundary.
+        // CodexAppServer is the only native-turn provider. Harness has its own
+        // tool-boundary capability; every CLI provider remains terminal.
+        assert_eq!(
+            BoundaryProviderKindV1::Harness.capability_kind(),
+            BoundaryCapabilityKindV1::HarnessToolBoundary
+        );
+        assert_eq!(
+            BoundaryProviderKindV1::Harness
+                .capability_kind()
+                .boundary_kind(),
+            BoundaryKindV1::ModelInvocation
+        );
         for provider in [
-            BoundaryProviderKindV1::Harness,
             BoundaryProviderKindV1::ClaudeCli,
             BoundaryProviderKindV1::CodexCli,
             BoundaryProviderKindV1::AntigravityCli,
@@ -2702,7 +2754,7 @@ mod agent_message_tests {
         // durable model invocation as its boundary value.
         let terminal = BoundaryAdmissionV1 {
             provider_kind: BoundaryProviderKindV1::Harness,
-            capability_kind: BoundaryCapabilityKindV1::TerminalOneTurn,
+            capability_kind: BoundaryCapabilityKindV1::HarnessToolBoundary,
             native_turn_id: None,
             ..base.clone()
         };
@@ -2718,6 +2770,55 @@ mod agent_message_tests {
             }
             .validate(),
             Err("agent_message_terminal_provider_must_have_null_native_turn")
+        );
+
+        // The stored column only ever holds a value the released CHECK admits,
+        // and a Harness row round-trips to its in-memory admission kind.
+        for kind in [
+            BoundaryCapabilityKindV1::NativeMultiTurn,
+            BoundaryCapabilityKindV1::HarnessToolBoundary,
+            BoundaryCapabilityKindV1::TerminalOneTurn,
+        ] {
+            assert!(
+                matches!(
+                    kind.persisted_str(),
+                    "native_multi_turn" | "terminal_one_turn"
+                ),
+                "{kind:?} must persist as a released capability_kind value"
+            );
+        }
+        assert_eq!(
+            BoundaryCapabilityKindV1::HarnessToolBoundary.persisted_str(),
+            "terminal_one_turn"
+        );
+        assert_eq!(
+            BoundaryCapabilityKindV1::from_persisted_str(
+                BoundaryProviderKindV1::Harness,
+                "terminal_one_turn"
+            ),
+            Some(BoundaryCapabilityKindV1::HarnessToolBoundary)
+        );
+        assert_eq!(
+            BoundaryCapabilityKindV1::from_persisted_str(
+                BoundaryProviderKindV1::ClaudeCli,
+                "terminal_one_turn"
+            ),
+            Some(BoundaryCapabilityKindV1::TerminalOneTurn)
+        );
+        assert_eq!(
+            BoundaryCapabilityKindV1::from_persisted_str(
+                BoundaryProviderKindV1::Harness,
+                "harness_tool_boundary"
+            ),
+            None,
+            "the in-memory name is never a stored value"
+        );
+
+        // The new capability also rejects AppServer-style turn correlation.
+        assert_eq!(
+            BoundaryCapabilityKindV1::from_str_exact("harness_tool_boundary")
+                .map(BoundaryCapabilityKindV1::boundary_kind),
+            Some(BoundaryKindV1::ModelInvocation)
         );
 
         // Capability kind may not contradict the provider matrix.

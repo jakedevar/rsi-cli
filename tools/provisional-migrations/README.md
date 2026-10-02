@@ -11,14 +11,14 @@ commit; it is retained as historical evidence after landing.
   "version": 130,
   "files": [
     {
-      "path": "crates/rsid/src/store/mod.rs",
-      "path_template": "crates/rsid/src/store/mod.rs",
+      "path": "crates/rsid/src/store/migrations/v130.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
       "source_blob": "sha256:<64 lowercase hex digits>",
       "sites": [
         {
-          "anchor": "pub const LATEST_SCHEMA_VERSION: i32 = 130;",
-          "replacement": "pub const LATEST_SCHEMA_VERSION: i32 = ${VERSION};",
-          "scope": "head"
+          "anchor": "fn migrate_v130(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
         },
         {
           "anchor": "if version < 130 {",
@@ -30,6 +30,15 @@ commit; it is retained as historical evidence after landing.
   ]
 }
 ```
+
+A migration is one new file, `crates/rsid/src/store/migrations/vNNN.rs`
+(three-digit name). The schema head is the highest file, so there is no shared
+constant or list to declare; `crates/rsid/build.rs` collects the files. The
+declaration must name that file with a `v${VERSION}.rs` template and a `unit`
+site on its `if version < N {` gate. Other files that quote the provisional
+number (helpers, `store/tests.rs` rewind constants) are declared as below. A
+declaration written against the old inline `store/mod.rs` layout is refused;
+port it to a `vNNN.rs` file first.
 
 List every occurrence of the provisional number in each changed source or test
 file. Each anchor must occur exactly once in its source file. Its replacement

@@ -21,5 +21,9 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-md.workspace = true
 uuid.workspace = true
 
+[[bin]]
+name = "rsi-test-impact"
+path = "src/bin/rsi-test-impact.rs"
+
 [lints]
 workspace = true

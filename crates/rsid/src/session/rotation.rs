@@ -8,6 +8,11 @@ use super::SessionManager;
 
 mod recovery;
 
+#[cfg(all(
+    test,
+    any(not(feature = "test-shard-mode"), feature = "test-shard-session-04")
+))]
+mod context_succession_tests;
 #[cfg(test)]
 mod fence_tests;
 use super::types::{
@@ -377,7 +382,7 @@ async fn should_suppress_final_handoff(
         }
         current = guard.get_session(id)?.and_then(|row| row.continued_from);
     }
-    for job in guard.list_scheduled_jobs()? {
+    for job in guard.list_enabled_terminal_watches()? {
         let rsi_common::types::WakeMode::OnTerminal(watched) = job.wake_mode else {
             continue;
         };
@@ -1266,6 +1271,48 @@ impl SessionManager {
         }
     }
 
+    /// Issue #692: whether the operator launch-model allowlist refuses the
+    /// session's own provider and model. A rotation re-launches that model (the
+    /// handoff write resumes it, the successor inherits it), so it is checked
+    /// before the handoff write, the successor's invocation admission and the
+    /// custody transfer. A refusal is recorded like any other rotation refusal
+    /// and the predecessor stays available.
+    async fn refuse_rotation_on_launch_allowlist(
+        session_id: Uuid,
+        rotation_id: Option<&str>,
+        runtime_config: &crate::config::RuntimeConfig,
+        completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+        event_bus: &Arc<crate::bus::EventBus>,
+        persistence: &PersistenceHandle,
+        store: &Arc<tokio::sync::Mutex<Store>>,
+    ) -> bool {
+        let refusal = completed.read().await.get(&session_id).and_then(|turn| {
+            runtime_config.launch_model_refusal(
+                turn.session.provider,
+                super::launch::provider_effective_model(
+                    turn.session.provider,
+                    turn.session.model.as_deref(),
+                )
+                .as_deref(),
+            )
+        });
+        let Some(reason) = refusal else {
+            return false;
+        };
+        tracing::warn!(%session_id, %reason, "context rotation refused by the launch-model allowlist");
+        Self::record_rotation_refusal(
+            session_id,
+            rotation_id,
+            rsi_common::launch_allowlist::LAUNCH_MODEL_NOT_ALLOWED,
+            completed,
+            event_bus,
+            persistence,
+            store,
+        )
+        .await;
+        true
+    }
+
     /// Execute rotation-specific follow-up after the session has been finalized.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_post_finalization_rotation_action(
@@ -1300,6 +1347,32 @@ impl SessionManager {
                     &completed,
                     &store,
                     &persistence,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
+                if Self::hold_child_automatic_rotation(
+                    session_id,
+                    false,
+                    rotation_id_for_log.as_deref(),
+                    &completed,
+                    &event_bus,
+                    &persistence,
+                    &store,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
+                if Self::refuse_rotation_on_launch_allowlist(
+                    session_id,
+                    rotation_id_for_log.as_deref(),
+                    &runtime_config,
+                    &completed,
+                    &event_bus,
+                    &persistence,
+                    &store,
                 )
                 .await
                 {
@@ -1459,6 +1532,32 @@ impl SessionManager {
                 {
                     return PostFinalizeRotationOutcome::ContinueNormalCompletion;
                 }
+                if Self::hold_child_automatic_rotation(
+                    sid,
+                    true,
+                    rotation_id_for_log.as_deref(),
+                    &completed,
+                    &event_bus,
+                    &persistence,
+                    &store,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
+                if Self::refuse_rotation_on_launch_allowlist(
+                    sid,
+                    rotation_id_for_log.as_deref(),
+                    &runtime_config,
+                    &completed,
+                    &event_bus,
+                    &persistence,
+                    &store,
+                )
+                .await
+                {
+                    return PostFinalizeRotationOutcome::ContinueNormalCompletion;
+                }
                 // ── Circuit breaker #2: failed handoff writer ──────────────────────────
                 // If the handoff-writing session itself failed (no meaningful output),
                 // don't spawn a child — the child would also fail immediately, trigger
@@ -1575,6 +1674,45 @@ impl SessionManager {
                 PostFinalizeRotationOutcome::Handled
             }
         }
+    }
+
+    /// #976: stop automatic context rotation of a lead-dismissible child.
+    /// A held rotation is recorded as `refused:<code>` (system event and
+    /// manager notice), the child completes normally, and its lead's terminal
+    /// watch reports it with the handoff and the dirty-worktree flag.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold_child_automatic_rotation(
+        session_id: Uuid,
+        successor: bool,
+        rotation_id: Option<&str>,
+        completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+        event_bus: &Arc<crate::bus::EventBus>,
+        persistence: &PersistenceHandle,
+        store: &Arc<tokio::sync::Mutex<Store>>,
+    ) -> bool {
+        let hold = store
+            .lock()
+            .await
+            .child_automatic_rotation_hold(session_id, successor);
+        let code = match hold {
+            Ok(None) => return false,
+            Ok(Some(code)) => code,
+            Err(error) => {
+                tracing::error!(%session_id, %error, "Child rotation hold read failed; holding");
+                "child_rotation_hold_unreadable"
+            }
+        };
+        Self::record_rotation_refusal(
+            session_id,
+            rotation_id,
+            code,
+            completed,
+            event_bus,
+            persistence,
+            store,
+        )
+        .await;
+        true
     }
 
     async fn suppress_protected_automatic_rotation(
@@ -1921,7 +2059,8 @@ impl SessionManager {
         store.lock().await.remove_controller_grant_v1(session_id);
         let session_token = super::remint_agent_token(&agent_tokens, session_id).await;
 
-        let config = LaunchConfig {
+        let mut config = LaunchConfig {
+            completion_gates: None,
             query: query.clone(),
             title: None,
             agent_role: completed_session.session.agent_role.clone(),
@@ -1951,6 +2090,7 @@ impl SessionManager {
             max_retries: None,
             group_id: completed_session.session.group_id,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::SessionContinueResume,
             parent_id: completed_session.session.parent_id,
@@ -1981,6 +2121,21 @@ impl SessionManager {
             topology_iteration: 0,
             closure_selector: None,
         };
+        config.completion_gates =
+            match super::completion_gates_launch::resolve_launch_completion_gates(
+                &store,
+                session_id,
+                completed_session.session.continued_from,
+                None,
+            )
+            .await
+            {
+                Ok(gates) => gates,
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "completion gates unreadable; handoff will use a fail-closed gate");
+                    Some(super::completion_gates_launch::fail_closed())
+                }
+            };
         #[cfg(test)]
         observe_handoff_custody_config_for_test(session_id, &config);
         drop(context_permit);
@@ -2027,7 +2182,9 @@ impl SessionManager {
                 Some(provider_label.as_str()),
                 config.model.as_deref(),
             )),
-            baseline_input_tokens: completed_session.session.total_input_tokens.unwrap_or(0),
+            baseline_input_tokens: super::types::session_prompt_baseline(
+                &completed_session.session,
+            ),
             baseline_output_tokens: completed_session.session.total_output_tokens.unwrap_or(0),
             baseline_cache_creation_tokens: completed_session
                 .session
@@ -2079,6 +2236,14 @@ impl SessionManager {
         // native `rsi_control` + `schedule_wake` tools — via the single
         // `default_tools` source of truth. The bound caller id is this session's
         // own id.
+        let spawn_generation = Self::next_spawn_generation_from(&spawn_epoch);
+        let rotation_tool_policy = super::tool_policy_launch::resolve_launch_tool_policy(
+            &store,
+            session_id,
+            completed_session.session.continued_from,
+            None,
+        )
+        .await;
         let launcher = super::provider_spawn::FreshLauncher {
             runtime_config: Arc::clone(&runtime_config),
             harness: super::provider_spawn::FreshHarnessCtx {
@@ -2090,6 +2255,9 @@ impl SessionManager {
                 event_bus: Arc::clone(&event_bus),
                 model_call_settlements: model_call_settlements.clone(),
                 spawn_coordinator: Arc::clone(&spawn_coordinator),
+                agent_message_arbiter: Arc::clone(&agent_message_arbiter),
+                process_registry_manager: spawn_coordinator.process_registry_manager(),
+                monitor_generation: spawn_generation,
                 memory_handle: memory_handle.clone(),
                 initial_admission_permit: admission_permit.clone(),
                 resolved_context_budget: completed_session
@@ -2098,6 +2266,7 @@ impl SessionManager {
                     .clone()
                     .expect("handoff resumes carry a resolved context budget"),
                 bound_session_id: session_id,
+                tool_policy: rotation_tool_policy,
             },
         };
 
@@ -2170,7 +2339,6 @@ impl SessionManager {
         // the parent row; inheritance would conflate two runs.
         session.approval_wait_ms = Some(0);
 
-        let spawn_generation = Self::next_spawn_generation_from(&spawn_epoch);
         let tracked = TrackedSession {
             rotation:
                 super::rotation_coordinator::RotationCoordinator::new_writing_handoff_with_rotation_id(
@@ -2186,10 +2354,13 @@ impl SessionManager {
             process: Some(process),
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: session.total_prompt_tokens.unwrap_or(0),
             live_usage_confidence: ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,
@@ -2686,6 +2857,7 @@ impl SessionManager {
             context_window: Some(child_budget.active_tokens),
             resolved_context_budget: Some(child_budget),
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             session_kind: parent_completed.session.session_kind,
             total_cache_creation_tokens: None,
@@ -2920,6 +3092,32 @@ impl SessionManager {
             crate::provider_capabilities::resolve_new_incarnation_context_budget(&child_session);
         install_context_budget(&mut child_session, child_budget);
         let initial_child_id = child_session.id;
+        // #692: the successor re-launches the inherited model; refuse before the
+        // controller reservation, invocation admission or custody bind.
+        if let Some(reason) = runtime_config.launch_model_refusal(
+            child_session.provider,
+            super::launch::provider_effective_model(
+                child_session.provider,
+                child_session.model.as_deref(),
+            )
+            .as_deref(),
+        ) {
+            tracing::warn!(%parent_id, %reason, "rotation successor refused by the launch-model allowlist");
+            if let Some(parent) = parent_for_archival.take() {
+                completed.write().await.insert(parent_id, parent);
+            }
+            Self::record_rotation_refusal(
+                parent_id,
+                rotation_id_for_log.as_deref(),
+                rsi_common::launch_allowlist::LAUNCH_MODEL_NOT_ALLOWED,
+                &completed,
+                &event_bus,
+                &persistence,
+                &store,
+            )
+            .await;
+            return;
+        }
         if let Err(error) = preflight_rotation_lead_transfer(&store, parent_id).await {
             tracing::warn!(
                 %parent_id,
@@ -3441,6 +3639,7 @@ impl SessionManager {
         // the successor's ContextRead permit after the durable bind and exact
         // successor authentication have completed.
         let mut config = LaunchConfig {
+            completion_gates: None,
             query,
             title: None,
             agent_role: child_session.agent_role.clone(),
@@ -3469,6 +3668,7 @@ impl SessionManager {
             max_retries: None,
             group_id: child_session.group_id,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: purpose,
             parent_id: child_session.parent_id,
             effort: child_session.effort.clone(),
@@ -3531,7 +3731,10 @@ impl SessionManager {
                     ),
                 )
                 .await;
-            match (super::preamble::load(child_session.session_kind), context) {
+            match (
+                super::preamble::load(child_session.session_kind, &permit_cwd),
+                context,
+            ) {
                 (Some(preamble), Some(context)) => Some(format!("{preamble}\n\n{context}")),
                 (Some(preamble), None) => Some(preamble),
                 (None, context) => context,
@@ -3691,6 +3894,29 @@ impl SessionManager {
         // `rsi_control` + `schedule_wake` + memory/list_files — via the single
         // `default_tools` source of truth. The bound caller id is the child's
         // own id.
+        let spawn_generation = Self::next_spawn_generation_from(&spawn_epoch);
+        let rotation_tool_policy = super::tool_policy_launch::resolve_launch_tool_policy(
+            &store,
+            child_id,
+            child_session.continued_from,
+            None,
+        )
+        .await;
+        config.completion_gates =
+            match super::completion_gates_launch::resolve_launch_completion_gates(
+                &store,
+                child_id,
+                child_session.continued_from,
+                None,
+            )
+            .await
+            {
+                Ok(gates) => gates,
+                Err(error) => {
+                    tracing::error!(%child_id, %error, "completion gates unreadable; rotation child will use a fail-closed gate");
+                    Some(super::completion_gates_launch::fail_closed())
+                }
+            };
         let launcher = super::provider_spawn::FreshLauncher {
             runtime_config: Arc::clone(&runtime_config),
             harness: super::provider_spawn::FreshHarnessCtx {
@@ -3702,6 +3928,9 @@ impl SessionManager {
                 event_bus: Arc::clone(&event_bus),
                 model_call_settlements: model_call_settlements.clone(),
                 spawn_coordinator: Arc::clone(&spawn_coordinator),
+                agent_message_arbiter: Arc::clone(&agent_message_arbiter),
+                process_registry_manager: spawn_coordinator.process_registry_manager(),
+                monitor_generation: spawn_generation,
                 memory_handle: memory_handle.clone(),
                 initial_admission_permit: admission_permit.clone(),
                 resolved_context_budget: child_session
@@ -3709,6 +3938,7 @@ impl SessionManager {
                     .clone()
                     .expect("rotation children carry a resolved context budget"),
                 bound_session_id: child_id,
+                tool_policy: rotation_tool_policy,
             },
         };
 
@@ -3837,7 +4067,6 @@ impl SessionManager {
 
         let (stop_tx, stop_rx) = mpsc::channel(1);
 
-        let spawn_generation = Self::next_spawn_generation_from(&spawn_epoch);
         let tracked = TrackedSession {
             session: child_session.clone(),
             spawn_generation,
@@ -3846,7 +4075,9 @@ impl SessionManager {
             process: Some(process),
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             rotation: if child_session.query.trim() == "/create_handoff" {
                 debug_assert!(
@@ -3867,6 +4098,7 @@ impl SessionManager {
             },
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence: rsi_common::types::ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,
@@ -4736,8 +4968,8 @@ mod tests {
     /// now funnel through the shared `provider_spawn` primitive (A4), whose
     /// Family-B `FreshLauncher` routes Harness through the FRESH
     /// `session::harness::HarnessClient` (which builds its registry via the
-    /// single shared `default_tools`), NOT the legacy
-    /// `crate::harness::client::HarnessClient` whose registry omitted
+    /// single shared `default_tools`), NOT the removed
+    /// legacy `harness::client::HarnessClient` whose registry omitted
     /// `schedule_wake` + the native `rsi_control` tools. Pin the fresh-client
     /// routing at its new home and prove the legacy split-brain client appears
     /// in neither the funnel nor rotation — guarding against a regression back
@@ -4750,10 +4982,15 @@ mod tests {
         // The legacy needle is assembled so rotation.rs cannot satisfy its
         // own source check through this assertion's string literal.
         let fresh_constructor = "crate::session::harness::HarnessClient::new()";
-        let fresh_route = "Self::harness_client(self.harness.codegraph_handle.as_ref()).launch(";
+        // Whitespace-insensitive (rustfmt spans the call over lines and adds a
+        // trailing comma); the arguments are the current collaborators (#793
+        // added the mail arbiter).
+        let fresh_route = "Self::harness_client(self.harness.codegraph_handle.as_ref(),&self.runtime_config,&self.harness.agent_message_arbiter,&self.harness.process_registry_manager,).launch(";
+        let squash = |source: &str| source.split_whitespace().collect::<String>();
         let legacy_needle = ["crate::harness", "::client::HarnessClient::", "launch("].concat();
         assert!(
-            funnel_source.contains(fresh_constructor) && funnel_source.contains(fresh_route),
+            funnel_source.contains(fresh_constructor)
+                && squash(funnel_source).contains(fresh_route),
             "rotation Harness launches must go through the fresh HarnessClient"
         );
         assert!(
@@ -4814,7 +5051,10 @@ mod tests {
             .find("remove_controller_grant_v1")
             .expect("grant removal");
         let remint = body.find("remint_agent_token").expect("token remint");
-        let config = body.find("let config = LaunchConfig").expect("raw config");
+        // #794 made the binding mutable to attach completion gates.
+        let config = body
+            .find("let mut config = LaunchConfig")
+            .expect("raw config");
         let admission = body.find("admit_invocation").expect("admission");
         let dispatch = body
             .find("super::provider_spawn::spawn_provider_process(")
@@ -5545,6 +5785,129 @@ mod tests {
             guard.list_scheduled_jobs()?.iter().any(|job| job.enabled
                 && job.wake_mode == rsi_common::types::WakeMode::OnTerminal(worker))
         );
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::large_futures,
+        clippy::significant_drop_tightening
+    )]
+    async fn epic_child_mid_task_rotation_is_held_for_its_lead() -> anyhow::Result<()> {
+        // #976: a child that ends a turn mid-task with a handoff gets no
+        // automatic successor; its lead's terminal watch decides.
+        let (manager, dir) = rotation_manager();
+        let (worker, _) = final_handoff_fixture(&manager, dir.path(), false).await?;
+        {
+            let mut completed = manager.completed.write().await;
+            let turn = completed.get_mut(&worker).expect("worker turn");
+            turn.events.clear();
+            let mut mid_task = final_handoff_event(worker);
+            mid_task.content = "Context is nearly full; handoff written, work continues.".into();
+            turn.events.push(mid_task);
+        }
+        let outcome = post_finalize_action_for_test(
+            &manager,
+            worker,
+            super::super::rotation_coordinator::RotationAction::SpawnChild {
+                session_id: worker,
+                handoff_filepath: Some("thoughts/shared/handoffs/own.md".into()),
+            },
+            "child-held",
+        )
+        .await;
+        manager.persistence.barrier().await?;
+        assert_eq!(
+            outcome,
+            PostFinalizeRotationOutcome::ContinueNormalCompletion
+        );
+        let guard = manager.store.lock().await;
+        assert_eq!(guard.find_rotation_successor(worker)?, None);
+        let events = terminal_rotation_events(&guard, worker)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "refused:child_rotation_held_for_lead");
+        assert!(
+            guard.list_scheduled_jobs()?.iter().any(|job| job.enabled
+                && job.wake_mode == rsi_common::types::WakeMode::OnTerminal(worker))
+        );
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::large_futures,
+        clippy::significant_drop_tightening
+    )]
+    async fn frozen_provider_child_skips_even_the_handoff_turn() -> anyhow::Result<()> {
+        use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+        // #976: a manager launch allowlist that leaves out the child's
+        // provider is a spend freeze; the child does not start a
+        // handoff-writing turn.
+        let (manager, _dir) = rotation_manager();
+        let (_, lead) = crate::store::manager_resources::tests::fixture(
+            &*manager.store.lock().await,
+            ManagerPolicyV2 {
+                allowed_launches: vec![ManagerLaunchChoiceV2 {
+                    provider: SessionProvider::Claude,
+                    model: "claude-opus-5-5".into(),
+                    effort: Some("xhigh".into()),
+                }],
+                ..Default::default()
+            },
+        );
+        let epic_id = lead.parent_id.expect("lead under its Epic");
+        let frozen = Uuid::new_v4();
+        let mut child = test_session(frozen, SessionStatus::Completed);
+        child.parent_id = Some(epic_id);
+        child.project_id = lead.project_id;
+        child.provider = SessionProvider::OpenRouter;
+        let running = Uuid::new_v4();
+        let mut claude_child = child.clone();
+        claude_child.id = running;
+        claude_child.provider = SessionProvider::Claude;
+        {
+            let guard = manager.store.lock().await;
+            guard.insert_session(&child)?;
+            guard.insert_session(&claude_child)?;
+            assert_eq!(
+                guard.child_automatic_rotation_hold(running, false)?,
+                None,
+                "an unfrozen child may still write its one handoff"
+            );
+            assert_eq!(
+                guard.child_automatic_rotation_hold(running, true)?,
+                Some("child_rotation_held_for_lead")
+            );
+            assert_eq!(guard.child_automatic_rotation_hold(lead.id, true)?, None);
+        }
+        manager
+            .completed
+            .write()
+            .await
+            .insert(frozen, CompletedSession::for_test(child));
+        let outcome = post_finalize_action_for_test(
+            &manager,
+            frozen,
+            super::super::rotation_coordinator::RotationAction::SendCreateHandoff,
+            "child-frozen",
+        )
+        .await;
+        manager.persistence.barrier().await?;
+        assert_eq!(
+            outcome,
+            PostFinalizeRotationOutcome::ContinueNormalCompletion
+        );
+        let guard = manager.store.lock().await;
+        let events = terminal_rotation_events(&guard, frozen)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "refused:child_rotation_spend_frozen");
+        assert_eq!(guard.find_rotation_successor(frozen)?, None);
         Ok(())
     }
 
@@ -7587,6 +7950,7 @@ mod tests {
             manager.persistence.clone(),
             None,
             Arc::clone(&manager.runtime_config),
+            None,
         )
         .await
         .ok_or_else(|| anyhow::anyhow!("finalizer did not return a rotation-safe decision"))?;
@@ -7655,6 +8019,134 @@ mod tests {
             "the stable finalizer-owned escalation must cross the FIFO barrier"
         );
         assert!(manager.completed.read().await.contains_key(&parent_id));
+        Ok(())
+    }
+
+    /// Issue #692: a rotation whose successor model is off the operator
+    /// allowlist is refused before the successor's invocation admission and
+    /// custody bind: no invocation row, no successor session row, no custody
+    /// transfer, and the predecessor stays available.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rotation_successor_off_the_operator_allowlist_is_refused_before_any_effect()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut parent = test_session(parent_id, SessionStatus::Completed);
+        parent.working_dir = dir.path().to_path_buf();
+        parent.model = Some("rotation-model".to_string());
+        manager.store.lock().await.insert_session(&parent)?;
+        let candidate = manager
+            .custody_execution_runtime()
+            .prepare_rotation_successor(&parent)
+            .await?;
+        let mut child = test_session(child_id, SessionStatus::Starting);
+        child.working_dir = parent.working_dir.clone();
+        child.continued_from = Some(parent_id);
+        child.model = parent.model.clone();
+        manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["some-other-model"]),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let tables = [
+            "sessions",
+            "model_invocations",
+            "sandbox_custody_roots",
+            "sandbox_custody_events",
+        ];
+        let count = |manager: &SessionManager, table: &str| -> i64 {
+            manager
+                .store
+                .try_lock()
+                .expect("store idle")
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        let before: Vec<i64> = tables.iter().map(|table| count(&manager, table)).collect();
+        spawn_rotation_child_for_test(
+            &manager,
+            CompletedSession::for_test(parent),
+            child,
+            candidate,
+            None,
+        )
+        .await;
+        let after: Vec<i64> = tables.iter().map(|table| count(&manager, table)).collect();
+        assert_eq!(
+            before, after,
+            "a refused rotation creates no row or custody"
+        );
+        assert!(manager.store.lock().await.get_session(child_id)?.is_none());
+        assert!(
+            manager.completed.read().await.contains_key(&parent_id),
+            "the predecessor stays available"
+        );
+        assert!(manager.active.read().await.is_empty());
+        Ok(())
+    }
+
+    /// Issue #692: the handoff-write and spawn arms preflight the predecessor's
+    /// model, so a disallowed rotation never resumes it for a handoff.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn rotation_handoff_preflight_refuses_a_model_off_the_operator_allowlist()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let parent_id = Uuid::new_v4();
+        let mut parent = test_session(parent_id, SessionStatus::Completed);
+        parent.working_dir = dir.path().to_path_buf();
+        parent.model = Some("rotation-model".to_string());
+        manager.store.lock().await.insert_session(&parent)?;
+        manager
+            .completed
+            .write()
+            .await
+            .insert(parent_id, CompletedSession::for_test(parent));
+        async fn refuse(manager: &SessionManager, parent_id: Uuid) -> bool {
+            SessionManager::refuse_rotation_on_launch_allowlist(
+                parent_id,
+                Some("rotation-1"),
+                &manager.runtime_config,
+                &manager.completed,
+                &manager.event_bus,
+                &manager.persistence,
+                &manager.store,
+            )
+            .await
+        }
+        assert!(
+            !refuse(&manager, parent_id).await,
+            "an empty list admits the rotation"
+        );
+        manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["other-model"]),
+            )
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            refuse(&manager, parent_id).await,
+            "a model off the list is refused"
+        );
+        manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["Rotation-Model"]),
+            )
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            !refuse(&manager, parent_id).await,
+            "an allowed model is admitted"
+        );
         Ok(())
     }
 
@@ -11002,6 +11494,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -11253,6 +11746,45 @@ mod tests {
         assert!(live.completed.read().await.contains_key(&live_id));
         assert!(!live.active.read().await.contains_key(&live_id));
         assert!(handoff_custody_test_seams_are_clean(live_id));
+    }
+
+    /// #18: a handoff resume whose recorded sandbox root is gone (branch kept)
+    /// refuses typed before any provider launch; nothing is recreated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn issue18_handoff_resume_refuses_when_recorded_root_is_missing() {
+        let (manager, dir) = rotation_manager();
+        let (session_id, root) = insert_live_handoff_fixture(&manager, dir.path()).await;
+        let repo = dir.path().join("live-rotation-repo");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&root)
+            .current_dir(&repo)
+            .output()
+            .expect("remove worktree");
+        assert!(output.status.success());
+        let session = manager
+            .completed
+            .read()
+            .await
+            .get(&session_id)
+            .expect("completed")
+            .session
+            .clone();
+        let error = manager
+            .custody_execution_runtime()
+            .prepare_handoff_resume(&session)
+            .await
+            .expect_err("missing root must refuse");
+        assert!(error.to_string().contains("root_missing"), "{error}");
+        assert_handoff_transition(&error);
+        install_handoff_custody_config_observation_for_test(session_id);
+        resume_handoff_for_test(&manager, session_id).await;
+        assert!(manager.completed.read().await.contains_key(&session_id));
+        assert!(!manager.active.read().await.contains_key(&session_id));
+        assert!(take_handoff_custody_config_for_test(session_id).is_none());
+        assert!(!root.exists(), "nothing is recreated");
+        assert!(handoff_custody_test_seams_are_clean(session_id));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

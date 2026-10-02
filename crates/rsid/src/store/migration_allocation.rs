@@ -1035,7 +1035,7 @@ mod tests {
         let a = store.migration_allocation_apply_at(&first, now).unwrap();
         let b = store.migration_allocation_apply_at(&second, now).unwrap();
         assert_eq!(a.claim.as_ref().unwrap().assigned_version, base() + 1);
-        assert_eq!(b.claim.as_ref().unwrap().assigned_version, 138);
+        assert_eq!(b.claim.as_ref().unwrap().assigned_version, base() + 2);
         assert_eq!(store.migration_allocation_apply_at(&first, now).unwrap(), a);
         drop(store);
         let store = Store::open(&path).unwrap();
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(consumed.head.landed_version, base() + 1);
         let (_, claims) = store.migration_allocation_view("repo").unwrap();
         assert_eq!(claims[0].source_commit, source('b'));
-        assert_eq!(claims[1].assigned_version, 138);
+        assert_eq!(claims[1].assigned_version, base() + 2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

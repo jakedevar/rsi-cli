@@ -40,6 +40,7 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
 STORE = "crates/rsid/src/store/mod.rs"
+MIGRATION_DIR = guard.MIGRATION_DIR
 MANIFEST = "tools/released-migrations.json"
 DECLARATIONS = "tools/provisional-migrations/"
 TOKEN = "${VERSION}"
@@ -115,14 +116,35 @@ def changed(repo: Path, base: str, source: str) -> set[str]:
     return paths
 
 
+def layout_of(manifest: dict) -> str:
+    """``dir`` for one file per version, ``file`` for the legacy inline layout."""
+    return "dir" if "migration_dir" in manifest else "file"
+
+
+def revision_migration_files(repo: Path, revision: str) -> list[str]:
+    listing = run(repo, "ls-tree", "-r", "--name-only", revision, "--", f"{MIGRATION_DIR}/",
+                  check=False).decode().splitlines()
+    return [name for name in listing if guard.migration_file_version(name) is not None]
+
+
+def protected_paths_at(repo: Path, revision: str, manifest: dict) -> list[str]:
+    """Pinned sources plus every per-version migration file at ``revision``."""
+    return sorted(set(guard.tracked_source_paths(manifest)) |
+                  set(revision_migration_files(repo, revision)))
+
+
+def is_migration_unit_file(name: str) -> bool:
+    return guard.migration_file_version(name) is not None
+
+
 def revision_inventory(repo: Path, revision: str) -> dict:
     raw = show(repo, revision, MANIFEST)
     if raw is None:
         raise Refusal(f"{MANIFEST} missing at {revision}")
     try:
         manifest = guard.load_manifest_text(raw.decode(), f"{revision}:{MANIFEST}")
-        files = {name: (show(repo, revision, name) or b"").decode()
-                 for name in guard.tracked_source_paths(manifest)}
+        names = protected_paths_at(repo, revision, manifest)
+        files = {name: (show(repo, revision, name) or b"").decode() for name in names}
         if any(show(repo, revision, name) is None for name in files):
             raise Refusal("manifest names a missing protected source")
         guard.validate_manifest(manifest, guard.inventory(files), "provisional inventory")
@@ -154,6 +176,9 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
     prior = base_manifest["latest_schema_version"]
     if old == prior:
         return None
+    if layout_of(source_manifest) != layout_of(target_manifest):
+        raise Refusal("migration layout differs between source and target; port the "
+                      f"provisional migration to {MIGRATION_DIR}/vNNN.rs before landing")
     if old != prior + 1 or set(source_manifest["blocks"]) - set(base_manifest["blocks"]) != {str(old)}:
         raise Refusal("accepted source has more than one provisional migration")
     if target_manifest["latest_schema_version"] < prior:
@@ -199,6 +224,7 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
         if source_path in declared_paths or destination in destinations or source_path not in all_changed:
             raise Refusal("duplicate, unchanged, or colliding provisional file")
         if (source_path.startswith("crates/rsid/src/store/") and source_path != STORE and
+                not is_migration_unit_file(source_path) and
                 source_path not in guard.tracked_source_paths(source_manifest)):
             raise Refusal(f"migration helper or rewind source is not pinned: {source_path}")
         declared_paths.add(source_path)
@@ -245,6 +271,21 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
     for filename in all_changed - declared_paths - {MANIFEST, declaration_path}:
         if version_pattern.search(filename.encode()) or version_pattern.search(show(repo, source, filename) or b""):
             raise Refusal(f"undeclared version-bearing file or site: {filename}")
+    if layout_of(source_manifest) == "dir":
+        unit_file = f"{MIGRATION_DIR}/v{old:03d}.rs"
+        if unit_file not in declared_paths:
+            raise Refusal(f"migration file must be declared: {unit_file}")
+        declared = next(file for file in declaration["files"] if file["path"] == unit_file)
+        if declared["path_template"] != f"{MIGRATION_DIR}/v${{VERSION}}.rs":
+            raise Refusal("migration file path_template must be vNNN.rs with the version token")
+        if not any(site["path"] == unit_file and site["scope"] == "unit" and
+                   site["before"] == f"if version < {old} {{" for site in replacements):
+            raise Refusal("migration gate needs an exact unit site")
+        return {"base": base, "source": source, "target": target,
+                "declaration": declaration_path, "old_version": old,
+                "new_version": target_manifest["latest_schema_version"] + 1,
+                "source_manifest": source_manifest, "target_manifest": target_manifest,
+                "files": declaration["files"], "sites": replacements}
     if STORE not in declared_paths:
         raise Refusal("schema constant and migration gate must be declared")
     if (not any(site["path"] == STORE and site["scope"] == "head" and
@@ -285,7 +326,7 @@ def preview_transformed_manifest(repo: Path, unit: dict) -> dict:
     version = unit["new_version"]
     entries = {file["path"]: file for file in unit["files"]}
     files = {}
-    for filename in guard.tracked_source_paths(unit["source_manifest"]):
+    for filename in protected_paths_at(repo, unit["source"], unit["source_manifest"]):
         original = show(repo, unit["source"], filename)
         if original is None:
             raise Refusal(f"protected source disappeared: {filename}")
@@ -362,8 +403,11 @@ def allowed_mask(repo: Path, unit: dict, filename: str, transformed: bytes) -> b
         if transformed[end:end + 1] == b"\n":
             end += 1
         mask[start:end] = b"\1" * (end - start)
+    if is_migration_unit_file(filename):
+        # The whole per-version file is the declared unit.
+        mask[:] = b"\1" * len(mask)
     if filename == STORE:
-        blocks = guard.migration_blocks(transformed.decode())
+        blocks = guard.migration_blocks({STORE: transformed.decode()})
         block = blocks.get(str(unit["new_version"]))
         if block is None or transformed.count(block.encode()) != 1:
             raise Refusal("transformed migration gate is missing or ambiguous")
@@ -379,13 +423,17 @@ def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) 
     latest = unit["target_manifest"]["latest_schema_version"]
     if latest <= prior:
         return mask
+    if is_migration_unit_file(filename):
+        number = guard.migration_file_version(filename)
+        if number is not None and prior < number <= latest:
+            mask[:] = b"\1" * len(mask)
     if filename == STORE:
         constant = f"pub const LATEST_SCHEMA_VERSION: i32 = {latest};".encode()
         if target.count(constant) != 1:
             raise Refusal("target schema constant is ambiguous")
         start = target.index(constant)
         mask[start:start + len(constant)] = b"\1" * len(constant)
-        blocks = guard.migration_blocks(target.decode())
+        blocks = guard.migration_blocks({STORE: target.decode()})
         for number in range(prior + 1, latest + 1):
             block = blocks.get(str(number))
             if block is None or target.count(block.encode()) != 1:
@@ -553,6 +601,12 @@ def resolve(repo: Path, worktree: Path, unit: dict) -> dict:
     transformed_manifest = unit["transformed_manifest"]
     protected_paths = (set(guard.tracked_source_paths(target_manifest)) |
                        set(guard.tracked_source_paths(transformed_manifest)))
+    migration_dir = worktree / MIGRATION_DIR
+    if (migration_dir.is_dir() and not migration_dir.is_symlink() and
+            migration_dir.resolve().is_relative_to(worktree.resolve())):
+        protected_paths |= {f"{MIGRATION_DIR}/{entry.name}" for entry in migration_dir.iterdir()
+                            if entry.is_file() and guard.migration_file_version(
+                                f"{MIGRATION_DIR}/{entry.name}") is not None}
     try:
         files = {}
         for filename in protected_paths:

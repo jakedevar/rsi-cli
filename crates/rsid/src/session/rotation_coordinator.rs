@@ -85,6 +85,9 @@ pub(crate) struct RotationCoordinator {
     /// Unique ID grouping all events for one rotation attempt.
     /// Generated lazily when the first non-idle transition occurs.
     rotation_id: Option<String>,
+    /// #959: one automatic threshold crossing was already handled without a
+    /// rotation (a worker keeps its task). Re-armed below the threshold.
+    automatic_threshold_latched: bool,
 }
 
 impl RotationCoordinator {
@@ -116,6 +119,7 @@ impl RotationCoordinator {
             state: RotationState::Idle,
             enabled,
             rotation_id: None,
+            automatic_threshold_latched: false,
         }
     }
 
@@ -136,6 +140,7 @@ impl RotationCoordinator {
             state: Self::writing_handoff_state(None),
             enabled,
             rotation_id: Some(rotation_id.unwrap_or_else(|| Uuid::new_v4().to_string())),
+            automatic_threshold_latched: false,
         }
     }
 
@@ -152,6 +157,28 @@ impl RotationCoordinator {
     /// Update the enabled flag at runtime (e.g., when per-session toggle changes).
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Whether automatic (threshold) rotation is enabled for this session.
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// #959: an automatic crossing already handled without a rotation.
+    pub(crate) const fn automatic_threshold_latched(&self) -> bool {
+        self.automatic_threshold_latched
+    }
+
+    /// #959: record that this crossing was handled; see
+    /// [`Self::automatic_threshold_latched`].
+    pub(crate) const fn latch_automatic_threshold(&mut self) {
+        self.automatic_threshold_latched = true;
+    }
+
+    /// #959: occupancy fell well below the threshold (compaction), so the next
+    /// crossing is handled again.
+    pub(crate) const fn rearm_automatic_threshold(&mut self) {
+        self.automatic_threshold_latched = false;
     }
 
     /// Returns the rotation_id for this rotation attempt, if one is active.

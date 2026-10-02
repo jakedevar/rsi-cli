@@ -157,7 +157,174 @@ pub(crate) enum AdoptionOutcome {
     Retained(&'static str),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ArchivedSandboxPurgeCandidate {
+    pub custody_id: Uuid,
+    pub generation: u64,
+    pub allocation_id: Uuid,
+    pub session_id: Uuid,
+    pub updated_at: String,
+    pub canonical_repo_dir: String,
+    pub sandbox_root: String,
+    pub sandbox_branch: String,
+    pub source_commit: String,
+}
+
 impl Store {
+    pub(crate) fn archived_sandbox_purge_candidates(
+        &self,
+        after: Option<(String, Uuid)>,
+        max_count: usize,
+    ) -> Result<Vec<ArchivedSandboxPurgeCandidate>> {
+        let max_count = u32::try_from(max_count)
+            .map_err(|_| DaemonError::Store("candidate limit exceeds SQLite bounds".into()))?;
+        let after_ts = after.as_ref().map(|(updated_at, _)| updated_at.as_str());
+        let after_id = after.as_ref().map(|(_, session_id)| session_id.to_string());
+        let mut statement = self.conn.prepare(
+            "SELECT r.custody_id,r.generation,r.allocation_id,s.id,s.updated_at,
+                    r.canonical_repo_dir,r.sandbox_root,r.sandbox_branch,
+                    r.source_commit
+               FROM sessions s
+               JOIN sandbox_custody_roots r ON r.custody_id=s.sandbox_custody_id
+              WHERE s.status='Archived'
+                AND s.sandbox_kind='GitWorktree'
+                AND s.sandbox_cleanup_state='Live'
+                AND s.pending_archive=0
+                AND r.state='live'
+                AND r.validation_state='verified'
+                AND r.owner_session_id=s.id
+                AND r.reserved_effects=0
+                AND r.active_effects=0
+                AND NOT EXISTS (
+                    SELECT 1 FROM sessions lead
+                     WHERE lead.lead_session_id=s.id
+                       AND lead.status NOT IN ('Archived','Deleted')
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM sessions child
+                     WHERE child.parent_id=s.id
+                       AND child.status IN ('Starting','Running','WaitingApproval')
+                )
+                AND (?2 IS NULL OR s.updated_at > ?2 OR (s.updated_at = ?2 AND s.id > ?3))
+              ORDER BY s.updated_at ASC, s.id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(
+            params![i64::from(max_count), after_ts, after_id.as_deref()],
+            |row| {
+                Ok(ArchivedSandboxPurgeCandidate {
+                    custody_id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            "invalid custody UUID".into(),
+                        )
+                    })?,
+                    generation: u64::try_from(row.get::<_, i64>(1)?).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            "invalid custody generation".into(),
+                        )
+                    })?,
+                    allocation_id: Uuid::parse_str(&row.get::<_, String>(2)?).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            "invalid allocation UUID".into(),
+                        )
+                    })?,
+                    session_id: Uuid::parse_str(&row.get::<_, String>(3)?).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            "invalid session UUID".into(),
+                        )
+                    })?,
+                    updated_at: row.get(4)?,
+                    canonical_repo_dir: row.get(5)?,
+                    sandbox_root: row.get(6)?,
+                    sandbox_branch: row.get(7)?,
+                    source_commit: row.get(8)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn archived_sandbox_purge_candidate_is_current(
+        &self,
+        candidate: &ArchivedSandboxPurgeCandidate,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s JOIN sandbox_custody_roots r
+                                  ON r.custody_id=s.sandbox_custody_id
+                                  WHERE s.id=?1 AND s.sandbox_custody_id=?2
+                                    AND s.status='Archived'
+                                    AND s.sandbox_kind='GitWorktree'
+                                    AND s.sandbox_cleanup_state='Live'
+                                    AND s.pending_archive=0
+                                    AND s.updated_at=?3
+                                    AND r.state='live'
+                                    AND r.validation_state='verified'
+                                    AND r.owner_session_id=s.id
+                                    AND r.generation=?4
+                                    AND r.reserved_effects=0
+                                    AND r.active_effects=0)",
+            params![
+                candidate.session_id.to_string(),
+                candidate.custody_id.to_string(),
+                candidate.updated_at,
+                sql_generation(candidate.generation)?
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn finalize_archived_sandbox_purge(
+        &mut self,
+        candidate: &ArchivedSandboxPurgeCandidate,
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_archived: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s JOIN sandbox_custody_roots r
+                              ON r.custody_id=s.sandbox_custody_id
+                              WHERE s.id=?1 AND s.status='Archived'
+                                AND s.sandbox_kind='GitWorktree'
+                                AND s.sandbox_cleanup_state='Live'
+                                AND s.pending_archive=0
+                                AND r.state='live'
+                                AND r.validation_state='verified'
+                                AND r.owner_session_id=s.id
+                                AND r.generation=?2
+                                AND r.reserved_effects=0
+                                AND r.active_effects=0)",
+            params![
+                candidate.session_id.to_string(),
+                sql_generation(candidate.generation)?
+            ],
+            |row| row.get(0),
+        )?;
+        if !session_archived {
+            return Err(DaemonError::Store(
+                "archived sandbox purge candidate changed before finalization".into(),
+            ));
+        }
+        transition_terminal_root_tx(
+            &transaction,
+            candidate.custody_id,
+            candidate.generation,
+            CustodyCause::Purge,
+            "purged",
+            "tombstoned",
+            "historical_purged",
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn sandbox_reclaim_run_result(&self, run_id: Uuid) -> Result<Value> {
         let run = self
             .conn
@@ -266,6 +433,31 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// True when `session_id` still has a durable consumer that needs the
+    /// session (or its custody) preserved: a successor reservation, an active
+    /// review assignment, an open cleanup/settlement row, a manager scope, a
+    /// queued/running manager operation, or an unarchived manager work fact.
+    /// Fails closed on query error.
+    pub(crate) fn session_has_pending_consumer(
+        &self,
+        session_id: &str,
+        custody_id: Uuid,
+    ) -> Result<bool> {
+        let dependent: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND state IN ('reserved','launching','committed','uncertain'))
+              OR EXISTS(SELECT 1 FROM manager_review_assignments WHERE author_session_id=?1 AND state IN ('reserved','allocating','active'))
+              OR EXISTS(SELECT 1 FROM archive_cleanup_runs WHERE custody_id=?2 AND phase NOT IN ('settled','refused'))
+              OR EXISTS(SELECT 1 FROM source_worktree_settlement_items WHERE custody_id=?2 AND phase NOT IN ('refused','unattempted','settled'))
+              OR EXISTS(SELECT 1 FROM harness_manager_scopes WHERE manager_session_id=?1)
+              OR EXISTS(SELECT 1 FROM harness_manager_v2_operations WHERE state IN ('queued','running','uncertain') AND (target_session_id=?1 OR instr(payload_json,?1)>0 OR instr(payload_json,?2)>0))
+              OR EXISTS(SELECT 1 FROM harness_manager_v2_work_facts WHERE archived=0 AND (instr(record_key,?1)>0 OR instr(work_key,?1)>0 OR instr(payload_json,?1)>0))",
+            params![session_id, custody_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap_or(true);
+        Ok(dependent)
+    }
+
     pub(crate) fn absent_root_gate(&self, c: &AbsentRootCandidate) -> Result<Option<&'static str>> {
         let owner = c.owner_session_id;
         if c.state == "live"
@@ -326,16 +518,7 @@ impl Store {
             if lead {
                 return Ok(Some("live_lead"));
             }
-            let dependent: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND state IN ('reserved','launching','committed','uncertain'))
-                  OR EXISTS(SELECT 1 FROM manager_review_assignments WHERE author_session_id=?1 AND state IN ('reserved','allocating','active'))
-                  OR EXISTS(SELECT 1 FROM archive_cleanup_runs WHERE custody_id=?2 AND phase NOT IN ('settled','refused'))
-                  OR EXISTS(SELECT 1 FROM source_worktree_settlement_items WHERE custody_id=?2 AND phase NOT IN ('refused','unattempted','settled'))
-                  OR EXISTS(SELECT 1 FROM harness_manager_scopes WHERE manager_session_id=?1)
-                  OR EXISTS(SELECT 1 FROM harness_manager_v2_operations WHERE state IN ('queued','running','uncertain') AND (target_session_id=?1 OR instr(payload_json,?1)>0 OR instr(payload_json,?2)>0))
-                  OR EXISTS(SELECT 1 FROM harness_manager_v2_work_facts WHERE archived=0 AND (instr(record_key,?1)>0 OR instr(work_key,?1)>0 OR instr(payload_json,?1)>0))",
-                params![participant,c.custody_id.to_string()],|r|r.get(0)).unwrap_or(true);
-            if dependent {
+            if self.session_has_pending_consumer(participant, c.custody_id)? {
                 return Ok(Some("pending_consumer"));
             }
         }

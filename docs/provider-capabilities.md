@@ -83,13 +83,13 @@ The semantic fixture is bounded and omits provider prompt payloads. Its digest i
 | memory-flush | `crates/rsid/src/session/monitor.rs` | `memory_flush_turn_candidate` | `call:context_budget` → `call:should_run_memory_flush, field:active_tokens` |
 | rotation | `crates/rsid/src/session/rotation.rs` | `SessionManager::decide_rotation_successor` | `call:resolve_new_incarnation_context_budget` → `field:context_window, field:resolved_context_budget` |
 | context-injection | `crates/rsid/src/session/launch.rs` | `SessionManager::launch_session_with_retry_admission` | `call:context_injection_allowance` → `call:assemble` |
-| harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch_with_binding` | `parameter:resolved_context_budget` → `call:run_harness_loop` |
+| harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch_with_binding` | `parameter:resolved_context_budget` → `call:run_harness_loop_with_compact_budget` |
 | persistence | `crates/rsid/src/store/sessions.rs` | `persisted_context_budget` | `parameter:resolved` → `field:source, field:source_version, field:source_digest, field:observed_at` |
 | rpc-session | `crates/rsid/src/session/queries.rs` | `rehydrate_context_budget_projection` | `call:rehydrate_resolved_context_budget` → `assignment:session.resolved_context_budget` |
 | bus-publication | `crates/rsid/src/monitor.rs` | `publish_context_usage` | `parameter:resolved_context_budget` → `field:context_window, field:resolved_context_budget` |
 | polling | `crates/rsi/src/app/polling.rs` | `App::apply_push_event` | `field:parsed.resolved_context_budget` → `assignment:state.session.resolved_context_budget` |
 | f3-detail | `crates/rsi/src/ui/overlay/session_info.rs` | `session_info_lines` | `call:detail_rows` → `call:field_line` |
-| wide-inspector-detail | `crates/rsi/src/ui/session.rs` | `render_inspector_context` | `call:detail_rows` → `call:wrap_plain` |
+| wide-inspector-detail | `crates/rsi/src/ui/session.rs` | `render_inspector_context` | `call:detail_rows` → `call:pack_chip_lines` |
 | detail-header-context | `crates/rsi/src/ui/status.rs` | `render_context_percent_segment_for` | `call:compact_label` → `call:styled` |
 | wide-inspector-compact | `crates/rsi/src/ui/session.rs` | `render_embedded_session_inspector` | `field:inspector.runtime.context` → `call:compact_label` |
 | session-list-compact-row | `crates/rsi/src/types/row.rs` | `compute_session_row_for_state_with_focus` | `call:compute_context_budget_view` → `call:compact_label` |

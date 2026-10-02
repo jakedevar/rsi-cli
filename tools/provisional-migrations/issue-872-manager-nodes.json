@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "version": 138,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/mod.rs",
+      "path_template": "crates/rsid/src/store/mod.rs",
+      "source_blob": "sha256:edc352eda7be03c1a13393ce69094f60de91873f7ae27d54d7578bb601c59b2b",
+      "sites": [
+        {
+          "anchor": "pub const LATEST_SCHEMA_VERSION: i32 = 138;",
+          "replacement": "pub const LATEST_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if version < 138 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/manager_nodes.rs",
+      "path_template": "crates/rsid/src/store/manager_nodes.rs",
+      "source_blob": "sha256:c6dbf7248a41dfde4e5e1f98a54fff79c0ffa81c3a880511602d8debd0314f87",
+      "sites": [
+        {
+          "anchor": "pub(super) const MANAGER_NODE_SCHEMA_VERSION: i32 = 138;",
+          "replacement": "pub(super) const MANAGER_NODE_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:bacb9d25eca30807aa3fb983a54c3aeda0bc20c430a3b84a77ae6bd2ad3d8980",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 138;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

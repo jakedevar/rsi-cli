@@ -32,7 +32,7 @@ research → plan → implement pipeline shape.
   <forbidden>findings, plan_summary, code_snippets, file_contents, stage_narrative</forbidden>
 </handoff_contract>
 
-**Worker preamble (binding for all spawned workers):** `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md`. Each spawned worker MUST load and obey that file's rules.
+**Worker preamble (binding for all spawned workers):** `.claude/commands/_shared/worker_preamble.md`. Each spawned worker MUST load and obey that file's rules.
 
 **Preflight (RSI-021):** `SendMessage` is a deferred tool. Before Step 1, invoke `ToolSearch` with `select:SendMessage,PushNotification,TaskUpdate` to load their schemas. The corrective-retry path in each parse step depends on `SendMessage`; Step 4 uses `PushNotification` + `TaskUpdate`. Also build the contract and manifest validators plus RPC helper once before dispatching: `cargo build -q -p rsi-common --bin rsi-contract-validate --bin rsi-manifest-validate --bin rsi-rpc`.
 

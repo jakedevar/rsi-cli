@@ -98,6 +98,17 @@ pub enum DaemonEvent {
         backoff_ms: u64,
         reason: String,
     },
+    /// A transiently failed child will be resumed automatically (#1015), or
+    /// its heal budget is exhausted (`not_before` is `None`). Sent to the
+    /// child's parent when no manager inbox notice covers the session.
+    SessionHealScheduled {
+        session_id: Uuid,
+        owner_session_id: Option<Uuid>,
+        attempt: u32,
+        max_attempts: u32,
+        not_before: Option<String>,
+        reason: String,
+    },
     /// Real-time context usage update from the streaming hot path.
     ContextUsageUpdated {
         session_id: Uuid,
@@ -138,7 +149,7 @@ pub enum DaemonEvent {
     /// side. The TUI renders this as an ambient notification.
     SessionClassified {
         session_id: Uuid,
-        verdict: crate::stall_classifier::types::Verdict,
+        verdict: crate::store_support::event_types::Verdict,
         confidence: f64,
         /// Idle duration at classification time (seconds).
         idle_secs: u64,
@@ -176,7 +187,7 @@ pub enum DaemonEvent {
         session_id: Uuid,
         old_status: SessionStatus,
         new_status: SessionStatus,
-        reason: crate::reconciliation::ReconciliationReason,
+        reason: crate::store_support::event_types::ReconciliationReason,
     },
     /// A dream consolidation cycle has started.
     DreamStarted,
@@ -349,6 +360,7 @@ impl From<DaemonEvent> for rsi_common::rpc::BusEvent {
                 }
                 DaemonEvent::MemoryIndexUpdated { .. } => "memory_index_updated".to_string(),
                 DaemonEvent::SessionRetrying { .. } => "session_retrying".to_string(),
+                DaemonEvent::SessionHealScheduled { .. } => "session_heal_scheduled".to_string(),
                 DaemonEvent::ContextUsageUpdated { .. } => "context_usage_updated".to_string(),
                 DaemonEvent::ProviderRateLimitUpdated { .. } => {
                     "provider_rate_limit_updated".to_string()
@@ -875,7 +887,7 @@ mod tests {
     fn test_session_classified_event_type() {
         let event = DaemonEvent::SessionClassified {
             session_id: Uuid::new_v4(),
-            verdict: crate::stall_classifier::types::Verdict::StalledContinue,
+            verdict: crate::store_support::event_types::Verdict::StalledContinue,
             confidence: 0.85,
             idle_secs: 720,
             action_taken: "continue".to_string(),
@@ -889,7 +901,7 @@ mod tests {
     fn test_session_classified_serde_roundtrip() {
         let event = DaemonEvent::SessionClassified {
             session_id: Uuid::new_v4(),
-            verdict: crate::stall_classifier::types::Verdict::Finished,
+            verdict: crate::store_support::event_types::Verdict::Finished,
             confidence: 0.99,
             idle_secs: 600,
             action_taken: "notify_only".to_string(),
@@ -904,7 +916,10 @@ mod tests {
                 action_taken,
                 ..
             } => {
-                assert_eq!(verdict, crate::stall_classifier::types::Verdict::Finished);
+                assert_eq!(
+                    verdict,
+                    crate::store_support::event_types::Verdict::Finished
+                );
                 assert!((confidence - 0.99).abs() < 1e-9);
                 assert_eq!(idle_secs, 600);
                 assert_eq!(action_taken, "notify_only");
@@ -919,7 +934,7 @@ mod tests {
         let id = Uuid::new_v4();
         let event = DaemonEvent::SessionClassified {
             session_id: id,
-            verdict: crate::stall_classifier::types::Verdict::NeedsUser,
+            verdict: crate::store_support::event_types::Verdict::NeedsUser,
             confidence: 0.55,
             idle_secs: 900,
             action_taken: "notify_only".to_string(),
@@ -943,7 +958,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             old_status: SessionStatus::Running,
             new_status: SessionStatus::Failed,
-            reason: crate::reconciliation::ReconciliationReason::ProcessDied,
+            reason: crate::store_support::event_types::ReconciliationReason::ProcessDied,
         };
         let bus_event: rsi_common::rpc::BusEvent = event.into();
         assert_eq!(bus_event.event_type, "session_reconciled");
@@ -956,7 +971,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             old_status: SessionStatus::Running,
             new_status: SessionStatus::Failed,
-            reason: crate::reconciliation::ReconciliationReason::ProcessDied,
+            reason: crate::store_support::event_types::ReconciliationReason::ProcessDied,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deser: DaemonEvent = serde_json::from_str(&json).unwrap();
@@ -967,7 +982,7 @@ mod tests {
                 assert_eq!(new_status, SessionStatus::Failed);
                 assert_eq!(
                     reason,
-                    crate::reconciliation::ReconciliationReason::ProcessDied
+                    crate::store_support::event_types::ReconciliationReason::ProcessDied
                 );
             }
             _ => panic!("Wrong variant"),

@@ -116,14 +116,15 @@ pub(crate) fn fail_next_effect_releases(count: usize) {
     FAIL_NEXT_EFFECT_RELEASES.store(count, Ordering::Release);
 }
 
-pub(crate) struct CustodyRootGuard(MutexGuard<'static, ()>);
+/// A held custody stripe. It also marks its thread as holding a stripe, so
+/// Store acquisition on that thread is bounded (see `custody_lock_order`).
+pub(crate) struct CustodyRootGuard(MutexGuard<'static, ()>, super::custody_lock_order::HeldScope);
 
 pub(crate) fn lock_custody_root(custody_id: Uuid) -> CustodyRootGuard {
-    CustodyRootGuard(
-        ROOT_LOCKS[custody_root_lock_shard(custody_id)]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    let guard = ROOT_LOCKS[custody_root_lock_shard(custody_id)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    CustodyRootGuard(guard, super::custody_lock_order::HeldScope::stripe())
 }
 
 /// Acquire one custody stripe without waiting. Maintenance callers use this
@@ -131,8 +132,14 @@ pub(crate) fn lock_custody_root(custody_id: Uuid) -> CustodyRootGuard {
 /// the blocking guard and their existing serialization contract.
 pub(crate) fn try_lock_custody_root(custody_id: Uuid) -> Option<CustodyRootGuard> {
     match ROOT_LOCKS[custody_root_lock_shard(custody_id)].try_lock() {
-        Ok(guard) => Some(CustodyRootGuard(guard)),
-        Err(TryLockError::Poisoned(error)) => Some(CustodyRootGuard(error.into_inner())),
+        Ok(guard) => Some(CustodyRootGuard(
+            guard,
+            super::custody_lock_order::HeldScope::stripe(),
+        )),
+        Err(TryLockError::Poisoned(error)) => Some(CustodyRootGuard(
+            error.into_inner(),
+            super::custody_lock_order::HeldScope::stripe(),
+        )),
         Err(TryLockError::WouldBlock) => None,
     }
 }
@@ -273,11 +280,12 @@ pub(crate) enum ArchivedRotationRestoration {
 // queued_turn_count is provider result telemetry, not an authority claim: it
 // also gates a later manager-notice idle wake, which checks its live value.
 // The exhaustive destructure in the test fails compilation when Session grows.
+#[cfg(test)]
 macro_rules! rotation_session_field_classes {
     (authority: [$($authority:ident),* $(,)?], non_authority: [$($non_authority:ident),* $(,)?],) => {
         #[cfg(test)]
         const ROTATION_AUTHORITY_SESSION_FIELDS: &[&str] = &[$(stringify!($authority)),*];
-        const ROTATION_NON_AUTHORITY_SESSION_FIELDS: &[&str] = &[$(stringify!($non_authority)),*];
+        const TEST_ROTATION_NON_AUTHORITY_SESSION_FIELDS: &[&str] = &[$(stringify!($non_authority)),*];
 
         #[cfg(test)]
         fn assert_rotation_session_fields_exhaustive(session: &Session) {
@@ -286,6 +294,7 @@ macro_rules! rotation_session_field_classes {
     };
 }
 
+#[cfg(test)]
 rotation_session_field_classes! {
     authority: [
         id, session_kind, provider, rotation_depth, retry_attempt, max_retries,
@@ -303,7 +312,7 @@ rotation_session_field_classes! {
         status, updated_at, context_usage_confidence, title, description,
         short_summary, stop_reason, cost_usd, duration_ms, num_turns,
         input_tokens, output_tokens, context_window, resolved_context_budget,
-        total_input_tokens, total_output_tokens, total_cache_creation_tokens,
+        total_input_tokens, total_prompt_tokens, total_output_tokens, total_cache_creation_tokens,
         total_cache_read_tokens, daemon_input_tokens, daemon_output_tokens,
         context_fill_pct, test_passed, clippy_passed, turn_count, retry_count,
         approval_wait_ms, approval_started_at, work_time_ms, thinking_tokens,
@@ -312,6 +321,46 @@ rotation_session_field_classes! {
         terminal_reason,
     ],
 }
+
+const ROTATION_NON_AUTHORITY_SESSION_FIELDS: &[&str] = &[
+    "status",
+    "updated_at",
+    "context_usage_confidence",
+    "title",
+    "description",
+    "short_summary",
+    "stop_reason",
+    "cost_usd",
+    "duration_ms",
+    "num_turns",
+    "input_tokens",
+    "output_tokens",
+    "context_window",
+    "resolved_context_budget",
+    "total_input_tokens",
+    "total_prompt_tokens",
+    "total_output_tokens",
+    "total_cache_creation_tokens",
+    "total_cache_read_tokens",
+    "daemon_input_tokens",
+    "daemon_output_tokens",
+    "context_fill_pct",
+    "test_passed",
+    "clippy_passed",
+    "turn_count",
+    "retry_count",
+    "approval_wait_ms",
+    "approval_started_at",
+    "work_time_ms",
+    "thinking_tokens",
+    "service_tier",
+    "cache_creation_1h_tokens",
+    "cache_creation_5m_tokens",
+    "permission_denial_count",
+    "subagent_stats_json",
+    "queued_turn_count",
+    "terminal_reason",
+];
 
 #[cfg(test)]
 mod session_authority_classification_tests {
@@ -323,6 +372,10 @@ mod session_authority_classification_tests {
     fn every_session_field_has_exactly_one_rotation_authority_class() {
         let session = crate::store::tests::make_test_session();
         assert_rotation_session_fields_exhaustive(&session);
+        assert_eq!(
+            ROTATION_NON_AUTHORITY_SESSION_FIELDS,
+            TEST_ROTATION_NON_AUTHORITY_SESSION_FIELDS,
+        );
         let authority: BTreeSet<_> = ROTATION_AUTHORITY_SESSION_FIELDS.iter().copied().collect();
         let non_authority: BTreeSet<_> = ROTATION_NON_AUTHORITY_SESSION_FIELDS
             .iter()
@@ -1002,6 +1055,54 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Probe inputs of every terminal custody root, for the startup proof
+    /// prefetch (#961). Speculative: the serial pass authenticates the static
+    /// identity first and uses a prefetched probe only for identical inputs.
+    pub(crate) fn startup_terminal_root_probe_inputs(
+        &self,
+    ) -> Result<Vec<(Uuid, crate::sandbox::custody::TerminalProofInputs)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT custody_id,sandbox_root,canonical_repo_dir,sandbox_branch,
+                    repository_identity,source_commit
+               FROM sandbox_custody_roots WHERE state!='live' ORDER BY custody_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::sandbox::custody::TerminalProofInputs {
+                        root_path: PathBuf::from(row.get::<_, String>(1)?),
+                        canonical_repo: PathBuf::from(row.get::<_, String>(2)?),
+                        sandbox_branch: row.get(3)?,
+                        repository_identity: row.get(4)?,
+                        source_commit: row.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(custody_id, inputs)| {
+                Uuid::parse_str(&custody_id)
+                    .map(|custody_id| (custody_id, inputs))
+                    .map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .collect()
+    }
+
+    /// Owners of every live custody root, for the startup proof prefetch
+    /// (#961). Speculative input only: the serial pass decides every outcome.
+    pub(crate) fn startup_live_root_owner_ids(&self) -> Result<Vec<Uuid>> {
+        let mut statement = self.conn.prepare(
+            "SELECT owner_session_id FROM sandbox_custody_roots
+              WHERE state='live' AND owner_session_id IS NOT NULL
+              ORDER BY custody_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|id| Uuid::parse_str(&id?).map_err(|error| DaemonError::Store(error.to_string())))
+            .collect()
+    }
+
     /// Backfill a missing allocation identity with the exact V98 rule: the
     /// owner named by the root's sequence-one `allocated` event.
     ///
@@ -1263,6 +1364,7 @@ impl Store {
         let restored = tx.execute(
             "UPDATE sessions
              SET status='Completed',
+                 stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'completed:restored'),
                  pending_archive=0,
                  working_dir=?1,
                  git_branch=?2,
@@ -2289,7 +2391,9 @@ impl Store {
             return Ok(ArchivedRotationRestoration::Refused);
         }
         let changed = tx.execute(
-            "UPDATE sessions SET status=?3, pending_archive=0, updated_at=?2
+            "UPDATE sessions SET status=?3, pending_archive=0,
+                 stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'restored_from_archive'),
+                 updated_at=?2
              WHERE id=?1 AND status='Archived' AND pending_archive=0
                AND sandbox_kind IS NULL AND sandbox_root IS NULL
                AND sandbox_branch IS NULL AND sandbox_cleanup_state IS NULL

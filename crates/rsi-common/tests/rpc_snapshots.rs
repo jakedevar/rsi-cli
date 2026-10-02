@@ -20,6 +20,7 @@ use rsi_common::provider_capabilities::{
     CapabilityConfidence, CapabilityEvidence, CapabilitySource, ContextCapacity,
     ResolvedContextBudget,
 };
+use rsi_common::provider_credentials::ProviderCredentialSlot;
 use rsi_common::rpc::{
     BusEvent, CancelModelInvocationParams, ConversationBatchEntry, ConversationBatchResponse,
     ConversationFetchCursor, GetConversationsSinceParams, GetModelControlStatusParams,
@@ -89,6 +90,7 @@ fn fixture_session() -> Session {
         context_window: Some(200_000),
         resolved_context_budget: None,
         total_input_tokens: Some(2000),
+        total_prompt_tokens: None,
         total_output_tokens: Some(900),
         total_cache_creation_tokens: Some(0),
         total_cache_read_tokens: Some(0),
@@ -298,6 +300,7 @@ fn fixture_model_control_status() -> ModelControlStatusReport {
 #[test]
 fn snap_launch_session_request() {
     let params = LaunchSessionParams {
+        completion_gates: None,
         query: "implement feature X".to_string(),
         title: None,
         working_dir: Some(PathBuf::from("/tmp/repo")),
@@ -320,6 +323,7 @@ fn snap_launch_session_request() {
         skip_context_pipeline: None,
         tags: vec!["ci".to_string()],
         workflow_id_override: None,
+        tool_policy: None,
     };
     let request = RpcRequest::new("LaunchSession", serde_json::to_value(&params).unwrap());
     insta::assert_json_snapshot!(request);
@@ -453,12 +457,22 @@ fn snap_get_health_status_response() {
         provider_antigravity_available: false,
         provider_codex_app_server_available: true,
         provider_harness_available: true,
+        provider_clis_missing: Vec::new(),
         queue_pending: 0,
         queue_claimed: 0,
         queue_completed: 42,
         queue_failed: 0,
         latest_daemon_restart: None,
         worker_slice_memory_pressure: None,
+        process_memory: None,
+        provider_credentials: Some(rsi_common::rpc::ProviderCredentialHealthSummary {
+            credentials: vec![rsi_common::rpc::ProviderCredentialHealth {
+                slot: ProviderCredentialSlot::Openrouter,
+                state: rsi_common::provider_credentials::CredentialState::EnvCompat,
+                env_var_names: vec!["OPEN_ROUTER".to_string(), "OPENROUTER_API_KEY".to_string()],
+            }],
+            missing: Vec::new(),
+        }),
         // V99/P1-B: a populated snapshot, so the wire shape of the new field is
         // pinned rather than only its empty-vec default.
         rate_limits: vec![ProviderRateLimitSnapshot {

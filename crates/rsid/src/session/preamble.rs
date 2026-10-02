@@ -1,25 +1,39 @@
 //! Per-session-kind preamble loader.
 //!
-//! Resolves the preamble file for a given `SessionKind`, with graceful
-//! fallback to the base file. Path discovery is cached for the daemon's
-//! lifetime via `OnceLock` (no hot-reload — RSI-009 will add that).
+//! A session's startup text has two parts:
 //!
-//! Discovery order for the harness root (the directory containing `.claude/`):
-//!   1. `RSI_HARNESS_ROOT` env var (also accepts `MOTHERSHIP_HARNESS_ROOT`,
-//!      `FLYWHEEL_HARNESS_ROOT` via `env_with_legacy`).
-//!   2. Walk upward from `std::env::current_dir()` looking for `.claude/`.
-//!   3. Walk upward from `std::env::current_exe()`'s parent looking for `.claude/`.
-//!   4. `None` — logged once at warn level; preamble loading is silently disabled
-//!      and launch continues without a preamble (graceful degradation).
+//!   * the RSI-generic part, compiled into the daemon ([`load_generic`]:
+//!     agent-control frame, backend policy, daemon-message convention, and the
+//!     thoughts commit policy when the tree has a `thoughts/` directory), and
+//!   * the project part, read from the session's OWN working tree
+//!     ([`load_project_preamble`], [`load_orchestration_router`]): its
+//!     `.claude/commands/_shared/worker_preamble*.md` and
+//!     `.claude/commands/orchestration_router.md`. A project without them
+//!     contributes nothing; there is no fallback to the rsi repo's text, so the
+//!     startup text never points at files the session's tree does not have.
+//!
+//! The session's tree is the sandbox root when sandboxed, else its
+//! `working_dir`; callers pass that directory. The files are looked up in it
+//! and in its ancestors up to and including the first directory holding a
+//! `.git` (a session started in a repo subdirectory still finds the repo's
+//! files; the search never climbs past the repository).
 //!
 //! Read-failure modes (variant or base file):
-//!   - `NotFound`: logged at debug; falls through to base (or returns `None` if base also missing).
-//!   - other IO error: logged at warn; falls through to base (or returns `None`).
-//!   - `None` is never an error — launch is never aborted by preamble loading.
+//!   - `NotFound`: logged at debug; falls through to base (or `None` if base also missing).
+//!   - other IO error: logged at warn; falls through to base (or `None`).
+//!   - `None` is never an error: launch is never aborted by preamble loading.
+//!
+//! [`harness_root`] (the daemon's own checkout, discovered once per process) no
+//! longer feeds any session text; it remains for tools and tests that need the
+//! rsi repo's files.
 
-use super::agent_verbs::agent_authority::AgentAuthorityProjection;
+use super::agent_verbs::agent_authority::{AgentAuthorityProjection, is_baseline_verb};
 use crate::error::{DaemonError, Result};
-use rsi_common::agent_control_schema::AgentControlVerbV1 as Verb;
+use rsi_common::agent_authority_catalog::{
+    AGENT_AUTHORITY_CATALOG_SCHEMA_VERSION_V1, AgentAuthorityCatalogV1,
+    AgentAuthorityControlDetailV1, AgentAuthorityControlV1, AgentAuthorityRefusalV1,
+};
+use rsi_common::agent_control_schema::{AgentControlDescriptorV1, AgentControlVerbV1 as Verb};
 use rsi_common::types::{Session, SessionKind};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -45,18 +59,6 @@ const EMBEDDED_EPIC_LEAD: &str = include_str!("guidance/epic_lead_v1.md");
 const EMBEDDED_MANAGER: &str = include_str!("guidance/manager_v1.md");
 const EMBEDDED_REVIEWER: &str = include_str!("guidance/assigned_reviewer_v1.md");
 
-/// A pending initial publication may advertise only the ordinary worker
-/// controls, even if the caller's snapshot was concurrently superseded.
-const PENDING_WORKER_VERBS: &[Verb] = &[
-    Verb::GetProgress,
-    Verb::SendMessage,
-    Verb::GetStatus,
-    Verb::Halt,
-    Verb::ContinueChild,
-    Verb::ScheduleWake,
-    Verb::CreateIssue,
-];
-
 fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
     match kind {
         SessionKind::Bug => Some(include_str!(
@@ -75,18 +77,9 @@ fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
     }
 }
 
-/// Build one versioned, role-filtered instruction snapshot from the durable
-/// projection. Launch and rotation will consume this after authority publishes;
-/// rendering itself never grants a server-side permission.
-pub(crate) fn render_versioned_guidance(
-    kind: SessionKind,
-    projection: &AgentAuthorityProjection,
-) -> Result<String> {
-    if !rsi_common::is_leaf_kind(kind) {
-        return Err(DaemonError::InvalidParam(
-            "agent_guidance_requires_leaf_session".into(),
-        ));
-    }
+/// Guidance ids must match the projection's role bits exactly; a mismatch is a
+/// visible store error rather than silently wrong role text.
+fn check_guidance_ids(projection: &AgentAuthorityProjection) -> Result<()> {
     let mut expected_ids = vec!["common", "worker"];
     if projection.is_lead {
         expected_ids.push("epic_lead");
@@ -102,6 +95,22 @@ pub(crate) fn render_versioned_guidance(
             "inconsistent agent guidance projection".into(),
         ));
     }
+    Ok(())
+}
+
+/// Build one versioned, role-filtered instruction snapshot from the durable
+/// projection. Launch and rotation will consume this after authority publishes;
+/// rendering itself never grants a server-side permission.
+pub(crate) fn render_versioned_guidance(
+    kind: SessionKind,
+    projection: &AgentAuthorityProjection,
+) -> Result<String> {
+    if !rsi_common::is_leaf_kind(kind) {
+        return Err(DaemonError::InvalidParam(
+            "agent_guidance_requires_leaf_session".into(),
+        ));
+    }
+    check_guidance_ids(projection)?;
 
     let mut sections = vec![
         format!(
@@ -119,16 +128,10 @@ pub(crate) fn render_versioned_guidance(
         EMBEDDED_WORKER.trim().to_string(),
     ]);
     if projection.pending {
-        sections.push("Authority publication is pending. Continue with the worker baseline and wait for a refreshed projection before using a role-specific control.".into());
+        sections.push(PENDING_PUBLICATION_NOTE.into());
     } else {
         for id in &projection.guidance_ids {
-            let text = match *id {
-                "epic_lead" => Some(EMBEDDED_EPIC_LEAD),
-                "manager" => Some(EMBEDDED_MANAGER),
-                "assigned_reviewer" => Some(EMBEDDED_REVIEWER),
-                _ => None,
-            };
-            if let Some(text) = text {
+            if let Some(text) = role_guidance(id) {
                 sections.push(text.trim().to_string());
             }
         }
@@ -141,16 +144,8 @@ pub(crate) fn render_versioned_guidance(
     let mut catalog = String::from(
         "## Controls in this authority snapshot\n\nUse a native tool when available; `rsi-rpc` supplies the transport token automatically. The token never belongs in request parameters.\n",
     );
-    for verb in &projection.verbs {
-        if projection.pending && !PENDING_WORKER_VERBS.contains(verb) {
-            continue;
-        }
-        let entry = verb.descriptor();
-        write!(catalog, "\n- `{}`", entry.method).expect("writing to a String cannot fail");
-        if let Some(tool) = entry.native_tool {
-            write!(catalog, " / `{}`", tool.name()).expect("writing to a String cannot fail");
-        }
-        write!(catalog, ": {}", entry.description).expect("writing to a String cannot fail");
+    for verb in advertised_verbs(projection) {
+        write_verb_entry(&mut catalog, verb.descriptor());
     }
     if !projection.pending {
         for (title, values) in [
@@ -170,16 +165,7 @@ pub(crate) fn render_versioned_guidance(
             }
         }
         if !projection.control_actions.is_empty() {
-            let actions = projection
-                .control_actions
-                .iter()
-                .map(|action| {
-                    serde_json::to_value(action)?
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| DaemonError::Store("invalid manager action name".into()))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let actions = manager_action_names(projection)?;
             write!(
                 catalog,
                 "\n\nAgentManagerControl actions: {}.",
@@ -263,7 +249,7 @@ fn walk_up_for_claude(start: &Path) -> Option<PathBuf> {
 
 /// Load the preamble for a given kind. Returns `None` if neither the variant
 /// nor the base file is readable. Never panics; never aborts launch.
-/// Compact, binary-embedded agent-control discovery nudge.
+/// Binary-embedded agent-control frame ([`agent_discovery_nudge`]).
 ///
 /// Appended to every per-kind preamble by [`load`], so BOTH fresh launch
 /// (`session::launch`) and context rotation (`session::rotation`) - which each
@@ -271,140 +257,192 @@ fn walk_up_for_claude(start: &Path) -> Option<PathBuf> {
 /// worker. This is embedded in the binary (not `.claude/` disk discovery) so it
 /// travels to any working directory, and it advertises ONLY the `Agent*` verbs
 /// plus the `rsi-rpc` token convention - never the generic RPC passthrough.
-pub const AGENT_DISCOVERY_NUDGE: &str = "\
+const AGENT_CONTROL_FRAME: &str = "\
 ## Agent control (rsi)
 
-You are an rsi-managed agent session. Prefer the typed `rsi_control_*` tools \
-when your provider exposes them. `rsi-rpc <Verb>` is the validated compatible \
-fallback; its authority token is supplied automatically via \
-`$RSI_SESSION_TOKEN` (transport-only - NEVER pass it in `--params`). The only \
-control verbs available to you are:
+You are an rsi-managed agent session. Start here: call \
+`AgentGetAuthorityCatalog` with `{}` (native tool \
+`rsi_control_authority_catalog`; Claude lists it as \
+`mcp__rsi-agent__rsi_control_authority_catalog`; CLI fallback \
+`rsi-rpc AgentGetAuthorityCatalog`). It is your operator's manual: your current \
+roles, the operating rules for those roles, and exactly the controls you may \
+call now. Pass `{\"verb\": \"<name>\"}` for one control alone: its schema, a \
+minimal example request and its refusal codes. Call it again after a role \
+change or an authority refusal. The catalog never grants authority: the \
+daemon checks every call.
 
-- `AgentSpawnChild` - spawn a child agent session under you.
-- `AgentReserveSuccessor` - reserve one daemon-authored same-Epic master successor; use this instead of Fresh for authority turnover.
-- `AgentGetProgress` - read one durable progress snapshot for your child cohort.
-- `AgentSendMessage` - queue attributed mail within your existing child-control scope.
-- `AgentGetStatus` - report status of you and your children.
-- `AgentHalt` - halt a running child agent.
-- `AgentContinueChild` - continue an exact child with a new prompt; supply the observed continuation cursor as a staleness fence. Continuing a running child interrupts its active turn, and delivery is not deduplicated.
-- `AgentArchiveChild` - archive a terminal child of the Epic you currently lead; supply the observed continuation cursor as a staleness fence. Current Epic lead only.
-- `AgentScheduleWake` - schedule a future wake/callback; `mode` is required. Use \
-  `resume` for same-session continuation, `fresh` only for a best-effort \
-  post-terminal root launch that carries no lead authority, `on_terminal` for a child watch, or `program_guard` for the \
-  unattended-program sentinel.
-- `AgentCreateIssue` - create a durable attributed issue follow-up.
-- `AgentListIssues`, `AgentGetIssue`, `AgentUpdateIssue`, `AgentUpdateIssueStatus`, \
-  `AgentArchiveIssue`, `AgentRestoreIssue`, and `AgentListIssueEvents` - guarded \
-  project Issue controls for the current owning-Epic lead or the current \
-  appointed manager with the `IssueCoordinate` grant. `AgentCreateIssue` \
-  remains available to ordinary project workers for follow-ups.
-- `AgentManagerProgress` - read bounded progress for your operator-appointed manager scope.
-- `AgentManagerInbox` - retrieve durable requests or replies in your live manager or feature-lead scope.
-- `AgentManagerSend` - queue a request to a selected Epic's current lead.
-- `AgentManagerReply` - record an explicit reply by request ID as the current feature lead.
-- `AgentManagerNotify` - send one unsolicited notice to your current appointed manager as the current feature lead.
-- `AgentManagerInspect` - page scoped workers, work, requests, decisions, topology, resources, actions and events.
-- `AgentManagerUpdate` - submit a typed ledger change with observed scope/policy versions and an idempotency key; lead request acknowledgement remains lead-bound.
-- `AgentSubmitReviewReceipt` - submit one immutable exact-source receipt as the live assigned reviewer; the daemon binds reviewer identity, invocation and custody.
-- `AgentManagerControl` - queue an explicitly granted lifecycle/topology action with exact target fences; inspect its receipt for execution outcome.
-- `AgentManagerPrepareControl` - preflight one supported semantic manager action against daemon-resolved live fences without queueing an effect.
-- `AgentManagerCommitPreparedControl` - commit an exact prepared ID/digest with an idempotency key; the daemon rechecks mutable authority and target state atomically.
-- `AgentManagerGetAction` - read one action receipt within the authenticated current manager's project and logical-manager scope.
-- `AgentManagerWorkView` - read your Epic's live work and granted file ownership as a manager-created worker (read-only).
-- `AgentTopologyUpsert`, `AgentTopologyList`, `AgentTopologyExecute`, `AgentTopologyGetExecution`, `AgentTopologyInterrupt`, and `AgentTopologyResolveAttempt` - author and run daemon-executed deterministic topologies as the current manager with `Automation` or an Epic lead within its Epic.
+Prefer the typed `rsi_control_*` tools when your provider exposes them. \
+`rsi-rpc <Verb>` is the validated compatible fallback; its authority token is \
+supplied automatically via `$RSI_SESSION_TOKEN` (transport-only - NEVER pass it \
+in `--params`). Do not invoke any other RPC method as an agent.
 
-`AgentSpawnChild` and `rsi_control_spawn` accept optional `provider`, `model`, \
-and `effort` fields. Set `provider` to launch a child on a different backend; \
-omitting it preserves the caller's provider, model, and effort defaults.
-
-`AgentSendMessage` accepts mail into a queue. A `queued` receipt does not prove \
-provider delivery; `failed` or `expired` is final mailbox settlement, not \
-proof of provider effect. Omitted or null `expires_at` gets a deadline 30 \
-minutes after first acceptance; exact retries keep that original deadline. \
-The deadline keeps running while the delivery Session is missing, recovery \
-is pending, or dispatch is denied; held queued mail can expire before \
-recovery or an idle boundary. This finite deadline is intentional. \
-Claude and Codex CLI workers have no authenticated mid-turn delivery and \
-acknowledgment path here. Use `AgentContinueChild` only when deliberately \
-interrupting and replacing a running turn.
-
-Run `rsi-rpc agent` to list these verbs. Do not invoke any other RPC method as \
-an agent.
-
-## Harness manager requests and replies
+`AgentScheduleWake`: `mode` is required. Use `resume` for same-session \
+continuation (never `fresh` on your own session), `fresh` only for a \
+best-effort post-terminal root launch that carries no lead authority, \
+`on_terminal` for a child watch, `program_guard` for the unattended-program \
+sentinel, or `when` for a wait the daemon evaluates itself (`when.jobs_terminal` \
+job ids you own, or `when.sha_on_rolling`; optional `timeout_seconds`): submit a \
+batch of `AgentSubmitJob` jobs with `wake:\"none\"` and arm ONE `when` wake, so you \
+are resumed once when the last job ends instead of once per job. An explicit \
+`name` replaces your earlier enabled wake of that name.
 
 Manager appointment and scope changes are operator-only. A title, prompt, or \
-tool registration grants no authority; existing child-control permissions stay unchanged.
-An appointed manager reads `AgentManagerProgress` with `{}`, follows \
-`next_after_epic_id` using `after_epic_id` until null, then uses `AgentManagerSend` with `epic_id`, `message`, and `idempotency_key` for selected \
-feature Epics. Native equivalents are `rsi_control_manager_progress` and \
-`rsi_control_manager_send`. Reuse a write key only for identical content.
+tool registration grants no authority; existing child-control permissions stay \
+unchanged. Direct operator instructions take precedence: surface conflicts \
+before acting. Human approvals remain operator-owned; manager mail cannot \
+answer or clear them.";
 
-Feature leads read `AgentManagerInbox` (native `rsi_control_manager_inbox`) with \
-`{}` or `after_sequence`, `limit` (1..32, default 32), and optional `request_id`. \
-Reply explicitly using `AgentManagerReply` (native `rsi_control_manager_reply`) \
-with the recorded request ID, `message`, and `idempotency_key`; include evidence \
-or a blocker. Send unsolicited status or blockers with `AgentManagerNotify` \
-(native `rsi_control_manager_notify`) using only `message` and `idempotency_key`; \
-the daemon derives your Epic and manager. A notice is never a request, approval \
-or acceptance. The manager reads the same inbox to collect replies and reports \
-what the evidence establishes. Send receipts mean queued, and an explicit reply \
-means replied; neither proves acceptance or completed implementation.
+/// Write one catalog entry: method, native tool name, and the canonical
+/// descriptor text (the same text `rsi-rpc agent` and MCP `tools/list` show).
+fn write_verb_entry(out: &mut String, descriptor: &AgentControlDescriptorV1) {
+    write!(out, "\n- `{}`", descriptor.method).expect("writing to a String cannot fail");
+    if let Some(tool) = descriptor.native_tool {
+        write!(out, " / `{}`", tool.name()).expect("writing to a String cannot fail");
+    }
+    write!(out, ": {}", descriptor.description).expect("writing to a String cannot fail");
+}
 
-Inbox retrieval is a durable tool read. Existing watches deliver coalesced \
-notices to read it once the sender or recipient is idle; do not assume provider \
-injection or interrupt an active turn to deliver manager mail. Live scope and \
-current leadership are rechecked, including after rotation or revocation. \
-Direct operator instructions take precedence: surface conflicts before acting. \
-Human approvals remain operator-owned; manager mail cannot answer or clear them.
+/// The agent-control frame every RSI-managed launch and rotation carries.
+///
+/// Deliberately short and role-independent: it sends every agent to
+/// `AgentGetAuthorityCatalog`, which serves role guidance and the permitted
+/// controls from the daemon's current authority projection
+/// ([`render_authority_catalog`]), so startup text can neither drift from nor
+/// overstate what the caller may do. It advertises ONLY the `Agent*` surface
+/// plus the `rsi-rpc` token convention - never the generic RPC passthrough.
+pub fn agent_discovery_nudge() -> &'static str {
+    AGENT_CONTROL_FRAME
+}
 
-V2 policy is a separate operator opt-in. Use `AgentManagerInspect` (native \
-`rsi_control_manager_inspect`) with `{}` or a section and returned cursor. \
-Partial traversal, reported progress, committed source, accepted work and \
-integrated delivery are separate facts; unknown evidence stays unknown.
-`AgentManagerUpdate` / `rsi_control_manager_update` record work, stage evidence, \
-dependencies, ownership, migration reservations, request lifecycle, decisions \
-and handoff. `AgentManagerControl` / `rsi_control_manager_control` queue only \
-explicitly granted exact-fence legacy actions. Prefer \
-`AgentManagerPrepareControl` / `rsi_control_manager_prepare_control`, then commit \
-the returned ID and digest with `AgentManagerCommitPreparedControl` / \
-`rsi_control_manager_commit_prepared_control`; inspect the durable result with \
-`AgentManagerGetAction` / `rsi_control_manager_get_action`. Read exact nested \
-schemas with `rsi-rpc <Verb> --schema`.
-A session the current manager created reads its Epic's live work, `mine`, \
-active file ownership, pause and unanswered-request delivery state with \
-`AgentManagerWorkView` / `rsi_control_manager_work_view` (`{}` or `work_key`, \
-`after_work_key`, `limit` 1..32). Granted ownership there is authoritative \
-without a relay turn; the view is read-only and grants no write, mail or \
-continuation authority.
-Deterministic topologies: `AgentTopologyUpsert` / `rsi_control_topology_upsert` \
-(`validate_only` reports diagnostics), then `AgentTopologyExecute` with the \
-returned `definition_digest`; read with `AgentTopologyGetExecution`, stop with \
-`AgentTopologyInterrupt`, and settle preserved work with \
-`AgentTopologyResolveAttempt`. Only the current manager holding `Automation` \
-(in-scope Epics) or an Epic lead (its own Epic; never `discard`) may call them. \
-Every session node names an explicit operator-allowed provider/model/effort.
-The manager may request DB-native review with the typed `request_review` update. \
-The assigned reviewer submits `AgentSubmitReviewReceipt` / \
-`rsi_control_submit_review_receipt` during the bound invocation. Do not create a \
-review artifact or evidence commit for that assignment.
-Mutations carry observed `fence` scope/policy versions and an identical-retry \
-`idempotency_key`; lead actions also carry observed lead/event/custody fences. \
-Never supply caller identity or permissions. Refresh after stale errors; do not \
-guess a new target or turn an uncertain receipt into another launch.
-Root `succeed_manager` requires explicit SelfSuccession and the current parentless \
-Standard manager. Read Overview's `manager_control` epoch/custody observation; \
-supply `expected`, `launch` and committed `handoff` (source_commit, relative_path, \
-blob_oid). Receive the queued receipt, then finish your turn. The daemon waits \
-for predecessor settlement and establishes distinct custody before publishing \
-authority. Logical work/mail/policy and accounting persist. Explicit succession \
-charges session creation, not automatic recovery; preserve actual human gates. \
-Status/monitor/execute intent, pauses, creation quotas, concurrency, allowed \
-provider/model/effort choices, retry limits and spend caps are persisted policy. \
-Unfinished authorized work remains an obligation after a provider turn ends. \
-Respect existing retry owners, operator pauses and exact human gates. Only the \
-operator answers consolidated decisions; manager requests cannot grant approval. \
-ProgramRun methods remain operator-only and are not manager tools.";
+/// Binary-shipped role section for one projection guidance id.
+fn role_guidance(id: &str) -> Option<&'static str> {
+    match id {
+        "epic_lead" => Some(EMBEDDED_EPIC_LEAD),
+        "manager" => Some(EMBEDDED_MANAGER),
+        "assigned_reviewer" => Some(EMBEDDED_REVIEWER),
+        _ => None,
+    }
+}
+
+const PENDING_PUBLICATION_NOTE: &str = "Authority publication is pending. Continue with the worker baseline and wait for a refreshed projection before using a role-specific control.";
+
+fn manager_action_names(projection: &AgentAuthorityProjection) -> Result<Vec<String>> {
+    projection
+        .control_actions
+        .iter()
+        .map(|action| {
+            serde_json::to_value(action)?
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| DaemonError::Store("invalid manager action name".into()))
+        })
+        .collect()
+}
+
+/// Controls a snapshot advertises: a pending publication keeps the worker
+/// baseline even if the caller's projection was concurrently superseded.
+fn advertised_verbs(projection: &AgentAuthorityProjection) -> impl Iterator<Item = Verb> + '_ {
+    projection
+        .verbs
+        .iter()
+        .copied()
+        .filter(|verb| !projection.pending || is_baseline_verb(*verb))
+}
+
+/// Build the caller's operator's manual (`AgentGetAuthorityCatalog`) from one
+/// durable projection: binary-shipped common, worker and committed role
+/// guidance, plus exactly the advertised controls. A pending publication gets
+/// the worker baseline and a refresh instruction. Never grants authority.
+pub(crate) fn render_authority_catalog(
+    session_id: uuid::Uuid,
+    projection: &AgentAuthorityProjection,
+    requested: Option<Verb>,
+) -> Result<AgentAuthorityCatalogV1> {
+    check_guidance_ids(projection)?;
+    let mut guidance = vec![EMBEDDED_COMMON.trim(), EMBEDDED_WORKER.trim()];
+    let mut roles = vec!["worker".to_string()];
+    if projection.pending {
+        guidance.push(PENDING_PUBLICATION_NOTE);
+    } else {
+        for id in &projection.guidance_ids {
+            if let Some(text) = role_guidance(id) {
+                guidance.push(text.trim());
+                roles.push((*id).to_string());
+            }
+        }
+    }
+    let controls: Vec<AgentAuthorityControlV1> = advertised_verbs(projection)
+        .map(|verb| {
+            let descriptor = verb.descriptor();
+            AgentAuthorityControlV1 {
+                method: descriptor.method.to_string(),
+                native_tool: descriptor.native_tool.map(|tool| tool.name().to_string()),
+                description: descriptor.description.to_string(),
+            }
+        })
+        .collect();
+    let control = requested.map(|verb| {
+        let descriptor = verb.descriptor();
+        AgentAuthorityControlDetailV1 {
+            method: descriptor.method.to_string(),
+            native_tool: descriptor.native_tool.map(|tool| tool.name().to_string()),
+            description: descriptor.description.to_string(),
+            permitted: advertised_verbs(projection).any(|advertised| advertised == verb),
+            parameters: descriptor.parameters(),
+            example: verb.example(),
+            refusals: verb
+                .refusals()
+                .iter()
+                .map(|refusal| AgentAuthorityRefusalV1 {
+                    code: refusal.code.to_string(),
+                    next_action: refusal.next_action.to_string(),
+                })
+                .collect(),
+        }
+    });
+    let owned = |values: &[&'static str]| values.iter().map(|v| (*v).to_string()).collect();
+    // A `verb` request gets only the compact envelope and that one control's
+    // detail; the full list, guidance and manager lists come without `verb`.
+    let committed = !projection.pending && control.is_none();
+    Ok(AgentAuthorityCatalogV1 {
+        schema_version: AGENT_AUTHORITY_CATALOG_SCHEMA_VERSION_V1,
+        session_id,
+        authority_revision: projection.revision.clone(),
+        pending: projection.pending,
+        roles,
+        guidance: if control.is_some() {
+            String::new()
+        } else {
+            guidance.join("\n\n")
+        },
+        controls: if control.is_some() {
+            Vec::new()
+        } else {
+            controls
+        },
+        manager_update_variants: if committed {
+            owned(&projection.update_variants)
+        } else {
+            Vec::new()
+        },
+        manager_control_actions: if committed {
+            manager_action_names(projection)?
+        } else {
+            Vec::new()
+        },
+        manager_prepared_actions: if committed {
+            owned(&projection.prepared_actions)
+        } else {
+            Vec::new()
+        },
+        delegated_operator_methods: if committed {
+            owned(&projection.delegated_operator_methods)
+        } else {
+            Vec::new()
+        },
+        control,
+    })
+}
 
 /// Commit policy for durable `thoughts/` artifacts.
 ///
@@ -438,31 +476,12 @@ sessions.
 
 Allowed worker-control surfaces, in order:
 
-1. RSI-native in-process control tools when present: `rsi_control_spawn`, `rsi_control_reserve_successor`, \
-`rsi_control_progress`, `rsi_control_send_message`, `rsi_control_status`, \
-`rsi_control_halt`, `rsi_control_create_issue`, `rsi_control_list_issues`, \
-`rsi_control_get_issue`, `rsi_control_update_issue`, `rsi_control_update_issue_status`, \
-`rsi_control_archive_issue`, `rsi_control_restore_issue`, `rsi_control_list_issue_events`, \
-`rsi_control_manager_progress`, `rsi_control_manager_inbox`, \
-`rsi_control_manager_send`, `rsi_control_manager_reply`, `rsi_control_manager_notify`, \
-`rsi_control_manager_inspect`, `rsi_control_manager_update`, \
-`rsi_control_submit_review_receipt`, `rsi_control_manager_control`, \
-`rsi_control_manager_prepare_control`, `rsi_control_manager_commit_prepared_control`, \
-`rsi_control_manager_get_action`, `rsi_control_manager_work_view`, \
-`rsi_control_topology_upsert`, `rsi_control_topology_list`, \
-`rsi_control_topology_execute`, `rsi_control_topology_get_execution`, \
-`rsi_control_topology_interrupt`, `rsi_control_topology_resolve_attempt`, \
-`schedule_wake`.
-2. RSI agent RPC verbs via `rsi-rpc`: `AgentSpawnChild`, `AgentReserveSuccessor`, `AgentGetProgress`, \
-`AgentSendMessage`, `AgentGetStatus`, `AgentHalt`, `AgentContinueChild`, `AgentArchiveChild`, `AgentScheduleWake`, \
-`AgentCreateIssue`, \
-`AgentListIssues`, `AgentGetIssue`, `AgentUpdateIssue`, `AgentUpdateIssueStatus`, \
-`AgentArchiveIssue`, `AgentRestoreIssue`, `AgentListIssueEvents`, \
-`AgentManagerProgress`, `AgentManagerInbox`, `AgentManagerSend`, `AgentManagerReply`, `AgentManagerNotify`, \
-`AgentManagerInspect`, `AgentManagerUpdate`, `AgentSubmitReviewReceipt`, `AgentManagerControl`, \
-`AgentManagerPrepareControl`, `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`, \
-`AgentManagerWorkView`, `AgentTopologyUpsert`, `AgentTopologyList`, `AgentTopologyExecute`, \
-`AgentTopologyGetExecution`, `AgentTopologyInterrupt`, `AgentTopologyResolveAttempt`.
+1. RSI-native control tools when present: the `rsi_control_*` tools (for \
+example `rsi_control_spawn` and `rsi_control_reserve_successor`) and \
+`schedule_wake`; Claude lists them as `mcp__rsi-agent__*`.
+2. RSI agent RPC verbs via `rsi-rpc` (for example `AgentSpawnChild` and \
+`AgentReserveSuccessor`). `AgentGetAuthorityCatalog` lists the controls you may \
+call.
 3. The documented RSI directive fallback (`<docregblock>/spawn_child ...</docregblock>` \
 or `<docregblock>/halt</docregblock>`) when neither native tools nor `rsi-rpc` \
 are available.
@@ -536,37 +555,114 @@ pub(super) fn prepend_sandbox_custody_instruction(
     }
 }
 
-/// Load the per-kind worker preamble the launch/rotation paths inject into the
-/// system prompt. Returns the on-disk kind preamble (or base) with the
-/// binary-embedded [`AGENT_DISCOVERY_NUDGE`] and [`RSI_BACKEND_POLICY`]
-/// appended. Because these layers are embedded, this always returns `Some(_)`
-/// even when no harness root / preamble file can be discovered - the
-/// agent-control frame is never lost to a missing disk file, and rotation
-/// (which calls this same loader) keeps it.
-pub fn load(kind: SessionKind) -> Option<String> {
-    let disk = load_disk(kind);
-    let embedded = format!(
-        "{AGENT_DISCOVERY_NUDGE}\n\n{THOUGHTS_COMMIT_POLICY}\n\n{RSI_BACKEND_POLICY}\n\n{DAEMON_MESSAGE_CONVENTION}"
-    );
-    Some(match disk {
-        Some(preamble) => format!("{preamble}\n\n{embedded}"),
-        None => embedded,
+/// Directories searched for project-owned startup files: `start` and its
+/// ancestors, up to and including the first one holding a `.git` entry. When no
+/// `.git` is found on the way up, only `start` itself is searched, so a bare
+/// directory never adopts files from an unrelated parent.
+fn project_search_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut found_git = false;
+    for dir in start.ancestors() {
+        dirs.push(dir.to_path_buf());
+        if dir.join(".git").exists() {
+            found_git = true;
+            break;
+        }
+    }
+    if !found_git {
+        dirs.truncate(1);
+    }
+    dirs
+}
+
+/// The project directory whose `.claude/commands` supplies the session's
+/// project startup text: the first searched directory holding the base
+/// preamble or the orchestration router. `None` means the project has neither.
+fn project_commands_root(start: &Path) -> Option<PathBuf> {
+    project_search_dirs(start).into_iter().find(|dir| {
+        dir.join(SHARED_DIR).join(BASE_FILENAME).is_file()
+            || dir
+                .join(COMMANDS_DIR)
+                .join(ORCHESTRATION_ROUTER_FILENAME)
+                .is_file()
     })
 }
 
-/// Disk-backed portion of [`load`]: composes the base preamble before a readable
-/// kind variant. Missing or unreadable variants fall back to the base; a
-/// readable variant still degrades gracefully if the base becomes unreadable
-/// after harness-root discovery. `None` only when no harness root is discovered
-/// or every applicable file read fails.
-fn load_disk(kind: SessionKind) -> Option<String> {
-    let root = harness_root()?;
-    load_disk_from_root(root, kind)
+/// Whether the session's tree has a `thoughts/` directory the commit policy can
+/// refer to.
+fn project_has_thoughts_dir(start: &Path) -> bool {
+    project_search_dirs(start)
+        .iter()
+        .any(|dir| dir.join("thoughts").is_dir())
 }
 
+/// RSI-generic part of the startup text, identical for every provider and
+/// project: the agent-control frame, the thoughts commit policy (only when
+/// `project_dir` has a `thoughts/` directory, since the policy names that
+/// path), the backend policy and the daemon-message convention. Compiled into
+/// the daemon; reads nothing but a directory probe.
+pub fn load_generic(project_dir: Option<&Path>) -> String {
+    let mut parts = vec![agent_discovery_nudge()];
+    if project_dir.is_some_and(project_has_thoughts_dir) {
+        parts.push(THOUGHTS_COMMIT_POLICY);
+    }
+    parts.push(RSI_BACKEND_POLICY);
+    parts.push(DAEMON_MESSAGE_CONVENTION);
+    parts.join("\n\n")
+}
+
+/// Project part of the startup text: the base preamble followed by the kind
+/// variant, read from the session's own tree (see the module docs). `None` when
+/// the project ships no preamble files.
+pub fn load_project_preamble(project_dir: &Path, kind: SessionKind) -> Option<String> {
+    let root = project_commands_root(project_dir)?;
+    load_disk_from_root(&root, kind)
+}
+
+/// Load the startup text the launch/rotation paths inject into the system
+/// prompt: the session's project preamble (if its tree has one) followed by the
+/// RSI-generic part ([`load_generic`]). Always `Some(_)`: the generic part is
+/// compiled in, so the agent-control frame is never lost, and rotation (which
+/// calls this same loader) keeps it.
+pub fn load(kind: SessionKind, project_dir: &Path) -> Option<String> {
+    let generic = load_generic(Some(project_dir));
+    Some(match load_project_preamble(project_dir, kind) {
+        Some(preamble) => format!("{preamble}\n\n{generic}"),
+        None => generic,
+    })
+}
+
+/// The one read path for project-part startup text. Canonicalizes the project
+/// root and the candidate file and reads only when the canonical file lies
+/// inside the canonical root, so a symlink or `..` cannot pull another
+/// project's text (or any readable file) into this project's prompts. A file
+/// that escapes is treated like a missing one: a warning is logged and the
+/// caller gets an error it already handles by omitting the part, never a launch
+/// failure. A path that does not exist reports `NotFound`.
+fn read_project_file(root: &Path, path: &Path) -> std::io::Result<String> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_file = path.canonicalize()?;
+    if !canonical_file.starts_with(&canonical_root) {
+        tracing::warn!(
+            path = %path.display(),
+            root = %root.display(),
+            "Project preamble file resolves outside the project tree; omitting it"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "project preamble file resolves outside the project tree",
+        ));
+    }
+    std::fs::read_to_string(canonical_file)
+}
+
+/// Disk-backed project portion of [`load`]: composes the base preamble before a
+/// readable kind variant in `root`. Missing or unreadable variants fall back to
+/// the base; a readable variant still degrades gracefully if the base becomes
+/// unreadable. `None` only when every applicable file read fails.
 fn load_disk_from_root(root: &Path, kind: SessionKind) -> Option<String> {
     let base_path = root.join(SHARED_DIR).join(BASE_FILENAME);
-    let base = match std::fs::read_to_string(&base_path) {
+    let base = match read_project_file(root, &base_path) {
         Ok(content) => Some(content),
         Err(e) => {
             tracing::warn!(
@@ -580,7 +676,7 @@ fn load_disk_from_root(root: &Path, kind: SessionKind) -> Option<String> {
 
     let variant = variant_filename(kind).and_then(|filename| {
         let path = root.join(SHARED_DIR).join(filename);
-        match std::fs::read_to_string(&path) {
+        match read_project_file(root, &path) {
             Ok(content) => Some(content),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(
@@ -609,25 +705,20 @@ fn load_disk_from_root(root: &Path, kind: SessionKind) -> Option<String> {
     }
 }
 
-/// Load the orchestration router skill body — the "mouth of the pipeline"
-/// frame injected at the start of every leaf-kind session's system prompt.
+/// Load the project's orchestration router skill body, the "mouth of the
+/// pipeline" frame placed first in a leaf-kind session's system prompt.
 ///
-/// Routes to `<harness_root>/.claude/commands/orchestration_router.md`,
-/// reusing `harness_root()`'s OnceLock-cached discovery. Returns `None`
-/// when no harness root could be discovered or the router file is missing
-/// — launch is never aborted by router-loading failure (graceful
-/// degradation, parallel to `load(kind)`).
+/// Read from `<project>/.claude/commands/orchestration_router.md` in the
+/// session's own tree. Returns `None` when the project has no router (there is
+/// no fallback to the rsi repo's router) or the read fails; launch is never
+/// aborted by router-loading failure.
 ///
-/// This loader is invoked from `super::launch::launch_session` BEFORE the
-/// per-kind preamble is pushed onto the system_prompt parts vector, so the
-/// router occupies the outermost frame for every spawnable session
-/// (Standard, TaskRabbit, Bug, Story, Task, Feature, Refactor, Research).
 /// Container kinds (Group/Epic) are gated out before this loader runs and
 /// therefore never receive the router.
-pub fn load_orchestration_router() -> Option<String> {
-    let root = harness_root()?;
+pub fn load_orchestration_router(project_dir: &Path) -> Option<String> {
+    let root = project_commands_root(project_dir)?;
     let path = root.join(COMMANDS_DIR).join(ORCHESTRATION_ROUTER_FILENAME);
-    match std::fs::read_to_string(&path) {
+    match read_project_file(&root, &path) {
         Ok(content) => Some(content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(
@@ -652,6 +743,15 @@ mod tests {
     use super::*;
     use rsi_common::harness_manager_v2::ManagerActionKindV2;
 
+    /// The rsi repository checkout this crate is built from: a session whose
+    /// tree is this directory is a session "in the rsi repo".
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
     fn worker_projection() -> AgentAuthorityProjection {
         AgentAuthorityProjection {
             revision: "sha256:worker-revision".into(),
@@ -666,6 +766,249 @@ mod tests {
             delegated_operator_methods: Vec::new(),
             guidance_ids: vec!["common", "worker"],
         }
+    }
+
+    fn all_roles_projection() -> AgentAuthorityProjection {
+        AgentAuthorityProjection {
+            revision: "sha256:all-roles".into(),
+            pending: false,
+            is_lead: true,
+            is_manager: true,
+            is_reviewer: true,
+            verbs: rsi_common::agent_control_schema::agent_control_catalog_v1()
+                .iter()
+                .map(|descriptor| descriptor.verb)
+                .collect(),
+            update_variants: vec!["stage", "handoff"],
+            control_actions: vec![ManagerActionKindV2::CreateSession],
+            prepared_actions: vec!["resume_lead"],
+            delegated_operator_methods: vec!["GetSession"],
+            guidance_ids: vec![
+                "common",
+                "worker",
+                "epic_lead",
+                "manager",
+                "assigned_reviewer",
+            ],
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn authority_catalog_lists_only_projected_worker_controls() {
+        let caller = uuid::Uuid::new_v4();
+        let mut projection = worker_projection();
+        projection.verbs.insert(0, Verb::GetAuthorityCatalog);
+        let catalog = render_authority_catalog(caller, &projection, None).unwrap();
+        assert_eq!(catalog.session_id, caller);
+        assert_eq!(catalog.authority_revision, "sha256:worker-revision");
+        assert!(!catalog.pending);
+        assert_eq!(catalog.roles, ["worker"]);
+        assert_eq!(
+            catalog
+                .controls
+                .iter()
+                .map(|control| control.method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "AgentGetAuthorityCatalog",
+                "AgentGetStatus",
+                "AgentCreateIssue"
+            ]
+        );
+        assert_eq!(
+            catalog.controls[1].native_tool.as_deref(),
+            Some("rsi_control_status")
+        );
+        assert!(
+            catalog
+                .guidance
+                .starts_with("## RSI authority and transport")
+        );
+        assert!(catalog.guidance.contains("## RSI worker baseline"));
+        assert!(catalog.manager_update_variants.is_empty());
+        assert!(catalog.control.is_none());
+        // A requested control carries its schema and whether this snapshot
+        // lists it: a worker may read AgentSpawnChild's shape but is told it
+        // is not one of its controls.
+        let detail = render_authority_catalog(caller, &projection, Some(Verb::SpawnChild))
+            .unwrap()
+            .control
+            .expect("requested control detail");
+        assert_eq!(detail.method, "AgentSpawnChild");
+        assert!(!detail.permitted);
+        assert_eq!(
+            detail.parameters,
+            Verb::SpawnChild.descriptor().parameters()
+        );
+        let permitted = render_authority_catalog(caller, &projection, Some(Verb::GetStatus))
+            .unwrap()
+            .control
+            .expect("requested control detail");
+        assert!(permitted.permitted);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn authority_catalog_verb_response_is_the_compact_envelope_and_one_detail() {
+        let caller = uuid::Uuid::new_v4();
+        let projection = all_roles_projection();
+        let full = render_authority_catalog(caller, &projection, None).unwrap();
+        assert!(!full.controls.is_empty() && !full.guidance.is_empty());
+
+        let compact =
+            render_authority_catalog(caller, &projection, Some(Verb::ContinueChild)).unwrap();
+        assert_eq!(compact.session_id, caller);
+        assert_eq!(compact.authority_revision, full.authority_revision);
+        assert_eq!(compact.roles, full.roles);
+        assert!(!compact.pending);
+        let json = serde_json::to_value(&compact).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "authority_revision",
+                "control",
+                "pending",
+                "roles",
+                "schema_version",
+                "session_id"
+            ],
+            "a verb request carries no controls list, guidance or manager lists"
+        );
+        let detail = &json["control"];
+        assert_eq!(detail["method"], "AgentContinueChild");
+        assert_eq!(detail["permitted"], true);
+        assert_eq!(detail["example"], Verb::ContinueChild.example());
+        let codes: Vec<&str> = detail["refusals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|refusal| refusal["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"agent_continue_stale_cursor"));
+        assert!(detail["refusals"][0]["next_action"].as_str().unwrap().len() > 1);
+        // The verb response is far smaller than the manual it replaces.
+        assert!(
+            serde_json::to_string(&json).unwrap().len() * 4
+                < serde_json::to_string(&full).unwrap().len()
+        );
+    }
+
+    /// Operating rules that used to live only in the rsi-agent-control skill
+    /// (#1055): the catalog guidance now carries them, so a session outside
+    /// this repository still gets them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn catalog_guidance_pins_the_mechanics_moved_out_of_the_skill() {
+        let guidance =
+            render_authority_catalog(uuid::Uuid::new_v4(), &all_roles_projection(), None)
+                .unwrap()
+                .guidance;
+        for phrase in [
+            // worker baseline: continuation fence and wake discipline
+            "never send `expected_row_version` for a session",
+            "not an idempotency key",
+            "`git diff <base_commit>..<child-ref>`",
+            "Continue yourself only through `AgentScheduleWake` with `mode:\"resume\"`",
+            "at most one same-session `mode:\"resume\"` wake of at most 3600 s",
+            "never `fresh` on your own session",
+            // epic lead: topology policy and Issue lifecycle
+            "`policy_refused`",
+            "archive is terminal-only and restore keeps the terminal status",
+            // manager: reach, deploy, landing queue, succession
+            "`manager_v2_leaf_required`",
+            "you cannot halt an Epic lead",
+            "before `succeed_manager`, `pause_lead` or lead replacement",
+            "`AgentRequestDeploy`",
+            "`AgentEnqueueLandingSource`",
+            "there are no hot-file claims or seals",
+            "`topology_bulk_fanout_min_openrouter`",
+        ] {
+            assert!(guidance.contains(phrase), "guidance lost: {phrase}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn authority_catalog_serves_each_committed_role() {
+        let catalog =
+            render_authority_catalog(uuid::Uuid::new_v4(), &all_roles_projection(), None).unwrap();
+        assert_eq!(
+            catalog.roles,
+            ["worker", "epic_lead", "manager", "assigned_reviewer"]
+        );
+        for section in [
+            "## RSI authority and transport",
+            "## RSI worker baseline",
+            "## Current Epic lead",
+            "## Appointed harness manager",
+            "## Active assigned reviewer",
+        ] {
+            assert!(catalog.guidance.contains(section), "missing {section}");
+        }
+        assert_eq!(
+            catalog.controls.len(),
+            rsi_common::agent_control_schema::agent_control_catalog_v1().len()
+        );
+        assert_eq!(catalog.manager_update_variants, ["stage", "handoff"]);
+        assert_eq!(catalog.manager_control_actions, ["create_session"]);
+        assert_eq!(catalog.manager_prepared_actions, ["resume_lead"]);
+        assert_eq!(catalog.delegated_operator_methods, ["GetSession"]);
+        let json = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert!(json.get("control").is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn pending_authority_catalog_keeps_worker_baseline_and_says_refresh() {
+        let mut projection = all_roles_projection();
+        projection.pending = true;
+        let catalog = render_authority_catalog(uuid::Uuid::new_v4(), &projection, None).unwrap();
+        assert!(catalog.pending);
+        assert_eq!(catalog.roles, ["worker"]);
+        assert!(
+            catalog
+                .guidance
+                .contains("Authority publication is pending")
+        );
+        assert!(
+            catalog
+                .guidance
+                .contains("call `AgentGetAuthorityCatalog` again shortly")
+        );
+        let methods = catalog
+            .controls
+            .iter()
+            .map(|control| control.method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            rsi_common::agent_control_schema::agent_control_catalog_v1()
+                .iter()
+                .filter(|descriptor| is_baseline_verb(descriptor.verb))
+                .map(|descriptor| descriptor.method)
+                .collect::<Vec<_>>()
+        );
+        assert!(methods.contains(&"AgentGetAuthorityCatalog"));
+        assert!(methods.contains(&"AgentSubmitJob"));
+        assert!(catalog.manager_control_actions.is_empty());
+        assert!(catalog.delegated_operator_methods.is_empty());
+
+        projection.guidance_ids = vec!["common", "worker"];
+        assert!(
+            render_authority_catalog(uuid::Uuid::new_v4(), &projection, None)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent agent guidance projection")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -793,6 +1136,237 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
+    fn project_reads_omit_symlink_escapes_and_follow_inside_links() {
+        let outside = tempfile::tempdir().expect("outside tree");
+        std::fs::write(outside.path().join("other_base.md"), "OTHER PROJECT BASE").expect("other");
+        std::fs::write(outside.path().join("other_router.md"), "OTHER ROUTER").expect("other");
+
+        let project = tempfile::tempdir().expect("project");
+        let commands = project.path().join(COMMANDS_DIR);
+        let shared = commands.join("_shared");
+        std::fs::create_dir_all(&shared).expect("shared dir");
+        std::fs::write(project.path().join("real_variant.md"), "INSIDE VARIANT").expect("real");
+        std::os::unix::fs::symlink(
+            outside.path().join("other_base.md"),
+            shared.join(BASE_FILENAME),
+        )
+        .expect("escaping base link");
+        std::os::unix::fs::symlink(
+            outside.path().join("other_router.md"),
+            commands.join(ORCHESTRATION_ROUTER_FILENAME),
+        )
+        .expect("escaping router link");
+        std::os::unix::fs::symlink(
+            project.path().join("real_variant.md"),
+            shared.join("worker_preamble_bug.md"),
+        )
+        .expect("inside variant link");
+
+        // Escaping base is omitted; the in-tree symlinked variant is followed.
+        assert_eq!(
+            load_disk_from_root(project.path(), SessionKind::Bug).as_deref(),
+            Some("INSIDE VARIANT")
+        );
+        // Escaping router is omitted.
+        assert_eq!(load_orchestration_router(project.path()), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn project_reads_omit_dotdot_paths_that_leave_the_root() {
+        let parent = tempfile::tempdir().expect("parent");
+        std::fs::write(parent.path().join("secret.md"), "SECRET").expect("secret");
+        let root = parent.path().join("project");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("inside.md"), "INSIDE").expect("inside");
+
+        let escaping = root.join("sub/../../secret.md");
+        std::fs::create_dir_all(root.join("sub")).expect("sub");
+        let err = read_project_file(&root, &escaping).expect_err("`..` escape must not read");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // A `..` that stays inside the root is fine.
+        assert_eq!(
+            read_project_file(&root, &root.join("sub/../inside.md"))
+                .as_deref()
+                .ok(),
+            Some("INSIDE")
+        );
+        let missing = read_project_file(&root, &root.join("nope.md")).expect_err("missing");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A directory tree that is not the rsi repo: a bare project with a
+    /// `.git` marker and, optionally, nothing else.
+    fn bare_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp project");
+        std::fs::create_dir(dir.path().join(".git")).expect("git marker");
+        dir
+    }
+
+    /// Path-like tokens (`dir/file.ext` or `dir/`) in `text` that name rsi-repo
+    /// files, for checking a composed prompt against a tree.
+    fn repo_path_references(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for token in text.split(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '(' | ')' | ',' | ';' | '"' | '\'' | '<' | '>')
+        }) {
+            let token = token.trim_end_matches(['.', ':']);
+            if [
+                "AGENTS.md",
+                "docs/",
+                ".agents/",
+                ".claude/",
+                "thoughts/",
+                "scripts/",
+                "crates/",
+            ]
+            .iter()
+            .any(|needle| token.contains(needle))
+            {
+                out.push(token.to_string());
+            }
+        }
+        out
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn project_without_claude_dir_gets_no_reference_to_missing_paths() {
+        let project = bare_project();
+        for kind in [
+            SessionKind::Standard,
+            SessionKind::Task,
+            SessionKind::Bug,
+            SessionKind::Feature,
+            SessionKind::Research,
+        ] {
+            let text = load(kind, project.path()).expect("generic part always loads");
+            assert!(text.contains(agent_discovery_nudge()));
+            assert!(text.contains(RSI_BACKEND_POLICY));
+            assert!(text.contains(DAEMON_MESSAGE_CONVENTION));
+            assert_eq!(text, load_generic(Some(project.path())));
+            for reference in repo_path_references(&text) {
+                assert!(
+                    project.path().join(&reference).exists(),
+                    "{kind:?} startup text names `{reference}`, which the project tree lacks"
+                );
+            }
+            assert_eq!(load_project_preamble(project.path(), kind), None);
+        }
+        assert_eq!(load_orchestration_router(project.path()), None);
+        // No `thoughts/` directory, so no thoughts commit policy either.
+        assert!(!load_generic(Some(project.path())).contains(THOUGHTS_COMMIT_POLICY));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn project_files_are_read_from_the_session_tree_not_the_daemon_checkout() {
+        let project = bare_project();
+        let commands = project.path().join(COMMANDS_DIR);
+        std::fs::create_dir_all(commands.join("_shared")).expect("commands dir");
+        std::fs::write(commands.join("_shared/worker_preamble.md"), "PROJECT BASE").expect("base");
+        std::fs::write(
+            commands.join("_shared/worker_preamble_bug.md"),
+            "PROJECT BUG",
+        )
+        .expect("variant");
+        std::fs::write(commands.join("orchestration_router.md"), "PROJECT ROUTER").expect("router");
+        std::fs::create_dir(project.path().join("thoughts")).expect("thoughts dir");
+
+        let bug = load(SessionKind::Bug, project.path()).expect("loads");
+        assert!(bug.starts_with("PROJECT BASE\n\nPROJECT BUG\n\n"));
+        assert_eq!(
+            bug,
+            format!(
+                "PROJECT BASE\n\nPROJECT BUG\n\n{}",
+                load_generic(Some(project.path()))
+            )
+        );
+        assert!(bug.contains(THOUGHTS_COMMIT_POLICY));
+        assert!(!bug.contains("# RPI Worker Preamble"));
+        assert_eq!(
+            load(SessionKind::Task, project.path()).map(|t| t.starts_with("PROJECT BASE\n\n")),
+            Some(true)
+        );
+        assert_eq!(
+            load_orchestration_router(project.path()).as_deref(),
+            Some("PROJECT ROUTER")
+        );
+
+        // A session started in a subdirectory of the repo resolves the same files.
+        let sub = project.path().join("crates/inner");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        assert_eq!(load(SessionKind::Bug, &sub), Some(bug));
+        assert_eq!(
+            load_orchestration_router(&sub).as_deref(),
+            Some("PROJECT ROUTER")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn project_search_never_climbs_past_the_repository() {
+        // Parent has the files but is not the session's repository.
+        let parent = tempfile::tempdir().expect("parent");
+        let commands = parent.path().join(COMMANDS_DIR);
+        std::fs::create_dir_all(commands.join("_shared")).expect("commands dir");
+        std::fs::write(commands.join("_shared/worker_preamble.md"), "PARENT BASE").expect("base");
+        std::fs::write(commands.join("orchestration_router.md"), "PARENT ROUTER").expect("router");
+
+        // Child repo (has .git) under the parent: the parent is out of bounds.
+        let repo = parent.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo");
+        assert_eq!(load_project_preamble(&repo, SessionKind::Task), None);
+        assert_eq!(load_orchestration_router(&repo), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn rsi_repo_composition_is_the_legacy_router_base_variant_then_generic() {
+        let root = repo_root();
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect(rel);
+        let router = read(".claude/commands/orchestration_router.md");
+        let base = read(".claude/commands/_shared/worker_preamble.md");
+        let legacy_embedded = format!(
+            "{}\n\n{THOUGHTS_COMMIT_POLICY}\n\n{RSI_BACKEND_POLICY}\n\n{DAEMON_MESSAGE_CONVENTION}",
+            agent_discovery_nudge()
+        );
+        assert_eq!(
+            load_orchestration_router(&root).as_deref(),
+            Some(router.as_str())
+        );
+        for (kind, variant) in [
+            (SessionKind::Standard, None),
+            (SessionKind::Task, None),
+            (SessionKind::Bug, Some("bug")),
+            (SessionKind::Feature, Some("feature")),
+            (SessionKind::Refactor, Some("refactor")),
+            (SessionKind::Research, Some("research")),
+        ] {
+            let disk = match variant {
+                Some(name) => format!(
+                    "{base}\n\n{}",
+                    read(&format!(
+                        ".claude/commands/_shared/worker_preamble_{name}.md"
+                    ))
+                ),
+                None => base.clone(),
+            };
+            assert_eq!(
+                load(kind, &root),
+                Some(format!("{disk}\n\n{legacy_embedded}")),
+                "rsi-repo composition changed for {kind:?}"
+            );
+        }
+        // A sandbox-style subdirectory of the repo resolves the same text.
+        assert_eq!(
+            load(SessionKind::Bug, &root.join("crates/rsid")),
+            load(SessionKind::Bug, &root)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
     fn loaded_preamble_carries_agent_discovery_nudge() {
         // The launch path (`session::launch`) pushes `load(kind)` into the
         // system-prompt parts for every launch-system-prompt provider, so the
@@ -805,9 +1379,10 @@ mod tests {
             SessionKind::Bug,
             SessionKind::Research,
         ] {
-            let preamble = load(kind).expect("load() always returns the embedded nudge");
+            let preamble =
+                load(kind, &repo_root()).expect("load() always returns the embedded nudge");
             assert!(
-                preamble.contains(AGENT_DISCOVERY_NUDGE),
+                preamble.contains(agent_discovery_nudge()),
                 "kind {kind:?} preamble must carry the agent-discovery nudge"
             );
             assert!(
@@ -821,6 +1396,28 @@ mod tests {
             assert!(
                 preamble.contains(DAEMON_MESSAGE_CONVENTION),
                 "kind {kind:?} preamble must carry the daemon message convention"
+            );
+        }
+    }
+
+    /// Every CLI the embedded startup text tells agents to run must be built
+    /// and linked onto PATH by `make release-install`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn every_cli_named_in_startup_guidance_is_installed() {
+        let install = include_str!("../../../../scripts/install-release.sh");
+        let startup = format!("{EMBEDDED_BASE}\n{}", agent_discovery_nudge());
+        for cli in ["rsi-rpc", "rsi-agent-mcp", "rsi-contract-validate"] {
+            if cli != "rsi-agent-mcp" {
+                assert!(startup.contains(cli), "startup text names {cli}");
+            }
+            assert!(
+                install.contains(&format!("--bin {cli}")),
+                "install-release.sh builds {cli}"
+            );
+            assert!(
+                install.contains(&format!("\"$BIN_DIR/{cli}\"")),
+                "install-release.sh links {cli} onto PATH"
             );
         }
     }
@@ -879,9 +1476,10 @@ mod tests {
         // Context rotation (`session::rotation`) rebuilds the child system
         // prompt from `preamble::load(child.session_kind)` — the same loader —
         // so a rotated session still carries the nudge (rotation-parity).
-        let rotated = load(SessionKind::Task).expect("rotation loader returns the nudge");
+        let rotated =
+            load(SessionKind::Task, &repo_root()).expect("rotation loader returns the nudge");
         assert!(
-            rotated.contains(AGENT_DISCOVERY_NUDGE),
+            rotated.contains(agent_discovery_nudge()),
             "rotated session preamble must retain the agent-discovery nudge"
         );
         assert!(
@@ -896,28 +1494,31 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
-    fn agent_discovery_nudge_advertises_only_agent_verbs() {
-        // Advertises the closed Agent* control surface and the tokened
-        // rsi-rpc convention — never the generic RPC passthrough.
-        for descriptor in rsi_common::agent_control_schema::agent_control_catalog_v1() {
-            let verb = descriptor.method;
-            assert!(
-                AGENT_DISCOVERY_NUDGE.contains(verb),
-                "nudge must advertise {verb}"
-            );
+    fn agent_discovery_nudge_sends_agents_to_the_authority_catalog() {
+        // The startup frame is short and role-independent: it names the one
+        // verb that serves role guidance and the permitted controls, plus the
+        // tokened rsi-rpc convention.
+        let nudge = agent_discovery_nudge();
+        for required in [
+            "Start here: call `AgentGetAuthorityCatalog` with `{}`",
+            "rsi_control_authority_catalog",
+            "mcp__rsi-agent__rsi_control_authority_catalog",
+            "rsi-rpc AgentGetAuthorityCatalog",
+            "{\"verb\": \"<name>\"}",
+            "RSI_SESSION_TOKEN",
+            "`mode` is required",
+            "same-session continuation",
+            "never `fresh` on your own session",
+        ] {
+            assert!(nudge.contains(required), "nudge must carry `{required}`");
         }
-        assert!(AGENT_DISCOVERY_NUDGE.contains("rsi-rpc"));
-        assert!(AGENT_DISCOVERY_NUDGE.contains("RSI_SESSION_TOKEN"));
-        assert!(AGENT_DISCOVERY_NUDGE.contains("`mode` is required"));
-        assert!(AGENT_DISCOVERY_NUDGE.contains("same-session continuation"));
-        assert!(AGENT_DISCOVERY_NUDGE.contains("optional `provider`"));
-        assert!(AGENT_DISCOVERY_NUDGE.contains("different backend"));
-        // The guarded Issue controls admit both the owning-Epic lead and the
-        // IssueCoordinate manager (K3/K11); this must stay a positive claim.
-        assert!(AGENT_DISCOVERY_NUDGE.contains(
-            "project Issue controls for the current owning-Epic lead or the \
-  current appointed manager with the `IssueCoordinate` grant"
-        ));
+        assert!(
+            rsi_common::agent_control_schema::AgentControlVerbV1::from_method_name(
+                "AgentGetAuthorityCatalog"
+            )
+            .is_some(),
+            "the frame's entry point must be a catalog verb"
+        );
         // The generic passthrough / read verbs are never advertised to agents.
         for forbidden in [
             "GetHealthStatus",
@@ -931,7 +1532,7 @@ mod tests {
             "AnswerHarnessManagerDecision",
         ] {
             assert!(
-                !AGENT_DISCOVERY_NUDGE.contains(forbidden),
+                !agent_discovery_nudge().contains(forbidden),
                 "nudge must not advertise generic surface `{forbidden}`"
             );
         }
@@ -940,6 +1541,22 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn manager_preamble_preserves_operator_authority_and_inbox_semantics() {
+        // The startup frame keeps the role-independent operator rules; the
+        // manager, lead, managed-worker and reviewer rules now ride the
+        // authority catalog for exactly those roles.
+        let projection = all_roles_projection();
+        let catalog = render_authority_catalog(uuid::Uuid::new_v4(), &projection, None).unwrap();
+        let native = catalog
+            .controls
+            .iter()
+            .filter_map(|control| control.native_tool.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let combined = format!(
+            "{}\n{}\n{native}",
+            agent_discovery_nudge(),
+            catalog.guidance
+        );
         for requirement in [
             "scope changes are operator-only",
             "existing child-control permissions stay unchanged",
@@ -976,8 +1593,21 @@ mod tests {
             "Human approvals remain operator-owned",
         ] {
             assert!(
-                AGENT_DISCOVERY_NUDGE.contains(requirement),
+                combined.contains(requirement),
                 "missing manager instruction: {requirement}"
+            );
+        }
+        for requirement in [
+            "optional `provider`",
+            "different backend",
+            "The assigned reviewer answers with a receipt, not an artifact",
+            "Do not create a review artifact or evidence commit",
+        ] {
+            assert!(
+                combined
+                    .to_lowercase()
+                    .contains(&requirement.to_lowercase()),
+                "missing role instruction: {requirement}"
             );
         }
     }

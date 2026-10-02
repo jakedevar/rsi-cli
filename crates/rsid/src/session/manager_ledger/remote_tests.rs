@@ -76,6 +76,485 @@ fn repos() -> Repos {
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn provisional_fixture(root: &Path, scenario: &str) -> serde_json::Value {
+    const BUILD: &str = r#"import importlib.util, json, pathlib, shutil, sys, types
+spec = importlib.util.spec_from_file_location('renumber_tests', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+t = module.ProvisionalMigrationTest('test_build_merge_uses_private_committer_identity')
+t.setUp()
+root = pathlib.Path(sys.argv[2])
+root.mkdir(parents=True, exist_ok=True)
+shutil.move(str(t.repo), str(root / 'repo'))
+t.repo = root / 'repo'
+t.temp = types.SimpleNamespace(name=str(root))
+renumber = module.RENUMBER
+if sys.argv[3] == 'same':
+    source = t.source('alpha')
+    worktree = root / 'source-alpha'
+    t.write(worktree, 'docs/accepted.txt', 'accepted line\n')
+    # Like #884's migration_allocation.rs: a protected section in an
+    # undeclared file, appended last and reordered by the landing inventory.
+    catalog = 'crates/rsid/src/store/alpha_catalog.rs'
+    t.write(worktree, catalog, '// RSI-RELEASED-MIGRATION-BEGIN: alpha-catalog\npub const ALPHA: &str = "alpha";\n// RSI-RELEASED-MIGRATION-END: alpha-catalog\n')
+    tracked = renumber.guard.tracked_source_paths(renumber.revision_inventory(t.repo, source))
+    files = {name: (worktree / name).read_text() for name in tracked}
+    files[catalog] = (worktree / catalog).read_text()
+    t.write(worktree, renumber.MANIFEST, json.dumps(renumber.guard.inventory(files), indent=2) + '\n')
+    t.git(worktree, 'add', 'docs/accepted.txt', catalog, renumber.MANIFEST)
+    t.git(worktree, 'commit', '-q', '-m', 'accepted document')
+    source = t.git(worktree, 'rev-parse', 'HEAD')
+    cohort = 'crates/rsid/src/store/cohort_settlement.rs'
+    t.write(t.repo, cohort, '// RSI-RELEASED-MIGRATION-BEGIN: target-extra\n// target\n// RSI-RELEASED-MIGRATION-END: target-extra\n')
+    paths = [renumber.STORE, cohort, 'crates/rsid/src/store/tests.rs']
+    files = {name: (t.repo / name).read_text() for name in paths}
+    inventory = renumber.guard.inventory(files)
+    t.write(t.repo, renumber.MANIFEST, json.dumps(inventory, indent=2) + '\n')
+    t.git(t.repo, 'add', cohort, renumber.MANIFEST)
+    t.git(t.repo, 'commit', '-q', '-m', 'independent protected section')
+    target = t.git(t.repo, 'rev-parse', 'HEAD')
+    unit, candidate = t.candidate(source, target)
+    t.git(t.repo, 'switch', '--detach', candidate)
+    t.write(t.repo, 'docs/extra.txt', 'extra\n')
+    t.git(t.repo, 'add', 'docs/extra.txt')
+    t.git(t.repo, 'commit', '-q', '-m', 'later descendant')
+    descendant = t.git(t.repo, 'rev-parse', 'HEAD')
+    t.git(t.repo, 'switch', '--detach', candidate)
+    t.git(t.repo, 'rm', 'docs/accepted.txt')
+    t.git(t.repo, 'commit', '-q', '-m', 'revert accepted document')
+    reverted = t.git(t.repo, 'rev-parse', 'HEAD')
+    t.git(t.repo, 'switch', '--detach', descendant)
+    t.git(t.repo, 'revert', '-m', '1', '--no-edit', candidate)
+    merge_reverted = t.git(t.repo, 'rev-parse', 'HEAD')
+    # The lander regenerates the inventory from a Python set, so its section
+    # order varies per process (hash randomization). Re-emit the landed
+    # inventory with the same JSON content in an order that always differs from
+    # the landed one: sorted, or reverse-sorted when the landed order already
+    # is sorted (otherwise the transform is a no-op and there is nothing to
+    # commit).
+    t.git(t.repo, 'switch', '--detach', candidate)
+    manifest = json.loads(renumber.show(t.repo, candidate, renumber.MANIFEST).decode())
+    landed = list(manifest['protected_sections'].items())
+    reordered = sorted(landed)
+    if reordered == landed:
+        reordered = sorted(landed, reverse=True)
+    assert reordered != landed, 'the fixture needs at least two protected sections'
+    manifest['protected_sections'] = dict(reordered)
+    t.write(t.repo, renumber.MANIFEST, json.dumps(manifest, indent=2) + '\n')
+    t.git(t.repo, 'add', renumber.MANIFEST)
+    t.git(t.repo, 'commit', '-q', '-m', 'regenerate inventory order')
+    reordered = t.git(t.repo, 'rev-parse', 'HEAD')
+    print(json.dumps({'base': t.base, 'source': source, 'candidate': candidate,
+                      'descendant': descendant, 'reverted': reverted,
+                      'merge_reverted': merge_reverted, 'reordered': reordered,
+                      'old': unit['old_version'], 'assigned': unit['new_version']}))
+else:
+    first = t.source('alpha')
+    source = t.source('beta')
+    _, prior = t.candidate(first, t.base)
+    unit, candidate = t.candidate(source, prior)
+    worktree = root / 'source-beta'
+    declaration = 'tools/provisional-migrations/beta.json'
+    data = json.loads((worktree / declaration).read_text())
+    data['files'][0]['source_blob'] = 'sha256:' + '0' * 64
+    t.write(worktree, declaration, json.dumps(data) + '\n')
+    t.git(worktree, 'add', declaration)
+    t.git(worktree, 'commit', '-q', '-m', 'mismatched mapping')
+    mismatch_source = t.git(worktree, 'rev-parse', 'HEAD')
+    tree = t.git(t.repo, 'rev-parse', candidate + '^{tree}')
+    mismatch = t.git(t.repo, 'commit-tree', tree, '-p', prior, '-p', mismatch_source, '-m', 'mismatched candidate')
+    t.git(worktree, 'rm', declaration)
+    t.git(worktree, 'commit', '-q', '-m', 'missing mapping')
+    missing_source = t.git(worktree, 'rev-parse', 'HEAD')
+    missing = t.git(t.repo, 'commit-tree', tree, '-p', prior, '-p', missing_source, '-m', 'missing candidate')
+    fake_manifest = json.loads(renumber.show(t.repo, candidate, renumber.MANIFEST).decode())
+    fake_manifest['latest_schema_version'] = 999
+    t.write(t.repo, renumber.MANIFEST, json.dumps(fake_manifest) + '\n')
+    t.git(t.repo, 'add', renumber.MANIFEST)
+    fake_tree = t.git(t.repo, 'write-tree')
+    fake_l = t.git(t.repo, 'commit-tree', fake_tree, '-p', prior, '-p', source, '-m', 'fake L')
+    print(json.dumps({'base': t.base, 'source': source, 'candidate': candidate,
+                      'mismatch_source': mismatch_source, 'mismatch': mismatch,
+                      'missing_source': missing_source, 'missing': missing,
+                      'fake_l': fake_l, 'old': unit['old_version'],
+                      'assigned': unit['new_version']}))
+"#;
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/tests/test_rolling_migration_renumber.py"
+    );
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            BUILD,
+            file,
+            root.to_str().unwrap(),
+            scenario,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn fixture_string(fixture: &serde_json::Value, key: &str) -> String {
+    fixture[key].as_str().unwrap().to_owned()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+async fn expect_accepted_content_error(
+    repo: &Path,
+    base: &str,
+    source: &str,
+    target: &str,
+    code: &str,
+) {
+    let error = git::accepted_content(repo, base, source, target)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(code), "expected {code}, got {error}");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_proves_same_version_transform_at_landing_and_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "same");
+    let repo = dir.path().join("repo");
+    let base = fixture_string(&fixture, "base");
+    let source = fixture_string(&fixture, "source");
+    let landing = fixture_string(&fixture, "candidate");
+    let descendant = fixture_string(&fixture, "descendant");
+    let reordered = fixture_string(&fixture, "reordered");
+    assert_eq!(fixture["old"], fixture["assigned"]);
+    // The accepted source's attributable paths, exactly as accepted_content selects them.
+    let changed = git(&repo, &["diff", "--name-only", "-z", &base, &source]);
+    let paths: Vec<&[u8]> = changed
+        .as_bytes()
+        .split(|byte: &u8| *byte == 0)
+        .filter(|path: &&[u8]| !path.is_empty())
+        .collect();
+    // Like #884: the regenerated inventory reorders accepted entries, so the
+    // unmapped line check alone refuses; the proven mapping accepts.
+    let error = git::verify_content_paths(&repo, &base, &source, &reordered, &paths)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("manager_v2_accepted_content_lost"),
+        "expected unmapped refusal, got {error}"
+    );
+    for target in [&landing, &descendant, &reordered] {
+        git::accepted_content(&repo, &base, &source, target)
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_proves_renumbered_file_and_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "renumber");
+    let repo = dir.path().join("repo");
+    assert_eq!(
+        fixture["old"].as_i64().unwrap() + 1,
+        fixture["assigned"].as_i64().unwrap()
+    );
+    git::accepted_content(
+        &repo,
+        &fixture_string(&fixture, "base"),
+        &fixture_string(&fixture, "source"),
+        &fixture_string(&fixture, "candidate"),
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_provisional_transform_still_rejects_real_revert() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "same");
+    let repo = dir.path().join("repo");
+    // Reverting the whole landing drops the migration and its inventory entries.
+    expect_accepted_content_error(
+        &repo,
+        &fixture_string(&fixture, "base"),
+        &fixture_string(&fixture, "source"),
+        &fixture_string(&fixture, "merge_reverted"),
+        "manager_v2_accepted_content_lost",
+    )
+    .await;
+    // Dropping an unrelated accepted file after a proven landing is still loss.
+    expect_accepted_content_error(
+        &repo,
+        &fixture_string(&fixture, "base"),
+        &fixture_string(&fixture, "source"),
+        &fixture_string(&fixture, "reverted"),
+        "manager_v2_accepted_content_lost",
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_provisional_transform_still_rejects_dropped_accepted_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "renumber");
+    let repo = dir.path().join("repo");
+    git(
+        &repo,
+        &[
+            "switch",
+            "--detach",
+            "--discard-changes",
+            &fixture_string(&fixture, "candidate"),
+        ],
+    );
+    let store = repo.join("crates/rsid/src/store/mod.rs");
+    let original = std::fs::read_to_string(&store).unwrap();
+    assert_eq!(original.matches("// V131: beta migration\n").count(), 1);
+    std::fs::write(&store, original.replace("// V131: beta migration\n", "")).unwrap();
+    git(&repo, &["add", "crates/rsid/src/store/mod.rs"]);
+    git(
+        &repo,
+        &["commit", "-q", "-m", "drop accepted migration line"],
+    );
+    let dropped = git(&repo, &["rev-parse", "HEAD"]);
+    expect_accepted_content_error(
+        &repo,
+        &fixture_string(&fixture, "base"),
+        &fixture_string(&fixture, "source"),
+        &dropped,
+        "manager_v2_accepted_content_lost",
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_provisional_mapping_is_exact_or_original_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "renumber");
+    let repo = dir.path().join("repo");
+    let base = fixture_string(&fixture, "base");
+    expect_accepted_content_error(
+        &repo,
+        &base,
+        &fixture_string(&fixture, "mismatch_source"),
+        &fixture_string(&fixture, "mismatch"),
+        "manager_v2_provisional_proof_failed",
+    )
+    .await;
+    expect_accepted_content_error(
+        &repo,
+        &base,
+        &fixture_string(&fixture, "missing_source"),
+        &fixture_string(&fixture, "missing"),
+        "manager_v2_accepted_content_lost",
+    )
+    .await;
+    let fake_l = fixture_string(&fixture, "fake_l");
+    let parent = git(&repo, &["rev-parse", &format!("{fake_l}^1")]);
+    let parent_manifest = git(
+        &repo,
+        &["show", &format!("{parent}:tools/released-migrations.json")],
+    );
+    let parent_latest = serde_json::from_str::<serde_json::Value>(&parent_manifest)
+        .unwrap()["latest_schema_version"]
+        .as_i64()
+        .unwrap();
+    let fake_manifest = git(
+        &repo,
+        &["show", &format!("{fake_l}:tools/released-migrations.json")],
+    );
+    let fake_latest =
+        serde_json::from_str::<serde_json::Value>(&fake_manifest).unwrap()["latest_schema_version"]
+            .as_i64()
+            .unwrap();
+    assert_ne!(parent_latest + 1, fake_latest);
+    expect_accepted_content_error(
+        &repo,
+        &base,
+        &fixture_string(&fixture, "source"),
+        &fake_l,
+        "manager_v2_provisional_proof_failed",
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_provisional_mapping_rejects_two_landings() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provisional_fixture(dir.path(), "renumber");
+    let repo = dir.path().join("repo");
+    let source = fixture_string(&fixture, "source");
+    let first = fixture_string(&fixture, "candidate");
+    let parent = git(&repo, &["rev-parse", &format!("{first}^1")]);
+    let first_tree = git(&repo, &["rev-parse", &format!("{first}^{{tree}}")]);
+    let second = git(
+        &repo,
+        &[
+            "commit-tree",
+            &first_tree,
+            "-p",
+            &parent,
+            "-p",
+            &source,
+            "-m",
+            "second landing",
+        ],
+    );
+    let join_tree = git(&repo, &["rev-parse", &format!("{second}^{{tree}}")]);
+    let target = git(
+        &repo,
+        &[
+            "commit-tree",
+            &join_tree,
+            "-p",
+            &first,
+            "-p",
+            &second,
+            "-m",
+            "join two landings",
+        ],
+    );
+    expect_accepted_content_error(
+        &repo,
+        &fixture_string(&fixture, "base"),
+        &source,
+        &target,
+        "manager_v2_provisional_proof_ambiguous",
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn review_path_disjointness_is_proven_from_git_or_fails_closed() {
+    // #984: a descendant is unrelated only when Git proves its own changes
+    // touch no path of the reviewed range; a missing branch is an error.
+    let r = repos();
+    git(r.local(), &["switch", "-c", "sealed", &r.base]);
+    std::fs::write(r.local().join("a.txt"), "sealed\n").unwrap();
+    git(r.local(), &["add", "a.txt"]);
+    git(r.local(), &["commit", "-m", "reviewed change"]);
+    let sealed = git(r.local(), &["rev-parse", "HEAD"]);
+    let unrelated = format!("rsi/{}", Uuid::new_v4());
+    git(r.local(), &["switch", "-c", &unrelated, &r.base]);
+    std::fs::write(r.local().join("b.txt"), "elsewhere\n").unwrap();
+    git(r.local(), &["add", "b.txt"]);
+    git(r.local(), &["commit", "-m", "unrelated child work"]);
+    let overlapping = format!("rsi/{}", Uuid::new_v4());
+    git(r.local(), &["switch", "-c", &overlapping, &r.base]);
+    std::fs::write(r.local().join("a.txt"), "child\n").unwrap();
+    git(r.local(), &["add", "a.txt"]);
+    git(r.local(), &["commit", "-m", "overlapping child work"]);
+    let range = git::changed_path_set(r.local(), &r.base, &sealed)
+        .await
+        .unwrap();
+    let own = git::changed_path_set(r.local(), &r.base, &format!("refs/heads/{unrelated}"))
+        .await
+        .unwrap();
+    assert!(own.is_disjoint(&range));
+    let own = git::changed_path_set(r.local(), &r.base, &format!("refs/heads/{overlapping}"))
+        .await
+        .unwrap();
+    assert!(!own.is_disjoint(&range));
+    assert!(
+        git::changed_path_set(
+            r.local(),
+            &r.base,
+            &format!("refs/heads/rsi/{}", Uuid::new_v4())
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn accepted_content_diff_deadline_refuses_as_ambiguous() {
+    // #978: the production diff bound still refuses; tests pass it explicitly.
+    let (base, source, target) = (b"a\nb\n", b"a\nx\nb\n", b"a\nx\nb\ny\n");
+    assert!(
+        git::text_content_survives_within(base, source, target, std::time::Duration::from_secs(60))
+            .unwrap()
+    );
+    let error = git::text_content_survives_within(base, source, target, std::time::Duration::ZERO)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_accepted_content_ambiguous"),
+        "{error}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn accepted_content_time_bound_refuses_as_ambiguous() {
+    // #978: an exhausted proof bound refuses with the same code; the proof
+    // cannot finish without awaiting a Git subprocess.
+    let r = repos();
+    r.publish(&r.source);
+    git::accepted_content_within(
+        r.local(),
+        &r.base,
+        &r.source,
+        &r.source,
+        std::time::Duration::from_secs(600),
+    )
+    .await
+    .unwrap();
+    let error = git::accepted_content_within(
+        r.local(),
+        &r.base,
+        &r.source,
+        &r.source,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_accepted_content_ambiguous"),
+        "{error}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn provisional_inventory_parsing_matches_released_migration_guard() {
+    // Real store blocks are indented; the guard keeps each line ending.
+    let store = b"fn migrate() {\n        if version < 6 {\n            six();\n        }\n        if version < 7 {  \r\n            seven();\n        }\r\n    }\n";
+    let lines = git::normalized_lines(store).unwrap();
+    let block = git::mapped_block(&lines, 7).unwrap();
+    assert_eq!(
+        block.concat(),
+        b"        if version < 7 {  \r\n            seven();\n        }\r\n".to_vec()
+    );
+    assert!(git::normalized_lines(b"lone\rcarriage\n").is_err());
+    let catalog = b"x\n  // RSI-RELEASED-MIGRATION-BEGIN: v7-catalog\nbody\n  // RSI-RELEASED-MIGRATION-END: v7-catalog  \n";
+    let lines = git::normalized_lines(catalog).unwrap();
+    assert_eq!(git::section_location(&lines, "v7-catalog").unwrap(), (1, 3));
+    let duplicated = b"// RSI-RELEASED-MIGRATION-BEGIN: a\n// RSI-RELEASED-MIGRATION-BEGIN: a\n// RSI-RELEASED-MIGRATION-END: a\n";
+    let lines = git::normalized_lines(duplicated).unwrap();
+    assert!(git::section_location(&lines, "a").is_err());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_rejects_forward_revert_despite_source_ancestry() {
     let r = repos();

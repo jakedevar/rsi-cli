@@ -4,8 +4,8 @@
 //! and communicates via bidirectional stdio JSON-RPC 2.0.
 
 use crate::app_server_control::{
-    AppServerControlPlane, IngressFrameClass, IngressOverflowAction, ProviderLifecycleKind,
-    QuarantineSealReason, classify_ingress_frame,
+    AppServerControlPlane, IngressFrameClass, IngressOverflowAction, JsonRpcId,
+    ProviderLifecycleKind, QuarantineSealReason, classify_ingress_frame,
 };
 use crate::claude::{LaunchConfig, StreamEvent};
 use crate::error::{DaemonError, Result};
@@ -25,6 +25,8 @@ use crate::provider::{
     TurnConfig, TurnId,
 };
 use crate::store::Store;
+#[allow(unused_imports)]
+pub(crate) use crate::store_support::app_server_approval::{APPROVAL_METHODS, approval_response};
 use rsi_common::model_control::ModelUsageConfidence;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -35,14 +37,6 @@ use std::sync::{
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
-
-/// Supported approval methods from the installed codex-cli 0.153.4 schemas.
-/// Permissions, user input, elicitation and legacy approvals have different
-/// response contracts and must stay unresolved until separately implemented.
-pub(crate) const APPROVAL_METHODS: &[&str] = &[
-    "item/commandExecution/requestApproval",
-    "item/fileChange/requestApproval",
-];
 
 fn is_operator_request(method: &str) -> bool {
     method.ends_with("/requestApproval")
@@ -55,65 +49,13 @@ fn is_operator_request(method: &str) -> bool {
         )
 }
 
-/// Method-bound response construction shared by the direct ProviderSession and
-/// detached writer paths. Request IDs remain JSON strings or signed integers;
-/// no coercion, missing-ID fallback, legacy enum guess, or persistent grant is
-/// introduced by an operator's single-request approve/deny answer.
-pub(crate) fn approval_response(
-    request_id: &Value,
-    method: &str,
-    params: &Value,
-    decision: ApprovalDecision,
-) -> Result<Value> {
-    if !APPROVAL_METHODS.contains(&method) {
-        return Err(DaemonError::InvalidParam(
-            "unsupported_appserver_approval_method".into(),
-        ));
-    }
-    if !(request_id.is_i64() || request_id.is_string()) {
-        return Err(DaemonError::InvalidParam(
-            "invalid_appserver_approval_request_id".into(),
-        ));
-    }
-    if !["threadId", "turnId", "itemId"]
-        .iter()
-        .all(|key| params[*key].is_string())
-        || !params["startedAtMs"].is_i64()
-    {
-        return Err(DaemonError::InvalidParam(
-            "incomplete_appserver_approval_params".into(),
-        ));
-    }
-    let decision = match (method, decision) {
-        (
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
-            ApprovalDecision::Approve,
-        ) => "accept",
-        (
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
-            ApprovalDecision::Deny,
-        ) => "decline",
-        (
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
-            ApprovalDecision::ApproveForSession,
-        ) => "acceptForSession",
-        _ => {
-            return Err(DaemonError::InvalidParam(
-                "unsupported_appserver_approval_decision".into(),
-            ));
-        }
-    };
-    if let Some(available) = params.get("availableDecisions").filter(|v| !v.is_null()) {
-        if !available
-            .as_array()
-            .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(decision)))
-        {
-            return Err(DaemonError::InvalidParam(
-                "appserver_approval_decision_not_available".into(),
-            ));
-        }
-    }
-    Ok(json!({"jsonrpc":"2.0", "id":request_id, "result":{"decision":decision}}))
+/// Build a JSON-RPC result reply that echoes the provider's exact request id
+/// (number or string). An id that is not a valid JSON-RPC id is refused; it is
+/// never replaced by a stand-in integer.
+fn tool_result_response(call_id: &Value, result: Value) -> Result<Value> {
+    let id = JsonRpcId::from_wire(call_id)
+        .ok_or_else(|| DaemonError::InvalidParam("invalid_appserver_tool_call_id".into()))?;
+    Ok(json!({"jsonrpc":"2.0", "id":id.to_json(), "result":result}))
 }
 
 /// `pub(crate)` ONLY so the frozen Group A module
@@ -383,14 +325,14 @@ async fn forward_app_server_notifications(
 pub(crate) fn route_app_server_message(
     msg: Value,
     plane: &AppServerControlPlane,
-    response_tx: &mpsc::Sender<(i64, AppServerResponse)>,
+    response_tx: &mpsc::Sender<(JsonRpcId, AppServerResponse)>,
     notification_tx: &mpsc::Sender<AppServerNotification>,
     event_tx: &mpsc::Sender<StreamEvent>,
     thread_id: &mut Option<String>,
 ) -> IngressOutcome {
     let class = classify_ingress_frame(&msg);
 
-    if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+    if let Some(id) = msg.get("id").and_then(JsonRpcId::from_wire) {
         if let Some(result) = msg.get("result") {
             return offer_without_blocking(
                 response_tx,
@@ -410,7 +352,12 @@ pub(crate) fn route_app_server_message(
     }
 
     if let Some(method) = msg.get("method").and_then(Value::as_str) {
-        let request_id = msg.get("id").and_then(Value::as_i64).unwrap_or(0);
+        // The exact wire id (number or string), or null when the frame has no
+        // usable id. Never aliased to a stand-in integer.
+        let request_id = msg
+            .get("id")
+            .and_then(JsonRpcId::from_wire)
+            .map_or(Value::Null, |id| id.to_json());
         let params = msg.get("params").cloned().unwrap_or_default();
         if method == "serverRequest/resolved" {
             // Same FIFO as publication: a separate notification forwarder can
@@ -568,7 +515,7 @@ fn terminate_app_server_provider(child_pid: Option<u32>, reason: &str) -> bool {
 async fn run_app_server_stdout_reader<R>(
     stdout: R,
     plane: Arc<AppServerControlPlane>,
-    response_tx: mpsc::Sender<(i64, AppServerResponse)>,
+    response_tx: mpsc::Sender<(JsonRpcId, AppServerResponse)>,
     notification_tx: mpsc::Sender<AppServerNotification>,
     event_tx: mpsc::Sender<StreamEvent>,
     child_pid: Option<u32>,
@@ -581,7 +528,21 @@ async fn run_app_server_stdout_reader<R>(
     let mut observed_eof = false;
 
     loop {
-        let line = match lines.next_line().await {
+        // #939: one oversized frame never kills the session. Drop the rest of
+        // that frame, leave a non-terminal marker in the transcript, and read
+        // on. Only a genuine read error stays fatal.
+        let next_line = match lines.next_line().await {
+            Err(BoundedLineError::Exceeded { limit }) => match lines.drain_oversized_line().await {
+                Ok(()) => {
+                    // Non-blocking: the reader must never wait on a mailbox.
+                    let _ = event_tx.try_send(crate::provider::stdout_line_truncated_event(limit));
+                    continue;
+                }
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
+        let line = match next_line {
             Ok(Some(line)) => line,
             Ok(None) => {
                 observed_eof = true;
@@ -589,11 +550,7 @@ async fn run_app_server_stdout_reader<R>(
             }
             Err(error) => {
                 let _ = plane.latch_provider_death(ProviderLifecycleKind::OverflowSeal);
-                let error_class = if matches!(error, BoundedLineError::Exceeded { .. }) {
-                    "provider_output_overflow"
-                } else {
-                    "provider_output_read_error"
-                };
+                let error_class = "provider_output_read_error";
                 let _ = event_tx.try_send(StreamEvent {
                     event_type: "process_error".to_string(),
                     data: json!({
@@ -747,12 +704,8 @@ impl AppServerWriter {
     }
 
     /// Send a tool result back to the provider.
-    pub async fn send_tool_result(&self, call_id: i64, result: Value) -> Result<()> {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": call_id,
-            "result": result
-        });
+    pub async fn send_tool_result(&self, call_id: &Value, result: Value) -> Result<()> {
+        let response = tool_result_response(call_id, result)?;
         let bytes = format!("{}\n", serde_json::to_string(&response)?).into_bytes();
         self.write_tx
             .send(bytes)
@@ -835,6 +788,56 @@ pub struct CodexAppServerSession {
     next_id: Arc<AtomicI64>,
     turn_control: Arc<dyn ModelCallControl>,
     current_turn_call: Option<ModelCallSettlement>,
+    /// Per-turn token usage summed from `thread/tokenUsage/updated` `last`
+    /// values; the cumulative `total` is never read.
+    turn_usage: TurnTokenUsage,
+}
+
+/// Token usage of one app-server turn, built only from per-model-call `last`
+/// values so cumulative thread totals (and their cumulative cache fields)
+/// never reach an invocation row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TurnTokenUsage {
+    observed: bool,
+    /// Uncached prompt tokens (`inputTokens - cachedInputTokens`).
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+}
+
+impl TurnTokenUsage {
+    /// Fold one `codex_token_count` event's `turn_usage` payload into the turn.
+    fn accumulate(&mut self, event: &StreamEvent) {
+        if event.event_type != "codex_token_count" {
+            return;
+        }
+        let Some(usage) = event.data.get("turn_usage") else {
+            return;
+        };
+        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+        self.observed = true;
+        self.input_tokens = self.input_tokens.saturating_add(field("input_tokens"));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(field("cache_read_tokens"));
+        self.output_tokens = self.output_tokens.saturating_add(field("output_tokens"));
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(field("reasoning_tokens"));
+    }
+
+    /// Usage for settlement, `None` when no per-call update was observed.
+    fn into_model_call_usage(self) -> Option<ModelCallUsage> {
+        self.observed.then(|| ModelCallUsage {
+            input_tokens: Some(self.input_tokens),
+            output_tokens: Some(self.output_tokens),
+            cache_read_tokens: Some(self.cache_read_tokens),
+            reasoning_tokens: Some(self.reasoning_tokens),
+            confidence: Some(ModelUsageConfidence::Measured),
+            ..ModelCallUsage::default()
+        })
+    }
 }
 
 impl CodexAppServerSession {
@@ -876,18 +879,15 @@ impl CodexAppServerSession {
                 next_id,
                 turn_control,
                 current_turn_call: Some(settlement),
+                turn_usage: TurnTokenUsage::default(),
             },
             event_tx,
             write_rx,
         ))
     }
 
-    async fn send_response(&mut self, id: i64, result: Value) -> Result<()> {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        });
+    async fn send_response(&mut self, id: &Value, result: Value) -> Result<()> {
+        let response = tool_result_response(id, result)?;
         let bytes = format!("{}\n", serde_json::to_string(&response)?).into_bytes();
         self.write_tx
             .send(bytes)
@@ -905,6 +905,7 @@ impl CodexAppServerSession {
     }
 
     async fn settle_current_turn_success(&mut self, event: &StreamEvent) -> Result<()> {
+        let turn_usage = std::mem::take(&mut self.turn_usage);
         let Some(call) = self.current_turn_call.take() else {
             return Ok(());
         };
@@ -913,25 +914,29 @@ impl CodexAppServerSession {
             .get("usage")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        self.turn_control
-            .complete(
-                call,
-                ModelCallUsage {
-                    input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
-                    output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
-                    cache_creation_tokens: usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64()),
-                    cache_read_tokens: usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64()),
-                    ..ModelCallUsage::default()
-                },
-            )
-            .await
+        let reported = ModelCallUsage {
+            input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+            output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+            cache_creation_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            cache_read_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+            ..ModelCallUsage::default()
+        };
+        // `turn/completed` carries no usage; the per-call token-count updates
+        // observed during the turn are the turn's measured usage.
+        let settled = if reported.input_tokens.is_none() && reported.output_tokens.is_none() {
+            turn_usage.into_model_call_usage().unwrap_or(reported)
+        } else {
+            reported
+        };
+        self.turn_control.complete(call, settled).await
     }
 
     async fn settle_current_turn_failure(&mut self, error_class: &str) -> Result<()> {
+        self.turn_usage = TurnTokenUsage::default();
         let Some(call) = self.current_turn_call.take() else {
             return Ok(());
         };
@@ -944,6 +949,7 @@ impl ProviderSession for CodexAppServerSession {
     async fn next_event(&mut self) -> Option<StreamEvent> {
         match self.event_rx.recv().await {
             Some(event) => {
+                self.turn_usage.accumulate(&event);
                 if event.event_type == "result"
                     && event.data.get("subtype").and_then(|v| v.as_str()) == Some("turn_completed")
                 {
@@ -1126,7 +1132,7 @@ impl ProviderSession for CodexAppServerSession {
         }
     }
 
-    async fn send_tool_result(&mut self, call_id: i64, result: Value) -> Result<()> {
+    async fn send_tool_result(&mut self, call_id: &Value, result: Value) -> Result<()> {
         self.send_response(call_id, result).await
     }
 
@@ -1154,12 +1160,13 @@ pub(crate) enum AppServerLaunchGate {
 
 impl CodexAppServerClient {
     pub fn new() -> Result<Self> {
-        let binary_path = which::which("codex").map_err(|_| DaemonError::CodexBinaryNotFound)?;
+        let binary_path =
+            crate::provider_cli::resolve("codex").ok_or(DaemonError::CodexBinaryNotFound)?;
         Ok(Self { binary_path })
     }
 
     pub fn is_available() -> bool {
-        which::which("codex").is_ok()
+        crate::provider_cli::resolve("codex").is_some()
     }
 
     pub(crate) async fn new_after_admission(
@@ -1299,7 +1306,7 @@ impl CodexAppServerClient {
         let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(100);
 
         // Channel for JSON-RPC responses (used by the handshake phase)
-        let (response_tx, mut response_rx) = mpsc::channel::<(i64, AppServerResponse)>(16);
+        let (response_tx, mut response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(16);
         // Channel for JSON-RPC notifications
         let (notification_tx, notification_rx) = mpsc::channel::<AppServerNotification>(16);
 
@@ -1475,7 +1482,7 @@ impl CodexAppServerClient {
         let init_response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if let Some((rid, val)) = response_rx.recv().await {
-                    if rid == init_id {
+                    if rid == JsonRpcId::Number(init_id) {
                         return Ok::<AppServerResponse, DaemonError>(val);
                     }
                 }
@@ -1556,7 +1563,7 @@ impl CodexAppServerClient {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     if let Some((rid, val)) = response_rx.recv().await {
-                        if rid == thread_start_id {
+                        if rid == JsonRpcId::Number(thread_start_id) {
                             return Ok::<AppServerResponse, DaemonError>(val);
                         }
                     }
@@ -1620,6 +1627,7 @@ impl CodexAppServerClient {
             next_id: next_id_clone,
             turn_control: Arc::clone(turn_control),
             current_turn_call,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         let process = CodexAppServerProcess { child };
@@ -1711,6 +1719,9 @@ fn map_token_usage_notification(params: &Value) -> Option<StreamEvent> {
     if total_tokens == 0 {
         return None;
     }
+    let last_u64 = |name: &str| last.get(name).and_then(|value| value.as_u64()).unwrap_or(0);
+    let input_tokens = last_u64("inputTokens");
+    let cached_input_tokens = last_u64("cachedInputTokens").min(input_tokens);
 
     Some(StreamEvent {
         event_type: "codex_token_count".to_string(),
@@ -1722,6 +1733,14 @@ fn map_token_usage_notification(params: &Value) -> Option<StreamEvent> {
                     "output_tokens": last.get("outputTokens").and_then(|value| value.as_u64()).unwrap_or(0),
                 },
                 "model_context_window": token_usage.get("modelContextWindow").and_then(|value| value.as_u64()),
+            },
+            // Per-model-call accounting from `last` only; `total` is the
+            // cumulative thread aggregate and is never read.
+            "turn_usage": {
+                "input_tokens": input_tokens.saturating_sub(cached_input_tokens),
+                "cache_read_tokens": cached_input_tokens,
+                "output_tokens": last.get("outputTokens").and_then(|value| value.as_u64()).unwrap_or(0),
+                "reasoning_tokens": last.get("reasoningOutputTokens").and_then(|value| value.as_u64()).unwrap_or(0),
             },
             "provider_event_type": "thread/tokenUsage/updated",
         }),
@@ -1839,6 +1858,7 @@ mod tests {
 
     fn launch_config_for_prompt_test(query: &str, system_prompt: Option<&str>) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query: query.to_string(),
             title: None,
             agent_role: None,
@@ -1873,6 +1893,7 @@ mod tests {
             model_invocation_dedup_key: None,
             model_invocation_request_fingerprint: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
             sandbox: None,
@@ -2242,7 +2263,7 @@ mod tests {
             drop(execution);
             let mut current_turn_call = Some(settlement);
             let test_plane = Arc::new(AppServerControlPlane::new());
-            let (response_tx, mut response_rx) = mpsc::channel::<(i64, AppServerResponse)>(1);
+            let (response_tx, mut response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(1);
             let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(1);
             let (event_tx, _event_rx) = mpsc::channel::<StreamEvent>(1);
             let mut routed_thread_id = None;
@@ -2256,7 +2277,7 @@ mod tests {
                 &mut routed_thread_id,
             );
             let (response_id, response) = response_rx.recv().await.expect("routed response");
-            assert_eq!(response_id, 7);
+            assert_eq!(response_id, JsonRpcId::Number(7));
             settle_thread_start_response(&control, &mut current_turn_call, response)
                 .await
                 .expect_err("invalid thread/start response must fail");
@@ -2421,6 +2442,7 @@ mod tests {
             next_id,
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -2460,6 +2482,7 @@ mod tests {
             next_id,
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -2497,6 +2520,7 @@ mod tests {
             next_id,
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         let config = TurnConfig {
@@ -2545,6 +2569,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
         let config = TurnConfig {
             input: "continue working".to_string(),
@@ -2583,6 +2608,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -2635,6 +2661,114 @@ mod tests {
         assert_eq!(settled.3, None);
     }
 
+    /// `turn/completed` carries no usage; the turn's invocation row takes the
+    /// sum of the per-call `last` values and never the cumulative `total`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn turn_completed_settles_per_turn_last_usage_not_cumulative_total() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let permit = root_permit(&store, session_id).await;
+        let invocation_id = permit.invocation_id();
+        let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(8);
+        let mut session = CodexAppServerSession {
+            thread_id: "thread-abc".to_string(),
+            working_dir: PathBuf::from("/home/user"),
+            write_tx,
+            event_rx,
+            next_id: Arc::new(AtomicI64::new(1)),
+            turn_control: turn_control(&store, session_id, permit),
+            current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
+        };
+        session
+            .start_turn(&TurnConfig {
+                input: "continue working".to_string(),
+                working_dir: None,
+            })
+            .await
+            .expect("turn starts");
+        write_rx.recv().await.expect("turn request");
+
+        // Two model calls in one turn; `total` is the huge cumulative thread
+        // aggregate (cached tokens included) and must never be counted.
+        for (input, cached, output, reasoning) in
+            [(1_000u64, 400u64, 50u64, 5u64), (2_000, 1_500, 70, 7)]
+        {
+            let event = map_token_usage_notification(&json!({
+                "threadId": "thread-abc",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 9_999_999u64,
+                        "inputTokens": 9_000_000u64,
+                        "cachedInputTokens": 8_000_000u64,
+                        "outputTokens": 999_999u64,
+                    },
+                    "last": {
+                        "totalTokens": input + output,
+                        "inputTokens": input,
+                        "cachedInputTokens": cached,
+                        "outputTokens": output,
+                        "reasoningOutputTokens": reasoning,
+                    },
+                    "modelContextWindow": 258_400u64,
+                }
+            }))
+            .expect("per-call usage notification");
+            event_tx.send(event).await.expect("send usage");
+            assert_eq!(
+                session.next_event().await.expect("usage").event_type,
+                "codex_token_count"
+            );
+        }
+        event_tx
+            .send(StreamEvent {
+                event_type: "result".to_string(),
+                data: json!({"subtype": "turn_completed", "usage": {}}),
+            })
+            .await
+            .expect("send turn completed");
+        session.next_event().await.expect("completed event");
+        drop(event_tx);
+        assert!(session.next_event().await.is_none());
+
+        let guard = store.lock().await;
+        let settled = guard
+            .conn
+            .query_row(
+                "SELECT status, input_tokens, output_tokens, cache_read_tokens,
+                        reasoning_tokens, usage_confidence
+                 FROM model_invocations WHERE id = ?1",
+                rusqlite::params![invocation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .expect("settled row");
+        assert_eq!(settled.0, "completed");
+        assert_eq!(
+            settled.1,
+            Some(600 + 500),
+            "uncached input is summed per call"
+        );
+        assert_eq!(settled.2, Some(120));
+        assert_eq!(
+            settled.3,
+            Some(1_900),
+            "cache reads are per-call, not the 8M total"
+        );
+        assert_eq!(settled.4, Some(12));
+        assert_eq!(settled.5, "measured");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn completed_turn_requires_a_new_admission_for_the_next_send() {
@@ -2652,6 +2786,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
         let config = TurnConfig {
             input: "continue working".to_string(),
@@ -2747,7 +2882,7 @@ mod tests {
         assert_eq!(initial_request["method"], "thread/start");
 
         let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(4);
-        let (response_tx, _response_rx) = mpsc::channel::<(i64, AppServerResponse)>(4);
+        let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(4);
         let (notification_tx, notification_rx) = mpsc::channel::<AppServerNotification>(4);
         let test_plane = Arc::new(AppServerControlPlane::new());
         tokio::spawn(forward_app_server_notifications(
@@ -2763,6 +2898,7 @@ mod tests {
             next_id,
             turn_control: Arc::clone(&control),
             current_turn_call: Some(settlement),
+            turn_usage: TurnTokenUsage::default(),
         };
         let mut routed_thread_id = None;
 
@@ -2861,6 +2997,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
         let config = TurnConfig {
             input: "continue working".to_string(),
@@ -2908,6 +3045,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -2964,6 +3102,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -2996,7 +3135,7 @@ mod tests {
         let invocation_id = permit.invocation_id();
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
         let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(4);
-        let (response_tx, _response_rx) = mpsc::channel::<(i64, AppServerResponse)>(4);
+        let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(4);
         let (notification_tx, notification_rx) = mpsc::channel::<AppServerNotification>(4);
         let test_plane = Arc::new(AppServerControlPlane::new());
         tokio::spawn(forward_app_server_notifications(
@@ -3012,6 +3151,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: turn_control(&store, session_id, permit),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         session
@@ -3076,6 +3216,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
         assert!(session.supports_multi_turn());
     }
@@ -3093,6 +3234,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
         assert!(session.supports_approvals());
     }
@@ -3125,7 +3267,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_mailbox_is_not_overflow_and_never_terminates_ingress() {
         let plane = Arc::new(AppServerControlPlane::new());
-        let (response_tx, response_rx) = mpsc::channel::<(i64, AppServerResponse)>(1);
+        let (response_tx, response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(1);
         let (notification_tx, notification_rx) = mpsc::channel::<AppServerNotification>(1);
         let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(1);
         // Exactly what happens once `launch` returns.
@@ -3177,7 +3319,7 @@ mod tests {
             std::time::Instant::now(),
         );
 
-        let (response_tx, _response_rx) = mpsc::channel::<(i64, AppServerResponse)>(4);
+        let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(4);
         let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(4);
         let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1);
 
@@ -3309,7 +3451,7 @@ mod tests {
         assert!(child_pid.is_some(), "the stand-in provider must have a PID");
 
         let plane = Arc::new(AppServerControlPlane::new());
-        let (response_tx, _response_rx) = mpsc::channel::<(i64, AppServerResponse)>(4);
+        let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(4);
         let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(4);
         // Capacity-1 and saturated: the next provider request cannot land.
         let (event_tx, _event_rx) = mpsc::channel::<StreamEvent>(1);
@@ -3350,6 +3492,74 @@ mod tests {
             Some(nix::sys::signal::Signal::SIGKILL as i32),
             "ingress terminates the provider with SIGKILL, which a provider blocked \
              writing into a full stdout pipe cannot ignore"
+        );
+    }
+
+    /// #939: one oversized stdout frame (here 5 MiB, past the 2 MiB bound) is
+    /// dropped with a non-terminal marker; the frames around it are still
+    /// routed and the provider is left running.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn oversized_stdout_frame_is_truncated_and_the_reader_continues() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a stand-in provider process");
+        let child_pid = child.id();
+
+        let plane = Arc::new(AppServerControlPlane::new());
+        let (response_tx, _response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(4);
+        let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(4);
+        let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(16);
+
+        let approval = |id: i64| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\
+                 \"method\":\"item/commandExecution/requestApproval\",\
+                 \"params\":{{\"command\":\"ls\"}}}}\n"
+            )
+        };
+        let mut bytes = approval(1).into_bytes();
+        bytes.extend_from_slice(b"{\"blob\":\"");
+        bytes.extend(std::iter::repeat_n(b'x', 5 * 1024 * 1024));
+        bytes.extend_from_slice(b"\"}\n");
+        bytes.extend_from_slice(approval(2).as_bytes());
+
+        run_app_server_stdout_reader(
+            std::io::Cursor::new(bytes),
+            Arc::clone(&plane),
+            response_tx,
+            notification_tx,
+            event_tx,
+            child_pid,
+        )
+        .await;
+
+        let mut kinds = Vec::new();
+        let mut marker = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if event.event_type == "process_error" {
+                marker = Some(event.data.clone());
+            }
+            kinds.push(event.event_type);
+        }
+        assert_eq!(
+            kinds,
+            vec!["approval_request", "process_error", "approval_request"],
+            "the transcript is before / truncation marker / after"
+        );
+        let marker = marker.expect("truncation marker");
+        assert_eq!(marker["terminal"], json!(false));
+        assert_eq!(
+            marker["error"],
+            json!(format!(
+                "[provider stdout line truncated at {PROVIDER_MAX_LINE_BYTES} bytes]"
+            ))
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "an oversized frame must not terminate the provider"
         );
     }
 
@@ -3477,6 +3687,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: Some(occupying_settlement),
+            turn_usage: TurnTokenUsage::default(),
         };
 
         let (turn, invocation_id) = admitted_delivery_turn(&store, session_id, 2).await;
@@ -3565,6 +3776,7 @@ mod tests {
             next_id: Arc::new(AtomicI64::new(1)),
             turn_control: Arc::new(NoopModelCallControl),
             current_turn_call: None,
+            turn_usage: TurnTokenUsage::default(),
         };
 
         let (turn, invocation_id) = admitted_delivery_turn(&store, session_id, 1).await;
@@ -3614,6 +3826,178 @@ mod tests {
             session.current_turn_call.is_none(),
             "a refused enqueue must not install a current turn"
         );
+    }
+
+    /// Route one frame and return what reached the response channel and the
+    /// event channel, so the id tests assert on the delivered envelopes.
+    fn route_id_frame(
+        frame: Value,
+    ) -> (
+        Vec<(JsonRpcId, AppServerResponse)>,
+        Vec<StreamEvent>,
+        IngressOutcome,
+    ) {
+        let plane = Arc::new(AppServerControlPlane::new());
+        let (response_tx, mut response_rx) = mpsc::channel::<(JsonRpcId, AppServerResponse)>(8);
+        let (notification_tx, _notification_rx) = mpsc::channel::<AppServerNotification>(8);
+        let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(8);
+        let mut thread_id = None;
+        let outcome = route_app_server_message(
+            frame,
+            &plane,
+            &response_tx,
+            &notification_tx,
+            &event_tx,
+            &mut thread_id,
+        );
+        let mut responses = Vec::new();
+        while let Ok(response) = response_rx.try_recv() {
+            responses.push(response);
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        (responses, events, outcome)
+    }
+
+    /// A string-id response must reach its waiter (issue #42): it used to be
+    /// skipped because the id was read with `as_i64`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn string_id_response_reaches_its_waiter() {
+        let (responses, _, outcome) =
+            route_id_frame(json!({"jsonrpc":"2.0","id":"abc-123","result":{"ok":true}}));
+        assert_eq!(outcome, IngressOutcome::Continue);
+        assert_eq!(responses.len(), 1, "the string-id response was dropped");
+        assert_eq!(responses[0].0, JsonRpcId::String("abc-123".into()));
+        assert!(matches!(&responses[0].1, AppServerResponse::Result(v) if v["ok"] == true));
+
+        let (responses, _, _) = route_id_frame(
+            json!({"jsonrpc":"2.0","id":"abc-124","error":{"code":-1,"message":"no"}}),
+        );
+        assert_eq!(responses.len(), 1, "the string-id error was dropped");
+        assert_eq!(responses[0].0, JsonRpcId::String("abc-124".into()));
+        assert!(matches!(responses[0].1, AppServerResponse::Error(_)));
+    }
+
+    /// Numeric ids keep routing exactly as before, including a wire `0`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn numeric_id_response_still_reaches_its_waiter() {
+        for id in [7_i64, 0] {
+            let (responses, _, _) =
+                route_id_frame(json!({"jsonrpc":"2.0","id":id,"result":{"n":id}}));
+            assert_eq!(responses.len(), 1, "numeric id {id} was dropped");
+            assert_eq!(responses[0].0, JsonRpcId::Number(id));
+        }
+    }
+
+    /// A string `"1"` and the number `1` are different ids.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn string_and_numeric_ids_with_the_same_text_do_not_collide() {
+        let (as_string, _, _) = route_id_frame(json!({"jsonrpc":"2.0","id":"1","result":{}}));
+        let (as_number, _, _) = route_id_frame(json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        assert_eq!(as_string[0].0, JsonRpcId::String("1".into()));
+        assert_eq!(as_number[0].0, JsonRpcId::Number(1));
+        assert_ne!(as_string[0].0, as_number[0].0);
+        // The handshake waiters compare against the exact numeric id they sent,
+        // so a string "1" can never satisfy the waiter for request 1.
+        assert_ne!(as_string[0].0, JsonRpcId::Number(1));
+    }
+
+    /// A string-id tool call carries its id in the event and is answered with
+    /// the same string id; a numeric id keeps its numeric payload and reply.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn string_id_tool_call_is_answered_with_the_same_string_id() {
+        let frame = |id: Value| {
+            json!({"jsonrpc":"2.0","id":id,"method":"item/tool/call",
+                   "params":{"name":"rsi_memory_search","arguments":{"q":"x"}}})
+        };
+        let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
+        let writer = AppServerWriter {
+            write_tx,
+            next_id: Arc::new(AtomicI64::new(1)),
+        };
+
+        for (id, expected_reply_id) in [
+            (json!("call-abc"), json!("call-abc")),
+            (json!(99), json!(99)),
+            (json!(0), json!(0)),
+        ] {
+            let (_, events, _) = route_id_frame(frame(id.clone()));
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "tool_call");
+            assert_eq!(events[0].data["call_id"], id, "payload id must be exact");
+
+            writer
+                .send_tool_result(&events[0].data["call_id"], json!({"done":true}))
+                .await
+                .expect("reply accepted");
+            let bytes = write_rx.recv().await.expect("reply bytes");
+            let reply: Value = serde_json::from_slice(&bytes).expect("reply json");
+            assert_eq!(reply["id"], expected_reply_id);
+            assert_eq!(reply["result"]["done"], true);
+        }
+    }
+
+    /// A string-id approval request keeps its exact id in the event payload and
+    /// the approval reply echoes it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn string_id_approval_request_keeps_its_exact_id() {
+        let params =
+            json!({"threadId":"t","turnId":"u","itemId":"i","startedAtMs":1,"command":"ls"});
+        let (_, events, _) = route_id_frame(json!({"jsonrpc":"2.0","id":"appr-1",
+            "method":"item/commandExecution/requestApproval","params":params}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "approval_request");
+        assert_eq!(events[0].data["request_id"], "appr-1");
+        let reply = approval_response(
+            &events[0].data["request_id"],
+            "item/commandExecution/requestApproval",
+            &params,
+            ApprovalDecision::Approve,
+        )
+        .expect("approval reply");
+        assert_eq!(reply["id"], "appr-1");
+    }
+
+    /// No id is aliased to 0: a frame without a usable id yields a null
+    /// `call_id`, a refused reply, and never a response envelope.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn an_unusable_id_is_never_aliased_to_zero() {
+        for id in [Some(json!(null)), Some(json!(1.5)), Some(json!(true)), None] {
+            let mut frame = json!({"jsonrpc":"2.0","method":"item/tool/call",
+                "params":{"name":"t","arguments":{}}});
+            if let Some(id) = id {
+                frame["id"] = id;
+            }
+            let (responses, events, _) = route_id_frame(frame);
+            assert!(responses.is_empty());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data["call_id"], Value::Null);
+        }
+
+        let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(1);
+        let writer = AppServerWriter {
+            write_tx,
+            next_id: Arc::new(AtomicI64::new(1)),
+        };
+        for bad in [json!(null), json!(1.5), json!(true), json!({})] {
+            writer
+                .send_tool_result(&bad, json!({}))
+                .await
+                .expect_err("an unusable id must be refused, not sent as 0");
+        }
+        assert!(write_rx.try_recv().is_err(), "nothing may be written");
+
+        // Responses with unusable ids are not delivered to a waiter as id 0.
+        let (responses, _, _) = route_id_frame(json!({"jsonrpc":"2.0","id":null,"result":{}}));
+        assert!(responses.is_empty());
     }
 }
 

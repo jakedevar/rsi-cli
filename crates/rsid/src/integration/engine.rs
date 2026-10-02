@@ -2147,7 +2147,9 @@ validate_candidate_tree() {
     validate_mutable_artifacts
     RSI_CUSTODY_COMMAND_INDEX="$RSI_CUSTODY_VERIFY_INDEX" git_cmd ls-files -u > "$RSI_CUSTODY_STATUS_FILE" || refuse "unmerged query failed"
     [ ! -s "$RSI_CUSTODY_STATUS_FILE" ] || refuse "unmerged index entries"
-    [ "$(RSI_CUSTODY_COMMAND_INDEX="$RSI_CUSTODY_VERIFY_INDEX" git_cmd write-tree)" = "$(git_cmd rev-parse --verify "$RSI_CUSTODY_CANDIDATE_OID^{tree}")" ] || refuse "real index tree differs"
+    # Read-only proof that the index is the candidate tree. `write-tree` is not
+    # used here: with an invalid cache tree it rewrites the index by rename, so
+    # the pinned verify artifact changes identity (#936).
     RSI_CUSTODY_COMMAND_INDEX="$RSI_CUSTODY_VERIFY_INDEX" git_cmd diff --cached --quiet "$RSI_CUSTODY_CANDIDATE_OID" || refuse "cached diff differs"
     RSI_CUSTODY_COMMAND_INDEX="$RSI_CUSTODY_VERIFY_INDEX" git_cmd diff --quiet "$RSI_CUSTODY_CANDIDATE_OID" || refuse "worktree diff differs"
     RSI_CUSTODY_COMMAND_INDEX="$RSI_CUSTODY_VERIFY_INDEX" git_cmd ls-files --others --exclude-standard > "$RSI_CUSTODY_STATUS_FILE" || refuse "untracked query failed"
@@ -3562,19 +3564,11 @@ async fn verify_candidate_state(
             "holder index has unmerged entries at the candidate",
         ));
     }
-    let tree = git::stdout(
-        config,
-        &record.holder,
-        &["rev-parse", "--verify", &format!("{candidate}^{{tree}}")],
-    )
-    .await?;
-    let index_tree =
-        git::stdout_with_index(config, &record.holder, &["write-tree"], &verify_index).await?;
-    if index_tree != tree {
-        return Err(uncertain(
-            "holder real index tree differs from the candidate",
-        ));
-    }
+    // `diff --cached` against the candidate is the read-only proof that the
+    // index is the candidate tree (unmerged entries were refused above).
+    // `write-tree` is not used on the verify copy: with an invalid cache tree
+    // it rewrites the index by rename, and the pinned verify artifact then
+    // fails its manifest identity check (#936).
     if !git::predicate_with_index(
         config,
         &record.holder,

@@ -520,6 +520,7 @@ async fn read_sse_stream(
     cancel: &CancellationToken,
     attempt_input_tokens: &mut u64,
     attempt_output_tokens: &mut u64,
+    attempt_cost_usd: &mut Option<f64>,
 ) -> Result<(String, Vec<AccumulatedToolCall>, Option<String>)> {
     let mut content_text = String::new();
     let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
@@ -586,6 +587,8 @@ async fn read_sse_stream(
                     .or_else(|| usage.get("output_tokens"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                *attempt_cost_usd =
+                    crate::session::harness::sse::reported_cost_usd(usage).or(*attempt_cost_usd);
             }
 
             let Some(choice) = chunk_json
@@ -773,6 +776,7 @@ async fn run_agentic_loop(
 
         let mut attempt_input_tokens = 0;
         let mut attempt_output_tokens = 0;
+        let mut attempt_cost_usd: Option<f64> = None;
         let stream_result = read_sse_stream(
             resp,
             &session_tag,
@@ -780,6 +784,7 @@ async fn run_agentic_loop(
             cancel,
             &mut attempt_input_tokens,
             &mut attempt_output_tokens,
+            &mut attempt_cost_usd,
         )
         .await;
         let (content_text, accumulated_tool_calls, finish_reason) = match stream_result {
@@ -799,6 +804,7 @@ async fn run_agentic_loop(
                 ModelCallUsage {
                     input_tokens: Some(attempt_input_tokens),
                     output_tokens: Some(attempt_output_tokens),
+                    estimated_cost_usd: attempt_cost_usd,
                     wall_time_ms: Some(
                         started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
                     ),

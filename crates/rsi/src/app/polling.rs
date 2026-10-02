@@ -13,17 +13,32 @@ use uuid::Uuid;
 const CONVERSATION_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const WORKER_PRESSURE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Re-read sooner while the rsid CPU reading still needs its second sample.
+const DAEMON_CPU_FIRST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// One bounded background Health read: worker-slice pressure for the top
+/// chrome plus rsid's own resource usage for the live-activity pane.
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonHealthRead {
+    pub(crate) pressure: Option<rsi_common::rpc::WorkerSliceMemoryPressure>,
+    pub(crate) resources: crate::daemon_resources::DaemonResourceSample,
+}
+
 async fn fetch_worker_pressure(
     socket_path: std::path::PathBuf,
-) -> Result<Option<rsi_common::rpc::WorkerSliceMemoryPressure>, String> {
+) -> Result<DaemonHealthRead, String> {
     tokio::time::timeout(CONVERSATION_POLL_TIMEOUT, async {
         let mut client = crate::client::DaemonClient::new(socket_path);
         client.connect().await.map_err(|error| error.to_string())?;
-        client
+        let pid = client.peer_pid();
+        let status = client
             .get_health_status()
             .await
-            .map(|status| status.worker_slice_memory_pressure)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(DaemonHealthRead {
+            resources: crate::daemon_resources::DaemonResourceSample::from_health(&status, pid),
+            pressure: status.worker_slice_memory_pressure,
+        })
     })
     .await
     .map_err(|_| "worker pressure Health read timed out".to_string())?
@@ -155,19 +170,36 @@ impl App {
             .is_some_and(tokio::task::JoinHandle::is_finished)
             && let Some(handle) = self.worker_pressure_refresh_handle.take()
         {
-            let pressure = match handle.await {
-                Ok(Ok(pressure)) => pressure,
+            let (pressure, resources) = match handle.await {
+                Ok(Ok(read)) => (read.pressure, Some(read.resources)),
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "worker pressure Health refresh unavailable");
-                    None
+                    (None, None)
                 }
                 Err(error) => {
                     tracing::debug!(%error, "worker pressure Health task failed");
-                    None
+                    (None, None)
                 }
             };
             if self.worker_slice_memory_pressure != pressure {
                 self.worker_slice_memory_pressure = pressure;
+                self.mark_dirty();
+            }
+            let resources = resources.map(|sample| {
+                crate::daemon_resources::DaemonResourceView::next(
+                    self.daemon_resources.as_ref(),
+                    sample,
+                )
+            });
+            if resources
+                .as_ref()
+                .is_some_and(crate::daemon_resources::DaemonResourceView::awaiting_cpu)
+            {
+                self.worker_pressure_next_refresh_at =
+                    std::time::Instant::now() + DAEMON_CPU_FIRST_INTERVAL;
+            }
+            if self.daemon_resources != resources {
+                self.daemon_resources = resources;
                 self.mark_dirty();
             }
         }
@@ -305,6 +337,12 @@ impl App {
             if let Ok(level) = self.client.get_operator_pause(session_id).await
                 && self.operator_pauses.insert(session_id, level) != Some(level)
             {
+                self.needs_redraw = true;
+            }
+            if let Ok(messages) = self.client.list_operator_messages(session_id).await
+                && self.operator_messages.get(&session_id) != Some(&messages)
+            {
+                self.operator_messages.insert(session_id, messages);
                 self.needs_redraw = true;
             }
         }
@@ -1387,7 +1425,7 @@ impl App {
                         crate::types::NotificationKind::Info,
                         crate::types::NotificationPriority::Medium,
                         format!("Scheduled: '{}' fired -> {}", parsed.job_name, short_id),
-                        None,
+                        Some(parsed.session_id),
                     );
                     return true;
                 }
@@ -1678,6 +1716,7 @@ mod conversation_poll_filter_tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

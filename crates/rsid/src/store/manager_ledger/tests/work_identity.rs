@@ -38,6 +38,7 @@ fn product(f: &Fixture, key: &str, expected: i64) -> ManagerUpdateV2 {
             ManagerWorkStageV2::Review,
             ManagerWorkStageV2::Verification,
         ],
+        risk_tier: Default::default(),
     }
 }
 
@@ -1030,6 +1031,7 @@ fn v121_database(directory: &tempfile::TempDir, name: &str) -> (std::path::PathB
     let database = directory.path().join(name);
     let f = fixture_using(Store::open(&database).unwrap());
     crate::store::tests::rewind_post_v121_tail_to(&f.store.conn, 121);
+    crate::store::tests::readd_current_session_columns(&f.store.conn);
     (database, f)
 }
 

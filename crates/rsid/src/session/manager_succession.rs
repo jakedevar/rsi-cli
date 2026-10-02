@@ -178,7 +178,7 @@ impl SessionManager {
         };
         let disabled = source.rotation_disabled_at.is_some();
         if let Err(error) = self
-            .launch_session_with_retry_admission(
+            .boxed_launch_session_with_retry_admission(
                 config,
                 None,
                 disabled,
@@ -452,6 +452,9 @@ impl Runtime {
                     return Err(refused("manager_succession_cleanup_changed"));
                 }
                 tracked.interrupt_requested = true;
+                tracked
+                    .interrupt_source
+                    .get_or_insert(crate::terminal_cause::InterruptSource::ManagerAction);
                 if let Some(process) = tracked.process.as_mut() {
                     process.kill().await?;
                     if process.is_alive() {
@@ -489,7 +492,11 @@ impl Runtime {
         let session = {
             let store = self.store.lock().await;
             if store.get_session(id)?.is_some() {
-                store.update_session_status(id, SessionStatus::Failed)?;
+                store.set_session_terminal_status(
+                    id,
+                    SessionStatus::Failed,
+                    "manager_succession_establishment_uncertain",
+                )?;
             }
             let current = store
                 .manager_succession(root.operation_id)?
@@ -528,6 +535,7 @@ impl Runtime {
 fn launch_config(root: &ManagerRootSuccession, content: String) -> Result<LaunchConfig> {
     let source = &root.frozen.predecessor;
     Ok(LaunchConfig {
+        completion_gates: None,
         query: content,
         title: source.title.clone(),
         agent_role: source.agent_role.clone(),
@@ -562,6 +570,7 @@ fn launch_config(root: &ManagerRootSuccession, content: String) -> Result<Launch
         model_invocation_dedup_key: Some(root.invocation_dedup_key()),
         model_invocation_request_fingerprint: Some(root.invocation_fingerprint()?),
         skip_project_model_default: true,
+        tool_policy: None,
         model_invocation_purpose:
             rsi_common::model_control::ModelInvocationPurpose::SessionRotateChild,
         sandbox: Some(rsi_common::types::SandboxSpec {

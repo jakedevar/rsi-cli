@@ -9,15 +9,15 @@ Run the RSI TUI on a remote machine over SSH, inside a persistent tmux session.
 
 Configuration:
   RSI_SSH_HOST              Remote host/IP. Used when [host] is omitted.
-  RSI_SSH_USER              SSH user. Default: jakedevar
+  RSI_SSH_USER              SSH user. Default: none (ssh config / local user)
   RSI_SSH_PORT              SSH port. Default: 22
   RSI_SSH_IDENTITY_FILE     Optional SSH private key path.
   RSI_TMUX_SESSION          Remote tmux session name. Default: rsi
   RSI_REMOTE_RSI_COMMAND    Command tmux should run. Default: rsi if installed,
-                            otherwise cargo run from /home/jakedevar/rsi.
+                            otherwise cargo run from ~/rsi on the remote.
 
 Examples:
-  rsi-ssh-tui.sh 71.227.210.118
+  rsi-ssh-tui.sh remote.example.net
   RSI_SSH_PORT=2222 rsi-ssh-tui.sh my-home.ddns.net
 EOF
 }
@@ -33,7 +33,7 @@ if [[ -z "$host" ]]; then
   exit 2
 fi
 
-user="${RSI_SSH_USER:-jakedevar}"
+user="${RSI_SSH_USER:-}"
 port="${RSI_SSH_PORT:-22}"
 identity_file="${RSI_SSH_IDENTITY_FILE:-}"
 session="${RSI_TMUX_SESSION:-rsi}"
@@ -44,11 +44,11 @@ if [[ ! "$session" =~ ^[A-Za-z0-9_.-]+$ ]]; then
 fi
 
 target="$host"
-if [[ "$host" != *@* ]]; then
+if [[ "$host" != *@* && -n "$user" ]]; then
   target="${user}@${host}"
 fi
 
-remote_rsi_command="${RSI_REMOTE_RSI_COMMAND:-bash -lc 'if command -v rsi >/dev/null 2>&1; then exec rsi; else cd /home/jakedevar/rsi && exec cargo run --bin rsi; fi'}"
+remote_rsi_command="${RSI_REMOTE_RSI_COMMAND:-bash -lc 'if command -v rsi >/dev/null 2>&1; then exec rsi; else cd ~/rsi && exec cargo run --bin rsi; fi'}"
 remote_command="tmux new-session -A -s '$session' \"$remote_rsi_command\""
 
 ssh_args=(

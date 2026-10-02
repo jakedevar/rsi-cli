@@ -1,10 +1,11 @@
 ---
 source: crates/rsi/tests/tui_integration.rs
+assertion_line: 2117
 expression: "support::buffer_to_snapshot(&buffer)"
 ---
  ● 0
  All projects / Sessions ┌────────────────────────────────────────────────┐               1 session
-  #   ∞  S  !  FUNCTION  │ cwd: /tmp/rsi-s-input  [default]               │   MODEL                ▮
+  #   ∞  S  !  FUNCTION  │ cwd: /tmp/rsi-s-input  default                 │   MODEL                ▮
  RECENT ─────────────────│                                                │─────────────────────────
 ▌        ✓     query 0   │ line 03                                        │ ✻
                          │ line 04                                        │
@@ -13,5 +14,5 @@ expression: "support::buffer_to_snapshot(&buffer)"
                          │ line 07                                        │
                          │ line 08                                        │
                          │                                                │
-                         │  INSERT  Ctrl+Enter: send  Esc: normal         │
+                         │  INSERT                                        │
                          └────────────────────────────────────────────────┘

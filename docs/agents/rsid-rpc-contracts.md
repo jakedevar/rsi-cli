@@ -4,8 +4,12 @@ Moved from `crates/rsid/AGENTS.md` on 2026-09-26. Read the section for the RPC
 family you are changing. The method list itself is the match arms in
 `crates/rsid/src/rpc.rs`.
 
-The full method list is the match arms in `crates/rsid/src/rpc.rs`. Only the
-non-obvious contracts are recorded here.
+The full method list is the match arms in `crates/rsid/src/rpc.rs`, which holds
+only the router; the handlers live in per-family modules under
+`crates/rsid/src/rpc/` (sessions, issues, manager, agent_verbs, scheduled_jobs,
+settings, storage, satellites, program_runs, topology, recursive_*, ...). Source-scanning
+tests read them through `rpc_production_source()`. Only the non-obvious
+contracts are recorded here.
 
 Session lifecycle & management: `SwitchSessionModel` is deprecated (model is
 locked at session creation).
@@ -43,7 +47,7 @@ Agent Sessions (P0 lead/child dispatch) — the entire agent-facing surface:
 `AgentSpawnChild`, `AgentReserveSuccessor`, `AgentGetProgress`,
 `AgentSendMessage`, `AgentGetStatus`, `AgentHalt`, `AgentContinueChild`,
 `AgentArchiveChild` (current Epic lead only),
-`AgentScheduleWake`,
+`AgentScheduleWake`, `AgentCancelWake` (own jobs only), `AgentListWakes` (own jobs only),
 `AgentCreateIssue`, `AgentListIssues`, `AgentGetIssue`, `AgentUpdateIssue`,
 `AgentUpdateIssueStatus`, `AgentArchiveIssue`, `AgentRestoreIssue`,
 `AgentListIssueEvents`, `AgentManagerProgress`, `AgentManagerInbox`,
@@ -147,3 +151,206 @@ have no authenticated mid-turn mail delivery and acknowledgment path here;
 mail can only reach a supported idle boundary before expiry. Use
 `AgentContinueChild` only when deliberate interruption and replacement of a
 running child is intended; it is not a mail delivery acknowledgment.
+
+## Agent authority catalog
+
+`AgentGetAuthorityCatalog` (native `rsi_control_authority_catalog`) is open to
+every tokened caller and self-scoped: the daemon resolves the token, reads one
+`agent_authority_projection`, and renders `AgentAuthorityCatalogV1`
+(`rsi_common::agent_authority_catalog`) via
+`session::preamble::render_authority_catalog`. Request `{verb?}` with
+`deny_unknown_fields`; null params mean `{}`. Refusals:
+`authority_catalog_invalid_request`, `authority_catalog_unknown_verb`, and the
+projection's own caller refusal. With `verb` the response is the compact
+envelope plus one `control` detail (`permitted`, `parameters`, `example`,
+`refusals`); `controls` and `guidance` are omitted. Examples and refusals come
+from `rsi_common::agent_control_examples`, exhaustive over the verb enum, so a
+new verb cannot ship without an example the tests validate. It is an
+advertisement, never a grant.
+
+## Rolling merge queue (#1007)
+
+`AgentEnqueueLandingSource` is the only agent-facing queue verb (in
+`AGENT_VERBS`, the closed catalog and `rsi-rpc`; no native tool). The daemon
+binds the caller from the token; only the current appointed manager and the
+current lead of the caller's Epic may enqueue (`queue_not_authorized`
+otherwise). Request `{source_commit, test_filters?, idempotency_key}`. Refusals:
+`queue_disabled`, `queue_source_invalid`, `queue_filter_invalid`,
+`queue_duplicate_source` (a live entry for the commit exists),
+`queue_idempotency_conflict`. Entries live in `rolling_queue_entries`
+(provisional migration) in FIFO `sequence` order; a run is one `gating` entry plus a
+`rolling_queue_batches` row. The runner (`rsid::rolling_queue`) claims the head
+while `rolling_queue_enabled` is on, runs `rsi-rolling-land` with the entry's
+`--test-filter` set and settles the entry once: the settling transaction CASes
+`gating -> terminal` and inserts the owner's single `scheduled_jobs` resume wake
+(`wake_job_id` is UNIQUE). Restart reconcile settles a `gating` entry whose
+source is an ancestor of `origin/rolling` and re-queues the rest. An out-of-band
+push costs at most one regate (`RSI_LANDER_MAX_REGATED_STALE_RETRIES=1`); a
+second is refused `queue_out_of_band_regate_exhausted` to the owner. There are no
+hot-file waits, claims or seals; migration numbers are renumbered at landing.
+The operator settings `rolling_queue_enabled`, `rolling_queue_batch_size` (1-8,
+S1 runs one source per gate) and `rolling_queue_speculation_depth` (0-2) and the
+read `GetRollingQueue` are operator-only: absent from `AGENT_VERBS`,
+`READ_VERBS`, native tools and the agent CLI catalog.
+
+## Child-aware continuations: hold and keep-alive valve (#794 S3)
+
+Operator-only; no agent verb reads or sets any of it, and there is no schema.
+
+- **Children a parent waits on** are its enabled automatic `agent-child-*`
+  terminal watches whose logical child's published rotation tip is live.
+- **Hold** (`program_hold_while_children_run`, default on). A program-mode
+  master's ordinary one-shot same-session Resume wake, when due, is *held* while
+  its `Completed` tip has a running child: the row stays enabled and untouched
+  (so `exact_master_continuation_guard_present` and the no-idle invariant still
+  hold), and nothing is delivered. It is released when the last child settles
+  (the child watch resumes the master as before) or, once, when the window
+  elapses. The window starts at the later of the wake's due time and the
+  parent's last provider output. The sentinel, valve rows, recurring wakes,
+  non-program wakes and a manual "trigger now" are never held.
+- **Valve** (`child_keepalive_enabled`, default off;
+  `child_keepalive_window_secs`, 300-21600, default 1500). Each scheduler tick,
+  an idle `Completed` parent with a running child, no pending question,
+  approval, operator pause or capacity incident, and no other enabled resume wake
+  gets at most one daemon-owned one-shot Resume row per window (primary key
+  derived from `(parent, window_start)`, name `keepalive-{parent}`). Delivery is
+  the ordinary Resume path (fence, spawn guard, retry backoff); a busy tip is
+  refused `continuation_target_busy` and retried. If every child settled before
+  delivery, the row is disabled undelivered. It never launches a Fresh session,
+  so no second writer can enter a sandbox. While the row exists it is an enabled
+  resume wake under the #1028 owner rule.
+- **Read side.** `ListScheduledJobHolds` (operator-only) returns the held wakes;
+  the TUI Scheduled Jobs overlay shows `HELD xN until HH:MM`.
+- **Settings.** The three keys are persisted runtime-config fields through
+  `GetDaemonConfig`/`UpdateDaemonConfig` and TUI Orchestration rows. The
+  scheduler reads the durable `daemon_settings` rows each tick, with the same
+  defaults `RuntimeConfig` publishes; an unreadable setting turns hold and valve
+  off (the pre-#794 behaviour).
+
+## Resource governor (#1014)
+
+`crates/rsid/src/governor.rs` admits builds and landers against slots, 1-minute
+load, disk free on `/`, `MemAvailable` and the workers slice's anon+shmem memory
+(never `memory.current`, which counts reclaimable page cache). Operator-only
+verbs `AcquireAdmission` (`{class: build|lander, pid, label?, ticket_id?}` ->
+`granted{lease_id}` or `queued{ticket_id, position, reason, message}`),
+`ReleaseAdmission` (`{lease_id}`; also cancels a queued ticket) and
+`GetResourceGovernor` (policy, gate margins, leases, queue; the same object
+rides on `GetHealthStatus` as `resource_governor`). They are absent from
+`AGENT_VERBS`/`READ_VERBS`: the client `scripts/cargo-slot` sends no session
+token, and a lease grants a slot only. A lease and a queued ticket are tied to
+the client pid + `/proc` start time and are reaped on the next governor call
+once the client is gone; a queued ticket not polled for 120 s is dropped. Policy
+settings `governor_build_slots` (4), `governor_lander_slots` (5),
+`governor_max_load` (0 = 1.25 x cores), `governor_min_free_disk_gb` (30),
+`governor_min_avail_mem_gb` (16), `governor_max_workers_slice_gb` (30) are live
+daemon settings with Settings > Orchestration rows. If rsid is unreachable the
+script falls back to its local flock gates.
+## Harness tool policy (#792)
+
+A per-session Harness tool policy is operator-only. It has no agent verb: it is
+absent from `AGENT_VERBS`, `READ_VERBS`, native tools and the agent CLI catalog,
+and `AgentSpawnChild` (`deny_unknown_fields`) has no field for it.
+
+- **Launch parameter.** `LaunchSessionParams.tool_policy`:
+  `{enabled_tools?, denied_tools[], web_access?, budgets{max_search_calls?,
+  max_fetch_calls?, max_result_bytes?, max_web_cost_usd_micros?}}`.
+  `web_access` is `enabled | hosted_only | disabled`; `denied_tools` wins over
+  `enabled_tools`. It is validated at launch (`tool_policy_invalid`) and refused
+  for providers that do not run the Harness loop
+  (`tool_policy_unsupported_provider`; Harness, OpenRouter and Bedrock only).
+- **Persistence.** One immutable `session_tool_policies` row per session
+  (provisional migration), written at launch. Continue, retry and rotation
+  resolve it through the `continued_from` chain, so restrictions survive
+  rotation. An unreadable row launches the session fail-closed (no tools, no web).
+- **Spawned children.** A child inherits its emitter's policy unchanged, so a
+  spawn can only keep or narrow it, never widen it. A child whose provider
+  cannot enforce it is refused (`tool_policy_unsupported_provider`), and a
+  Harness -> Codex CLI route fallback is refused for a policy session.
+- **Daemon defaults.** `harness_web_access`, `harness_max_search_calls`,
+  `harness_max_fetch_calls`, `harness_max_result_bytes` and
+  `harness_max_web_cost_usd_micros` (0 = unlimited) through
+  `GetDaemonConfig`/`UpdateDaemonConfig` and the TUI Orchestration settings.
+  A session policy overrides a default it sets; unset fields inherit. Read at
+  each Harness launch.
+- **Network egress (#774).** `egress` (`deny_private` | `offline`; unset =
+  `deny_private`) on the session `tool_policy`, with the daemon default
+  `harness_egress_mode` (Orchestration settings, read at each Harness launch).
+  There is no allow-all mode and no host allow-list. The policy reaches tools as
+  `ToolContext.policy.egress`; a network-capable tool fetches only through
+  `session::harness::egress::EgressFetcher`, which refuses non-http(s) and
+  credential URLs, IP literals and every DNS answer that is loopback,
+  link-local, cloud metadata (`169.254.169.254`, `fd00:ec2::254`), private
+  (RFC 1918, CGNAT, ULA), unspecified, multicast or reserved (IPv4-mapped, NAT64
+  and 6to4 forms classify by the embedded IPv4), connects to the vetted
+  address only (no proxy, no re-resolution), re-vets every redirect hop by hand
+  (`max_redirects` 5), and caps the body (5 MiB) and time (30 s), each with a
+  visible `egress_denied` / `egress_limit_exceeded` tool error. `offline` refuses
+  every fetch and runs the `shell`/`exec_command`/completion-gate commands in an
+  empty user+network namespace (fails closed when `unshare` or unprivileged user
+  namespaces are unavailable). In `deny_private` the shell's network is left
+  alone (git and builds need it), so the shell is not covered by the private-range
+  guard; systemd `IPAddressDeny` is not enforced for user scopes. No Harness
+  network tool exists yet (#748): `EgressFetcher` has no production caller until
+  one lands. The classifier is deny-by-default (IANA special-purpose tables; IPv6
+  only inside `2000::/3`), and DNS resolution shares the fetch's total deadline.
+- **Enforcement.** The catalog build omits refused native tools and never sends
+  a refused or exhausted hosted web spec. Execution refuses again: a forced
+  call to a refused tool, or a hosted call the policy does not admit, settles as
+  a visible tool-error row `Error: tool_policy_denied: ...` with no tool run and
+  no hosted result admitted. Budget exhaustion settles as `Error:
+  tool_budget_exhausted: ...`; the session continues. Cost is an estimate
+  (hosted searches at 0.01 USD, fetches token-only).
+## Durable agent jobs (#1002)
+
+`AgentSubmitJob`, `AgentGetJob` and `AgentListJobs` are agent verbs (in
+`AGENT_VERBS`, the closed catalog and `rsi-rpc`; no native tool, none in
+`READ_VERBS`). The daemon binds the caller from the token; the job is owned by
+that session. `params` are typed per `kind` (`test`, `build`, `landing`,
+`cloud_gate`, `cloud_sweep`; `rsi_common::agent_jobs`) and become a fixed argv in
+`rsid::agent_jobs::job_command`: an agent never supplies a command line, and every
+free-text field is a validated bare token. The working directory is the caller's
+own `sandbox_root`; `landing`, `cloud_gate` and `cloud_sweep` are refused `job_kind_not_authorized`
+unless the caller is the current appointed manager or current Epic lead; the cloud
+gate and the sweep run the scripts and Terraform embedded in the daemon binary
+(written to `~/.rsi/jobs/trusted-gate`), never the caller's tree (the sweep gets
+the caller's repository only as `--repo`: git never runs there or with its
+configuration; the `origin` URL is read with `git config --file` and `rolling` is
+fetched into the daemon-owned bare mirror `~/.rsi/jobs/sweep-mirror.git` under
+sanitized git configuration, then bundled from it); `cloud_sweep {sha}` runs
+`cloud-sweep.sh cloud <sha> --repo <cwd> --mirror <jobs_dir>/sweep-mirror.git` (unit `RuntimeMaxSec` 8 h, `TimeoutStopSec` 20 min) and settles with a typed
+`result.sweep` (`verdict` GREEN|RED|INCOMPLETE from the last log line, which
+must be exactly `VERDICT <GREEN|RED|INCOMPLETE> <sha> new=<n>` (GREEN only with
+`new=0`, RED only with `n>=1`; any other token is INCOMPLETE), plus the NEW/KNOWN
+names in `~/.rsi/cloud/results/<sha>/QA.md`; GREEN also needs a readable,
+within-2-MiB report for that SHA whose verdict section's NEW count and final
+line agree, else INCOMPLETE with a `sweep_report_*` refusal) and a typed `refusal` when the spend
+guard or another gate stops it; the migration that widened the `kind` CHECK
+rebuilds `agent_jobs` (a provisional migration); each unit has
+`MemoryMax`/`CPUQuota` and a capped log (`head -c` in the wrapper: at the cap the
+log gets a marker and the recorded status is 153); only an appointed manager may pass `worktree`, and it must be a
+worktree of the caller's own repository (same `git rev-parse --git-common-dir`).
+The row lives in `agent_jobs` (provisional migration, terminal rows immutable and
+undeletable). `submit` inserts the `running` row and starts a
+`systemd-run --user --collect` unit `rsi-job-<id>` (`TimeoutStopSec` 60 s, 120 s
+for landing and 20 min for `cloud_gate` so its destroy trap finishes;
+`RuntimeMaxSec` per kind); the unit's fixed `/bin/sh` wrapper redirects output to
+`~/.rsi/jobs/<id>.log` and writes the exit status to `<id>.status` as its last
+act. A launch failure returns `job_launch_failed` and never wakes.
+
+Test/build units receive a private, disk-backed `<id>.tmp` directory beside
+the log as `TMPDIR`; launch is refused if this resolves to tmpfs/ramfs.
+Their `CARGO_TARGET_DIR` preserves an explicit daemon environment override,
+otherwise resolves the worktree/ancestor and global Cargo `build.target-dir`,
+falling back to the worktree's `target/`. Scratch is removed on launch failure
+or terminal settlement, including restart reconciliation. Landing/cloud-gate
+units retain their existing environment; session tokens are never forwarded.
+
+The daemon task
+`run_agent_jobs_loop` polls `running` rows every 5 s and on startup (the same
+poll is the restart reconcile): a status file settles the job `succeeded` or
+`failed` (`landing`/`cloud_gate` classify with the queue's `classify_run`,
+success means a published tip); an inactive unit with no status after a 60 s launch
+grace settles `lost`. `settle_agent_job` CASes `running -> terminal` and inserts
+the owner's single `scheduled_jobs` resume wake in the same transaction, so
+overlapping polls and restarts never wake twice.

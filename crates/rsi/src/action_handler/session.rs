@@ -47,10 +47,7 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
         }
 
         LcAction::QuickContinue => {
-            let session_id = match app.focused_pane().cloned() {
-                Some(Pane::SessionDetail { session_id }) => Some(session_id),
-                _ => app.selected_session_id(),
-            };
+            let session_id = app.selected_session_id_for_lifecycle_action();
             if let Some(sid) = session_id {
                 if let Some(state) = app.sessions.get(&sid)
                     && state.session.status == rsi_common::types::SessionStatus::Starting
@@ -66,17 +63,14 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::ContinueSession(query) => match query {
             Some(q) => {
-                if let Some(session_id) = app.selected_session_id() {
+                if let Some(session_id) = app.selected_session_id_for_lifecycle_action() {
                     app.continue_session(session_id, &q).await;
                 } else {
                     app.notify("No session selected");
                 }
             }
             None => {
-                let session_id = match app.focused_pane().cloned() {
-                    Some(Pane::SessionDetail { session_id }) => Some(session_id),
-                    _ => app.selected_session_id(),
-                };
+                let session_id = app.selected_session_id_for_lifecycle_action();
                 if let Some(sid) = session_id {
                     if let Some(state) = app.sessions.get(&sid) {
                         if state.session.status == rsi_common::types::SessionStatus::Starting {
@@ -1905,6 +1899,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

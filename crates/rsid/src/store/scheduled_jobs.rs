@@ -36,6 +36,45 @@ fn record_agent_child_watch_transition(
     Ok(())
 }
 
+/// Deterministic program-guard job ids whose owner session is neither
+/// Archived nor Deleted. One sessions scan per retention batch; never per row.
+fn live_program_guard_job_ids(conn: &Connection) -> Result<std::collections::HashSet<Uuid>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM sessions WHERE status NOT IN ('Archived','Deleted')")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut guards = std::collections::HashSet::with_capacity(ids.len());
+    for raw in ids {
+        let session_id = Uuid::parse_str(&raw).map_err(|error| {
+            DaemonError::Store(format!(
+                "invalid session UUID while resolving program guards: {error}"
+            ))
+        })?;
+        guards.insert(
+            crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(
+                session_id,
+            ),
+        );
+    }
+    Ok(guards)
+}
+
+/// `max(last_fired_at, updated_at)`, accepting either 'Z' or '+00:00'
+/// RFC3339 offsets. `None` when a present stamp cannot be parsed.
+fn retention_last_activity(last_fired_at: Option<&str>, updated_at: &str) -> Option<DateTime<Utc>> {
+    let parse = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|parsed| parsed.with_timezone(&Utc))
+    };
+    let updated = parse(updated_at)?;
+    match last_fired_at {
+        None => Some(updated),
+        Some(fired) => parse(fired).map(|fired| fired.max(updated)),
+    }
+}
+
 /// Mutable-field update payload for `update_scheduled_job()`.
 pub struct ScheduledJobUpdate {
     pub name: Option<String>,
@@ -43,6 +82,38 @@ pub struct ScheduledJobUpdate {
     pub schedule: Option<ScheduleSpec>,
     pub enabled: Option<bool>,
     pub next_fire_at: Option<DateTime<Utc>>,
+}
+
+/// Grace period after a job is disabled or last fired before retention may
+/// delete it (operator rule, Issue #954).
+pub(crate) const RETENTION_GRACE_MINUTES: i64 = 15;
+
+/// Report from one retention batch, or the sum of a run's batches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionSweepReport {
+    /// Disabled rows that passed the SQL reference filters and were examined.
+    pub scanned: usize,
+    /// Examined rows disabled or fired within the grace period.
+    pub kept_too_recent: usize,
+    /// Examined rows whose timestamps could not be parsed (kept, fail closed).
+    pub kept_unreadable: usize,
+    /// Program guards whose owner session is not Archived/Deleted.
+    pub kept_program_guards: usize,
+    /// Deleted scheduled jobs, including superseded manager watches.
+    pub deleted: usize,
+    /// Of `deleted`, superseded manager watches pruned with their watch row.
+    pub deleted_manager_watches: usize,
+}
+
+impl RetentionSweepReport {
+    pub const fn absorb(&mut self, other: &Self) {
+        self.scanned += other.scanned;
+        self.kept_too_recent += other.kept_too_recent;
+        self.kept_unreadable += other.kept_unreadable;
+        self.kept_program_guards += other.kept_program_guards;
+        self.deleted += other.deleted;
+        self.deleted_manager_watches += other.deleted_manager_watches;
+    }
 }
 
 impl Store {
@@ -111,6 +182,282 @@ impl Store {
         Ok(())
     }
 
+    /// Insert an agent-owned job after disabling the owner's other enabled jobs
+    /// of the same name, as ONE immediate transaction. Only rows whose
+    /// `wake_session_id` is `owner` are touched; daemon-owned program guards and
+    /// manager watches are never replaced. Rows are disabled, not deleted.
+    /// Returns the ids that were disabled.
+    pub(crate) fn insert_scheduled_job_replacing_name(
+        &self,
+        owner: Uuid,
+        job: &ScheduledJob,
+    ) -> Result<Vec<Uuid>> {
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let candidates = self.owned_wake_rows(&tx, owner, None, Some(&job.name), true)?;
+        let replaceable: Vec<Uuid> = candidates
+            .into_iter()
+            .filter(|row| !row.protected)
+            .map(|row| row.id)
+            .collect();
+        disable_scheduled_jobs_conn(&tx, &replaceable)?;
+        insert_scheduled_job_conn(&tx, job)?;
+        tx.commit()?;
+        Ok(replaceable)
+    }
+
+    /// Disable the caller's own scheduled job(s) selected by exactly one of
+    /// `job_id` or `name`. Ownership is `wake_session_id == owner`; another
+    /// session's job is reported as not found. Daemon-owned program guards and
+    /// manager watches are refused. Already-disabled owned rows are a no-op
+    /// success. Returns the ids that were newly disabled.
+    pub(crate) fn cancel_owned_scheduled_jobs(
+        &self,
+        owner: Uuid,
+        job_id: Option<Uuid>,
+        name: Option<&str>,
+    ) -> Result<Vec<Uuid>> {
+        self.cancel_owned_scheduled_jobs_inner(owner, job_id, name, false)
+    }
+
+    /// Daemon-side withdrawal of the session's internal background-process
+    /// wake. Unlike [`Self::cancel_owned_scheduled_jobs`] (the agent-facing
+    /// path) this may disable the reserved `background-process-*` row.
+    pub(crate) fn cancel_internal_process_wake(&self, owner: Uuid) -> Result<Vec<Uuid>> {
+        let name = format!("{BACKGROUND_PROCESS_WAKE_PREFIX}{owner}");
+        self.cancel_owned_scheduled_jobs_inner(owner, None, Some(&name), true)
+    }
+
+    fn cancel_owned_scheduled_jobs_inner(
+        &self,
+        owner: Uuid,
+        job_id: Option<Uuid>,
+        name: Option<&str>,
+        allow_internal: bool,
+    ) -> Result<Vec<Uuid>> {
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let rows = self.owned_wake_rows(&tx, owner, job_id, name, false)?;
+        if rows.is_empty() {
+            return Err(DaemonError::InvalidParam(
+                "wake_not_found: no scheduled job of this session matches the selector".into(),
+            ));
+        }
+        let (protected, cancellable): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.protected || (row.internal && !allow_internal));
+        if cancellable.is_empty() && !protected.is_empty() {
+            return Err(DaemonError::InvalidParam(
+                "wake_protected: daemon-owned program guards, manager watches and background-process wakes cannot be cancelled"
+                    .into(),
+            ));
+        }
+        let to_disable: Vec<Uuid> = cancellable
+            .into_iter()
+            .filter(|row| row.enabled)
+            .map(|row| row.id)
+            .collect();
+        disable_scheduled_jobs_conn(&tx, &to_disable)?;
+        tx.commit()?;
+        Ok(to_disable)
+    }
+
+    /// Bounded read of the scheduled jobs owned by `owner`
+    /// (`wake_session_id == owner`), soonest fire first. Disabled history is
+    /// included only when asked for. Returns `(job, protected)` where
+    /// `protected` marks daemon-owned program guards and manager watches.
+    pub(crate) fn list_owned_scheduled_jobs(
+        &self,
+        owner: Uuid,
+        include_disabled: bool,
+        limit: usize,
+    ) -> Result<Vec<(ScheduledJob, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, message, schedule_json, last_fired_at, next_fire_at,
+                    enabled, working_dir, provider, model, project_id, created_at, updated_at,
+                    wake_mode, wake_session_id
+             FROM scheduled_jobs
+             WHERE wake_session_id = ?1 AND (?2 = 1 OR enabled = 1)
+             ORDER BY enabled DESC, next_fire_at ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let jobs: Vec<ScheduledJob> = stmt
+            .query_map(
+                params![owner.to_string(), include_disabled as i32, limit as i64],
+                |row| Ok(map_scheduled_job_row(row)),
+            )?
+            .filter_map(|r| keep_readable_row("list_owned_scheduled_jobs", r))
+            .collect();
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let protected = is_background_process_wake_name(&job.name)
+                || self.program_guard_owner_for_job_id(&job.id)?.is_some()
+                || self.is_harness_manager_watch(job.id)?;
+            out.push((job, protected));
+        }
+        Ok(out)
+    }
+
+    /// Daemon-settings key recording the resume wakes a `pause_lead` suspended
+    /// for `lead`, so `resume_lead` restores exactly those.
+    pub(crate) fn suspended_lead_wakes_key(lead: Uuid) -> String {
+        format!("manager_suspended_wakes:{lead}")
+    }
+
+    fn read_suspended_lead_wakes(&self, lead: Uuid) -> Result<Vec<Uuid>> {
+        let Some(raw) = self.get_daemon_setting(&Self::suspended_lead_wakes_key(lead))? else {
+            return Ok(Vec::new());
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| DaemonError::Store(format!("invalid suspended wake record: {e}")))?;
+        Ok(value["job_ids"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// #1042: disable `lead`'s own enabled `resume` wakes for a manager
+    /// `pause_lead` and record exactly which jobs were suspended (a
+    /// `daemon_settings` row, so no schema change). Runs on the caller's
+    /// connection, hence inside the caller's transaction. Program guards and
+    /// manager watches are never suspended; rows are disabled, never deleted.
+    /// Earlier still-unrestored suspensions are kept, so a repeated pause
+    /// cannot lose the record. Returns the ids newly suspended.
+    pub(crate) fn suspend_lead_resume_wakes(
+        &self,
+        lead: Uuid,
+        action_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let mut candidates = Vec::new();
+        for row in self.owned_wake_rows_by_mode(lead, "resume")? {
+            if !row.protected {
+                candidates.push(row.id);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        disable_scheduled_jobs_conn(&self.conn, &candidates)?;
+        let mut all = self.read_suspended_lead_wakes(lead)?;
+        for id in &candidates {
+            if !all.contains(id) {
+                all.push(*id);
+            }
+        }
+        let record = serde_json::json!({
+            "action_id": action_id,
+            "job_ids": all,
+        });
+        self.set_daemon_setting(&Self::suspended_lead_wakes_key(lead), &record.to_string())?;
+        Ok(candidates)
+    }
+
+    /// #1042: re-enable exactly the jobs a `pause_lead` suspended for `lead`
+    /// (still disabled resume jobs of that lead), then clear the record.
+    /// Jobs that were meanwhile replaced or re-enabled are left as they are.
+    /// Returns the ids restored.
+    pub(crate) fn restore_lead_suspended_wakes(&self, lead: Uuid) -> Result<Vec<Uuid>> {
+        let recorded = self.read_suspended_lead_wakes(lead)?;
+        if recorded.is_empty() {
+            return Ok(recorded);
+        }
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut restored = Vec::new();
+        for id in recorded {
+            let changed = self.conn.execute(
+                "UPDATE scheduled_jobs SET enabled = 1, updated_at = ?2
+                 WHERE id = ?1 AND enabled = 0 AND wake_mode = 'resume' AND wake_session_id = ?3",
+                params![id.to_string(), now, lead.to_string()],
+            )?;
+            if changed == 1 {
+                restored.push(id);
+            }
+        }
+        self.set_daemon_setting(
+            &Self::suspended_lead_wakes_key(lead),
+            &serde_json::json!({ "job_ids": Vec::<Uuid>::new() }).to_string(),
+        )?;
+        Ok(restored)
+    }
+
+    /// Enabled jobs of `owner` with the given stored `wake_mode`.
+    fn owned_wake_rows_by_mode(&self, owner: Uuid, mode: &str) -> Result<Vec<OwnedWakeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM scheduled_jobs
+             WHERE wake_session_id = ?1 AND wake_mode = ?2 AND enabled = 1",
+        )?;
+        let ids = stmt
+            .query_map(params![owner.to_string(), mode], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = Uuid::parse_str(&id)
+                .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))?;
+            let protected = self.program_guard_owner_for_job_id(&id)?.is_some()
+                || self.is_harness_manager_watch(id)?;
+            rows.push(OwnedWakeRow {
+                id,
+                enabled: true,
+                protected,
+                internal: false,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn owned_wake_rows(
+        &self,
+        tx: &Connection,
+        owner: Uuid,
+        job_id: Option<Uuid>,
+        name: Option<&str>,
+        enabled_only: bool,
+    ) -> Result<Vec<OwnedWakeRow>> {
+        let mut stmt = tx.prepare(
+            "SELECT id, enabled, name FROM scheduled_jobs
+             WHERE wake_session_id = ?1
+               AND (?2 IS NULL OR id = ?2)
+               AND (?3 IS NULL OR name = ?3)
+               AND (?4 = 0 OR enabled = 1)
+               AND (?2 IS NOT NULL OR ?3 IS NOT NULL)",
+        )?;
+        let raw = stmt
+            .query_map(
+                params![
+                    owner.to_string(),
+                    job_id.map(|id| id.to_string()),
+                    name,
+                    enabled_only as i32
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = Vec::with_capacity(raw.len());
+        for (id, enabled, job_name) in raw {
+            let id = Uuid::parse_str(&id)
+                .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))?;
+            let protected = self.program_guard_owner_for_job_id(&id)?.is_some()
+                || self.is_harness_manager_watch(id)?;
+            rows.push(OwnedWakeRow {
+                id,
+                enabled,
+                protected,
+                internal: is_background_process_wake_name(&job_name),
+            });
+        }
+        Ok(rows)
+    }
+
     pub fn list_scheduled_jobs(&self) -> Result<Vec<ScheduledJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, message, schedule_json, last_fired_at, next_fire_at,
@@ -123,6 +470,73 @@ impl Store {
             .filter_map(|r| keep_readable_row("list_scheduled_jobs", r))
             .collect();
         Ok(jobs)
+    }
+
+    /// One page of scheduled jobs for the operator RPC (Issue #954 B), newest
+    /// created first. Ordering is the immutable key `(created_at, id)`, so a
+    /// cursor built from the last row stays valid however rows are added,
+    /// fired, disabled or deleted between pages. The default filter keeps
+    /// enabled rows plus rows fired or updated (disabled) within
+    /// [`RETENTION_GRACE_MINUTES`] of `now`, and rows whose `updated_at` cannot
+    /// be parsed (fail open, matching retention's fail-closed keep);
+    /// `include_history` returns everything. Returns the page and, when more
+    /// rows follow, the cursor for the next page.
+    pub fn list_scheduled_jobs_page(
+        &self,
+        now: DateTime<Utc>,
+        include_history: bool,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<ScheduledJob>, Option<String>)> {
+        let limit = limit.max(1);
+        let after = cursor.map(parse_scheduled_jobs_cursor).transpose()?;
+        let cutoff = (now - chrono::Duration::minutes(RETENTION_GRACE_MINUTES))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, message, schedule_json, last_fired_at, next_fire_at,
+                    enabled, working_dir, provider, model, project_id, created_at, updated_at,
+                    wake_mode, wake_session_id
+             FROM scheduled_jobs
+             WHERE (?1 = 1
+                    OR enabled = 1
+                    OR julianday(updated_at) IS NULL
+                    OR julianday(updated_at) >= julianday(?2)
+                    OR julianday(last_fired_at) >= julianday(?2))
+               AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id < ?4))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?5",
+        )?;
+        let (after_created, after_id) = match &after {
+            Some((created, id)) => (Some(created.as_str()), Some(id.as_str())),
+            None => (None, None),
+        };
+        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let raw = stmt
+            .query_map(
+                params![
+                    include_history as i64,
+                    cutoff,
+                    after_created,
+                    after_id,
+                    fetch
+                ],
+                |row| {
+                    let created_at: String = row.get(11)?;
+                    let id: String = row.get(0)?;
+                    Ok((created_at, id, map_scheduled_job_row(row)))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = raw.len() > limit;
+        let mut next_cursor = None;
+        let mut jobs = Vec::with_capacity(raw.len().min(limit));
+        for (created_at, id, mapped) in raw.into_iter().take(limit) {
+            next_cursor = Some(format!("{id}@{created_at}"));
+            if let Some(job) = keep_readable_row("list_scheduled_jobs_page", Ok(mapped)) {
+                jobs.push(job);
+            }
+        }
+        Ok((jobs, if has_more { next_cursor } else { None }))
     }
 
     /// Scan only currently enabled terminal watches. The existing partial index
@@ -500,7 +914,7 @@ impl Store {
         {
             return Ok(ContinuationRetryOutcome::Exhausted(retry));
         }
-        let backoff_seconds = (30_i64 << (retry.attempts - 1).min(5)).min(600);
+        let backoff_seconds = continuation_backoff_seconds(retry.attempts);
         let next_fire_at = now + chrono::Duration::seconds(backoff_seconds);
         let json =
             serde_json::to_string(&retry).map_err(|error| DaemonError::Store(error.to_string()))?;
@@ -618,6 +1032,162 @@ impl Store {
         Ok(())
     }
 
+    /// One bounded retention batch (Issue #954 operator rule).
+    ///
+    /// Deletes a DISABLED job once `max(last_fired_at, updated_at)` is at least
+    /// [`RETENTION_GRACE_MINUTES`] old, except:
+    /// - program guards whose owner session is not Archived/Deleted;
+    /// - rows referenced by a RESTRICT foreign key;
+    /// - jobs referenced by a Starting/Running/WaitingApproval session;
+    /// - manager watches of the CURRENT scope version, or with an open notice.
+    ///
+    /// A manager watch job id is a `UUIDv5` over a key that embeds the scope
+    /// `row_version`, and reconcile derives ids only from the current scope, so
+    /// a superseded watch can never be re-created or re-armed; it is pruned
+    /// together with its `harness_manager_watches` row.
+    ///
+    /// Reference exclusions are applied in SQL so permanently kept rows never
+    /// occupy a page; the keyset cursor (`after`, ascending id) always advances.
+    /// Selection and deletion share one IMMEDIATE transaction per batch, and
+    /// every read error aborts the batch without deleting (fail closed).
+    /// Returns the next cursor, or `None` once the table is exhausted.
+    ///
+    /// # Errors
+    /// Returns an error, having deleted nothing, when any read or write in the
+    /// batch transaction fails.
+    pub fn retention_sweep_batch(
+        &self,
+        now: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<(RetentionSweepReport, Option<Uuid>)> {
+        let mut report = RetentionSweepReport::default();
+        let cutoff = now - chrono::Duration::minutes(RETENTION_GRACE_MINUTES);
+        let limit = limit.max(1);
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let live_guards = live_program_guard_job_ids(&tx)?;
+        let page: Vec<(String, Option<String>, String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT j.id, j.last_fired_at, j.updated_at,
+                        EXISTS(SELECT 1 FROM harness_manager_watches w WHERE w.job_id=j.id)
+                   FROM scheduled_jobs j
+                  WHERE j.enabled=0
+                    AND CASE WHEN json_valid(j.schedule_json)
+                             THEN COALESCE(json_type(j.schedule_json,'$.transient_heal')='object',0)
+                             ELSE 0 END=0
+                    AND (?1 IS NULL OR j.id > ?1)
+                    AND NOT EXISTS (SELECT 1 FROM sandbox_custody_events r
+                                     WHERE r.scheduled_job_id=j.id)
+                    AND NOT EXISTS (SELECT 1 FROM idea_program_run_actions r
+                                     WHERE r.scheduled_job_id=j.id)
+                    AND NOT EXISTS (SELECT 1 FROM master_no_idle_capacity_incidents r
+                                     WHERE r.wake_job_id=j.id OR r.program_guard_job_id=j.id)
+                    AND NOT EXISTS (SELECT 1 FROM master_no_idle_capacity_attempts r
+                                     WHERE r.delivery_wake_job_id=j.id)
+                    AND NOT EXISTS (SELECT 1 FROM sessions s
+                                     WHERE s.scheduled_job_id=j.id
+                                       AND s.status IN ('Starting','Running','WaitingApproval'))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM harness_manager_watches w
+                         WHERE w.job_id=j.id
+                           AND (w.scope_version IS (SELECT c.row_version
+                                                      FROM harness_manager_scopes c
+                                                     WHERE c.project_id=w.project_id)
+                                OR EXISTS (SELECT 1 FROM harness_manager_notices n
+                                            WHERE n.job_id=j.id
+                                              AND n.retired_at IS NULL
+                                              AND n.settled_at IS NULL)))
+                  ORDER BY j.id
+                  LIMIT ?2",
+            )?;
+            stmt.query_map(
+                params![
+                    after.map(|id| id.to_string()),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let next = if page.len() < limit {
+            None
+        } else {
+            let last = &page[page.len() - 1].0;
+            Some(Uuid::parse_str(last).map_err(|error| {
+                DaemonError::Store(format!(
+                    "invalid scheduled job id in retention page: {error}"
+                ))
+            })?)
+        };
+        report.scanned = page.len();
+
+        let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for (raw_id, last_fired_at, updated_at, is_manager_watch) in page {
+            let Ok(id) = Uuid::parse_str(&raw_id) else {
+                report.kept_unreadable += 1;
+                continue;
+            };
+            let Some(last_activity) =
+                retention_last_activity(last_fired_at.as_deref(), &updated_at)
+            else {
+                report.kept_unreadable += 1;
+                continue;
+            };
+            if last_activity > cutoff {
+                report.kept_too_recent += 1;
+                continue;
+            }
+            if live_guards.contains(&id) {
+                report.kept_program_guards += 1;
+                continue;
+            }
+            // Record the witness while any manager-watch row still exists so
+            // the transition matches `delete_scheduled_job` bookkeeping.
+            record_agent_child_watch_transition(&tx, &id, "deleted", &now_str)?;
+            if is_manager_watch {
+                tx.execute(
+                    "DELETE FROM harness_manager_watches WHERE job_id=?1",
+                    params![id.to_string()],
+                )?;
+                report.deleted_manager_watches += 1;
+            }
+            let deleted = tx.execute(
+                "DELETE FROM scheduled_jobs WHERE id=?1 AND enabled=0",
+                params![id.to_string()],
+            )?;
+            report.deleted += deleted;
+        }
+        tx.commit()?;
+        Ok((report, next))
+    }
+
+    /// Run retention batches until the table is exhausted or `max_batches`
+    /// batches ran. The daemon scheduler drives batches itself so it can
+    /// release the store lock between them; this helper serves tests and
+    /// operator tooling.
+    ///
+    /// # Errors
+    /// Returns the first failing batch's error; earlier batches stay committed.
+    pub fn retention_sweep(
+        &self,
+        now: DateTime<Utc>,
+        batch_limit: usize,
+        max_batches: usize,
+    ) -> Result<RetentionSweepReport> {
+        let mut total = RetentionSweepReport::default();
+        let mut cursor = None;
+        for _ in 0..max_batches.max(1) {
+            let (report, next) = self.retention_sweep_batch(now, cursor, batch_limit)?;
+            total.absorb(&report);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(total)
+    }
+
     pub fn toggle_scheduled_job(&self, id: &Uuid) -> Result<bool> {
         self.ensure_terminal_watch_enable_within_cap(id)?;
         let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -732,6 +1302,39 @@ pub(super) fn decode_scheduled_job_wake_authority(
         ));
     }
     Ok((wake_mode, wake_session_id))
+}
+
+/// Reserved name prefix of the daemon-internal Harness background-process
+/// idle-completion wake; agents can neither create nor cancel such a job.
+pub(crate) const BACKGROUND_PROCESS_WAKE_PREFIX: &str = "background-process-";
+
+fn is_background_process_wake_name(name: &str) -> bool {
+    name.starts_with(BACKGROUND_PROCESS_WAKE_PREFIX)
+}
+
+struct OwnedWakeRow {
+    id: Uuid,
+    enabled: bool,
+    protected: bool,
+    /// Daemon-internal Harness background-process wake (reserved name
+    /// prefix). Replaceable by the registry but never agent-cancellable.
+    internal: bool,
+}
+
+/// Flip `enabled` to 0 for each id through the same witness bookkeeping as
+/// [`Store::update_scheduled_job`]; rows are never deleted.
+fn disable_scheduled_jobs_conn(conn: &Connection, ids: &[Uuid]) -> Result<()> {
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    for id in ids {
+        let changed = conn.execute(
+            "UPDATE scheduled_jobs SET enabled = 0, updated_at = ?2 WHERE id = ?1 AND enabled = 1",
+            params![id.to_string(), now],
+        )?;
+        if changed == 1 {
+            record_agent_child_watch_transition(conn, id, "disabled", &now)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn insert_scheduled_job_conn(conn: &Connection, job: &ScheduledJob) -> Result<()> {
@@ -914,6 +1517,19 @@ pub(super) fn upsert_capacity_recovery_wake_tx(
 /// dropped row leaves a daemon-log trace instead of silently vanishing from
 /// list / due / get results. Outer `Err` is a rusqlite read error, inner `Err`
 /// is a row-mapping error from [`map_scheduled_job_row`].
+/// Splits a `ListScheduledJobs` cursor (`<id>@<created_at>`) into
+/// `(created_at, id)` as stored. The id must be a lowercase UUID so a forged
+/// cursor cannot smuggle an arbitrary comparison key.
+fn parse_scheduled_jobs_cursor(cursor: &str) -> Result<(String, String)> {
+    let invalid = || DaemonError::InvalidParam("invalid ListScheduledJobs cursor".into());
+    let (id, created_at) = cursor.split_once('@').ok_or_else(invalid)?;
+    let parsed = Uuid::parse_str(id).map_err(|_| invalid())?;
+    if parsed.to_string() != id || created_at.is_empty() {
+        return Err(invalid());
+    }
+    Ok((created_at.to_string(), id.to_string()))
+}
+
 fn keep_readable_row(
     query: &'static str,
     row: rusqlite::Result<Result<ScheduledJob>>,
@@ -982,6 +1598,153 @@ fn map_scheduled_job_row(row: &rusqlite::Row) -> Result<ScheduledJob> {
     })
 }
 
+/// Daemon-evaluated wait predicates (#1006): the predicate and its bookkeeping
+/// are the daemon-owned `$.wake_when` key of `schedule_json` (no DDL). Like
+/// `$.continuation_retry`, `ScheduleSpec` does not model the key, so an
+/// operator schedule edit drops it and a client-supplied key never
+/// deserializes into an update.
+impl Store {
+    /// Arm a predicate wake in one immediate transaction: every job id the
+    /// predicate names must exist and belong to the wake's owner
+    /// (`wake_when_job_not_found` otherwise, so a foreign id is
+    /// indistinguishable from an unknown one), the owner's enabled predicate
+    /// wakes stay under the cap, an explicit name replaces the owner's earlier
+    /// enabled unprotected job of that name, and the row is inserted with its
+    /// `$.wake_when` state. Returns the ids the name replacement disabled.
+    pub(crate) fn insert_wake_when(
+        &self,
+        job: &ScheduledJob,
+        state: &rsi_common::wake_predicate::WakeWhenState,
+        replace_name: bool,
+    ) -> Result<Vec<Uuid>> {
+        use rsi_common::wake_predicate as wp;
+        let owner = job.wake_session_id.ok_or_else(|| {
+            DaemonError::InvalidParam("mode 'when' requires a known origin session id".into())
+        })?;
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(ids) = &state.predicate.jobs_terminal {
+            for id in ids {
+                let owned: Option<String> = tx
+                    .query_row(
+                        "SELECT owner_session_id FROM agent_jobs WHERE id=?1",
+                        params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if owned.as_deref() != Some(owner.to_string().as_str()) {
+                    return Err(DaemonError::InvalidParam(
+                        wp::WAKE_WHEN_JOB_NOT_FOUND.into(),
+                    ));
+                }
+            }
+        }
+        let replaceable: Vec<Uuid> = if replace_name {
+            self.owned_wake_rows(&tx, owner, None, Some(&job.name), true)?
+                .into_iter()
+                .filter(|row| !row.protected)
+                .map(|row| row.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        disable_scheduled_jobs_conn(&tx, &replaceable)?;
+        let held: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM scheduled_jobs
+             WHERE wake_session_id=?1 AND enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when') IS NOT NULL",
+            params![owner.to_string()],
+            |row| row.get(0),
+        )?;
+        if held >= wp::WAKE_WHEN_MAX_PER_SESSION as i64 {
+            return Err(DaemonError::InvalidParam(wp::WAKE_WHEN_CAP_REACHED.into()));
+        }
+        insert_scheduled_job_conn(&tx, job)?;
+        let json =
+            serde_json::to_string(state).map_err(|error| DaemonError::Store(error.to_string()))?;
+        tx.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.wake_when',json(?2))
+             WHERE id=?1 AND json_valid(schedule_json)",
+            params![job.id.to_string(), json],
+        )?;
+        tx.commit()?;
+        Ok(replaceable)
+    }
+
+    /// The predicate state of a wake row; `None` for every ordinary row.
+    pub(crate) fn wake_when_state(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<rsi_common::wake_predicate::WakeWhenState>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(schedule_json)
+                        THEN json_extract(schedule_json,'$.wake_when') END
+                 FROM scheduled_jobs WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Test fixture: replace a row's predicate state (for example to expire
+    /// its deadline without waiting).
+    #[cfg(test)]
+    pub(crate) fn set_wake_when_state_for_test(
+        &self,
+        id: Uuid,
+        state: &rsi_common::wake_predicate::WakeWhenState,
+    ) -> Result<()> {
+        let json =
+            serde_json::to_string(state).map_err(|error| DaemonError::Store(error.to_string()))?;
+        self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.wake_when',json(?2)) WHERE id=?1",
+            params![id.to_string(), json],
+        )?;
+        Ok(())
+    }
+
+    /// Enabled predicate wakes due at `now`: the scheduler's fast lane, which
+    /// evaluates them far more often than the general due poll.
+    pub(crate) fn list_due_wake_when_jobs(&self, now: &DateTime<Utc>) -> Result<Vec<ScheduledJob>> {
+        let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, message, schedule_json, last_fired_at, next_fire_at,
+                    enabled, working_dir, provider, model, project_id, created_at, updated_at,
+                    wake_mode, wake_session_id
+             FROM scheduled_jobs
+             WHERE enabled = 1 AND next_fire_at <= ?1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when') IS NOT NULL
+             ORDER BY next_fire_at ASC",
+        )?;
+        let jobs = stmt
+            .query_map(params![now_str], |row| Ok(map_scheduled_job_row(row)))?
+            .filter_map(|r| keep_readable_row("list_due_wake_when_jobs", r))
+            .collect();
+        Ok(jobs)
+    }
+
+    /// A pending predicate stays armed: move only `next_fire_at`, and only of
+    /// a still-enabled row, leaving `last_fired_at` and `updated_at` alone.
+    pub(crate) fn defer_wake_when(&self, id: Uuid, next_fire_at: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET next_fire_at=?2 WHERE id=?1 AND enabled=1",
+            params![
+                id.to_string(),
+                next_fire_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -990,7 +1753,7 @@ mod tests {
     use rsi_common::program_runs::{
         ProgramRunActionKindV1, ProgramRunActionPurposeV1, ProgramRunActionStateV1,
     };
-    use rsi_common::types::{Recurrence, ScheduleSpec, WakeMode};
+    use rsi_common::types::{Recurrence, ScheduleSpec, SessionStatus, WakeMode};
 
     fn mk_job(wake_mode: WakeMode, wake_session_id: Option<Uuid>) -> ScheduledJob {
         let now = Utc::now();
@@ -1199,10 +1962,665 @@ mod tests {
             .expect("due");
         assert!(due.iter().any(|j| j.id == job.id));
     }
+    // --- Issue #954 retention sweep: positive end-state assertions ---
+
+    fn retention_job(
+        id: Uuid,
+        enabled: bool,
+        age: chrono::Duration,
+        wake_session_id: Option<Uuid>,
+    ) -> ScheduledJob {
+        let at = Utc::now() - age;
+        ScheduledJob {
+            id,
+            name: format!("retention-{id}"),
+            message: String::new(),
+            schedule: ScheduleSpec {
+                recurrence: Recurrence::Once,
+                anchor: at,
+            },
+            last_fired_at: Some(at),
+            next_fire_at: at,
+            enabled,
+            working_dir: Some(std::path::PathBuf::from("/var/tmp/retention")),
+            provider: None,
+            model: None,
+            project_id: None,
+            created_at: at,
+            updated_at: at,
+            wake_mode: WakeMode::Resume,
+            wake_session_id,
+        }
+    }
+
+    fn old() -> chrono::Duration {
+        chrono::Duration::minutes(super::RETENTION_GRACE_MINUTES + 15)
+    }
+
+    fn job_exists(store: &Store, id: Uuid) -> bool {
+        store.scheduled_job_exists(&id).expect("exists")
+    }
+
+    fn enable_foreign_keys(store: &Store) {
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("foreign keys on");
+        let on: i64 = store
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("pragma");
+        assert_eq!(on, 1, "sweep must run with RESTRICT enforced");
+    }
+
+    /// Insert a minimal row into `table` whose `column` references `job_id`.
+    fn insert_reference(store: &Store, table: &str, column: &str, job_id: Uuid) {
+        insert_row(store, table, &[(column, job_id.to_string().into())]);
+    }
+
+    /// Insert a minimal row into `table` with the given column values; every
+    /// other NOT NULL column without a default gets a unique dummy value.
+    /// Test fixture only: CHECK, FK and validation-trigger enforcement are off
+    /// while the row is written, then foreign keys are re-enabled.
+    fn insert_row(store: &Store, table: &str, fixed: &[(&str, rusqlite::types::Value)]) {
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+            .expect("fixture pragmas");
+        let columns: Vec<(String, String, bool, bool)> = store
+            .conn
+            .prepare(&format!("SELECT name,type,\"notnull\",dflt_value IS NOT NULL FROM pragma_table_info('{table}')"))
+            .expect("table info")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .expect("columns")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        let mut names = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        for (name, kind, not_null, has_default) in columns {
+            if let Some((_, value)) = fixed.iter().find(|(column, _)| *column == name) {
+                names.push(name);
+                values.push(value.clone());
+            } else if not_null && !has_default {
+                values.push(if kind.to_ascii_uppercase().contains("INT") {
+                    rusqlite::types::Value::Integer(1)
+                } else {
+                    Uuid::new_v4().to_string().into()
+                });
+                names.push(name);
+            }
+        }
+        // Validation triggers (e.g. V79 ProgramRun identity) are fixture noise
+        // here: lift them for this one insert and restore their exact SQL.
+        let triggers: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?1")
+            .expect("triggers")
+            .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("trigger rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect triggers");
+        for (name, _) in &triggers {
+            store
+                .conn
+                .execute_batch(&format!("DROP TRIGGER \"{name}\";"))
+                .expect("lift trigger");
+        }
+        let placeholders = (1..=names.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        store
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO {table}({}) VALUES({placeholders})",
+                    names.join(",")
+                ),
+                rusqlite::params_from_iter(values),
+            )
+            .expect("insert reference");
+        for (_, sql) in &triggers {
+            store.conn.execute_batch(sql).expect("restore trigger");
+        }
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .expect("checks back on");
+        enable_foreign_keys(store);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_deletes_old_disabled_with_projection_and_keeps_enabled_and_recent() {
+        let store = Store::open_in_memory().expect("store");
+        enable_foreign_keys(&store);
+        let (eligible, enabled, recent) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store
+            .insert_scheduled_job(&retention_job(eligible, false, old(), None))
+            .unwrap();
+        store
+            .insert_scheduled_job(&retention_job(enabled, true, old(), None))
+            .unwrap();
+        store
+            .insert_scheduled_job(&retention_job(
+                recent,
+                false,
+                chrono::Duration::minutes(5),
+                None,
+            ))
+            .unwrap();
+        let projections = |id: Uuid| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM scheduled_job_path_projections WHERE job_id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(projections(eligible), 1);
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.kept_too_recent, 1);
+        assert!(!job_exists(&store, eligible));
+        assert_eq!(projections(eligible), 0, "projection cascades with the job");
+        assert!(job_exists(&store, enabled), "enabled job kept");
+        assert!(
+            job_exists(&store, recent),
+            "job inside the grace period kept"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_ages_offset_timestamps_and_keeps_unreadable_rows() {
+        let store = Store::open_in_memory().expect("store");
+        let (offset_old, offset_recent) = (Uuid::new_v4(), Uuid::new_v4());
+        store
+            .insert_scheduled_job(&retention_job(offset_old, false, old(), None))
+            .unwrap();
+        store
+            .insert_scheduled_job(&retention_job(
+                offset_recent,
+                false,
+                chrono::Duration::minutes(1),
+                None,
+            ))
+            .unwrap();
+        for id in [offset_old, offset_recent] {
+            // Rewrite both stamps in '+00:00' form, as older writers produced.
+            store
+                .conn
+                .execute(
+                    "UPDATE scheduled_jobs
+                        SET updated_at=replace(updated_at,'Z','+00:00'),
+                            last_fired_at=replace(last_fired_at,'Z','+00:00')
+                      WHERE id=?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+        }
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        assert_eq!(report.deleted, 1);
+        assert!(!job_exists(&store, offset_old));
+        assert!(job_exists(&store, offset_recent));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_keeps_live_owner_program_guard_and_deletes_archived_owner_guard() {
+        let store = Store::open_in_memory().expect("store");
+        let live_owner = Uuid::new_v4();
+        let archived_owner = Uuid::new_v4();
+        for (owner, status) in [
+            (live_owner, SessionStatus::Completed),
+            (archived_owner, SessionStatus::Archived),
+        ] {
+            let mut session = crate::session::agent_verbs::tests::test_session(
+                owner,
+                std::path::PathBuf::from("/var/tmp/retention"),
+            );
+            session.status = status;
+            store.insert_session(&session).expect("session");
+        }
+        let guard = |owner| {
+            crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(owner)
+        };
+        for owner in [live_owner, archived_owner] {
+            store
+                .insert_scheduled_job(&retention_job(guard(owner), false, old(), Some(owner)))
+                .unwrap();
+        }
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        assert_eq!(report.kept_program_guards, 1);
+        assert_eq!(report.deleted, 1);
+        assert!(
+            job_exists(&store, guard(live_owner)),
+            "closed guard of a resumable owner stays"
+        );
+        assert!(!job_exists(&store, guard(archived_owner)));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_keeps_restrict_referenced_and_active_session_jobs() {
+        let store = Store::open_in_memory().expect("store");
+        let restrict_references = [
+            ("sandbox_custody_events", "scheduled_job_id"),
+            ("idea_program_run_actions", "scheduled_job_id"),
+            ("master_no_idle_capacity_incidents", "wake_job_id"),
+            ("master_no_idle_capacity_incidents", "program_guard_job_id"),
+            ("master_no_idle_capacity_attempts", "delivery_wake_job_id"),
+        ];
+        let mut referenced_jobs = Vec::new();
+        for (table, column) in restrict_references {
+            let id = Uuid::new_v4();
+            store
+                .insert_scheduled_job(&retention_job(id, false, old(), None))
+                .unwrap();
+            insert_reference(&store, table, column, id);
+            referenced_jobs.push(id);
+        }
+        let active_job = Uuid::new_v4();
+        let finished_job = Uuid::new_v4();
+        for (job, status) in [
+            (active_job, SessionStatus::Running),
+            (finished_job, SessionStatus::Completed),
+        ] {
+            store
+                .insert_scheduled_job(&retention_job(job, false, old(), None))
+                .unwrap();
+            let session_id = Uuid::new_v4();
+            let mut session = crate::session::agent_verbs::tests::test_session(
+                session_id,
+                std::path::PathBuf::from("/var/tmp/retention"),
+            );
+            session.status = status;
+            store.insert_session(&session).expect("session");
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET scheduled_job_id=?1 WHERE id=?2",
+                    [job.to_string(), session_id.to_string()],
+                )
+                .unwrap();
+        }
+        let plain = Uuid::new_v4();
+        store
+            .insert_scheduled_job(&retention_job(plain, false, old(), None))
+            .unwrap();
+        enable_foreign_keys(&store);
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        for id in &referenced_jobs {
+            assert!(job_exists(&store, *id), "RESTRICT-referenced job kept");
+        }
+        assert!(
+            job_exists(&store, active_job),
+            "active session reference kept"
+        );
+        assert!(!job_exists(&store, finished_job));
+        assert!(!job_exists(&store, plain));
+        assert_eq!(report.deleted, 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_pages_past_permanently_kept_rows() {
+        let store = Store::open_in_memory().expect("store");
+        enable_foreign_keys(&store);
+        let now = Utc::now();
+        // 300 kept rows whose ids sort before every eligible row.
+        let mut kept = Vec::new();
+        for index in 0..300u128 {
+            let id = Uuid::from_u128(index + 1);
+            store
+                .insert_scheduled_job(&retention_job(id, false, old(), None))
+                .unwrap();
+            insert_reference(&store, "sandbox_custody_events", "scheduled_job_id", id);
+            kept.push(id);
+        }
+        // 300 closed guards of resumable owners, also sorting first.
+        for index in 0..300u128 {
+            let owner = Uuid::from_u128(10_000 + index);
+            let session = crate::session::agent_verbs::tests::test_session(
+                owner,
+                std::path::PathBuf::from("/var/tmp/retention"),
+            );
+            store.insert_session(&session).expect("session");
+            let guard =
+                crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(
+                    owner,
+                );
+            store
+                .insert_scheduled_job(&retention_job(guard, false, old(), Some(owner)))
+                .unwrap();
+            kept.push(guard);
+        }
+        let eligible: Vec<Uuid> = (0..5u128)
+            .map(|index| Uuid::from_u128(u128::MAX - index))
+            .collect();
+        for id in &eligible {
+            store
+                .insert_scheduled_job(&retention_job(*id, false, old(), None))
+                .unwrap();
+        }
+
+        // Drive batches exactly as the scheduler does.
+        let mut cursor = None;
+        let mut total = RetentionSweepReport::default();
+        for _ in 0..50 {
+            let (report, next) = store
+                .retention_sweep_batch(now, cursor, 200)
+                .expect("batch");
+            total.absorb(&report);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(total.deleted, 5, "every eligible row is reached");
+        for id in &eligible {
+            assert!(!job_exists(&store, *id));
+        }
+        assert!(kept.iter().all(|id| job_exists(&store, *id)));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_batch_rolls_back_when_an_exclusion_read_fails() {
+        let store = Store::open_in_memory().expect("store");
+        let id = Uuid::new_v4();
+        store
+            .insert_scheduled_job(&retention_job(id, false, old(), None))
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 ALTER TABLE harness_manager_notices RENAME TO harness_manager_notices_hidden;",
+            )
+            .unwrap();
+
+        let result = store.retention_sweep_batch(Utc::now(), None, 200);
+
+        assert!(result.is_err(), "missing exclusion source fails closed");
+        assert!(job_exists(&store, id), "nothing deleted on a failed read");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_prunes_only_superseded_manager_watches_without_open_notices() {
+        use rusqlite::types::Value;
+        let store = Store::open_in_memory().expect("store");
+        let project = Uuid::new_v4().to_string();
+        insert_row(
+            &store,
+            "harness_manager_scopes",
+            &[
+                ("project_id", Value::from(project.clone())),
+                ("row_version", Value::Integer(7)),
+            ],
+        );
+        let (superseded, noticed, current, orphan) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (job, watch_project, scope_version) in [
+            (superseded, project.clone(), 6),
+            (noticed, project.clone(), 6),
+            (current, project, 7),
+            // A project whose manager scope is gone is superseded too.
+            (orphan, Uuid::new_v4().to_string(), 3),
+        ] {
+            store
+                .insert_scheduled_job(&retention_job(job, false, old(), None))
+                .unwrap();
+            insert_row(
+                &store,
+                "harness_manager_watches",
+                &[
+                    ("job_id", Value::from(job.to_string())),
+                    ("project_id", Value::from(watch_project)),
+                    ("scope_version", Value::Integer(scope_version)),
+                ],
+            );
+        }
+        // An open (unretired, unsettled) notice still needs its transport.
+        insert_reference(&store, "harness_manager_notices", "job_id", noticed);
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        assert_eq!(report.deleted_manager_watches, 2);
+        for pruned in [superseded, orphan] {
+            assert!(!job_exists(&store, pruned));
+            assert!(!store.is_harness_manager_watch(pruned).unwrap());
+        }
+        for kept in [noticed, current] {
+            assert!(job_exists(&store, kept));
+            assert!(store.is_harness_manager_watch(kept).unwrap());
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn retention_pruned_superseded_watches_are_not_recreated_or_renotified_by_reconcile() {
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+
+        let store = Store::open_in_memory().expect("store");
+        let (config, lead) = fixture(
+            &store,
+            rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
+        );
+        store
+            .reconcile_harness_manager_watches()
+            .expect("reconcile");
+        let watch_jobs = |version: i64| -> Vec<Uuid> {
+            store
+                .conn
+                .prepare(
+                    "SELECT job_id FROM harness_manager_watches
+                      WHERE project_id=?1 AND scope_version=?2 ORDER BY job_id",
+                )
+                .unwrap()
+                .query_map(
+                    rusqlite::params![config.project_id.to_string(), version],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .map(|id| Uuid::parse_str(&id.unwrap()).unwrap())
+                .collect()
+        };
+        let superseded = watch_jobs(config.row_version);
+        assert!(
+            !superseded.is_empty(),
+            "the completed lead produced a scope-{} watch",
+            config.row_version
+        );
+
+        // Widen the scope by one Epic so the scope version really advances.
+        let epic = lead.parent_id.expect("lead epic");
+        let mut second_epic = store.get_session(epic).unwrap().expect("epic row");
+        second_epic.id = Uuid::new_v4();
+        store.insert_session(&second_epic).expect("second epic");
+        let current = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: config.project_id,
+                session_id: config.manager_session_id,
+                epic_ids: Some(vec![epic, second_epic.id]),
+                expected_row_version: config.row_version,
+            })
+            .expect("scope bump");
+        assert!(current.row_version > config.row_version);
+        store
+            .reconcile_harness_manager_watches()
+            .expect("reconcile");
+        let current_jobs = watch_jobs(current.row_version);
+
+        // Settle history forward: retire any notice still open on the old
+        // scope, then age and disable every watch job.
+        let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for id in &superseded {
+            store
+                .conn
+                .execute(
+                    "UPDATE harness_manager_notices SET retired_at=?2
+                      WHERE job_id=?1 AND retired_at IS NULL AND settled_at IS NULL",
+                    [id.to_string(), stamp.clone()],
+                )
+                .unwrap();
+        }
+        let aged = (Utc::now() - old()).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for id in superseded.iter().chain(current_jobs.iter()) {
+            store
+                .conn
+                .execute(
+                    "UPDATE scheduled_jobs SET enabled=0,updated_at=?2,last_fired_at=?2 WHERE id=?1",
+                    [id.to_string(), aged.clone()],
+                )
+                .unwrap();
+        }
+        let notices = |id: Uuid| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM harness_manager_notices WHERE job_id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let notices_before: Vec<i64> = superseded.iter().map(|id| notices(*id)).collect();
+        enable_foreign_keys(&store);
+
+        let report = store.retention_sweep(Utc::now(), 200, 50).expect("sweep");
+
+        assert_eq!(report.deleted_manager_watches, superseded.len());
+        for id in &current_jobs {
+            assert!(job_exists(&store, *id), "current-scope watch kept");
+        }
+
+        // Reconcile derives ids from the current scope only: nothing pruned
+        // comes back and no new notice is recorded against a pruned id.
+        store
+            .reconcile_harness_manager_watches()
+            .expect("reconcile");
+        store
+            .reconcile_harness_manager_watches()
+            .expect("reconcile");
+        for (index, id) in superseded.iter().enumerate() {
+            assert!(!job_exists(&store, *id), "pruned watch job stays pruned");
+            assert!(!store.is_harness_manager_watch(*id).unwrap());
+            assert_eq!(notices(*id), notices_before[index]);
+        }
+        assert_eq!(watch_jobs(current.row_version), current_jobs);
+    }
+
+    /// With >= 5000 disabled rows present, the filtered read returns only
+    /// enabled rows — no disabled rows leak into the hot path.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn filtered_read_excludes_disabled_at_scale() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let now = Utc::now();
+        let past = now - chrono::Duration::minutes(30);
+        // Insert 5000 disabled rows + 1 enabled row
+        for i in 0..5000 {
+            let id = Uuid::new_v4();
+            let job = ScheduledJob {
+                id,
+                name: format!("old-{i}"),
+                message: String::new(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: past,
+                },
+                last_fired_at: Some(past),
+                next_fire_at: past,
+                enabled: false,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: past,
+                updated_at: past,
+                wake_mode: WakeMode::Fresh,
+                wake_session_id: None,
+            };
+            store.insert_scheduled_job(&job).expect("insert");
+        }
+        let enabled_id = Uuid::new_v4();
+        let watched_session = Uuid::new_v4();
+        let master = Uuid::new_v4();
+        let enabled_job = ScheduledJob {
+            id: enabled_id,
+            name: "enabled-on-terminal".into(),
+            message: String::new(),
+            schedule: ScheduleSpec {
+                recurrence: Recurrence::EverySeconds(60),
+                anchor: now,
+            },
+            last_fired_at: None,
+            next_fire_at: now,
+            enabled: true,
+            working_dir: None,
+            provider: None,
+            model: None,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+            wake_mode: WakeMode::OnTerminal(watched_session),
+            wake_session_id: Some(master),
+        };
+        store
+            .insert_scheduled_job(&enabled_job)
+            .expect("insert enabled");
+        let total: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM scheduled_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 5001, "5000 disabled + 1 enabled");
+        // list_enabled_terminal_watches returns only the enabled on_terminal row
+        let enabled_watches = store.list_enabled_terminal_watches().expect("list");
+        assert_eq!(
+            enabled_watches.len(),
+            1,
+            "only the enabled on_terminal row returned"
+        );
+        assert_eq!(enabled_watches[0].id, enabled_id);
+        // Verify all returned rows are enabled and on_terminal
+        for w in &enabled_watches {
+            assert!(w.enabled, "all returned rows are enabled");
+            assert!(
+                matches!(w.wake_mode, WakeMode::OnTerminal(_)),
+                "all returned rows are on_terminal"
+            );
+        }
+    }
 }
 
 /// K2 retry bound: the 8th consecutive retryable refusal exhausts the wake.
 pub(crate) const CONTINUATION_RETRY_MAX_ATTEMPTS: u32 = 7;
+
+/// Backoff before attempt `attempts` (1-based): 30s doubling, capped at 10
+/// minutes. Shared with the transient-failure heal (#1015).
+pub(crate) fn continuation_backoff_seconds(attempts: u32) -> i64 {
+    (30_i64 << attempts.saturating_sub(1).min(5)).min(600)
+}
 
 /// Daemon-owned retry state of a fenced continuation (`$.continuation_retry`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1220,4 +2638,229 @@ pub enum ContinuationRetryOutcome {
         next_fire_at: DateTime<Utc>,
     },
     Exhausted(ContinuationRetryV1),
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cancel_wake_tests {
+    use super::*;
+    use rsi_common::types::{ScheduleSpec, SessionStatus};
+
+    fn owned_job(name: &str, mode: WakeMode, owner: Option<Uuid>) -> ScheduledJob {
+        let now = Utc::now();
+        ScheduledJob {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            message: "continue".to_string(),
+            schedule: ScheduleSpec {
+                recurrence: Recurrence::Once,
+                anchor: now,
+            },
+            last_fired_at: None,
+            next_fire_at: now,
+            enabled: true,
+            working_dir: None,
+            provider: None,
+            model: None,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+            wake_mode: mode,
+            wake_session_id: owner,
+        }
+    }
+
+    fn enabled(store: &Store, id: Uuid) -> bool {
+        store
+            .get_scheduled_job(&id)
+            .unwrap()
+            .expect("cancelled wakes are disabled, never deleted")
+            .enabled
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn cancelling_an_own_resume_wake_clears_the_succession_recovery_owner_gate() {
+        let store = Store::open_in_memory().unwrap();
+        let manager = Uuid::new_v4();
+        let mut session = crate::session::agent_verbs::tests::test_session(
+            manager,
+            std::path::PathBuf::from("/var/tmp/cancel-wake"),
+        );
+        session.status = SessionStatus::Completed;
+        store.insert_session(&session).unwrap();
+        let job = owned_job("safety-net", WakeMode::Resume, Some(manager));
+        store.insert_scheduled_job(&job).unwrap();
+
+        let refused = store.manager_action_human_gate(manager).unwrap_err();
+        assert!(
+            matches!(&refused, DaemonError::InvalidParam(code) if code == "manager_v2_human_or_recovery_owner"),
+            "{refused:?}"
+        );
+
+        let cancelled = store
+            .cancel_owned_scheduled_jobs(manager, Some(job.id), None)
+            .unwrap();
+        assert_eq!(cancelled, vec![job.id]);
+        assert!(!enabled(&store, job.id));
+        store.manager_action_human_gate(manager).unwrap();
+
+        // Cancelling again is an idempotent no-op on an owned, disabled row.
+        assert!(
+            store
+                .cancel_owned_scheduled_jobs(manager, Some(job.id), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn cancel_refuses_another_sessions_job_by_id_and_by_name() {
+        let store = Store::open_in_memory().unwrap();
+        let (mine, theirs) = (Uuid::new_v4(), Uuid::new_v4());
+        let job = owned_job("shared-name", WakeMode::Resume, Some(theirs));
+        store.insert_scheduled_job(&job).unwrap();
+
+        for error in [
+            store
+                .cancel_owned_scheduled_jobs(mine, Some(job.id), None)
+                .unwrap_err(),
+            store
+                .cancel_owned_scheduled_jobs(mine, None, Some("shared-name"))
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, DaemonError::InvalidParam(code) if code.starts_with("wake_not_found")),
+                "{error:?}"
+            );
+        }
+        assert!(enabled(&store, job.id));
+        // No selector never matches anything, even the caller's own jobs.
+        assert!(
+            store
+                .cancel_owned_scheduled_jobs(theirs, None, None)
+                .is_err()
+        );
+        assert!(enabled(&store, job.id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn cancel_by_name_disables_every_enabled_own_job_of_that_name() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = Uuid::new_v4();
+        let first = owned_job("net", WakeMode::Resume, Some(owner));
+        let second = owned_job("net", WakeMode::AgentFresh, Some(owner));
+        let other_name = owned_job("keep", WakeMode::Resume, Some(owner));
+        for job in [&first, &second, &other_name] {
+            store.insert_scheduled_job(job).unwrap();
+        }
+        let mut cancelled = store
+            .cancel_owned_scheduled_jobs(owner, None, Some("net"))
+            .unwrap();
+        cancelled.sort();
+        let mut expected = vec![first.id, second.id];
+        expected.sort();
+        assert_eq!(cancelled, expected);
+        assert!(!enabled(&store, first.id));
+        assert!(!enabled(&store, second.id));
+        assert!(enabled(&store, other_name.id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn cancel_refuses_the_daemon_owned_program_guard() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = Uuid::new_v4();
+        store
+            .insert_session(&crate::session::agent_verbs::tests::test_session(
+                owner,
+                std::path::PathBuf::from("/var/tmp/cancel-wake-guard"),
+            ))
+            .unwrap();
+        let mut guard = owned_job("program-guard", WakeMode::Resume, Some(owner));
+        guard.id =
+            crate::session::harness::tools::schedule_wake::deterministic_program_guard_job_id(
+                owner,
+            );
+        store.insert_scheduled_job(&guard).unwrap();
+        let error = store
+            .cancel_owned_scheduled_jobs(owner, Some(guard.id), None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, DaemonError::InvalidParam(code) if code.starts_with("wake_protected")),
+            "{error:?}"
+        );
+        assert!(enabled(&store, guard.id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn agent_cancel_refuses_the_internal_process_wake_but_the_daemon_withdraws_it() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = Uuid::new_v4();
+        store
+            .insert_session(&crate::session::agent_verbs::tests::test_session(
+                owner,
+                std::path::PathBuf::from("/var/tmp/cancel-wake-internal"),
+            ))
+            .unwrap();
+        let name = format!("{BACKGROUND_PROCESS_WAKE_PREFIX}{owner}");
+        let wake = owned_job(&name, WakeMode::Resume, Some(owner));
+        store.insert_scheduled_job(&wake).unwrap();
+
+        let by_id = store
+            .cancel_owned_scheduled_jobs(owner, Some(wake.id), None)
+            .unwrap_err();
+        assert!(
+            matches!(&by_id, DaemonError::InvalidParam(code) if code.starts_with("wake_protected")),
+            "{by_id:?}"
+        );
+        let by_name = store
+            .cancel_owned_scheduled_jobs(owner, None, Some(&name))
+            .unwrap_err();
+        assert!(
+            matches!(&by_name, DaemonError::InvalidParam(code) if code.starts_with("wake_protected")),
+            "{by_name:?}"
+        );
+        assert!(enabled(&store, wake.id));
+        let listed = store.list_owned_scheduled_jobs(owner, false, 8).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].1, "the internal wake is listed as protected");
+
+        // The registry can still replace its own row (coalescing) and withdraw it.
+        let replacement = owned_job(&name, WakeMode::Resume, Some(owner));
+        let replaced = store
+            .insert_scheduled_job_replacing_name(owner, &replacement)
+            .unwrap();
+        assert_eq!(replaced, vec![wake.id]);
+        assert!(!enabled(&store, wake.id));
+        assert!(enabled(&store, replacement.id));
+        let withdrawn = store.cancel_internal_process_wake(owner).unwrap();
+        assert_eq!(withdrawn, vec![replacement.id]);
+        assert!(!enabled(&store, replacement.id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn insert_replacing_name_keeps_one_enabled_job_per_name_per_session() {
+        let store = Store::open_in_memory().unwrap();
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = owned_job("net", WakeMode::Resume, Some(owner));
+        let unrelated_name = owned_job("other", WakeMode::Resume, Some(owner));
+        let other_session = owned_job("net", WakeMode::Resume, Some(other));
+        for job in [&first, &unrelated_name, &other_session] {
+            store.insert_scheduled_job(job).unwrap();
+        }
+        let second = owned_job("net", WakeMode::Resume, Some(owner));
+        let replaced = store
+            .insert_scheduled_job_replacing_name(owner, &second)
+            .unwrap();
+        assert_eq!(replaced, vec![first.id]);
+        assert!(!enabled(&store, first.id));
+        assert!(enabled(&store, second.id));
+        assert!(enabled(&store, unrelated_name.id));
+        assert!(enabled(&store, other_session.id));
+    }
 }

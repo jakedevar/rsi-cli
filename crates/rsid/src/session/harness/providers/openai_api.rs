@@ -9,7 +9,7 @@
 use crate::error::DaemonError;
 use crate::model_control::ModelExecutionCapability;
 use crate::session::harness::api_key::ApiCredential;
-use crate::session::harness::errors;
+use crate::session::harness::errors::{self, ProviderError, ProviderErrorClass};
 use crate::session::harness::provider::{ApiProvider, Result};
 use crate::session::harness::sse::read_openai_sse_stream;
 use crate::session::harness::types::*;
@@ -29,7 +29,7 @@ impl OpenAiApiProvider {
         &self,
         request: &ChatRequest,
         execution: ModelExecutionCapability,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, Option<String>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = self.build_request_body(request);
         let mut req = self
@@ -38,6 +38,7 @@ impl OpenAiApiProvider {
             .header("content-type", "application/json")
             .json(&body);
         let key = self.credential.current();
+        let fingerprint = key.as_ref().map(crate::vault::SecretString::fingerprint);
         if let Some(key) = key {
             req = req.bearer_auth(key.expose());
         }
@@ -49,14 +50,14 @@ impl OpenAiApiProvider {
             .send("OpenAI")
             .await
             .map_err(errors::transport)?;
-        Ok(response)
+        Ok((response, fingerprint))
     }
 
     async fn send_openrouter_request(
         &self,
         request: &ChatRequest,
         execution: ModelExecutionCapability,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, Option<String>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = self.build_request_body(request);
         let mut req = self
@@ -67,6 +68,7 @@ impl OpenAiApiProvider {
         let key = self.credential.current().ok_or_else(|| {
             DaemonError::OpenAiApiError("OpenRouter credential unavailable".to_string())
         })?;
+        let fingerprint = key.fingerprint();
         req = req.bearer_auth(key.expose());
         let response = execution
             .bind_http(
@@ -76,7 +78,7 @@ impl OpenAiApiProvider {
             .send("OpenRouter")
             .await
             .map_err(errors::transport)?;
-        Ok(response)
+        Ok((response, Some(fingerprint)))
     }
     pub fn new(explicit_key: Option<&str>) -> Result<Self> {
         let credential = ApiCredential::for_slot(explicit_key, Some(crate::vault::Slot::Openai));
@@ -192,6 +194,7 @@ impl OpenAiApiProvider {
                         .iter()
                         .filter_map(|block| match block {
                             ToolContentBlock::Text { text } => Some(text.as_str()),
+                            ToolContentBlock::ServerToolResult { .. } => None,
                             ToolContentBlock::Image { .. } => None,
                         })
                         .collect::<Vec<_>>()
@@ -199,13 +202,25 @@ impl OpenAiApiProvider {
                     let image_parts = blocks
                         .iter()
                         .filter_map(|block| match block {
-                            ToolContentBlock::Image { media_type, data } => Some(json!({
+                            ToolContentBlock::Image {
+                                media_type,
+                                data,
+                                detail,
+                                ..
+                            } => {
+                                let mut image_url = json!({
                                 "type": "image_url",
                                 "image_url": {
                                     "url": format!("data:{media_type};base64,{data}"),
                                 },
-                            })),
+                                });
+                                if let Some(detail) = detail {
+                                    image_url["image_url"]["detail"] = json!(detail);
+                                }
+                                Some(image_url)
+                            }
                             ToolContentBlock::Text { .. } => None,
+                            ToolContentBlock::ServerToolResult { .. } => None,
                         })
                         .collect::<Vec<_>>();
                     if !image_parts.is_empty() {
@@ -278,6 +293,7 @@ impl OpenAiApiProvider {
         let tools: Vec<Value> = request
             .tools
             .iter()
+            .filter(|t| matches!(t.kind, HarnessToolSpecKind::Function))
             .map(|t| {
                 let schema: Value =
                     serde_json::from_str(&t.parameters_json).unwrap_or(json!({"type": "object"}));
@@ -306,6 +322,16 @@ impl OpenAiApiProvider {
         if let Some(max) = request.max_tokens {
             body["max_tokens"] = json!(max);
         }
+        // OpenRouter normalises reasoning control under `reasoning.effort`.
+        if self.execution_route
+            == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
+            && let Some(effort) = request
+                .reasoning_effort
+                .as_deref()
+                .filter(|effort| matches!(*effort, "low" | "medium" | "high"))
+        {
+            body["reasoning"] = json!({ "effort": effort });
+        }
         if request.stream && !self.quirks.disable_streaming {
             body["stream"] = json!(true);
             body["stream_options"] = json!({"include_usage": true});
@@ -322,7 +348,7 @@ impl ApiProvider for OpenAiApiProvider {
         request: &ChatRequest,
         execution: ModelExecutionCapability,
     ) -> Result<ChatResponse> {
-        let resp = if self.execution_route
+        let (resp, fingerprint) = if self.execution_route
             == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
         {
             self.send_openrouter_request(request, execution).await?
@@ -331,7 +357,16 @@ impl ApiProvider for OpenAiApiProvider {
         };
 
         if !resp.status().is_success() {
-            return Err(errors::classify_response(resp).await);
+            let status = resp.status().as_u16();
+            let error = errors::classify_response(resp).await;
+            if matches!(
+                ProviderError::from_daemon_error(&error).map(|error| error.class),
+                Some(ProviderErrorClass::CreditExhausted)
+            ) && let Some(fingerprint) = fingerprint
+            {
+                self.credential.mark_exhausted(&fingerprint, status);
+            }
+            return Err(error);
         }
 
         let json: Value = resp
@@ -365,6 +400,8 @@ impl ApiProvider for OpenAiApiProvider {
                             id: tc.get("id")?.as_str()?.to_string(),
                             name: tc.get("function")?.get("name")?.as_str()?.to_string(),
                             arguments: tc.get("function")?.get("arguments")?.as_str()?.to_string(),
+                            hosted: false,
+                            hosted_result: None,
                         })
                     })
                     .collect()
@@ -380,6 +417,7 @@ impl ApiProvider for OpenAiApiProvider {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cost_usd: crate::session::harness::sse::reported_cost_usd(u),
                 ..Default::default()
             })
             .unwrap_or_default();
@@ -419,7 +457,7 @@ impl ApiProvider for OpenAiApiProvider {
             return Ok(response);
         }
 
-        let resp = if self.execution_route
+        let (resp, fingerprint) = if self.execution_route
             == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
         {
             self.send_openrouter_request(request, execution).await?
@@ -428,7 +466,16 @@ impl ApiProvider for OpenAiApiProvider {
         };
 
         if !resp.status().is_success() {
-            return Err(errors::classify_response(resp).await);
+            let status = resp.status().as_u16();
+            let error = errors::classify_response(resp).await;
+            if matches!(
+                ProviderError::from_daemon_error(&error).map(|error| error.class),
+                Some(ProviderErrorClass::CreditExhausted)
+            ) && let Some(fingerprint) = fingerprint
+            {
+                self.credential.mark_exhausted(&fingerprint, status);
+            }
+            return Err(error);
         }
 
         let (content, acc_tool_calls, usage, stop_reason) =
@@ -440,6 +487,8 @@ impl ApiProvider for OpenAiApiProvider {
                 id: tc.id,
                 name: tc.name,
                 arguments: tc.arguments,
+                hosted: false,
+                hosted_result: None,
             })
             .collect();
 
@@ -454,6 +503,10 @@ impl ApiProvider for OpenAiApiProvider {
 
     fn supports_native_tools(&self) -> bool {
         self.quirks.native_tools
+    }
+
+    fn supports_image_input(&self, model: &str) -> bool {
+        crate::provider_capabilities::supports_image_input(model)
     }
 
     fn name(&self) -> &str {
@@ -490,6 +543,13 @@ mod route_tests {
             ProviderQuirks::default(),
         )
         .unwrap();
+        let image = crate::session::harness::tools::view_image::test_png_image_block(Some("low"));
+        let ToolContentBlock::Image {
+            media_type, data, ..
+        } = &image
+        else {
+            panic!("test image block");
+        };
         let body = provider.build_request_body(&request(vec![
             ChatMessage::tool_result("legacy", "plain text"),
             ChatMessage::tool_result_blocks(
@@ -505,10 +565,7 @@ mod route_tests {
                     ToolContentBlock::Text {
                         text: "preview".into(),
                     },
-                    ToolContentBlock::Image {
-                        media_type: "image/png".into(),
-                        data: "aGVsbG8=".into(),
-                    },
+                    image.clone(),
                 ],
                 false,
             ),
@@ -552,10 +609,27 @@ mod route_tests {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "Image returned by tool call image:"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                    {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}"), "detail": "low"}}
                 ]
             })
         );
+    }
+
+    /// #1061: OpenRouter requests carry the reasoning effort as
+    /// `reasoning.effort`; other chat-completions routes do not.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn openrouter_body_carries_reasoning_effort() {
+        let mut req = request(vec![ChatMessage::user("hi")]);
+        req.reasoning_effort = Some("low".into());
+        let body = OpenAiApiProvider::openrouter()
+            .unwrap()
+            .build_request_body(&req);
+        assert_eq!(body["reasoning"], json!({"effort": "low"}));
+        let body = OpenAiApiProvider::new(Some("key"))
+            .unwrap()
+            .build_request_body(&req);
+        assert!(body.get("reasoning").is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -578,5 +652,29 @@ mod route_tests {
             }
         ));
         assert!(provider.supports_native_tools());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn chat_completions_local_unknown_and_openrouter_routes_have_no_hosted_tools() {
+        for base_url in [
+            "http://localhost:11434/v1",
+            "https://unknown-compatible-route.test/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            let provider = OpenAiApiProvider::with_config(
+                base_url.into(),
+                ApiCredential::None,
+                ProviderQuirks::default(),
+            )
+            .unwrap();
+            let capabilities = provider.web_capabilities("test-model");
+            assert!(capabilities.tools.is_empty(), "{base_url}");
+
+            let mut request = request(vec![ChatMessage::user("search")]);
+            request.tools = capabilities.specs();
+            let body = provider.build_request_body(&request);
+            assert!(body.get("tools").is_none(), "{base_url}");
+        }
     }
 }

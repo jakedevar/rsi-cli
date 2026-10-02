@@ -1,7 +1,7 @@
 //! Bounded scheduling for one hub-owned satellite poller.
 //!
-//! S2 keeps this scheduler inert. S3 will attach its RPC client and operator
-//! controls; a TUI render must never start a peer request itself.
+//! The daemon owns the poll loop. A TUI render reads only the hub cache and
+//! must never start a peer request itself.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -17,12 +17,19 @@ use serde_json::Value;
 
 use super::link::connect_owned_socket;
 use super::registry::{ContinuityResult, PeerContinuity, RegistryLink, RegistryPeer};
+pub(crate) use crate::store_support::satellite::{
+    MAX_CACHED_BYTES, MAX_CACHED_ROWS, MAX_REGISTERED_PEERS, PeerSnapshot,
+};
+use rsi_common::agent_deploy::AgentRequestDeployReceiptV1;
 use rsi_common::satellite::{
     SATELLITE_WIRE_VERSION_V1, SatelliteCompatibility, SatelliteIdentityV1,
-    SatelliteSessionPageRequestV1, SatelliteSessionPageV1, SatelliteSessionSummaryV1,
+    SatelliteSessionPageRequestV1, SatelliteSessionPageV1,
+};
+use rsi_common::satellite_dispatch::{
+    DELIVER_HUB_MESSAGE_METHOD, REQUEST_HUB_DEPLOY_METHOD, SatelliteDeliverRequestV1,
+    SatelliteDeliverResultV1, SatelliteDeployRequestV1,
 };
 
-pub(crate) const MAX_REGISTERED_PEERS: usize = 128;
 pub(crate) const MAX_IN_FLIGHT: usize = 4;
 const MIN_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -30,8 +37,6 @@ const MAX_JITTER_MS: u64 = 3_000;
 pub(crate) const RPC_DEADLINE: Duration = Duration::from_secs(3);
 pub(crate) const MAX_RPC_ENVELOPE_BYTES: usize =
     rsi_common::satellite::SATELLITE_MAX_RESPONSE_BYTES + 4_096;
-pub(crate) const MAX_CACHED_ROWS: usize = 1_000;
-pub(crate) const MAX_CACHED_BYTES: usize = 1_048_576;
 const MAX_PAGES: usize = 20;
 
 fn protocol_error(message: &'static str) -> io::Error {
@@ -61,6 +66,32 @@ async fn bounded_line(reader: &mut BufReader<UnixStream>, max_bytes: usize) -> i
     }
 }
 
+/// One bounded request/response exchange. The caller owns the method
+/// allowlist; this only enforces the envelope.
+async fn exchange(
+    reader: &mut BufReader<UnixStream>,
+    method: &'static str,
+    params: Value,
+    max_response_bytes: usize,
+    deadline: Duration,
+) -> io::Result<RpcResponse> {
+    let request = RpcRequest::new(method, params);
+    let mut encoded = serde_json::to_vec(&request).map_err(io::Error::other)?;
+    encoded.push(b'\n');
+    tokio::time::timeout(deadline, reader.get_mut().write_all(&encoded))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC write timed out"))??;
+    let cap = max_response_bytes.min(MAX_RPC_ENVELOPE_BYTES);
+    let line = tokio::time::timeout(deadline, bounded_line(reader, cap))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC read timed out"))??;
+    let response: RpcResponse = serde_json::from_slice(&line).map_err(io::Error::other)?;
+    if response.jsonrpc != "2.0" || response.id != request.id {
+        return Err(protocol_error("invalid satellite RPC envelope"));
+    }
+    Ok(response)
+}
+
 /// Fixed, read-only RPC allowlist. The caller owns the validated link and
 /// must check the returned installation/incarnation against registry custody.
 pub(crate) async fn call_read_rpc(
@@ -75,32 +106,108 @@ pub(crate) async fn call_read_rpc(
             "satellite RPC method is outside read allowlist",
         ));
     }
-    let request = RpcRequest::new(method, params);
-    let mut encoded = serde_json::to_vec(&request).map_err(io::Error::other)?;
-    encoded.push(b'\n');
-    tokio::time::timeout(deadline, reader.get_mut().write_all(&encoded))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC write timed out"))??;
-    let cap = max_response_bytes.min(MAX_RPC_ENVELOPE_BYTES);
-    let line = tokio::time::timeout(deadline, bounded_line(reader, cap))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC read timed out"))??;
-    let response: RpcResponse = serde_json::from_slice(&line).map_err(io::Error::other)?;
-    if response.jsonrpc != "2.0"
-        || response.id != request.id
-        || response.error.is_some()
-        || response.result.is_none()
-    {
+    let response = exchange(reader, method, params, max_response_bytes, deadline).await?;
+    if response.error.is_some() || response.result.is_none() {
         return Err(protocol_error("invalid satellite RPC envelope"));
     }
     Ok(response.result.expect("checked result"))
 }
 
-#[derive(Debug)]
-pub(crate) struct PeerSnapshot {
-    pub(crate) installation_id: Uuid,
-    pub(crate) incarnation_id: Uuid,
-    pub(crate) sessions: Vec<SatelliteSessionSummaryV1>,
+/// What the satellite answered to one delivery attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliverReply {
+    Accepted(SatelliteDeliverResultV1),
+    /// The satellite refused with a stable code (`busy`,
+    /// `target_not_authorized`, a conflict, ...).
+    Refused(String),
+}
+
+/// The one delivery method the hub may call, with its own one-method
+/// allowlist so the read allowlist never widens.
+pub(crate) async fn call_deliver_rpc(
+    reader: &mut BufReader<UnixStream>,
+    request: &SatelliteDeliverRequestV1,
+    deadline: Duration,
+) -> io::Result<DeliverReply> {
+    let params = serde_json::to_value(request).map_err(io::Error::other)?;
+    let response = exchange(
+        reader,
+        DELIVER_HUB_MESSAGE_METHOD,
+        params,
+        MAX_RPC_ENVELOPE_BYTES,
+        deadline,
+    )
+    .await?;
+    if let Some(error) = response.error {
+        return Ok(DeliverReply::Refused(error.message));
+    }
+    let value = response
+        .result
+        .ok_or_else(|| protocol_error("invalid satellite RPC envelope"))?;
+    let result: SatelliteDeliverResultV1 =
+        serde_json::from_value(value).map_err(io::Error::other)?;
+    if result.message_id != request.message_id {
+        return Err(protocol_error("satellite acknowledged a different message"));
+    }
+    Ok(DeliverReply::Accepted(result))
+}
+
+/// What the satellite answered to a hub deploy request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeployReply {
+    Accepted(AgentRequestDeployReceiptV1),
+    /// The satellite refused; the message carries its stable code.
+    Refused(String),
+}
+
+/// The one deploy method the hub may call (own one-method allowlist, so the
+/// read allowlist never widens). `deadline` bounds each of the write and the
+/// read; staging copies and hashes binaries before the satellite replies.
+pub(crate) async fn call_deploy_rpc(
+    reader: &mut BufReader<UnixStream>,
+    request: &SatelliteDeployRequestV1,
+    deadline: Duration,
+) -> io::Result<DeployReply> {
+    let params = serde_json::to_value(request).map_err(io::Error::other)?;
+    let response = exchange(
+        reader,
+        REQUEST_HUB_DEPLOY_METHOD,
+        params,
+        MAX_RPC_ENVELOPE_BYTES,
+        deadline,
+    )
+    .await?;
+    if let Some(error) = response.error {
+        return Ok(DeployReply::Refused(error.message));
+    }
+    let value = response
+        .result
+        .ok_or_else(|| protocol_error("invalid satellite RPC envelope"))?;
+    let receipt: AgentRequestDeployReceiptV1 =
+        serde_json::from_value(value).map_err(io::Error::other)?;
+    Ok(DeployReply::Accepted(receipt))
+}
+
+/// Explicit operator probe before pairing. This reports the remote identity
+/// over a custody-checked link but does not pin or trust that identity.
+pub(crate) async fn inspect_link_identity(
+    satellite_root: &Path,
+    link: &RegistryLink,
+) -> io::Result<SatelliteIdentityV1> {
+    link.validate(satellite_root).map_err(protocol_error)?;
+    let socket = connect_owned_socket(satellite_root, &link.socket_path, RPC_DEADLINE).await?;
+    let mut rpc = BufReader::new(socket);
+    let value = call_read_rpc(
+        &mut rpc,
+        "GetSatelliteIdentity",
+        Value::Null,
+        MAX_RPC_ENVELOPE_BYTES,
+        RPC_DEADLINE,
+    )
+    .await?;
+    let identity: SatelliteIdentityV1 = serde_json::from_value(value).map_err(io::Error::other)?;
+    identity.validate().map_err(io::Error::other)?;
+    Ok(identity)
 }
 
 /// One bounded peer read, invoked only after S3 operator policy enables it.
@@ -224,6 +331,7 @@ pub(crate) async fn probe_link(
                 installation_id: identity.installation_id.0,
                 incarnation_id: identity.daemon_incarnation_id.0,
                 sessions,
+                health: identity.health.clone(),
             });
         }
     }
@@ -238,25 +346,49 @@ struct PeerPoll {
     next_due: Instant,
 }
 
+fn jitter(max_jitter_ms: u64, peer_id: Uuid) -> Duration {
+    let bytes = peer_id.as_bytes();
+    let seed = u64::from_be_bytes(bytes[..8].try_into().expect("UUID has 16 bytes"));
+    Duration::from_millis(seed % (max_jitter_ms + 1))
+}
+
+fn delay(min_interval: Duration, max_jitter_ms: u64, peer_id: Uuid, failures: u8) -> Duration {
+    let multiplier = 1u32 << failures.min(5);
+    (min_interval * multiplier).min(MAX_BACKOFF) + jitter(max_jitter_ms, peer_id)
+}
+
 /// One process-local schedule. Registry rows, not this map, survive restart.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PollSchedule {
     peers: HashMap<Uuid, PeerPoll>,
     in_flight: usize,
+    min_interval: Duration,
+    max_jitter_ms: u64,
 }
 
-fn jitter(peer_id: Uuid) -> Duration {
-    let bytes = peer_id.as_bytes();
-    let seed = u64::from_be_bytes(bytes[..8].try_into().expect("UUID has 16 bytes"));
-    Duration::from_millis(seed % (MAX_JITTER_MS + 1))
-}
-
-fn delay(peer_id: Uuid, failures: u8) -> Duration {
-    let multiplier = 1u32 << failures.min(5);
-    (MIN_INTERVAL * multiplier).min(MAX_BACKOFF) + jitter(peer_id)
+impl Default for PollSchedule {
+    fn default() -> Self {
+        Self {
+            peers: HashMap::new(),
+            in_flight: 0,
+            min_interval: MIN_INTERVAL,
+            max_jitter_ms: MAX_JITTER_MS,
+        }
+    }
 }
 
 impl PollSchedule {
+    /// Shortened timings so tests can exercise the schedule loop without
+    /// waiting out the production 15s interval and 3s jitter.
+    #[cfg(test)]
+    pub(crate) fn with_test_timing(min_interval: Duration, max_jitter_ms: u64) -> Self {
+        Self {
+            min_interval,
+            max_jitter_ms,
+            ..Self::default()
+        }
+    }
+
     /// Register a peer without scheduling an immediate dial. Newly loaded
     /// observations are stale until an explicit S3 activation starts polling.
     pub(crate) fn register(&mut self, peer_id: Uuid, enabled: bool, now: Instant) -> bool {
@@ -265,11 +397,12 @@ impl PollSchedule {
         {
             return false;
         }
+        let next_due = now + delay(self.min_interval, self.max_jitter_ms, peer_id, 0);
         let state = self.peers.entry(peer_id).or_insert_with(|| PeerPoll {
             enabled,
             in_flight: false,
             failures: 0,
-            next_due: now + delay(peer_id, 0),
+            next_due,
         });
         state.enabled = enabled;
         true
@@ -314,7 +447,13 @@ impl PollSchedule {
         } else {
             state.failures.saturating_add(1)
         };
-        state.next_due = now + delay(peer_id, state.failures);
+        state.next_due = now
+            + delay(
+                self.min_interval,
+                self.max_jitter_ms,
+                peer_id,
+                state.failures,
+            );
     }
 }
 
@@ -507,6 +646,7 @@ mod tests {
                     session_read: true,
                     limits: SatelliteReadLimitsV1::default(),
                 },
+                health: None,
             };
             let response =
                 RpcResponse::success(Some(json!(1)), serde_json::to_value(identity).unwrap());

@@ -454,6 +454,29 @@ fn binary_cross_stage_gate_exits_2_on_uncovered_manifest() {
 }
 
 #[test]
+fn binary_cross_stage_gate_exits_2_when_only_failed_or_pending_items_link_the_key() {
+    // A FAIL or PENDING item that lists `covers: F-002` must not count as
+    // coverage: only PASS/Checked items verify a declared key.
+    for name in ["linkage_failed.md", "linkage_pending.md"] {
+        let manifest = manifest_fixture_path(name);
+        let output = run_contract_args(
+            VERIFY_DECLARING_F002,
+            &["S6", "--manifest", &manifest.to_string_lossy()],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{name}: unfinished item must not cover F-002\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("uncovered_linkage"), "{name}: {stdout}");
+        assert!(stdout.contains("F-002"), "{name}: {stdout}");
+    }
+}
+
+#[test]
 fn binary_cross_stage_gate_exits_0_on_covered_manifest() {
     let manifest = manifest_fixture_path("linkage_covered.md");
     let output = run_contract_args(

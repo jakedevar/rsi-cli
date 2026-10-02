@@ -186,7 +186,10 @@ pub enum LcAction {
     SwitchProject(String),
 
     /// Create a project from command mode.
-    CreateProject { name: String, path: Option<String> },
+    CreateProject {
+        name: String,
+        path: Option<String>,
+    },
 
     /// Open the edit form for a project by name.
     EditProjectByName(String),
@@ -412,6 +415,8 @@ pub enum LcAction {
 
     /// Refresh `App::daemon_features` from the daemon (re-fetch GetDaemonConfig).
     RefreshDaemonFeatures,
+    /// Open the operator satellite registry and read-only remote-session browser.
+    OpenSatelliteRegistry,
 
     /// Sync title model configuration from UserSettings to daemon RuntimeConfig.
     SyncTitleModelConfig,
@@ -493,6 +498,8 @@ pub enum LcAction {
     OpenHarnessManagerInbox,
     /// Open manager inspection in the unified operator surface.
     OpenHarnessManagerInspect,
+    /// Operator node list, inspect, configure, and revoke command.
+    ManagerNodeCommand(String),
 
     /// P1.12: fire `ExecuteTopology` against the focused Epic's bound topology
     /// with `parent_id = Epic.id`. No-op (with error toast) if the focused
@@ -573,6 +580,25 @@ pub enum LcAction {
     /// Import every importable slot from its legacy env var
     /// (`ImportProviderCredentialsFromEnv`).
     ImportProviderCredentialsFromEnv,
+    RefreshMcpServers,
+    UpsertMcpServer {
+        server: rsi_common::mcp::McpServerDefinition,
+    },
+    SetMcpServerEnabled {
+        id: String,
+        enabled: bool,
+    },
+    SetMcpServerSecret {
+        id: String,
+        secret: crate::types::McpSecretString,
+    },
+    RotateMcpServerSecret {
+        id: String,
+        secret: crate::types::McpSecretString,
+    },
+    ClearMcpServerSecret {
+        id: String,
+    },
 }
 
 #[cfg(test)]
@@ -700,6 +726,7 @@ impl LcAction {
             LcAction::EmergencyStopAll => "EmergencyStopAll",
             LcAction::CancelModelInvocation(..) => "CancelModelInvocation",
             LcAction::RefreshDaemonFeatures => "RefreshDaemonFeatures",
+            LcAction::OpenSatelliteRegistry => "OpenSatelliteRegistry",
             LcAction::SyncTitleModelConfig => "SyncTitleModelConfig",
             LcAction::SyncMemoryModelConfig => "SyncMemoryModelConfig",
             LcAction::SyncPromptProcessorConfig => "SyncPromptProcessorConfig",
@@ -727,6 +754,7 @@ impl LcAction {
             LcAction::OpenHarnessManagerDecisions => "OpenHarnessManagerDecisions",
             LcAction::OpenHarnessManagerInbox => "OpenHarnessManagerInbox",
             LcAction::OpenHarnessManagerInspect => "OpenHarnessManagerInspect",
+            LcAction::ManagerNodeCommand(..) => "ManagerNodeCommand",
             LcAction::RunEpicTopology => "RunEpicTopology",
             LcAction::JumpAttentionN(..) => "JumpAttentionN",
             LcAction::OpenRecentFileN(..) => "OpenRecentFileN",
@@ -743,6 +771,12 @@ impl LcAction {
             Self::ClearProviderCredentialSlot(..) => "ClearProviderCredentialSlot",
             Self::CheckProviderCredentialSlot(..) => "CheckProviderCredentialSlot",
             Self::ImportProviderCredentialsFromEnv => "ImportProviderCredentialsFromEnv",
+            Self::RefreshMcpServers => "RefreshMcpServers",
+            Self::UpsertMcpServer { .. } => "UpsertMcpServer",
+            Self::SetMcpServerEnabled { .. } => "SetMcpServerEnabled",
+            Self::SetMcpServerSecret { .. } => "SetMcpServerSecret",
+            Self::RotateMcpServerSecret { .. } => "RotateMcpServerSecret",
+            Self::ClearMcpServerSecret { .. } => "ClearMcpServerSecret",
         }
     }
 }
@@ -987,6 +1021,7 @@ mod tests {
             LcAction::EmergencyStopAll,
             LcAction::CancelModelInvocation(uuid::Uuid::nil()),
             LcAction::RefreshDaemonFeatures,
+            LcAction::OpenSatelliteRegistry,
             LcAction::OpenScheduleBrowser,
             LcAction::OpenColorCustomizer,
             LcAction::SyncMemoryModelConfig,
@@ -1054,6 +1089,7 @@ mod tests {
             LcAction::OpenHarnessManagerDecisions,
             LcAction::OpenHarnessManagerInbox,
             LcAction::OpenHarnessManagerInspect,
+            LcAction::ManagerNodeCommand("list".into()),
             LcAction::JumpAttentionN(1),
             LcAction::OpenRecentFileN(1),
             // --- Provider Keys / key vault (#694 K1b) ---
@@ -1073,6 +1109,32 @@ mod tests {
                 rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
             ),
             LcAction::ImportProviderCredentialsFromEnv,
+            LcAction::RefreshMcpServers,
+            LcAction::UpsertMcpServer {
+                server: rsi_common::mcp::McpServerDefinition {
+                    id: "fixture".to_string(),
+                    command: "/usr/bin/true".to_string(),
+                    args: Vec::new(),
+                    secret_env_names: Vec::new(),
+                    working_dir: None,
+                    enabled: false,
+                },
+            },
+            LcAction::SetMcpServerEnabled {
+                id: "fixture".to_string(),
+                enabled: true,
+            },
+            LcAction::SetMcpServerSecret {
+                id: "fixture".to_string(),
+                secret: crate::types::McpSecretString::new("fixture-secret".to_string()),
+            },
+            LcAction::RotateMcpServerSecret {
+                id: "fixture".to_string(),
+                secret: crate::types::McpSecretString::new("fixture-secret".to_string()),
+            },
+            LcAction::ClearMcpServerSecret {
+                id: "fixture".to_string(),
+            },
         ];
 
         // `LcAction::variant_name` is an exhaustive match with no wildcard

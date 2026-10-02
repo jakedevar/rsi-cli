@@ -292,6 +292,7 @@ pub(crate) fn sandbox_unchanged(sandbox: &Path, pre_head: &str) -> Result<bool> 
 /// A fresh command sandbox at the fork commit. A sandbox already at the
 /// attempt's path (a crash between allocation and its durable record) is
 /// adopted only when it is exactly the fork commit and clean.
+#[cfg(test)]
 pub(crate) fn allocate_or_adopt(
     allocator: &crate::sandbox::SandboxAllocator,
     session_id: Uuid,
@@ -310,6 +311,35 @@ pub(crate) fn allocate_or_adopt(
     }
     Ok(allocator
         .allocate(
+            session_id,
+            fork.origin(),
+            rsi_common::types::SandboxKind::GitWorktree,
+            fork.commit(),
+            None,
+        )?
+        .root)
+}
+
+pub(crate) fn allocate_or_adopt_with_permit(
+    allocator: &crate::sandbox::SandboxAllocator,
+    permit: crate::sandbox::AllocationPermit,
+    session_id: Uuid,
+    fork: &crate::topology::custody::TopologyForkSource,
+) -> Result<PathBuf> {
+    let existing = allocator.base_dir().join(session_id.to_string());
+    if existing.exists() {
+        let observed =
+            crate::topology::custody::observe_sandbox_excluding(&existing, SCRATCH_DIRS)?;
+        if observed.dirty || observed.head != fork.commit() {
+            return Err(DaemonError::InvalidParam(
+                "existing command sandbox diverged from its fork commit".into(),
+            ));
+        }
+        return existing.canonicalize().map_err(DaemonError::Io);
+    }
+    Ok(allocator
+        .allocate_with_permit(
+            permit,
             session_id,
             fork.origin(),
             rsi_common::types::SandboxKind::GitWorktree,

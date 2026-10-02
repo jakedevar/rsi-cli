@@ -10,6 +10,22 @@
 
 use crate::types::SessionProvider;
 
+/// Provider-discovered reasoning capabilities, independent of RSI's fallback catalog.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelEffortCapabilities {
+    pub model: String,
+    pub supported_efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
+/// Opt-in model discovery response. Legacy clients still receive model tuples.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredModels {
+    pub models: Vec<(String, String)>,
+    #[serde(default)]
+    pub effort_capabilities: Vec<ModelEffortCapabilities>,
+}
+
 /// The backend that produced a model's weights, used to keep review authors
 /// and reviewers on independent vendor families. Unknown model IDs fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

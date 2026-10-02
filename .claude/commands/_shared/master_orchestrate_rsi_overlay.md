@@ -75,8 +75,8 @@ Use this vocabulary unless a narrower gate pack overrides it:
 - `live-execution`
 - `other`
 
-Schema changes require an inline versioned migration in
-`crates/rsid/src/store/mod.rs` and matching `user_version` bump. Released
+Schema changes require a new versioned migration file
+`crates/rsid/src/store/migrations/vNNN.rs` with the matching `user_version` bump. Released
 migrations and pins remain immutable.
 
 ## Verification Defaults

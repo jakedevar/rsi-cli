@@ -87,7 +87,7 @@ pub async fn handle_schedule_form_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Esc => {
             // Return to browser
-            crate::overlay::schedule_browser::open_schedule_browser(app).await;
+            crate::overlay::schedule_browser::reopen_schedule_browser(app).await;
         }
         KeyCode::Char(c) => {
             if let OverlayState::ScheduleForm {
@@ -296,7 +296,7 @@ async fn submit_schedule_form(app: &mut App, editing_id: Option<uuid::Uuid>) {
     }
 
     // Return to browser
-    crate::overlay::schedule_browser::open_schedule_browser(app).await;
+    crate::overlay::schedule_browser::reopen_schedule_browser(app).await;
 }
 
 fn form_to_recurrence(index: usize, interval: u64) -> Recurrence {

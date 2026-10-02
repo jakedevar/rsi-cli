@@ -63,6 +63,7 @@ cache/projects.json
 !.gemini/commands/feature_status.toml
 !.gemini/commands/implement.toml
 !.gemini/commands/implement_plan.toml
+!.gemini/commands/intake.toml
 !.gemini/commands/iterate_plan.toml
 !.gemini/commands/linear.toml
 !.gemini/commands/local_review.toml

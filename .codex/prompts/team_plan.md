@@ -6,7 +6,7 @@ description: Create implementation plans using a master-worker planning team
 
 Master-agent orchestrator for creating implementation plans from tickets and research documents. The master decomposes the scope into codebase domains, dispatches background workers to research and draft plan sections simultaneously, then synthesizes their compact contributions into a coherent, ordered implementation plan.
 
-**Worker preamble (binding):** This command's worker sub-agents MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=planning` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
+**Worker preamble (binding):** This command's worker sub-agents MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=planning` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
 **Use this over `/plan` when:**
 - The ticket spans 3+ codebase subsystems

@@ -122,6 +122,19 @@ The current provider type system supports these classes:
 - **Harness** — a direct API harness that owns its own conversation loop,
   tools, and compaction.
 
+#### Harness compaction keeps the task (#1058)
+
+A Harness-loop session (`Harness`, and the OpenRouter/Bedrock/Local engines
+that run the same loop) compacts its history when live context reaches the
+lower of 75% of the model window and the absolute budget (#966), or, as a
+backstop, at 150 messages (about 75 tool calls; it was 50). Compaction may
+summarize the work done, never the instructions: every path (auto, focused,
+local-truncation fallback, emergency, and the 200-message cap) keeps the system
+prompt, the first user task message and the latest user instruction verbatim,
+then a summary of the rest, then the last messages. A continued session rebuilds
+the same shape from its persisted `Compressed` events. Tool call/result pairing
+is repaired before each provider request.
+
 Supported is not the same as available. A choice may be absent or may fail to
 launch if its binary, account, credentials, API endpoint, model, or feature
 configuration is not present on your installation. Check **Settings**, the

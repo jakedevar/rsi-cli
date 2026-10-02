@@ -408,23 +408,113 @@ impl Store {
             "session_id":lead.id,
             "status":lead.status,
             "stop_reason":lead.stop_reason,
-            "question":question,
+            "question":question.clone(),
             "model_invocation_id":model_invocation_id,
             "event_sequence":event_sequence,
             "session_updated_at":lead.updated_at,
         });
-        let version = fingerprint(&state)?;
-        self.insert_manager_notice(
-            config,
-            epic,
-            true,
-            "session_state",
-            &lead.id.to_string(),
-            &version,
-            Some(lead.id),
-            &state,
-            false,
-        )
+        // Transcript traffic, invocation IDs and timestamps are not manager
+        // actions. A refusal is identified by its stable class, so retries of
+        // the same failed state wake the manager only once.
+        let failure_class = lead.stop_reason.as_deref().map(|reason| {
+            let mut parts = reason.split(':');
+            let first = parts.next().unwrap_or_default();
+            match parts.next() {
+                Some(second) => format!("{first}:{second}"),
+                None => first.to_string(),
+            }
+        });
+        let semantic = fingerprint(&json!({
+            "status": lead.status,
+            "failure_class": failure_class,
+            "question": question,
+        }))?;
+        let prefix = format!("semantic:{semantic}:");
+        // SAVEPOINT also composes with terminal archival's outer transaction.
+        // Retiring the obsolete pending wake and inserting its replacement is
+        // atomic; delivered notices remain immutable history.
+        self.conn
+            .execute_batch("SAVEPOINT manager_session_notice")?;
+        let result = (|| {
+            let latest: Option<(i64, String, bool)> = self
+                .conn
+                .query_row(
+                    "SELECT sequence,subject_version,settled_at IS NOT NULL FROM harness_manager_notices
+                 WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
+                   AND kind='session_state' AND subject_id=?4
+                   AND subject_version LIKE 'semantic:%'
+                 ORDER BY sequence DESC LIMIT 1",
+                    params![
+                        config.project_id.to_string(),
+                        config.manager_session_id.to_string(),
+                        config.row_version,
+                        lead.id.to_string()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((_, version, settled)) = latest.as_ref()
+                && version.starts_with(&prefix)
+            {
+                if *settled {
+                    // Retrieval acknowledged this exact semantic state. A
+                    // later reconciliation must not create another wake, even
+                    // if the deterministic route has changed since delivery.
+                    return Ok(None);
+                }
+                // Re-enter the existing notice path so restart recovery can
+                // restore a disabled transport for an unsettled row.
+                return self.insert_manager_notice(
+                    config,
+                    epic,
+                    true,
+                    "session_state",
+                    &lead.id.to_string(),
+                    version,
+                    Some(lead.id),
+                    &state,
+                    false,
+                );
+            }
+            self.conn.execute(
+                "UPDATE harness_manager_notices SET retired_at=?5
+                 WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
+                   AND kind='session_state' AND subject_id=?4
+                   AND subject_version LIKE 'semantic:%'
+                   AND retired_at IS NULL AND settled_at IS NULL AND delivered_at IS NULL",
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    lead.id.to_string(),
+                    now()
+                ],
+            )?;
+            let version = format!("{prefix}{}", latest.map_or(0, |(sequence, _, _)| sequence));
+            self.insert_manager_notice(
+                config,
+                epic,
+                true,
+                "session_state",
+                &lead.id.to_string(),
+                &version,
+                Some(lead.id),
+                &state,
+                false,
+            )
+        })();
+        match result {
+            Ok(job) => {
+                self.conn.execute_batch("RELEASE manager_session_notice")?;
+                Ok(job)
+            }
+            Err(error) => {
+                self.conn.execute_batch(
+                    "ROLLBACK TO manager_session_notice; RELEASE manager_session_notice",
+                )?;
+                Err(error)
+            }
+        }
     }
 
     /// One durable recovery notice per refused provider thread. The manager
@@ -460,6 +550,94 @@ impl Store {
             false,
         )?;
         Ok(())
+    }
+
+    /// One durable notice per scheduled (or exhausted) transient heal of a
+    /// lead (#1015). Keyed by `(session, transient_heal_*:<attempt>)`, so a
+    /// repeated reconcile pass never duplicates it. Returns whether the
+    /// session is a manager-covered lead; `false` means the caller owns the
+    /// child-path notice.
+    pub(crate) fn record_manager_heal_notice(
+        &self,
+        session_id: Uuid,
+        version: &str,
+        state: &Value,
+    ) -> Result<bool> {
+        let Some(lead) = self.get_session(session_id)? else {
+            return Ok(false);
+        };
+        let Some((config, epic)) = self.delivery_abandoned_notice_route(&lead)? else {
+            return Ok(false);
+        };
+        let mut state = state.clone();
+        if let Some(object) = state.as_object_mut() {
+            object.insert("lead_session_id".into(), json!(session_id));
+            object.insert("epic_id".into(), json!(epic));
+        }
+        self.insert_manager_notice(
+            &config,
+            epic,
+            true,
+            "session_state",
+            &session_id.to_string(),
+            version,
+            Some(session_id),
+            &state,
+            false,
+        )?;
+        Ok(true)
+    }
+
+    /// Route one durable DRAIN state notice to each appointed manager with a
+    /// live lead. Reuse the released `session_state` kind; its state retains the
+    /// full per-session drain snapshot for inbox retrieval after restart.
+    pub(crate) fn record_daemon_drain_notices(
+        &self,
+        boot_id: Uuid,
+        snapshot: &Value,
+    ) -> Result<usize> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT project_id FROM harness_manager_scopes ORDER BY project_id")?;
+        let projects = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut recorded = 0;
+        for project in projects {
+            let project = Uuid::parse_str(&project)
+                .map_err(|error| DaemonError::Store(format!("invalid manager project: {error}")))?;
+            let Some(config) = self.get_harness_manager(project)? else {
+                continue;
+            };
+            for epic in &config.epic_ids {
+                let Ok(lead) = self.manager_lead(project, *epic) else {
+                    continue;
+                };
+                let state = json!({
+                    "session_id":lead.id,
+                    "status":lead.status,
+                    "daemon_drain":snapshot,
+                });
+                if self
+                    .insert_manager_notice(
+                        &config,
+                        *epic,
+                        true,
+                        "session_state",
+                        &lead.id.to_string(),
+                        &format!("drain:{boot_id}"),
+                        Some(lead.id),
+                        &state,
+                        false,
+                    )?
+                    .is_some()
+                {
+                    recorded += 1;
+                }
+                break;
+            }
+        }
+        Ok(recorded)
     }
 
     /// Capture the final exact session state while the Epic still names this
@@ -1236,7 +1414,7 @@ impl Store {
         &self,
         job: &rsi_common::types::ScheduledJob,
         capture: &super::manager_watch_settlement::WatchFireCapture,
-        delivery: &crate::issue_tracker::poller::UnconsumedDelivery,
+        delivery: &crate::store_support::issue_tracker::UnconsumedDelivery,
         abandoned_at: DateTime<Utc>,
         sequence_floor: i32,
     ) -> Result<Option<DeliveryAbandonedRecord>> {
@@ -2230,6 +2408,38 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
+    fn drain_queues_one_durable_manager_notice_with_session_state() {
+        let store = Store::open_in_memory().expect("store");
+        let (config, lead) = fixture(&store, policy());
+        let boot_id = Uuid::new_v4();
+        let snapshot = json!({"draining":true,"active_sessions":[{
+            "session_id":lead.id,"state":"finishing_current_turn"
+        }]});
+        assert_eq!(
+            store
+                .record_daemon_drain_notices(boot_id, &snapshot)
+                .expect("notice"),
+            1
+        );
+        assert_eq!(
+            store
+                .record_daemon_drain_notices(boot_id, &snapshot)
+                .expect("retry"),
+            0
+        );
+        let (project, subject, state): (String, String, String) = store.conn.query_row(
+            "SELECT project_id,subject_id,json_extract(state_json,'$.daemon_drain.active_sessions[0].state')
+             FROM harness_manager_notices WHERE subject_version=?1",
+            [format!("drain:{boot_id}")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).expect("retained notice");
+        assert_eq!(project, config.project_id.to_string());
+        assert_eq!(subject, lead.id.to_string());
+        assert_eq!(state, "finishing_current_turn");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
     fn lead_integration_advance_uses_one_manager_idle_transport() {
         let store = Store::open_in_memory().unwrap();
         let (config, lead) = fixture(&store, policy());
@@ -2729,6 +2939,7 @@ mod tests {
                 priority: 1,
                 weight: 1,
                 required_gates: vec![ManagerWorkStageV2::Planning],
+                risk_tier: Default::default(),
             },
         )
         .unwrap();
@@ -4660,6 +4871,127 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
+    fn session_notices_coalesce_transcript_churn_and_repeated_refusal_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("semantic-notices.db");
+        let store = Store::open(&database).unwrap();
+        let (config, lead) = fixture(&store, policy());
+        store
+            .update_session_status(lead.id, SessionStatus::Failed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET stop_reason='provider_error:codex:attempt-one' WHERE id=?1",
+                [lead.id.to_string()],
+            )
+            .unwrap();
+        let first = store.get_session(lead.id).unwrap().unwrap();
+        store
+            .record_manager_session_notice(&config, &first)
+            .unwrap();
+        let mut churn = first.clone();
+        churn.updated_at += chrono::Duration::seconds(1);
+        churn.stop_reason = Some("provider_error:codex:attempt-two".into());
+        store
+            .record_manager_session_notice(&config, &churn)
+            .unwrap();
+        let before: i64 = store.conn.query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE kind='session_state' AND subject_id=?1",
+            [lead.id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(before, 2); // Initial state plus one failure-class transition.
+        let pending: i64 = store.conn.query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE kind='session_state'
+             AND subject_id=?1 AND retired_at IS NULL AND settled_at IS NULL AND delivered_at IS NULL",
+            [lead.id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending, 1);
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        reopened.reconcile_harness_manager_watches().unwrap();
+        let recovered_count: i64 = reopened.conn.query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE kind='session_state' AND subject_id=?1",
+            [lead.id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert!(recovered_count >= before);
+        let recovered = reopened.get_session(lead.id).unwrap().unwrap();
+        reopened
+            .record_manager_session_notice(&config, &recovered)
+            .unwrap();
+        let after: i64 = reopened.conn.query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE kind='session_state' AND subject_id=?1",
+            [lead.id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(after, recovered_count);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn settled_session_failure_is_not_republished_by_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("settled-session-notices.db");
+        let store = Store::open(&database).unwrap();
+        let (config, lead) = fixture(&store, policy());
+        store
+            .update_session_status(lead.id, SessionStatus::Failed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET stop_reason='provider_error:codex:first' WHERE id=?1",
+                [lead.id.to_string()],
+            )
+            .unwrap();
+        store.reconcile_harness_manager_watches().unwrap();
+        let inbox = store
+            .manager_inbox(config.manager_session_id, &Default::default())
+            .unwrap();
+        assert!(inbox.notices.iter().any(|notice| {
+            notice.kind == "session_state"
+                && notice.subject_id == lead.id.to_string()
+                && notice.state["stop_reason"] == "provider_error:codex:first"
+        }));
+        let count = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM harness_manager_notices
+                     WHERE kind='session_state' AND subject_id=?1",
+                    [lead.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let settled_count = count(&store);
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        reopened.reconcile_harness_manager_watches().unwrap();
+        reopened.manager_v2_reconcile_notices(&config).unwrap();
+        assert_eq!(count(&reopened), settled_count);
+        assert!(
+            reopened
+                .manager_inbox(config.manager_session_id, &Default::default())
+                .unwrap()
+                .notices
+                .is_empty()
+        );
+
+        reopened
+            .conn
+            .execute(
+                "UPDATE sessions SET stop_reason='provider_error:anthropic:first' WHERE id=?1",
+                [lead.id.to_string()],
+            )
+            .unwrap();
+        reopened.reconcile_harness_manager_watches().unwrap();
+        assert_eq!(count(&reopened), settled_count + 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
     fn oversized_question_projects_truthfully_without_rolling_back_other_project() {
         let store = Store::open_in_memory().unwrap();
         let (oversized_config, oversized_lead) = fixture(&store, policy());
@@ -5170,7 +5502,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
-    fn distinct_subject_burst_is_transport_bounded_without_erasing_durable_versions() {
+    fn session_state_burst_keeps_history_and_one_pending_transport() {
         let store = Store::open_in_memory().unwrap();
         let (config, lead) = fixture(&store, policy());
         let baseline: i64 = store
@@ -5223,9 +5555,8 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("- session_state "))
                 .count(),
-            MAX_RENDERED_NOTICES as usize
+            1
         );
-        assert!(job.message.contains("additional notices remain"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

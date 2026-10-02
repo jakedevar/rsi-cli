@@ -1366,6 +1366,56 @@ pub fn dim_metadata() -> Color {
     }
 }
 
+// Terminal-default surfaces need color to distinguish metadata without a scrim.
+// Keep other themes' established text hierarchy.
+pub fn model_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        lavender()
+    } else {
+        subtext1()
+    }
+}
+
+pub fn time_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        sky()
+    } else {
+        dim_metadata()
+    }
+}
+
+pub fn effort_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        peach()
+    } else {
+        dim_metadata()
+    }
+}
+
+pub fn count_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        blue()
+    } else {
+        dim_metadata()
+    }
+}
+
+pub fn cost_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        green()
+    } else {
+        dim_metadata()
+    }
+}
+
+pub fn path_text() -> Color {
+    if uses_terminal_default_backgrounds() {
+        teal()
+    } else {
+        subtext1()
+    }
+}
+
 pub fn section_label_text() -> Color {
     if is_transparent_theme() {
         yellow()
@@ -1776,9 +1826,18 @@ pub(crate) fn test_rgb_channels(color: Color) -> Option<(u8, u8, u8)> {
 }
 
 // Overlay / popup
-/// Shared modal frame color, aligned with the session-detail divider.
+/// Composer border policy, shared with modal frames so every popup stays visible.
+pub fn input_bar_border(focused: bool) -> Color {
+    match active_border_policy() {
+        BorderPolicy::FullBorders => session_detail_border(),
+        BorderPolicy::AccentFocusOnly if focused => focused_border(),
+        BorderPolicy::AccentFocusOnly => tier_panel(),
+    }
+}
+
+/// Modal frames match the focused composer, including operator color overrides.
 pub fn overlay_border() -> Color {
-    surface2()
+    input_bar_border(true)
 }
 pub fn overlay_title() -> Color {
     text()
@@ -1848,7 +1907,7 @@ pub fn suggestion_desc() -> Color {
     overlay0()
 }
 pub fn suggestion_border() -> Color {
-    surface1()
+    overlay_border()
 }
 pub fn visual_selection_bg() -> Color {
     border_override(6).unwrap_or_else(surface2)
@@ -2141,6 +2200,51 @@ mod tests {
         pin_theme_state()
     }
 
+    #[test]
+    fn popup_frames_match_input_bar_in_every_theme_and_follow_overrides() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let _guard = theme_test_guard();
+        clear_theme_role_overrides();
+        for index in 0..theme_count() {
+            set_theme_by_index(index);
+            for block in [
+                overlay_block(),
+                taskrabbit_overlay_block(),
+                blank_overlay_block(),
+                unfocused_overlay_block(),
+            ] {
+                let area = Rect::new(0, 0, 12, 5);
+                let mut buffer = Buffer::empty(area);
+                block.render(area, &mut buffer);
+                for (x, y, symbol) in [
+                    (0, 0, "┌"),
+                    (11, 0, "┐"),
+                    (0, 4, "└"),
+                    (11, 4, "┘"),
+                    (0, 2, "│"),
+                    (5, 4, "─"),
+                ] {
+                    assert_eq!(buffer[(x, y)].symbol(), symbol, "{}", active_theme_key());
+                    assert_eq!(
+                        buffer[(x, y)].fg,
+                        input_bar_border(true),
+                        "{}",
+                        active_theme_key()
+                    );
+                    assert_ne!(buffer[(x, y)].fg, overlay_bg());
+                }
+            }
+            let role = if active_border_policy() == BorderPolicy::FullBorders {
+                ThemeRole::Border
+            } else {
+                ThemeRole::FocusedBorder
+            };
+            set_theme_role_override(role, Some([222, 133, 77]));
+            assert_eq!(overlay_border(), Color::Rgb(222, 133, 77));
+            set_theme_role_override(role, None);
+        }
+    }
+
     fn wcag_relative_luminance(color: Color) -> f64 {
         let Color::Rgb(r, g, b) = color else {
             panic!("opaque contrast matrix requires RGB colors, got {color:?}");
@@ -2181,19 +2285,19 @@ mod tests {
     }
 
     #[test]
-    fn modal_borders_follow_session_detail_divider_color() {
+    fn modal_borders_follow_focused_input_bar_color() {
         let _guard = theme_test_guard();
 
-        // Modal frames share the theme's session-detail divider color.
+        // Modal frames share the focused input bar's color.
         assert!(set_theme_by_name("goth"));
         assert_eq!(focused_border(), Color::Rgb(181, 138, 215));
-        assert_eq!(overlay_border(), surface2());
+        assert_eq!(overlay_border(), input_bar_border(true));
 
         assert!(set_theme_by_name("junkyard"));
         assert_eq!(focused_border(), Color::Rgb(30, 185, 128));
-        assert_eq!(overlay_border(), surface2());
+        assert_eq!(overlay_border(), input_bar_border(true));
 
-        // Every theme keeps modal borders aligned with the session-detail divider.
+        // Every theme keeps modal borders aligned with the focused input bar.
         for i in 0..theme_count() {
             set_theme_by_index(i);
             let key = theme_key(i);
@@ -2204,8 +2308,8 @@ mod tests {
             );
             assert_eq!(
                 overlay_border(),
-                surface2(),
-                "{key}: modal border should match session-detail divider"
+                input_bar_border(true),
+                "{key}: modal border should match focused input bar"
             );
         }
 

@@ -66,6 +66,7 @@
 //!    panics — cannot wedge its logical root forever.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -128,6 +129,10 @@ pub(crate) struct OutstandingGrant {
 #[derive(Debug, Default)]
 pub(crate) struct AgentMessageArbiter {
     state: Mutex<ArbiterState>,
+    // The monitor already holds this per-manager shared object at every native
+    // turn boundary. Closing admission here lets drain stop new turns without
+    // interrupting the one currently running.
+    turn_admission_closed: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +146,14 @@ impl AgentMessageArbiter {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn close_turn_admission(&self) {
+        self.turn_admission_closed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn turn_admission_closed(&self) -> bool {
+        self.turn_admission_closed.load(Ordering::Acquire)
     }
 
     /// The exact argument [`plan_dispatch_tick`]'s

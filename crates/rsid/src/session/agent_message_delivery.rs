@@ -282,7 +282,7 @@ fn build_admission_request(
 /// which is the point: they are assertions the claim re-checks under
 /// `BEGIN IMMEDIATE`, so re-reading them here would launder a stale snapshot
 /// into a fence that always agrees with itself.
-fn build_claim_request(
+pub(crate) fn build_claim_request(
     grant: &ArbitrationGrant,
     delivery_model_invocation_id: Uuid,
     delivery_boot_id: Uuid,
@@ -958,7 +958,7 @@ fn rejected_admission(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bus::EventBus;
     use crate::model_control::call_control::ModelCallSettlementWorker;
@@ -1161,7 +1161,7 @@ mod tests {
         }
     }
 
-    fn tracked(session: rsi_common::types::Session) -> TrackedSession {
+    pub(crate) fn tracked(session: rsi_common::types::Session) -> TrackedSession {
         let session_id = session.id;
         let (stop_tx, _stop_rx) = tokio::sync::mpsc::channel(1);
         TrackedSession {
@@ -1172,13 +1172,16 @@ mod tests {
             process: None,
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             rotation: crate::session::rotation_coordinator::RotationCoordinator::new(
                 session_id, 0, false,
             ),
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence: rsi_common::types::ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,

@@ -92,6 +92,7 @@ fn dhat_heap_baseline() {
             output_tokens: None,
             context_window: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

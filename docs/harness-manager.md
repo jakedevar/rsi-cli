@@ -1,7 +1,8 @@
 # Harness manager
 
-The harness manager is an ordinary session appointed by the operator to coordinate
-feature Epics in one project. V1 supplies scoped progress and durable request/reply
+The root harness manager is an ordinary session appointed by the operator to coordinate
+feature Epics in one project. Area nodes can hold narrower grants for disjoint
+Groups or Epics in that project. V1 supplies scoped progress and durable request/reply
 mail. V2 adds a separate, explicit policy for persistent operating intent, bounded
 control, work evidence and exact operator decisions. An existing appointment gains
 no mutation capabilities automatically. Feature leads retain their own identities,
@@ -14,8 +15,9 @@ work and normal worker controls.
 > `:manager appoint` / `:manager scope` save, even an identical one, bumps the
 > scope version and revokes the saved policy and all in-flight manager mail, so
 > a re-appoint after a policy save silently undoes the grant. There is one
-> manager seat per project: appointing a new session displaces the current
-> manager. A policy save does not state what it granted, and Enter/Space cycles
+> legacy root seat per project: appointing a new root session displaces the current
+> root. Area nodes have separate seats and explicit narrower grants. A policy
+> save does not state what it granted, and Enter/Space cycles
 > the preset row, so a save can land as Observe (mode `monitor`, no
 > capabilities). Confirm the result by asking the manager to run
 > `AgentManagerInspect {}`: the policy must name that session, read
@@ -57,6 +59,52 @@ its selection. Scope edits revoke old mail and fence the old policy/actions. Reo
 retains a revoked grant's exact saved values and labels it revoked. Opening grants
 nothing; explicitly saving regrants the displayed draft under the current scope.
 
+## Area manager nodes
+
+The operator can inspect the current project's nodes with `:manager node list`
+and `:manager node get <node UUID>`. The same reads are available through the
+operator RPCs `ListManagerNodes` and `GetManagerNode`, both with `project_id`.
+The result reports each stable node ID, seat root, scope, grant state and versions,
+authority epoch, and direct-report count.
+
+`ConfigureManagerNode` appoints an area seat when `node_id` is null and edits an
+existing leaf area node when `node_id` is set. The operator supplies a selected
+Group/Epic scope, a grant and matching policy, observed parent grant/policy/epoch
+versions, the observed child grant version (zero for a new node), and an
+idempotency key. `:manager node configure <JSON>` sends the same typed request.
+The daemon requires strictly narrower scope, capabilities and finite allowances;
+it rejects sibling overlap and aggregate capacity excess. An Epic move that would
+create sibling overlap is refused. An edit bumps the node grant version and epoch.
+An active manager can use `AgentManagerDelegateNode` to create or replace a
+direct child grant. Its request has the same grant and version fields but no
+`project_id`: the daemon derives the project from the parent node and verifies
+that the caller is the parent's current seat inside the grant transaction.
+Completed, revoked, stale and unrelated seats cannot delegate. The operator
+retains `ConfigureManagerNode` and `RevokeManagerNode` for every node.
+To set a stricter root direct-report cap, configure the root node with
+`parent_node_id` set to the nil UUID, all expected parent versions set to zero,
+the current root selector, seat, policy and grant unchanged except for
+`grant.max_direct_reports`, and the observed root grant version. The cap can be
+one through five and cannot fall below the current live direct-report count.
+
+`RevokeManagerNode` retires a node and its descendants together. The operator
+supplies the observed grant version, authority epoch and an idempotency key;
+`:manager node revoke <node UUID> <epoch>` reads the current grant version and
+rejects a changed epoch. An identical RPC retry returns its original result.
+Root appointment and policy remain under the existing `:manager appoint`,
+`:manager scope` and `:manager policy` commands. While area delegates are active,
+a root appointment, scope or policy edit, pause, or clear is refused. Revoke the
+child nodes first, then make the root change. Clearing an appointment removes
+its current scope projection row; immutable grant records remain for audit.
+
+Managers can submit `AgentManagerEscalate` with a subject and a fenced parent
+route or two Epic owners. The daemon addresses the nearest common ancestor of
+the two current deepest owners. `AgentManagerListEscalations` reads the
+current node's addressed and sent records. `AgentManagerResolveEscalation`
+records a ruling or forwards to its parent. The record and event history survive seat
+succession. Stale grants, custody or revoked ancestors refuse new effects;
+manager rulings never answer an operator approval.
+
 ## Policy (`:manager policy`)
 
 Use `j`/`k`, arrows or Tab/Shift-Tab to move. Enter/Space toggles or cycles a choice,
@@ -97,7 +145,7 @@ grants`).
 | --- | --- |
 | Observe | Monitor mode with no write grants. |
 | Execute | Work/evidence coordination, lead control, session creation, lead assignment, integration evidence, explicit manager self-succession, scoped session control and project Issue coordination. |
-| Full project control | Execute permissions plus topology management and Operator delegation (`operator_call` against the closed allowlist; see Operator delegation below). Whole-project scope can newly enable root Group creation; selected scope retains its existing explicit grants. |
+| Full project control | Every capability: Execute permissions plus topology management, Operator delegation (`operator_call` against the closed allowlist; see Operator delegation below), GitEffect, Automation, StorageControl, DaemonSettings and Deploy (operator directive 2026-09-30). Whole-project scope can newly enable root Group creation; selected scope retains its existing explicit grants. A Full policy saved before a grant joined the preset keeps its exact grants and shows as Custom until the operator re-applies Full and saves. |
 | Custom | The exact effective policy, including legacy settings and individual overrides. |
 
 Grants are operator-owned and never widened automatically. A policy saved as
@@ -131,21 +179,46 @@ Budgets section.
 | Grant SessionCreate / LeadAssign | Session creation and lead assignment are separate permissions and separate actions, including a vacant Epic's first child. |
 | Grant SelfSuccession | Permit the current parentless Standard manager to reserve its own successor with a committed handoff and a permitted launch choice. Legacy policies do not gain this permission automatically. |
 | Grant Integration | Record independently checked integration evidence at an exact target commit. This is not a shell or Git merge API. |
-| Grant GitEffect | Advance an integration target ref (fast-forward or two-parent merge) through the guarded rolling merge engine. Distinct from `Integration` which records evidence only; a policy with `Integration` but not `GitEffect` cannot move a ref. Not included in Execute or Full presets; the agent-managed preset (Slice 4) grants it. |
+| Grant GitEffect | Advance an integration target ref (fast-forward or two-parent merge) through the guarded rolling merge engine. Distinct from `Integration` which records evidence only; a policy with `Integration` but not `GitEffect` cannot move a ref. Granted by Full project control (since 2026-09-30), not by Execute. |
 | Grant SessionControl | Permits `AgentHalt`, `AgentContinueChild` and `AgentSendMessage` against Epic leads and their descendants inside the manager's live scope (Execute mode, not paused, no pending operator question, approval or pause on the target). Read-only `AgentGetStatus`/`AgentGetProgress`/terminal-watch reach over scoped sessions needs appointment scope only. Also permits the `archive_session`, `restore_session` and `update_session` housekeeping actions on one scoped leaf (see Scoped session housekeeping). Leads and workers never inherit it. |
 | Grant IssueCoordinate | Permit the current appointed manager to use the guarded Issue controls project-wide, alongside the current owning-Epic lead path: the reads (`AgentListIssues`, `AgentGetIssue`, `AgentListIssueEvents`) and the four CAS mutations (`AgentUpdateIssue`, `AgentUpdateIssueStatus`, `AgentArchiveIssue`, `AgentRestoreIssue`). Each manager mutation is audited in `issue_events` with actor `manager` (its own session ID and request key, no owning Epic); the grant and live scope are rechecked inside the mutation transaction. This does not expose operator-only generic Issue RPC or ProgramRun, and revocation takes effect within the next Issue transaction. |
 | Grant OperatorDelegation | Permit `AgentManagerControl` `operator_call` (Execute mode, not paused) to invoke one method from the closed, versioned `DELEGABLE_OPERATOR_METHODS` allowlist against a leaf in the manager's own project. See Operator delegation below. |
+| Grant DaemonSettings | Permit the current appointed manager to change the operator-allowlisted daemon settings (maximum sandbox roots, sandbox minimum free GiB, the reclaim watermarks) through `AgentManagerControl` `operator_call` `ProposeDaemonSetting`, only inside the per-key bounds the operator sets under "Daemon settings · manager bounds" (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; needs no other grant. Spend, credentials, appointment and scope stay operator-only. See Operator delegation below. |
+| Grant StorageControl | Permit the current appointed manager to read sandbox storage status and run the bounded build-cache reclaim (preview or real pass) through `AgentManagerControl` `operator_call` (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; `OperatorDelegation` is not required and does not imply it. Daemon storage settings stay operator-only. See Operator delegation below and `docs/sandbox-storage.md`. |
+| Grant Deploy | Permit the current appointed manager to call `AgentRequestDeploy` (#1045): stage already-built binaries from a `binaries_dir`, wait for a quiet point (no lander or job running, no scoped worker mid-turn; bounded by `max_wait_secs`, default 900, at most 3600), then have the daemon swap them in and restart under `rsid-supervisor.sh` (exit 75, provider environment intact) and wake the caller once with the outcome. Needs Execute mode and no pause at call time. Off by default; granted by Full project control (since 2026-09-30), not by Execute; it is not a daemon setting. Refused `deploy_needs_supervisor` when the daemon is not run by the supervisor script, and `deploy_restart_budget` after two deploy restarts in an hour. Cut-off workers follow the normal restart recovery rules. |
 | Grant Automation | Permit the current appointed manager to author, execute, interrupt and resolve deterministic topologies on in-scope Epics through the six `AgentTopology*` verbs (#633). Every session node's explicit provider/model/effort must equal an `allowed_launches` entry (empty fails closed); manager-requested node launches charge the created-session quota; effects need Execute mode and no pause. Distinct from `Topology` (containers). Discarding preserved work is manager-only and needs the exact preserved commit. |
 | Grant Group / Grant Group by ID | Select existing project Groups (at most 32). Enter an ID if it is not cached in the session list. |
 | Allow root Group creation | Separate root-creation opt-in; also requires Topology. |
 | Created container / session quota | Persistent creation ceilings: 0–64 containers and 0–1024 sessions. Defaults are zero. Policy edits do not reset scope usage. Manager workers, `retry_lead`, `replace_lead` and root successions consume the session quota. DB-native reviewer launches do not; they stay bounded by per-work review rounds and the active session limit. A blocked or revoked operation that never created its session is not charged (queued, running, failed and uncertain operations are). |
 | Active session limit | 1–100, default 4; applies alongside existing provider/Model Control admission. |
+| Tier-2 minimum reviewer | Local, Standard (default), or Premium. Enter cycles the value. A work row marked `risk_tier: "tier2"` requires a DB-native reviewer at or above this model tier; use Tier-2 for authority, custody, and migration changes. The field is saved through the same operator policy RPC as the other budgets. |
 | Provider active limits | Optional 1–64 ceiling per provider. Blank removes the override and uses the overall policy. |
 | Allowed launches | Empty permits any valid explicit manager launch but holds automatic intent recovery. Adding entries restricts launches to those exact choices (up to 32) and enables intent recovery to choose among them, subject to its other gates. Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. Default effort means no explicit effort; it is not an effort wildcard. Enter on Remove deletes that draft choice; removing the last entry restores unrestricted explicit choices and holds intent recovery. Use currently configured valid model/effort values. |
 | Recovery attempt limit | 0–32 persisted attempts; default zero disables automatic recovery allowance. Existing retry owners and kill-switches still apply. |
 | Retry delay | 1–86400 seconds, default 60. Waiting for a due time remains an outstanding obligation. |
 | Request timeout | 30–604800 seconds, default 900. Expiration records a blocker/recovery obligation, never invented completion. |
 | Spend cap (USD) | Optional positive finite amount; blank removes the cap. Unknown usage remains unknown; a finite cap cannot treat an unproved balance as zero. |
+
+### Start a manager worker directly
+
+The current manager can create a worker under an in-scope Epic without asking
+that Epic's lead to spawn it. In Execute mode, grant `SessionCreate`, set a
+positive created-session quota, and choose an allowed provider/model/effort
+tuple. The Epic's legal child kinds are `Story`, `Task`, `Bug`, `Feature`,
+`Refactor`, and `Research`. `Standard` is not legal under an Epic. The normal
+active, provider, spend, pause, and custody gates still apply. Each successful
+worker creation consumes the manager's lifetime created-session quota.
+
+Use `AgentManagerPrepareControl` with the semantic operation below, then pass
+its exact `prepared_id` and `target_digest` to
+`AgentManagerCommitPreparedControl` with a stable idempotency key. Read the
+returned `operation_id` with `AgentManagerGetAction` to confirm the outcome.
+The prepared action resolves current scope and target fences; a stale result
+needs a fresh prepare. Lead assignment is a separate `assign_lead` action.
+
+```json
+{"operation":{"action":"create_session","parent_id":"<epic-uuid>","kind":"Task","query":"Implement the assigned work","launch":{"provider":"Codex","model":"gpt-6-sol","effort":"medium"}}}
+```
 
 The provider rows are Claude, Codex, Pioneer, Local, Antigravity, CodexAppServer and
 Harness. Catalog errors, cancelled selection and unavailable legacy choices
@@ -182,6 +255,12 @@ predecessor is durably terminal, absent from the active map and its process
 cohort is reaped to a fixed point. A queued exact resume or lead repair is then
 no longer fenced. Settlement appends `action_settled` evidence; it never
 rewrites the original request or re-executes an effect.
+
+`pause_lead` is not refused for the lead's own enabled `resume` wakes (#1042).
+Its success suspends them in the same transaction (disabled, never deleted;
+program guards and manager watches are left alone) and records exactly which
+jobs in `daemon_settings` key `manager_suspended_wakes:<lead>`; a succeeded
+`resume_lead` re-enables exactly those jobs. Operator holds still refuse.
 
 `settle_uncertain_action {operation_id, expected_row_version}` asks the daemon
 to re-observe one uncertain action in the manager's project and scope. It needs
@@ -611,7 +690,9 @@ AppServer lead or has no captured provider session id returns
 `manager_v2_resume_unavailable` (`next_action: retry_lead`) at admission, and
 such a lead is always retry-admissible. If the id is lost after admission, the
 receipt outcome carries the same code. Other unconfirmed resume failures remain
-`manager_v2_lifecycle_unconfirmed`.
+`manager_v2_lifecycle_unconfirmed`. A launch refused because the sandbox
+execution scratch is unavailable (for example a sandbox root on tmpfs) records
+`manager_v2_execution_scratch_unavailable` in the receipt outcome.
 
 The additive action receipt fields are `action_kind`, `target_type`, durable `state`
 and optional typed `result`, alongside the existing operation ID, target session ID,
@@ -689,6 +770,18 @@ exact source using the bounded `launch` choice. Allocation progresses durably
 through `reserved`, `allocating`, and `active`; terminal states are `submitted`,
 `superseded`, `cancelled`, or `failed`. Re-review creates a new assignment and
 keeps prior assignments and receipts as history.
+
+Mark authority, custody, and migration work as `risk_tier: "tier2"` in its
+`work` update. The default for older work records and omitted updates is
+`tier1`. A Tier-2 `request_review` refuses a launch below the operator's
+`minimum_tier2_reviewer_tier`. For a fix addressing an earlier reviewer's
+findings, set `delta_of` to that `changes_requested` assignment ID and
+`finding_keys` to the exact finding keys being resolved. The daemon verifies
+the earlier receipt, same work and spec revision, changed source, and keys.
+That review may use the original reviewer's model family; the author and its
+custody lineage remain excluded, and the three-round review budget still
+applies. The reviewer prompt names the prior assignment and requested keys
+while retaining the required exact-source checks.
 
 The assigned reviewer submits exactly one receipt during its bound invocation.
 The receipt contains only a verdict and bounded findings; it does not use an
@@ -954,12 +1047,56 @@ housekeeping above: reach is the manager's whole **project** (any leaf whose
 executable surface is a closed, versioned allowlist rather than three fixed
 actions.
 
-The current allowlist is `DELEGABLE_OPERATOR_METHODS` v2:
+The current allowlist is `DELEGABLE_OPERATOR_METHODS` v4:
 
 - `ArchiveSession` — logical-only, same retention table as below.
 - `GetArchiveCleanupStatus` — read-only.
 - `ListSessions` — project-bound, byte-bounded page.
 - `UnarchiveSession` — logical restore (added in v2).
+- `GetSandboxStorageStatus` — the bounded storage preview (added in v3, #1043).
+- `RunSandboxBuildCacheReclaim` — one bounded reclaim pass, params
+  `{"dry_run": bool}` (added in v3, #1043).
+- `ProposeDaemonSetting` — change one curated daemon setting inside the
+  operator's bounds, params `{"key", "value", "reason"}` (added in v4, #1046).
+
+The first four need `OperatorDelegation`. The last two need the separate
+`StorageControl` grant instead (`OPERATOR_DELEGATION_METHODS` and
+`STORAGE_CONTROL_OPERATOR_METHODS` partition the allowlist); holding only one
+of the two grants never reaches the other's methods. `StorageControl` is off by
+default, appears as the operator's `:manager policy` "Grant Storage control"
+row, and is granted by Full project control (not Execute). A delegated storage call has no session target, so it
+carries no `OperatorCallFenceV1`; admission is the grant, Execute mode and
+`paused == false`, re-run at effect time, and the receipt carries the bounded
+report. The delegated pass uses the daemon's configured watermarks, TTL and
+pass limits: the params carry no threshold, and daemon settings
+(`UpdateDaemonConfig`) stay operator-only. The pass runs under the trigger
+labels `manager_dry_run`, `manager_actual` and `preview`.
+
+**Daemon settings (`DaemonSettings`, #1046).** `ProposeDaemonSetting` needs the
+third, separate grant. `DELEGABLE_OPERATOR_METHODS` is partitioned three ways
+(`OPERATOR_DELEGATION_METHODS`, `STORAGE_CONTROL_OPERATOR_METHODS`,
+`DAEMON_SETTINGS_OPERATOR_METHODS`); no grant reaches another's methods. The
+grant is off by default and granted by Full project control, not Execute (the operator's `:manager policy` "Grant
+Daemon settings" row). It is inert until the operator also bounds a key: the
+policy's `daemon_setting_bounds` (default empty) holds `{key, min, max}` per key
+and the `:manager policy` "Daemon settings · manager bounds" rows edit them
+(`MIN-MAX`, blank means not adjustable). The curated allowlist is
+`MANAGER_ADJUSTABLE_DAEMON_SETTINGS` in `rsi-common::manager_daemon_settings`:
+`sandbox_max_source_roots` (Maximum sandbox roots),
+`sandbox_min_free_gib`, `sandbox_build_cache_reclaim_high_watermark_pct` and
+`sandbox_build_cache_reclaim_low_watermark_pct`, each with the daemon's own hard
+range that the operator's bounds must sit inside. Spend policy, credentials,
+appointment and scope are not in the table and stay operator-only
+(`UpdateDaemonConfig` stays in `NEVER_DELEGABLE`). A proposal is checked at
+admission and again at effect time against the grant's current policy, so a
+tightened bound refuses queued work. It is applied through the same validate,
+persist and publish steps as `UpdateDaemonConfig` (the daemon's own invariants,
+such as low watermark below high, still apply), under the shared daemon-config
+write lock. The `AgentManagerControl` `idempotency_key` replays a retry without a
+second effect; the reason is stored in the action payload and the receipt
+carries `{key, previous, value, reason}`, so the Actions inspection (and the TUI
+board Actions view, which titles the row `Daemon setting · key → value · state`)
+is the audit journal. No migration: the bounds ride in the policy JSON.
 
 A method outside the allowlist is refused `manager_v2_operator_method_not_delegable`
 before it reaches any handler — this is true of every non-allowlisted `rpc.rs`
@@ -974,8 +1111,8 @@ workflows, schedulers and generation calls (spend outside manager quotas);
 `ContinueSession`/`InterruptSession`/`MarkPendingArchive` (K14_PAUSE — an
 operator continue clears manager pause; halt already exists under
 `SessionControl`); deletion and undeletion of any kind; daemon-global custody
-(`GetSandboxStorageStatus`, `RunSandboxBuildCacheReclaim`, the source-worktree
-cohort family); `ProgramRun`/Closure kernels; the generic Issue verbs (the
+(the source-worktree cohort family; sandbox storage status and build-cache
+reclaim are delegable only under `StorageControl`); `ProgramRun`/Closure kernels; the generic Issue verbs (the
 guarded `IssueCoordinate` path covers Issues instead); and streaming, memory
 writes and cache clears. A test asserts: every allowlisted and every
 `NEVER_DELEGABLE` name is a real `rpc.rs` arm; the two sets are disjoint; and
@@ -996,9 +1133,13 @@ non-leaf target, refuses `manager_v2_target_out_of_project` /
 
 | Refusal code | When |
 | --- | --- |
-| `manager_v2_operator_method_not_delegable` | Method is not one of the four allowlisted methods |
+| `manager_v2_operator_method_not_delegable` | Method is not one of the seven allowlisted methods |
 | `manager_v2_operator_params_invalid` | Params fail decode or shape validation for the method |
-| `manager_v2_capability_denied` | Caller lacks the `OperatorDelegation` grant |
+| `manager_v2_capability_denied` | Caller lacks the `OperatorDelegation` grant (or, for the two storage methods, the `StorageControl` grant; for `ProposeDaemonSetting`, the `DaemonSettings` grant) |
+| `manager_v2_daemon_setting_not_allowlisted` | `ProposeDaemonSetting` key is not in the curated allowlist |
+| `manager_v2_daemon_setting_not_adjustable` | The operator set no bound for the key |
+| `manager_v2_daemon_setting_out_of_bounds` | Value is outside the operator's `min`/`max` |
+| `manager_v2_daemon_setting_rejected` | The daemon's own validation refused an in-bounds value |
 | `manager_v2_execute_required` | Policy mode is not `Execute` |
 | `manager_v2_policy_paused` | Policy paused, or (Archive/Unarchive) target Epic is in `paused_epic_ids` |
 | `manager_v2_operator_fence_required` | Archive/Unarchive call omitted `OperatorCallFenceV1` |

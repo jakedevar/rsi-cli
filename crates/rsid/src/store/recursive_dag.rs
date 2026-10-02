@@ -67,7 +67,7 @@ use rsi_common::types::{
     FailurePolicy, SandboxKind, SessionProvider, SessionStatus, Topology, TopologyDefinition,
     TopologyEdge, TopologyNode,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1522,7 +1522,7 @@ impl Store {
             return recursive_store_error("recursive graph limits must be positive");
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let now = timestamp_now();
         tx.execute(
             "INSERT INTO recursive_task_graphs (
@@ -1587,7 +1587,7 @@ impl Store {
         graph_id: RecursiveTaskGraphId,
         create: RecursiveDecompositionBatchCreate,
     ) -> Result<RecursiveInjectionBatch> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let committed_at = timestamp_now();
         let batch = insert_recursive_decomposition_batch_tx(&tx, graph_id, create, &committed_at)?;
@@ -1619,7 +1619,7 @@ impl Store {
         attempt_id: RecursiveAttemptId,
         executor_kind: RecursiveExecutionMode,
     ) -> Result<RecursiveTaskAttempt> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let detail = load_recursive_graph_detail(&tx, graph_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive DAG graph not found: {graph_id}"))
@@ -1720,7 +1720,7 @@ impl Store {
             block_reason.as_deref(),
         )?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let attempt =
             load_recursive_attempt_by_id(&tx, graph_id, attempt_id)?.ok_or_else(|| {
@@ -1783,7 +1783,7 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let detail = load_recursive_graph_detail(&tx, graph_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive DAG graph not found: {graph_id}"))
@@ -1832,7 +1832,7 @@ impl Store {
         &self,
         create: RecursiveTypedArtifactRoleCreate,
     ) -> Result<RecursiveTypedArtifactRoleRow> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let created_at = timestamp_now();
         insert_typed_artifact_role_tx(&tx, &create, &created_at)?;
         let row =
@@ -1861,7 +1861,7 @@ impl Store {
         &self,
         create: RecursiveTypedTestResultCreate,
     ) -> Result<RecursiveTypedTestSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let created_at = timestamp_now();
         insert_typed_test_result_tx(&tx, &create, &created_at)?;
         let row = load_recursive_typed_test_summary_tx(&tx, create.test_id)?.ok_or_else(|| {
@@ -1885,7 +1885,7 @@ impl Store {
         &self,
         create: RecursiveTypedDiffCreate,
     ) -> Result<RecursiveTypedDiffSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let created_at = timestamp_now();
         insert_typed_diff_tx(&tx, &create, &created_at)?;
         let row = load_recursive_typed_diff_summary_tx(&tx, create.diff_id)?.ok_or_else(|| {
@@ -2185,7 +2185,7 @@ impl Store {
         stop_reason: String,
     ) -> Result<RecursiveTaskGraphSummary> {
         validate_nonempty("recursive scheduler stop reason", &stop_reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let at = timestamp_now();
         if stop_reason != "cancellation_requested" {
@@ -2410,7 +2410,7 @@ impl Store {
         run_id: RecursiveSchedulerRunId,
         step_count: u32,
     ) -> Result<RecursiveSchedulerRunSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = load_recursive_scheduler_run_tx(&tx, run_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive scheduler run not found: {run_id}"))
         })?;
@@ -2469,7 +2469,7 @@ impl Store {
         report_artifact_id: Option<i64>,
         expected_mode: RecursiveExecutionMode,
     ) -> Result<RecursiveSchedulerRunSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = load_recursive_scheduler_run_tx(&tx, run_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive scheduler run not found: {run_id}"))
         })?;
@@ -2567,7 +2567,7 @@ impl Store {
         report_artifact_id: Option<i64>,
         expected_mode: RecursiveExecutionMode,
     ) -> Result<RecursiveSchedulerRunSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = load_recursive_scheduler_run_tx(&tx, run_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive scheduler run not found: {run_id}"))
         })?;
@@ -2689,7 +2689,7 @@ impl Store {
         expected_mode: RecursiveExecutionMode,
     ) -> Result<RecursiveSchedulerRunSummary> {
         validate_nonempty("recursive scheduler run failure reason", &failure_reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = load_recursive_scheduler_run_tx(&tx, run_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive scheduler run not found: {run_id}"))
         })?;
@@ -2792,7 +2792,7 @@ impl Store {
         create: RecursiveLiveAttemptCreate,
     ) -> Result<RecursiveLiveAttemptDetail> {
         validate_live_attempt_create(&create)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let context = validate_live_attempt_create_context_tx(&tx, &create, false)?;
         let live = insert_recursive_live_attempt_create_tx(&tx, &create, &context)?;
         if live.summary.task_id != context.task.id {
@@ -3208,7 +3208,7 @@ impl Store {
         id: RecursiveLiveAttemptId,
         session_id: Uuid,
     ) -> Result<RecursiveLiveAttemptDetail> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let live = load_recursive_live_attempt_tx(&tx, id)?
             .ok_or_else(|| DaemonError::Store(format!("recursive live attempt not found: {id}")))?;
         if let Some(existing_session_id) = live.summary.session_id {
@@ -3272,7 +3272,7 @@ impl Store {
         update: RecursiveLiveAttemptStatusUpdate,
     ) -> Result<RecursiveLiveAttemptDetail> {
         validate_live_attempt_status_update(&update)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let current = load_recursive_live_attempt_tx(&tx, id)?
             .ok_or_else(|| DaemonError::Store(format!("recursive live attempt not found: {id}")))?;
         validate_live_attempt_status_transition(current.summary.status, update.status)?;
@@ -3523,7 +3523,7 @@ impl Store {
         &self,
         id: RecursiveLiveInterruptId,
     ) -> Result<RecursiveLiveInterruptSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let interrupt = load_recursive_live_interrupt_tx(&tx, id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive live interrupt not found: {id}"))
         })?;
@@ -3551,7 +3551,7 @@ impl Store {
         &self,
         id: RecursiveLiveInterruptId,
     ) -> Result<RecursiveLiveInterruptSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let interrupt = load_recursive_live_interrupt_tx(&tx, id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive live interrupt not found: {id}"))
         })?;
@@ -3639,7 +3639,7 @@ impl Store {
         failure_reason: String,
     ) -> Result<RecursiveLiveInterruptSummary> {
         validate_nonempty("recursive live interrupt failure_reason", &failure_reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let interrupt = load_recursive_live_interrupt_tx(&tx, id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive live interrupt not found: {id}"))
         })?;
@@ -3776,7 +3776,7 @@ impl Store {
         graph_id: RecursiveTaskGraphId,
         create: RecursiveCancellationRequestCreate,
     ) -> Result<RecursiveCancellationRequestSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let request = request_recursive_graph_cancellation_tx(&tx, graph_id, create, None)?;
         tx.commit()?;
         Ok(request)
@@ -3787,7 +3787,7 @@ impl Store {
         run_id: RecursiveSchedulerRunId,
         create: RecursiveCancellationRequestCreate,
     ) -> Result<RecursiveCancellationRequestSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let request = request_recursive_scheduler_run_cancellation_tx(&tx, run_id, create, None)?;
         tx.commit()?;
         Ok(request)
@@ -3800,7 +3800,7 @@ impl Store {
         create: RecursiveCancellationRequestCreate,
     ) -> Result<RecursiveCancellationRequestSummary> {
         validate_cancellation_request_create(&create)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         load_recursive_graph_summary(&tx, graph_id)?.ok_or_else(|| {
             DaemonError::Store(format!("recursive DAG graph not found: {graph_id}"))
         })?;
@@ -3886,7 +3886,7 @@ impl Store {
         request_id: RecursiveCancellationRequestId,
         run_id: Option<RecursiveSchedulerRunId>,
     ) -> Result<RecursiveCancellationRequestSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let request = observe_recursive_cancellation_request_tx(&tx, request_id, run_id)?;
         tx.commit()?;
         Ok(request)
@@ -3896,7 +3896,7 @@ impl Store {
         &self,
         request_id: RecursiveCancellationRequestId,
     ) -> Result<RecursiveCancellationRequestSummary> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let request =
             load_recursive_cancellation_request_tx(&tx, request_id)?.ok_or_else(|| {
                 DaemonError::Store(format!(
@@ -3949,7 +3949,7 @@ impl Store {
         rejection_reason: String,
     ) -> Result<RecursiveCancellationRequestSummary> {
         validate_nonempty("recursive cancellation rejection reason", &rejection_reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         load_recursive_cancellation_request_tx(&tx, request_id)?.ok_or_else(|| {
             DaemonError::Store(format!(
                 "recursive cancellation request not found: {request_id}"
@@ -3993,7 +3993,7 @@ impl Store {
         to_status: RecursiveTaskLifecycleState,
         reason: Option<String>,
     ) -> Result<RecursiveTaskNode> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let at = timestamp_now();
         transition_recursive_task_state_tx(&tx, graph_id, task_id, to_status, reason, &at)?;
@@ -4025,7 +4025,7 @@ impl Store {
         task_id: RecursiveTaskId,
         instructions: String,
     ) -> Result<RecursiveTaskNode> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         ensure_recursive_node_editable_tx(&tx, graph_id, task_id)?;
         let at = timestamp_now();
@@ -4061,7 +4061,7 @@ impl Store {
         integration_strategy: Option<String>,
         verification_strategy: Option<String>,
     ) -> Result<RecursiveTaskNode> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         ensure_recursive_node_editable_tx(&tx, graph_id, task_id)?;
         let at = timestamp_now();
@@ -4144,7 +4144,7 @@ impl Store {
         reason: String,
     ) -> Result<RecursiveTaskNode> {
         validate_nonempty("reopen reason", &reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_recursive_graph_mutable_tx(&tx, graph_id)?;
         let at = timestamp_now();
         tx.execute(
@@ -4488,7 +4488,7 @@ impl Store {
         &self,
         graph_id: RecursiveTaskGraphId,
     ) -> Result<RecursiveGraphRecoveryResult> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let at = timestamp_now();
         let detail = match load_recursive_graph_detail(&tx, graph_id) {
             Ok(Some(detail)) => detail,
@@ -4569,7 +4569,7 @@ impl Store {
         reason: String,
     ) -> Result<()> {
         validate_nonempty("quarantine reason", &reason)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let at = timestamp_now();
         quarantine_recursive_task_graph_tx(&tx, graph_id, &reason, &at)?;
         tx.commit()?;
@@ -19032,6 +19032,37 @@ mod tests {
             .create_recursive_task_graph(graph_create(graph_id, root_id, max_descendants))
             .expect("create graph");
         (graph_id, root_id)
+    }
+
+    /// #980: recursive DAG writes check the graph mutability fence (a read)
+    /// before they write, so each must wait out a concurrent writer on another
+    /// connection instead of failing at once with `SQLITE_BUSY`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn recursive_dag_writes_wait_for_a_concurrent_writer_instead_of_failing_busy() {
+        let (dir, store) = test_store();
+        let (graph_id, root_id) = create_graph(&store, 8);
+        let recorded = crate::store::tests::while_another_connection_writes(
+            &dir.path().join("test.db"),
+            || {
+                store.record_recursive_execution_artifacts(
+                    RecursiveTaskGraphId(graph_id),
+                    vec![RecursiveExecutionArtifactCreate {
+                        task_id: RecursiveTaskId(root_id),
+                        attempt_id: None,
+                        kind: RecursiveExecutionArtifactKind::Inline,
+                        label: "recorded under a concurrent writer".to_string(),
+                        content: Some("waited".to_string()),
+                        uri: None,
+                        metadata: serde_json::json!({ "source": "test" }),
+                    }],
+                )
+            },
+        )
+        .expect("the artifact is recorded after the concurrent writer commits");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].label, "recorded under a concurrent writer");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]

@@ -62,6 +62,13 @@ At least one agent provider, installed and signed in:
 
 `git` is also needed at run time: sandboxes are git worktrees.
 
+RSI runs Claude Code in print mode, with a new CLI process for each resumed
+turn. It sets [`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`](https://code.claude.com/docs/en/env-vars)
+so Bash commands and subagents stay in the foreground. Claude's built-in
+background tasks end with the CLI process, and restoring their stopped-task
+notifications can abort the next follow-up without a reply. Use RSI-owned jobs
+and wakes for long builds and tests; ordinary commands can run in the foreground.
+
 ### Optional
 
 - **systemd user session** (Linux): lets `rsi` start `rsid` for you.

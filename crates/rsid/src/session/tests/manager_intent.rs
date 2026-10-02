@@ -58,6 +58,7 @@ async fn work(p: &Pilot, key: &str) {
                 ManagerWorkStageV2::Review,
                 ManagerWorkStageV2::Verification,
             ],
+            risk_tier: Default::default(),
         },
     )
     .await;
@@ -245,7 +246,7 @@ async fn stop(p: &Pilot, id: Uuid) {
     launch::drop_controller_candidate_test_stream(id);
     wait_terminal(p, id, SessionStatus::Interrupted).await;
 }
-async fn restart(p: &mut Pilot) {
+pub(super) async fn restart(p: &mut Pilot) {
     assert!(p.manager.active.read().await.is_empty());
     assert_eq!(p.manager.persistence.pending.load(Ordering::SeqCst), 0);
     let store = Store::open(&p._dir.path().join("rsi.db")).unwrap();
@@ -927,9 +928,7 @@ async fn manager_intent_dependencies_and_decisions_explain_unfinished_idle() {
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn manager_intent_live_decision_pause_and_dependency_races_refuse_at_custody_provider_boundary()
- {
+async fn manager_intent_race_scenario() {
     for gate in ["decision", "pause", "dependency"] {
         let p = pilot().await;
         work(&p, "product").await;
@@ -1015,6 +1014,37 @@ async fn manager_intent_live_decision_pause_and_dependency_races_refuse_at_custo
             .unwrap();
         assert_eq!(status, "failed");
     }
+}
+
+// #985: the race body above is pinned on the caller's stack by `#[tokio::test]`.
+// Keep the ordinary test on the default libtest thread, and pin the headroom
+// with a guard that runs the same scenario on a deliberately small stack.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_intent_live_decision_pause_and_dependency_races_refuse_at_custody_provider_boundary()
+ {
+    manager_intent_race_scenario().await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[test]
+fn manager_intent_race_scenario_has_stack_headroom() {
+    // 1.5 MiB is below the 2 MiB default libtest thread stack; the scenario
+    // must not overflow it. Guard against regressions that re-embed the huge
+    // launch state machines in the scenario future (#985).
+    std::thread::Builder::new()
+        .stack_size(1536 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("build multi-thread runtime");
+            runtime.block_on(manager_intent_race_scenario());
+        })
+        .expect("spawn guard thread")
+        .join()
+        .expect("scenario survives a 1.5 MiB stack");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

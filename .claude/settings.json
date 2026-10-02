@@ -19,9 +19,9 @@
   "mcpServers": {},
   "permissions": {
     "allow": [
-      "Edit(/home/jakedevar/rsi/.claude/commands/**)",
-      "Bash(mkdir -p /home/jakedevar/rsi/.claude/commands/_shared)",
-      "Bash(mkdir /home/jakedevar/rsi/.claude/commands/_shared)"
+      "Edit(.claude/commands/**)",
+      "Bash(mkdir -p .claude/commands/_shared)",
+      "Bash(mkdir .claude/commands/_shared)"
     ]
   }
 }

@@ -48,6 +48,11 @@ enum Operation {
 fn print_agent_verbs(writer: &mut impl std::io::Write) -> std::io::Result<()> {
     writeln!(
         writer,
+        "Start here: rsi-rpc AgentGetAuthorityCatalog  (your roles, their rules, and the controls you may call now)"
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
         "rsi-rpc agent control verbs (the only surface advertised to agents):"
     )?;
     for descriptor in agent_control_catalog_v1() {
@@ -80,6 +85,17 @@ fn is_agent_advertise_request(raw_args: &[String]) -> bool {
 
 fn main() -> ExitCode {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    // #1049: the Claude PostToolUse hook. Handled before the verb parser: it is
+    // not a verb, ignores stdin, and always exits 0 (a tool call is never
+    // failed or delayed by it).
+    if raw_args.first().map(String::as_str) == Some(rsi_common::boundary_mail_hook::HOOK_SUBCOMMAND)
+    {
+        let code = rsi_common::boundary_mail_hook::run_hook(
+            &mut std::io::stdout().lock(),
+            rsi_common::agent_rpc_client::dispatch_with_timeout,
+        );
+        return ExitCode::from(code);
+    }
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let code = run(raw_args, &mut stdout.lock(), &mut stderr.lock(), dispatch);
@@ -318,6 +334,11 @@ where
     let Some(method) = method else {
         return Err("missing <METHOD>".to_string());
     };
+    // Agent verbs take an object; an omitted `--params` means `{}` so
+    // `rsi-rpc AgentGetAuthorityCatalog` works as written.
+    if params.is_null() && AgentControlVerbV1::from_method_name(&method).is_some() {
+        params = Value::Object(serde_json::Map::new());
+    }
 
     Ok(Args {
         socket,
@@ -392,6 +413,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "AgentGetAuthorityCatalog",
                 "AgentSpawnChild",
                 "AgentReserveSuccessor",
                 "AgentGetProgress",
@@ -401,6 +423,8 @@ mod tests {
                 "AgentContinueChild",
                 "AgentArchiveChild",
                 "AgentScheduleWake",
+                "AgentCancelWake",
+                "AgentListWakes",
                 "AgentCreateIssue",
                 "AgentListIssues",
                 "AgentGetIssue",
@@ -422,12 +446,26 @@ mod tests {
                 "AgentManagerCommitPreparedControl",
                 "AgentManagerGetAction",
                 "AgentManagerWorkView",
+                "AgentManagerDelegateNode",
+                "AgentManagerEscalate",
+                "AgentManagerListEscalations",
+                "AgentManagerResolveEscalation",
                 "AgentTopologyUpsert",
                 "AgentTopologyList",
                 "AgentTopologyExecute",
                 "AgentTopologyGetExecution",
                 "AgentTopologyInterrupt",
                 "AgentTopologyResolveAttempt",
+                "AgentEnqueueLandingSource",
+                "AgentReadSessionEvents",
+                "AgentGetProviderStatus",
+                "AgentSubmitJob",
+                "AgentGetJob",
+                "AgentListJobs",
+                "AgentSendSatelliteMessage",
+                "AgentGetDaemonInfo",
+                "AgentRequestDeploy",
+                "AgentQueryFailureSignatures",
             ]
         );
         let wake_description = agent_control_catalog_v1()
@@ -443,6 +481,15 @@ mod tests {
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert!(!dispatched);
+        // #1011: the listing is exactly the declarations flagged `cli`.
+        assert_eq!(names, rsi_common::rpc_verb_registry::cli_verb_methods());
+        let listed: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|word| word.starts_with("Agent"))
+            .collect();
+        assert_eq!(listed, names);
         for method in names {
             assert!(stdout.contains(method));
         }
@@ -455,6 +502,7 @@ mod tests {
             "ConfigureHarnessManagerPolicy",
             "GetHarnessManagerState",
             "AnswerHarnessManagerDecision",
+            "GetRollingQueue",
         ] {
             assert!(!stdout.contains(operator_method));
             let (code, _, _, dispatched) = run_offline(&[operator_method, "--schema"]);
@@ -597,6 +645,35 @@ mod tests {
                 .unwrap()
                 .contains("rsi-rpc socket: /tmp/rsi-rpc-test.sock")
         );
+    }
+
+    #[test]
+    fn omitted_agent_params_dispatch_an_empty_object() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let seen = std::cell::RefCell::new(None);
+        let code = run(
+            vec!["AgentGetAuthorityCatalog".to_string()],
+            &mut stdout,
+            &mut stderr,
+            |_, method, params| {
+                *seen.borrow_mut() = Some((method.to_string(), params));
+                Ok(RpcResponse::success(
+                    Some(Value::Number(1.into())),
+                    Value::Null,
+                ))
+            },
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            seen.into_inner(),
+            Some((
+                "AgentGetAuthorityCatalog".to_string(),
+                serde_json::json!({})
+            ))
+        );
+        let (_, stdout, _, _) = run_offline(&["agent"]);
+        assert!(stdout.starts_with("Start here: rsi-rpc AgentGetAuthorityCatalog"));
     }
 
     #[test]

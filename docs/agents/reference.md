@@ -36,6 +36,7 @@ Useful validators and helpers:
 ```bash
 ./tools/install-hooks.sh
 ./scripts/check-identity-assertions.sh
+./scripts/check-personal-paths.sh
 ```
 
 `check-identity-assertions.sh` is a hard CI gate and a pre-commit check. It
@@ -43,6 +44,14 @@ rejects a test that requires an entity's OWN name to be invisible (asserting a
 string that the same file assigns to a `title`/`name`/`query` field is absent
 from rendered output). Asserting that chrome, key hints, or leaked values are
 absent is legitimate and is not flagged.
+
+`check-personal-paths.sh` is a hard CI gate and a pre-commit check (Issue
+#730). It rejects personal home paths / account names and public IP literals
+in tracked files outside `thoughts/` (historical records). Use `$HOME`, `~/`,
+repo-relative paths or placeholders (`remote.example.net`, `203.0.113.0/24`).
+The allowlist lives in `tools/check_personal_paths.py` and is deliberately tiny
+(GitHub repo slugs, the public resolver `8.8.8.8`); private, loopback, CGNAT and
+documentation ranges pass without an entry.
 
 Rust is pinned by `rust-toolchain.toml`. Use the pinned toolchain when building, testing, formatting, or linting.
 
@@ -136,7 +145,7 @@ stay absent from `AGENT_VERBS`, `READ_VERBS`, native provider tools, and the
 agent CLI catalog. See issue #35 for the outstanding audit.
 
 Hard rules:
-1. Never change schema without a versioned migration: an inline `if version < N` block in `crates/rsid/src/store/mod.rs` (see the V70 block for the pattern) plus a matching `user_version` bump in the same change. There is no separate `store/migrations/` directory. **Released migration DDL, catalog projections, and fingerprints are immutable. Never repair them in place; add a forward migration.** Mark migration-owned helper/catalog regions for the released-migration inventory and refresh it only to append the new version; CI rejects any changed existing pin relative to the base.
+1. Never change schema without a versioned migration: one new file `crates/rsid/src/store/migrations/vNNN.rs` (three-digit name; see `v139.rs` for the pattern) holding an `impl Store { fn migrate_vNNN }` with the `if version < N` block and the matching `user_version` bump. `crates/rsid/build.rs` collects the files in order into the runner table and derives `LATEST_SCHEMA_VERSION` from the highest file, so a new migration edits no shared file and never conflicts in `store/mod.rs` (which keeps only the runner). Released files are immutable. The provisional renumber tool (`tools/rolling-migration-renumber.py`) renames `v130.rs` to the next number and rewrites its declared sites; a declaration against the old inline layout must be ported first. **Released migration DDL, catalog projections, and fingerprints are immutable. Never repair them in place; add a forward migration.** Mark migration-owned helper/catalog regions for the released-migration inventory and refresh it only to append the new version; CI rejects any changed existing pin relative to the base.
 2. Never hard-delete rows without explicit user consent. Prefer logical delete, archive, or status transitions.
 3. Timestamp values must be RFC3339 with nanosecond precision.
 4. UUIDs must be lowercase canonical strings.
@@ -416,3 +425,53 @@ Types reference: `thoughts/shared/reference/types-and-interfaces.md`
 Keybindings: `docs/keybindings.md`
 
 Feature-specific details belong in docs or reference files, not in this top-level instruction file.
+
+## Shared cargo target growth (#1063)
+
+The hub builds every worker, shard, lander and sweep job against
+`~/.cargo/shared-target`. Incremental sessions from one-off builds are never
+reused and once grew `debug/incremental` to 63 GB, which tripped cargo-slot's
+30 GB free-space gate and stalled every build.
+
+- One-off builds set `CARGO_INCREMENTAL=0`: `scripts/run-rsid-test-shards.sh`,
+  `scripts/cloud-sweep.sh`, `scripts/cloud-gate.sh`, `scripts/run-rolling-qa.py`,
+  the lander's gate commands, and `scripts/cargo-slot` for lander, shard, sweep
+  and gate invocations. Interactive and worker dev builds keep incremental.
+- `~/.rsi/bin/cargo-slot` is a machine copy outside the repo. Swap it for
+  `scripts/cargo-slot` (the #1014 governor client) to get the same behaviour.
+- Under disk pressure (the sandbox build-cache reclaim's high watermark), rsid
+  also prunes stale top-level entries of `<shared target>/debug/incremental`
+  (`crates/rsid/src/shared_target_prune.rs`): entries whose newest mtime is over
+  30 minutes old, oldest first, at most 256 entries or 30 s per pass. The pass
+  takes a non-blocking exclusive `flock` on `debug/.cargo-lock`; a running cargo
+  build holds that lock, so a held lock skips the prune. It is logged as
+  "Shared target incremental prune pass completed". The target is
+  `RSI_SHARED_TARGET_DIR`, else `CARGO_TARGET_DIR`, else `~/.cargo/shared-target`.
+
+## Launch-model allowlist (#692)
+
+The operator's allowed model ids live in the daemon setting
+`launch_model_allowlist` (a list; empty means unrestricted). Set it with
+`UpdateDaemonConfig` (`rsi-rpc UpdateDaemonConfig --params
+'{"field":"launch_model_allowlist","value":"gpt-6-sol, claude-opus-5-5"}'`) or the
+TUI command `:launch-allow <ids|clear>`; `:launch-allow` alone prints it. It is
+daemon-wide, applies to the next launch without a restart, and is operator-only
+(not in the agent verb catalogs).
+
+The rule: the daemon checks the **effective** model of every launch against the
+list, before any side effect (sandbox allocation, custody, session row, model
+invocation). Effective means the request's model, else the project's
+`FLYWHEEL.md` default, else the provider's own default (Pioneer, Bedrock and
+OpenRouter fill one in). The launch is refused with a typed
+`launch_model_not_allowed: ... allowed: <list>` (as `PolicyDenied`; on
+`AgentSpawnChild` as `agent_spawn_rejected:LaunchModelNotAllowed`) when that
+model is off the list, or when no effective model can be determined (a Claude,
+Codex, Antigravity, Local or Harness launch that names none and has no project
+default). Ids compare case-insensitively and exactly after canonicalisation:
+a trailing context-variant tag (`claude-sonnet-5-5[1m]` = `claude-sonnet-5-5`)
+is dropped on both sides, and `openrouter/` (OpenRouter) or `bedrock/`
+(Bedrock) routing prefixes are aliases. Continuations and rotations re-launch
+the stored model and are preflighted the same way, before the continuation
+fence, the invocation admission and the successor custody bind, so a session
+whose resolved model is allowed keeps working and one whose model is not is
+refused with its predecessor left intact.

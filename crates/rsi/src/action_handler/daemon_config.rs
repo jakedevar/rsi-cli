@@ -80,6 +80,44 @@ pub async fn set_openrouter_model_route(app: &mut App, args: &str) {
     }
 }
 
+/// Read, set, or clear the operator launch-model allowlist from the TUI command
+/// line (Issue #692). The daemon validates and enforces it on every launch path;
+/// an empty list means unrestricted.
+#[allow(clippy::future_not_send)] // App belongs to the single-threaded event loop.
+pub async fn set_launch_model_allowlist(app: &mut App, args: &str) {
+    const FIELD: &str = rsi_common::launch_allowlist::LAUNCH_MODEL_ALLOWLIST_FIELD;
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let args = args.trim();
+    if args.is_empty() {
+        match app.client.get_daemon_config().await {
+            Ok(config) => {
+                let current: Vec<&str> = config[FIELD]
+                    .as_array()
+                    .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
+                    .unwrap_or_default();
+                if current.is_empty() {
+                    app.notify("Launch model allowlist: unrestricted");
+                } else {
+                    app.notify(format!("Launch model allowlist: {}", current.join(", ")));
+                }
+            }
+            Err(error) => app.notify(format!("Failed to read launch model allowlist: {error}")),
+        }
+        return;
+    }
+    // `clear` (or none/off) is a daemon-side spelling of the empty list.
+    match app
+        .client
+        .update_daemon_config("launch_model_allowlist", serde_json::json!(args))
+        .await
+    {
+        Ok(()) => app.notify_success(format!("Launch model allowlist updated: {args}")),
+        Err(error) => app.notify(format!("Failed to update launch model allowlist: {error}")),
+    }
+}
+
 /// Refresh the cached lifetime usage aggregate for the Settings -> Stats
 /// category (T8; 1:1 clone of `refresh_daemon_features`). Tab-scoped
 /// per-project filter (D1): reads `app.current_project_id` at fetch time,
@@ -803,7 +841,7 @@ mod tests {
     use super::{
         daemon_cycle_value_json, refresh_daemon_features, refresh_usage_stats,
         sandbox_cache_reclaim_failure_message, sandbox_cache_reclaim_success_message,
-        toggle_daemon_feature,
+        set_launch_model_allowlist, toggle_daemon_feature,
     };
     use crate::settings::DaemonFeatureValue;
     use rsi_common::sandbox_storage::{
@@ -934,6 +972,49 @@ mod tests {
             };
         }
         captured
+    }
+
+    /// Issue #692: `:launch-allow <models>` writes the operator allowlist through
+    /// `UpdateDaemonConfig`, and `clear` writes the empty-list spelling.
+    #[tokio::test]
+    async fn launch_allow_command_writes_the_allowlist_field() {
+        use crate::client::DaemonClient;
+
+        let Ok(directory) = tempfile::tempdir() else {
+            panic!("failed to create temp dir for fake daemon socket");
+        };
+        let socket = directory.path().join("daemon.sock");
+        let Ok(listener) = tokio::net::UnixListener::bind(&socket) else {
+            panic!("failed to bind fake daemon socket at {socket:?}");
+        };
+        let server = tokio::spawn(respond_to_update_daemon_config(listener, 2));
+
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = DaemonClient::new(socket);
+        let Ok(()) = app.client.connect().await else {
+            panic!("fake daemon connect failed");
+        };
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        set_launch_model_allowlist(&mut app, " gpt-6-sol,claude-opus-5-5 ").await;
+        set_launch_model_allowlist(&mut app, "clear").await;
+
+        let Ok(captured) = server.await else {
+            panic!("fake daemon task failed");
+        };
+        assert_eq!(
+            captured,
+            vec![
+                (
+                    "launch_model_allowlist".to_string(),
+                    serde_json::json!("gpt-6-sol,claude-opus-5-5")
+                ),
+                (
+                    "launch_model_allowlist".to_string(),
+                    serde_json::json!("clear")
+                ),
+            ]
+        );
     }
 
     /// (c) acceptance: `issue35_fields_emit_update_daemon_config_with_their_field`.

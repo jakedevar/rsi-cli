@@ -13,18 +13,27 @@
 //! - `title`        — AI-generated session title helpers
 //! - `types`        — supporting enums and structs
 
+mod agent_jobs_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
 pub(crate) mod agent_message_dispatcher;
 pub(crate) mod agent_message_reconciler;
+mod agent_read_events;
 pub mod agent_verbs;
 mod archive_cleanup;
+mod authority_catalog_verb;
+pub(crate) mod boundary_mail;
 mod cards;
 pub mod chain_driver;
 mod cohort_settlement;
 mod completed_transcript_cache;
+mod completion_gates_launch;
 mod context_pipeline;
+mod context_succession;
+mod daemon_info_verb;
+mod failure_signature_verb;
 mod delegated_operator;
+pub(crate) mod deploy_verb;
 mod esp_games;
 pub(crate) mod graph_executions;
 pub(crate) mod graph_runner;
@@ -48,10 +57,14 @@ mod persistence;
 pub mod preamble;
 mod projects;
 mod provider_spawn;
+mod provider_status_verb;
 mod queries;
 pub(crate) mod question;
 mod reaper;
 pub mod retention;
+mod rolling_queue_verb;
+mod satellite_message_verb;
+mod tool_policy_launch;
 #[cfg(test)]
 pub(crate) use reaper::fail_runtime_orphan_reap_for_test;
 #[cfg(all(test, target_os = "linux"))]
@@ -60,16 +73,18 @@ pub(crate) mod recursive_bridge;
 pub(crate) mod retry_policy;
 mod rotation;
 mod rotation_coordinator;
+pub(crate) mod sandbox_purge;
 pub mod spawn_coordinator;
 pub mod spawn_directive;
 mod spawn_single_flight;
-pub(crate) use spawn_single_flight::RotationPublicationGuards;
+pub(crate) use crate::store_support::spawn_single_flight::RotationPublicationGuards;
 mod summarizer;
 pub(crate) mod tag_ops;
 pub(crate) mod title;
 pub(crate) mod topology_agent_verbs;
 pub(crate) mod topology_bridge;
 pub(crate) mod topology_ops;
+pub(crate) mod transient_heal;
 pub mod types;
 pub(crate) mod until_evaluator;
 mod workflows;
@@ -111,9 +126,13 @@ use crate::openai::OpenAiClient;
 use crate::project_cache::ProjectIndex;
 use crate::provider_capabilities::CatalogRefreshReason;
 use crate::sandbox::SandboxAllocator;
+#[cfg(test)]
+use crate::sandbox::SandboxCapacity;
 use crate::session::harness::HarnessClient;
 use crate::store::Store;
 use crate::tool_registry::{ToolRegistry, register_builtin_tools};
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,6 +146,12 @@ use uuid::Uuid;
 pub(crate) struct AgentTokenRegistry {
     by_token: HashMap<String, Uuid>,
     by_session: HashMap<Uuid, String>,
+}
+
+impl crate::idea_control::AgentTokenLookup for AgentTokenRegistry {
+    fn session_for_token(&self, token: &str) -> Option<Uuid> {
+        self.get(token).copied()
+    }
 }
 
 impl AgentTokenRegistry {
@@ -245,8 +270,12 @@ pub async fn run_bounded_retry_dispatch<F, Fut>(
 pub(crate) type TopologyAgentSelf = Arc<std::sync::OnceLock<std::sync::Weak<SessionManager>>>;
 
 pub struct SessionManager {
+    /// Deploy drain (#1073): holds new child work while a deploy waits.
+    pub(crate) deploy_drain: Arc<crate::deploy_drain::DeployDrain>,
     /// Set before the graceful restart drain; no new provider turn may start.
     pub(super) restart_draining: std::sync::atomic::AtomicBool,
+    /// Operator-requested DRAIN restart, distinct from the hard signal path.
+    pub(super) drain_restart_requested: std::sync::atomic::AtomicBool,
     pub(super) active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     pub(super) completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache,
@@ -256,6 +285,8 @@ pub struct SessionManager {
     pub(super) local_client: Option<OpenAiClient>,
     pub(super) agy_client: Option<AgyClient>,
     pub(super) harness_client: HarnessClient,
+    pub(super) harness_process_manager:
+        Arc<harness::tools::process_registry::HarnessProcessRegistryManager>,
     /// Shared S3 index registration used by construction-bound native reads.
     pub(super) codegraph_handle: Option<crate::codegraph::IndexHandle>,
     pub(super) store: Arc<tokio::sync::Mutex<Store>>,
@@ -308,9 +339,19 @@ pub struct SessionManager {
     /// Live runtime config for daemon-tunable values (e.g. retry_max_backoff_ms).
     /// Shared with RpcServer; reads are lock-free via atomics.
     pub(super) runtime_config: Arc<RuntimeConfig>,
+    /// Serialises daemon-config writes (the operator `UpdateDaemonConfig`
+    /// handler and the manager's `ProposeDaemonSetting`, #1046) so a
+    /// read-modify-write of one setting cannot lose a concurrent write.
+    pub(crate) daemon_config_update: tokio::sync::Mutex<()>,
     /// Per-session sandbox allocator. Consulted by launch_session when
     /// `LaunchConfig.sandbox` is `Some` and by Phase 3 cleanup hooks.
     pub(crate) sandbox_allocator: Arc<SandboxAllocator>,
+    /// Deterministic admission observations and call accounting for sandbox
+    /// capacity tests. This is absent from non-test daemon builds.
+    #[cfg(test)]
+    pub(crate) sandbox_allocation_test_capacities: std::sync::Mutex<VecDeque<SandboxCapacity>>,
+    #[cfg(test)]
+    pub(crate) sandbox_allocation_test_pressure_pages: std::sync::atomic::AtomicUsize,
     /// Daemon-global spawn coordinator. Consulted by `monitor_session` when
     /// it sees a `<docregblock>/spawn_child …</docregblock>` directive in
     /// assistant text. Holds per-Epic token buckets across sessions.
@@ -371,6 +412,10 @@ pub struct SessionManager {
     /// One immutable identity for this daemon process. ProgramRun claims and
     /// leases persist this witness so restart/ABA recovery can fence old work.
     pub(crate) program_run_boot_id: Uuid,
+    /// Single-flight guard for `reconcile_manager_actions_once`. Per manager,
+    /// not process-global: a global guard made concurrent managers (parallel
+    /// tests in one process) return `Ok(0)` without reconciling (#1095).
+    pub(crate) manager_action_reconcile: tokio::sync::Mutex<()>,
     /// Restart evidence is fixed for this daemon incarnation. A health read
     /// can return it even while another task holds the Store mutex.
     pub(crate) latest_daemon_restart: Option<rsi_common::rpc::DaemonRestartRecordV1>,
@@ -410,6 +455,15 @@ pub(super) fn schedule_memory_sync(
 }
 
 impl SessionManager {
+    pub async fn clear_stale_harness_process_wakes(&self) {
+        self.harness_process_manager.clear_stale_wakes().await;
+    }
+
+    pub fn install_harness_process_scheduler(&self, scheduler: crate::scheduler::SchedulerHandle) {
+        self.harness_process_manager
+            .install_scheduler_handle(scheduler);
+    }
+
     pub async fn refresh_codex_catalog_at_startup(&self) -> Result<()> {
         let client = self
             .codex_client
@@ -479,7 +533,10 @@ impl SessionManager {
         let codex_client = CodexClient::new(Arc::clone(&runtime_config)).ok();
         let local_client = OpenAiClient::new_local().ok();
         let agy_client = AgyClient::new().ok();
-        let harness_client = HarnessClient::new();
+        let agent_message_arbiter = Arc::new(agent_message_arbiter::AgentMessageArbiter::new());
+        let mut harness_client = HarnessClient::new();
+        harness_client.set_runtime_config(Arc::clone(&runtime_config));
+        harness_client.set_agent_message_arbiter(Arc::clone(&agent_message_arbiter));
 
         // Build project index from existing projects in the store.
         let projects = store.load_projects().unwrap_or_default();
@@ -524,6 +581,10 @@ impl SessionManager {
         // exhaust memory; the per-Epic token bucket is the primary throttle.
         let (spawn_tx, spawn_rx) = tokio::sync::mpsc::channel(64);
         let spawn_coordinator = Arc::new(spawn_coordinator::SpawnCoordinator::new(spawn_tx));
+        let harness_process_manager = spawn_coordinator.process_registry_manager();
+        harness_process_manager.install_store(Arc::clone(&store));
+        harness_client.set_process_registry_manager(Arc::clone(&harness_process_manager));
+        spawn_coordinator.install_runtime_config(Arc::clone(&runtime_config));
         let (successor_tx, successor_rx) = tokio::sync::mpsc::channel(64);
         spawn_coordinator
             .install_successor_sender(successor_tx)
@@ -593,7 +654,9 @@ impl SessionManager {
         }
 
         Ok(Self {
+            deploy_drain: Arc::new(crate::deploy_drain::DeployDrain::new()),
             restart_draining: std::sync::atomic::AtomicBool::new(false),
+            drain_restart_requested: std::sync::atomic::AtomicBool::new(false),
             active: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
             completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache::new(),
@@ -603,6 +666,7 @@ impl SessionManager {
             local_client,
             agy_client,
             harness_client,
+            harness_process_manager: Arc::clone(&harness_process_manager),
             codegraph_handle: None,
             store,
             custody_settlements,
@@ -629,7 +693,12 @@ impl SessionManager {
             workspace_roots,
             tool_registry,
             runtime_config,
+            daemon_config_update: tokio::sync::Mutex::new(()),
             sandbox_allocator,
+            #[cfg(test)]
+            sandbox_allocation_test_capacities: std::sync::Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            sandbox_allocation_test_pressure_pages: std::sync::atomic::AtomicUsize::new(0),
             spawn_coordinator,
             app_server_control,
             spawn_rx: Some(spawn_rx),
@@ -642,9 +711,10 @@ impl SessionManager {
             command_registry,
             agent_tokens: Arc::new(RwLock::new(AgentTokenRegistry::default())),
             program_run_boot_id,
+            manager_action_reconcile: tokio::sync::Mutex::new(()),
             latest_daemon_restart,
             spawn_epoch: Arc::new(AtomicU64::new(1)),
-            agent_message_arbiter: Arc::new(agent_message_arbiter::AgentMessageArbiter::new()),
+            agent_message_arbiter,
         })
     }
 
@@ -858,6 +928,12 @@ impl SessionManager {
 
     /// Clone the daemon-global spawn coordinator. Used by tests and any
     /// future call site that needs to dispatch directives directly.
+    /// The deploy drain shared with the deploy runner (#1073).
+    #[must_use]
+    pub fn deploy_drain(&self) -> Arc<crate::deploy_drain::DeployDrain> {
+        Arc::clone(&self.deploy_drain)
+    }
+
     pub fn spawn_coordinator(&self) -> Arc<spawn_coordinator::SpawnCoordinator> {
         Arc::clone(&self.spawn_coordinator)
     }
@@ -2081,6 +2157,39 @@ impl crate::issue_tracker::poller::SessionLauncher for SessionManager {
     ) -> Result<Uuid> {
         self.resume_scheduled_for(target, query, Some(job_ids))
             .await
+    }
+
+    async fn reconcile_transient_heal_after_resume(&self, target: Uuid) {
+        let _guard = spawn_single_flight::acquire_spawn_guard(target).await;
+        let active = self.active.read().await.contains_key(&target);
+        if !active {
+            transient_heal::heal_failed_session(&self.store, &self.event_bus, target).await;
+        }
+    }
+
+    async fn deploy_holds_resume(&self, target: Uuid) -> bool {
+        if !self.deploy_drain.is_draining() {
+            return false;
+        }
+        let has_parent = match self.store.lock().await.get_session(target) {
+            Ok(session) => session.is_some_and(|session| session.parent_id.is_some()),
+            Err(_) => false,
+        };
+        let held = self.deploy_drain.holds(Some(target), has_parent);
+        if held {
+            self.deploy_drain.note_wake_held();
+        }
+        held
+    }
+
+    async fn provider_usage_hold(&self, target: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.usage_limit_hold_for(target).await {
+            Ok(hold) => hold.map(|hold| hold.until),
+            Err(error) => {
+                tracing::warn!(%target, %error, "provider usage-limit hold unreadable; not holding");
+                None
+            }
+        }
     }
 
     async fn resume_capacity_scheduled(

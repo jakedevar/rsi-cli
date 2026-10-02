@@ -182,11 +182,14 @@ impl Store {
         let provider = frozen.provider()?;
         let model = expected.request.model.clone().or(frozen.model);
         let model = if provider == rsi_common::types::SessionProvider::Pioneer {
-            Some(crate::pioneer::pioneer_launch_model(model.as_deref()).to_string())
+            Some(
+                crate::store_support::provider_defaults::pioneer_launch_model(model.as_deref())
+                    .to_string(),
+            )
         } else if provider == rsi_common::types::SessionProvider::Bedrock && model.is_none() {
             Some(crate::bedrock::BEDROCK_DEFAULT_MODEL.to_string())
         } else if provider == rsi_common::types::SessionProvider::OpenRouter && model.is_none() {
-            Some(crate::openrouter::OPENROUTER_DEFAULT_MODEL.to_string())
+            Some(crate::store_support::provider_defaults::OPENROUTER_DEFAULT_MODEL.to_string())
         } else {
             model
         };
@@ -218,7 +221,14 @@ impl Store {
             || record.provider.as_deref() != Some(format!("{provider:?}").as_str())
             || record.backend != record.provider
             || record.model != model
-            || record.effort != expected.request.effort.clone().or(frozen.effort)
+            || !effort_matches_admission(
+                record.effort.as_deref(),
+                expected
+                    .request
+                    .effort
+                    .as_deref()
+                    .or(frozen.effort.as_deref()),
+            )
             || another
         {
             return Err(DaemonError::PolicyDenied(
@@ -227,4 +237,12 @@ impl Store {
         }
         Ok(Some(record))
     }
+}
+
+/// Whether a record's effort is consistent with the effort the successor was
+/// admitted at. Settlement back-fills the effective effort (#587) only on rows
+/// admitted without one, so a `None` admitted effort accepts whatever the
+/// settled row recorded (telemetry only); a named effort must match exactly.
+fn effort_matches_admission(recorded: Option<&str>, admitted: Option<&str>) -> bool {
+    admitted.is_none() || recorded == admitted
 }

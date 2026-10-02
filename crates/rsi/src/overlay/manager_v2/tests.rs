@@ -182,6 +182,7 @@ async fn operator_policy_edits_every_field_and_saves_current_fences() {
         }
         s.activate(Epic(epic));
         s.activate(CreateGroups);
+        s.activate(Tier2Reviewer);
         for (field, value) in [
             (Containers, "8"),
             (Sessions, "16"),
@@ -191,6 +192,7 @@ async fn operator_policy_edits_every_field_and_saves_current_fences() {
             (Deadline, "1800"),
             (Spend, "12.50"),
             (ProviderLimit(1), "2"),
+            (SettingBound(0), "4096-32768"),
         ] {
             s.apply_text(field, value).unwrap();
         }
@@ -2310,5 +2312,39 @@ async fn policy_usage_request_retained_across_same_scope_reload_is_dropped_and_t
     assert!(
         fresh.contains("Usage: sessions 153/512 created · 359 left · active 3/4"),
         "{fresh}"
+    );
+}
+
+/// #1046: the Actions journal row of a manager's daemon setting change shows
+/// the key, the new and previous value, the receipt state and the reason.
+#[test]
+fn daemon_setting_action_row_shows_key_value_previous_and_reason() {
+    let row = json!({
+        "type": "action",
+        "state": "succeeded",
+        "operation": {
+            "action": "operator_call",
+            "call": {
+                "method": "ProposeDaemonSetting",
+                "params": {
+                    "key": "sandbox_max_source_roots",
+                    "value": 16384,
+                    "reason": "wrapped to 512 with 1490 live roots"
+                }
+            }
+        },
+        "outcome": {
+            "state": "succeeded",
+            "operator_result": {
+                "shape": "scalar",
+                "method": "ProposeDaemonSetting",
+                "result": {"key": "sandbox_max_source_roots", "previous": 512, "value": 16384,
+                           "reason": "wrapped to 512 with 1490 live roots"}
+            }
+        }
+    });
+    assert_eq!(
+        board::row_title(&row),
+        "Daemon setting · sandbox_max_source_roots → 16384 · succeeded (was 512) · wrapped to 512 with 1490 live roots"
     );
 }

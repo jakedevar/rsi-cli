@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "version": 141,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v141.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:32e2e322b48d179ce9c2d2a0b18b7dadbc816d0c9b4d5022336a04a627aaa08d",
+      "sites": [
+        {
+          "anchor": "fn migrate_v141(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 141 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_reclaim_sweep::apply_identity_events_migration(self, 141)?;",
+          "replacement": "target_reclaim_sweep::apply_identity_events_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/target_reclaim_sweep.rs",
+      "path_template": "crates/rsid/src/store/target_reclaim_sweep.rs",
+      "source_blob": "sha256:85cc4d7468415b23a8af44a986c120a98c4058b6665f7bc076708469049f4743",
+      "sites": [
+        {
+          "anchor": "pub(crate) const TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION: i32 = 141;",
+          "replacement": "pub(crate) const TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

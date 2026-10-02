@@ -2100,3 +2100,158 @@ fn manager_v2_resources_reports_created_session_usage_against_the_quota() {
         serde_json::json!({"used":2,"limit":5,"remaining":3})
     );
 }
+
+fn helper_admission_request(session: &Session) -> ModelAdmissionRequest {
+    // Paid background work is denied by default, so a helper is admitted
+    // through the local (free) backend like the real title/memory callers.
+    ModelAdmissionRequest {
+        purpose: ModelInvocationPurpose::SessionTitle,
+        provider: Some("Local".into()),
+        model: Some("qwen3:4b".into()),
+        backend: Some("ollama".into()),
+        ..admission_request(session)
+    }
+}
+
+fn admit_helper(store: &Store, session: &Session) -> StoreAdmissionOutcome {
+    let request = helper_admission_request(session);
+    store
+        .admit_model_invocation(
+            Uuid::new_v4(),
+            *crate::model_control::registry::entry(request.purpose),
+            ModelTier::Local,
+            &request,
+        )
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_helper_calls_skip_the_concurrency_cap_but_obey_pause() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            max_active_sessions: 1,
+            ..Default::default()
+        },
+    );
+    let idle = clone_session(&store, &lead, config.epic_ids[0], SessionKind::Task);
+    // One running lead call fills the cap of one; a second session is refused.
+    admitted(&store, &lead);
+    assert_denied(admit(&store, &idle), "concurrency_capacity");
+    // A helper call for that same idle session is not refused by the cap and
+    // does not occupy a slot.
+    match admit_helper(&store, &idle) {
+        StoreAdmissionOutcome::Admitted(_) => {}
+        other => panic!("helper must bypass the concurrency cap, got {other:?}"),
+    }
+    assert_eq!(
+        store.manager_v2_resource_snapshot(&config).unwrap()["active_sessions"],
+        1
+    );
+    // The operator pause still stops helper calls, with the lead's refusal.
+    update_policy(&store, &config, |p| p.paused = true);
+    assert_denied(admit(&store, &idle), "policy_paused");
+    assert_denied(admit_helper(&store, &idle), "policy_paused");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_helper_calls_obey_the_spend_cap() {
+    let store = Store::open_in_memory().unwrap();
+    let (_config, lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            max_spend_usd: Some(2.0),
+            ..Default::default()
+        },
+    );
+    let first = admitted(&store, &lead);
+    complete(&store, first, 1.0);
+    let second = admitted(&store, &lead);
+    complete(&store, second, 1.0);
+    assert_denied(admit(&store, &lead), "spend_exhausted");
+    assert_denied(admit_helper(&store, &lead), "spend_exhausted");
+}
+
+/// A paid helper on the memory LLM's Remote HTTP path: provider label
+/// `Remote`, a non-loopback OpenAI-compatible endpoint (#1080).
+fn admit_paid_remote_helper(store: &Store, session: &Session) -> StoreAdmissionOutcome {
+    let request = ModelAdmissionRequest {
+        purpose: ModelInvocationPurpose::MemoryObservationExtract,
+        provider: Some("Remote".into()),
+        model: Some("gpt-test".into()),
+        backend: Some("openai_compatible_api".into()),
+        ..admission_request(session)
+    };
+    // The operator enabled paid background work for this purpose.
+    let mut entry = *crate::model_control::registry::entry(request.purpose);
+    entry.background_paid_enabled_by_default = true;
+    store
+        .admit_model_invocation(Uuid::new_v4(), entry, ModelTier::Standard, &request)
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_remote_paid_helper_is_admitted_then_obeys_pause() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+    match admit_paid_remote_helper(&store, &lead) {
+        StoreAdmissionOutcome::Admitted(_) => {}
+        other => panic!("enabled paid remote helper must be admitted, got {other:?}"),
+    }
+    update_policy(&store, &config, |p| p.paused = true);
+    assert_denied(admit(&store, &lead), "policy_paused");
+    assert_denied(admit_paid_remote_helper(&store, &lead), "policy_paused");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_remote_paid_helper_obeys_the_spend_cap() {
+    let store = Store::open_in_memory().unwrap();
+    let (_config, lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            max_spend_usd: Some(2.0),
+            ..Default::default()
+        },
+    );
+    let first = admitted(&store, &lead);
+    complete(&store, first, 1.0);
+    let second = admitted(&store, &lead);
+    complete(&store, second, 1.0);
+    assert_denied(admit(&store, &lead), "spend_exhausted");
+    assert_denied(admit_paid_remote_helper(&store, &lead), "spend_exhausted");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_remote_paid_helper_obeys_provider_usage_limits() {
+    let store = Store::open_in_memory().unwrap();
+    let (_config, lead) = fixture(&store, ManagerPolicyV2::default());
+    // A remote OpenAI-compatible call is a direct-API (Harness) call.
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &ProviderRateLimitSnapshot {
+                provider: SessionProvider::Harness,
+                status: None,
+                rate_limit_type: None,
+                overage_status: None,
+                is_using_overage: false,
+                observed_at: Utc::now(),
+                windows: vec![ProviderRateLimitWindow {
+                    window_key: "five_hour".into(),
+                    utilization: 1.0,
+                    resets_at_epoch: Some(Utc::now().timestamp() + 3600),
+                }],
+            },
+            None,
+        )
+        .unwrap();
+    assert_denied(
+        admit_paid_remote_helper(&store, &lead),
+        "provider_usage_limit",
+    );
+}

@@ -11,11 +11,11 @@ status: pending_verification
 ## Phase 1 - cross-stage linkage
 
 ### Automated
-- verification_manifest round-trips satisfies/covers
+- [PASS] verification_manifest round-trips satisfies/covers
   satisfies: F-001
 
 ### Daemon-level
-- [PENDING] rsi-rpc ListSessions returns JSON
+- [PASS] rsi-rpc ListSessions returns JSON
   - check: RSI_DAEMON_SOCKET_PATH=/tmp/rsi.sock rsi-rpc ListSessions
   - expected: stdout parses as JSON object with result key
   - satisfies: F-003

@@ -22,6 +22,12 @@ pub const HEALTH_NOTICE_UNREAD_AFTER_SECS: i64 = 30 * 60;
 pub const HEALTH_FACT_EVENT_WINDOW: i64 = 2048;
 /// Newest lead `rotation_events` rows searched for its latest rotation outcome.
 pub const HEALTH_ROTATION_EVENT_WINDOW: i64 = 256;
+/// Newest completed resume turns examined for the `lead_poll_signature` fact.
+const HEALTH_POLL_TURN_WINDOW: i64 = 8;
+/// A poll turn carries at most this many `ToolUse` events in its window.
+const HEALTH_POLL_TURN_MAX_TOOL_USES: i64 = 8;
+/// Consecutive poll turns that report `lead_poll_signature`.
+const HEALTH_POLL_TURN_MIN_RUN: usize = 3;
 /// SQL `LIMIT` for a bounded read: `HEALTH_BOUND + 1`, so one extra row
 /// detects truncation.
 const READ_LIMIT: i64 = 33;
@@ -156,6 +162,7 @@ impl Store {
         let fact = self.health_delivery_abandoned(&mut row)?;
         let rotation_refused = self.health_rotation_refused(&mut row)?;
         let retry_owner = self.health_lead_unavailable(&mut row)?;
+        let poll_signature = self.health_lead_poll_signature(&mut row)?;
         let latest_daemon_restart = self.latest_daemon_restart_record()?;
         let evidence: Vec<Value> = lead_changed
             .iter()
@@ -171,7 +178,7 @@ impl Store {
             "reports":reports, "reviews":reviews,
             "facts":{"delivery_abandoned":fact,"requests_lead_changed":lead_changed,
                 "successor_uncertain":uncertain,"rotation_refused":rotation_refused,
-                "lead_retry_owner":retry_owner},
+                "lead_retry_owner":retry_owner,"lead_poll_signature":poll_signature},
             "stuck":row.stuck,
             "latest_daemon_restart":latest_daemon_restart,
             "complete":row.truncated.is_empty(),
@@ -386,19 +393,26 @@ impl Store {
         // `pending_requests` is the capacity slot count Progress and the send
         // cap read. A reopen never reclaims a slot, so active > pending makes
         // any overshoot above the per-Epic cap observable.
-        let count = |predicate: String| -> Result<i64> {
-            Ok(self.conn.query_row(
-                &format!(
-                    "SELECT count(*) FROM harness_manager_messages m
-                     WHERE m.project_id=?1 AND m.scope_version=?2 AND m.manager_session_id=?3
-                       AND m.epic_id=?4 AND {predicate}"
-                ),
-                params![row.project, row.config.row_version, row.manager, row.epic],
-                |r| r.get(0),
-            )?)
-        };
-        let active = count(manager_request_unanswered_sql())?;
-        let pending = count(manager_request_open_sql())?;
+        let active: i64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM harness_manager_messages m
+                 WHERE m.project_id=?1 AND m.scope_version=?2 AND m.manager_session_id=?3
+                   AND m.epic_id=?4 AND {}",
+                manager_request_unanswered_sql()
+            ),
+            params![row.project, row.config.row_version, row.manager, row.epic],
+            |r| r.get(0),
+        )?;
+        let pending: i64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM harness_manager_messages m
+                 WHERE m.project_id=?1 AND m.scope_version=?2 AND m.manager_session_id=?3
+                   AND m.epic_id=?4 AND {}",
+                manager_request_open_sql()
+            ),
+            params![row.project, row.config.row_version, row.manager, row.epic],
+            |r| r.get(0),
+        )?;
         let informational: i64 = self.conn.query_row(
             "SELECT count(*) FROM harness_manager_messages m WHERE m.project_id=?1
              AND m.scope_version=?2 AND m.manager_session_id=?3 AND m.epic_id=?4
@@ -506,6 +520,112 @@ impl Store {
             row.stuck("lead_unavailable", &evidence);
         }
         Ok(owner)
+    }
+
+    /// `lead_poll_signature`: the lead's newest completed resume turns are a
+    /// run of at least [`HEALTH_POLL_TURN_MIN_RUN`] effect-free poll turns.
+    /// Advisory v1 (#1003): bounded, read-only, never a gate.
+    fn health_lead_poll_signature(&self, row: &mut Row<'_>) -> Result<Option<Value>> {
+        let Some(lead) = row.lead_id else {
+            return Ok(None);
+        };
+        // idx_model_invocations_session_id (session_id): newest completed
+        // resume turns of the lead only, bounded by HEALTH_POLL_TURN_WINDOW.
+        let turns = self
+            .conn
+            .prepare(
+                "SELECT id,started_at,completed_at FROM model_invocations
+                 WHERE session_id=?1 AND trigger_source='continue_session'
+                   AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                 ORDER BY completed_at DESC, rowid DESC LIMIT ?2",
+            )?
+            .query_map(params![lead.to_string(), HEALTH_POLL_TURN_WINDOW], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Newest-first: stop at the first turn that is not a poll turn.
+        let mut run: Vec<(String, String, String)> = Vec::new();
+        for (id, started, completed) in turns {
+            if !self.poll_turn_is_effect_free(row.config, lead, &started, &completed)? {
+                break;
+            }
+            run.push((id, started, completed));
+        }
+        if run.len() < HEALTH_POLL_TURN_MIN_RUN {
+            return Ok(None);
+        }
+        let value = json!({
+            "consecutive_poll_turns":run.len(),
+            "since":run.last().map(|turn| turn.1.clone()),
+            "latest":run.first().map(|turn| turn.2.clone()),
+            "invocation_ids":run.iter().map(|turn| turn.0.clone()).collect::<Vec<_>>(),
+        });
+        row.stuck("lead_poll_signature", &[value.clone()]);
+        Ok(Some(value))
+    }
+
+    /// True when a lead turn window carries at most
+    /// [`HEALTH_POLL_TURN_MAX_TOOL_USES`] tool uses and no durable effect by
+    /// the lead in any manager/agent/issue producer table. Ledger events are
+    /// read through the `(project, manager, scope)` index of this health
+    /// row's scope so a health page never scans the whole event log.
+    /// `julianday` normalizes RFC3339 offsets; the window is inclusive.
+    fn poll_turn_is_effect_free(
+        &self,
+        config: &HarnessManagerConfigV1,
+        lead: Uuid,
+        started: &str,
+        completed: &str,
+    ) -> Result<bool> {
+        let tool_uses: i64 = self.conn.query_row(
+            "SELECT count(*) FROM conversation_events
+             WHERE session_id=?1 AND event_type='ToolUse'
+               AND julianday(created_at) >= julianday(?2)
+               AND julianday(created_at) <= julianday(?3)",
+            params![lead.to_string(), started, completed],
+            |r| r.get(0),
+        )?;
+        if tool_uses > HEALTH_POLL_TURN_MAX_TOOL_USES {
+            return Ok(false);
+        }
+        let effect: bool = self.conn.query_row(
+            "SELECT
+               EXISTS(SELECT 1 FROM harness_manager_v2_events
+                 WHERE project_id=?4 AND manager_session_id=?5 AND scope_version=?6
+                   AND actor_session_id=?1
+                   AND julianday(created_at) >= julianday(?2)
+                   AND julianday(created_at) <= julianday(?3))
+            OR EXISTS(SELECT 1 FROM harness_manager_messages
+                 WHERE sender_session_id=?1
+                   AND julianday(created_at) >= julianday(?2)
+                   AND julianday(created_at) <= julianday(?3))
+            OR EXISTS(SELECT 1 FROM agent_spawn_requests
+                 WHERE owner_session_id=?1
+                   AND julianday(reserved_at) >= julianday(?2)
+                   AND julianday(reserved_at) <= julianday(?3))
+            OR EXISTS(SELECT 1 FROM issue_events
+                 WHERE actor_session_id=?1
+                   AND julianday(occurred_at) >= julianday(?2)
+                   AND julianday(occurred_at) <= julianday(?3))
+            OR EXISTS(SELECT 1 FROM agent_messages
+                 WHERE owner_session_id=?1
+                   AND julianday(created_at) >= julianday(?2)
+                   AND julianday(created_at) <= julianday(?3))",
+            params![
+                lead.to_string(),
+                started,
+                completed,
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(!effect)
     }
 
     /// `lead_rotation_refused`: the lead's newest rotation outcome is a

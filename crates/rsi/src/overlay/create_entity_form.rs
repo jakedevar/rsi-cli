@@ -1262,7 +1262,10 @@ fn default_effort_model(provider: rsi_common::types::SessionProvider) -> &'stati
     }
 }
 
-fn effort_ladder_for_selection(
+/// Effort levels the form offers for the effective provider/model, in order.
+/// Shared by effort cycling and the rendered Effort row so the row shows
+/// exactly the levels `e`/`E` can select.
+pub(crate) fn effort_ladder_for_selection(
     provider: Option<rsi_common::types::SessionProvider>,
     model: Option<&str>,
     selected_provider: rsi_common::types::SessionProvider,
@@ -1842,6 +1845,38 @@ mod tests {
         assert_eq!(default, first_opus);
     }
 
+    /// The Effort row renders exactly this ladder, so it must follow the
+    /// selected model (matching the Claude CLI's `supportedEffortLevels`).
+    #[test]
+    fn effort_ladder_for_selection_follows_the_selected_model() {
+        use rsi_common::types::SessionProvider::{Claude, Codex};
+        let ladder =
+            |provider, model| effort_ladder_for_selection(Some(provider), model, Claude, None);
+        assert_eq!(
+            ladder(Claude, Some("claude-opus-5")),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            ladder(Claude, Some("claude-sonnet-4-6")),
+            ["low", "medium", "high", "max"]
+        );
+        // Zero-effort models keep the provider baseline (see
+        // `effort_cycle_falls_back_for_zero_effort_model`).
+        assert_eq!(
+            ladder(Claude, Some("claude-haiku-4-5-20251001")),
+            rsi_common::model_utils::effort_ladder("claude-opus-5-5")
+        );
+        // No model chosen: the provider default's ladder.
+        assert_eq!(
+            ladder(Claude, None),
+            rsi_common::model_utils::effort_ladder("claude-opus-5-5")
+        );
+        assert_eq!(
+            ladder(Codex, None),
+            rsi_common::model_utils::effort_ladder("gpt-6-astra")
+        );
+    }
+
     fn test_app() -> App {
         DevState::clear();
         PersistedState::default().save();
@@ -1910,6 +1945,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

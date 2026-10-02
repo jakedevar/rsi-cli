@@ -6,6 +6,16 @@ host the daemon and either can initiate SSH. Choose the initiator based on
 which direction the network permits. Phase 0 provides the dial-home systemd
 unit as the default for laptops that cannot accept inbound connections.
 
+## Global polling switch
+
+`Satellite polling` (the daemon setting `satellite_polling_enabled`, also a row
+under Settings → Satellites) is the operator's global off switch for hub
+polling. With it off, the hub poller stops scheduling registry-driven probes and
+link inspections on its next tick: no peer socket is dialled. Paired-peer
+registry rows and cached observations are retained, so disabling polling is not
+a delete. Polling resumes on the next tick once the switch is turned back on,
+with no daemon restart. It defaults to on.
+
 ## Dial-home: satellite initiates SSH
 
 The laptop opens SSH to the hub and reverse-forwards its local `rsid` socket to
@@ -20,7 +30,7 @@ use a known installed path for the helper script.
 For this hub and laptop name:
 
 ```bash
-~/rsi/scripts/satellite/install.sh arch-laptop jakedevar@192.168.50.21 --port 22
+~/rsi/scripts/satellite/install.sh arch-laptop you@laptop.example.net --port 22
 ```
 
 The general form is:
@@ -145,6 +155,35 @@ reports `provider_openrouter_available=false`; the operator must configure its
 OpenRouter credential in that laptop's RSI vault before scheduling OpenRouter
 sessions there. Do not copy the hub's provider credential into a tunnel config.
 
+## Hub registry and cached session view
+
+In the hub TUI, open **Settings → Integrations → Satellites → Satellite
+registry**. The browser uses the hub daemon socket throughout. Its remote
+session rows are cached observations labeled by both peer ID and remote
+session ID; selecting one cannot run a local session action. Offline peers
+retain their last observation with a stale badge and age. The browser never
+starts a daemon or connects the TUI directly to a peer.
+
+After installing a tunnel, add a disabled peer, then add its local socket link
+under `~/.rsi/satellites/` on the hub. A dial-home link uses the reverse
+forwarded socket; a direct link uses the local forwarded socket and its SSH
+target. Record the operator-owned SSH trust reference for each link. Enable
+the peer and link, select the link, then press `p` to probe its installation
+and daemon incarnation IDs. Compare the installation ID with the intended
+peer before entering it as the peer's expected installation ID and enabling
+session reads. The background poller only reads enabled, paired peers. It
+checks every enabled link for that peer before accepting a snapshot, so an
+identity conflict quarantines the peer even if another link answers.
+
+Use `R` on a peer only after repairing its SSH trust or reconciling a
+replacement installation. This explicit acknowledgement clears quarantine
+to a degraded state; a fresh identity check is still required before the peer
+is healthy. Editing a label or link does not clear quarantine. `r` refreshes
+the browser; `n` and `b` page through up to 30 cached sessions at a time.
+The hub registry stores no provider credentials and grants no per-method
+restriction to a forwarded daemon socket. Restrict the hub Unix user, socket
+permissions, SSH account, key and host policy accordingly.
+
 ## Health check and TUI attach
 
 Always probe the selected socket before starting the TUI. `rsi` can start a
@@ -216,7 +255,7 @@ If a stale hub socket remains after removing an instance, remove that
 instance's socket while its tunnel is stopped:
 
 ```bash
-ssh -p 22 jakedevar@192.168.50.21 'rm -f "$HOME/.rsi/satellites/arch-laptop.sock"'
+ssh -p 22 you@laptop.example.net 'rm -f "$HOME/.rsi/satellites/arch-laptop.sock"'
 ```
 
 ## Path and security assumptions

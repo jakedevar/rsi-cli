@@ -59,6 +59,32 @@ impl SettingsGroup {
             Self::Integrations => "How do I reach agents from elsewhere?",
         }
     }
+
+    /// The group's sections in page order: the tabs the settings view shows
+    /// while this group is selected in the category rail.
+    pub fn sections(self) -> impl Iterator<Item = SettingsSection> {
+        SettingsSection::ALL
+            .iter()
+            .copied()
+            .filter(move |section| section.group() == self)
+    }
+
+    /// The tab a category opens on when the rail selects it.
+    #[must_use]
+    pub fn first_section(self) -> SettingsSection {
+        self.sections()
+            .next()
+            .unwrap_or(SettingsSection::ThemeColors)
+    }
+
+    /// Position of the group in [`Self::ALL`] (rail order).
+    #[must_use]
+    pub fn position(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|group| *group == self)
+            .unwrap_or(0)
+    }
 }
 
 /// Settings sections (the rail entries inside a group), in page order.
@@ -86,6 +112,8 @@ pub enum SettingsSection {
     ClaudeHooks,
     ClaudeSkills,
     MessageBridges,
+    Satellites,
+    McpServers,
 }
 
 impl SettingsSection {
@@ -112,6 +140,8 @@ impl SettingsSection {
         Self::ClaudeHooks,
         Self::ClaudeSkills,
         Self::MessageBridges,
+        Self::Satellites,
+        Self::McpServers,
     ];
 
     #[must_use]
@@ -134,7 +164,9 @@ impl SettingsSection {
             | Self::SandboxStorage
             | Self::ClaudeHooks
             | Self::ClaudeSkills => SettingsGroup::ProvidersAndSandboxes,
-            Self::MessageBridges => SettingsGroup::Integrations,
+            Self::MessageBridges | Self::Satellites | Self::McpServers => {
+                SettingsGroup::Integrations
+            }
         }
     }
 
@@ -163,6 +195,8 @@ impl SettingsSection {
             Self::ClaudeHooks => "Claude Hooks",
             Self::ClaudeSkills => "Claude Skills",
             Self::MessageBridges => "Message Bridges",
+            Self::Satellites => "Satellites",
+            Self::McpServers => "MCP Servers",
         }
     }
 
@@ -191,14 +225,34 @@ impl SettingsSection {
             Self::ClaudeHooks => "Claude Code hooks.",
             Self::ClaudeSkills => "Claude user skills.",
             Self::MessageBridges => "Reach agents from Signal or iMessage.",
+            Self::Satellites => "Registered peers, local links and cached remote sessions.",
+            Self::McpServers => "MCP server definitions and credential metadata.",
         }
     }
 }
 
-/// One logical settings row. Dynamic lists (hooks, skills, providers,
-/// budgets, stats) are one variant each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SettingId {
+/// Declares `SettingId` and `SettingId::ALL` from one list of variants, so
+/// adding a setting is a single line. Page order is not encoded here: it is
+/// the declaration order of the `SETTINGS` slice below (#1013), so no
+/// positional ordinal is ever renumbered.
+macro_rules! setting_ids {
+    ($($(#[$meta:meta])* $id:ident,)+) => {
+        /// One logical settings row. Dynamic lists (hooks, skills, providers,
+        /// budgets, stats) are one variant each.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum SettingId {
+            $($(#[$meta])* $id,)+
+        }
+
+        impl SettingId {
+            /// Every setting id (guards `SETTINGS` against omissions and
+            /// duplicates; carries no ordering meaning).
+            pub const ALL: &'static [Self] = &[$(Self::$id,)+];
+        }
+    };
+}
+
+setting_ids! {
     BuiltInTheme,
     ThemeRoles,
     LegacyColors,
@@ -277,13 +331,30 @@ pub enum SettingId {
     WorkerScopeMemoryMax,
     WorkerScopeMemorySwapMax,
     WorkerScopeCpuWeight,
+    RollingQueueEnabled,
+    DeployDrainEnabled,
+    RollingQueueBatchSize,
+    RollingQueueSpeculationDepth,
+    ProgramHoldWhileChildren,
+    ChildKeepaliveEnabled,
+    ChildKeepaliveWindow,
+    HarnessWebAccess,
+    HarnessEgressMode,
+    HarnessSearchCap,
+    HarnessFetchCap,
+    HarnessCompletionGates,
+    HarnessOutputCap,
+    HarnessWebCostCap,
     CodegraphIndexing,
     CodexSandbox,
     ClaudeConfigIsolation,
     VaultEnvCompat,
     VaultCheckTtl,
     OpenRouterRoute,
+    BedrockRoute,
     ApiRouteFallback,
+    OpenRouterContextBudget,
+    HarnessMaxIterations,
     SandboxStorageStatus,
     CacheReclaim,
     CacheReclaimTtl,
@@ -299,125 +370,27 @@ pub enum SettingId {
     PreviewReclaim,
     ReclaimNow,
     SourceWorktreeSettlement,
+    SandboxMaxSourceRoots,
+    SandboxMinFreeGib,
+    McpDeferredToolThreshold,
+    CloudSpendStatus,
+    CloudSpendStopLine,
+    CloudSpendDailyCap,
+    ArchivedSandboxPurge,
     ClaudeHooks,
     ClaudeSkills,
     SignalBridge,
     ImessageBridge,
     CompletedTranscriptCache,
-}
-
-impl SettingId {
-    /// Exhaustive position in page order (guards `SETTINGS` against omissions).
-    #[must_use]
-    pub const fn index(self) -> usize {
-        match self {
-            Self::BuiltInTheme => 0,
-            Self::ThemeRoles => 1,
-            Self::LegacyColors => 2,
-            Self::ResetTheme => 3,
-            Self::TextAreaBackground => 4,
-            Self::BackgroundColor => 5,
-            Self::FormulationAnimation => 6,
-            Self::FormulationSpeed => 7,
-            Self::ActivityIndicator => 8,
-            Self::DetailColumn => 9,
-            Self::NavigatorPreset => 10,
-            Self::NavigatorColumns => 11,
-            Self::CardFields => 12,
-            Self::SessionRetentionEnabled => 13,
-            Self::SessionRetentionWindowHours => 14,
-            Self::ShowSystemEvents => 15,
-            Self::ShowThinkingEvents => 16,
-            Self::HideToolResults => 17,
-            Self::SubmitOnEnter => 18,
-            Self::AutoOpenQuestionPanel => 19,
-            Self::PromptCompiler => 20,
-            Self::DefaultModel => 21,
-            Self::TitleModel => 22,
-            Self::PromptCompilerModel => 23,
-            Self::MemoryModel => 24,
-            Self::DreamModel => 25,
-            Self::ClassifierModel => 26,
-            Self::ApiProviders => 27,
-            Self::SystemPromptPreset => 28,
-            Self::ModelControlMode => 29,
-            Self::EmergencyStop => 30,
-            Self::MaxChildEffort => 31,
-            Self::BudgetPolicies => 32,
-            Self::UsageStats => 33,
-            Self::UsageActions => 34,
-            Self::ProviderCredentialSlots => 35,
-            Self::RetryOnFailure => 36,
-            Self::MaxRetries => 37,
-            Self::RetryMaxBackoff => 38,
-            Self::RetryOnStall => 39,
-            Self::ReconciliationLoop => 40,
-            Self::ContextRotation => 41,
-            Self::ContextRotationGlobalPct => 42,
-            Self::ContextRotationClaudePct => 43,
-            Self::ContextRotationCodexPct => 44,
-            Self::StallDetection => 45,
-            Self::StallClassifier => 46,
-            Self::ClassifierIdleClaude => 47,
-            Self::ClassifierIdleCodex => 48,
-            Self::ClassifierCooldown => 49,
-            Self::ClassifierMaxPerSession => 50,
-            Self::ClassifierConfidenceFloor => 51,
-            Self::MemorySystem => 52,
-            Self::DreamConsolidation => 53,
-            Self::ObservationThreshold => 54,
-            Self::DreamCooldown => 55,
-            Self::DreamIdle => 56,
-            Self::DialecticEngine => 57,
-            Self::BackgroundQueue => 58,
-            Self::DagRecoveryControls => 59,
-            Self::DagSchedulerControls => 60,
-            Self::DagCancellationControls => 61,
-            Self::DagLiveSchedulerControl => 62,
-            Self::DagRunLeaseTtl => 63,
-            Self::DagMaxConcurrentGraphs => 64,
-            Self::GvRenderRecursiveOrigin => 65,
-            Self::GvInfoDashboard => 66,
-            Self::TopologyExecutor => 67,
-            Self::TopologyBuildNodes => 68,
-            Self::TopologyBulkFanout => 69,
-            Self::CompletedTranscriptCache => 70,
-            Self::RsidScopeMemoryHigh => 71,
-            Self::RsidScopeMemoryMax => 72,
-            Self::RsidScopeMemorySwapMax => 73,
-            Self::RsidScopeCpuWeight => 74,
-            Self::WorkerScopeMemoryHigh => 75,
-            Self::WorkerScopeMemoryMax => 76,
-            Self::WorkerScopeMemorySwapMax => 77,
-            Self::WorkerScopeCpuWeight => 78,
-            Self::CodegraphIndexing => 79,
-            Self::CodexSandbox => 80,
-            Self::ClaudeConfigIsolation => 81,
-            Self::VaultEnvCompat => 82,
-            Self::VaultCheckTtl => 83,
-            Self::OpenRouterRoute => 84,
-            Self::ApiRouteFallback => 85,
-            Self::SandboxStorageStatus => 86,
-            Self::CacheReclaim => 87,
-            Self::CacheReclaimTtl => 88,
-            Self::CacheReclaimInterval => 89,
-            Self::CachePressureHigh => 90,
-            Self::CachePressureLow => 91,
-            Self::CacheReclaimPassLimit => 92,
-            Self::AgentBuildJobs => 93,
-            Self::AgentBuildLineTables => 94,
-            Self::AgentBuildSccache => 95,
-            Self::AgentBuildSccacheSize => 96,
-            Self::AgentBuildSlots => 97,
-            Self::PreviewReclaim => 98,
-            Self::ReclaimNow => 99,
-            Self::SourceWorktreeSettlement => 100,
-            Self::ClaudeHooks => 101,
-            Self::ClaudeSkills => 102,
-            Self::SignalBridge => 103,
-            Self::ImessageBridge => 104,
-        }
-    }
+    SatelliteRegistry,
+    SatellitePolling,
+    GovernorBuildSlots,
+    GovernorLanderSlots,
+    GovernorMaxLoad,
+    GovernorMinFreeDisk,
+    GovernorMinAvailMem,
+    GovernorMaxWorkersSlice,
+    McpServerConfigurations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,7 +602,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::ActivityIndicator,
         section: SettingsSection::Screen,
         label: "Activity indicator",
-        summary: "Chooses the working-indicator style: Semantic, Rainbow Classic or Rainbow Compact.",
+        summary: "Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight.",
         detail: None,
         keywords: &["indicator", "spinner", "rainbow"],
         kind: SettingKind::Cycle,
@@ -669,9 +642,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::NavigatorColumns,
         section: SettingsSection::SessionList,
         label: "Navigator optional columns",
-        summary: "Turns individual optional navigator columns on or off.",
+        summary: "Turns optional navigator columns on or off; J/K move the selected column, saved per preset.",
         detail: Some(
-            "Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. Required columns cannot be hidden.",
+            "Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden.",
         ),
         keywords: &["navigator", "columns"],
         kind: SettingKind::DynamicList,
@@ -1055,8 +1028,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::ContextRotation,
         section: SettingsSection::RetriesRecovery,
         label: "Context rotation",
-        summary: "Rotates a session into a fresh context near its limit, carrying a handoff forward.",
-        detail: None,
+        summary: "Near its limit, asks a manager or Epic lead to pass its seat at the next idle boundary; workers keep going on native compaction.",
+        detail: Some("Manual rotation still works for any session."),
         keywords: &["rotation", "context"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("context_rotation_enabled"),
@@ -1196,7 +1169,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["memory"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("memory_enabled"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::LiveOffRestartOn),
         destructive: false,
     },
     SettingSpec {
@@ -1512,6 +1485,312 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::RollingQueueEnabled,
+        section: SettingsSection::Orchestration,
+        label: "Rolling merge queue",
+        summary: "Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues.",
+        detail: Some(
+            "When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish.",
+        ),
+        keywords: &["merge", "queue", "landing", "rolling", "lander"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("rolling_queue_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::DeployDrainEnabled,
+        section: SettingsSection::Orchestration,
+        label: "Hold new work while a deploy waits",
+        summary: "While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs.",
+        detail: Some(
+            "Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything.",
+        ),
+        keywords: &["deploy", "drain", "hold", "quiet", "restart"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("deploy_drain_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::RollingQueueBatchSize,
+        section: SettingsSection::Orchestration,
+        label: "Merge queue batch size",
+        summary: "Maximum ready sources merged into one candidate and gated once (1-8); the current runner gates one source at a time.",
+        detail: None,
+        keywords: &["merge", "queue", "batch", "landing"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("rolling_queue_batch_size"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::RollingQueueSpeculationDepth,
+        section: SettingsSection::Orchestration,
+        label: "Merge queue speculation depth",
+        summary: "How many candidates are prepared on top of the batch being gated (0-2).",
+        detail: None,
+        keywords: &["merge", "queue", "speculation", "landing"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("rolling_queue_speculation_depth"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ProgramHoldWhileChildren,
+        section: SettingsSection::Orchestration,
+        label: "Hold program wakes while children run",
+        summary: "Program-mode masters' due resume wakes wait while their spawned children run, then deliver once per keep-alive window; the wake stays armed meanwhile.",
+        detail: Some(
+            "The held wake stays enabled and exact, so the no-idle invariant is unchanged. It delivers when the last child settles (the child watch wakes the master) or once when the window elapses; an operator trigger-now bypasses the hold. Non-program wakes are never held.",
+        ),
+        keywords: &["program", "hold", "wake", "children", "idle"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("program_hold_while_children_run"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ChildKeepaliveEnabled,
+        section: SettingsSection::Orchestration,
+        label: "Child keep-alive valve",
+        summary: "Off by default. When on, an idle parent whose children keep running gets one same-session resume per window so it can unblock hung children.",
+        detail: Some(
+            "The valve inserts at most one daemon-owned one-shot Resume row per window, only for a Completed parent with no other enabled resume wake, pending question, approval, pause or capacity incident, and retires it undelivered if every child settled first. It never launches a Fresh session.",
+        ),
+        keywords: &["keepalive", "children", "resume", "wake", "hung"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("child_keepalive_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ChildKeepaliveWindow,
+        section: SettingsSection::Orchestration,
+        label: "Child keep-alive window (s)",
+        summary: "Length of the keep-alive and hold window (300-21600 seconds, default 1500).",
+        detail: None,
+        keywords: &["keepalive", "window", "hold", "children"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("child_keepalive_window_secs"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorBuildSlots,
+        section: SettingsSection::Orchestration,
+        label: "Build slots",
+        summary: "Concurrent cargo build/test runs the resource governor admits (1-16); default 4.",
+        detail: None,
+        keywords: &["governor", "build", "slots", "cargo"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_build_slots"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorLanderSlots,
+        section: SettingsSection::Orchestration,
+        label: "Lander slots",
+        summary: "Concurrent rsi-rolling-land runs the resource governor admits (1-16); default 5.",
+        detail: None,
+        keywords: &["governor", "lander", "slots"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_lander_slots"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorMaxLoad,
+        section: SettingsSection::Orchestration,
+        label: "Governor max load (0 auto)",
+        summary: "1-minute load at or above which no new build or lander starts; 0 means 1.25 x cores.",
+        detail: None,
+        keywords: &["governor", "load"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_max_load"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorMinFreeDisk,
+        section: SettingsSection::Orchestration,
+        label: "Governor min free disk (GB)",
+        summary: "Free space on / below which no new build or lander starts; default 30.",
+        detail: None,
+        keywords: &["governor", "disk", "free"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_min_free_disk_gb"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorMinAvailMem,
+        section: SettingsSection::Orchestration,
+        label: "Governor min available memory (GB)",
+        summary: "MemAvailable below which no new build or lander starts; default 16.",
+        detail: None,
+        keywords: &["governor", "memory", "available"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_min_avail_mem_gb"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::GovernorMaxWorkersSlice,
+        section: SettingsSection::Orchestration,
+        label: "Governor max workers-slice memory (GB)",
+        summary: "Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30.",
+        detail: None,
+        keywords: &["governor", "memory", "workers", "slice"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("governor_max_workers_slice_gb"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessWebAccess,
+        section: SettingsSection::Orchestration,
+        label: "Harness web access",
+        summary: "Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it.",
+        detail: None,
+        keywords: &["harness", "web", "search", "policy", "benchmark"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_web_access"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessEgressMode,
+        section: SettingsSection::Orchestration,
+        label: "Harness network egress",
+        summary: "Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it.",
+        detail: None,
+        keywords: &["harness", "network", "egress", "ssrf", "offline", "policy"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_egress_mode"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessSearchCap,
+        section: SettingsSection::Orchestration,
+        label: "Harness search call cap",
+        summary: "Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues.",
+        detail: None,
+        keywords: &["harness", "search", "budget", "policy"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_max_search_calls"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessFetchCap,
+        section: SettingsSection::Orchestration,
+        label: "Harness fetch call cap",
+        summary: "Default cap on hosted web fetches per Harness session; 0 is unlimited.",
+        detail: None,
+        keywords: &["harness", "fetch", "budget", "policy"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_max_fetch_calls"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessCompletionGates,
+        section: SettingsSection::Orchestration,
+        label: "Harness completion gates",
+        summary: "Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead.",
+        detail: Some(
+            "Read at launch, so running sessions keep the value they started with (#794).",
+        ),
+        keywords: &["harness", "completion", "gate", "verify", "kill switch"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("completion_gates_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessOutputCap,
+        section: SettingsSection::Orchestration,
+        label: "Harness tool output cap (bytes)",
+        summary: "Default cap on total tool output bytes per Harness session; 0 is unlimited. Once used up, further tool calls return a typed error.",
+        detail: None,
+        keywords: &["harness", "bytes", "output", "budget", "policy"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_max_result_bytes"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessWebCostCap,
+        section: SettingsSection::Orchestration,
+        label: "Harness web cost cap (micro-USD)",
+        summary: "Default cap on estimated hosted web cost per Harness session (1000000 = 1 USD, searches estimated at 0.01 USD); 0 is unlimited.",
+        detail: None,
+        keywords: &["harness", "cost", "budget", "policy"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_max_web_cost_usd_micros"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::McpDeferredToolThreshold,
+        section: SettingsSection::Orchestration,
+        label: "MCP deferred tool threshold",
+        summary: "Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable.",
+        detail: Some(
+            "Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap.",
+        ),
+        keywords: &["mcp", "tools", "search", "deferred", "harness"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("mcp.deferred_tool_threshold"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CloudSpendStatus,
+        section: SettingsSection::Orchestration,
+        label: "Cloud spend",
+        summary: "Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below.",
+        detail: Some(
+            "Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC.",
+        ),
+        keywords: &["cloud", "spend", "budget", "aws", "gate", "remote"],
+        kind: SettingKind::ReadOnly,
+        owner: SettingOwner::DaemonState("cloud spend"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CloudSpendStopLine,
+        section: SettingsSection::Orchestration,
+        label: "Cloud spend stop line (USD)",
+        summary: "Cumulative remote-gate spend at which a new remote run is refused.",
+        detail: Some(
+            "Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes.",
+        ),
+        keywords: &["cloud", "spend", "budget", "stop", "grant", "gate"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("cloud_spend_stop_line_usd"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CloudSpendDailyCap,
+        section: SettingsSection::Orchestration,
+        label: "Cloud spend daily cap (USD)",
+        summary: "Remote-gate spend per UTC day at which a new remote run is refused.",
+        detail: Some(
+            "Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop.",
+        ),
+        keywords: &["cloud", "spend", "budget", "daily", "gate"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("cloud_spend_daily_cap_usd"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::CodegraphIndexing,
         section: SettingsSection::CodeIntelligence,
         label: "Codegraph indexing",
@@ -1584,6 +1863,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::BedrockRoute,
+        section: SettingsSection::ProviderIsolation,
+        label: "Bedrock engine",
+        summary: "Choose the engine for new Bedrock sessions: codex_cli runs GPT in Codex and Claude in Claude Code; harness runs both in RSI's Harness.",
+        detail: None,
+        keywords: &["bedrock", "route", "harness", "codex", "claude", "aws"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("api_route.bedrock"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::ApiRouteFallback,
         section: SettingsSection::ProviderIsolation,
         label: "API route fallback",
@@ -1592,6 +1883,44 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["openrouter", "route", "fallback", "codex"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("api_route.fallback"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::OpenRouterContextBudget,
+        section: SettingsSection::ProviderIsolation,
+        label: "OpenRouter context budget (0 off)",
+        summary: "Live-context tokens at which an OpenRouter session compacts; 0 keeps the model's own limit.",
+        detail: None,
+        keywords: &[
+            "openrouter",
+            "context",
+            "budget",
+            "compact",
+            "cost",
+            "tokens",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("openrouter_context_budget_tokens"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HarnessMaxIterations,
+        section: SettingsSection::ProviderIsolation,
+        label: "Harness iterations per turn",
+        summary: "Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000).",
+        detail: None,
+        keywords: &[
+            "harness",
+            "openrouter",
+            "iterations",
+            "steps",
+            "turn",
+            "cap",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("harness_max_iterations_per_turn"),
         apply: SettingApply::Daemon(ApplyClass::NextSpawn),
         destructive: false,
     },
@@ -1776,6 +2105,42 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: true,
     },
     SettingSpec {
+        id: SettingId::SandboxMaxSourceRoots,
+        section: SettingsSection::SandboxStorage,
+        label: "Maximum sandbox roots",
+        summary: "Maximum direct source roots under the sandbox base before a new allocation is refused.",
+        detail: None,
+        keywords: &["sandbox", "allocation", "count", "capacity"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("sandbox_max_source_roots"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::SandboxMinFreeGib,
+        section: SettingsSection::SandboxStorage,
+        label: "Minimum free space (GiB)",
+        summary: "Free filesystem space required before a new sandbox is allocated.",
+        detail: None,
+        keywords: &["sandbox", "allocation", "disk", "capacity"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("sandbox_min_free_gib"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ArchivedSandboxPurge,
+        section: SettingsSection::SandboxStorage,
+        label: "Purge archived sandboxes",
+        summary: "Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded.",
+        detail: None,
+        keywords: &["sandbox", "purge", "archive", "disk"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("archived_sandbox_purge_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: true,
+    },
+    SettingSpec {
         id: SettingId::ClaudeHooks,
         section: SettingsSection::ClaudeHooks,
         label: "Claude hooks",
@@ -1823,6 +2188,48 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: SettingApply::Immediate,
         destructive: false,
     },
+    SettingSpec {
+        id: SettingId::SatelliteRegistry,
+        section: SettingsSection::Satellites,
+        label: "Satellite registry",
+        summary: "Manage paired peers and local socket links; browse cached remote sessions.",
+        detail: Some(
+            "Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads.",
+        ),
+        keywords: &["satellite", "peer", "remote", "socket", "registry"],
+        kind: SettingKind::Action,
+        owner: SettingOwner::DaemonState("satellite_registry"),
+        apply: SettingApply::Immediate,
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::SatellitePolling,
+        section: SettingsSection::Satellites,
+        label: "Satellite polling",
+        summary: "Global switch for hub satellite polling; off keeps registry rows and cached observations.",
+        detail: Some(
+            "Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on.",
+        ),
+        keywords: &["satellite", "poll", "polling", "peer", "network"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("satellite_polling_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::McpServerConfigurations,
+        section: SettingsSection::McpServers,
+        label: "MCP servers",
+        summary: "Daemon-configured MCP server definitions and credential metadata; a adds, Enter edits, t enables or disables.",
+        detail: Some(
+            "Server definitions remain disabled until enabled. Credentials are entered through a masked form and stored only in the operator vault.",
+        ),
+        keywords: &["mcp", "server", "credential", "vault"],
+        kind: SettingKind::DynamicList,
+        owner: SettingOwner::DaemonState("mcp servers"),
+        apply: SettingApply::Immediate,
+        destructive: false,
+    },
 ];
 
 #[cfg(test)]
@@ -1856,6 +2263,36 @@ mod tests {
                     .get(offset..end)
                     .is_some_and(|window| window.contains(&quoted))
             })
+    }
+
+    /// The settings view shows one rail row per group and one tab per
+    /// section: every group owns at least one tab, the tabs of all groups
+    /// together are exactly `SettingsSection::ALL` in page order, and a
+    /// group opens on its first tab.
+    #[test]
+    fn group_tabs_partition_every_section_in_page_order() {
+        let mut tabs = Vec::new();
+        for (position, group) in SettingsGroup::ALL.iter().enumerate() {
+            let sections: Vec<SettingsSection> = group.sections().collect();
+            assert!(!sections.is_empty(), "{group:?} owns at least one tab");
+            assert_eq!(group.first_section(), sections[0]);
+            assert_eq!(group.position(), position);
+            assert!(sections.iter().all(|section| section.group() == *group));
+            tabs.extend(sections);
+        }
+        assert_eq!(tabs, SettingsSection::ALL.to_vec());
+        assert_eq!(
+            SettingsGroup::AgentAutomation
+                .sections()
+                .collect::<Vec<_>>(),
+            vec![
+                SettingsSection::RetriesRecovery,
+                SettingsSection::StallDetection,
+                SettingsSection::MemoryDreaming,
+                SettingsSection::Orchestration,
+                SettingsSection::CodeIntelligence,
+            ]
+        );
     }
 
     /// The write proof recognises real TUI writers.
@@ -1994,10 +2431,44 @@ mod tests {
         }
     }
 
+    /// #1013: page order is the declaration order of `SETTINGS`; there is no
+    /// positional ordinal table. Every id is declared exactly once.
     #[test]
-    fn setting_ids_are_unique_and_in_index_order() {
+    fn setting_ids_are_declared_exactly_once() {
+        assert_eq!(SETTINGS.len(), SettingId::ALL.len());
+        for id in SettingId::ALL {
+            let declared = SETTINGS.iter().filter(|spec| spec.id == *id).count();
+            assert_eq!(declared, 1, "{id:?} is declared once in SETTINGS");
+        }
+    }
+
+    /// #1013: an entry's position is derived from declaration order, so
+    /// inserting a setting shifts no other entry's relative order (two
+    /// branches adding settings never renumber each other's rows).
+    #[test]
+    fn declaration_order_is_stable_when_an_entry_is_added() {
+        let ids: Vec<SettingId> = SETTINGS.iter().map(|spec| spec.id).collect();
+        let position = |order: &[SettingId], id: SettingId| {
+            order.iter().position(|candidate| *candidate == id).unwrap()
+        };
+        let removed = ids[ids.len() / 2];
+        let without: Vec<SettingId> = ids.iter().copied().filter(|id| *id != removed).collect();
+        for (a, b) in ids.iter().zip(ids.iter().skip(1)) {
+            if *a == removed || *b == removed {
+                continue;
+            }
+            assert_eq!(
+                position(&without, *a) < position(&without, *b),
+                position(&ids, *a) < position(&ids, *b),
+                "adding {removed:?} keeps {a:?} before {b:?}"
+            );
+        }
+        // Order matches the slice itself, not any id-derived number.
         for (position, spec) in SETTINGS.iter().enumerate() {
-            assert_eq!(spec.id.index(), position, "{:?} is at its index", spec.id);
+            assert_eq!(
+                SETTINGS.iter().position(|s| s.id == spec.id),
+                Some(position)
+            );
         }
     }
 

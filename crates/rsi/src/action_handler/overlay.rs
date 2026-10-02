@@ -209,11 +209,17 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                 {
                     // Provider stays the same; models are already loaded from discovery
                 } else if model_id.starts_with("claude-") {
-                    app.selected_provider = rsi_common::types::SessionProvider::Claude;
-                    app.available_models = crate::app::CLAUDE_MODELS
-                        .iter()
-                        .map(|(id, name)| (id.to_string(), name.to_string()))
-                        .collect();
+                    // Already on Claude: keep the discovered list, which can
+                    // carry models the static fallback does not. Switching in:
+                    // show the fallback now and fetch the CLI's live list.
+                    if app.selected_provider != rsi_common::types::SessionProvider::Claude {
+                        app.selected_provider = rsi_common::types::SessionProvider::Claude;
+                        app.available_models = crate::app::CLAUDE_MODELS
+                            .iter()
+                            .map(|(id, name)| (id.to_string(), name.to_string()))
+                            .collect();
+                        app.needs_model_refresh = true;
+                    }
                 } else if model_id.starts_with("gemini-") || model_id.starts_with("gpt-oss-") {
                     app.selected_provider = rsi_common::types::SessionProvider::Antigravity;
                     app.available_models = crate::app::ANTIGRAVITY_MODELS

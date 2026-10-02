@@ -65,6 +65,7 @@ portable-pty = { workspace = true }
 vt100 = { workspace = true }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }

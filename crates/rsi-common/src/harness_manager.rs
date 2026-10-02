@@ -13,6 +13,157 @@ pub const HARNESS_MANAGER_MAX_GROUPS: usize = 32;
 pub const HARNESS_MANAGER_MAX_MESSAGE_BYTES: usize = 8192;
 pub const HARNESS_MANAGER_MAX_INBOX_PAGE: u16 = 32;
 
+/// A manager node may address its parent, or the shared ancestor of two
+/// currently owned Epic scopes. Caller identity is supplied by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagerNodeEscalationRouteV1 {
+    Parent,
+    EpicConflict {
+        left_epic_id: Uuid,
+        right_epic_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentManagerEscalateRequestV1 {
+    pub project_id: Uuid,
+    pub subject_id: Uuid,
+    pub reason: String,
+    pub route: ManagerNodeEscalationRouteV1,
+    pub expected_source_authority_epoch: i64,
+    pub expected_source_grant_version: i64,
+    pub expected_target_authority_epoch: i64,
+    pub expected_target_grant_version: i64,
+    pub expected_target_session_id: Uuid,
+    pub idempotency_key: String,
+}
+
+/// Attributed RPC input. The daemon derives the project from the caller's
+/// session and supplies it to the transactional store operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentManagerEscalateInputV1 {
+    pub subject_id: Uuid,
+    pub reason: String,
+    pub route: ManagerNodeEscalationRouteV1,
+    pub expected_source_authority_epoch: i64,
+    pub expected_source_grant_version: i64,
+    pub expected_target_authority_epoch: i64,
+    pub expected_target_grant_version: i64,
+    pub expected_target_session_id: Uuid,
+    pub idempotency_key: String,
+}
+
+impl AgentManagerEscalateInputV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.clone().into_request(Uuid::from_u128(1)).validate()
+    }
+
+    pub fn into_request(self, project_id: Uuid) -> AgentManagerEscalateRequestV1 {
+        AgentManagerEscalateRequestV1 {
+            project_id,
+            subject_id: self.subject_id,
+            reason: self.reason,
+            route: self.route,
+            expected_source_authority_epoch: self.expected_source_authority_epoch,
+            expected_source_grant_version: self.expected_source_grant_version,
+            expected_target_authority_epoch: self.expected_target_authority_epoch,
+            expected_target_grant_version: self.expected_target_grant_version,
+            expected_target_session_id: self.expected_target_session_id,
+            idempotency_key: self.idempotency_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentManagerListEscalationsRequestV1 {}
+
+impl AgentManagerEscalateRequestV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_manager_body(&self.reason, &self.idempotency_key)?;
+        if self.project_id.is_nil()
+            || self.subject_id.is_nil()
+            || self.expected_source_authority_epoch <= 0
+            || self.expected_source_grant_version <= 0
+            || self.expected_target_authority_epoch <= 0
+            || self.expected_target_grant_version <= 0
+            || self.expected_target_session_id.is_nil()
+            || matches!(self.route, ManagerNodeEscalationRouteV1::EpicConflict { left_epic_id, right_epic_id }
+                if left_epic_id.is_nil() || right_epic_id.is_nil() || left_epic_id == right_epic_id)
+        {
+            return Err("manager_node_invalid_escalation");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentManagerResolveEscalationRequestV1 {
+    pub escalation_id: Uuid,
+    pub expected_version: i64,
+    pub expected_target_authority_epoch: i64,
+    pub expected_target_grant_version: i64,
+    pub expected_target_session_id: Uuid,
+    /// `None` forwards to the addressed node's parent. A ruling is a manager
+    /// decision only; it never represents human approval.
+    pub ruling: Option<String>,
+    pub idempotency_key: String,
+}
+
+impl AgentManagerResolveEscalationRequestV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.escalation_id.is_nil()
+            || self.expected_version <= 0
+            || self.expected_target_authority_epoch <= 0
+            || self.expected_target_grant_version <= 0
+            || self.expected_target_session_id.is_nil()
+            || self.ruling.as_ref().is_some_and(|value| {
+                value.trim().is_empty()
+                    || value.len() > HARNESS_MANAGER_MAX_MESSAGE_BYTES
+                    || value.contains('\0')
+            })
+            || self.idempotency_key.is_empty()
+            || self.idempotency_key.len() > 128
+            || self.idempotency_key.contains('\0')
+        {
+            return Err("manager_node_invalid_escalation_resolution");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerNodeEscalationStateV1 {
+    Open,
+    Ruled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerNodeEscalationV1 {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub subject_id: Uuid,
+    pub source_node_id: Uuid,
+    pub target_node_id: Uuid,
+    pub reason: String,
+    pub source_authority_epoch: i64,
+    pub source_grant_version: i64,
+    pub target_authority_epoch: i64,
+    pub target_grant_version: i64,
+    /// The seat lineage tip when this node became the addressed owner.
+    pub target_session_id: Uuid,
+    pub version: i64,
+    pub state: ManagerNodeEscalationStateV1,
+    pub ruling: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetHarnessManagerRequestV1 {

@@ -7,7 +7,7 @@ description: Orchestrate implementation plans using a master-worker agent team
 
 Master-agent orchestrator for implementing plans from `thoughts/shared/plans/`. The master decomposes the plan into independent phase clusters, dispatches background worker agents in parallel per tier, gates dependent tiers, and presents a unified verification report at the end.
 
-**Worker preamble (binding):** This command's worker sub-agents MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=implementation` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
+**Worker preamble (binding):** This command's worker sub-agents MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=implementation` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 
 **Use this over `/implement` when:**
 - The plan has 3+ phases

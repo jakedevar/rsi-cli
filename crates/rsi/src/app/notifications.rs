@@ -4,7 +4,7 @@ use super::App;
 
 impl App {
     /// Push a new notification onto the queue.
-    /// Aggregates same-kind notifications that arrive within 500ms.
+    /// Aggregates same-kind notifications for the same session within 500ms.
     pub fn push_notification(
         &mut self,
         kind: crate::types::NotificationKind,
@@ -24,6 +24,7 @@ impl App {
         // and was created within 500ms, update its message with a count instead.
         if let Some(last) = self.notifications.back_mut() {
             if last.kind == kind
+                && last.session_id == session_id
                 && !last.dismissed
                 && last.created_at.elapsed() < Duration::from_millis(500)
             {
@@ -139,6 +140,31 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::{NotificationKind, NotificationPriority};
+
+    #[test]
+    fn distinct_session_notifications_keep_distinct_navigation_targets() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        app.push_notification(
+            NotificationKind::Info,
+            NotificationPriority::Medium,
+            "first".into(),
+            Some(first),
+        );
+        app.push_notification(
+            NotificationKind::Info,
+            NotificationPriority::Medium,
+            "second".into(),
+            Some(second),
+        );
+
+        assert_eq!(app.notifications.len(), 2);
+        assert_eq!(app.notifications[0].session_id, Some(first));
+        assert_eq!(app.notifications[1].session_id, Some(second));
+    }
+
     #[test]
     fn expiry_reports_visible_replacement_and_removal_with_mixed_priorities() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);

@@ -4,18 +4,7 @@
 //! SQLite persistence. Detects dead processes, state drift, and optionally
 //! auto-remediates stalled sessions.
 
-use serde::{Deserialize, Serialize};
-
-/// Reason a session was reconciled (transitioned by the reconciliation loop).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReconciliationReason {
-    /// Process exited but session was still marked as active.
-    ProcessDied,
-    /// Session was active in SQLite but not in the in-memory map (or vice versa).
-    StoreDesync,
-    /// Session was stalled beyond threshold and auto-remediation was enabled.
-    StallRemediation,
-}
+pub use crate::store_support::event_types::ReconciliationReason;
 
 /// Action to take when a session is detected as stalled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +97,18 @@ impl TerminalSettlementGuard {
             .insert(session_id);
         Self { session_id }
     }
+}
+
+/// True while `session_id`'s terminal finalizer still owns its post-exit
+/// writes (final status, metadata, the terminal sandbox observation event).
+/// The finalizer registers the guard under the `active` write lock that also
+/// removes the session, so "absent from `active` and not settling" is a
+/// complete witness that no further lead-fence event can be appended (#1033).
+pub(crate) fn terminal_settlement_in_progress(session_id: Uuid) -> bool {
+    terminal_settlements()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&session_id)
 }
 
 impl Drop for TerminalSettlementGuard {

@@ -8,7 +8,7 @@ Operator procedure. Read it end to end before running anything.
 
 ```text
 ERROR Database open/migration failed; daemon cannot start
-  db=/home/jakedevar/.rsi/rsi.db
+  db=~/.rsi/rsi.db
   error=V99 identity backfill found a branched Epic lineage
 ```
 

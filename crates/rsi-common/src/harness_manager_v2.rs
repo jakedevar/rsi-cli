@@ -8,9 +8,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::manager_daemon_settings::{ManagerDaemonSettingBoundV2, validate_daemon_setting_bounds};
 use crate::manager_operator_delegation::{
     OperatorCallFenceV1, OperatorCallResultV1, OperatorCallV1,
 };
+use crate::model_control::ModelTier;
 use crate::types::{SessionKind, SessionProvider};
 
 pub const MANAGER_V2_MAX_PAGE: u16 = 64;
@@ -19,6 +21,14 @@ pub const MANAGER_V2_MAX_PENDING_ACTIONS: usize = 128;
 pub const MANAGER_V2_MAX_GROUPS: usize = 32;
 pub const MANAGER_V2_MAX_WORK: usize = 256;
 pub const MANAGER_REVIEW_MAX_FINDINGS: usize = 64;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerWorkRiskTierV2 {
+    #[default]
+    Tier1,
+    Tier2,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +60,25 @@ pub enum ManagerCapabilityV2 {
     /// from `Topology`, which creates containers. A land step additionally
     /// needs `GitEffect`.
     Automation,
+    /// #1043: read daemon sandbox storage status and run the bounded build-cache
+    /// reclaim (preview or real pass) through the audited `operator_call`
+    /// manager action, under the configured watermarks and limits. Off by
+    /// default; granted by the Full project control preset (not Execute);
+    /// daemon storage settings stay operator-only.
+    StorageControl,
+    /// #1046: change the operator-allowlisted daemon settings (sandbox roots,
+    /// minimum free space, reclaim watermarks) through the audited
+    /// `operator_call` manager action, inside the per-key bounds the operator
+    /// sets in `ManagerPolicyV2::daemon_setting_bounds`. Off by default;
+    /// granted by the Full project control preset (not Execute), and inert
+    /// until the operator bounds a key; spend, credentials, appointment and
+    /// scope stay operator-only.
+    DaemonSettings,
+    /// #1045: ask the daemon to stage verified binaries and restart itself at a
+    /// quiet point through `AgentRequestDeploy`. Off by default; granted by
+    /// the Full project control preset (not Execute); needs Execute mode and
+    /// no pause at call time.
+    Deploy,
 }
 
 /// Upper bound on distinct grants in one policy; well above the variant count
@@ -101,6 +130,11 @@ pub struct ManagerPolicyV2 {
     pub retry_delay_seconds: u32,
     pub request_timeout_seconds: u32,
     pub max_spend_usd: Option<f64>,
+    /// Minimum reviewer model tier for explicitly classified Tier-2 work.
+    pub minimum_tier2_reviewer_tier: ModelTier,
+    /// #1046: operator-set `min`/`max` per allowlisted daemon setting. A key
+    /// without an entry is not manager-adjustable (default: none).
+    pub daemon_setting_bounds: Vec<ManagerDaemonSettingBoundV2>,
 }
 
 impl Default for ManagerPolicyV2 {
@@ -121,6 +155,8 @@ impl Default for ManagerPolicyV2 {
             retry_delay_seconds: 60,
             request_timeout_seconds: 900,
             max_spend_usd: None,
+            minimum_tier2_reviewer_tier: ModelTier::Standard,
+            daemon_setting_bounds: vec![],
         }
     }
 }
@@ -163,6 +199,7 @@ impl ManagerPolicyV2 {
         for choice in &self.allowed_launches {
             choice.validate()?;
         }
+        validate_daemon_setting_bounds(&self.daemon_setting_bounds)?;
         Ok(())
     }
 }
@@ -257,6 +294,8 @@ pub enum ManagerInspectSectionV2 {
     Health,
     /// Durable SQLite migration-version allocations and competing claims.
     MigrationAllocations,
+    /// One read-only health row per registered satellite peer (#1017).
+    Satellites,
 }
 
 const fn page_limit() -> u16 {
@@ -968,6 +1007,12 @@ impl ManagerActionV2 {
             Self::ArchiveSession { .. }
             | Self::RestoreSession { .. }
             | Self::UpdateSession { .. } => ManagerCapabilityV2::SessionControl,
+            Self::OperatorCall { call, .. } if call.requires_storage_control() => {
+                ManagerCapabilityV2::StorageControl
+            }
+            Self::OperatorCall { call, .. } if call.requires_daemon_settings() => {
+                ManagerCapabilityV2::DaemonSettings
+            }
             Self::OperatorCall { .. } => ManagerCapabilityV2::OperatorDelegation,
         }
     }
@@ -1449,6 +1494,8 @@ pub enum ManagerUpdateV2 {
         priority: u8,
         weight: u16,
         required_gates: Vec<ManagerWorkStageV2>,
+        #[serde(default)]
+        risk_tier: ManagerWorkRiskTierV2,
     },
     Stage {
         key: String,
@@ -1520,6 +1567,10 @@ pub enum ManagerUpdateV2 {
         source_commit: String,
         query: String,
         launch: ManagerLaunchChoiceV2,
+        #[serde(default)]
+        delta_of: Option<Uuid>,
+        #[serde(default)]
+        finding_keys: Vec<String>,
     },
     Accept {
         key: String,
@@ -1683,6 +1734,8 @@ impl AgentManagerUpdateRequestV2 {
                 source_commit,
                 query,
                 launch,
+                delta_of,
+                finding_keys,
                 ..
             } => {
                 text(key, 256)?;
@@ -1695,6 +1748,22 @@ impl AgentManagerUpdateRequestV2 {
                 }
                 text(query, 32_768)?;
                 launch.validate()?;
+                if delta_of.is_some() != !finding_keys.is_empty()
+                    || finding_keys.len() > MANAGER_REVIEW_MAX_FINDINGS
+                    || finding_keys.iter().any(|key| {
+                        key.is_empty()
+                            || key.len() > 64
+                            || !key.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                            })
+                    })
+                    || finding_keys
+                        .iter()
+                        .enumerate()
+                        .any(|(i, key)| finding_keys[..i].contains(key))
+                {
+                    return Err("manager_review_invalid_delta");
+                }
             }
             ManagerUpdateV2::Accept { key, .. } => text(key, 256)?,
             ManagerUpdateV2::Integration {
@@ -1801,6 +1870,30 @@ pub fn unique_ids(ids: &[Uuid], max: usize) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tier2_review_policy_and_work_metadata_default_and_round_trip() {
+        let default: ManagerPolicyV2 = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(default.minimum_tier2_reviewer_tier, ModelTier::Standard);
+        let mut strict = default;
+        strict.minimum_tier2_reviewer_tier = ModelTier::Premium;
+        let restored: ManagerPolicyV2 =
+            serde_json::from_value(serde_json::to_value(strict).unwrap()).unwrap();
+        assert_eq!(restored.minimum_tier2_reviewer_tier, ModelTier::Premium);
+        let work: ManagerUpdateV2 = serde_json::from_value(json!({
+            "update":"work", "key":"authority", "expected_row_version":0,
+            "epic_id":Uuid::new_v4(), "title":"Authority change", "kind":"program",
+            "priority":1, "weight":1, "required_gates":["implementation"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            work,
+            ManagerUpdateV2::Work {
+                risk_tier: ManagerWorkRiskTierV2::Tier1,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn manager_v2_default_grant_preserves_status_only_and_rejects_unknown_fields() {
@@ -1978,6 +2071,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ManagerCapabilityV2::Automation).unwrap(),
             json!("automation")
+        );
+        // #1045: `Deploy` is an ordinary, valid grant under its snake_case name.
+        let deploy: ManagerPolicyV2 =
+            serde_json::from_value(json!({"mode":"execute","capabilities":["deploy"]})).unwrap();
+        assert_eq!(deploy.validate(), Ok(()));
+        assert_eq!(
+            serde_json::to_value(ManagerCapabilityV2::Deploy).unwrap(),
+            json!("deploy")
         );
     }
 

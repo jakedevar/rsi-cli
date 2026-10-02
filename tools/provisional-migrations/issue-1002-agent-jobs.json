@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": 144,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v144.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:480d37fb8b52e9270e6e7d5f5a59fc051e38d1e1cdea1894485f297a2db2bf79",
+      "sites": [
+        {
+          "anchor": "fn migrate_v144(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 144 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "agent_jobs::apply_migration(self, 144)?;",
+          "replacement": "agent_jobs::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/agent_jobs.rs",
+      "path_template": "crates/rsid/src/store/agent_jobs.rs",
+      "source_blob": "sha256:6c2cada5191a5fa971246d58804b8174d881fe61119f1353051d76f7d046da8c",
+      "sites": [
+        {
+          "anchor": "pub(crate) const AGENT_JOBS_SCHEMA_VERSION: i32 = 144;",
+          "replacement": "pub(crate) const AGENT_JOBS_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:f3ba2f144562706a8006a3233c3de02171a3ba357fadb1abb6fa1bbba64e6f99",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 144;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

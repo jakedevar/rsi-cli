@@ -49,12 +49,7 @@ pub(super) fn render_file_explorer(
     } else {
         theme::subtext0()
     };
-    // This drawer is an overlay, but it is a persistent split-style surface.
-    // Give its boundary the same neutral chrome color as ordinary pane rules,
-    // rather than the primary-colored modal border from `overlay_block`.
-    let border_style = Style::default().fg(theme::neutral_border());
     let block = theme::overlay_block()
-        .border_style(border_style)
         .title(Line::from(Span::styled(
             title,
             Style::default()
@@ -270,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn drawer_border_uses_neutral_pane_chrome() {
+    fn drawer_border_matches_input_bar() {
         theme::with_theme_state(|| {
             let mut terminal =
                 Terminal::new(TestBackend::new(80, 12)).expect("test terminal should initialize");
@@ -296,8 +291,8 @@ mod tests {
 
             assert_eq!(
                 terminal.backend().buffer()[(0, 1)].fg,
-                theme::neutral_border(),
-                "drawer boundary must use normal pane chrome, not modal focus color"
+                theme::input_bar_border(true),
+                "drawer boundary must match focused input bar"
             );
         });
     }

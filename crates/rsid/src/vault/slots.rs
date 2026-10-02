@@ -156,6 +156,9 @@ pub const fn slot_for_provider(provider: SessionProvider) -> Option<Slot> {
 /// The slot the in-process Harness uses for `model` (no explicit base URL).
 #[must_use]
 pub fn slot_for_harness_model(model: &str) -> Option<Slot> {
+    if crate::bedrock::bedrock_vendor(model).is_some() {
+        return Some(Slot::Bedrock);
+    }
     if model.starts_with("claude-") {
         return Some(Slot::Anthropic);
     }
@@ -165,7 +168,7 @@ pub fn slot_for_harness_model(model: &str) -> Option<Slot> {
     {
         return Some(Slot::Openai);
     }
-    crate::session::harness::compatible_table::lookup(model)
+    crate::store_support::compatible_table::lookup(model)
         .filter(|entry| !entry.env_vars.is_empty())
         .and_then(|entry| slot_for_compatible_entry(entry.name))
 }
@@ -188,7 +191,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn every_keyed_compatible_entry_maps_to_a_slot_covering_its_env_vars() {
-        for entry in crate::session::harness::compatible_table::COMPATIBLE_TABLE {
+        for entry in crate::store_support::compatible_table::COMPATIBLE_TABLE {
             match slot_for_compatible_entry(entry.name) {
                 Some(slot) => {
                     for var in entry.env_vars {

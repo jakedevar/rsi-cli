@@ -1,11 +1,14 @@
 //! Amazon Bedrock Responses API through Codex's custom-provider transport.
 
+use rsi_common::types::SessionProvider;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
+
+pub use rsi_common::bedrock_model::{BedrockVendor, anthropic_model_name, bedrock_vendor};
 
 pub const BEDROCK_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub const BEDROCK_DEFAULT_MODEL: &str = "global.openai.gpt-5.6-sol";
@@ -122,6 +125,53 @@ fn region_valid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// The runtime a new Bedrock launch runs on.
+///
+/// Bedrock is the operator-facing provider and `api_route.bedrock` (with its
+/// per-model overrides) picks the engine. GPT models stay on
+/// [`SessionProvider::Bedrock`], whose spawn arm runs Codex or the Bedrock
+/// Responses Harness. Claude models move to a concrete provider recorded on
+/// the session, so a resume never switches engines:
+///
+/// * `codex_cli` → [`SessionProvider::Claude`] (Claude Code with
+///   `CLAUDE_CODE_USE_BEDROCK`), the native CLI for Claude.
+/// * `harness` → [`SessionProvider::Harness`] (Bedrock `InvokeModel`).
+#[must_use]
+pub fn resolve_launch_provider(
+    provider: SessionProvider,
+    model: Option<&str>,
+    route: crate::config::OpenRouterRoute,
+) -> SessionProvider {
+    if provider != SessionProvider::Bedrock
+        || model.and_then(bedrock_vendor) != Some(BedrockVendor::Anthropic)
+    {
+        return provider;
+    }
+    match route {
+        crate::config::OpenRouterRoute::Harness => SessionProvider::Harness,
+        crate::config::OpenRouterRoute::CodexCli => SessionProvider::Claude,
+    }
+}
+
+/// `bedrock-runtime` base URL for the OpenAI-compatible API.
+#[must_use]
+pub fn runtime_openai_base_url(region: &str) -> String {
+    format!("https://bedrock-runtime.{region}.amazonaws.com/openai/v1")
+}
+
+/// `bedrock-runtime` `InvokeModel` URL (streaming or not) for `model`.
+#[must_use]
+pub fn runtime_invoke_url(region: &str, model: &str, stream: bool) -> String {
+    let operation = if stream {
+        "invoke-with-response-stream"
+    } else {
+        "invoke"
+    };
+    // Model IDs are `[a-z0-9.-:]`; `:` is the only byte that needs escaping.
+    let model = model.replace(':', "%3A");
+    format!("https://bedrock-runtime.{region}.amazonaws.com/model/{model}/{operation}")
+}
+
 pub fn available(codex_available: bool) -> bool {
     available_with(&crate::vault::global(), codex_available)
 }
@@ -159,7 +209,8 @@ impl CodexOverrides {
                 "model_provider=\"bedrock\"".into(),
                 "model_providers.bedrock.name=\"Bedrock\"".into(),
                 format!(
-                    "model_providers.bedrock.base_url=\"https://bedrock-runtime.{region}.amazonaws.com/openai/v1\""
+                    "model_providers.bedrock.base_url=\"{}\"",
+                    runtime_openai_base_url(region)
                 ),
                 format!("model_providers.bedrock.env_key=\"{BEDROCK_ENV}\""),
                 "model_providers.bedrock.wire_api=\"responses\"".into(),
@@ -245,11 +296,27 @@ fn bundled_slug(model: &str) -> Option<&str> {
 fn catalog_for(bundled: &[u8], model: &str) -> Option<Vec<u8>> {
     let slug = bundled_slug(model)?;
     let catalog: serde_json::Value = serde_json::from_slice(bundled).ok()?;
-    let mut entry = catalog
-        .get("models")?
-        .as_array()?
-        .iter()
-        .find(|entry| entry.get("slug").and_then(|value| value.as_str()) == Some(slug))?
+    let entries = catalog.get("models")?.as_array()?;
+    fn entry_slug(entry: &serde_json::Value) -> Option<&str> {
+        entry.get("slug").and_then(|value| value.as_str())
+    }
+    let exact = entries.iter().find(|entry| entry_slug(entry) == Some(slug));
+    // A model released after this Codex build (e.g. `gpt-6.1-sol` against a
+    // catalog holding only `gpt-6-sol`) borrows its newest same-family
+    // predecessor's metadata rather than Codex's generic fallback.
+    let mut entry = exact
+        .or_else(|| {
+            let (family, version) = slug_family(slug)?;
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let (candidate, candidate_version) = slug_family(entry_slug(entry)?)?;
+                    (candidate == family && candidate_version <= version)
+                        .then_some((candidate_version, entry))
+                })
+                .max_by(|left, right| left.0.cmp(&right.0))
+                .map(|(_, entry)| entry)
+        })?
         .clone();
     let object = entry.as_object_mut()?;
     object.insert("slug".into(), model.into());
@@ -261,6 +328,20 @@ fn catalog_for(bundled: &[u8], model: &str) -> Option<Vec<u8>> {
     let mut encoded = serde_json::to_vec(&serde_json::json!({ "models": [entry] })).ok()?;
     encoded.push(b'\n');
     Some(encoded)
+}
+
+/// Splits `gpt-6.1-sol` into family `(["gpt"], ["sol"])` and version `[6, 1]`:
+/// the first dash-separated segment that is a dotted number is the version.
+fn slug_family(slug: &str) -> Option<((Vec<&str>, Vec<&str>), Vec<u32>)> {
+    let parts: Vec<&str> = slug.split('-').collect();
+    let (index, version) = parts.iter().enumerate().find_map(|(index, part)| {
+        let version: Option<Vec<u32>> = part.split('.').map(|n| n.parse().ok()).collect();
+        Some((index, version?))
+    })?;
+    Some((
+        (parts[..index].to_vec(), parts[index + 1..].to_vec()),
+        version,
+    ))
 }
 
 /// The runtime Responses endpoint has no GET /models operation, so list the
@@ -321,7 +402,7 @@ pub async fn discover_models() -> Result<Vec<(String, String)>, String> {
     models.dedup();
     if models.is_empty() {
         return Err(
-            "Bedrock has no active GPT Responses inference profiles in selected region".into(),
+            "Bedrock has no active GPT or Claude inference profiles in selected region".into(),
         );
     }
     Ok(models)
@@ -345,10 +426,11 @@ fn parse_profile_page(
             .iter()
             .filter(|entry| entry["status"] == "ACTIVE")
             .filter_map(|entry| entry["inferenceProfileId"].as_str())
-            // This provider uses bedrock-runtime Responses. Other active
-            // profiles can require Converse, Messages, or Chat Completions;
-            // GPT OSS requires bedrock-mantle for Responses.
-            .filter(|id| id.contains(".openai.gpt-") && !id.contains("gpt-oss"))
+            // GPT models run through the OpenAI-compatible bedrock-runtime
+            // endpoints (Codex or the Harness); Claude models run through
+            // Claude Code or the Harness (see `resolve_launch_provider`).
+            // Other vendors need Converse; GPT OSS needs bedrock-mantle.
+            .filter(|id| bedrock_vendor(id).is_some())
             .map(|id| (id.to_string(), id.to_string())),
     );
     Ok(document["nextToken"]
@@ -411,6 +493,13 @@ mod tests {
         let global: serde_json::Value = serde_json::from_slice(&global).unwrap();
         assert_eq!(global["models"][0]["slug"], "global.openai.gpt-6-sol");
 
+        // A release newer than the bundled catalog borrows its family's
+        // newest older entry; an older or unrelated one does not.
+        let newer = catalog_for(bundled, "us.openai.gpt-6.1-luna").unwrap();
+        let newer: serde_json::Value = serde_json::from_slice(&newer).unwrap();
+        assert_eq!(newer["models"][0]["slug"], "us.openai.gpt-6.1-luna");
+        assert_eq!(newer["models"][0]["context_window"], 272000);
+        assert!(catalog_for(bundled, "us.openai.gpt-5.9-luna").is_none());
         assert!(catalog_for(bundled, "us.openai.gpt-9-unknown").is_none());
         assert!(catalog_for(bundled, "us.anthropic.claude-sonnet-5").is_none());
         assert!(model_id_valid("us.openai.gpt-6-luna"));
@@ -420,13 +509,14 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn profile_page_keeps_active_gpt_responses_models() {
+    fn profile_page_keeps_active_gpt_and_claude_models() {
         let page = br#"{
             "inferenceProfileSummaries": [
                 {"inferenceProfileId": "us.openai.gpt-6-sol", "status": "ACTIVE"},
                 {"inferenceProfileId": "global.openai.gpt-5.6-luna", "status": "ACTIVE"},
                 {"inferenceProfileId": "us.openai.gpt-oss-120b", "status": "ACTIVE"},
                 {"inferenceProfileId": "us.anthropic.claude-sonnet-5", "status": "ACTIVE"},
+                {"inferenceProfileId": "us.meta.llama4-maverick-v1:0", "status": "ACTIVE"},
                 {"inferenceProfileId": "us.openai.gpt-6-luna", "status": "INACTIVE"}
             ],
             "nextToken": "page-2"
@@ -435,9 +525,61 @@ mod tests {
         let next = parse_profile_page(page, &mut models).unwrap();
         assert_eq!(next.as_deref(), Some("page-2"));
         let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, ["us.openai.gpt-6-sol", "global.openai.gpt-5.6-luna"]);
+        assert_eq!(
+            ids,
+            [
+                "us.openai.gpt-6-sol",
+                "global.openai.gpt-5.6-luna",
+                "us.anthropic.claude-sonnet-5"
+            ]
+        );
 
         let last = br#"{"inferenceProfileSummaries": []}"#;
         assert_eq!(parse_profile_page(last, &mut models).unwrap(), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn launch_provider_follows_bedrock_route_and_vendor() {
+        use crate::config::OpenRouterRoute::{CodexCli, Harness};
+        let claude = Some("us.anthropic.claude-sonnet-5-v1:0");
+        let gpt = Some("global.openai.gpt-5.6-sol");
+        let bedrock = SessionProvider::Bedrock;
+        assert_eq!(
+            resolve_launch_provider(bedrock, claude, CodexCli),
+            SessionProvider::Claude
+        );
+        assert_eq!(
+            resolve_launch_provider(bedrock, claude, Harness),
+            SessionProvider::Harness
+        );
+        // GPT keeps the Bedrock provider; its spawn arm applies the route.
+        assert_eq!(resolve_launch_provider(bedrock, gpt, CodexCli), bedrock);
+        assert_eq!(resolve_launch_provider(bedrock, gpt, Harness), bedrock);
+        assert_eq!(
+            resolve_launch_provider(bedrock, Some("us.meta.llama4-maverick-v1:0"), Harness),
+            bedrock
+        );
+        assert_eq!(
+            resolve_launch_provider(SessionProvider::Claude, claude, Harness),
+            SessionProvider::Claude
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn runtime_urls_target_bedrock_runtime() {
+        assert_eq!(
+            runtime_invoke_url("us-east-1", "us.anthropic.claude-sonnet-5-v1:0", true),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-5-v1%3A0/invoke-with-response-stream"
+        );
+        assert_eq!(
+            runtime_invoke_url("us-east-1", "global.anthropic.claude-opus-5-5", false),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/global.anthropic.claude-opus-5-5/invoke"
+        );
+        assert_eq!(
+            runtime_openai_base_url("us-west-2"),
+            "https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1"
+        );
     }
 }

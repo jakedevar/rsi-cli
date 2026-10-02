@@ -25,6 +25,7 @@ required-features = ["dev-fixtures"]
 
 [dependencies]
 rsi-common = { path = "../rsi-common" }
+rsid-core = { path = "../rsid-core" }
 rsi-graph = { path = "../rsi-graph" }
 rsi-codegraph = { path = "../rsi-codegraph" }
 tokio = { workspace = true }
@@ -42,7 +43,7 @@ dotenvy = { workspace = true }
 thiserror = { workspace = true }
 which = { workspace = true }
 nix = { workspace = true }
-rusqlite = { workspace = true, features = ["load_extension", "functions"] }
+rusqlite = { workspace = true, features = ["load_extension", "functions", "blob", "hooks"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 anyhow = "1"
 async-trait = "0.1"
@@ -56,6 +57,7 @@ zeroize = "1"
 hex = "0.4"
 walkdir = "2"
 notify = "7"
+unicode-normalization = { workspace = true }
 serde_yaml_ng = { workspace = true }
 toml = "0.8"
 minijinja = { workspace = true }
@@ -63,8 +65,11 @@ parking_lot = "0.12"
 lru = "0.16"
 blake3 = "1"
 rand = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
 tempfile = "3"
 similar = "2.7"
+rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process"] }
 
 # Optional: heap profiling (Phase 0.4) — enabled via `dhat-heap` feature
 dhat = { version = "0.3", optional = true }
@@ -86,11 +91,19 @@ mockito = "1"
 wiremock = "0.6"
 temp-env = { workspace = true, features = ["async_closure"] }
 criterion = { workspace = true }
+# Self dev-dependency: enables the test-only `test-seam` feature for tests.
+rsid = { path = ".", features = ["test-seam"] }
 
 [features]
 default = []
 test-ollama = []
 dev-fixtures = ["rusqlite/backup"]
+# Test seam (#393): lets integration tests inject a hermetic /proc inventory
+# for the public archive-cleanup blocking workers. It exists only in test
+# builds (enabled through the self dev-dependency below); no RPC, agent verb,
+# setting or environment variable can turn it on, and release builds never
+# compile it, so production stays fail-closed against the live /proc.
+test-seam = []
 # Unit-test shards keep direct `cargo test -p rsid --lib` complete. Selecting
 # exactly one shard feature enables mode and compiles only that shard's tests.
 test-shard-mode = []

@@ -1,8 +1,11 @@
 //! Unit tests for session module.
 
+mod harness_idle_wake;
 mod harness_manager;
 mod manager_actions;
+mod terminal_cause;
 mod terminal_watch_owner;
+mod transient_heal;
 
 use super::types::{PIPELINE_PATH_RE, TerminalFinalizeDecision};
 use super::*;
@@ -27,12 +30,39 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// A fixture directory on the Cargo target filesystem, never `$TMPDIR`.
+///
+/// Sandbox execution scratch refuses a sandbox root on tmpfs/ramfs, and the
+/// rolling lander runs its test gates with `TMPDIR` on `/dev/shm`. A fixture
+/// under `$TMPDIR` therefore failed every candidate launch in the gate while
+/// passing on a developer host. The lander requires `CARGO_TARGET_DIR` outside
+/// the system temp directory.
+fn disk_backed_tempdir() -> TempDir {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+        .join("rsid-session-fixtures");
+    std::fs::create_dir_all(&base).unwrap();
+    // Sandbox allocation refuses a non-canonical base, and the fallback above
+    // contains `..` whenever CARGO_TARGET_DIR is unset (daemon test jobs).
+    let base = std::fs::canonicalize(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir_in(base)
+        .unwrap()
+}
+
 fn manager() -> (SessionManager, TempDir) {
-    let dir = TempDir::new().unwrap();
+    let dir = disk_backed_tempdir();
     let db_path = dir.path().join("rsi.db");
     let store = Store::open(&db_path).expect("open store");
     let config = Config::from_env();
     let runtime_config = RuntimeConfig::from_config(&config);
+    // As in the launch tests: these tests are not about host capacity, so
+    // the host's free space must not refuse their sandbox allocations.
+    runtime_config
+        .sandbox_min_free_gib
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let manager = SessionManager::new(
         std::sync::Arc::new(EventBus::new(16)),
         store,
@@ -94,6 +124,7 @@ fn bare_session(id: Uuid) -> Session {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -389,6 +420,48 @@ fn test_convert_stream_event_message() {
     assert_eq!(event.role, Some(Role::Assistant));
     assert_eq!(event.content, "Hello, world!");
     assert_eq!(event.sequence, 1);
+}
+
+/// #1039: `history_repaired` is a recognized Harness event that persists one
+/// visible System row instead of tripping the unrecognized-type diagnostic.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn test_convert_stream_event_history_repaired() {
+    let stream = StreamEvent {
+        event_type: "history_repaired".to_string(),
+        data: serde_json::json!({ "synthesized": 2, "dropped": 1 }),
+    };
+    let mut seq = 4;
+    let events = SessionManager::convert_recognized_stream_event(&stream, Uuid::new_v4(), &mut seq)
+        .expect("history_repaired must be a recognized stream event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, EventType::System);
+    assert_eq!(events[0].sequence, 5);
+    assert!(events[0].content.contains("2 tool result(s) synthesized"));
+    assert!(events[0].content.contains("1 message(s) dropped"));
+    assert_eq!(
+        events[0].metadata.as_deref(),
+        Some(&serde_json::json!({ "history_repaired": { "synthesized": 2, "dropped": 1 } }))
+    );
+}
+
+/// #1061: the final-answer retry is a recognized Harness event that persists
+/// one visible System row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn test_convert_stream_event_final_answer_retry() {
+    let stream = StreamEvent {
+        event_type: "final_answer_retry".to_string(),
+        data: serde_json::json!({ "provider_stop_reason": "length" }),
+    };
+    let mut seq = 4;
+    let events = SessionManager::convert_recognized_stream_event(&stream, Uuid::new_v4(), &mut seq)
+        .expect("final_answer_retry must be a recognized stream event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, EventType::System);
+    assert_eq!(events[0].sequence, 5);
+    assert!(events[0].content.contains("retrying once"));
+    assert!(events[0].content.contains("provider stop reason: length"));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -950,6 +1023,82 @@ async fn continue_retry_refusal_is_launch_time_and_not_a_started_provider() {
         !manager.active.read().await.contains_key(&session_id),
         "a refused launch must not leave an active provider incarnation"
     );
+}
+
+/// Issue #572: mail to any Codex session is refused with the typed hold while
+/// another Codex session's usage limit is in force (one provider account), and
+/// the refusal carries the provider's retry-after. An operator continuation is
+/// not gated, and a session on another provider is unaffected.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn usage_limit_hold_refuses_mail_to_codex_sessions_until_the_retry_after() {
+    let (manager, _dir) = manager();
+    let retry_at = chrono::Utc::now() + chrono::Duration::days(2);
+    let text = format!(
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {} {}th, {} {}.",
+        retry_at.format("%b"),
+        retry_at.format("%-d"),
+        retry_at.format("%Y"),
+        retry_at.format("%-I:%M %p"),
+    );
+    let exhausted = Uuid::new_v4();
+    let mut failed = bare_session(exhausted);
+    failed.provider = SessionProvider::Codex;
+    failed.status = SessionStatus::Failed;
+    failed.stop_reason = Some(crate::codex::CODEX_USAGE_LIMIT_STOP_REASON.into());
+    insert_row(&manager, &failed).await;
+    manager
+        .store
+        .lock()
+        .await
+        .insert_event(&ConversationEvent {
+            id: 0,
+            session_id: exhausted,
+            sequence: 1,
+            event_type: EventType::Message,
+            role: Some(Role::Assistant),
+            content: format!("**Process Error (codex_event)**\n```\n{text}\n```"),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        })
+        .unwrap();
+
+    let other = Uuid::new_v4();
+    let mut idle = bare_session(other);
+    idle.provider = SessionProvider::Codex;
+    idle.status = SessionStatus::Completed;
+    insert_row(&manager, &idle).await;
+    let error = manager
+        .continue_session(other, "mail".to_string())
+        .await
+        .expect_err("mail to a Codex session is held while the account is exhausted");
+    let until = crate::provider_exhaustion::hold_error_until(&error).expect("typed hold refusal");
+    assert_eq!(
+        until,
+        retry_at
+            .date_naive()
+            .and_time(
+                chrono::NaiveTime::from_hms_opt(
+                    chrono::Timelike::hour(&retry_at),
+                    chrono::Timelike::minute(&retry_at),
+                    0
+                )
+                .unwrap()
+            )
+            .and_utc()
+    );
+
+    let claude = Uuid::new_v4();
+    let mut other_provider = bare_session(claude);
+    other_provider.provider = SessionProvider::Claude;
+    other_provider.status = SessionStatus::Completed;
+    insert_row(&manager, &other_provider).await;
+    assert_eq!(manager.usage_limit_hold_for(claude).await.unwrap(), None);
+    assert!(manager.usage_limit_hold_for(other).await.unwrap().is_some());
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -1691,6 +1840,7 @@ async fn stale_finalize_generation_does_not_clobber_active_session() {
         manager.persistence.clone(),
         None,
         manager.runtime_config.clone(),
+        None,
     )
     .await;
 
@@ -1727,6 +1877,7 @@ async fn stale_finalize_generation_does_not_clobber_active_session() {
         manager.persistence.clone(),
         None,
         manager.runtime_config.clone(),
+        None,
     )
     .await;
 
@@ -1777,6 +1928,7 @@ async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
             manager.persistence.clone(),
             None,
             manager.runtime_config.clone(),
+            None,
         )
         .await
         .expect("durable finalization");
@@ -1785,7 +1937,9 @@ async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
         match intent {
             "interrupt" => {
                 assert_eq!(finalized.status, SessionStatus::Interrupted);
-                assert_eq!(row.stop_reason, None);
+                // The stale handoff reason is dropped; the interrupt (here with
+                // no recorded source) names its own cause (#588).
+                assert_eq!(row.stop_reason.as_deref(), Some("interrupted:unattributed"));
             }
             "stall" => {
                 assert_eq!(finalized.status, SessionStatus::Failed);
@@ -1825,6 +1979,7 @@ async fn terminal_status_event_is_published_after_completed_map_is_ready() {
         manager.persistence.clone(),
         None,
         manager.runtime_config.clone(),
+        None,
     ));
 
     loop {
@@ -1901,6 +2056,7 @@ async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
             manager.persistence.clone(),
             None,
             Arc::clone(&manager.runtime_config),
+            None,
         ));
         drop(held);
         writer.await.expect("queued lifecycle writer");
@@ -2178,6 +2334,447 @@ async fn memory_flush_live_monitor_dispatches_once_from_canonical_budget() {
             .map(|completed| completed.session.status),
         Some(SessionStatus::Completed),
         "the original single-turn policy resumes after the flush"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_operator_message_waits_for_tool_result_boundary() {
+    queued_operator_message_boundary(false, false).await;
+}
+
+/// #1049: a normal operator message to a live Claude turn is queued for the
+/// next tool boundary; a session that is not mid-turn is left to `continue`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_message_to_a_live_claude_turn_is_queued_not_interrupting() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.status = SessionStatus::Running;
+    session.provider = SessionProvider::Claude;
+    insert_row(&manager, &session).await;
+    let (mut tracked, _process) =
+        scripted_process_tracked(session_id, 7, true, 0, true, false, false);
+    tracked.session = session;
+    manager.active.write().await.insert(session_id, tracked);
+
+    assert!(
+        manager
+            .queue_operator_message_if_turn_active(session_id, "soft note")
+            .await
+            .expect("queue")
+    );
+    let queued = manager
+        .store
+        .lock()
+        .await
+        .list_operator_messages(session_id)
+        .expect("list");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].content, "soft note");
+    assert_eq!(queued[0].state, "queued");
+    // The turn was not touched: the session is still tracked as active.
+    assert!(manager.active.read().await.contains_key(&session_id));
+
+    let idle = Uuid::new_v4();
+    let idle_session = bare_session(idle);
+    insert_row(&manager, &idle_session).await;
+    assert!(
+        !manager
+            .queue_operator_message_if_turn_active(idle, "not mid-turn")
+            .await
+            .expect("not queued")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_to_effect_crash_recovers_one_provider_turn() {
+    queued_operator_message_boundary(true, false).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appserver_start_turn_crash_remains_uncertain_without_replay() {
+    queued_operator_message_boundary(false, true).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn queued_operator_message_boundary(restart_after_claim: bool, crash_after_start: bool) {
+    let (manager, dir) = manager();
+    let session_id = Uuid::new_v4();
+    let generation = 7;
+    let mut session = bare_session(session_id);
+    session.status = SessionStatus::Starting;
+    session.provider = SessionProvider::CodexAppServer;
+    insert_row(&manager, &session).await;
+    let queued = manager
+        .store
+        .lock()
+        .await
+        .queue_operator_message(session_id, "operator follow-up", "after-tool")
+        .expect("queue while first turn is live");
+
+    let manager = if restart_after_claim {
+        // Fault after the durable claim and before the effect-possible write.
+        // The old daemon did not call the provider. Reopen the same database
+        // as a new daemon and run the production startup reconciler.
+        let claimed = manager
+            .store
+            .lock()
+            .await
+            .claim_operator_message(session_id)
+            .expect("claim before crash")
+            .expect("queued message");
+        assert_eq!(claimed.id, queued.id);
+        drop(manager);
+        let store = Store::open(&dir.path().join("rsi.db")).expect("reopen after crash");
+        let config = Config::from_env();
+        let recovered = SessionManager::new(
+            std::sync::Arc::new(EventBus::new(16)),
+            store,
+            false,
+            dir.path().join("daemon.sock"),
+            None,
+            Vec::new(),
+            RuntimeConfig::from_config(&config),
+            dir.path().join("sandboxes"),
+        )
+        .expect("restarted manager");
+        assert_eq!(
+            recovered
+                .reconcile_operator_messages_at_startup()
+                .await
+                .expect("startup reconciliation"),
+            (1, 0)
+        );
+        assert_eq!(
+            recovered
+                .store
+                .lock()
+                .await
+                .list_operator_messages(session_id)
+                .expect("recovered queue")[0]
+                .state,
+            "queued"
+        );
+        recovered
+    } else {
+        manager
+    };
+
+    let (stop_tx, stop_rx) = mpsc::channel(4);
+    let (mut tracked, process) =
+        scripted_process_tracked(session_id, generation, true, 0, true, false, false);
+    tracked.session = session;
+    tracked.stop_tx = stop_tx;
+    manager.active.write().await.insert(session_id, tracked);
+    let (event_tx, event_rx) = mpsc::channel(4);
+    let started_turns = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let turn_started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let provider = RecordingMultiTurnProvider {
+        event_rx,
+        started_turns: std::sync::Arc::clone(&started_turns),
+        turn_started: std::sync::Arc::clone(&turn_started),
+    };
+    let monitor = tokio::spawn(SessionManager::monitor_session(
+        session_id,
+        generation,
+        Box::new(provider),
+        std::sync::Arc::clone(&manager.active),
+        std::sync::Arc::clone(&manager.completed),
+        std::sync::Arc::clone(&manager.event_bus),
+        stop_rx,
+        std::sync::Arc::clone(&manager.store),
+        manager.model_call_settlements.handle().expect("settlement"),
+        manager.persistence.clone(),
+        0,
+        false,
+        manager.socket_path.clone(),
+        std::sync::Arc::clone(&manager.token_counter),
+        None,
+        manager.retry_tx.clone(),
+        std::sync::Arc::clone(&manager.tool_registry),
+        crate::turn_controller::TurnController::new(
+            crate::turn_controller::ContinuationPolicy::MaxTurns(2),
+        ),
+        std::sync::Arc::clone(&manager.runtime_config),
+        std::sync::Arc::clone(&manager.spawn_coordinator),
+        std::sync::Arc::clone(&manager.agent_tokens),
+        std::sync::Arc::clone(&manager.spawn_epoch),
+        std::sync::Arc::clone(&manager.agent_message_arbiter),
+        manager.codegraph_handle.clone(),
+        manager.custody_execution_runtime(),
+    ));
+    event_tx
+        .send(StreamEvent {
+            event_type: "tool_use".into(),
+            data: serde_json::json!({"name":"shell","input":{"command":"sleep 1"}}),
+        })
+        .await
+        .expect("tool begins");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if manager
+                .store
+                .lock()
+                .await
+                .load_events(session_id)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == EventType::ToolUse)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool event persisted");
+    assert!(
+        started_turns.lock().await.is_empty(),
+        "queued input waits for tool completion"
+    );
+    event_tx
+        .send(StreamEvent {
+            event_type: "tool_result".into(),
+            data: serde_json::json!({"name":"shell","content":"done"}),
+        })
+        .await
+        .expect("tool completes");
+    event_tx
+        .send(StreamEvent {
+            event_type: "result".into(),
+            data: serde_json::json!({"subtype":"turn_completed"}),
+        })
+        .await
+        .expect("turn completes");
+    tokio::time::timeout(std::time::Duration::from_secs(2), turn_started.notified())
+        .await
+        .expect("next turn starts at result boundary");
+    assert_eq!(started_turns.lock().await[0].input, "operator follow-up");
+    assert_eq!(
+        manager
+            .store
+            .lock()
+            .await
+            .list_operator_messages(session_id)
+            .expect("queue state before provider result")[0]
+            .state,
+        "effect_possible",
+        "enqueue alone is not provider delivery evidence"
+    );
+    if crash_after_start {
+        monitor.abort();
+        let _ = monitor.await;
+        drop(event_tx);
+        drop(manager);
+        let mut store = Store::open(&dir.path().join("rsi.db")).expect("reopen after turn start");
+        assert_eq!(
+            store
+                .reconcile_operator_messages_at_startup()
+                .expect("startup reconciliation"),
+            (0, 1)
+        );
+        assert_eq!(
+            store
+                .list_operator_messages(session_id)
+                .expect("recovered outcome")[0]
+                .state,
+            "uncertain"
+        );
+        assert!(
+            store
+                .claim_operator_message(session_id)
+                .expect("no duplicate claim")
+                .is_none()
+        );
+        assert_eq!(started_turns.lock().await.len(), 1);
+        return;
+    }
+    event_tx
+        .send(StreamEvent {
+            event_type: "result".into(),
+            data: serde_json::json!({"subtype":"turn_completed"}),
+        })
+        .await
+        .expect("provider confirms second turn");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if manager
+                .store
+                .lock()
+                .await
+                .list_operator_messages(session_id)
+                .expect("queue state after provider result")[0]
+                .state
+                == "delivered"
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider result settles operator message");
+    assert_eq!(
+        manager
+            .store
+            .lock()
+            .await
+            .list_operator_messages(session_id)
+            .expect("queue state")[0]
+            .state,
+        "delivered"
+    );
+    assert_eq!(queued.session_id, session_id);
+    drop(event_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), monitor)
+        .await
+        .expect("monitor settles")
+        .expect("monitor task");
+    assert_eq!(
+        started_turns.lock().await.len(),
+        1,
+        "one queued message starts exactly one provider turn"
+    );
+    assert!(
+        process
+            .interrupt_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_waits_for_codex_tool_result_before_shutdown() {
+    use std::sync::atomic::Ordering;
+
+    let mut fixture =
+        start_scripted_monitor_for_provider(SessionProvider::Codex, true, Vec::new(), true, 0)
+            .await;
+    let session_id = fixture.session_id;
+    let provider_tx = fixture.provider_tx.take().expect("provider sender");
+    provider_tx
+        .send(StreamEvent {
+            event_type: "tool_use".into(),
+            data: serde_json::json!({"name":"shell","input":{"command":"compile"}}),
+        })
+        .await
+        .expect("tool begins");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if fixture
+                .manager
+                .store
+                .lock()
+                .await
+                .load_events(session_id)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == EventType::ToolUse)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool start persisted");
+    fixture.manager.request_drain_restart();
+    let interrupt_count = std::sync::Arc::clone(&fixture.process.interrupt_count);
+    let alive = std::sync::Arc::clone(&fixture.process.alive);
+    let feed = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            interrupt_count.load(Ordering::SeqCst),
+            0,
+            "drain keeps the in-flight Codex tool alive"
+        );
+        provider_tx
+            .send(StreamEvent {
+                event_type: "tool_result".into(),
+                data: serde_json::json!({"name":"shell","content":"compile completed"}),
+            })
+            .await
+            .expect("tool result");
+        provider_tx
+            .send(StreamEvent {
+                event_type: "result".into(),
+                data: serde_json::json!({"subtype":"success"}),
+            })
+            .await
+            .expect("turn result");
+        alive.store(false, Ordering::SeqCst);
+        drop(provider_tx);
+    };
+    let (shutdown, ()) = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        tokio::join!(
+            fixture
+                .manager
+                .shutdown_drain(std::time::Duration::from_secs(5)),
+            feed
+        )
+    })
+    .await
+    .expect("bounded drain");
+    shutdown.expect("drain settled");
+    tokio::time::timeout(std::time::Duration::from_secs(5), fixture.monitor)
+        .await
+        .expect("monitor settled")
+        .expect("monitor task");
+    let events = fixture
+        .manager
+        .store
+        .lock()
+        .await
+        .load_events(session_id)
+        .expect("transcript");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.content.contains("compile completed")),
+        "the completed tool result is durable before daemon shutdown"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn confirmed_interrupt_now_cancels_the_active_turn() {
+    use std::sync::atomic::Ordering;
+
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.status = SessionStatus::Running;
+    insert_row(&manager, &session).await;
+    let (mut tracked, process) =
+        scripted_process_tracked(session_id, 7, true, 0, true, false, false);
+    tracked.session = session;
+    manager.active.write().await.insert(session_id, tracked);
+
+    manager
+        .interrupt_session_operator_with_pause(
+            session_id,
+            crate::store::manager_actions::OperatorPause::Hard,
+        )
+        .await
+        .expect("confirmed emergency interrupt");
+    assert!(
+        process.interrupt_count.load(Ordering::SeqCst) >= 1,
+        "the active provider received cancellation"
+    );
+    assert!(manager.active.read().await[&session_id].interrupt_requested);
+    assert_eq!(
+        manager
+            .store
+            .lock()
+            .await
+            .get_operator_pause(session_id)
+            .expect("pause"),
+        crate::store::manager_actions::OperatorPause::Hard
     );
 }
 
@@ -3055,6 +3652,11 @@ async fn init_handshake_and_rate_limit_event_persist_through_the_monitor_loop() 
         ],
         "every advertised capability token is recorded, in order"
     );
+    assert_eq!(
+        row.model.as_deref(),
+        Some("claude-opus-5"),
+        "init's variant-suffixed model is stored as the canonical catalog id (#273)"
+    );
 
     let snapshots = store
         .load_provider_rate_limit_snapshots()
@@ -3078,6 +3680,83 @@ async fn init_handshake_and_rate_limit_event_persist_through_the_monitor_loop() 
             ("seven_day".to_string(), 0.05),
         ],
         "every reported plan window lands, not just the first"
+    );
+    drop(store);
+
+    let _ = fixture.scheduler.shutdown().await;
+    fixture.watch_task.abort();
+    fixture.manager.event_bus.unsubscribe();
+}
+
+/// A single oversized CLI stdout frame must be reported without ending the
+/// provider stream or changing the events on either side of it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_provider_stdout_line_survives_session_monitor() {
+    use crate::process_control::{BoundedLineError, BoundedLines, PROVIDER_MAX_LINE_BYTES};
+    use std::sync::atomic::Ordering;
+
+    let mut stdout = Vec::new();
+    stdout.extend_from_slice(br#"{"type":"assistant","role":"assistant","content":"before"}"#);
+    stdout.push(b'\n');
+    stdout.extend_from_slice(
+        serde_json::json!({
+            "type": "assistant",
+            "role": "assistant",
+            "content": "x".repeat(PROVIDER_MAX_LINE_BYTES),
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    stdout.push(b'\n');
+    stdout.extend_from_slice(br#"{"type":"assistant","role":"assistant","content":"after"}"#);
+    stdout.push(b'\n');
+    stdout.extend_from_slice(br#"{"type":"result","subtype":"success"}"#);
+    stdout.push(b'\n');
+
+    let mut lines = BoundedLines::new(std::io::Cursor::new(stdout), PROVIDER_MAX_LINE_BYTES);
+    let mut events = Vec::new();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => events.push(serde_json::from_str::<StreamEvent>(&line).unwrap()),
+            Ok(None) => break,
+            Err(BoundedLineError::Exceeded { limit }) => {
+                lines.drain_oversized_line().await.unwrap();
+                events.push(crate::provider::stdout_line_truncated_event(limit));
+            }
+            Err(error) => panic!("unexpected stdout read error: {error}"),
+        }
+    }
+
+    let mut fixture =
+        start_scripted_monitor_for_provider(SessionProvider::Claude, false, events, true, 0).await;
+    wait_for_scripted_result_boundary(&fixture, "after").await;
+    fixture.process.exit_code.store(0, Ordering::SeqCst);
+    fixture.process.alive.store(false, Ordering::SeqCst);
+    drop(fixture.provider_tx.take());
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.monitor)
+        .await
+        .expect("monitor drains the scripted stream")
+        .expect("monitor task");
+
+    let store = fixture.manager.store.lock().await;
+    let row = store
+        .get_session(fixture.session_id)
+        .expect("load session")
+        .expect("session row");
+    assert_eq!(row.status, SessionStatus::Completed);
+    let persisted = store.load_events(fixture.session_id).expect("load events");
+    let content: Vec<_> = persisted
+        .iter()
+        .map(|event| event.content.as_str())
+        .collect();
+    assert_eq!(
+        content,
+        [
+            "before",
+            "**Provider diagnostic (stdout)**\n```\n[provider stdout line truncated at 2097152 bytes]\n```",
+            "after",
+        ]
     );
     drop(store);
 
@@ -3575,6 +4254,10 @@ struct CodexReplay {
     /// Settled session row after the provider exited.
     row: Session,
     events: Vec<ConversationEvent>,
+    /// The Codex usage-limit dispatch hold in force once the stream settled.
+    usage_limit_hold: Option<crate::provider_exhaustion::UsageLimitHold>,
+    /// `SystemMessage` texts published while the stream was replayed.
+    system_messages: Vec<String>,
 }
 
 /// Replay a Codex CLI JSONL stream through the production mapper and monitor.
@@ -3671,6 +4354,19 @@ async fn replay_codex_cli_stream(
         .await
         .load_events(fixture.session_id)
         .expect("load replayed Codex events");
+    let usage_limit_hold = fixture
+        .manager
+        .store
+        .lock()
+        .await
+        .codex_usage_limit_hold(chrono::Utc::now())
+        .expect("read usage-limit hold");
+    let mut system_messages = Vec::new();
+    while let Ok(event) = fixture.bus_rx.try_recv() {
+        if let DaemonEvent::SystemMessage { message, .. } = &*event {
+            system_messages.push(message.clone());
+        }
+    }
     let _ = fixture.scheduler.shutdown().await;
     fixture.watch_task.abort();
     fixture.manager.event_bus.unsubscribe();
@@ -3679,6 +4375,8 @@ async fn replay_codex_cli_stream(
         interrupts_after_prelude,
         row,
         events,
+        usage_limit_hold,
+        system_messages,
     }
 }
 
@@ -3778,6 +4476,85 @@ async fn codex_0_156_turn_failed_after_warning_items_fails_with_codex_text() {
         event.content.contains("**Process Error (codex_event)**")
             && event.content.contains("400 Bad Request")
     }));
+}
+
+/// Issue #572: a Codex usage-limit turn (the remote-compact wrapper form) ends
+/// the session Failed with the typed stop reason, never Completed with an empty
+/// one, carries the exact provider text, and holds automated dispatch until the
+/// provider's retry-after.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_usage_limit_turn_fails_with_typed_stop_reason_and_holds_dispatch() {
+    let retry_at = chrono::Utc::now() + chrono::Duration::days(3);
+    let retry_text = format!(
+        "{} {}th, {} {}",
+        retry_at.format("%b"),
+        retry_at.format("%-d"),
+        retry_at.format("%Y"),
+        retry_at.format("%-I:%M %p"),
+    );
+    let message = format!(
+        "Error running remote compact task: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {retry_text}."
+    );
+    let replay = replay_codex_cli_stream(
+        &[serde_json::json!({"type": "thread.started", "thread_id": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d"})],
+        &[
+            serde_json::json!({"type": "turn.started"}),
+            serde_json::json!({"type": "error", "message": message}),
+            serde_json::json!({"type": "turn.failed", "error": {"message": message}}),
+        ],
+    )
+    .await;
+
+    assert_eq!(replay.row.status, SessionStatus::Failed);
+    assert_eq!(
+        replay.row.stop_reason.as_deref(),
+        Some(crate::codex::CODEX_USAGE_LIMIT_STOP_REASON)
+    );
+    assert!(replay.events.iter().any(|event| {
+        event.content.contains("**Process Error (codex_event)**")
+            && event.content.contains(&message)
+    }));
+    assert!(
+        replay
+            .system_messages
+            .iter()
+            .any(|text| text.contains("Codex usage limit reached") && text.contains(&message)),
+        "the exact provider error is reported once: {:?}",
+        replay.system_messages
+    );
+    let hold = replay.usage_limit_hold.expect("usage limit holds dispatch");
+    assert_eq!(hold.session_id, replay.row.id);
+    assert_eq!(hold.provider_text, message);
+    let expected = retry_at.date_naive().and_time(
+        chrono::NaiveTime::from_hms_opt(
+            chrono::Timelike::hour(&retry_at),
+            chrono::Timelike::minute(&retry_at),
+            0,
+        )
+        .unwrap(),
+    );
+    assert_eq!(hold.until, expected.and_utc());
+}
+
+/// Issue #572: an ordinary failed turn is not reclassified as exhaustion.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_non_usage_limit_failure_does_not_hold_dispatch() {
+    let replay = replay_codex_cli_stream(
+        &[serde_json::json!({"type": "thread.started", "thread_id": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e"})],
+        &[
+            serde_json::json!({"type": "turn.started"}),
+            serde_json::json!({"type": "turn.failed", "error": {"message": "unexpected status 400 Bad Request"}}),
+        ],
+    )
+    .await;
+    assert_eq!(replay.row.status, SessionStatus::Failed);
+    assert_eq!(replay.usage_limit_hold, None);
+    assert_eq!(
+        replay.row.stop_reason.as_deref(),
+        Some("provider_error:codex:unexpected status 400 Bad Request")
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -4072,6 +4849,1391 @@ async fn list_sessions_includes_store_rows_missing_from_memory() {
     let sessions = manager.list_sessions().await;
     assert!(sessions.iter().any(|s| s.id == in_memory_id));
     assert!(sessions.iter().any(|s| s.id == store_only_id));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_runtime_candidate_snapshot_is_scalar_and_nonblocking() {
+    let (manager, _dir) = manager();
+    let project = Uuid::new_v4();
+    let active_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let mut active = bare_session(active_id);
+    active.status = SessionStatus::Running;
+    active.project_id = Some(project);
+    active.title = Some("large title".repeat(100_000));
+    manager
+        .active
+        .write()
+        .await
+        .insert(active_id, TrackedSession::new_for_test(active));
+    let mut completed = bare_session(completed_id);
+    completed.project_id = Some(project);
+    manager.completed.write().await.insert(
+        completed_id,
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    let snapshot = manager.remote_runtime_session_candidates().unwrap();
+    let mut page_choices = vec![
+        crate::remote_read::SessionCandidateSelection {
+            id: active_id,
+            origin: crate::remote_read::SessionCandidateOrigin::Active,
+        },
+        crate::remote_read::SessionCandidateSelection {
+            id: completed_id,
+            origin: crate::remote_read::SessionCandidateOrigin::Completed,
+        },
+    ];
+    page_choices.sort_unstable_by_key(|row| row.id);
+    let page_rows = manager
+        .remote_runtime_session_page_rows(project, &page_choices, &snapshot)
+        .unwrap();
+    assert_eq!(page_rows.len(), 2);
+    assert!(page_rows.iter().all(Option::is_some));
+    let active_row = page_rows[page_choices
+        .iter()
+        .position(|row| row.id == active_id)
+        .unwrap()]
+    .as_ref()
+    .unwrap();
+    assert!(active_row.own_title.text.len() <= 512);
+    assert!(active_row.own_title.observed_bytes > 512);
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(Uuid::new_v4(), &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    let selected_runtime = manager
+        .remote_selected_runtime_session(project, active_id)
+        .unwrap()
+        .unwrap();
+    let pending_capture = manager
+        .remote_runtime_only_pending_capture(project, active_id)
+        .unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY,project_id TEXT);
+         CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,sequence INTEGER);",
+    )
+    .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    let selected =
+        crate::remote_read::selected_runtime_store_miss(&tx, project, active_id, selected_runtime)
+            .unwrap();
+    tx.rollback().unwrap();
+    let pending = manager
+        .remote_runtime_only_pending_finish(&selected, pending_capture)
+        .unwrap();
+    assert_eq!(pending.coverage.len(), 8);
+    assert_eq!(
+        pending.coverage[0].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+    assert_eq!(
+        pending.coverage[1].state,
+        rsi_common::remote_read::CoverageStateV1::Complete
+    );
+    assert_eq!(
+        pending.coverage[4].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+    assert_eq!(snapshot.active.len(), 1);
+    assert_eq!(snapshot.active[0].id, active_id);
+    assert_eq!(snapshot.active[0].project_id, Some(project));
+    assert_eq!(snapshot.completed.len(), 1);
+    assert_eq!(snapshot.completed[0].id, completed_id);
+    assert!(snapshot.completed_observed_at >= snapshot.active_observed_at);
+    assert_eq!(snapshot.active[0].spawn_generation, Some(0));
+    assert_eq!(snapshot.completed[0].spawn_generation, None);
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, active_id),
+        Ok(Some(_))
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, completed_id),
+        Ok(Some(_))
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(Uuid::new_v4(), active_id),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&snapshot)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::NoObservedChange
+    );
+    let held = manager.active.write().await;
+    assert!(matches!(
+        manager.remote_runtime_session_candidates(),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, active_id),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    drop(held);
+    let held = manager.completed.write().await;
+    assert!(matches!(
+        manager.remote_runtime_session_candidates(),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    drop(held);
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&active_id)
+        .unwrap()
+        .spawn_generation += 1;
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&snapshot)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::Changed
+    );
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    let refreshed = manager.remote_runtime_session_candidates().unwrap();
+    let mut completed = manager.completed.write().await;
+    let entry = completed.get_mut(&completed_id).unwrap();
+    entry.session.updated_at = entry.session.updated_at.clone() + chrono::Duration::nanoseconds(1);
+    drop(completed);
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&refreshed)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::Changed
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_sessions_owner_merges_runtime_rows_after_store() {
+    use tokio::io::AsyncReadExt;
+
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let ids = [
+        Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+    ];
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at)
+             VALUES(?1,'Remote','#000000',?2,?2)",
+                rusqlite::params![project.to_string(), at],
+            )
+            .unwrap();
+    }
+    let mut active = bare_session(ids[0]);
+    active.status = SessionStatus::Running;
+    active.project_id = Some(project);
+    active.title = Some("runtime active".into());
+    manager
+        .active
+        .write()
+        .await
+        .insert(ids[0], TrackedSession::new_for_test(active));
+    let mut completed = bare_session(ids[1]);
+    completed.project_id = Some(project);
+    completed.title = Some("runtime completed".into());
+    manager.completed.write().await.insert(
+        ids[1],
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteListSessionsV1",
+            "params":{"project_id":project,"limit":2}
+        }))
+        .unwrap();
+    let completed = crate::remote_read::spawn_sessions_read(
+        crate::remote_read::RemoteReadLimiter::global(),
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4())),
+        request,
+        project,
+        [2; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    completed
+        .send_json_line(&mut writer, |result| result.unwrap())
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let response: rsi_common::remote_read::SessionsResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response.items.len(), 2);
+    assert_eq!(response.items[0].id.as_str(), ids[0].to_string());
+    assert_eq!(response.items[1].id.as_str(), ids[1].to_string());
+    assert_eq!(response.items[0].own_title.as_str(), "runtime active");
+    assert_eq!(response.items[1].own_title.as_str(), "runtime completed");
+    assert_eq!(response.coverage[0].lower_bound.get(), 1);
+    assert_eq!(response.coverage[1].lower_bound.get(), 1);
+    assert!(response.items.iter().all(|item| item.attention.incomplete));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_selected_session_owner_preserves_saved_and_runtime_only_identity() {
+    use tokio::io::AsyncReadExt;
+
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let saved_id = Uuid::new_v4();
+    let runtime_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store.conn.execute(
+            "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'Remote','#000000',?2,?2)",
+            rusqlite::params![project.to_string(), at],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at,project_id,is_eval)
+             VALUES(?1,'saved title','/saved','Completed',?2,?2,?3,0)",
+            rusqlite::params![saved_id.to_string(), at, project.to_string()],
+        ).unwrap();
+    }
+    let mut runtime = bare_session(runtime_id);
+    runtime.status = SessionStatus::Running;
+    runtime.project_id = Some(project);
+    runtime.query = "runtime title".into();
+    let event_id = 9_007_199_254_740_993_i64;
+    let mut tracked = TrackedSession::new_for_test(runtime);
+    tracked.events.push(ConversationEvent {
+        id: event_id,
+        session_id: runtime_id,
+        sequence: 17,
+        event_type: rsi_common::types::EventType::Message,
+        role: Some(rsi_common::types::Role::Assistant),
+        created_at: chrono::Utc::now(),
+        content: "runtime event".into(),
+        tool_name: None,
+        tool_input: None,
+        offload_id: None,
+        tool_use_id: None,
+        metadata: None,
+    });
+    manager.active.write().await.insert(runtime_id, tracked);
+    let mut completed = bare_session(completed_id);
+    completed.project_id = Some(project);
+    manager.completed.write().await.insert(
+        completed_id,
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: false,
+        },
+    );
+    let limiter = crate::remote_read::RemoteReadLimiter::new();
+    for (id, saved) in [(saved_id, true), (runtime_id, false), (completed_id, false)] {
+        let request: rsi_common::remote_read::ReadRequestV1 =
+            serde_json::from_value(serde_json::json!({
+                "method":"RemoteGetSessionV1",
+                "params":{"project_id":project,"session_id":id}
+            }))
+            .unwrap();
+        assert!(matches!(
+            crate::remote_read::spawn_selected_session_read(
+                &limiter,
+                std::sync::Arc::clone(&manager.store),
+                std::sync::Arc::clone(&manager),
+                &request,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ),
+            Err(crate::remote_read::ReadError::InvalidSource)
+        ));
+        let completed = crate::remote_read::spawn_selected_session_read(
+            &limiter,
+            std::sync::Arc::clone(&manager.store),
+            std::sync::Arc::clone(&manager),
+            &request,
+            project,
+            Uuid::new_v4(),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(65536);
+        completed
+            .send_json_line(&mut writer, |result| result.expect("selected session"))
+            .await
+            .unwrap();
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        let response: rsi_common::remote_read::SessionResponseV1 =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.item.summary.id.as_str(), id.to_string());
+        assert_eq!(response.coverage[2].lower_bound.get(), u64::from(saved));
+        assert_eq!(response.item.pending_coverage.len(), 8);
+        assert!(!response.complete);
+        assert_eq!(
+            response.item.sequences.len(),
+            if id == runtime_id { 2 } else { 1 }
+        );
+        if id == runtime_id {
+            assert_eq!(
+                response.item.sequences[0].source,
+                rsi_common::remote_read::SourceV1::ActiveSessions
+            );
+            assert_eq!(response.item.sequences[0].sequence, Some(17));
+            assert_eq!(
+                response.item.sequences[0].event_id.as_ref().unwrap().get(),
+                event_id
+            );
+        }
+        assert_eq!(
+            response.item.sequences.last().unwrap().source,
+            rsi_common::remote_read::SourceV1::StoreHistory
+        );
+        if id == completed_id {
+            assert_eq!(response.coverage[1].lower_bound.get(), 1);
+        }
+    }
+
+    // Runtime events may have a sequence before persistence assigns an ID.
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&runtime_id)
+        .unwrap()
+        .events[0]
+        .id = 0;
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetSessionV1",
+            "params":{"project_id":project,"session_id":runtime_id}
+        }))
+        .unwrap();
+    let completed = crate::remote_read::spawn_selected_session_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        &request,
+        project,
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(65536);
+    completed
+        .send_json_line(&mut writer, |result| result.expect("unpersisted event"))
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let response: rsi_common::remote_read::SessionResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response.item.sequences[0].sequence, Some(17));
+    assert!(response.item.sequences[0].event_id.is_none());
+
+    // A Store row owned by a different project prevents a runtime-only claim.
+    let foreign = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store.conn.execute(
+            "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'Foreign','#000000',?2,?2)",
+            rusqlite::params![foreign.to_string(), at],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at,project_id,is_eval)
+             VALUES(?1,'foreign','/foreign','Completed',?2,?2,?3,0)",
+            rusqlite::params![runtime_id.to_string(), at, foreign.to_string()],
+        ).unwrap();
+    }
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetSessionV1",
+            "params":{"project_id":project,"session_id":runtime_id}
+        }))
+        .unwrap();
+    let completed = crate::remote_read::spawn_selected_session_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        manager,
+        &request,
+        project,
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(1024);
+    completed
+        .send_json_line(&mut writer, |result| {
+            matches!(
+                result,
+                Err(crate::remote_read::ReadError::SourceUnavailable)
+            )
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_read_refusal_holds_no_permit_and_deadline_reports_busy() {
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16}
+        }))
+        .unwrap();
+    let spawn = |limiter: &crate::remote_read::RemoteReadLimiter, trusted: Uuid| {
+        crate::remote_read::spawn_initial_saved_decisions_sources(
+            limiter,
+            std::sync::Arc::clone(&manager.store),
+            std::sync::Arc::clone(&manager),
+            &request,
+            trusted,
+        )
+    };
+
+    // A refused request is validated before admission: it never holds a
+    // permit, however many times it is refused.
+    let limiter = crate::remote_read::RemoteReadLimiter::new();
+    let all = limiter.available_permits();
+    for _ in 0..8 {
+        assert!(matches!(
+            spawn(&limiter, Uuid::new_v4()),
+            Err(crate::remote_read::ReadError::InvalidSource)
+        ));
+        assert_eq!(limiter.available_permits(), all);
+    }
+
+    // `Busy` from an admitted read is its own deadline expiring (here zero,
+    // the limit a loaded host reaches by delaying the worker), not a held
+    // permit. The completed result owns the permit until it is settled.
+    let expired = crate::remote_read::RemoteReadLimiter::with_deadline(
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let completed = spawn(&expired, project).unwrap().await.unwrap();
+    assert_eq!(expired.available_permits(), all - 1);
+    let (mut writer, _reader) = tokio::io::duplex(4096);
+    completed
+        .send_json_line(&mut writer, |result| {
+            matches!(result, Err(crate::remote_read::ReadError::Busy))
+        })
+        .await
+        .unwrap();
+    assert_eq!(expired.available_permits(), all);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
+    use tokio::io::AsyncReadExt;
+
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at)
+             VALUES(?1,'Remote','#000000',?2,?2)",
+                rusqlite::params![project.to_string(), at],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at,project_id,is_eval)
+             VALUES(?1,'saved','/saved','Completed',?2,?2,?3,0)",
+            rusqlite::params![session.to_string(), at, project.to_string()],
+        ).unwrap();
+    }
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16}
+        }))
+        .unwrap();
+    // The production read deadlines (250 ms, 50 ms for the Store transaction)
+    // are wall-clock and start at admission, so a loaded host can expire them
+    // before the read finishes. This test asserts the owner's source coverage,
+    // not the deadline: give the reads room. The deadline is tested in
+    // `remote_read_refusal_holds_no_permit_and_deadline_reports_busy`.
+    let limiter = crate::remote_read::RemoteReadLimiter::with_deadline(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
+    );
+    assert!(matches!(
+        crate::remote_read::spawn_initial_saved_decisions_sources(
+            &limiter,
+            std::sync::Arc::clone(&manager.store),
+            std::sync::Arc::clone(&manager),
+            &request,
+            Uuid::new_v4(),
+        ),
+        Err(crate::remote_read::ReadError::InvalidSource)
+    ));
+    let completed = crate::remote_read::spawn_initial_saved_decisions_sources(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        &request,
+        project,
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    completed
+        .send_json_line(&mut writer, |result| result.unwrap().acquired.coverage)
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let coverage: Vec<rsi_common::remote_read::SourceCoverageV1> =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(coverage.len(), 8);
+    assert_eq!(
+        coverage[0].source,
+        rsi_common::remote_read::SourceV1::QuestionPublications
+    );
+    assert_eq!(
+        coverage[0].state,
+        rsi_common::remote_read::CoverageStateV1::Complete
+    );
+    assert_eq!(
+        coverage[7].source,
+        rsi_common::remote_read::SourceV1::LegacyApprovals
+    );
+    assert_eq!(
+        coverage[7].state,
+        rsi_common::remote_read::CoverageStateV1::Complete
+    );
+    assert_eq!(
+        coverage[4].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+
+    let page_signer =
+        std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4()));
+    assert!(matches!(
+        crate::remote_read::spawn_initial_saved_decisions_page(
+            &limiter,
+            std::sync::Arc::clone(&manager.store),
+            std::sync::Arc::clone(&manager),
+            std::sync::Arc::clone(&page_signer),
+            request.clone(),
+            Uuid::new_v4(),
+            [7; 32],
+            Uuid::new_v4(),
+        ),
+        Err(crate::remote_read::ReadError::InvalidSource)
+    ));
+    let page = crate::remote_read::spawn_initial_saved_decisions_page(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        page_signer,
+        request.clone(),
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    page.send_json_line(&mut writer, |result| {
+        matches!(
+            result,
+            Err(crate::remote_read::ReadError::SourceUnavailable
+                | crate::remote_read::ReadError::Busy)
+        )
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+
+    let selected_request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{
+                "project_id":project,
+                "session_id":session,
+                "limit":16,
+                "selected_decision_id":format!("question:{}", Uuid::new_v4())
+            }
+        }))
+        .unwrap();
+    let selected_page = crate::remote_read::spawn_initial_saved_decisions_page(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4())),
+        selected_request,
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(65536);
+    selected_page
+        .send_json_line(&mut writer, |result| {
+            matches!(
+                result,
+                Err(crate::remote_read::ReadError::SourceUnavailable
+                    | crate::remote_read::ReadError::Busy)
+            )
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+
+    // A signed position from a present writer cannot be resumed after this
+    // manager observes the writer as missing, even though Store is readable.
+    use crate::remote_read::{
+        DecisionsPositionV1, NativeRuntimeApprovalListSnapshot, NativeRuntimeApprovalListState,
+        PendingCandidate, PendingKey, PendingPagePosition, PendingPageSelection,
+        RuntimeQuestionSlotListSnapshot, SourcePage,
+    };
+    let now = chrono::Utc::now();
+    let native = NativeRuntimeApprovalListSnapshot {
+        session,
+        observed_at: now,
+        state: NativeRuntimeApprovalListState::Present(Vec::new()),
+    };
+    let slots = RuntimeQuestionSlotListSnapshot {
+        project,
+        session,
+        active_observed_at: now,
+        completed_observed_at: now,
+        active_generation: None,
+        completed_found: false,
+        slots: Vec::new(),
+    };
+    let empty: SourcePage<PendingCandidate, PendingKey> = SourcePage {
+        items: Vec::new(),
+        next: None,
+        has_more: false,
+    };
+    let selection = PendingPageSelection {
+        items: Vec::new(),
+        next: PendingPagePosition {
+            examined: [0; 5],
+            key_bucket: 0,
+            slot_offset: 0,
+            page_bucket: 0,
+        },
+        remaining_in_inputs: false,
+    };
+    let position = DecisionsPositionV1::after_page(
+        [None; 4],
+        &selection,
+        [&empty, &empty, &empty, &empty],
+        &native,
+        &slots,
+        false,
+    )
+    .unwrap();
+    let signer = std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4()));
+    let cursor = signer.sign_decisions(&request, [7; 32], &position).unwrap();
+    let resumed: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16,"cursor":cursor}
+        }))
+        .unwrap();
+    let completed = crate::remote_read::spawn_resumed_saved_decisions_sources(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::clone(&signer),
+        &resumed,
+        project,
+        [7; 32],
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    completed
+        .send_json_line(&mut writer, |result| {
+            matches!(
+                result,
+                Err(crate::remote_read::ReadError::SourceUnavailable)
+            )
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+
+    let page = crate::remote_read::spawn_resumed_saved_decisions_page(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::clone(&signer),
+        resumed,
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    page.send_json_line(&mut writer, |result| {
+        matches!(
+            result,
+            Err(crate::remote_read::ReadError::SourceUnavailable
+                | crate::remote_read::ReadError::Busy)
+        )
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+
+    let selected_id = format!("question:{}", Uuid::new_v4());
+    let selected_query: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16,"selected_decision_id":selected_id}
+        }))
+        .unwrap();
+    let selected_cursor = signer
+        .sign_decisions(&selected_query, [7; 32], &position)
+        .unwrap();
+    let selected_resumed: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16,"selected_decision_id":selected_id,"cursor":selected_cursor}
+        }))
+        .unwrap();
+    let page = crate::remote_read::spawn_resumed_saved_decisions_page(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        signer,
+        selected_resumed,
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    page.send_json_line(&mut writer, |result| {
+        matches!(
+            result,
+            Err(crate::remote_read::ReadError::SourceUnavailable
+                | crate::remote_read::ReadError::Busy)
+        )
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+
+    let routed = crate::remote_read::spawn_decisions_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        manager,
+        std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4())),
+        request,
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    routed
+        .send_json_line(&mut writer, |result| {
+            matches!(
+                result,
+                Err(crate::remote_read::ReadError::SourceUnavailable
+                    | crate::remote_read::ReadError::Busy)
+            )
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_runtime_only_decisions_owner_pages_slots_with_unavailable_native() {
+    use rsi_common::types::{PendingQuestion, QuestionItem};
+    use tokio::io::AsyncReadExt;
+
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'Remote','#000000',?2,?2)",
+                rusqlite::params![project.to_string(), at],
+            )
+            .unwrap();
+    }
+    let mut active = bare_session(session);
+    active.status = SessionStatus::Running;
+    active.project_id = Some(project);
+    active.pending_question = Some(PendingQuestion {
+        questions: vec![QuestionItem {
+            question: "Continue?".into(),
+            header: "Choice".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }],
+    });
+    let mut tracked = TrackedSession::new_for_test(active);
+    tracked.pending_question = Some(PendingQuestion {
+        questions: vec![QuestionItem {
+            question: "Tracked?".into(),
+            header: "Choice".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }],
+    });
+    manager.active.write().await.insert(session, tracked);
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":1}
+        }))
+        .unwrap();
+    let limiter = crate::remote_read::RemoteReadLimiter::new();
+    let signer = std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4()));
+    assert!(matches!(
+        crate::remote_read::spawn_runtime_only_decisions_page(
+            &limiter,
+            std::sync::Arc::clone(&manager.store),
+            std::sync::Arc::clone(&manager),
+            std::sync::Arc::clone(&signer),
+            request.clone(),
+            Uuid::new_v4(),
+            [9; 32],
+            Uuid::new_v4(),
+        ),
+        Err(crate::remote_read::ReadError::InvalidSource)
+    ));
+    let page = crate::remote_read::spawn_decisions_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::clone(&signer),
+        request.clone(),
+        project,
+        [9; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    page.send_json_line(&mut writer, |result| {
+        result.expect("runtime-only decisions response")
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let response: rsi_common::remote_read::DecisionsResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert!(!response.complete);
+    assert_eq!(response.items.len(), 1);
+    assert!(response.items[0].id.as_str().starts_with("question-slot:"));
+    let first_id = response.items[0].id.clone();
+    let cursor = response
+        .next_cursor
+        .expect("remaining runtime question slot");
+    assert_eq!(response.coverage.len(), 8);
+    assert_eq!(response.coverage[1].lower_bound.get(), 1);
+    assert_eq!(response.coverage[2].lower_bound.get(), 1);
+    assert_eq!(
+        response.coverage[0].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+    assert_eq!(
+        response.coverage[4].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+
+    let selected_request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":1,"selected_decision_id":first_id}
+        }))
+        .unwrap();
+    let selected_page = crate::remote_read::spawn_decisions_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        std::sync::Arc::clone(&manager),
+        std::sync::Arc::clone(&signer),
+        selected_request,
+        project,
+        [9; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(65536);
+    selected_page
+        .send_json_line(&mut writer, |result| result.expect("selected runtime slot"))
+        .await
+        .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let selected_response: rsi_common::remote_read::DecisionsResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert!(matches!(
+        selected_response.selected,
+        rsi_common::remote_read::SelectedDecisionV1::Present { decision, stale: false }
+            if decision.id == first_id
+    ));
+
+    let resumed: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":1,"cursor":cursor}
+        }))
+        .unwrap();
+    let page = crate::remote_read::spawn_decisions_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        manager,
+        signer,
+        resumed,
+        project,
+        [9; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(4096);
+    page.send_json_line(&mut writer, |result| {
+        result.expect("resumed runtime-only decisions")
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let next: rsi_common::remote_read::DecisionsResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert!(!next.complete);
+    assert_eq!(next.items.len(), 1);
+    assert_ne!(next.items[0].id, first_id);
+    assert!(next.next_cursor.is_none());
+    assert_eq!(
+        next.coverage[4].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_selected_question_slot_fences_generation_and_mirror_without_tombstone() {
+    use crate::remote_read::{
+        QuestionSlotGeneration, QuestionSlotMirror, ReadError, RuntimeQuestionSlotRecheck,
+        RuntimeQuestionSlotState,
+    };
+    use rsi_common::types::{PendingQuestion, QuestionItem};
+
+    let question = |label: &str| PendingQuestion {
+        questions: vec![QuestionItem {
+            question: label.into(),
+            header: "Choose".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }],
+    };
+    let (manager, _dir) = manager();
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let mut active = bare_session(session);
+    active.project_id = Some(project);
+    active.status = SessionStatus::Running;
+    active.pending_question = Some(question("Session mirror?"));
+    let mut tracked = TrackedSession::new_for_test(active);
+    tracked.pending_question = Some(question("Tracked mirror?"));
+    manager.active.write().await.insert(session, tracked);
+
+    let selected = manager
+        .remote_selected_question_slot(
+            project,
+            session,
+            QuestionSlotGeneration::Spawn(0),
+            QuestionSlotMirror::Tracked,
+        )
+        .unwrap();
+    let RuntimeQuestionSlotState::Present(ref projection) = selected.state else {
+        panic!("tracked question must be present");
+    };
+    assert_eq!(projection.questions[0].question.as_str(), "Tracked mirror?");
+    let session_mirror = manager
+        .remote_selected_question_slot(
+            project,
+            session,
+            QuestionSlotGeneration::Spawn(0),
+            QuestionSlotMirror::Session,
+        )
+        .unwrap();
+    let RuntimeQuestionSlotState::Present(projection) = session_mirror.state else {
+        panic!("session question must be present");
+    };
+    assert_eq!(projection.questions[0].question.as_str(), "Session mirror?");
+    assert_eq!(
+        manager
+            .remote_selected_question_slot_recheck(&selected)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::NoObservedChange
+    );
+
+    let held = manager.active.write().await;
+    assert!(matches!(
+        manager.remote_selected_question_slot(
+            project,
+            session,
+            QuestionSlotGeneration::Spawn(0),
+            QuestionSlotMirror::Tracked,
+        ),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&session)
+        .unwrap()
+        .pending_question = Some(question("Replacement?"));
+    assert_eq!(
+        manager
+            .remote_selected_question_slot_recheck(&selected)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&session)
+        .unwrap()
+        .spawn_generation += 1;
+    assert!(matches!(
+        manager
+            .remote_selected_question_slot(
+                project,
+                session,
+                QuestionSlotGeneration::Spawn(0),
+                QuestionSlotMirror::Tracked,
+            )
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotState::SourceChanged
+    ));
+    assert_eq!(
+        manager
+            .remote_selected_question_slot_recheck(&selected)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+    assert!(matches!(
+        manager.remote_selected_question_slot(
+            Uuid::new_v4(),
+            session,
+            QuestionSlotGeneration::Spawn(1),
+            QuestionSlotMirror::Tracked,
+        ),
+        Err(ReadError::SourceUnavailable)
+    ));
+
+    let completed_id = Uuid::new_v4();
+    let mut completed = bare_session(completed_id);
+    completed.project_id = Some(project);
+    completed.pending_question = Some(question("Completed question?"));
+    manager.completed.write().await.insert(
+        completed_id,
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    let completed_snapshot = manager
+        .remote_selected_question_slot(
+            project,
+            completed_id,
+            QuestionSlotGeneration::Completed,
+            QuestionSlotMirror::Session,
+        )
+        .unwrap();
+    assert!(matches!(
+        completed_snapshot.state,
+        RuntimeQuestionSlotState::Present(_)
+    ));
+    assert!(matches!(
+        manager
+            .remote_selected_question_slot(
+                project,
+                completed_id,
+                QuestionSlotGeneration::Completed,
+                QuestionSlotMirror::Tracked,
+            )
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotState::SourceChanged
+    ));
+    let held = manager.completed.write().await;
+    assert!(matches!(
+        manager.remote_selected_question_slot(
+            project,
+            completed_id,
+            QuestionSlotGeneration::Completed,
+            QuestionSlotMirror::Session,
+        ),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    manager
+        .completed
+        .write()
+        .await
+        .get_mut(&completed_id)
+        .unwrap()
+        .session
+        .pending_question = None;
+    assert_eq!(
+        manager
+            .remote_selected_question_slot_recheck(&completed_snapshot)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+    let missing = manager
+        .remote_selected_question_slot(
+            project,
+            completed_id,
+            QuestionSlotGeneration::Completed,
+            QuestionSlotMirror::Session,
+        )
+        .unwrap();
+    assert!(matches!(missing.state, RuntimeQuestionSlotState::Missing));
+    assert_eq!(
+        manager
+            .remote_selected_question_slot_recheck(&missing)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_question_slot_list_bounds_three_mirrors_and_rechecks_cache_presence() {
+    use crate::remote_read::{
+        QuestionSlotGeneration, QuestionSlotMirror, ReadError, RuntimeQuestionSlotRecheck,
+    };
+    use rsi_common::types::{PendingQuestion, QuestionItem};
+
+    let question = |label: &str| PendingQuestion {
+        questions: vec![QuestionItem {
+            question: label.into(),
+            header: "Choose".into(),
+            options: Vec::new(),
+            multi_select: false,
+        }],
+    };
+    let (manager, _dir) = manager();
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let mut active = bare_session(session);
+    active.project_id = Some(project);
+    active.status = SessionStatus::Running;
+    active.pending_question = Some(question("Session active?"));
+    let mut tracked = TrackedSession::new_for_test(active);
+    tracked.pending_question = Some(question("Tracked active?"));
+    manager.active.write().await.insert(session, tracked);
+    let mut completed = bare_session(session);
+    completed.project_id = Some(project);
+    completed.pending_question = Some(question("Session completed?"));
+    manager.completed.write().await.insert(
+        session,
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    let before = manager.remote_question_slot_list(project, session).unwrap();
+    assert_eq!(before.active_generation, Some(0));
+    assert!(before.completed_found);
+    assert_eq!(before.slots.len(), 3);
+    assert_eq!(before.slots[0].mirror, QuestionSlotMirror::Tracked);
+    assert_eq!(before.slots[1].mirror, QuestionSlotMirror::Session);
+    assert_eq!(
+        before.slots[2].generation,
+        QuestionSlotGeneration::Completed
+    );
+    assert_eq!(
+        before.slots[2].projection.questions[0].question.as_str(),
+        "Session completed?"
+    );
+    assert_eq!(
+        manager
+            .remote_question_slot_list_recheck(&before)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::NoObservedChange
+    );
+    let held = manager.active.write().await;
+    assert!(matches!(
+        manager.remote_question_slot_list(project, session),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    let held = manager.completed.write().await;
+    assert!(matches!(
+        manager.remote_question_slot_list(project, session),
+        Err(ReadError::Busy)
+    ));
+    drop(held);
+    assert!(matches!(
+        manager.remote_question_slot_list(Uuid::new_v4(), session),
+        Err(ReadError::SourceUnavailable)
+    ));
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&session)
+        .unwrap()
+        .spawn_generation += 1;
+    assert_eq!(
+        manager
+            .remote_question_slot_list_recheck(&before)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+    let refreshed = manager.remote_question_slot_list(project, session).unwrap();
+    manager.completed.write().await.remove(&session);
+    assert_eq!(
+        manager
+            .remote_question_slot_list_recheck(&refreshed)
+            .unwrap()
+            .state,
+        RuntimeQuestionSlotRecheck::Changed
+    );
+    let missing = manager
+        .remote_question_slot_list(project, Uuid::new_v4())
+        .unwrap();
+    assert!(missing.slots.is_empty());
+    assert!(missing.active_generation.is_none());
+    assert!(!missing.completed_found);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

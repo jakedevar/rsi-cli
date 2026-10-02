@@ -3,9 +3,13 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: u8 = 1;
+/// Longest a lander waits on another lander's base-shard lock when the caller
+/// gives no tighter bound.
+const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
+const LOCK_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(super) struct BaseShardEntry {
@@ -68,11 +72,27 @@ pub(super) struct BaseShardSlot {
 }
 
 impl BaseShardSlot {
+    /// Acquire with the default bounded wait (`DEFAULT_LOCK_WAIT`).
     pub(super) async fn acquire(
         root: &Path,
         rolling_sha: &str,
         shard: &str,
         fingerprint: &str,
+    ) -> Result<Self, String> {
+        Self::acquire_within(root, rolling_sha, shard, fingerprint, DEFAULT_LOCK_WAIT).await
+    }
+
+    /// Acquire the per-shard slot lock, waiting at most `max_wait`. Another
+    /// lander holds the lock while it computes this base shard, so a wait is
+    /// normal, but never silent or unbounded: a periodic diagnostic names the
+    /// lock file, and an expired wait refuses (fail closed) instead of wedging
+    /// the lander behind a stuck holder.
+    pub(super) async fn acquire_within(
+        root: &Path,
+        rolling_sha: &str,
+        shard: &str,
+        fingerprint: &str,
+        max_wait: Duration,
     ) -> Result<Self, String> {
         let digest = fingerprint
             .strip_prefix("sha256:")
@@ -94,17 +114,37 @@ impl BaseShardSlot {
             .create(&directory)
             .map_err(|error| format!("cannot create base shard cache: {error}"))?;
         let path = directory.join(format!("{shard}.json"));
+        let lock_path = directory.join(format!("{shard}.lock"));
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .open(directory.join(format!("{shard}.lock")))
+            .open(&lock_path)
             .map_err(|error| format!("cannot open base shard cache lock: {error}"))?;
+        let started = Instant::now();
+        let mut last_notice = started;
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
                 Err(fs::TryLockError::WouldBlock) => {
+                    let waited = started.elapsed();
+                    if waited >= max_wait {
+                        return Err(format!(
+                            "base shard cache lock {} is still held after {}s: another lander is computing base shard {shard}; refusing to proceed without it (retry the landing once that lander finishes)",
+                            lock_path.display(),
+                            waited.as_secs()
+                        ));
+                    }
+                    if last_notice.elapsed() >= LOCK_NOTICE_INTERVAL {
+                        last_notice = Instant::now();
+                        eprintln!(
+                            "waiting for base shard cache lock {} (held by another lander computing base shard {shard}; waited {}s of {}s)",
+                            lock_path.display(),
+                            waited.as_secs(),
+                            max_wait.as_secs()
+                        );
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 Err(fs::TryLockError::Error(error)) => {

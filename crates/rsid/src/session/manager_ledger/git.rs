@@ -1,21 +1,99 @@
 use super::*;
 use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use tokio::{io::AsyncReadExt, process::Command};
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-async fn run(root: &Path, args: &[&str]) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+// #978: evidence bounds. Production refuses a hung git command, a
+// pathological diff or an overlong proof with these wall-clock limits. Test
+// builds use generous limits so a busy landing host cannot turn a correctness
+// test into a timing race; dedicated tests drive each refusal explicitly.
+#[cfg(not(test))]
+const GIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const GIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(not(test))]
+const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(not(test))]
+const ACCEPTED_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const ACCEPTED_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Longest stderr kept to classify a failure; the rest is drained and dropped.
+const STDERR_CLASSIFY_BYTES: u64 = 4096;
+/// Longest wait for a killed evidence command to be reaped.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a failed evidence command failed because a required object is not
+/// in the local object store. Local-only reads (`GIT_NO_LAZY_FETCH`) refuse a
+/// promised object instead of fetching it.
+fn missing_local_object(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "lazy fetching disabled",
+        "unable to read",
+        "bad object",
+        "bad file",
+        "missing blob",
+        "missing tree",
+        "missing commit",
+        "promisor",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// One evidence git command, confined to local objects: no lazy promisor
+/// fetch, no transport, no credential helper or prompt, and no replacement
+/// or graft history. The child runs in its own process group so a timeout
+/// kills every descendant, and the group is reaped before this returns.
+async fn run_bounded(
+    root: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    run_reach(root, args, timeout, Reach::Local).await
+}
+
+/// Whether an evidence command may talk to the named `origin`. Only the two
+/// freshness probes (`ls-remote` and the private-ref `fetch`) are `Origin`;
+/// every object read is `Local`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Local,
+    Origin,
+}
+
+async fn run_reach(
+    root: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    reach: Reach,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     let mut command = Command::new("git");
+    command.args([
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]);
+    if reach == Reach::Local {
+        // No transport and no credential helper or prompt for object reads.
+        command.args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+        ]);
+    }
     command
-        .args([
-            "--no-optional-locks",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-C",
-        ])
+        .arg("-C")
         .arg(root)
         .args(args)
         // Evidence names canonical objects, never locally substituted history.
@@ -23,11 +101,15 @@ async fn run(root: &Path, args: &[&str]) -> Result<(std::process::ExitStatus, Ve
         .env("GIT_GRAFT_FILE", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // Local objects only: a missing promised object is an error, never a
+        // fetch through a remote, transport or credential helper (#389).
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     for key in [
         "GIT_DIR",
@@ -35,40 +117,105 @@ async fn run(root: &Path, args: &[&str]) -> Result<(std::process::ExitStatus, Ve
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
+        "GIT_EXTERNAL_DIFF",
     ] {
         command.env_remove(key);
     }
+    crate::process_control::configure_tokio_process_group(
+        &mut command,
+        crate::process_control::ProcessContainment::Group,
+    )
+    .map_err(|_| refused("manager_v2_git_unavailable"))?;
     let mut child = command
         .spawn()
         .map_err(|_| refused("manager_v2_git_unavailable"))?;
+    let pgid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .map(nix::unistd::Pid::from_raw);
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| refused("manager_v2_git_unavailable"))?
         .take(MAX_BYTES + 1);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| refused("manager_v2_git_read"))?;
-        if bytes.len() as u64 > MAX_BYTES {
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| refused("manager_v2_git_unavailable"))?;
+    let outcome = tokio::time::timeout(timeout, async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (out_read, err_read) = tokio::join!(stdout.read_to_end(&mut out), async {
+            let mut capped = (&mut stderr).take(STDERR_CLASSIFY_BYTES);
+            let read = capped.read_to_end(&mut err).await;
+            // Keep draining so a chatty command never blocks on a full pipe.
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+            read
+        });
+        out_read.map_err(|_| refused("manager_v2_git_read"))?;
+        err_read.map_err(|_| refused("manager_v2_git_read"))?;
+        if out.len() as u64 > MAX_BYTES {
             return Err(refused("manager_v2_git_output_limit"));
         }
         let status = child
             .wait()
             .await
             .map_err(|_| refused("manager_v2_git_wait"))?;
-        Ok((status, bytes))
+        Ok((status, out, err))
     })
-    .await
-    .map_err(|_| refused("manager_v2_git_timeout"))?
+    .await;
+    match outcome {
+        Ok(Ok(done)) => Ok(done),
+        failed => {
+            // Timeout or an over-limit read: kill the whole group, then reap.
+            if let Some(pgid) = pgid {
+                crate::process_control::terminate_process_group(pgid);
+            }
+            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+            match failed {
+                Ok(Err(error)) => Err(error),
+                _ => Err(refused("manager_v2_git_timeout")),
+            }
+        }
+    }
+}
+
+async fn run(root: &Path, args: &[&str]) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    let (status, bytes, _) = run_bounded(root, args, GIT_COMMAND_TIMEOUT).await?;
+    Ok((status, bytes))
 }
 
 pub(super) async fn read(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let (status, bytes) = run(root, args).await?;
+    read_within(root, args, GIT_COMMAND_TIMEOUT).await
+}
+
+/// A freshness probe that talks to `origin` (still no lazy promisor fetch,
+/// same bounds and process-group cleanup).
+async fn read_origin(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let (status, bytes, _) = run_reach(root, args, GIT_COMMAND_TIMEOUT, Reach::Origin).await?;
     if !status.success() {
         return Err(refused("manager_v2_git_failed"));
+    }
+    Ok(bytes)
+}
+
+pub(super) async fn read_within(
+    root: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let (status, bytes, stderr) = run_bounded(root, args, timeout).await?;
+    if !status.success() {
+        return Err(refused(if missing_local_object(&stderr) {
+            "manager_v2_git_missing_local_object"
+        } else {
+            "manager_v2_git_failed"
+        }));
     }
     Ok(bytes)
 }
@@ -166,18 +313,43 @@ pub(super) async fn repository(root: &Path) -> Result<()> {
     Ok(())
 }
 pub(super) async fn ancestor(root: &Path, source: &str, target: &str) -> Result<bool> {
-    let (status, _) = run(root, &["merge-base", "--is-ancestor", source, target]).await?;
+    let (status, _, stderr) = run_bounded(
+        root,
+        &["merge-base", "--is-ancestor", source, target],
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await?;
     match status.code() {
         Some(0) => Ok(true),
+        // Exit 1 is the only "not an ancestor" answer.
         Some(1) => Ok(false),
+        // Both operands are commit ids here, so a commit git cannot resolve
+        // locally is a missing promised object, not a generic git failure.
+        _ if missing_local_object(&stderr)
+            || String::from_utf8_lossy(&stderr)
+                .to_ascii_lowercase()
+                .contains("not a valid commit name") =>
+        {
+            Err(refused("manager_v2_git_missing_local_object"))
+        }
         _ => Err(refused("manager_v2_git_failed")),
     }
 }
 
-async fn content_blob(root: &Path, commit: &str, path: &str) -> Result<Option<Vec<u8>>> {
+pub(super) async fn content_blob(root: &Path, commit: &str, path: &str) -> Result<Option<Vec<u8>>> {
     let object = format!("{commit}:{path}");
-    let (status, _) = run(root, &["cat-file", "-e", &object]).await?;
+    // Resolve through trees only: a path that is absent is `None`, while a
+    // promised object that is not local stays a typed missing-object error.
+    let (status, _, stderr) = run_bounded(
+        root,
+        &["rev-parse", "--verify", "--quiet", &object],
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await?;
     if !status.success() {
+        if missing_local_object(&stderr) {
+            return Err(refused("manager_v2_git_missing_local_object"));
+        }
         return Ok(None);
     }
     read(root, &["show", &object]).await.map(Some)
@@ -218,10 +390,19 @@ fn restored_base_line(ops: &[DiffOp], changed: std::ops::Range<usize>) -> bool {
 }
 
 fn text_content_survives(base: &[u8], source: &[u8], target: &[u8]) -> Result<bool> {
+    text_content_survives_within(base, source, target, DIFF_DEADLINE)
+}
+
+pub(super) fn text_content_survives_within(
+    base: &[u8],
+    source: &[u8],
+    target: &[u8],
+    limit: std::time::Duration,
+) -> Result<bool> {
     let old = lines(base);
     let accepted = lines(source);
     let published = lines(target);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + limit;
     let changes = capture_diff_slices_deadline(Algorithm::Myers, &old, &accepted, Some(deadline));
     let old_to_target =
         capture_diff_slices_deadline(Algorithm::Myers, &old, &published, Some(deadline));
@@ -486,12 +667,19 @@ pub(super) async fn accepted_content(
     source: &str,
     target: &str,
 ) -> Result<()> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        accepted_content_inner(root, base, source, target),
-    )
-    .await
-    .map_err(|_| refused("manager_v2_accepted_content_ambiguous"))?
+    accepted_content_within(root, base, source, target, ACCEPTED_CONTENT_TIMEOUT).await
+}
+
+pub(super) async fn accepted_content_within(
+    root: &Path,
+    base: &str,
+    source: &str,
+    target: &str,
+    limit: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(limit, accepted_content_inner(root, base, source, target))
+        .await
+        .map_err(|_| refused("manager_v2_accepted_content_ambiguous"))?
 }
 
 async fn accepted_content_inner(root: &Path, base: &str, source: &str, target: &str) -> Result<()> {
@@ -555,7 +743,45 @@ async fn accepted_content_inner(root: &Path, base: &str, source: &str, target: &
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .collect();
-    verify_content_paths(root, &content_base, source, target, &paths).await
+    match verify_content_paths(root, &content_base, source, target, &paths).await {
+        Err(error)
+            if error
+                .to_string()
+                .contains("manager_v2_accepted_content_lost") =>
+        {
+            match provisional_mapping(root, &content_base, source, target).await? {
+                None => Err(error),
+                Some(mapping) => {
+                    verify_mapped_content_paths(
+                        root,
+                        &content_base,
+                        source,
+                        target,
+                        &paths,
+                        &mapping,
+                    )
+                    .await
+                }
+            }
+        }
+        result => result,
+    }
+}
+
+/// #984: the set of paths changed between two commits (or refs). A missing
+/// ref or any Git failure is an error, so a caller proving disjointness
+/// fails closed.
+pub(super) async fn changed_path_set(
+    root: &Path,
+    from: &str,
+    to: &str,
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    Ok(changed_paths(root, from, to)
+        .await?
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 async fn changed_paths(root: &Path, base: &str, source: &str) -> Result<Vec<u8>> {
@@ -575,7 +801,7 @@ async fn changed_paths(root: &Path, base: &str, source: &str) -> Result<Vec<u8>>
     Ok(changed)
 }
 
-async fn verify_content_paths(
+pub(super) async fn verify_content_paths(
     root: &Path,
     base: &str,
     source: &str,
@@ -622,6 +848,554 @@ async fn verify_content_paths(
         }
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionalDeclaration {
+    schema_version: i64,
+    version: i64,
+    files: Vec<ProvisionalFile>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionalFile {
+    path: String,
+    path_template: String,
+    source_blob: String,
+    sites: Vec<ProvisionalSite>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionalSite {
+    anchor: String,
+    replacement: String,
+    scope: ProvisionalScope,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProvisionalScope {
+    Unit,
+    Head,
+}
+
+struct ProvisionalMapping {
+    source: String,
+    declaration: ProvisionalDeclaration,
+    unit_version: i64,
+    source_inventory: serde_json::Value,
+    target_inventory: serde_json::Value,
+}
+
+fn provisional_proof_failed() -> crate::error::DaemonError {
+    refused("manager_v2_provisional_proof_failed")
+}
+
+fn provisional_proof_ambiguous() -> crate::error::DaemonError {
+    refused("manager_v2_provisional_proof_ambiguous")
+}
+
+fn safe_declaration_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'/' | b'-')
+                })
+        })
+        && path.split('/').filter(|part| *part != ".git").count() == path.split('/').count()
+}
+
+async fn json_blob(root: &Path, commit: &str, path: &str) -> Result<serde_json::Value> {
+    let bytes = content_blob(root, commit, path)
+        .await?
+        .ok_or_else(provisional_proof_failed)?;
+    serde_json::from_slice(&bytes).map_err(|_| provisional_proof_failed())
+}
+
+fn object(value: &serde_json::Value) -> Result<&serde_json::Map<String, serde_json::Value>> {
+    value.as_object().ok_or_else(provisional_proof_failed)
+}
+
+fn inventory_latest(value: &serde_json::Value) -> Result<i64> {
+    object(value)?
+        .get("latest_schema_version")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(provisional_proof_failed)
+}
+
+fn inventory_map<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    object(value)?
+        .get(key)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(provisional_proof_failed)
+}
+
+fn sha256_prefix(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+async fn provisional_mapping(
+    root: &Path,
+    content_base: &str,
+    source: &str,
+    target: &str,
+) -> Result<Option<ProvisionalMapping>> {
+    let changed = changed_paths(root, content_base, source).await?;
+    let mut declarations = Vec::new();
+    for raw in changed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(raw)
+            .map_err(|_| refused("manager_v2_accepted_content_unsupported"))?;
+        if path.starts_with("tools/provisional-migrations/")
+            && path.ends_with(".json")
+            && content_blob(root, content_base, path).await?.is_none()
+        {
+            declarations.push(path.to_owned());
+        }
+    }
+    match declarations.len() {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(provisional_proof_ambiguous()),
+    }
+    let declaration_path = declarations.pop().expect("declaration count checked");
+    let declaration_bytes = content_blob(root, source, &declaration_path)
+        .await?
+        .ok_or_else(provisional_proof_failed)?;
+    if declaration_bytes.len() > 512 * 1024 {
+        return Err(provisional_proof_failed());
+    }
+    let declaration: ProvisionalDeclaration =
+        serde_json::from_slice(&declaration_bytes).map_err(|_| provisional_proof_failed())?;
+    if declaration.schema_version != 1 {
+        return Err(provisional_proof_failed());
+    }
+
+    let raw = read(
+        root,
+        &[
+            "rev-list",
+            "--parents",
+            "--ancestry-path",
+            &format!("{source}..{target}"),
+        ],
+    )
+    .await?;
+    let history =
+        String::from_utf8(raw).map_err(|_| refused("manager_v2_accepted_content_unsupported"))?;
+    let mut landings = Vec::new();
+    for line in history.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() == 3 && fields[2] == source {
+            let landing = fields[0];
+            let parent = fields[1];
+            if canonical_sha(landing)
+                && canonical_sha(parent)
+                && !ancestor(root, source, parent).await?
+            {
+                landings.push((landing.to_owned(), parent.to_owned()));
+            }
+        }
+    }
+    let (landing, parent) = match landings.as_slice() {
+        [] => return Ok(None),
+        [landing] => (landing.0.clone(), landing.1.clone()),
+        _ => return Err(provisional_proof_ambiguous()),
+    };
+
+    let source_inventory = json_blob(root, source, "tools/released-migrations.json").await?;
+    let parent_inventory = json_blob(root, &parent, "tools/released-migrations.json").await?;
+    let landing_inventory = json_blob(root, &landing, "tools/released-migrations.json").await?;
+    let target_inventory = json_blob(root, target, "tools/released-migrations.json").await?;
+    let old = declaration.version;
+    if inventory_latest(&source_inventory)? != old
+        || !inventory_map(&source_inventory, "blocks")?.contains_key(&old.to_string())
+    {
+        return Err(provisional_proof_failed());
+    }
+    let unit_version = inventory_latest(&parent_inventory)? + 1;
+    if unit_version < old || inventory_latest(&landing_inventory)? != unit_version {
+        return Err(provisional_proof_failed());
+    }
+
+    if declaration.files.is_empty() || declaration.files.len() > 128 {
+        return Err(provisional_proof_failed());
+    }
+    let total_sites: usize = declaration.files.iter().map(|file| file.sites.len()).sum();
+    if total_sites > 4096 {
+        return Err(provisional_proof_failed());
+    }
+    let mut destinations = HashSet::new();
+    let mut store_declared = false;
+    for file in &declaration.files {
+        let destination = file
+            .path_template
+            .replace("${VERSION}", &unit_version.to_string());
+        let old_path = file.path_template.replace("${VERSION}", &old.to_string());
+        if !safe_declaration_path(&file.path)
+            || !safe_declaration_path(&old_path)
+            || !safe_declaration_path(&destination)
+            || old_path != file.path
+        {
+            return Err(provisional_proof_failed());
+        }
+        if !destinations.insert(destination) {
+            return Err(provisional_proof_failed());
+        }
+        store_declared |= holds_migration_block(&file.path, old);
+        let blob = content_blob(root, source, &file.path)
+            .await?
+            .ok_or_else(provisional_proof_failed)?;
+        if blob.contains(&0) || sha256_prefix(&blob) != file.source_blob {
+            return Err(provisional_proof_failed());
+        }
+        let mut covered = vec![false; blob.len()];
+        for site in &file.sites {
+            if site.anchor.is_empty()
+                || site.replacement.contains('\0')
+                || !site.replacement.contains("${VERSION}")
+                || site.replacement.replace("${VERSION}", &old.to_string()) != site.anchor
+            {
+                return Err(provisional_proof_failed());
+            }
+            let anchor = site.anchor.as_bytes();
+            let Some(offset) = blob
+                .windows(anchor.len())
+                .position(|window| window == anchor)
+            else {
+                return Err(provisional_proof_failed());
+            };
+            if blob
+                .windows(anchor.len())
+                .filter(|window| *window == anchor)
+                .count()
+                != 1
+                || covered[offset..offset + anchor.len()]
+                    .iter()
+                    .any(|covered| *covered)
+            {
+                return Err(provisional_proof_failed());
+            }
+            covered[offset..offset + anchor.len()].fill(true);
+        }
+    }
+    if !store_declared {
+        return Err(provisional_proof_failed());
+    }
+    Ok(Some(ProvisionalMapping {
+        source: source.to_owned(),
+        declaration,
+        unit_version,
+        source_inventory,
+        target_inventory,
+    }))
+}
+
+fn render_mapped(
+    file: &ProvisionalFile,
+    unit_version: i64,
+    head_version: i64,
+    source: &[u8],
+) -> Result<Vec<u8>> {
+    let mut replacements = Vec::new();
+    for site in &file.sites {
+        let anchor = site.anchor.as_bytes();
+        if source
+            .windows(anchor.len())
+            .filter(|window| *window == anchor)
+            .count()
+            != 1
+        {
+            return Err(provisional_proof_failed());
+        }
+        let offset = source
+            .windows(anchor.len())
+            .position(|window| window == anchor)
+            .expect("anchor count checked");
+        let version = match site.scope {
+            ProvisionalScope::Unit => unit_version,
+            ProvisionalScope::Head => head_version,
+        };
+        replacements.push((
+            offset,
+            anchor.len(),
+            site.replacement
+                .replace("${VERSION}", &version.to_string())
+                .into_bytes(),
+        ));
+    }
+    replacements.sort_by_key(|(offset, _, _)| std::cmp::Reverse(*offset));
+    let mut mapped = source.to_vec();
+    for (offset, anchor_len, replacement) in replacements {
+        mapped.splice(offset..offset + anchor_len, replacement);
+    }
+    Ok(mapped)
+}
+
+/// Split like the Python inventory guard's `splitlines(keepends=True)`.
+/// A lone carriage return would split differently there, so refuse it.
+pub(super) fn normalized_lines(blob: &[u8]) -> Result<Vec<&[u8]>> {
+    let carriage_returns = blob.iter().filter(|byte| **byte == b'\r').count();
+    if carriage_returns != blob.windows(2).filter(|window| window == b"\r\n").count() {
+        return Err(provisional_proof_failed());
+    }
+    Ok(lines(blob))
+}
+
+/// The guard's `BLOCK_RE` is `^(?P<indent>\s*)if version < (?P<version>\d+) \{\s*$`;
+/// the block ends at the first later line equal to `<indent>}`.
+pub(super) fn mapped_block<'a>(mapped: &'a [&'a [u8]], version: i64) -> Result<&'a [&'a [u8]]> {
+    let opener = format!("if version < {version} {{");
+    let start = mapped
+        .iter()
+        .position(|line| String::from_utf8_lossy(line).trim() == opener)
+        .ok_or_else(provisional_proof_failed)?;
+    let indent = String::from_utf8_lossy(mapped[start])
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .collect::<String>();
+    let end = mapped[start + 1..]
+        .iter()
+        .position(|line| {
+            let text = String::from_utf8_lossy(line);
+            text.trim_end_matches(['\r', '\n']) == format!("{indent}}}")
+        })
+        .map(|offset| start + offset + 1)
+        .ok_or_else(provisional_proof_failed)?;
+    Ok(&mapped[start..=end])
+}
+
+const SECTION_BEGIN: &str = "// RSI-RELEASED-MIGRATION-BEGIN: ";
+const SECTION_END: &str = "// RSI-RELEASED-MIGRATION-END: ";
+
+/// Locate one protected section exactly as the guard's `BEGIN_RE`/`END_RE`
+/// (`^\s*// RSI-RELEASED-MIGRATION-BEGIN: <name>\s*$`) would.
+pub(super) fn section_location(lines: &[&[u8]], name: &str) -> Result<(usize, usize)> {
+    let begin = format!("{SECTION_BEGIN}{name}");
+    let end = format!("{SECTION_END}{name}");
+    let marked = |wanted: &str| {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| String::from_utf8_lossy(line).trim() == wanted)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    match (marked(&begin).as_slice(), marked(&end).as_slice()) {
+        ([start], [stop]) if start < stop => Ok((*start, *stop)),
+        _ => Err(provisional_proof_failed()),
+    }
+}
+
+async fn verify_mapped_inventory(
+    mapping: &ProvisionalMapping,
+    root: &Path,
+    content_base: &str,
+) -> Result<()> {
+    let base = json_blob(root, content_base, "tools/released-migrations.json").await?;
+    let source = &mapping.source_inventory;
+    let published = &mapping.target_inventory;
+    let base_object = object(&base)?;
+    let source_object = object(source)?;
+    let target_object = object(published)?;
+    if inventory_latest(published)? < mapping.unit_version {
+        return Err(refused("manager_v2_accepted_content_lost"));
+    }
+    let base_blocks = inventory_map(&base, "blocks")?;
+    let source_blocks = inventory_map(source, "blocks")?;
+    let target_blocks = inventory_map(published, "blocks")?;
+    for (version, fingerprint) in base_blocks {
+        if source_blocks.get(version) != Some(fingerprint) {
+            return Err(provisional_proof_failed());
+        }
+    }
+    let base_sections = inventory_map(&base, "protected_sections")?;
+    let source_sections = inventory_map(source, "protected_sections")?;
+    for (name, section) in base_sections {
+        if source_sections.get(name) != Some(section) {
+            return Err(provisional_proof_failed());
+        }
+    }
+    for (key, value) in source_object {
+        if !matches!(
+            key.as_str(),
+            "latest_schema_version" | "blocks" | "protected_sections"
+        ) && base_object.get(key) != Some(value)
+            && target_object.get(key) != Some(value)
+        {
+            return Err(refused("manager_v2_accepted_content_lost"));
+        }
+    }
+
+    let mut file_map: HashMap<String, &ProvisionalFile> = HashMap::new();
+    let mut source_blobs = HashMap::new();
+    for file in &mapping.declaration.files {
+        file_map.insert(file.path.clone(), file);
+        let blob = content_blob(root, &mapping.source, &file.path).await?;
+        let blob = blob.ok_or_else(provisional_proof_failed)?;
+        source_blobs.insert(&file.path, blob);
+    }
+    let store = mapping
+        .declaration
+        .files
+        .iter()
+        .find(|file| holds_migration_block(&file.path, mapping.declaration.version))
+        .ok_or_else(provisional_proof_failed)?;
+    let store_source = &source_blobs[&store.path];
+    let mapped_store = render_mapped(
+        store,
+        mapping.unit_version,
+        inventory_latest(published)?,
+        store_source,
+    )?;
+    let mapped_store_lines = normalized_lines(&mapped_store)?;
+    let block = mapped_block(mapped_store_lines.as_slice(), mapping.unit_version)?;
+    let target_block = target_blocks
+        .get(&mapping.unit_version.to_string())
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| refused("manager_v2_accepted_content_lost"))?;
+    if target_block != sha256_prefix(&block.concat()) {
+        return Err(refused("manager_v2_accepted_content_lost"));
+    }
+    for (version, fingerprint) in source_blocks {
+        if version != &mapping.declaration.version.to_string()
+            && !base_blocks.contains_key(version)
+            && target_blocks.get(version) != Some(fingerprint)
+        {
+            return Err(refused("manager_v2_accepted_content_lost"));
+        }
+    }
+
+    for (name, fingerprint) in source_sections {
+        if base_sections.contains_key(name) {
+            continue;
+        }
+        let fingerprint_object = object(fingerprint)?;
+        let path = fingerprint_object
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(provisional_proof_failed)?;
+        // A section in an undeclared file carries no version sites: its
+        // accepted text and path must survive unchanged.
+        let (source_blob, mapped, destination) = match file_map.get(path) {
+            Some(file) => {
+                let source_blob = source_blobs[&file.path].clone();
+                let mapped = render_mapped(
+                    file,
+                    mapping.unit_version,
+                    inventory_latest(published)?,
+                    &source_blob,
+                )?;
+                let destination = file
+                    .path_template
+                    .replace("${VERSION}", &mapping.unit_version.to_string());
+                (source_blob, mapped, destination)
+            }
+            None => {
+                let source_blob = content_blob(root, &mapping.source, path)
+                    .await?
+                    .ok_or_else(provisional_proof_failed)?;
+                (source_blob.clone(), source_blob, path.to_owned())
+            }
+        };
+        let source_lines = normalized_lines(&source_blob)?;
+        let (start, stop) = section_location(source_lines.as_slice(), name)?;
+        let mapped_lines = normalized_lines(&mapped)?;
+        if mapped_lines.len() != source_lines.len() {
+            return Err(provisional_proof_failed());
+        }
+        let begin_text = String::from_utf8_lossy(mapped_lines[start]);
+        let mapped_name = begin_text
+            .trim()
+            .strip_prefix(SECTION_BEGIN)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(provisional_proof_failed)?;
+        let expected = serde_json::json!({
+            "path": destination,
+            "sha256": sha256_prefix(&mapped_lines[start..=stop].concat()),
+        });
+        if target_object
+            .get("protected_sections")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|sections| sections.get(mapped_name))
+            != Some(&expected)
+        {
+            return Err(refused("manager_v2_accepted_content_lost"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_mapped_content_paths(
+    root: &Path,
+    content_base: &str,
+    source: &str,
+    target: &str,
+    paths: &[&[u8]],
+    mapping: &ProvisionalMapping,
+) -> Result<()> {
+    for raw in paths {
+        std::str::from_utf8(raw).map_err(|_| refused("manager_v2_accepted_content_unsupported"))?;
+    }
+    let mut file_map: HashMap<String, &ProvisionalFile> = HashMap::new();
+    for file in &mapping.declaration.files {
+        file_map.insert(file.path.clone(), file);
+    }
+    let head_version = inventory_latest(&mapping.target_inventory)?;
+    // Undeclared paths, including the declaration itself, keep the ordinary
+    // line check; one call shares its source/target tree comparison.
+    let mut ordinary = Vec::new();
+    for raw in paths {
+        let path = std::str::from_utf8(raw).expect("candidate paths validated above");
+        if path == "tools/released-migrations.json" {
+            verify_mapped_inventory(mapping, root, content_base).await?;
+            continue;
+        }
+        let Some(file) = file_map.get(path) else {
+            ordinary.push(*raw);
+            continue;
+        };
+        let source_blob = content_blob(root, source, path)
+            .await?
+            .ok_or_else(provisional_proof_failed)?;
+        let mapped = render_mapped(file, mapping.unit_version, head_version, &source_blob)?;
+        let destination = file
+            .path_template
+            .replace("${VERSION}", &mapping.unit_version.to_string());
+        let now = content_blob(root, target, &destination).await?;
+        if now.as_deref() == Some(mapped.as_slice()) {
+            continue;
+        }
+        let Some(now) = now else {
+            return Err(refused("manager_v2_accepted_content_lost"));
+        };
+        let before = content_blob(root, content_base, path)
+            .await?
+            .unwrap_or_default();
+        if before.contains(&0) || mapped.contains(&0) || now.contains(&0) {
+            return Err(refused("manager_v2_accepted_content_unsupported"));
+        }
+        if !text_content_survives(&before, &mapped, &now)? {
+            return Err(refused("manager_v2_accepted_content_lost"));
+        }
+    }
+    verify_content_paths(root, content_base, source, target, &ordinary).await
 }
 
 const ROLLING_REF: &str = "refs/heads/rolling";
@@ -680,7 +1454,7 @@ pub(super) async fn local_only_policy(root: &Path) -> Result<bool> {
 }
 
 async fn remote_integration_head(root: &Path) -> Result<(String, String)> {
-    let raw = read(
+    let raw = read_origin(
         root,
         &["ls-remote", "--symref", "origin", "HEAD", ROLLING_REF],
     )
@@ -744,7 +1518,7 @@ async fn remote_contains_target(root: &Path, source: &str, target: &str) -> Resu
     let observed = remote_integration_head(root).await?;
     let private_ref = format!("refs/rsi/observe/{}", Uuid::new_v4());
     let refspec = format!("{}:{private_ref}", observed.0);
-    let fetched = read(
+    let fetched = read_origin(
         root,
         &[
             "-c",
@@ -864,6 +1638,77 @@ pub(super) async fn blob(root: &Path, commit: &str, path: &str) -> Result<Vec<u8
     }
     read(root, &["cat-file", "blob", &entry]).await
 }
+const STORE_MOD_PATH: &str = "crates/rsid/src/store/mod.rs";
+const MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
+
+fn migration_file_path(version: u32) -> String {
+    format!("{MIGRATION_DIR}/v{version:03}.rs")
+}
+
+/// The store layout of one revision. The per-file layout keeps each released
+/// migration in `migrations/vNNN.rs` and derives the schema head from the
+/// highest file; the legacy layout keeps every block and the
+/// `LATEST_SCHEMA_VERSION` declaration in `store/mod.rs`.
+pub(super) enum MigrationLayout {
+    PerFile { head: u32 },
+    Legacy { source: String },
+}
+
+pub(super) async fn migration_layout(root: &Path, rev: &str) -> Result<MigrationLayout> {
+    let listing = read(
+        root,
+        &[
+            "ls-tree",
+            "--name-only",
+            rev,
+            "--",
+            &format!("{MIGRATION_DIR}/"),
+        ],
+    )
+    .await?;
+    let listing =
+        String::from_utf8(listing).map_err(|_| refused("manager_v2_invalid_inventory"))?;
+    let mut head: Option<u32> = None;
+    for path in listing.lines() {
+        let Some(name) = path.strip_prefix(&format!("{MIGRATION_DIR}/")) else {
+            continue;
+        };
+        let Some(digits) = name
+            .strip_prefix('v')
+            .and_then(|rest| rest.strip_suffix(".rs"))
+        else {
+            continue;
+        };
+        if digits.len() < 3 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let version: u32 = digits
+            .parse()
+            .map_err(|_| refused("manager_v2_invalid_inventory"))?;
+        if name != format!("v{version:03}.rs") {
+            return Err(refused("manager_v2_invalid_inventory"));
+        }
+        head = Some(head.map_or(version, |current| current.max(version)));
+    }
+    if let Some(head) = head {
+        return Ok(MigrationLayout::PerFile { head });
+    }
+    let source = read(
+        root,
+        &["cat-file", "blob", &format!("{rev}:{STORE_MOD_PATH}")],
+    )
+    .await?;
+    let source = String::from_utf8(source).map_err(|_| refused("manager_v2_invalid_inventory"))?;
+    Ok(MigrationLayout::Legacy { source })
+}
+
+/// True when `path` is the file that holds migration `version`'s block:
+/// `store/mod.rs` (legacy layout) or `migrations/vNNN.rs` (per-file layout).
+fn holds_migration_block(path: &str, version: i64) -> bool {
+    path == STORE_MOD_PATH
+        || u32::try_from(version).is_ok_and(|number| path == migration_file_path(number))
+}
+
 pub(super) async fn migration(root: &Path, baseline: &str, digest: &str) -> Result<()> {
     if !canonical_sha(baseline) || remote_head(root).await? != baseline {
         return Err(refused("manager_v2_stale_migration_baseline"));
@@ -893,40 +1738,58 @@ pub(super) async fn migration(root: &Path, baseline: &str, digest: &str) -> Resu
     let blocks = inventory["blocks"]
         .as_object()
         .ok_or_else(|| refused("manager_v2_invalid_inventory"))?;
-    let source = read(
-        root,
-        &[
-            "cat-file",
-            "blob",
-            &format!("{baseline}:crates/rsid/src/store/mod.rs"),
-        ],
-    )
-    .await?;
-    let source = String::from_utf8(source).map_err(|_| refused("manager_v2_invalid_inventory"))?;
-    let expected_head = format!(
-        "pub const LATEST_SCHEMA_VERSION: i32 = {};",
-        crate::store::LATEST_SCHEMA_VERSION
-    );
-    if !source.lines().any(|line| line == expected_head) {
-        return Err(refused("manager_v2_schema_head_changed"));
+    let layout = migration_layout(root, baseline).await?;
+    let expected_head = crate::store::LATEST_SCHEMA_VERSION;
+    match &layout {
+        MigrationLayout::PerFile { head } => {
+            if i64::from(*head) != i64::from(expected_head) {
+                return Err(refused("manager_v2_schema_head_changed"));
+            }
+        }
+        MigrationLayout::Legacy { source } => {
+            let expected = format!("pub const LATEST_SCHEMA_VERSION: i32 = {expected_head};");
+            if !source.lines().any(|line| line == expected) {
+                return Err(refused("manager_v2_schema_head_changed"));
+            }
+        }
     }
     for (version, pin) in blocks {
         if canonical["blocks"][version] != *pin {
             return Err(refused("manager_v2_released_pin_changed"));
         }
-        let body = if version == "0" {
+        let number: u32 = version
+            .parse()
+            .map_err(|_| refused("manager_v2_invalid_inventory"))?;
+        let source = match &layout {
+            MigrationLayout::Legacy { source } => source.clone(),
+            MigrationLayout::PerFile { .. } => {
+                let bytes = read(
+                    root,
+                    &[
+                        "cat-file",
+                        "blob",
+                        &format!("{baseline}:{}", migration_file_path(number)),
+                    ],
+                )
+                .await
+                .map_err(|_| refused("manager_v2_invalid_inventory"))?;
+                String::from_utf8(bytes).map_err(|_| refused("manager_v2_invalid_inventory"))?
+            }
+        };
+        let body = if number == 0 {
             let lines: Vec<_> = source.split_inclusive('\n').collect();
             let start = lines
                 .iter()
                 .position(|l| l.contains("// V0: Original schema"))
                 .ok_or_else(|| refused("manager_v2_invalid_inventory"))?;
-            let end = lines
-                .iter()
-                .position(|l| l.contains("// V1: Session metadata columns"))
+            // Legacy: the V0 region ends at the V1 comment; per-file: at the
+            // step function's closing `Ok(())` (as the Python guard).
+            let end = (start + 1..lines.len())
+                .find(|i| {
+                    lines[*i].contains("// V1: Session metadata columns")
+                        || lines[*i].trim_end_matches(['\r', '\n']) == "        Ok(())"
+                })
                 .ok_or_else(|| refused("manager_v2_invalid_inventory"))?;
-            if start >= end {
-                return Err(refused("manager_v2_invalid_inventory"));
-            }
             lines[start..end].concat()
         } else {
             let lines: Vec<_> = source.split_inclusive('\n').collect();
@@ -1009,22 +1872,18 @@ pub(super) async fn migration_seal_head(root: &Path) -> Result<(String, u32)> {
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n < i32::MAX as u32)
         .ok_or_else(|| refused("manager_v2_invalid_inventory"))?;
-    let source = read(
-        root,
-        &[
-            "cat-file",
-            "blob",
-            &format!("{tip}:crates/rsid/src/store/mod.rs"),
-        ],
-    )
-    .await?;
-    let declaration = format!("pub const LATEST_SCHEMA_VERSION: i32 = {version};");
-    if !String::from_utf8(source)
-        .map_err(|_| refused("manager_v2_invalid_inventory"))?
-        .lines()
-        .any(|line| line == declaration)
-    {
-        return Err(refused("manager_v2_schema_head_changed"));
+    match migration_layout(root, &tip).await? {
+        MigrationLayout::PerFile { head } => {
+            if head != version {
+                return Err(refused("manager_v2_schema_head_changed"));
+            }
+        }
+        MigrationLayout::Legacy { source } => {
+            let declaration = format!("pub const LATEST_SCHEMA_VERSION: i32 = {version};");
+            if !source.lines().any(|line| line == declaration) {
+                return Err(refused("manager_v2_schema_head_changed"));
+            }
+        }
     }
     Ok((tip, version))
 }

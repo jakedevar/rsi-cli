@@ -23,6 +23,9 @@ pub(crate) use facts::{V122_CATALOG_OBJECTS, WORK_FACTS_SCHEMA_VERSION};
 mod tests;
 
 pub(crate) const GRAPH_BUDGET: usize = 1024;
+/// Store kind for accepted-content integration refusals. It is keyed by the
+/// work key so a stale refusal is naturally ignored after a re-bind.
+pub(crate) const INTEGRATION_REFUSAL_KIND: &str = "integration_refusal";
 pub(crate) const STAGES: [ManagerWorkStageV2; 5] = [
     ManagerWorkStageV2::Planning,
     ManagerWorkStageV2::Implementation,
@@ -41,6 +44,8 @@ pub(crate) struct WorkRecord {
     pub priority: u8,
     pub weight: u16,
     pub required_gates: Vec<ManagerWorkStageV2>,
+    #[serde(default)]
+    pub risk_tier: ManagerWorkRiskTierV2,
     pub spec_revision: i64,
     pub source_session_id: Option<Uuid>,
     pub source_commit: Option<String>,
@@ -164,6 +169,9 @@ pub(crate) struct LedgerObservation {
     pub evidence: Option<EvidenceAdmission>,
     pub source_commit: Option<String>,
     pub custody: Vec<(Uuid, Uuid, u64)>,
+    /// #984: descendants of the author whose own branch changes are
+    /// path-disjoint from the sealed review range, proven by the daemon.
+    pub review_unrelated: Vec<Uuid>,
     pub migration: Option<(String, String)>,
     /// Repository identity, observed rolling tip, released schema head, and
     /// the allocator's prior remote tip, and exact sources proved published.

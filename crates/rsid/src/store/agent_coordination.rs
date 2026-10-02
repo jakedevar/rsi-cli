@@ -473,6 +473,42 @@ fn get_spawn_request_by_owner_digest(
         .optional()?)
 }
 
+/// C-P2-23 page bound for the watch-repair scan: 64 rows or 10 ms per
+/// transaction, whichever comes first.
+pub(crate) const WATCH_REPAIR_PAGE_MAX_ROWS: usize = 64;
+pub(crate) const WATCH_REPAIR_PAGE_MAX_MILLIS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WatchRepairPageBudget {
+    pub max_rows: usize,
+    pub max_millis: u64,
+}
+
+impl Default for WatchRepairPageBudget {
+    fn default() -> Self {
+        Self {
+            max_rows: WATCH_REPAIR_PAGE_MAX_ROWS,
+            max_millis: WATCH_REPAIR_PAGE_MAX_MILLIS,
+        }
+    }
+}
+
+/// Keyset position of the last row of a watch-repair page:
+/// `(owner_session_id, child_session_id, spawn_request_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WatchRepairCursor {
+    owner_session_id: String,
+    child_session_id: String,
+    spawn_request_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct WatchRepairPage {
+    pub records: Vec<AgentSpawnRequestRecord>,
+    /// `Some` only when the page was cut short by the row or time budget.
+    pub next: Option<WatchRepairCursor>,
+}
+
 impl Store {
     /// Preserve the final worktree observation in the existing event stream.
     /// Recording `None` is significant: a failed probe must supersede an older
@@ -1041,12 +1077,32 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn list_agent_spawn_requests_for_watch_repair(
+    /// One keyset page of launched spawn requests whose automatic terminal
+    /// watch needs repair (C-P2-23: 64 rows or 10 ms per transaction, resumed
+    /// by a continuation cursor). The page ends at `budget.max_rows` rows or
+    /// once `budget.max_millis` has elapsed (checked after each row, so a page
+    /// always advances by at least one row). `next` is `Some` only when the
+    /// page was cut short; pass it back to resume strictly after the last row.
+    pub(crate) fn list_agent_spawn_requests_for_watch_repair_page(
         &self,
-    ) -> Result<Vec<AgentSpawnRequestRecord>> {
-        let mut statement = self.conn.prepare(&format!(
-            "{SPAWN_REQUEST_SELECT} AS request
+        after: Option<&WatchRepairCursor>,
+        budget: WatchRepairPageBudget,
+    ) -> Result<WatchRepairPage> {
+        let started = std::time::Instant::now();
+        let (after_owner, after_child, after_request) = match after {
+            Some(cursor) => (
+                cursor.owner_session_id.as_str(),
+                cursor.child_session_id.as_str(),
+                cursor.spawn_request_id.as_str(),
+            ),
+            None => ("", "", ""),
+        };
+        let max_rows = budget.max_rows.max(1);
+        let fetch_limit = i64::try_from(max_rows.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut statement = self.conn.prepare(
+            "SELECT request.spawn_request_id,request.owner_session_id,request.idempotency_digest,request.request_fingerprint,request.request_json,request.child_session_id,request.epic_id,request.kind,request.state,request.safe_error_class,request.reserved_at,request.updated_at,request.epic_spawn_ordinal FROM agent_spawn_requests AS request
              WHERE request.state='launched'
+               AND (request.owner_session_id,request.child_session_id,request.spawn_request_id) > (?1,?2,?3)
                AND EXISTS (
                  SELECT 1 FROM sessions AS owner
                  WHERE owner.id=request.owner_session_id
@@ -1084,11 +1140,37 @@ impl Store {
                      WHERE manager_watch.job_id=watch.id
                    )
                )
-             ORDER BY request.owner_session_id,request.child_session_id"
-        ))?;
-        Ok(statement
-            .query_map([], map_spawn_request_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+             ORDER BY request.owner_session_id,request.child_session_id,request.spawn_request_id
+             LIMIT ?4",
+        )?;
+        let mut rows = statement.query(params![
+            after_owner,
+            after_child,
+            after_request,
+            fetch_limit
+        ])?;
+        let mut records = Vec::new();
+        let mut truncated = false;
+        while let Some(row) = rows.next()? {
+            if records.len() >= max_rows {
+                truncated = true;
+                break;
+            }
+            records.push(map_spawn_request_row(row)?);
+            if started.elapsed() >= std::time::Duration::from_millis(budget.max_millis) {
+                truncated = true;
+                break;
+            }
+        }
+        let next = match (truncated, records.last()) {
+            (true, Some(last)) => Some(WatchRepairCursor {
+                owner_session_id: last.owner_session_id.to_string(),
+                child_session_id: last.child_session_id.to_string(),
+                spawn_request_id: last.spawn_request_id.to_string(),
+            }),
+            _ => None,
+        };
+        Ok(WatchRepairPage { records, next })
     }
 
     pub(crate) fn list_incomplete_agent_spawn_requests(
@@ -1373,6 +1455,21 @@ impl Store {
         // A fresh insert is an original acceptance, not a deduplication.
         accepted.deduplicated = false;
         if let Some(scope) = manager_scope.as_ref() {
+            let policy = self
+                .manager_policy_for_config(&scope.config)?
+                .ok_or_else(|| DaemonError::InvalidParam("manager_v2_grant_required".into()))?;
+            // Immutable admission binding. The claim transaction compares this
+            // exact node/epoch/policy with the current deepest owner before a
+            // provider can see the queued message.
+            self.manager_v2_event(
+                &scope.config,
+                Some(owner_session_id),
+                "agent_mail_authority",
+                &message_id.to_string(),
+                policy.row_version,
+                &serde_json::json!({"epic_id":scope.epic_id,"target":request.target_session_id,
+                    "node_id":policy.manager_session_id}),
+            )?;
             self.audit_manager_session_control(scope, "AgentSendMessage", "accepted")?;
         }
         tx.commit()?;
@@ -1592,6 +1689,81 @@ impl Store {
     /// error, because the dispatcher must respond to it by settling the unused
     /// model invocation with a pre-effect error class and releasing its grant —
     /// which is ordinary control flow, not a fault.
+    pub(crate) fn manager_mail_claim_current(
+        &self,
+        tx: &Transaction<'_>,
+        message_id: Uuid,
+        owner: Uuid,
+        target: Uuid,
+    ) -> Result<bool> {
+        let markers: Vec<(String, i64, i64, Option<String>, String)> = {
+            let mut statement = tx.prepare(
+                "SELECT manager_session_id,scope_version,row_version,actor_session_id,payload_json
+                 FROM harness_manager_v2_events
+                 WHERE kind='agent_mail_authority' AND record_key=?1 LIMIT 2",
+            )?;
+            statement
+                .query_map([message_id.to_string()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if markers.len() > 1 {
+            return Ok(false);
+        }
+        if let Some((principal, epoch, policy_version, actor, payload)) = markers.first() {
+            let Some(scope) = self
+                .manager_session_control_scope(owner, target, true)
+                .ok()
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            let Some(policy) = self.manager_policy_for_config(&scope.config).ok().flatten() else {
+                return Ok(false);
+            };
+            let payload: serde_json::Value = serde_json::from_str(payload)?;
+            return Ok(actor.as_deref() == Some(owner.to_string().as_str())
+                && scope.config.manager_session_id.to_string() == *principal
+                && scope.config.row_version == *epoch
+                && policy.row_version == *policy_version
+                && payload["epic_id"] == serde_json::json!(scope.epic_id)
+                && payload["target"] == serde_json::json!(target)
+                && payload["node_id"] == serde_json::json!(policy.manager_session_id));
+        }
+        // Pre-upgrade manager mail has no exact grant binding. Keep ordinary
+        // direct-child and Epic-lead mail working, but fail closed for mail
+        // admitted only through a historical manager seat.
+        let _lineage_root = self.manager_lineage_root(owner)?;
+        let was_manager: bool = tx.query_row(
+            "WITH RECURSIVE lineage(id) AS (
+                SELECT ?1
+                UNION
+                SELECT s.continued_from FROM sessions s JOIN lineage l ON s.id=l.id
+                WHERE s.continued_from IS NOT NULL
+             )
+             SELECT EXISTS(SELECT 1 FROM lineage l WHERE
+                EXISTS(SELECT 1 FROM manager_nodes n WHERE n.seat_root_session_id=l.id)
+                OR EXISTS(SELECT 1 FROM harness_manager_scopes s WHERE s.manager_session_id=l.id)
+                OR EXISTS(SELECT 1 FROM harness_manager_v2_events e WHERE e.manager_session_id=l.id))",
+            [owner.to_string()],
+            |row| row.get(0),
+        )?;
+        if !was_manager {
+            return Ok(true);
+        }
+        Ok(self
+            .get_session(target)?
+            .is_some_and(|session| session.parent_id == Some(owner))
+            || self.epic_lead_authorizes_child(owner, target)?)
+    }
+
     pub(crate) fn claim_agent_message_exact(
         &self,
         request: &ClaimAgentMessageRequest,
@@ -1626,9 +1798,10 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         // ---- 1. exact aggregate fence -----------------------------------
-        let aggregate: Option<(String, i64, i64, Option<i64>)> = tx
+        let aggregate: Option<(String, i64, i64, Option<i64>, String, String)> = tx
             .query_row(
-                "SELECT state, state_version, attempt_count, current_attempt_number
+                "SELECT state, state_version, attempt_count, current_attempt_number,
+                        owner_session_id,target_session_id
                    FROM agent_messages WHERE id=?1",
                 params![request.message_id.to_string()],
                 |row| {
@@ -1637,11 +1810,15 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((state, state_version, attempt_count, current_attempt_number)) = aggregate else {
+        let Some((state, state_version, attempt_count, current_attempt_number, owner, target)) =
+            aggregate
+        else {
             return Ok(ClaimAgentMessageOutcome::CasLost(
                 AgentMessageClaimCasLoss::MessageMissing,
             ));
@@ -1667,6 +1844,13 @@ impl Store {
         {
             return Ok(ClaimAgentMessageOutcome::CasLost(
                 AgentMessageClaimCasLoss::CurrentAttemptMismatch,
+            ));
+        }
+        let owner = parse_store_uuid("agent message owner", &owner)?;
+        let target = parse_store_uuid("agent message target", &target)?;
+        if !self.manager_mail_claim_current(&tx, request.message_id, owner, target)? {
+            return Ok(ClaimAgentMessageOutcome::CasLost(
+                AgentMessageClaimCasLoss::ManagerAuthorityChanged,
             ));
         }
 
@@ -1738,6 +1922,7 @@ impl Store {
         // Every terminal-one-turn provider is permanently `not_applicable`.
         let correlation_state = match capability_kind {
             BoundaryCapabilityKindV1::NativeMultiTurn => CorrelationStateV1::CorrelationPending,
+            BoundaryCapabilityKindV1::HarnessToolBoundary => CorrelationStateV1::NotApplicable,
             BoundaryCapabilityKindV1::TerminalOneTurn => CorrelationStateV1::NotApplicable,
         };
         let attempt_rows = tx.execute(
@@ -1759,7 +1944,7 @@ impl Store {
                 request.expected_session_generation,
                 request.delivery_model_invocation_id.to_string(),
                 request.provider_kind.as_str(),
-                capability_kind.as_str(),
+                capability_kind.persisted_str(),
                 boundary_kind.as_str(),
                 now_string,
                 expires_string,
@@ -3937,7 +4122,7 @@ impl Store {
     ) -> Result<PermitSettleOutcomeV1> {
         let now = settled_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let target = settlement.target_state();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         let durable: Option<(String, String, i64, String, String, i64)> = tx
             .query_row(
@@ -5413,6 +5598,7 @@ pub(crate) enum AgentMessageClaimCasLoss {
     SessionGenerationMismatch,
     SessionInvocationMismatch,
     ModelInvocationMissing,
+    ManagerAuthorityChanged,
 }
 
 impl AgentMessageClaimCasLoss {
@@ -5428,6 +5614,7 @@ impl AgentMessageClaimCasLoss {
             Self::SessionGenerationMismatch => "agent_message_claim_session_generation_mismatch",
             Self::SessionInvocationMismatch => "agent_message_claim_session_invocation_mismatch",
             Self::ModelInvocationMissing => "agent_message_claim_model_invocation_missing",
+            Self::ManagerAuthorityChanged => "agent_message_claim_manager_authority_changed",
         }
     }
 }
@@ -6045,7 +6232,7 @@ fn validate_agent_message_live_target(
     Ok(())
 }
 
-fn resolve_lineage_tip(tx: &Transaction<'_>, origin: Uuid) -> Result<Uuid> {
+pub(super) fn resolve_lineage_tip(tx: &Transaction<'_>, origin: Uuid) -> Result<Uuid> {
     let chain = lineage_chain(tx, origin)?;
     Ok(chain.last().copied().unwrap_or(origin))
 }
@@ -6348,6 +6535,139 @@ mod tests {
             .pragma_update(None, "user_version", live_version)
             .expect("restore live schema head");
         fingerprint.expect("compute accepted V82 mailbox fingerprint")
+    }
+
+    /// Seed `count` launched spawn requests under `owner_id`, each with a live
+    /// child and a `pending` watch witness, so each is a watch-repair candidate.
+    #[allow(clippy::expect_used)]
+    fn seed_watch_repair_candidates(store: &Store, owner_id: Uuid, epic_id: Uuid, count: usize) {
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for index in 0..count {
+            let child_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let mut child = test_session(child_id, std::path::PathBuf::from("/tmp"));
+            child.parent_id = Some(epic_id);
+            child.status = SessionStatus::Running;
+            store.insert_session(&child).expect("insert child");
+            let request = AgentSpawnChildRequestV1 {
+                kind: SessionKind::Task,
+                provider: None,
+                model: None,
+                effort: None,
+                query: "work".into(),
+                agent_role: None,
+                topology_node: None,
+                iteration: None,
+                tags: None,
+                idempotency_key: format!("watch-repair-page-{owner_id}-{index}"),
+            };
+            store
+                .reserve_agent_spawn_request(
+                    owner_id,
+                    &format!("sha256:{0}{0}", request_id.simple()),
+                    &format!("sha256:{0}{0}", child_id.simple()),
+                    &request,
+                    epic_id,
+                    request_id,
+                    child_id,
+                )
+                .expect("reserve request");
+            store.mark_agent_spawn_queued(request_id).expect("queue");
+            store
+                .mark_agent_spawn_launching(request_id)
+                .expect("launching");
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_spawn_requests SET state='launched',updated_at=?1,launched_at=?1 WHERE spawn_request_id=?2",
+                    params![now, request_id.to_string()],
+                )
+                .expect("settle launched");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO agent_child_watch_witness
+                     (owner_session_id,child_session_id,job_id,state,updated_at)
+                     VALUES (?1,?2,NULL,'pending',?3)",
+                    params![owner_id.to_string(), child_id.to_string(), now],
+                )
+                .expect("witness");
+        }
+    }
+
+    /// C-P2-23: the watch-repair scan is keyset-paginated. A population larger
+    /// than one page is walked by the cursor with no duplicate and no gap, and
+    /// equals the order of the unpaginated `ORDER BY` key.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn watch_repair_scan_pages_a_population_larger_than_one_page_without_gaps() {
+        let store = Store::open_in_memory().expect("open store");
+        let mut expected = 0;
+        for per_owner in [70, 45, 40] {
+            let owner_id = Uuid::new_v4();
+            let mut owner = test_session(owner_id, std::path::PathBuf::from("/tmp"));
+            owner.status = SessionStatus::Running;
+            store.insert_session(&owner).expect("insert owner");
+            let epic_id = Uuid::new_v4();
+            let mut epic = test_session(epic_id, std::path::PathBuf::from("/tmp"));
+            epic.session_kind = SessionKind::Epic;
+            epic.lead_session_id = Some(owner_id);
+            store.insert_session(&epic).expect("insert epic");
+            seed_watch_repair_candidates(&store, owner_id, epic_id, per_owner);
+            expected += per_owner;
+        }
+        assert!(expected > 2 * WATCH_REPAIR_PAGE_MAX_ROWS);
+
+        let mut cursor = None;
+        let mut pages = 0;
+        let mut seen = Vec::new();
+        loop {
+            let page = store
+                .list_agent_spawn_requests_for_watch_repair_page(
+                    cursor.as_ref(),
+                    WatchRepairPageBudget {
+                        max_rows: WATCH_REPAIR_PAGE_MAX_ROWS,
+                        // Row-bound only: a huge time budget keeps the page
+                        // size deterministic on a slow machine.
+                        max_millis: 60_000,
+                    },
+                )
+                .expect("page");
+            assert!(page.records.len() <= WATCH_REPAIR_PAGE_MAX_ROWS);
+            pages += 1;
+            seen.extend(page.records.iter().map(|r| {
+                (
+                    r.owner_session_id.to_string(),
+                    r.child_session_id.to_string(),
+                    r.spawn_request_id.to_string(),
+                )
+            }));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), expected, "no gap");
+        assert!(pages >= 3, "population spans several pages: {pages}");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "pages arrive in strict keyset order");
+        sorted.dedup();
+        assert_eq!(sorted.len(), expected, "no duplicate across pages");
+
+        // A zero time budget still advances one row per page (never wedges).
+        let first = store
+            .list_agent_spawn_requests_for_watch_repair_page(
+                None,
+                WatchRepairPageBudget {
+                    max_rows: WATCH_REPAIR_PAGE_MAX_ROWS,
+                    max_millis: 0,
+                },
+            )
+            .expect("time-bounded page");
+        assert_eq!(first.records.len(), 1);
+        assert!(first.next.is_some());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

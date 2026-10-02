@@ -912,10 +912,12 @@ fn rotate_log_file(current_path: &Path, log_dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::verify_worker_slice_properties;
     use super::{
         DaemonStart, RsidScopeSettings, WorkerScopeSettings, ensure_daemon_socket,
         prefer_sibling_daemon, resolve_daemon_command_with, should_auto_start_daemon_with,
-        sibling_daemon_binary, verify_worker_slice_properties,
+        sibling_daemon_binary,
     };
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
@@ -1284,13 +1286,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn worker_slice_verification_requires_finite_exact_parent() {
+        // The defaults derive from host memory (#1014), so build the expected
+        // properties from them instead of pinning one host's numbers.
         let settings = WorkerScopeSettings::defaults();
-        let valid = "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/user@1000.service/rsi-workers.slice\nMemoryHigh=6442450944\nMemoryMax=8589934592\nMemorySwapMax=0\nCPUWeight=20\n";
-        assert!(verify_worker_slice_properties(settings, valid).is_ok());
+        let mib = 1024 * 1024;
+        let memory_max = format!("MemoryMax={}", settings.memory_max_mib * mib);
+        let valid = format!(
+            "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/user@1000.service/rsi-workers.slice\nMemoryHigh={}\n{memory_max}\nMemorySwapMax={}\nCPUWeight={}\n",
+            settings.memory_high_mib * mib,
+            settings.memory_swap_max_mib * mib,
+            settings.cpu_weight
+        );
+        assert!(verify_worker_slice_properties(settings, &valid).is_ok());
         assert!(
             verify_worker_slice_properties(
                 settings,
-                &valid.replace("MemoryMax=8589934592", "MemoryMax=infinity")
+                &valid.replace(&memory_max, "MemoryMax=infinity")
             )
             .is_err()
         );

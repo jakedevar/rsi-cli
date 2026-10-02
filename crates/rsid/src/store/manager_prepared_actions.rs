@@ -611,9 +611,12 @@ impl Store {
                     && target.status == SessionStatus::Interrupted;
                 let gate = if matches!(
                     action,
+                    ManagerActionV2::RetryLead { .. } | ManagerActionV2::ReplaceLead { .. }
+                ) {
+                    self.manager_lead_handover_human_gate(target.id)
+                } else if matches!(
+                    action,
                     ManagerActionV2::ResumeLead { .. }
-                        | ManagerActionV2::RetryLead { .. }
-                        | ManagerActionV2::ReplaceLead { .. }
                         | ManagerActionV2::AssignLead {
                             session_id: Some(_),
                             ..
@@ -629,7 +632,7 @@ impl Store {
                 capture_blocker(gate, &mut blockers)?;
             }
         } else if let Some(target) = admission.target.as_ref() {
-            capture_blocker(self.manager_action_human_gate(target.id), &mut blockers)?;
+            capture_blocker(self.manager_lead_pause_human_gate(target.id), &mut blockers)?;
         }
         if let Some(launch) = &admission.launch {
             let existing = admission
@@ -1024,10 +1027,17 @@ mod tests {
             assert!(error.to_string().contains("injected V115 fault"), "{error}");
             assert_eq!(version(&store.conn), 114);
             assert_eq!(fingerprint(&store.conn), V114_SOURCE_FINGERPRINT);
-            assert_eq!(
-                store.get_session(session.id).unwrap().unwrap().title,
-                session.title
-            );
+            // Read the V114 row directly: the current serializer expects
+            // columns (#1000) that a V114 schema does not have.
+            let title: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT title FROM sessions WHERE id = ?1",
+                    [session.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(title, session.title);
             store
                 .apply_manager_prepared_actions_v115_migration()
                 .unwrap();
@@ -1179,7 +1189,16 @@ mod tests {
         fn at_v115() -> Self {
             let store = Store::open_in_memory().unwrap();
             rewind_store_to_schema_version(&store.conn, 115);
-            Self::with_store(store)
+            // The fixture session is written through the current serializer, so
+            // #1000's column is present only for that insert (exact V115 after).
+            crate::store::tests::readd_current_session_columns(&store.conn);
+            let fixture = Self::with_store(store);
+            fixture
+                .store
+                .conn
+                .execute_batch("ALTER TABLE sessions DROP COLUMN total_prompt_tokens;")
+                .unwrap();
+            fixture
         }
 
         fn with_store(store: Store) -> Self {

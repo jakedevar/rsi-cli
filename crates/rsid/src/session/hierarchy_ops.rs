@@ -1025,6 +1025,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -1119,13 +1120,16 @@ mod tests {
             process: None,
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive,
             rotation: crate::session::rotation_coordinator::RotationCoordinator::new(
                 session_id, 0, false,
             ),
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence: ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,
@@ -1791,6 +1795,7 @@ mod tests {
             manager.persistence.clone(),
             None,
             manager.runtime_config.clone(),
+            None,
         )
         .await;
 
@@ -2280,6 +2285,7 @@ pub(super) fn build_container_session(
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,

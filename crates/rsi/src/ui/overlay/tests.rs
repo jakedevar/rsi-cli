@@ -36,6 +36,92 @@ use super::apply_geometry_deltas;
 use crate::types::ModalGeometry;
 
 #[test]
+fn scoped_geometry_moves_centered_popup_and_restores_between_paints() {
+    let viewport = Rect::new(0, 0, 120, 40);
+    let base = super::fixed_centered_rect(viewport, 50, 12);
+    let adjusted = super::with_paint_geometry(
+        Some(ModalGeometry {
+            dx: 6,
+            dy: 4,
+            dw: 8,
+            dh: 6,
+        }),
+        || super::fixed_centered_rect(viewport, 50, 12),
+    );
+    assert_eq!(adjusted.x, base.x + 6);
+    assert_eq!(adjusted.y, base.y + 4);
+    assert_eq!(adjusted.width, base.width + 8);
+    assert_eq!(adjusted.height, base.height + 6);
+    assert_eq!(super::fixed_centered_rect(viewport, 50, 12), base);
+}
+
+#[test]
+fn sort_picker_renders_at_its_saved_geometry() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.overlay = crate::types::OverlayState::SortPicker { selected_index: 0 };
+    let geom = ModalGeometry {
+        dx: 6,
+        dy: 2,
+        dw: 8,
+        dh: 4,
+    };
+    app.modal_geometries
+        .insert("SortPicker".into(), geom.clone());
+    let viewport = Rect::new(0, 0, 100, 30);
+    let base =
+        super::fixed_centered_rect(viewport, 45, crate::app::SortOrder::ALL.len() as u16 + 4);
+    let expected = apply_geometry_deltas(base, &geom, viewport);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let top_row: String = (0..100).map(|x| buffer[(x, expected.y)].symbol()).collect();
+    assert_eq!(top_row.find("Sort Order"), Some(expected.x as usize + 4));
+
+    app.modal_geometries.insert(
+        "SortPicker".into(),
+        ModalGeometry {
+            dw: -500,
+            dh: -500,
+            ..ModalGeometry::default()
+        },
+    );
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+}
+
+#[test]
+fn terminal_popup_renders_with_saved_resize() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.overlay = crate::types::OverlayState::Terminal;
+    let geom = ModalGeometry {
+        dx: 0,
+        dy: 2,
+        dw: -12,
+        dh: -4,
+    };
+    app.modal_geometries.insert("Terminal".into(), geom.clone());
+    let viewport = Rect::new(0, 0, 100, 30);
+    let base = Rect::new(5, 3, 90, 24);
+    let expected = apply_geometry_deltas(base, &geom, viewport);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let top_row: String = (0..100).map(|x| buffer[(x, expected.y)].symbol()).collect();
+    assert_eq!(top_row.find("TERMINAL"), Some(expected.x as usize + 4));
+}
+
+#[test]
 fn test_geometry_zero_deltas_passthrough() {
     let base = Rect::new(20, 5, 60, 20);
     let viewport = Rect::new(0, 0, 120, 40);

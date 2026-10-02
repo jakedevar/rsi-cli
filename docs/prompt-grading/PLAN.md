@@ -4,7 +4,7 @@
 Refactor the 7 RPI (Research-Plan-Implement) slash commands to eliminate compounding context bloat, replace vague guidance with numeric contracts, and establish a single shared worker preamble as the source of truth. This is the foundation on which the RSI recursively-self-improving agent harness will mutate prompts — so getting the contracts crisp now determines whether RSI can measure and improve itself later.
 
 ## Context & Background
-RPI is a three-stage pipeline — `research_codebase` → `create_plan` → `implement_plan` — with team variants (`team_research_codebase`, `team_create_plan`, `team_implement`) that fan out to worker sub-agents, and `master_implement` which orchestrates the full pipeline end-to-end. The grading pass in `/home/jakedevar/rsi/docs/prompt-grading/` (see `research_codebase.md`, `implement_plan.md`, `team_create_plan.md`) found three systemic problems:
+RPI is a three-stage pipeline — `research_codebase` → `create_plan` → `implement_plan` — with team variants (`team_research_codebase`, `team_create_plan`, `team_implement`) that fan out to worker sub-agents, and `master_implement` which orchestrates the full pipeline end-to-end. The grading pass in `~/rsi/docs/prompt-grading/` (see `research_codebase.md`, `implement_plan.md`, `team_create_plan.md`) found three systemic problems:
 
 1. **Full-file read mandate** — "Read files FULLY — never use limit/offset" appears ~7 times and single-handedly blows the context window on any real codebase.
 2. **Master compounding bloat** — `master_implement` inlines each stage's findings into the next stage's prompt, so by Step 6 the master is carrying the entire research doc + entire plan doc + entire implementation handoff in-context instead of re-reading from disk.
@@ -38,7 +38,7 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 **Changes:**
 - Grep each of the three solo commands for `Read files FULLY`, `never use limit`, `never use offset`, `full file`, and equivalents. Replace every hit (~7 total) with the canonical replacement:
   > *"Read targeted ranges via Grep-then-Read. Full-file reads only for files <400 lines. Budget: ≤8k tokens of file reads before acting."*
-- Create `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` as a stub containing:
+- Create `~/rsi/.claude/commands/_shared/worker_preamble.md` as a stub containing:
   - Return budget: `≤250 tokens default` (research), `≤400 tokens` (planning), `≤300 tokens` (implementation) — annotated so team commands can reference the appropriate variant.
   - Forbidden-content list: no code snippets, no full-file contents, no verbose prose, no recap of the prompt, no hedging.
   - The rule: **"file:line refs are free; prose is taxed."**
@@ -49,11 +49,11 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
   > *"Preflight: `EnterWorktree` is a deferred tool. Before calling it, invoke `ToolSearch` with `select:EnterWorktree,ExitWorktree` to load the schemas. Same applies to any other deferred tool listed in the environment reminder."*
 
 **Success check:**
-- `grep -ri "Read files FULLY\|never use limit\|never use offset" /home/jakedevar/rsi/.claude/commands/` returns zero hits.
-- `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` exists.
+- `grep -ri "Read files FULLY\|never use limit\|never use offset" ~/rsi/.claude/commands/` returns zero hits.
+- `~/rsi/.claude/commands/_shared/worker_preamble.md` exists.
 - Each team command contains a reference to the shared preamble path.
-- `grep -n "fail 3" /home/jakedevar/rsi/.claude/commands/implement_plan.md /home/jakedevar/rsi/.claude/commands/team_implement.md` returns matches in both.
-- `grep -n "ToolSearch" /home/jakedevar/rsi/.claude/commands/implement_plan.md` returns a match.
+- `grep -n "fail 3" ~/rsi/.claude/commands/implement_plan.md ~/rsi/.claude/commands/team_implement.md` returns matches in both.
+- `grep -n "ToolSearch" ~/rsi/.claude/commands/implement_plan.md` returns a match.
 
 **Risk:** Low — additive constraints, no behavioral inversion. Worst case: a command reads slightly less of a file than before and asks for a targeted follow-up read.
 
@@ -90,7 +90,7 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 
 **Success check:**
 - Character count of the Step 2 spawn prompt (excluding the path itself) is ≥80% smaller than baseline (record baseline before editing).
-- `grep -n "Re-read\|re-read" /home/jakedevar/rsi/.claude/commands/master_implement.md` hits in Step 6.
+- `grep -n "Re-read\|re-read" ~/rsi/.claude/commands/master_implement.md` hits in Step 6.
 - `<handoff_contract>` appears exactly once in the file.
 - `<discard_after_extract>` appears between each of the three stage transitions.
 
@@ -136,7 +136,7 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 **Success check:**
 - Each team command file contains a `<return_schema>` block with `max_words` / `max_items` annotations on every field.
 - Each team command file contains a `<forbidden_content>` block.
-- `grep -n "files_modified is the ONLY" /home/jakedevar/rsi/.claude/commands/team_implement.md` returns a match.
+- `grep -n "files_modified is the ONLY" ~/rsi/.claude/commands/team_implement.md` returns a match.
 
 **Risk:** Low-medium. Workers may initially try to exceed the schema; the master prompt should explicitly reject over-budget returns and request a rewrite (covered by the shared preamble in Phase 4).
 
@@ -146,7 +146,7 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 **Files touched:** `.claude/commands/_shared/worker_preamble.md` (expand the stub from Phase 1), all 7 commands.
 
 **Changes:**
-- Flesh out `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` as the single source of truth. Sections:
+- Flesh out `~/rsi/.claude/commands/_shared/worker_preamble.md` as the single source of truth. Sections:
   1. **Role framing** — "You are a worker agent in an RPI team. Your master is waiting on a bounded return."
   2. **Read budget** — the ≤8k-tokens-of-file-reads rule from Phase 1.
   3. **Return budget** — per-role token caps (research 250, planning 400, implementation 300), selectable by the including command.
@@ -160,9 +160,9 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 - Add a comment at the top of the shared preamble: `<!-- This file is the RSI meta-harness mutation target. All RPI workers load their contract from here. -->`
 
 **Success check:**
-- `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` contains all six sections above.
+- `~/rsi/.claude/commands/_shared/worker_preamble.md` contains all six sections above.
 - Each of the 7 commands contains exactly one reference to the shared preamble path.
-- `grep -c "forbidden" /home/jakedevar/rsi/.claude/commands/*.md` shows preamble content de-duplicated (forbidden-content lists no longer inlined in individual commands).
+- `grep -c "forbidden" ~/rsi/.claude/commands/*.md` shows preamble content de-duplicated (forbidden-content lists no longer inlined in individual commands).
 - Mutating a rule in the shared preamble (e.g., tightening the word cap) changes worker behavior for all 7 commands without further edits.
 
 **Risk:** Low behaviorally (all content already exists post-Phase-3, just centralized); medium operationally — future edits must go through the shared file, and humans need to notice the reference. Mitigation: leave a one-line note at the top of each command pointing at the shared file.
@@ -170,7 +170,7 @@ The fix is sequenced as four PRs: immediate relief, master rewrite, structured r
 ---
 
 ## Ambiguity Resolutions
-- **Shared preamble location** → `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md`. Underscore-prefixed directory signals "not a slash command", keeps the command list clean.
+- **Shared preamble location** → `~/rsi/.claude/commands/_shared/worker_preamble.md`. Underscore-prefixed directory signals "not a slash command", keeps the command list clean.
 - **Global `~/.claude/commands/` variants** (`research_codebase_nt.md`, `create_plan_nt.md`, etc.) → Out of scope for this plan. User-global variants follow in a separate pass once the project-local pattern is proven.
 - **Per-role token budgets** → Research workers 250, planning workers 400 (need more structural fields), implementation workers 300 (need `files_modified` list). Encoded as selectable roles in the shared preamble.
 - **Handoff block format (JSON/YAML vs prose+XML)** → Keep prose with XML tags. Rationales: matches existing RPI style, stays grep-able from the shell, LLMs parse XML-tagged prose reliably, and JSON/YAML would require a harness-side parser that doesn't exist yet. Revisit when the RSI meta-harness needs structured extraction.

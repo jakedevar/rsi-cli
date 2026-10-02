@@ -30,7 +30,7 @@ pub fn render_question_modal(
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height / 3).saturating_sub(popup_height / 2).max(1);
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = super::scoped_popup_rect(Rect::new(x, y, popup_width, popup_height), area);
 
     frame.render_widget(Clear, popup_area);
 

@@ -1,6 +1,6 @@
 //! Git operations tool -- status, diff, log, branch operations.
 
-use super::{HarnessTool, truncation::truncate_text};
+use super::{HarnessTool, ToolContext, truncation::truncate_text};
 use crate::process_control::{
     CaptureError, CaptureLimits, SESSION_TOOL_MAX_STREAM_BYTES, SESSION_TOOL_TIMEOUT,
     capture_bounded,
@@ -50,6 +50,7 @@ impl GitTool {
         args: serde_json::Value,
         working_dir: &Path,
         cancel: &CancellationToken,
+        max_output_bytes: usize,
     ) -> ToolResult {
         let git_args = args
             .get("args")
@@ -103,6 +104,9 @@ impl GitTool {
 
         let mut limits = CaptureLimits::session_tool();
         limits.execution_timeout = timeout;
+        let max_output_bytes = max_output_bytes.min(MAX_OUTPUT_BYTES);
+        limits.max_stdout_bytes = max_output_bytes;
+        limits.max_stderr_bytes = max_output_bytes;
         match capture_bounded(command, limits, cancel).await {
             Ok(output) => {
                 let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -116,7 +120,7 @@ impl GitTool {
                     success: output.status.success(),
                     output: truncate_text(
                         &combined,
-                        MAX_OUTPUT_BYTES,
+                        max_output_bytes,
                         output.stdout_truncated || output.stderr_truncated,
                     )
                     .content,
@@ -170,7 +174,8 @@ impl HarnessTool for GitTool {
 
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult {
         let cancel = CancellationToken::new();
-        self.execute_with_cancel(args, working_dir, &cancel).await
+        self.execute_with_cancel(args, working_dir, &cancel, MAX_OUTPUT_BYTES)
+            .await
     }
 
     async fn execute_cancellable(
@@ -179,7 +184,22 @@ impl HarnessTool for GitTool {
         working_dir: &Path,
         cancel: &CancellationToken,
     ) -> ToolResult {
-        self.execute_with_cancel(args, working_dir, cancel).await
+        self.execute_with_cancel(args, working_dir, cancel, MAX_OUTPUT_BYTES)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolResult {
+        self.execute_with_cancel(
+            args,
+            &context.working_dir,
+            &context.cancel,
+            context.policy.max_output_bytes,
+        )
+        .await
     }
 }
 

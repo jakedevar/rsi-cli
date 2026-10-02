@@ -37,6 +37,11 @@ use rsi_common::rpc::{
     RunRecursiveFakeSchedulerParams, RunRecursiveLiveSchedulerParams,
 };
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimReportWire;
+use rsi_common::satellite::{
+    SatelliteHubSessionsPageV1, SatelliteHubSessionsRequestV1, SatelliteProbeLinkRequestV1,
+    SatelliteProbeLinkResultV1, SatellitePutLinkRequestV1, SatellitePutPeerRequestV1,
+    SatelliteRegistryV1,
+};
 use rsi_common::types::{
     IndexStatusSidecar, IndexStatusValue, Project, Session, SessionProvider, Topology,
     TopologyDefinition,
@@ -63,6 +68,30 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OperatorMessageView {
+    pub id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub content: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub delivered_at: Option<String>,
+}
+
+impl OperatorMessageView {
+    /// A message the operator still has in flight: not yet handed to the model
+    /// (`queued`), being handed over, or of unknown outcome. `delivered`
+    /// (at a tool boundary or as a turn) and `withdrawn` are settled.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "queued" | "dispatching" | "effect_possible" | "uncertain"
+        )
+    }
+}
 use tokio::net::UnixStream;
 
 #[derive(Debug, thiserror::Error)]
@@ -386,6 +415,93 @@ fn recursive_artifact_summary_list_params(
 }
 
 impl DaemonClient {
+    /// Read the hub-owned satellite registry. This never connects the TUI to a peer.
+    pub async fn list_satellite_peers(&mut self) -> Result<SatelliteRegistryV1> {
+        Ok(serde_json::from_value(
+            self.request("ListSatellitePeers", Value::Null).await?,
+        )?)
+    }
+
+    /// Apply a revision-fenced operator edit to one peer.
+    pub async fn put_satellite_peer(&mut self, request: SatellitePutPeerRequestV1) -> Result<u64> {
+        let response = self
+            .request("PutSatellitePeer", serde_json::to_value(request)?)
+            .await?;
+        Ok(response["revision"]
+            .as_u64()
+            .ok_or_else(|| ClientError::Protocol("missing satellite revision".into()))?)
+    }
+
+    /// Replace one peer's operator-declared dispatch scope (#1017 slice 3).
+    pub async fn put_satellite_peer_scope(
+        &mut self,
+        request: rsi_common::satellite_dispatch::SatellitePutScopeRequestV1,
+    ) -> Result<u64> {
+        let response = self
+            .request("PutSatellitePeerScope", serde_json::to_value(request)?)
+            .await?;
+        Ok(response["revision"]
+            .as_u64()
+            .ok_or_else(|| ClientError::Protocol("missing satellite revision".into()))?)
+    }
+
+    /// Read this daemon's satellite-side inbound delivery policy.
+    pub async fn get_satellite_inbound_policy(
+        &mut self,
+    ) -> Result<rsi_common::satellite_dispatch::SatelliteInboundPolicyV1> {
+        Ok(serde_json::from_value(
+            self.request("GetSatelliteInboundPolicy", Value::Null)
+                .await?,
+        )?)
+    }
+
+    /// Replace this daemon's satellite-side inbound delivery policy.
+    pub async fn put_satellite_inbound_policy(
+        &mut self,
+        policy: rsi_common::satellite_dispatch::SatelliteInboundPolicyV1,
+    ) -> Result<()> {
+        self.request(
+            "PutSatelliteInboundPolicy",
+            serde_json::to_value(
+                rsi_common::satellite_dispatch::PutSatelliteInboundPolicyRequestV1 { policy },
+            )?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Apply a revision-fenced operator edit to one local socket link.
+    pub async fn put_satellite_link(&mut self, request: SatellitePutLinkRequestV1) -> Result<u64> {
+        let response = self
+            .request("PutSatelliteLink", serde_json::to_value(request)?)
+            .await?;
+        Ok(response["revision"]
+            .as_u64()
+            .ok_or_else(|| ClientError::Protocol("missing satellite revision".into()))?)
+    }
+
+    /// Probe a configured link without changing registry state.
+    pub async fn probe_satellite_link(
+        &mut self,
+        request: SatelliteProbeLinkRequestV1,
+    ) -> Result<SatelliteProbeLinkResultV1> {
+        Ok(serde_json::from_value(
+            self.request("ProbeSatelliteLink", serde_json::to_value(request)?)
+                .await?,
+        )?)
+    }
+
+    /// Read one bounded page of cached remote sessions from the hub.
+    pub async fn list_hub_satellite_sessions(
+        &mut self,
+        request: SatelliteHubSessionsRequestV1,
+    ) -> Result<SatelliteHubSessionsPageV1> {
+        Ok(serde_json::from_value(
+            self.request("ListHubSatelliteSessions", serde_json::to_value(request)?)
+                .await?,
+        )?)
+    }
+
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
@@ -415,6 +531,13 @@ impl DaemonClient {
     /// Check if connected.
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// PID of the daemon at the other end of the socket (`SO_PEERCRED`);
+    /// `None` when disconnected or when the platform does not report it.
+    pub fn peer_pid(&self) -> Option<u32> {
+        let pid = self.stream.as_ref()?.peer_cred().ok()?.pid()?;
+        u32::try_from(pid).ok().filter(|pid| *pid > 0)
     }
 
     /// Disconnect from daemon.
@@ -623,6 +746,42 @@ impl DaemonClient {
     ) -> Result<rsi_common::harness_manager_v2::ManagerInspectionV2> {
         let result = self
             .request("GetHarnessManagerState", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn list_manager_nodes(
+        &mut self,
+        request: rsi_common::manager_nodes::ListManagerNodesRequestV1,
+    ) -> Result<rsi_common::manager_nodes::ListManagerNodesResultV1> {
+        let result = self
+            .request("ListManagerNodes", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn get_manager_node(
+        &mut self,
+        request: rsi_common::manager_nodes::GetManagerNodeRequestV1,
+    ) -> Result<Option<rsi_common::manager_nodes::ManagerNodeViewV1>> {
+        let result = self
+            .request("GetManagerNode", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn configure_manager_node(
+        &mut self,
+        request: rsi_common::manager_nodes::ConfigureManagerNodeRequestV1,
+    ) -> Result<rsi_common::manager_nodes::ManagerNodeViewV1> {
+        let result = self
+            .request("ConfigureManagerNode", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn revoke_manager_node(
+        &mut self,
+        request: rsi_common::manager_nodes::RevokeManagerNodeRequestV1,
+    ) -> Result<rsi_common::manager_nodes::ManagerNodeViewV1> {
+        let result = self
+            .request("RevokeManagerNode", serde_json::to_value(request)?)
             .await?;
         Ok(serde_json::from_value(result)?)
     }
@@ -1278,6 +1437,79 @@ impl DaemonClient {
         Ok(())
     }
 
+    pub async fn queue_operator_message(
+        &mut self,
+        session_id: uuid::Uuid,
+        content: &str,
+        idempotency_key: uuid::Uuid,
+    ) -> Result<OperatorMessageView> {
+        let response = self.request("QueueOperatorMessage", serde_json::json!({
+            "session_id": session_id, "content": content, "idempotency_key": idempotency_key.to_string(),
+        })).await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn list_operator_messages(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<Vec<OperatorMessageView>> {
+        let response = self
+            .request(
+                "ListOperatorMessages",
+                serde_json::json!({"session_id": session_id}),
+            )
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn edit_operator_message(
+        &mut self,
+        message_id: uuid::Uuid,
+        content: &str,
+    ) -> Result<OperatorMessageView> {
+        let response = self
+            .request(
+                "EditOperatorMessage",
+                serde_json::json!({"message_id": message_id, "content": content}),
+            )
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn withdraw_operator_message(
+        &mut self,
+        message_id: uuid::Uuid,
+    ) -> Result<OperatorMessageView> {
+        let response = self
+            .request(
+                "WithdrawOperatorMessage",
+                serde_json::json!({"message_id": message_id}),
+            )
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn interrupt_session_now(&mut self, session_id: uuid::Uuid) -> Result<()> {
+        self.request(
+            "InterruptSessionNow",
+            serde_json::json!({
+                "session_id": session_id, "confirmation": "INTERRUPT NOW",
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn restart_daemon_drain(&mut self) -> Result<Value> {
+        self.request("RestartDaemonDrain", serde_json::json!({}))
+            .await
+    }
+
+    pub async fn get_drain_restart_status(&mut self) -> Result<Value> {
+        self.request("GetDrainRestartStatus", serde_json::json!({}))
+            .await
+    }
+
     /// Get model segments for a session (for rendering switch dividers).
     pub async fn get_model_segments(
         &mut self,
@@ -1311,6 +1543,31 @@ impl DaemonClient {
             .await?;
         let stats: rsi_common::types::UsageStats = serde_json::from_value(result)?;
         Ok(stats)
+    }
+
+    /// Get today's (UTC) efficiency metrics (operator-only
+    /// `GetEfficiencyMetrics`), day-grouped, for Settings -> Stats.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon RPC call fails or the response body
+    /// doesn't deserialize.
+    pub async fn get_efficiency_metrics_today(
+        &mut self,
+    ) -> Result<rsi_common::rpc::EfficiencyMetricsResponse> {
+        let from = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|start| start.and_utc())
+            .unwrap_or_else(chrono::Utc::now);
+        let params = rsi_common::rpc::GetEfficiencyMetricsParams {
+            from,
+            to: from + chrono::Duration::days(1),
+            group_by: rsi_common::rpc::EfficiencyMetricsGroupBy::Day,
+        };
+        let result = self
+            .request("GetEfficiencyMetrics", serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
     }
 
     pub async fn get_model_control_status(
@@ -1384,6 +1641,108 @@ impl DaemonClient {
             .request(
                 rsi_common::provider_credentials::METHOD_LIST,
                 serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ListMcpServers` — metadata-only server definitions and credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn list_mcp_servers(&mut self) -> Result<rsi_common::mcp::ListMcpServersResult> {
+        let result = self
+            .request(rsi_common::mcp::METHOD_LIST, serde_json::Value::Null)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `UpsertMcpServer` — create or replace one nonsecret server definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn upsert_mcp_server(
+        &mut self,
+        server: rsi_common::mcp::McpServerDefinition,
+    ) -> Result<()> {
+        self.request(
+            rsi_common::mcp::METHOD_UPSERT,
+            serde_json::to_value(rsi_common::mcp::UpsertMcpServerParams { server })?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `SetMcpServerEnabled` — explicitly enable or disable a definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn set_mcp_server_enabled(&mut self, id: String, enabled: bool) -> Result<()> {
+        self.request(
+            rsi_common::mcp::METHOD_SET_ENABLED,
+            serde_json::to_value(rsi_common::mcp::SetMcpServerEnabledParams { id, enabled })?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `SetMcpServerSecret` — store the server credential. The secret is moved
+    /// directly into the request and never copied by the TUI.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn set_mcp_server_secret(
+        &mut self,
+        id: String,
+        secret: crate::types::McpSecretString,
+    ) -> Result<rsi_common::mcp::McpCredentialMetadata> {
+        let secret = secret.into_exposed();
+        let result = self
+            .request(
+                rsi_common::mcp::METHOD_SET_SECRET,
+                serde_json::json!({ "id": id, "secret": secret }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `RotateMcpServerSecret` — replace the server credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn rotate_mcp_server_secret(
+        &mut self,
+        id: String,
+        secret: crate::types::McpSecretString,
+    ) -> Result<rsi_common::mcp::McpCredentialMetadata> {
+        let secret = secret.into_exposed();
+        let result = self
+            .request(
+                rsi_common::mcp::METHOD_ROTATE_SECRET,
+                serde_json::json!({ "id": id, "secret": secret }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ClearMcpServerSecret` — clear the credential and retain its tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn clear_mcp_server_secret(
+        &mut self,
+        id: String,
+    ) -> Result<rsi_common::mcp::McpCredentialMetadata> {
+        let result = self
+            .request(
+                rsi_common::mcp::METHOD_CLEAR_SECRET,
+                serde_json::to_value(rsi_common::mcp::McpServerIdParams { id })?,
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -2583,6 +2942,27 @@ impl DaemonClient {
         Ok(models)
     }
 
+    /// Discover model names and provider-supplied effort ladders/defaults.
+    pub async fn discover_models_with_capabilities(
+        &mut self,
+        provider: SessionProvider,
+    ) -> Result<rsi_common::model_utils::DiscoveredModels> {
+        let result = self
+            .request(
+                "DiscoverModels",
+                serde_json::json!({ "provider": provider, "include_capabilities": true }),
+            )
+            .await?;
+        // An older daemon ignores the opt-in field and returns legacy tuples.
+        if result.is_array() {
+            return Ok(rsi_common::model_utils::DiscoveredModels {
+                models: serde_json::from_value(result)?,
+                ..Default::default()
+            });
+        }
+        Ok(serde_json::from_value(result)?)
+    }
+
     /// Fetch current memory provider status from daemon.
     pub async fn memory_status(&mut self) -> Result<MemoryProviderStatus> {
         let result = self.request("MemoryStatus", Value::Null).await?;
@@ -2933,8 +3313,37 @@ impl DaemonClient {
 
     // --- Scheduled job methods ---
 
-    pub async fn list_scheduled_jobs(&mut self) -> Result<Vec<rsi_common::types::ScheduledJob>> {
-        let result = self.request("ListScheduledJobs", Value::Null).await?;
+    /// One page of scheduled jobs (Issue #954 B). `cursor` continues a previous
+    /// page; `include_history` also returns old disabled rows. A daemon that
+    /// predates paging answers with a bare array, which is one final page.
+    pub async fn list_scheduled_jobs_page(
+        &mut self,
+        include_history: bool,
+        cursor: Option<String>,
+    ) -> Result<rsi_common::rpc::ListScheduledJobsResult> {
+        let params = rsi_common::rpc::ListScheduledJobsParams {
+            include_history,
+            limit: None,
+            cursor,
+        };
+        let result = self
+            .request("ListScheduledJobs", serde_json::to_value(&params)?)
+            .await?;
+        if result.is_array() {
+            return Ok(rsi_common::rpc::ListScheduledJobsResult {
+                jobs: serde_json::from_value(result)?,
+                next_cursor: None,
+                include_history,
+            });
+        }
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Wakes the daemon is holding while their children run (#794 S3).
+    pub async fn list_scheduled_job_holds(
+        &mut self,
+    ) -> Result<Vec<rsi_common::child_autonomy::ScheduledJobHoldV1>> {
+        let result = self.request("ListScheduledJobHolds", Value::Null).await?;
         Ok(serde_json::from_value(result)?)
     }
 
@@ -3021,7 +3430,93 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_delivered_operator_message_is_not_pending() {
+        let view = |state: &str| super::OperatorMessageView {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            content: "hello".into(),
+            state: state.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            delivered_at: None,
+        };
+        for pending in ["queued", "dispatching", "effect_possible", "uncertain"] {
+            assert!(view(pending).is_pending(), "{pending}");
+        }
+        for settled in ["delivered", "withdrawn"] {
+            assert!(!view(settled).is_pending(), "{settled}");
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn discover_models_capabilities_decode_live_metadata_and_legacy_daemons() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        let socket_path = crate::test_support::short_socket_path("model-effort");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            for result in [
+                serde_json::json!({
+                    "models": [["gpt-6.1-sol", "GPT-6.1 Sol"]],
+                    "effort_capabilities": [{"model": "gpt-6.1-sol",
+                        "supported_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                        "default_effort": "low"}]
+                }),
+                serde_json::json!([["gpt-6.1-sol", "GPT-6.1 Sol"]]),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "DiscoverModels");
+                assert_eq!(request["params"]["include_capabilities"], true);
+                assert_eq!(request["params"]["provider"], "Codex");
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": request["id"], "result": result
+                            })
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut client = DaemonClient::new(socket_path.clone());
+        client.connect().await.unwrap();
+        let live = client
+            .discover_models_with_capabilities(SessionProvider::Codex)
+            .await
+            .unwrap();
+        assert_eq!(
+            live.models,
+            vec![("gpt-6.1-sol".into(), "GPT-6.1 Sol".into())]
+        );
+        assert_eq!(
+            live.effort_capabilities[0].supported_efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            live.effort_capabilities[0].default_effort.as_deref(),
+            Some("low")
+        );
+        let legacy = client
+            .discover_models_with_capabilities(SessionProvider::Codex)
+            .await
+            .unwrap();
+        assert_eq!(legacy.models, live.models);
+        assert_eq!(legacy.effort_capabilities, Vec::new());
+        server.await.unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+    }
 
     #[tokio::test]
     async fn operator_pause_rpcs_send_strength_and_decode_readback() {

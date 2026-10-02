@@ -43,6 +43,8 @@ fn review_request(key: &str, version: i64, sha: &str) -> AgentManagerUpdateReque
                 model: "claude-sonnet-5".into(),
                 effort: None,
             },
+            delta_of: None,
+            finding_keys: vec![],
         },
         "review",
     )
@@ -186,7 +188,12 @@ fn review_reservation_requires_a_known_different_recorded_family() {
         .store
         .manager_review_reserve_on(f.manager, &config, &review, &record, version, &observed)
         .unwrap_err();
-    assert!(error.to_string().contains("manager_review_family_conflict"));
+    // An unknown reviewer family is refused with its own typed code.
+    assert!(
+        error
+            .to_string()
+            .contains("manager_review_reviewer_family_unknown")
+    );
 
     if let ManagerUpdateV2::RequestReview { launch, .. } = &mut review.change {
         launch.model = "z-ai/glm-5.3-flashx".into();
@@ -282,6 +289,17 @@ fn request_at(
     sha: &str,
     model: &str,
 ) -> crate::error::Result<Uuid> {
+    request_at_delta(f, caller, key, sha, model, None)
+}
+
+fn request_at_delta(
+    f: &Fixture,
+    caller: Uuid,
+    key: &str,
+    sha: &str,
+    model: &str,
+    delta: Option<(Uuid, &str)>,
+) -> crate::error::Result<Uuid> {
     let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
     let (mut row, mut record) = f.store.manager_v2_work(&config, key).unwrap();
     if record.source_commit.as_deref() != Some(sha) {
@@ -299,8 +317,18 @@ fn request_at(
             .unwrap();
     }
     let mut review = review_request(key, row.row_version, sha);
-    if let ManagerUpdateV2::RequestReview { launch, .. } = &mut review.change {
+    if let ManagerUpdateV2::RequestReview {
+        launch,
+        delta_of,
+        finding_keys,
+        ..
+    } = &mut review.change
+    {
         launch.model = model.into();
+        if let Some((prior, finding)) = delta {
+            *delta_of = Some(prior);
+            *finding_keys = vec![finding.into()];
+        }
     }
     // Production reserves inside the ledger transaction; the deferred
     // supersession key is checked at its commit.
@@ -484,6 +512,79 @@ fn review_round_budget_counts_three_non_superseded_assignments_per_revision() {
     let error = refusal(request_at(&f, f.manager, "rounds", &"d".repeat(40), GLM));
     assert!(error.contains("manager_review_round_budget"), "{error}");
     assert_eq!(review_rows(&f, "rounds"), (3, 3));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn finding_delta_can_reuse_its_reviewer_family_but_requires_its_exact_finding() {
+    let f = fixture();
+    source_work(&f, "finding-delta", &"a".repeat(40));
+    let first = request_at(&f, f.manager, "finding-delta", &"a".repeat(40), SONNET).unwrap();
+    submit_review(&f, first);
+    let receipt_id: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT receipt_id FROM manager_review_receipts WHERE assignment_id=?1",
+            [first.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO manager_review_findings
+         (receipt_id,finding_key,severity,summary,location,blocking)
+         VALUES(?1,'custody-check','error','Recheck custody',NULL,1)",
+            [receipt_id],
+        )
+        .unwrap();
+    let changed = "b".repeat(40);
+    let unknown = refusal(request_at_delta(
+        &f,
+        f.manager,
+        "finding-delta",
+        &changed,
+        SONNET,
+        Some((first, "invented-key")),
+    ));
+    assert!(
+        unknown.contains("manager_review_invalid_delta"),
+        "{unknown}"
+    );
+    let second = request_at_delta(
+        &f,
+        f.manager,
+        "finding-delta",
+        &changed,
+        SONNET,
+        Some((first, "custody-check")),
+    )
+    .unwrap();
+    let author_family = refusal(request_at_delta(
+        &f,
+        f.manager,
+        "finding-delta",
+        &"c".repeat(40),
+        "gpt-6-sol",
+        Some((first, "custody-check")),
+    ));
+    assert!(
+        author_family.contains("manager_review_family_conflict"),
+        "{author_family}"
+    );
+    let request: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT request_json FROM manager_review_assignments WHERE assignment_id=?1",
+            [second.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    assert_eq!(request["delta_of"], first.to_string());
+    assert_eq!(request["finding_keys"], json!(["custody-check"]));
 }
 
 /// #599 A1 test 1: S2's same-SHA exemption is withdrawn; a re-request of a

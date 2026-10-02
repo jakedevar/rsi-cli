@@ -9,8 +9,18 @@
 //! This service only converts minutes-latency into seconds-latency by
 //! nudging the scheduler (`trigger_now` / `check_now`) when a relevant event
 //! flies by. It holds no correctness-bearing state: every nudge re-reads job
-//! rows, and firing is idempotent (delivered jobs are disabled; the
-//! scheduler's `OnTerminal` arm no-ops on disabled rows).
+//! rows.
+//!
+//! Firing is **not** fire-once idempotent. Delivery is at-least-once, with a
+//! post-effect persistence window: a `WatchFireOutcome::Delivered` outcome
+//! stamps `last_fired_at` but leaves the job ARMED (deferred by the redelivery
+//! backoff) pending provider-output confirmation, because disabling on
+//! dispatch destroyed notifications whose resumed turn died before emitting
+//! anything (Issue #12). Only `Confirmed` (the tip produced output), `Abandon`
+//! and `AbandonUnconsumed` retire a row; disabled rows are what the
+//! scheduler's `OnTerminal` arm skips. A nudge or restart that lands inside
+//! the window can therefore deliver the same watch again. See
+//! `scheduler::fire_job` and `arm_watch_jobs_pending_confirmation`.
 //!
 //! Sibling task beside `stall_detector` (F-012): the inverse concern
 //! (event-driven vs scan-cadence), no shared state, deliberately NOT an
@@ -110,13 +120,14 @@ async fn handle_event(event: &DaemonEvent, store: &Arc<Mutex<Store>>, scheduler:
         return;
     }
 
-    // Low row count; refreshed per event — the service holds no state.
+    // SQL-filtered to enabled on_terminal rows only; the per-event path
+    // never loads historical disabled jobs.
     let (jobs, ancestors) = {
         let guard = store.lock().await;
         if let Err(error) = guard.reconcile_harness_manager_watches() {
             tracing::error!(%error, "manager watch acceleration deferred to durable reconciliation");
         }
-        match guard.list_scheduled_jobs() {
+        match guard.list_enabled_terminal_watches() {
             Ok(jobs) => {
                 let mut ancestors = Vec::new();
                 let mut current = session_id;

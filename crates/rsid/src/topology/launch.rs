@@ -123,6 +123,7 @@ impl NodeLaunchBuilder<'_> {
         options: NodeLaunchOptions,
     ) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query,
             title: None,
             agent_role: None,
@@ -157,6 +158,7 @@ impl NodeLaunchBuilder<'_> {
             model_invocation_dedup_key: Some(options.key),
             model_invocation_request_fingerprint: Some(options.fingerprint),
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: ModelInvocationPurpose::WorkflowGraphNode,
             sandbox: Some(SandboxSpec {
                 kind: Some(SandboxKind::GitWorktree),

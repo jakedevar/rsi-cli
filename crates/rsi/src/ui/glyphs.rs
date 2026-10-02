@@ -74,6 +74,15 @@ pub const REQUIRED: &str = "?";
 pub const PREVIOUS: &str = "↳";
 pub const DESCENDANTS: &str = "Σ";
 
+// ---------------------------------------------------------------------------
+// Session kinds
+// ---------------------------------------------------------------------------
+
+/// Group container in the session list.
+pub const GROUP_CONTAINER: &str = "▣";
+/// Epic container in the session list.
+pub const EPIC_CONTAINER: &str = "▲";
+
 /// Height glyphs for a one-cell effort gauge, lowest to highest.
 const EFFORT_LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 

@@ -6,6 +6,9 @@ use super::{
     label_for,
 };
 use rsi_common::harness_manager_presets::*;
+use rsi_common::manager_daemon_settings::{
+    MANAGER_ADJUSTABLE_DAEMON_SETTINGS, ManagerDaemonSettingBoundV2,
+};
 use std::{
     collections::{BTreeSet, HashMap},
     path::PathBuf,
@@ -17,6 +20,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::{
     harness_manager::HarnessManagerConfigV1,
     harness_manager_v2::*,
+    model_control::ModelTier,
     types::{SessionKind, SessionProvider},
 };
 use uuid::Uuid;
@@ -32,7 +36,7 @@ pub const PROVIDERS: [SessionProvider; 9] = [
     SessionProvider::CodexAppServer,
     SessionProvider::Harness,
 ];
-const CAPABILITIES: [ManagerCapabilityV2; 12] = [
+const CAPABILITIES: [ManagerCapabilityV2; 15] = [
     ManagerCapabilityV2::WorkPlan,
     ManagerCapabilityV2::LeadControl,
     ManagerCapabilityV2::Topology,
@@ -45,6 +49,9 @@ const CAPABILITIES: [ManagerCapabilityV2; 12] = [
     ManagerCapabilityV2::IssueCoordinate,
     ManagerCapabilityV2::OperatorDelegation,
     ManagerCapabilityV2::Automation,
+    ManagerCapabilityV2::StorageControl,
+    ManagerCapabilityV2::DaemonSettings,
+    ManagerCapabilityV2::Deploy,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,7 @@ pub enum Field {
     Containers,
     Sessions,
     Concurrency,
+    Tier2Reviewer,
     ProviderLimit(usize),
     LaunchProvider(usize),
     LaunchModel(usize),
@@ -77,6 +85,8 @@ pub enum Field {
     RetryDelay,
     Deadline,
     Spend,
+    /// #1046: operator min/max bound of one allowlisted daemon setting.
+    SettingBound(usize),
 }
 pub struct PolicyState {
     pub config: HarnessManagerConfigV1,
@@ -126,6 +136,7 @@ pub enum Section {
     Authority,
     Scope,
     Recovery,
+    DaemonSettings,
     Preview,
 }
 impl Section {
@@ -137,6 +148,7 @@ impl Section {
             Self::Authority => "Authority · mode and grants",
             Self::Scope => "Scope",
             Self::Recovery => "Recovery",
+            Self::DaemonSettings => "Daemon settings · manager bounds",
             Self::Launches => "Launches",
             Self::Preview => "Effective preview · read-only",
         }
@@ -197,6 +209,7 @@ fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
         Field::Sessions => p.max_created_sessions.to_string(),
         Field::Containers => p.max_created_containers.to_string(),
         Field::Concurrency => p.max_active_sessions.to_string(),
+        Field::Tier2Reviewer => format!("{:?}", p.minimum_tier2_reviewer_tier),
         Field::ProviderLimit(i) => p
             .provider_limits
             .iter()
@@ -205,6 +218,7 @@ fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
         Field::Spend => p
             .max_spend_usd
             .map_or_else(|| "uncapped".into(), |v| v.to_string()),
+        Field::SettingBound(i) => setting_bound_text(p, i),
         Field::Mode => format!("{:?}", p.mode),
         Field::Paused => p.paused.to_string(),
         Field::Capability(i) => p.capabilities.contains(&CAPABILITIES[i]).to_string(),
@@ -216,6 +230,19 @@ fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
         Field::Deadline => p.request_timeout_seconds.to_string(),
         _ => return None,
     })
+}
+
+/// Display and edit text of one allowlisted setting's bound: `min-max`, or
+/// `not adjustable` when the operator has not bounded the key (the default).
+fn setting_bound_text(p: &ManagerPolicyV2, i: usize) -> String {
+    let key = MANAGER_ADJUSTABLE_DAEMON_SETTINGS[i].key;
+    p.daemon_setting_bounds
+        .iter()
+        .find(|b| b.key == key)
+        .map_or_else(
+            || "not adjustable".into(),
+            |b| format!("{}-{}", b.min, b.max),
+        )
 }
 
 const fn capability_description(capability: ManagerCapabilityV2) -> &'static str {
@@ -242,6 +269,15 @@ const fn capability_description(capability: ManagerCapabilityV2) -> &'static str
         ManagerCapabilityV2::Automation => {
             "Author, run, interrupt and resolve topologies on scoped Epics"
         }
+        ManagerCapabilityV2::StorageControl => {
+            "Read sandbox storage status and run the build-cache reclaim under the configured limits"
+        }
+        ManagerCapabilityV2::DaemonSettings => {
+            "Change the allowlisted daemon settings inside the bounds set under Daemon settings"
+        }
+        ManagerCapabilityV2::Deploy => {
+            "Ask the daemon to stage built binaries and restart itself at a quiet point (AgentRequestDeploy)"
+        }
     }
 }
 
@@ -250,6 +286,8 @@ const fn capability_description(capability: ManagerCapabilityV2) -> &'static str
 fn capability_label(capability: ManagerCapabilityV2) -> String {
     match capability {
         ManagerCapabilityV2::OperatorDelegation => "Operator delegation".into(),
+        ManagerCapabilityV2::StorageControl => "Storage control".into(),
+        ManagerCapabilityV2::DaemonSettings => "Daemon settings".into(),
         other => format!("{other:?}"),
     }
 }
@@ -269,6 +307,7 @@ impl PolicyState {
                     | Field::Epic(_)
                     | Field::Group(_)
                     | Field::CreateGroups
+                    | Field::Tier2Reviewer
                     | Field::LaunchProvider(_) => RowKind::Toggle,
                     Field::Preset(_)
                     | Field::Suggestions
@@ -353,6 +392,13 @@ impl PolicyState {
             "Active session limit",
             d.max_active_sessions.to_string(),
             "Sessions the manager's cohort may run at once",
+        );
+        push(
+            section,
+            Field::Tier2Reviewer,
+            "Tier-2 minimum reviewer",
+            format!("{:?}", d.minimum_tier2_reviewer_tier),
+            "Minimum model tier for authority, custody and migration work; Enter cycles Local, Standard, Premium",
         );
         push(
             section,
@@ -552,6 +598,20 @@ impl PolicyState {
             "How long a manager request may stay unanswered before it is overdue",
         );
 
+        section = Section::DaemonSettings;
+        for (i, setting) in MANAGER_ADJUSTABLE_DAEMON_SETTINGS.iter().enumerate() {
+            push(
+                section,
+                Field::SettingBound(i),
+                &format!("Manager may set {}", setting.label),
+                setting_bound_text(d, i),
+                &format!(
+                    "Enter MIN-MAX ({}-{} allowed) to let a manager with Grant Daemon settings change this setting inside it; blank means not adjustable",
+                    setting.hard_min, setting.hard_max
+                ),
+            );
+        }
+
         section = Section::Preview;
         push(
             section,
@@ -592,8 +652,10 @@ impl PolicyState {
             Field::Sessions => d.max_created_sessions != o.max_created_sessions,
             Field::Containers => d.max_created_containers != o.max_created_containers,
             Field::Concurrency => d.max_active_sessions != o.max_active_sessions,
+            Field::Tier2Reviewer => d.minimum_tier2_reviewer_tier != o.minimum_tier2_reviewer_tier,
             Field::ProviderLimit(i) => limit(d, i) != limit(o, i),
             Field::Spend => d.max_spend_usd != o.max_spend_usd,
+            Field::SettingBound(i) => setting_bound_text(d, i) != setting_bound_text(o, i),
             Field::Mode => d.mode != o.mode,
             Field::Paused => d.paused != o.paused,
             Field::Capability(i) => {
@@ -636,6 +698,15 @@ impl PolicyState {
             if !(min..=max).contains(&value) {
                 return Some(format!("must be {min}–{max}"));
             }
+        }
+        if let Field::SettingBound(i) = field {
+            let key = MANAGER_ADJUSTABLE_DAEMON_SETTINGS[i].key;
+            return d
+                .daemon_setting_bounds
+                .iter()
+                .find(|b| b.key == key)
+                .and_then(|b| b.validate().err())
+                .map(|_| "bounds must be min-max inside the allowed range".into());
         }
         if let Field::ProviderLimit(i) = field {
             // Entries past the daemon's collection bound are each invalid.
@@ -740,6 +811,14 @@ impl PolicyState {
             Field::Epic(id) => toggle(&mut self.draft.paused_epic_ids, id),
             Field::Group(id) => toggle(&mut self.draft.group_ids, id),
             Field::CreateGroups => self.draft.allow_create_groups = !self.draft.allow_create_groups,
+            Field::Tier2Reviewer => {
+                self.draft.minimum_tier2_reviewer_tier =
+                    match self.draft.minimum_tier2_reviewer_tier {
+                        ModelTier::Local => ModelTier::Standard,
+                        ModelTier::Standard => ModelTier::Premium,
+                        ModelTier::Premium => ModelTier::Local,
+                    };
+            }
             Field::LaunchProvider(i) => {
                 let pos = PROVIDERS
                     .iter()
@@ -777,7 +856,15 @@ impl PolicyState {
                     .unwrap_or_default();
                 self.edit = Some((
                     field,
-                    if ["inherit", "default", "uncapped", "Enter UUID"].contains(&value.as_str()) {
+                    if [
+                        "inherit",
+                        "default",
+                        "uncapped",
+                        "Enter UUID",
+                        "not adjustable",
+                    ]
+                    .contains(&value.as_str())
+                    {
                         String::new()
                     } else {
                         value
@@ -852,6 +939,27 @@ impl PolicyState {
                     });
                 }
             }
+            Field::SettingBound(i) => {
+                let setting = &MANAGER_ADJUSTABLE_DAEMON_SETTINGS[i];
+                self.draft
+                    .daemon_setting_bounds
+                    .retain(|b| b.key != setting.key);
+                if !value.is_empty() {
+                    let bound = parse_setting_bound(setting.key, value).ok_or_else(|| {
+                        format!(
+                            "Enter MIN-MAX inside {}-{}; blank means not adjustable.",
+                            setting.hard_min, setting.hard_max
+                        )
+                    })?;
+                    bound.validate().map_err(|_| {
+                        format!(
+                            "Bounds must sit inside {}-{} with MIN at most MAX.",
+                            setting.hard_min, setting.hard_max
+                        )
+                    })?;
+                    self.draft.daemon_setting_bounds.push(bound);
+                }
+            }
             Field::LaunchModel(i) => {
                 if value.is_empty() {
                     return Err("Enter an exact model id.".into());
@@ -886,6 +994,16 @@ impl PolicyState {
         Ok(())
     }
 }
+/// Parse `MIN-MAX` (also `MIN..MAX` or `MIN–MAX`) into a bound for `key`.
+fn parse_setting_bound(key: &str, text: &str) -> Option<ManagerDaemonSettingBoundV2> {
+    let normalized = text.replace("..", "-").replace('–', "-");
+    let (min, max) = normalized.split_once('-')?;
+    Some(ManagerDaemonSettingBoundV2 {
+        key: key.into(),
+        min: min.trim().parse().ok()?,
+        max: max.trim().parse().ok()?,
+    })
+}
 impl Field {
     fn policy_field(self) -> Option<ManagerPolicyField> {
         Some(match self {
@@ -898,6 +1016,7 @@ impl Field {
             Self::Containers => ManagerPolicyField::CreatedContainers,
             Self::Sessions => ManagerPolicyField::CreatedSessions,
             Self::Concurrency => ManagerPolicyField::ActiveSessions,
+            Self::Tier2Reviewer => ManagerPolicyField::Tier2Reviewer,
             Self::ProviderLimit(_) => ManagerPolicyField::ProviderLimits,
             Self::LaunchProvider(_)
             | Self::LaunchModel(_)
@@ -910,6 +1029,7 @@ impl Field {
             Self::RetryDelay => ManagerPolicyField::RetryDelaySeconds,
             Self::Deadline => ManagerPolicyField::RequestTimeoutSeconds,
             Self::Spend => ManagerPolicyField::MaxSpendUsd,
+            Self::SettingBound(_) => ManagerPolicyField::DaemonSettingBounds,
             _ => return None,
         })
     }

@@ -94,6 +94,7 @@ fn add_test_sessions(app: &mut App, count: usize) {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -378,6 +379,7 @@ fn add_snapshot_sessions(app: &mut App) {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: Some(10_000 + u64::from(idx) * 1_000),
+            total_prompt_tokens: None,
             total_output_tokens: Some(2_000 + u64::from(idx) * 100),
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -669,6 +671,7 @@ fn test_session_state_creation() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -920,72 +923,95 @@ fn snap_session_browser_240x70() {
     insta::assert_snapshot!("snap_session_browser_240x70", text);
 }
 
+/// The settings menu at 120x40: a category rail with every category's
+/// glyph, the selected category's sections as tabs, switch widgets, and key
+/// prompts naming exactly what Enter does on the selected row.
 #[test]
-fn snap_settings_context_workbench_120x40() {
+fn settings_menu_120x40_shows_categories_tabs_and_switches() {
     let mut app = test_app();
     focus_settings(&mut app, SettingsSection::InputPrompts, 0);
     let buffer = support::render_app(&mut app, 120, 40);
     let text = support::buffer_to_snapshot(&buffer);
 
     for label in [
-        "APPEARANCE",
-        "WORKSPACE",
-        "MODELS",
-        "SAFETY & SPEND",
-        "AGENT AUTOMATION",
-        "PROVIDERS & SANDBOXES",
-        "INTEGRATIONS",
-        "ITEMS FOCUS",
-        "Submit on Enter",
-        "[ON]",
-        "Enter toggle → OFF",
+        "≡ Settings",
+        "◐ Appearance",
+        "▤ Workspace",
+        "✦ Models",
+        "$ Safety & Spend",
+        "↺ Agent Automation",
+        "⊡ Providers & Sandboxes",
+        "⇄ Integrations",
+        "Session List",
+        "Transcript Defaults",
+        "Input & Prompts",
+        "▌ Submit on Enter",
+        "━━● ON",
+        "○── OFF",
+        "↵ toggle → OFF",
+        "Tab section",
     ] {
-        assert!(text.contains(label), "missing Settings label {label}");
+        assert!(
+            text.contains(label),
+            "missing Settings label {label}:\n{text}"
+        );
     }
-    assert!(!text.contains("CONTEXT\n"));
-    insta::assert_snapshot!("snap_settings_context_workbench_120x40", text);
 }
 
+/// From 150 columns the info card sits beside the list and explains the
+/// selected setting: what it does, its caution, when it applies, where it
+/// is stored.
 #[test]
-fn snap_settings_context_workbench_200x58() {
+fn settings_menu_200x58_explains_the_selected_setting_beside_the_list() {
     let mut app = test_app();
     focus_settings(&mut app, SettingsSection::InputPrompts, 0);
     let buffer = support::render_app(&mut app, 200, 58);
     let text = support::buffer_to_snapshot(&buffer);
 
     for label in [
-        "CONTEXT WORKBENCH",
-        "SECTIONS",
-        "ITEMS FOCUS",
-        "CONTEXT",
-        "ENTER RESULT",
-        "Persistence",
-        "state.json",
+        "Submit on Enter",
+        "Plain Enter submits multiline text",
+        "Toggle OFF when the terminal cannot deliver",
+        "✓ applies now",
+        "⌂ state.json",
+        "Owner",
+        "TUI (state.json)",
     ] {
-        assert!(text.contains(label), "missing Settings label {label}");
+        assert!(
+            text.contains(label),
+            "missing Settings label {label}:\n{text}"
+        );
     }
-    assert!(!text.contains("LIVE IMPACT"));
-    insta::assert_snapshot!("snap_settings_context_workbench_200x58", text);
 }
 
+/// A choice row lists every option in the info card and marks the current
+/// one, and its value renders as a `◂ value ▸` selector.
 #[test]
-fn snap_settings_context_workbench_240x70() {
+fn settings_menu_240x70_lists_choice_options() {
     let mut app = test_app();
-    focus_settings(&mut app, SettingsSection::InputPrompts, 0);
+    focus_settings(&mut app, SettingsSection::Screen, 4);
     let buffer = support::render_app(&mut app, 240, 70);
     let text = support::buffer_to_snapshot(&buffer);
 
     for label in [
-        "CONTEXT",
-        "LIVE IMPACT",
-        "INPUT CONTRACT",
-        "AFFECTED SURFACES",
-        "DEPENDENCY",
-        "PROVENANCE",
+        "OPTIONS",
+        "● Semantic",
+        "○ Rainbow Starlight",
+        "▌ Activity indicator",
     ] {
-        assert!(text.contains(label), "missing Settings label {label}");
+        assert!(
+            text.contains(label),
+            "missing Settings label {label}:\n{text}"
+        );
     }
-    insta::assert_snapshot!("snap_settings_context_workbench_240x70", text);
+    let row = text
+        .lines()
+        .find(|line| line.contains("▌ Activity indicator"))
+        .expect("selected Activity indicator row");
+    assert!(
+        row.contains('◂') && row.contains('▸') && row.contains("Semantic"),
+        "{row}"
+    );
 }
 
 #[test]
@@ -1001,22 +1027,25 @@ fn settings_dense_daemon_category_keeps_selected_row_visible() {
         .expect("stall classifier confidence floor setting");
     let total = rows.len();
     let selected_position = selected_index + 1;
-    let selected_label = app.daemon_features[rows[selected_index].1].label.clone();
-    let first_label = app.daemon_features[rows[0].1].label.clone();
+    let selected_label = rows[selected_index].0.label;
     focus_settings(&mut app, SettingsSection::StallDetection, selected_index);
-    // Epic M design D.1 shrank each section to a handful of rows, so a
-    // shorter viewport (rather than the 24-row one this test used against
-    // the old 33-row DaemonFeatures bucket) is needed to force scrolling.
+    // A short viewport forces the list to scroll to the selected row.
     let buffer = support::render_app(&mut app, 120, 12);
     let text = support::buffer_to_snapshot(&buffer);
 
-    assert!(text.contains(&format!("{selected_position}/{total}")));
-    assert!(text.contains(&selected_label));
-    assert!(!text.contains(&first_label));
+    assert!(
+        text.contains(&format!("{selected_position}/{total}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("▌ {selected_label}")), "{text}");
+    assert!(
+        text.contains('┃'),
+        "scrollbar thumb marks the scrolled list:\n{text}"
+    );
 }
 
 #[test]
-fn settings_settlement_row_renders_as_an_action_without_column_clipping() {
+fn settings_settlement_row_renders_as_an_action_button() {
     let mut app = test_app();
     let rows =
         rsi::settings_keys::daemon_feature_rows_for_section(&app, SettingsSection::SandboxStorage);
@@ -1030,10 +1059,8 @@ fn settings_settlement_row_renders_as_an_action_without_column_clipping() {
     let buffer = support::render_app(&mut app, 240, 70);
     let text = support::buffer_to_snapshot(&buffer);
 
-    assert!(text.contains("Press Enter"));
-    assert!(text.contains("Enter open audit"));
-    assert!(!text.contains("Open destructive a"));
-    assert!(!text.contains("Read-only value"));
+    assert!(text.contains(" Open audit "), "{text}");
+    assert!(text.contains("↵ open the settlement audit"), "{text}");
 }
 
 #[test]
@@ -1047,11 +1074,17 @@ fn settings_codex_sandbox_value_fits_without_clipping() {
         .iter()
         .position(|(spec, _)| spec.id == rsi::settings_registry::SettingId::CodexSandbox)
         .expect("Codex sandbox setting");
+    let label = rows[selected_index].0.label;
     focus_settings(&mut app, SettingsSection::ProviderIsolation, selected_index);
     let buffer = support::render_app(&mut app, 240, 70);
     let text = support::buffer_to_snapshot(&buffer);
 
-    assert!(text.contains("‹ danger-full-access ›"));
+    let row = text
+        .lines()
+        .find(|line| line.contains(&format!("▌ {label}")))
+        .expect("selected Codex sandbox row");
+    assert!(row.contains("danger-full-access"), "{row}");
+    assert!(row.contains('◂') && row.contains('▸'), "{row}");
 }
 
 #[test]
@@ -1071,9 +1104,17 @@ fn settings_model_dropdown_keeps_fixed_row_anchor() {
     let buffer = support::render_app(&mut app, 200, 58);
     let text = support::buffer_to_snapshot(&buffer);
 
-    assert!(text.contains("Model [Claude"));
+    assert!(text.contains("Model  ") && text.contains(" Claude "));
     assert!(text.contains("Sonnet 4"));
-    assert_eq!(buffer[(38, 12)].symbol(), "╭");
+    let lines: Vec<&str> = text.lines().collect();
+    let row = lines
+        .iter()
+        .position(|line| line.contains("▌ Memory model"))
+        .expect("active Memory model row");
+    assert!(
+        lines.get(row + 1).is_some_and(|line| line.contains('╭')),
+        "the picker opens directly below the active row:\n{text}"
+    );
 }
 
 #[test]
@@ -1353,7 +1394,7 @@ fn wide_inspector_keeps_active_and_capacity_labels_distinct() {
 
     let text = support::buffer_to_snapshot(&support::render_app(&mut app, 200, 58));
     for detail in [
-        "◔ ▰▱▱▱▱▱▱▱▱▱ 9%  34k / 258k runtime",
+        "◔ ▮▯▯▯▯▯▯▯▯▯ 9%  34k / 258k runtime",
         "provider: default 272k · max 872k · effective factor 95%",
         "API: context max 1.05m · output max 128k",
         "compaction: limit 230k",
@@ -2411,6 +2452,7 @@ fn test_markdown_rendering_produces_styled_spans() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,

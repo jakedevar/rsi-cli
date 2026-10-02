@@ -1,0 +1,75 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/rsi-gate-bootstrap.log) 2>&1
+
+# Lifetime backstop first, before any download can fail: the instance's
+# shutdown behavior is terminate and its root volume is deleted on
+# termination, so this removes all compute and storage even if the operator
+# side never runs terraform destroy.
+shutdown -h +${max_lifetime_minutes} 'rsi remote gate lifetime reached'
+
+# AL2023 mounts /tmp as tmpfs, and custody tests refuse tmpfs sandbox roots
+# (Issue #933). The remote executor sets no TMPDIR, so keep /tmp on the
+# encrypted root disk like a normal build host.
+if [ "$(findmnt -n -o FSTYPE /tmp || true)" = tmpfs ]; then
+  systemctl mask --now tmp.mount || umount -l /tmp
+fi
+chmod 1777 /tmp
+
+# The lander's remote executor needs git, python3.11 at /usr/bin/python3.11,
+# passwordless sudo for the SSH user (ec2-user on AL2023) and the rsid build
+# dependencies. It uploads the exact commits as a bundle; no Git credential
+# or network clone is needed here.
+dnf install -y git tar gzip python3.11 sqlite gcc gcc-c++ make cmake \
+  pkgconf-pkg-config openssl-devel fontconfig-devel
+
+RUN_AS='${run_as}'
+id "$RUN_AS" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RUN_AS"
+# Install the components rust-toolchain.toml requires now. Otherwise the
+# first cargo call in a worktree makes rustup download them and print info
+# lines to stderr, which rolling-shard-fingerprint.py hashes: the remote probe
+# and the runner then disagree on the same host (remote_fingerprint_mismatch).
+runuser -u "$RUN_AS" -- bash -c \
+  'curl -fsSL --proto =https --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${rust_toolchain} --component rustfmt --component clippy'
+runuser -u "$RUN_AS" -- bash -c \
+  'curl -fsSL --proto =https --tlsv1.2 https://get.nexte.st/${nextest_version}/linux | tar -xzf - -C "$HOME/.cargo/bin"'
+runuser -u "$RUN_AS" -- bash -c '"$HOME/.cargo/bin/rustc" --version && "$HOME/.cargo/bin/cargo" nextest --version'
+
+%{ if sccache_bucket != "" ~}
+# Warm shared compile cache (Issue #1010). sccache reads and writes only the
+# ${sccache_prefix}/ prefix of the private S3 bucket, with credentials from the
+# instance role (IMDSv2); nothing secret is written to disk. Cargo picks the
+# wrapper up from the run-as user's config, so the lander's remote shards
+# (sudo -H -u, cleared environment) and the cloud sweep both use it. Incremental
+# compilation is off because sccache cannot cache it.
+SCCACHE_TARBALL="sccache-v${sccache_version}-x86_64-unknown-linux-musl"
+curl -fsSL --proto =https --tlsv1.2 -o "/tmp/$SCCACHE_TARBALL.tar.gz" \
+  "https://github.com/mozilla/sccache/releases/download/v${sccache_version}/$SCCACHE_TARBALL.tar.gz"
+echo "${sccache_sha256}  /tmp/$SCCACHE_TARBALL.tar.gz" | sha256sum -c -
+tar -xzf "/tmp/$SCCACHE_TARBALL.tar.gz" -C /tmp
+install -m 755 "/tmp/$SCCACHE_TARBALL/sccache" /usr/local/bin/sccache
+rm -rf "/tmp/$SCCACHE_TARBALL" "/tmp/$SCCACHE_TARBALL.tar.gz"
+RUN_AS_HOME=$(getent passwd "$RUN_AS" | cut -d: -f6)
+install -d -o "$RUN_AS" -g "$RUN_AS" "$RUN_AS_HOME/.config/sccache" "$RUN_AS_HOME/.cargo"
+cat >"$RUN_AS_HOME/.config/sccache/config" <<SCCACHE_CONFIG
+[cache.s3]
+bucket = "${sccache_bucket}"
+region = "us-west-1"
+key_prefix = "${sccache_prefix}"
+no_credentials = false
+SCCACHE_CONFIG
+cat >>"$RUN_AS_HOME/.cargo/config.toml" <<CARGO_CONFIG
+[build]
+rustc-wrapper = "/usr/local/bin/sccache"
+incremental = false
+CARGO_CONFIG
+chown "$RUN_AS:$RUN_AS" "$RUN_AS_HOME/.config/sccache/config" "$RUN_AS_HOME/.cargo/config.toml"
+# One long-lived server so its counters cover the whole run (the default
+# 10-minute idle exit would reset them); the wrapper script reads them at the end.
+runuser -u "$RUN_AS" -- env HOME="$RUN_AS_HOME" SCCACHE_IDLE_TIMEOUT=0 /usr/local/bin/sccache --start-server
+runuser -u "$RUN_AS" -- env HOME="$RUN_AS_HOME" /usr/local/bin/sccache --zero-stats
+runuser -u "$RUN_AS" -- env HOME="$RUN_AS_HOME" /usr/local/bin/sccache --show-stats | head -n 30
+%{ endif ~}
+
+# scripts/cloud-gate.sh waits for this marker before starting the lander.
+touch /var/lib/rsi-gate-ready

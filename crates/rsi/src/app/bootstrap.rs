@@ -126,12 +126,14 @@ pub(crate) enum BootstrapEvent {
         generation: u64,
         usage: Result<UsageStats, String>,
         model_control: Result<ModelControlStatusReport, String>,
+        efficiency: Result<rsi_common::rpc::EfficiencyMetricsResponse, String>,
     },
     UsageRefresh {
         attempt: u64,
         generation: u64,
         usage: Result<UsageStats, String>,
         model_control: Result<ModelControlStatusReport, String>,
+        efficiency: Result<rsi_common::rpc::EfficiencyMetricsResponse, String>,
     },
     GraphExecutions {
         attempt: u64,
@@ -618,12 +620,17 @@ async fn run_snapshot(
             .get_model_control_status(Some(12))
             .await
             .map_err(|error| error.to_string());
+        let efficiency = client
+            .get_efficiency_metrics_today()
+            .await
+            .map_err(|error| error.to_string());
         if tx
             .send(BootstrapEvent::SnapshotUsageStatus {
                 attempt,
                 generation,
                 usage,
                 model_control,
+                efficiency,
             })
             .await
             .is_err()
@@ -742,13 +749,18 @@ async fn run_usage_refresh(
                 .get_model_control_status(Some(12))
                 .await
                 .map_err(|error| error.to_string()),
+            client
+                .get_efficiency_metrics_today()
+                .await
+                .map_err(|error| error.to_string()),
         ))
     })
     .await;
-    let (usage, model_control) = match result {
+    let (usage, model_control, efficiency) = match result {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => (Err(error.clone()), Err(error)),
+        Ok(Err(error)) => (Err(error.clone()), Err(error.clone()), Err(error)),
         Err(_) => (
+            Err("usage refresh timed out".to_string()),
             Err("usage refresh timed out".to_string()),
             Err("usage refresh timed out".to_string()),
         ),
@@ -759,6 +771,7 @@ async fn run_usage_refresh(
             generation,
             usage,
             model_control,
+            efficiency,
         })
         .await;
 }
@@ -847,6 +860,7 @@ impl App {
             handle.abort();
         }
         self.worker_slice_memory_pressure = None;
+        self.daemon_resources = None;
         self.worker_pressure_next_refresh_at = Instant::now();
         if let Some(handle) = self.conversation_poll_handle.take() {
             handle.abort();
@@ -1246,8 +1260,18 @@ impl App {
                             Ok(status) => {
                                 self.worker_slice_memory_pressure =
                                     status.worker_slice_memory_pressure.clone();
+                                // Memory and queues show at once; the first
+                                // background read (soon) adds rsid's /proc
+                                // counters so CPU can follow a few seconds later.
+                                self.daemon_resources =
+                                    Some(crate::daemon_resources::DaemonResourceView::next(
+                                        None,
+                                        crate::daemon_resources::DaemonResourceSample::from_health(
+                                            &status, None,
+                                        ),
+                                    ));
                                 self.worker_pressure_next_refresh_at =
-                                    Instant::now() + Duration::from_secs(15);
+                                    Instant::now() + Duration::from_secs(3);
                                 if let Some(restart) = &status.latest_daemon_restart {
                                     self.push_notification(
                                         crate::types::NotificationKind::Info,
@@ -1412,6 +1436,7 @@ impl App {
                 generation,
                 usage,
                 model_control,
+                efficiency,
             } => {
                 let current_generation = self.bootstrap.finish_usage_refresh(generation);
                 if attempt != self.bootstrap.attempt() || !current_generation {
@@ -1420,6 +1445,12 @@ impl App {
                 match usage {
                     Ok(stats) => self.cached_usage_stats = Some(stats),
                     Err(error) => tracing::warn!(attempt, %error, "Usage stats refresh failed"),
+                }
+                match efficiency {
+                    Ok(metrics) => self.cached_efficiency_metrics = Some(metrics),
+                    Err(error) => {
+                        tracing::warn!(attempt, %error, "Efficiency metrics refresh failed")
+                    }
                 }
                 match model_control {
                     Ok(status) => {
@@ -1441,6 +1472,7 @@ impl App {
                 generation,
                 usage,
                 model_control,
+                efficiency,
             } => {
                 // A stale completion must not clear a newer task's handle or
                 // overwrite the newer view of usage/configuration state.
@@ -1451,6 +1483,12 @@ impl App {
                 match usage {
                     Ok(stats) => self.cached_usage_stats = Some(stats),
                     Err(error) => tracing::warn!(attempt, %error, "Usage stats refresh failed"),
+                }
+                match efficiency {
+                    Ok(metrics) => self.cached_efficiency_metrics = Some(metrics),
+                    Err(error) => {
+                        tracing::warn!(attempt, %error, "Efficiency metrics refresh failed")
+                    }
                 }
                 match model_control {
                     Ok(status) => {

@@ -532,10 +532,19 @@ pub async fn run_event_loop(
                     }
                     // Resize embedded terminal to match overlay dimensions before draw
                     if matches!(&app.overlay, crate::types::OverlayState::Terminal) {
+                        let (w, h) = app.last_terminal_size;
+                        let geom = app
+                            .modal_geometries
+                            .get("Terminal")
+                            .cloned()
+                            .unwrap_or_default();
+                        let popup = crate::ui::overlay::terminal::popup_rect(
+                            ratatui::layout::Rect::new(0, 0, w, h),
+                            &geom,
+                        );
                         if let Some(ref mut term) = app.terminal {
-                            let (w, h) = app.last_terminal_size;
-                            let inner_w = (w * 90 / 100).max(20).saturating_sub(2);
-                            let inner_h = (h * 80 / 100).max(5).saturating_sub(2);
+                            let inner_w = popup.width.saturating_sub(2);
+                            let inner_h = popup.height.saturating_sub(2);
                             term.resize(inner_h, inner_w);
                         }
                     }
@@ -824,17 +833,24 @@ pub async fn run_event_loop(
                 app.needs_model_refresh = false;
                 let provider = app.model_refresh_provider.take().unwrap_or(app.selected_provider);
                 let socket_path = app.client.socket_path().to_path_buf();
-                let fallback = crate::app::models_for_provider(provider);
+                let fallback = rsi_common::model_utils::DiscoveredModels {
+                    models: crate::app::models_for_provider(provider),
+                    ..Default::default()
+                };
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 app.model_discovery_rx = Some(rx);
                 tokio::spawn(async move {
                     let mut client = crate::client::DaemonClient::new(socket_path);
                     let models = if client.connect().await.is_ok() {
-                        client.discover_models(provider).await.unwrap_or(fallback)
+                        client.discover_models_with_capabilities(provider).await.unwrap_or(fallback)
                     } else {
                         fallback
                     };
-                    let _ = tx.send(crate::app::ModelDiscoveryResult { provider, models });
+                    let _ = tx.send(crate::app::ModelDiscoveryResult {
+                        provider,
+                        models: models.models,
+                        effort_capabilities: models.effort_capabilities,
+                    });
                 });
             }
 
@@ -846,7 +862,8 @@ pub async fn run_event_loop(
                 }
             } => {
                 app.model_discovery_rx = None;
-                if let Ok(crate::app::ModelDiscoveryResult { provider, models }) = result {
+                if let Ok(crate::app::ModelDiscoveryResult { provider, models, effort_capabilities }) = result {
+                    app.model_effort_capabilities.insert(provider, effort_capabilities);
                     if !models.is_empty() {
                         if provider == app.selected_provider {
                             app.available_models = models.clone();
@@ -2281,6 +2298,42 @@ mod tests {
     use ratatui::layout::Rect;
     use std::path::PathBuf;
 
+    fn detail_app_with_different_selected_row() -> (crate::app::App, uuid::Uuid, uuid::Uuid) {
+        use rsi_common::types::SessionStatus;
+
+        let mut app = crate::app::app_test_helpers::with_session_list(2);
+        let displayed_id = app.filtered_session_order[0];
+        let selected_id = app.filtered_session_order[1];
+        app.sessions.get_mut(&displayed_id).unwrap().session.status = SessionStatus::Completed;
+        app.sessions.get_mut(&selected_id).unwrap().session.status = SessionStatus::Running;
+
+        let pane_id = app.active_tab().focused_pane;
+        let list_state = app
+            .active_tab()
+            .layout
+            .find_pane(pane_id)
+            .expect("initial session list")
+            .clone();
+        app.active_tab_mut().session_list_state = list_state;
+        *app.active_tab_mut()
+            .layout
+            .find_pane_mut(pane_id)
+            .expect("focused session list") = Pane::SessionDetail {
+            session_id: displayed_id,
+        };
+        if let Pane::SessionList {
+            selected_index,
+            selected_session,
+            ..
+        } = &mut app.active_tab_mut().session_list_state
+        {
+            *selected_index = 1;
+            *selected_session = Some(selected_id);
+        }
+
+        (app, displayed_id, selected_id)
+    }
+
     #[tokio::test]
     async fn colon_and_space_semicolon_open_the_same_palette_and_reset_command_mode() {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -2556,6 +2609,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_detail_lifecycle_key_routing_uses_selected_list_row() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let (mut app, displayed_id, selected_id) = detail_app_with_different_selected_row();
+        let socket_path = crate::test_support::short_socket_path("detail-lifecycle");
+        let listener = UnixListener::bind(&socket_path).expect("bind detail lifecycle daemon");
+        app.client = crate::client::DaemonClient::new(socket_path.clone());
+        app.client
+            .connect()
+            .await
+            .expect("connect detail lifecycle daemon");
+        app.poll.connected = true;
+
+        let rpc = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept lifecycle connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read lifecycle request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("decode lifecycle request");
+                let result = if request["method"] == "QueueOperatorMessage" {
+                    serde_json::json!({
+                        "id": uuid::Uuid::new_v4(),
+                        "session_id": request["params"]["session_id"].clone(),
+                        "content": request["params"]["content"].clone(),
+                        "state": "queued",
+                        "created_at": "2026-09-30T00:00:00.000000000Z",
+                        "updated_at": "2026-09-30T00:00:00.000000000Z",
+                        "delivered_at": null,
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"].clone(),
+                                "result": result,
+                            })
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("ack lifecycle request");
+                requests.push(request);
+            }
+            requests
+        });
+
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .await;
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .await;
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .await;
+        let requests = rpc.await.expect("lifecycle daemon task");
+        std::fs::remove_file(&socket_path).expect("remove detail lifecycle socket");
+
+        assert_eq!(requests[0]["method"], "InterruptSession");
+        assert_eq!(requests[0]["params"]["session_id"], selected_id.to_string());
+        // #929: the interrupted row is still busy locally, so the operator's
+        // "continue" is queued for the next safe turn boundary instead of
+        // killing in-flight tool calls. It still targets the selected row.
+        assert_eq!(requests[1]["method"], "QueueOperatorMessage");
+        assert_eq!(requests[1]["params"]["session_id"], selected_id.to_string());
+        assert_eq!(requests[1]["params"]["content"], "continue");
+        assert_eq!(
+            app.operator_messages.get(&selected_id).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            app.sessions.get(&displayed_id).unwrap().session.status,
+            rsi_common::types::SessionStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_in_detail_opens_selected_session_list_row() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, displayed_id, selected_id) = detail_app_with_different_selected_row();
+        step_once(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+
+        assert_ne!(displayed_id, selected_id);
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionDetail { session_id }) if *session_id == selected_id
+        ));
+    }
+
+    #[tokio::test]
     async fn issue_workspace_result_applies_while_help_is_open() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         let project_id = uuid::Uuid::new_v4();
@@ -2650,7 +2817,11 @@ mod tests {
             ActionAvailability::Available(request) if request.id == ActionId::MoveDown
         ));
         step_once(&mut app, down).await;
-        assert_eq!(app.settings_state.section, SettingsSection::Screen);
+        assert_eq!(
+            app.settings_state.section,
+            SettingsSection::SessionList,
+            "j on the rail selects the next category, opened on its first tab"
+        );
 
         let open = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
@@ -2670,6 +2841,22 @@ mod tests {
         let before = app.settings.text_area_backfill_enabled;
         step_once(&mut app, toggle).await;
         assert_eq!(app.settings.text_area_backfill_enabled, !before);
+    }
+
+    #[tokio::test]
+    async fn raw_settings_tab_keys_switch_the_category_section_tabs() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut app = settings_app();
+        assert_eq!(app.settings_state.section, SettingsSection::ThemeColors);
+        step_once(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).await;
+        assert_eq!(app.settings_state.section, SettingsSection::Screen);
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        )
+        .await;
+        assert_eq!(app.settings_state.section, SettingsSection::ThemeColors);
     }
 
     #[tokio::test]
@@ -3421,6 +3608,12 @@ mod tests {
                     // Geometry persists through the shared test state file;
                     // start every case from the default geometry.
                     app.modal_geometries.clear();
+                    // Pin the terminal size. Unset, layout falls back to
+                    // crossterm::terminal::size(), which without a TTY is
+                    // `tput` (80x24 when TERM is set, an error and the 120
+                    // fallback when it is not), so the pinned sidebar width
+                    // depended on the ambient TERM (#946).
+                    app.last_terminal_size = (80, 24);
                     let before = observe(&app);
                     step_once(&mut app, chord(chord_name)).await;
                     if matches!(*fixture_name, "prompt_overlay" | "prompt_config_pending")
@@ -3462,8 +3655,8 @@ mod tests {
             }
         }
 
-        /// Recorded on the pre-refactor decoders (`RSI_PRINT_T8C=1`). Never
-        /// edit an existing row; the refactor must reproduce every one.
+        /// Recorded on the pre-refactor decoders (`RSI_PRINT_T8C=1`). Keep
+        /// rows stable except for explicit behavior changes with regression coverage.
         #[rustfmt::skip]
         const PINNED: &[(&str, &str, &str)] = &[
             ("list", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
@@ -3526,7 +3719,7 @@ mod tests {
             ("detail", "Up", "panes=detail[Some(0) scroll=Some(0) cursor=None tail=Some(false)]"),
             ("detail", "Down", "panes=detail[Some(0) scroll=Some(3) cursor=None tail=Some(false)]"),
             ("detail", "Esc", "-"),
-            ("detail", "Enter", "notes=1"),
+            ("detail", "Enter", "-"),
             ("detail", "Backspace", "focus=SessionList; panes=list[Main#0]"),
             ("detail", "x", "notes=1"),
             ("detail", "Ctrl-Enter", "-"),
@@ -3670,14 +3863,14 @@ mod tests {
             ("terminal", "Ctrl-I", "-"),
             ("terminal", "Ctrl-H", "-"),
             ("terminal", "Ctrl-L", "-"),
-            ("terminal", "Ctrl-Shift-Up", "-"),
-            ("terminal", "Ctrl-Shift-Down", "-"),
-            ("terminal", "Ctrl-Shift-Left", "-"),
-            ("terminal", "Ctrl-Shift-Right", "-"),
-            ("terminal", "Ctrl-Up", "-"),
-            ("terminal", "Ctrl-Down", "-"),
-            ("terminal", "Ctrl-Left", "-"),
-            ("terminal", "Ctrl-Right", "-"),
+            ("terminal", "Ctrl-Shift-Up", "geom=ModalGeometry { dx: 0, dy: 0, dw: 0, dh: -2 }"),
+            ("terminal", "Ctrl-Shift-Down", "geom=ModalGeometry { dx: 0, dy: 0, dw: 0, dh: 2 }"),
+            ("terminal", "Ctrl-Shift-Left", "geom=ModalGeometry { dx: 0, dy: 0, dw: -2, dh: 0 }"),
+            ("terminal", "Ctrl-Shift-Right", "geom=ModalGeometry { dx: 0, dy: 0, dw: 2, dh: 0 }"),
+            ("terminal", "Ctrl-Up", "geom=ModalGeometry { dx: 0, dy: -2, dw: 0, dh: 0 }"),
+            ("terminal", "Ctrl-Down", "geom=ModalGeometry { dx: 0, dy: 2, dw: 0, dh: 0 }"),
+            ("terminal", "Ctrl-Left", "geom=ModalGeometry { dx: -2, dy: 0, dw: 0, dh: 0 }"),
+            ("terminal", "Ctrl-Right", "geom=ModalGeometry { dx: 2, dy: 0, dw: 0, dh: 0 }"),
             ("terminal", "Ctrl-0", "-"),
             ("terminal", "Shift-Up", "-"),
             ("terminal", "Shift-Down", "-"),

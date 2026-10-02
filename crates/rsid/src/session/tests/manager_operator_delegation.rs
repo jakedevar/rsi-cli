@@ -11,9 +11,10 @@
 
 use super::*;
 use rsi_common::manager_operator_delegation::{
-    DELEGABLE_OPERATOR_METHODS, DELEGATED_PAGE_MAX_BYTES, DELEGATED_PAGE_MAX_ROWS,
-    DelegatedListSessionsParamsV1, NEVER_DELEGABLE_OPERATOR_METHODS_V1,
-    OPERATOR_METHOD_NOT_DELEGABLE, OperatorCallFenceV1, OperatorCallResultV1, OperatorCallV1,
+    DAEMON_SETTINGS_OPERATOR_METHODS, DELEGABLE_OPERATOR_METHODS, DELEGATED_PAGE_MAX_BYTES,
+    DELEGATED_PAGE_MAX_ROWS, DelegatedListSessionsParamsV1, NEVER_DELEGABLE_OPERATOR_METHODS_V1,
+    OPERATOR_METHOD_NOT_DELEGABLE, OPERATOR_PARAMS_INVALID, OperatorCallFenceV1,
+    OperatorCallResultV1, OperatorCallV1,
 };
 use rsi_common::types::{SandboxCleanupState, WakeMode};
 use serde_json::{Value, json};
@@ -189,17 +190,10 @@ fn rpc_catalog() -> Vec<String> {
     methods
 }
 
-/// The string entries of one `const NAME: &[&str] = &[ ... ];` in rpc.rs.
-fn rpc_const_list(name: &str) -> Vec<String> {
-    let start = RPC_SOURCE
-        .find(&format!("const {name}: &[&str] = &["))
-        .unwrap_or_else(|| panic!("{name} declaration"));
-    let end = start + RPC_SOURCE[start..].find("];").unwrap();
-    let quoted = regex::Regex::new(r#""([A-Za-z]+)""#).unwrap();
-    quoted
-        .captures_iter(&RPC_SOURCE[start..end])
-        .map(|c| c[1].to_string())
-        .collect()
+/// The attributed-caller verb lists, as `agent_gate` derives them from the
+/// single registry declaration (#1011).
+fn registry_list(methods: &[&str]) -> Vec<String> {
+    methods.iter().map(|m| (*m).to_string()).collect()
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -227,6 +221,13 @@ async fn operator_call_catalog_refuses_every_non_allowlisted_rpc_method() {
         catalog.len()
     );
     for method in DELEGABLE_OPERATOR_METHODS {
+        // #1046: `ProposeDaemonSetting` is a delegated-only method with no
+        // operator RPC arm (the operator sets its bounds through
+        // `ConfigureHarnessManagerPolicy`); it is not dispatchable at all.
+        if DAEMON_SETTINGS_OPERATOR_METHODS.contains(method) {
+            assert!(!catalog.iter().any(|m| m == method), "{method}");
+            continue;
+        }
         assert!(catalog.iter().any(|m| m == method), "allowlisted {method}");
     }
     // K14b: the v2 allowlist entry is a real operator method and delegable.
@@ -263,8 +264,8 @@ async fn operator_call_leaves_the_tokened_gate_and_agent_catalog_unchanged() {
     // The delegated path adds no socket verb: every attributed-caller verb is
     // an `Agent*` wrapper (other Epics add their own), none is an operator
     // method, and READ_VERBS is pinned exactly.
-    let agent_verbs = rpc_const_list("AGENT_VERBS");
-    let read_verbs = rpc_const_list("READ_VERBS");
+    let agent_verbs = registry_list(rsi_common::rpc_verb_registry::agent_verb_methods());
+    let read_verbs = registry_list(rsi_common::rpc_verb_registry::read_verb_methods());
     assert!(
         agent_verbs.iter().all(|verb| verb.starts_with("Agent")),
         "{agent_verbs:?}"
@@ -1697,4 +1698,1200 @@ async fn operator_call_unarchive_of_a_non_archived_session_is_refused_not_a_no_o
     )
     .await;
     assert_eq!(row(&p, completed).await.status, SessionStatus::Completed);
+}
+
+/// Pilot plus exactly the given grants (policy version 2), Execute mode.
+async fn grant_pilot(grants: &[ManagerCapabilityV2]) -> Pilot {
+    let p = pilot().await;
+    let mut policy = p.policy.clone();
+    policy.mode = ManagerOperatingModeV2::Execute;
+    policy.capabilities.extend_from_slice(grants);
+    reconfigure(&p, 1, policy);
+    p
+}
+
+fn journaled_operations(p: &Pilot) -> i64 {
+    p.manager
+        .store
+        .try_lock()
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT count(*) FROM harness_manager_v2_operations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn storage_calls() -> [(&'static str, ManagerActionV2); 3] {
+    [
+        ("status", call("GetSandboxStorageStatus", json!({}), None)),
+        (
+            "preview",
+            call(
+                "RunSandboxBuildCacheReclaim",
+                json!({"dry_run": true}),
+                None,
+            ),
+        ),
+        (
+            "real",
+            call(
+                "RunSandboxBuildCacheReclaim",
+                json!({"dry_run": false}),
+                None,
+            ),
+        ),
+    ]
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn storage_control_is_denied_without_the_capability() {
+    // OperatorDelegation alone never reaches the storage methods, and no
+    // refusal is journaled.
+    let p = grant_pilot(&[ManagerCapabilityV2::OperatorDelegation]).await;
+    let before = journaled_operations(&p);
+    for (name, operation) in storage_calls() {
+        refused_with(
+            &p,
+            &format!("storage-denied-{name}"),
+            operation,
+            "manager_v2_capability_denied",
+        )
+        .await;
+    }
+    assert_eq!(journaled_operations(&p), before);
+    // A lead gains nothing from a StorageControl grant either.
+    let p = grant_pilot(&[ManagerCapabilityV2::StorageControl]).await;
+    for (name, operation) in storage_calls() {
+        let error = control_as(&p, p.lead, 2, &format!("storage-lead-{name}"), operation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manager_v2_capability_denied"), "{error}");
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn storage_control_runs_status_preview_and_real_reclaim_and_journals_each() {
+    // StorageControl alone (no OperatorDelegation) is enough for the two
+    // storage methods.
+    let p = grant_pilot(&[ManagerCapabilityV2::StorageControl]).await;
+    let before = journaled_operations(&p);
+    for (name, operation) in storage_calls() {
+        let queued = control(&p, &format!("storage-{name}"), operation)
+            .await
+            .unwrap();
+        p.execute().await.unwrap();
+        let receipt = p.receipt(queued.operation_id).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Succeeded, "{name}");
+        let Some(OperatorCallResultV1::Scalar { method, result }) =
+            receipt.operator_result.map(|r| *r)
+        else {
+            panic!("{name}: scalar storage report");
+        };
+        assert_eq!(
+            method,
+            if name == "status" {
+                "GetSandboxStorageStatus"
+            } else {
+                "RunSandboxBuildCacheReclaim"
+            }
+        );
+        let report = result.get("report").unwrap_or(&result);
+        assert_eq!(report["dry_run"], json!(name != "real"), "{name}");
+        // The manager is the journaled actor; daemon settings supplied the
+        // limits (the report echoes the configured watermarks).
+        assert_eq!(actor(&p, queued.operation_id), Some(p.owner.to_string()));
+        assert!(report.get("config").is_some(), "{name}: {result}");
+    }
+    assert_eq!(journaled_operations(&p), before + 3);
+    // StorageControl does not unlock the session methods.
+    let target = leaf(&p, None, SessionStatus::Completed, 25).await;
+    refused_with(
+        &p,
+        "storage-not-archive",
+        archive(&p, target).await,
+        "manager_v2_capability_denied",
+    )
+    .await;
+    // Params are closed: no caller-chosen watermark or limit.
+    for (key, params) in [
+        ("storage-bad-empty", json!({})),
+        (
+            "storage-bad-extra",
+            json!({"dry_run": true, "high_watermark_pct": 1}),
+        ),
+    ] {
+        refused_with(
+            &p,
+            key,
+            call("RunSandboxBuildCacheReclaim", params, None),
+            OPERATOR_PARAMS_INVALID,
+        )
+        .await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn storage_control_keeps_the_execute_and_pause_gates() {
+    let p = grant_pilot(&[ManagerCapabilityV2::StorageControl]).await;
+    let mut monitor = p.policy.clone();
+    monitor.mode = ManagerOperatingModeV2::Monitor;
+    monitor
+        .capabilities
+        .push(ManagerCapabilityV2::StorageControl);
+    reconfigure(&p, 2, monitor);
+    let error = control_as(
+        &p,
+        p.owner,
+        3,
+        "storage-monitor",
+        call("GetSandboxStorageStatus", json!({}), None),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("manager_v2_execute_required"), "{error}");
+    let mut paused = p.policy.clone();
+    paused.paused = true;
+    paused
+        .capabilities
+        .push(ManagerCapabilityV2::StorageControl);
+    reconfigure(&p, 3, paused);
+    let error = control_as(
+        &p,
+        p.owner,
+        4,
+        "storage-paused",
+        call(
+            "RunSandboxBuildCacheReclaim",
+            json!({"dry_run": false}),
+            None,
+        ),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("manager_v2_policy_paused"), "{error}");
+}
+
+/// #1046: a pilot holding `DaemonSettings` and the given operator bounds.
+async fn settings_pilot(bounds: &[(&str, u64, u64)]) -> Pilot {
+    let p = pilot().await;
+    let mut policy = p.policy.clone();
+    policy.mode = ManagerOperatingModeV2::Execute;
+    policy
+        .capabilities
+        .push(ManagerCapabilityV2::DaemonSettings);
+    policy.daemon_setting_bounds = bounds
+        .iter()
+        .map(
+            |(key, min, max)| rsi_common::manager_daemon_settings::ManagerDaemonSettingBoundV2 {
+                key: (*key).into(),
+                min: *min,
+                max: *max,
+            },
+        )
+        .collect();
+    reconfigure(&p, 1, policy);
+    p
+}
+
+fn propose(key: &str, value: u64, reason: &str) -> ManagerActionV2 {
+    call(
+        "ProposeDaemonSetting",
+        json!({"key": key, "value": value, "reason": reason}),
+        None,
+    )
+}
+
+fn persisted_setting(p: &Pilot, key: &str) -> Option<String> {
+    p.manager
+        .store
+        .try_lock()
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT value FROM daemon_settings WHERE key=?1",
+            [key],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_is_denied_without_the_capability() {
+    // OperatorDelegation and StorageControl never reach ProposeDaemonSetting,
+    // even when the operator bounded the key, and nothing is journaled.
+    let p = pilot().await;
+    let mut policy = p.policy.clone();
+    policy.mode = ManagerOperatingModeV2::Execute;
+    policy.capabilities.extend([
+        ManagerCapabilityV2::OperatorDelegation,
+        ManagerCapabilityV2::StorageControl,
+    ]);
+    policy.daemon_setting_bounds = vec![
+        rsi_common::manager_daemon_settings::ManagerDaemonSettingBoundV2 {
+            key: "sandbox_max_source_roots".into(),
+            min: 1,
+            max: 65_536,
+        },
+    ];
+    reconfigure(&p, 1, policy);
+    let before = journaled_operations(&p);
+    refused_with(
+        &p,
+        "settings-denied",
+        propose("sandbox_max_source_roots", 16_384, "wrapped"),
+        "manager_v2_capability_denied",
+    )
+    .await;
+    assert_eq!(journaled_operations(&p), before);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_default_bounds_are_none_so_every_key_is_refused() {
+    let p = settings_pilot(&[]).await;
+    for (i, setting) in rsi_common::manager_daemon_settings::MANAGER_ADJUSTABLE_DAEMON_SETTINGS
+        .iter()
+        .enumerate()
+    {
+        refused_with(
+            &p,
+            &format!("settings-unbounded-{i}"),
+            propose(setting.key, setting.hard_max, "try"),
+            "manager_v2_daemon_setting_not_adjustable",
+        )
+        .await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_change_inside_bounds_is_applied_persisted_and_journaled() {
+    let p = settings_pilot(&[("sandbox_max_source_roots", 4096, 32_768)]).await;
+    // The 2026-09-29 incident: the setting wrapped down while roots were live.
+    p.manager
+        .runtime_config
+        .update_field("sandbox_max_source_roots", &json!(512))
+        .unwrap();
+    let before = journaled_operations(&p);
+    let queued = control(
+        &p,
+        "settings-roots",
+        propose(
+            "sandbox_max_source_roots",
+            16_384,
+            "wrapped to 512 with 1490 live roots",
+        ),
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Succeeded);
+    let Some(OperatorCallResultV1::Scalar { method, result }) = receipt.operator_result.map(|r| *r)
+    else {
+        panic!("scalar proposal result");
+    };
+    assert_eq!(method, "ProposeDaemonSetting");
+    assert_eq!(result["key"], "sandbox_max_source_roots");
+    assert_eq!(result["previous"], 512);
+    assert_eq!(result["value"], 16_384);
+    assert_eq!(result["reason"], "wrapped to 512 with 1490 live roots");
+    // Live value, durable value and journal all reflect the change.
+    assert_eq!(
+        p.manager.runtime_config.to_json()["sandbox_max_source_roots"],
+        16_384
+    );
+    assert_eq!(
+        persisted_setting(&p, "sandbox_max_source_roots").as_deref(),
+        Some("16384")
+    );
+    assert_eq!(journaled_operations(&p), before + 1);
+    assert_eq!(actor(&p, queued.operation_id), Some(p.owner.to_string()));
+    let stored: String = p
+        .manager
+        .store
+        .try_lock()
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT payload_json FROM harness_manager_v2_operations WHERE id=?1",
+            [queued.operation_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("wrapped to 512 with 1490 live roots"),
+        "{stored}"
+    );
+    // The same idempotency key replays without a second effect or journal row.
+    p.manager
+        .runtime_config
+        .update_field("sandbox_max_source_roots", &json!(8192))
+        .unwrap();
+    let replay = control(
+        &p,
+        "settings-roots",
+        propose(
+            "sandbox_max_source_roots",
+            16_384,
+            "wrapped to 512 with 1490 live roots",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.operation_id, queued.operation_id);
+    assert_eq!(
+        p.manager.runtime_config.to_json()["sandbox_max_source_roots"],
+        8192
+    );
+    assert_eq!(journaled_operations(&p), before + 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_out_of_bounds_and_off_allowlist_are_refused_untouched() {
+    let p = settings_pilot(&[
+        ("sandbox_max_source_roots", 4096, 32_768),
+        ("sandbox_min_free_gib", 5, 50),
+    ])
+    .await;
+    let before = journaled_operations(&p);
+    let roots = p.manager.runtime_config.to_json()["sandbox_max_source_roots"].clone();
+    for (key, name, value, code) in [
+        ("sandbox_max_source_roots", "low", 4095, "out_of_bounds"),
+        ("sandbox_max_source_roots", "high", 32_769, "out_of_bounds"),
+        ("sandbox_min_free_gib", "zero", 0, "out_of_bounds"),
+        // In the registry and the daemon range, but not bounded by the operator.
+        (
+            "sandbox_build_cache_reclaim_high_watermark_pct",
+            "unbounded",
+            90,
+            "not_adjustable",
+        ),
+        // Spend, credentials and any other daemon setting are off the allowlist.
+        ("max_spend_usd", "spend", 1, "not_allowlisted"),
+        ("governor_max_load", "governor", 1, "not_allowlisted"),
+    ] {
+        refused_with(
+            &p,
+            &format!("settings-refused-{name}"),
+            propose(key, value, "try"),
+            &format!("manager_v2_daemon_setting_{code}"),
+        )
+        .await;
+    }
+    assert_eq!(journaled_operations(&p), before);
+    assert_eq!(
+        p.manager.runtime_config.to_json()["sandbox_max_source_roots"],
+        roots
+    );
+    // A missing reason is refused as malformed params.
+    refused_with(
+        &p,
+        "settings-no-reason",
+        call(
+            "ProposeDaemonSetting",
+            json!({"key": "sandbox_min_free_gib", "value": 10}),
+            None,
+        ),
+        OPERATOR_PARAMS_INVALID,
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_reclaim_watermarks_apply_through_the_validated_path() {
+    let p = settings_pilot(&[
+        ("sandbox_build_cache_reclaim_high_watermark_pct", 50, 95),
+        ("sandbox_build_cache_reclaim_low_watermark_pct", 10, 95),
+    ])
+    .await;
+    let queued = control(
+        &p,
+        "settings-high",
+        propose(
+            "sandbox_build_cache_reclaim_high_watermark_pct",
+            92,
+            "disk pressure",
+        ),
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Succeeded);
+    let snapshot = p
+        .manager
+        .runtime_config
+        .sandbox_build_cache_reclaim_snapshot();
+    assert_eq!(snapshot.high_watermark_pct, 92);
+    assert_eq!(
+        persisted_setting(&p, "sandbox_build_cache_reclaim_high_watermark_pct").as_deref(),
+        Some("92")
+    );
+    // The daemon's own invariant (low below high) still refuses an in-bounds
+    // value, and the live config keeps its previous value.
+    let queued = control(
+        &p,
+        "settings-low",
+        propose(
+            "sandbox_build_cache_reclaim_low_watermark_pct",
+            94,
+            "too high",
+        ),
+    )
+    .await
+    .unwrap();
+    let _ = p.execute().await;
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_ne!(
+        receipt.state,
+        ManagerActionStateV2::Succeeded,
+        "{receipt:?}"
+    );
+    assert_eq!(
+        p.manager
+            .runtime_config
+            .sandbox_build_cache_reclaim_snapshot()
+            .low_watermark_pct,
+        snapshot.low_watermark_pct
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_settings_keep_the_execute_gate_and_a_tightened_bound_refuses_queued_work() {
+    let p = settings_pilot(&[("sandbox_min_free_gib", 5, 50)]).await;
+    let mut monitor = p.policy.clone();
+    monitor.mode = ManagerOperatingModeV2::Monitor;
+    monitor
+        .capabilities
+        .push(ManagerCapabilityV2::DaemonSettings);
+    monitor.daemon_setting_bounds = vec![
+        rsi_common::manager_daemon_settings::ManagerDaemonSettingBoundV2 {
+            key: "sandbox_min_free_gib".into(),
+            min: 5,
+            max: 50,
+        },
+    ];
+    reconfigure(&p, 2, monitor);
+    let error = control_as(
+        &p,
+        p.owner,
+        3,
+        "settings-monitor",
+        propose("sandbox_min_free_gib", 10, "disk"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("manager_v2_execute_required"), "{error}");
+}
+
+// ---- #1045 slice 2: AgentRequestDeploy ----------------------------------
+
+const DEPLOY_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+struct DeployDirs {
+    _dir: TempDir,
+    source: std::path::PathBuf,
+    install: std::path::PathBuf,
+    service: crate::deploy::DeployService,
+}
+
+fn deploy_dirs(supervised: bool, probe_sha: &'static str, probe_schema: i64) -> DeployDirs {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("build");
+    let install = dir.path().join("install");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::write(source.join("rsid"), b"new-rsid").unwrap();
+    std::fs::write(install.join("rsid"), b"old-rsid").unwrap();
+    let service = crate::deploy::DeployService::new(
+        install.clone(),
+        vec![dir.path().to_path_buf()],
+        Box::new(move || supervised),
+        std::sync::Arc::new(move |_: &std::path::Path| Ok((probe_sha.to_string(), probe_schema))),
+    );
+    DeployDirs {
+        _dir: dir,
+        source,
+        install,
+        service,
+    }
+}
+
+fn deploy_request(
+    dirs: &DeployDirs,
+    key: &str,
+) -> rsi_common::agent_deploy::AgentRequestDeployRequestV1 {
+    rsi_common::agent_deploy::AgentRequestDeployRequestV1 {
+        sha: DEPLOY_SHA.into(),
+        binaries_dir: Some(dirs.source.to_string_lossy().into_owned()),
+        build: None,
+        idempotency_key: key.into(),
+        max_wait_secs: None,
+        peer_id: None,
+    }
+}
+
+async fn request_deploy(
+    p: &Pilot,
+    caller: Uuid,
+    dirs: &DeployDirs,
+    request: rsi_common::agent_deploy::AgentRequestDeployRequestV1,
+) -> crate::error::Result<rsi_common::agent_deploy::AgentRequestDeployReceiptV1> {
+    p.manager
+        .agent_control()
+        .agent_request_deploy_with(caller, request, &dirs.service, chrono::Utc::now())
+        .await
+}
+
+fn staged_leftovers(install: &std::path::Path) -> usize {
+    std::fs::read_dir(install)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".deploy-")
+        })
+        .count()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_needs_the_capability_execute_mode_and_the_manager_seat() {
+    let dirs = deploy_dirs(true, DEPLOY_SHA, 999);
+
+    // Execute mode but no Deploy grant.
+    let p = grant_pilot(&[]).await;
+    let error = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "cap"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_capability_required"), "{error}");
+
+    // A scoped worker and an Epic lead are never the deploy caller.
+    let worker = leaf(&p, Some(p.epic), SessionStatus::Running, 0).await;
+    for caller in [worker, p.lead] {
+        let error = request_deploy(&p, caller, &dirs, deploy_request(&dirs, "seat"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deploy_not_authorized"), "{error}");
+    }
+
+    // Granted, but not in Execute mode.
+    let mut status_mode = p.policy.clone();
+    status_mode.mode = ManagerOperatingModeV2::Status;
+    status_mode.capabilities.push(ManagerCapabilityV2::Deploy);
+    reconfigure(&p, 2, status_mode);
+    let error = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "mode"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_execute_required"), "{error}");
+
+    // Granted and paused.
+    let mut paused = p.policy.clone();
+    paused.mode = ManagerOperatingModeV2::Execute;
+    paused.paused = true;
+    paused.capabilities.push(ManagerCapabilityV2::Deploy);
+    reconfigure(&p, 3, paused);
+    let error = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "paused"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_execute_required"), "{error}");
+
+    // Granted, Execute, not paused: accepted.
+    let mut open = p.policy.clone();
+    open.mode = ManagerOperatingModeV2::Execute;
+    open.capabilities.push(ManagerCapabilityV2::Deploy);
+    reconfigure(&p, 4, open);
+    let receipt = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "ok"))
+        .await
+        .unwrap();
+    assert_eq!(receipt.state, rsi_common::agent_deploy::DeployState::Staged);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_request_stages_verified_binaries_and_replays_by_key() {
+    let dirs = deploy_dirs(true, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+
+    let first = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "stage"))
+        .await
+        .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.sha, DEPLOY_SHA);
+    assert_eq!(first.binaries.len(), 1);
+    assert_eq!(first.binaries[0].name, "rsid");
+    assert_eq!(first.binaries[0].sha256.len(), 64);
+    assert_eq!(staged_leftovers(&dirs.install), 1);
+    // Nothing is installed until the quiet point.
+    assert_eq!(
+        std::fs::read(dirs.install.join("rsid")).unwrap(),
+        b"old-rsid"
+    );
+
+    let replay = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "stage"))
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.deploy_id, first.deploy_id);
+    assert_eq!(staged_leftovers(&dirs.install), 1);
+
+    // The same key for a different request is a conflict.
+    let mut other = deploy_request(&dirs, "stage");
+    other.max_wait_secs = Some(60);
+    let error = request_deploy(&p, p.owner, &dirs, other)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_idempotency_key_conflict"), "{error}");
+
+    // One live deploy at a time; the refused attempt leaves no staged copy.
+    let error = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "second"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_already_in_progress"), "{error}");
+    assert_eq!(staged_leftovers(&dirs.install), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_request_refusals_are_typed_and_leave_nothing_staged() {
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+
+    let mismatch = deploy_dirs(true, "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", 999);
+    let downgrade = deploy_dirs(true, DEPLOY_SHA, 1);
+    let unsupervised = deploy_dirs(false, DEPLOY_SHA, 999);
+    let plain = deploy_dirs(true, DEPLOY_SHA, 999);
+    for (dirs, key, code) in [
+        (&mismatch, "sha", "deploy_sha_mismatch"),
+        (&downgrade, "schema", "deploy_schema_downgrade"),
+        (&unsupervised, "sup", "deploy_needs_supervisor"),
+    ] {
+        let error = request_deploy(&p, p.owner, dirs, deploy_request(dirs, key))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(code), "{code}: {error}");
+        assert_eq!(staged_leftovers(&dirs.install), 0, "{code}");
+    }
+
+    // Directory outside the allowed roots, a missing rsid, and `build:true`.
+    let mut outside = deploy_request(&plain, "outside");
+    outside.binaries_dir = Some("/tmp".into());
+    let error = request_deploy(&p, p.owner, &plain, outside)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_directory_not_allowed"), "{error}");
+    std::fs::remove_file(plain.source.join("rsid")).unwrap();
+    let error = request_deploy(&p, p.owner, &plain, deploy_request(&plain, "missing"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_binary_missing"), "{error}");
+    let mut build = deploy_request(&plain, "build");
+    build.binaries_dir = None;
+    build.build = Some(true);
+    let error = request_deploy(&p, p.owner, &plain, build)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_build_not_supported"), "{error}");
+    assert_eq!(staged_leftovers(&plain.install), 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_is_advertised_only_to_a_manager_holding_the_capability() {
+    use rsi_common::agent_control_schema::AgentControlVerbV1::RequestDeploy;
+    let p = grant_pilot(&[]).await;
+    let advertised = |caller: Uuid| {
+        p.manager
+            .store
+            .try_lock()
+            .unwrap()
+            .agent_authority_projection(caller)
+            .unwrap()
+            .verbs
+            .contains(&RequestDeploy)
+    };
+    assert!(!advertised(p.owner));
+    let mut granted = p.policy.clone();
+    granted.mode = ManagerOperatingModeV2::Execute;
+    granted.capabilities.push(ManagerCapabilityV2::Deploy);
+    reconfigure(&p, 2, granted);
+    assert!(advertised(p.owner));
+    assert!(!advertised(p.lead));
+}
+
+// ---- #1017 slice 2: hub-initiated satellite deploy over the link ---------
+
+/// A fake satellite: answers `GetSatelliteIdentity` (with health) and
+/// `RequestHubDeploy`, and records every deploy request it receives.
+struct FakeSatellite {
+    _temp: tempfile::TempDir,
+    root: std::path::PathBuf,
+    peer: Uuid,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    deploys: std::sync::Arc<
+        std::sync::Mutex<Vec<rsi_common::satellite_dispatch::SatelliteDeployRequestV1>>,
+    >,
+    refuse: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    build_sha: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellite {
+    use rsi_common::satellite::{
+        SatelliteHealthV1, SatelliteLinkConfigV1, SatelliteLinkDirectionV1, SatellitePeerConfigV1,
+        SatellitePutLinkRequestV1, SatellitePutPeerRequestV1, SatelliteUuidV1,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let temp = tempfile::Builder::new()
+        .prefix("sat-deploy-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().join("satellites");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.join("peer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let installation = Uuid::new_v4();
+    let incarnation = Uuid::new_v4();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deploys = Arc::new(Mutex::new(Vec::new()));
+    let refuse: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let build_sha = Arc::new(Mutex::new("b".repeat(40)));
+    let (c, d, r, b) = (
+        Arc::clone(&calls),
+        Arc::clone(&deploys),
+        Arc::clone(&refuse),
+        Arc::clone(&build_sha),
+    );
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (c, d, r, b) = (
+                Arc::clone(&c),
+                Arc::clone(&d),
+                Arc::clone(&r),
+                Arc::clone(&b),
+            );
+            tokio::spawn(async move {
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let request: rsi_common::rpc::RpcRequest = serde_json::from_str(&line).unwrap();
+                    let id = Some(request.id.clone().into());
+                    let response = match request.method.as_str() {
+                        "GetSatelliteIdentity" => {
+                            let mut identity =
+                                crate::satellite::identity(installation, incarnation);
+                            identity.health = Some(SatelliteHealthV1 {
+                                daemon_version: "1.0.0".into(),
+                                binary_sha256: Some("cd".repeat(32)),
+                                uptime_seconds: 42,
+                                schema_version: Some(146),
+                                sessions_running: 0,
+                                sessions_waiting_approval: 0,
+                                disk_free_bytes: None,
+                                load_avg_1m_milli: None,
+                                build_sha: Some(b.lock().unwrap().clone()),
+                                started_at: Some("2026-09-29T12:00:00.000000000Z".into()),
+                                supervisor_mode: Some("rsid-supervisor.sh".into()),
+                                last_deploy: Some(rsi_common::satellite::SatelliteDeployStatusV1 {
+                                    deploy_id: SatelliteUuidV1(Uuid::new_v4()),
+                                    state: rsi_common::agent_deploy::DeployState::Succeeded,
+                                    sha: "b".repeat(40),
+                                }),
+                                missing_provider_clis: Vec::new(),
+                            });
+                            rsi_common::rpc::RpcResponse::success(
+                                id,
+                                serde_json::to_value(identity).unwrap(),
+                            )
+                        }
+                        "RequestHubDeploy" => {
+                            if let Some(message) = r.lock().unwrap().clone() {
+                                rsi_common::rpc::RpcResponse::error(
+                                    id,
+                                    rsi_common::RpcError {
+                                        code: -32000,
+                                        message,
+                                        data: None,
+                                    },
+                                )
+                            } else {
+                                let wire: rsi_common::satellite_dispatch::SatelliteDeployRequestV1 =
+                                    serde_json::from_value(request.params.clone()).unwrap();
+                                let receipt =
+                                    rsi_common::agent_deploy::AgentRequestDeployReceiptV1 {
+                                        deploy_id: Uuid::new_v4(),
+                                        state: rsi_common::agent_deploy::DeployState::Staged,
+                                        sha: wire.sha.clone(),
+                                        deadline_at: "2026-09-29T12:15:00.000000000Z".into(),
+                                        binaries: Vec::new(),
+                                        replayed: false,
+                                    };
+                                d.lock().unwrap().push(wire);
+                                rsi_common::rpc::RpcResponse::success(
+                                    id,
+                                    serde_json::to_value(receipt).unwrap(),
+                                )
+                            }
+                        }
+                        other => panic!("hub called a method outside the allowlist: {other}"),
+                    };
+                    let mut bytes = serde_json::to_vec(&response).unwrap();
+                    bytes.push(b'\n');
+                    stream.get_mut().write_all(&bytes).await.unwrap();
+                }
+            });
+        }
+    });
+    let peer = Uuid::new_v4();
+    {
+        let store = p.manager.store().lock().await;
+        let revision = store.satellite_registry_revision().unwrap();
+        store
+            .put_satellite_peer(
+                &SatellitePutPeerRequestV1 {
+                    expected_registry_revision: revision,
+                    peer: SatellitePeerConfigV1 {
+                        peer_id: SatelliteUuidV1(peer),
+                        label: "laptop".into(),
+                        expected_installation_id: Some(SatelliteUuidV1(installation)),
+                        enabled: true,
+                        read_enabled: true,
+                        dispatch_enabled: dispatch,
+                    },
+                    repair_quarantine: false,
+                },
+                &root,
+            )
+            .unwrap();
+        let revision = store.satellite_registry_revision().unwrap();
+        store
+            .put_satellite_link(
+                &SatellitePutLinkRequestV1 {
+                    expected_registry_revision: revision,
+                    peer_id: SatelliteUuidV1(peer),
+                    link: SatelliteLinkConfigV1 {
+                        link_id: SatelliteUuidV1(Uuid::new_v4()),
+                        direction: SatelliteLinkDirectionV1::DialHomeReverse,
+                        socket_path: socket.to_string_lossy().into_owned(),
+                        ssh_target: None,
+                        trust_reference: "ssh-config:peer".into(),
+                        enabled: true,
+                        priority: 0,
+                    },
+                },
+                &root,
+            )
+            .unwrap();
+        if scoped {
+            let revision = store.satellite_registry_revision().unwrap();
+            store
+                .put_satellite_peer_scope(revision, peer, &[SatelliteUuidV1(Uuid::new_v4())])
+                .unwrap();
+        }
+    }
+    FakeSatellite {
+        _temp: temp,
+        root,
+        peer,
+        calls,
+        deploys,
+        refuse,
+        build_sha,
+    }
+}
+
+fn satellite_deploy_request(
+    dirs: &DeployDirs,
+    peer: Uuid,
+    key: &str,
+) -> rsi_common::agent_deploy::AgentRequestDeployRequestV1 {
+    let mut request = deploy_request(dirs, key);
+    request.binaries_dir = Some("/home/laptop/.rsi/staging/bin-x".into());
+    request.peer_id = Some(rsi_common::satellite::SatelliteUuidV1(peer));
+    request
+}
+
+async fn request_satellite_deploy(
+    p: &Pilot,
+    caller: Uuid,
+    dirs: &DeployDirs,
+    sat: &FakeSatellite,
+    request: rsi_common::agent_deploy::AgentRequestDeployRequestV1,
+) -> crate::error::Result<rsi_common::agent_deploy::AgentRequestDeployReceiptV1> {
+    p.manager
+        .agent_control()
+        .agent_request_deploy_via(
+            caller,
+            request,
+            &dirs.service,
+            chrono::Utc::now(),
+            &sat.root,
+        )
+        .await
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_deploy_reaches_the_paired_satellite_for_the_deploy_manager_only() {
+    // The local daemon is not supervised: a local deploy would refuse, so a
+    // receipt proves the request went over the link and not through the local
+    // flow.
+    let dirs = deploy_dirs(false, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+
+    let receipt = request_satellite_deploy(
+        &p,
+        p.owner,
+        &dirs,
+        &sat,
+        satellite_deploy_request(&dirs, sat.peer, "sat-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.state, rsi_common::agent_deploy::DeployState::Staged);
+    assert_eq!(receipt.sha, DEPLOY_SHA);
+    {
+        let seen = sat.deploys.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].sha, DEPLOY_SHA);
+        assert_eq!(seen[0].binaries_dir, "/home/laptop/.rsi/staging/bin-x");
+        assert_eq!(seen[0].idempotency_key, "sat-1");
+        assert_eq!(seen[0].sender_session_id, p.owner);
+    }
+    // The hub kept no deploy row: the satellite's own row is the record.
+    assert!(
+        p.manager
+            .store()
+            .lock()
+            .await
+            .latest_agent_deploy()
+            .unwrap()
+            .is_none()
+    );
+
+    // A scoped worker and an Epic lead are refused before any link call.
+    let before = sat.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let worker = leaf(&p, Some(p.epic), SessionStatus::Running, 0).await;
+    for caller in [worker, p.lead] {
+        let error = request_satellite_deploy(
+            &p,
+            caller,
+            &dirs,
+            &sat,
+            satellite_deploy_request(&dirs, sat.peer, "no"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deploy_not_authorized"), "{error}");
+    }
+    assert_eq!(sat.calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_deploy_needs_the_deploy_grant_and_an_operator_scoped_peer() {
+    let dirs = deploy_dirs(false, DEPLOY_SHA, 999);
+
+    // A manager without the Deploy grant is refused, and nothing is sent.
+    let no_grant = grant_pilot(&[]).await;
+    let sat = fake_satellite(&no_grant, true, true).await;
+    let error = request_satellite_deploy(
+        &no_grant,
+        no_grant.owner,
+        &dirs,
+        &sat,
+        satellite_deploy_request(&dirs, sat.peer, "cap"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("deploy_capability_required"), "{error}");
+    assert!(sat.deploys.lock().unwrap().is_empty());
+
+    // Dispatch off, no declared scope and an unknown peer are one refusal.
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let dispatch_off = fake_satellite(&p, false, true).await;
+    let unscoped = fake_satellite(&p, true, false).await;
+    let mut refusals = Vec::new();
+    for (sat, peer) in [
+        (&dispatch_off, dispatch_off.peer),
+        (&unscoped, unscoped.peer),
+        (&dispatch_off, Uuid::new_v4()),
+    ] {
+        let error = request_satellite_deploy(
+            &p,
+            p.owner,
+            &dirs,
+            sat,
+            satellite_deploy_request(&dirs, peer, "scope"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("target_not_authorized"), "{error}");
+        assert!(sat.deploys.lock().unwrap().is_empty());
+        refusals.push(error);
+    }
+    assert!(
+        refusals.windows(2).all(|pair| pair[0] == pair[1]),
+        "{refusals:?}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_deploy_carries_only_the_satellites_stable_refusal_codes() {
+    let dirs = deploy_dirs(false, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+    for (remote, expected) in [
+        (
+            "Policy denied: deploy_needs_supervisor",
+            "deploy_needs_supervisor",
+        ),
+        (
+            "Policy denied: target_not_authorized",
+            "target_not_authorized",
+        ),
+        (
+            "Invalid parameter: /home/x/secret failed",
+            "satellite_deploy_refused",
+        ),
+    ] {
+        *sat.refuse.lock().unwrap() = Some(remote.into());
+        let error = request_satellite_deploy(
+            &p,
+            p.owner,
+            &dirs,
+            &sat,
+            satellite_deploy_request(&dirs, sat.peer, "codes"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    // A link that no longer exists is `satellite_deploy_unreachable`.
+    std::fs::remove_file(sat.root.join("peer.sock")).unwrap();
+    let error = request_satellite_deploy(
+        &p,
+        p.owner,
+        &dirs,
+        &sat,
+        satellite_deploy_request(&dirs, sat.peer, "dark"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("satellite_deploy_unreachable"), "{error}");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn daemon_info_lists_satellites_read_over_the_link_for_the_manager_only() {
+    let p = grant_pilot(&[]).await;
+    let sat = fake_satellite(&p, false, false).await;
+    let service = crate::daemon_info::DaemonInfoService::new(
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+        std::path::PathBuf::from("/proc/self/exe"),
+    );
+    let info = p
+        .manager
+        .agent_control()
+        .agent_get_daemon_info_via(p.owner, &service, &sat.root)
+        .await
+        .unwrap();
+    assert_eq!(info.satellites.len(), 1);
+    let row = &info.satellites[0];
+    assert_eq!(row.peer_id.0, sat.peer);
+    assert_eq!(row.label, "laptop");
+    assert!(row.reachable);
+    assert_eq!(row.build_sha.as_deref(), Some("b".repeat(40).as_str()));
+    assert_eq!(row.supervisor_mode.as_deref(), Some("rsid-supervisor.sh"));
+    assert_eq!(row.schema_version, Some(146));
+    assert_eq!(
+        row.last_deploy.as_ref().map(|deploy| deploy.state),
+        Some(rsi_common::agent_deploy::DeployState::Succeeded)
+    );
+
+    // A deploy that lands changes the read; the next call sees the new build.
+    *sat.build_sha.lock().unwrap() = "c".repeat(40);
+    let after = p
+        .manager
+        .agent_control()
+        .agent_get_daemon_info_via(p.owner, &service, &sat.root)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.satellites[0].build_sha.as_deref(),
+        Some("c".repeat(40).as_str())
+    );
+
+    // The Epic lead sees the hub only.
+    let lead = p
+        .manager
+        .agent_control()
+        .agent_get_daemon_info_via(p.lead, &service, &sat.root)
+        .await
+        .unwrap();
+    assert!(lead.satellites.is_empty());
+
+    // A dark satellite is `reachable:false` with a stable code, no identity.
+    std::fs::remove_file(sat.root.join("peer.sock")).unwrap();
+    let dark = p
+        .manager
+        .agent_control()
+        .agent_get_daemon_info_via(p.owner, &service, &sat.root)
+        .await
+        .unwrap();
+    assert!(!dark.satellites[0].reachable);
+    assert_eq!(
+        dark.satellites[0].error.as_deref(),
+        Some("satellite_unreachable")
+    );
+    assert!(dark.satellites[0].build_sha.is_none());
 }

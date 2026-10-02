@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn test_extract_slash_query_cursor_at_col_zero() {
         let mut textarea = tui_textarea::TextArea::default();
-        textarea.insert_str("/home/jakedevar/docs");
+        textarea.insert_str("/home/user/docs");
         // Move cursor to column 0 (simulating Shift-I)
         textarea.move_cursor(tui_textarea::CursorMove::Head);
         let query = extract_slash_query(&textarea);

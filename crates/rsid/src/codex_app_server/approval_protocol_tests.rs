@@ -193,6 +193,7 @@ async fn both_provider_and_writer_paths_conform_for_all_supported_methods_ids_an
         next_id: Arc::new(AtomicI64::new(1)),
         turn_control: Arc::new(crate::model_control::call_control::NoopModelCallControl),
         current_turn_call: None,
+        turn_usage: super::TurnTokenUsage::default(),
     };
     for method in [
         "item/commandExecution/requestApproval",

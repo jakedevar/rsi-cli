@@ -78,12 +78,12 @@ impl Store {
     fn appserver_approval_binding_valid(&self, target: &Value) -> Result<bool> {
         let valid_method = target["method"].as_str().is_some_and(|m| {
             [
-                crate::provider::ApprovalDecision::Approve,
-                crate::provider::ApprovalDecision::Deny,
+                crate::store_support::provider_settings::ApprovalDecision::Approve,
+                crate::store_support::provider_settings::ApprovalDecision::Deny,
             ]
             .into_iter()
             .any(|answer| {
-                crate::codex_app_server::approval_response(
+                crate::store_support::app_server_approval::approval_response(
                     &target["request_id"],
                     m,
                     &target["params"],
@@ -354,13 +354,19 @@ impl Store {
                     }
                 }
                 let answers: Vec<_> = [
-                    ("approve", crate::provider::ApprovalDecision::Approve),
-                    ("deny", crate::provider::ApprovalDecision::Deny),
+                    (
+                        "approve",
+                        crate::store_support::provider_settings::ApprovalDecision::Approve,
+                    ),
+                    (
+                        "deny",
+                        crate::store_support::provider_settings::ApprovalDecision::Deny,
+                    ),
                 ]
                 .into_iter()
                 .filter_map(|(label, answer)| {
                     (answerable
-                        && crate::codex_app_server::approval_response(
+                        && crate::store_support::app_server_approval::approval_response(
                             &target["request_id"],
                             target["method"].as_str().unwrap_or_default(),
                             &target["params"],

@@ -12,10 +12,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::archive_cleanup::{ArchiveSessionParamsV1, GetArchiveCleanupStatusParamsV1};
+pub use crate::manager_daemon_settings::ProposeDaemonSettingParamsV1;
 use crate::types::{SandboxCleanupState, SessionKind, SessionStatus};
 
 /// Version of the current delegable operator-method allowlist.
-pub const DELEGATED_OPERATOR_ALLOWLIST_VERSION: u32 = 2;
+pub const DELEGATED_OPERATOR_ALLOWLIST_VERSION: u32 = 4;
 
 /// K14a allowlist (v1), kept as the historical record of what v1 delegated.
 pub const DELEGABLE_OPERATOR_METHODS_V1: [&str; 3] =
@@ -29,9 +30,44 @@ pub const DELEGABLE_OPERATOR_METHODS_V2: [&str; 4] = [
     "UnarchiveSession",
 ];
 
+/// K14c allowlist (v3, #1043): v2 plus the two `StorageControl` methods.
+pub const DELEGABLE_OPERATOR_METHODS_V3: [&str; 6] = [
+    "ArchiveSession",
+    "GetArchiveCleanupStatus",
+    "GetSandboxStorageStatus",
+    "ListSessions",
+    "RunSandboxBuildCacheReclaim",
+    "UnarchiveSession",
+];
+
+/// K14d allowlist (v4, #1046): v3 plus `ProposeDaemonSetting`.
+pub const DELEGABLE_OPERATOR_METHODS_V4: [&str; 7] = [
+    "ArchiveSession",
+    "GetArchiveCleanupStatus",
+    "GetSandboxStorageStatus",
+    "ListSessions",
+    "ProposeDaemonSetting",
+    "RunSandboxBuildCacheReclaim",
+    "UnarchiveSession",
+];
+
 /// The current allowlist: exactly the method names of
 /// `DelegatedOperatorCallV1`, sorted.
-pub const DELEGABLE_OPERATOR_METHODS: &[&str] = &DELEGABLE_OPERATOR_METHODS_V2;
+pub const DELEGABLE_OPERATOR_METHODS: &[&str] = &DELEGABLE_OPERATOR_METHODS_V4;
+
+/// The methods an `OperatorDelegation` grant alone unlocks (the v2 allowlist).
+pub const OPERATOR_DELEGATION_METHODS: &[&str] = &DELEGABLE_OPERATOR_METHODS_V2;
+
+/// #1043: the methods only the separate, off-by-default `StorageControl`
+/// grant unlocks. Daemon storage settings stay operator-only; these run with
+/// the configured watermarks and limits.
+pub const STORAGE_CONTROL_OPERATOR_METHODS: &[&str] =
+    &["GetSandboxStorageStatus", "RunSandboxBuildCacheReclaim"];
+
+/// #1046: the method only the separate, off-by-default `DaemonSettings` grant
+/// unlocks. It changes only allowlisted keys, inside operator-set bounds;
+/// `UpdateDaemonConfig` itself stays undelegable.
+pub const DAEMON_SETTINGS_OPERATOR_METHODS: &[&str] = &["ProposeDaemonSetting"];
 
 /// Operator RPC families that stay undelegable even with the grant.
 ///
@@ -87,9 +123,8 @@ pub const NEVER_DELEGABLE_OPERATOR_METHODS_V1: &[&str] = &[
     "DeleteProject",
     "DeleteLabel",
     "DeleteTopology",
-    // Daemon-global custody (K14_SCOPE).
-    "GetSandboxStorageStatus",
-    "RunSandboxBuildCacheReclaim",
+    // Daemon-global custody (K14_SCOPE). Sandbox storage status and build-cache
+    // reclaim are delegable only under `StorageControl` (#1043).
     "ListSourceWorktreeCohorts",
     "AuditSourceWorktreeCohort",
     "ApplySourceWorktreeCohort",
@@ -192,6 +227,19 @@ impl OperatorCallV1 {
         Ok(())
     }
 
+    /// True when the call needs the `StorageControl` grant instead of
+    /// `OperatorDelegation`.
+    #[must_use]
+    pub fn requires_storage_control(&self) -> bool {
+        STORAGE_CONTROL_OPERATOR_METHODS.contains(&self.method.as_str())
+    }
+
+    /// True when the call needs the `DaemonSettings` grant.
+    #[must_use]
+    pub fn requires_daemon_settings(&self) -> bool {
+        DAEMON_SETTINGS_OPERATOR_METHODS.contains(&self.method.as_str())
+    }
+
     /// Resolve the closed executable form, refusing every other method.
     pub fn typed(&self) -> Result<DelegatedOperatorCallV1, &'static str> {
         self.validate()?;
@@ -207,6 +255,15 @@ impl OperatorCallV1 {
             }
             "ListSessions" => DelegatedOperatorCallV1::ListSessions(decode(params)?),
             "UnarchiveSession" => DelegatedOperatorCallV1::UnarchiveSession(decode(params)?),
+            "GetSandboxStorageStatus" => {
+                DelegatedOperatorCallV1::GetSandboxStorageStatus(decode(params)?)
+            }
+            "RunSandboxBuildCacheReclaim" => {
+                DelegatedOperatorCallV1::RunSandboxBuildCacheReclaim(decode(params)?)
+            }
+            "ProposeDaemonSetting" => {
+                DelegatedOperatorCallV1::ProposeDaemonSetting(decode(params)?)
+            }
             _ => return Err(OPERATOR_METHOD_NOT_DELEGABLE),
         };
         call.validate()?;
@@ -224,6 +281,21 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, &'static st
 #[serde(deny_unknown_fields)]
 pub struct UnarchiveSessionParamsV1 {
     pub session_id: Uuid,
+}
+
+/// Params of the delegated `GetSandboxStorageStatus`: none (closed so nested
+/// authority fails at decode).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetSandboxStorageStatusParamsV1 {}
+
+/// Params of the delegated `RunSandboxBuildCacheReclaim`. Same shape as the
+/// operator RPC; watermarks and limits come from daemon settings, never from
+/// the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSandboxBuildCacheReclaimParamsV1 {
+    pub dry_run: bool,
 }
 
 /// Session-targeted fence for mutating delegated calls.
@@ -245,6 +317,15 @@ pub enum DelegatedOperatorCallV1 {
     GetArchiveCleanupStatus(GetArchiveCleanupStatusParamsV1),
     /// Project-bound, byte-bounded session page.
     ListSessions(DelegatedListSessionsParamsV1),
+    /// #1043 (`StorageControl`): the daemon-wide build-cache preview, the same
+    /// bounded dry-run the operator status view uses.
+    GetSandboxStorageStatus(GetSandboxStorageStatusParamsV1),
+    /// #1043 (`StorageControl`): one bounded reclaim pass (preview or real)
+    /// under the configured watermarks and limits.
+    RunSandboxBuildCacheReclaim(RunSandboxBuildCacheReclaimParamsV1),
+    /// #1046 (`DaemonSettings`): change one allowlisted daemon setting inside
+    /// the operator's bounds, with a reason; journaled by the manager action.
+    ProposeDaemonSetting(ProposeDaemonSettingParamsV1),
 }
 
 impl DelegatedOperatorCallV1 {
@@ -255,6 +336,9 @@ impl DelegatedOperatorCallV1 {
             Self::GetArchiveCleanupStatus(_) => "GetArchiveCleanupStatus",
             Self::ListSessions(_) => "ListSessions",
             Self::UnarchiveSession(_) => "UnarchiveSession",
+            Self::GetSandboxStorageStatus(_) => "GetSandboxStorageStatus",
+            Self::RunSandboxBuildCacheReclaim(_) => "RunSandboxBuildCacheReclaim",
+            Self::ProposeDaemonSetting(_) => "ProposeDaemonSetting",
         }
     }
 
@@ -265,7 +349,10 @@ impl DelegatedOperatorCallV1 {
             Self::ArchiveSession(p) => Some(p.session_id),
             Self::UnarchiveSession(p) => Some(p.session_id),
             Self::GetArchiveCleanupStatus(p) => Some(p.session_id),
-            Self::ListSessions(_) => None,
+            Self::ListSessions(_)
+            | Self::GetSandboxStorageStatus(_)
+            | Self::RunSandboxBuildCacheReclaim(_)
+            | Self::ProposeDaemonSetting(_) => None,
         }
     }
 
@@ -283,6 +370,7 @@ impl DelegatedOperatorCallV1 {
                 Err(OPERATOR_PARAMS_INVALID)
             }
             Self::ListSessions(p) => p.validate(),
+            Self::ProposeDaemonSetting(p) => p.validate(),
             _ => Ok(()),
         }
     }
@@ -401,20 +489,106 @@ mod tests {
             call("GetArchiveCleanupStatus", json!({"session_id": id})),
             call("ListSessions", json!({})),
             call("UnarchiveSession", json!({"session_id": id})),
+            call("GetSandboxStorageStatus", json!({})),
+            call("RunSandboxBuildCacheReclaim", json!({"dry_run": true})),
+            call(
+                "ProposeDaemonSetting",
+                json!({"key": "sandbox_min_free_gib", "value": 5, "reason": "disk"}),
+            ),
         ]
         .into_iter()
         .map(|c| c.typed().unwrap().method())
         .collect::<Vec<_>>();
         methods.sort_unstable();
         assert_eq!(methods, DELEGABLE_OPERATOR_METHODS);
-        assert_eq!(DELEGABLE_OPERATOR_METHODS, DELEGABLE_OPERATOR_METHODS_V2);
+        assert_eq!(DELEGABLE_OPERATOR_METHODS, DELEGABLE_OPERATOR_METHODS_V4);
         // v2 extends v1 by exactly UnarchiveSession.
         assert!(
             DELEGABLE_OPERATOR_METHODS_V1
                 .iter()
                 .all(|m| DELEGABLE_OPERATOR_METHODS_V2.contains(m))
         );
-        assert_eq!(DELEGATED_OPERATOR_ALLOWLIST_VERSION, 2);
+        assert_eq!(DELEGATED_OPERATOR_ALLOWLIST_VERSION, 4);
+    }
+
+    #[test]
+    fn storage_methods_are_split_from_operator_delegation() {
+        // #1043: the two storage methods need StorageControl; every other
+        // allowlisted method stays under OperatorDelegation.
+        let mut union = OPERATOR_DELEGATION_METHODS
+            .iter()
+            .chain(STORAGE_CONTROL_OPERATOR_METHODS)
+            .chain(DAEMON_SETTINGS_OPERATOR_METHODS)
+            .copied()
+            .collect::<Vec<_>>();
+        union.sort_unstable();
+        assert_eq!(union, DELEGABLE_OPERATOR_METHODS);
+        for method in STORAGE_CONTROL_OPERATOR_METHODS {
+            assert!(!OPERATOR_DELEGATION_METHODS.contains(method), "{method}");
+            assert!(call(method, json!({"dry_run": true})).requires_storage_control());
+        }
+        for method in OPERATOR_DELEGATION_METHODS {
+            assert!(!call(method, json!({})).requires_storage_control());
+            assert!(!call(method, json!({})).requires_daemon_settings());
+        }
+        // #1046: ProposeDaemonSetting needs the separate DaemonSettings grant.
+        for method in DAEMON_SETTINGS_OPERATOR_METHODS {
+            assert!(!OPERATOR_DELEGATION_METHODS.contains(method), "{method}");
+            assert!(
+                !STORAGE_CONTROL_OPERATOR_METHODS.contains(method),
+                "{method}"
+            );
+            assert!(call(method, json!({})).requires_daemon_settings());
+            assert!(!call(method, json!({})).requires_storage_control());
+        }
+    }
+
+    #[test]
+    fn propose_daemon_setting_params_are_closed_and_need_a_reason() {
+        let ok = call(
+            "ProposeDaemonSetting",
+            json!({"key": "sandbox_max_source_roots", "value": 16384, "reason": "wrapped"}),
+        )
+        .typed()
+        .unwrap();
+        assert_eq!(ok.method(), "ProposeDaemonSetting");
+        assert!(!ok.is_effect());
+        assert_eq!(ok.session_id(), None);
+        for forged in [
+            json!({"key": "sandbox_max_source_roots", "value": 1}),
+            json!({"key": "sandbox_max_source_roots", "value": 1, "reason": " "}),
+            json!({"key": "sandbox_max_source_roots", "value": -1, "reason": "x"}),
+            json!({"key": "k", "value": 1, "reason": "x", "session_id": Uuid::new_v4()}),
+        ] {
+            assert_eq!(
+                call("ProposeDaemonSetting", forged).typed(),
+                Err(OPERATOR_PARAMS_INVALID)
+            );
+        }
+    }
+
+    #[test]
+    fn storage_params_are_closed() {
+        for forged in [
+            call("GetSandboxStorageStatus", json!({"dry_run": true})),
+            call("RunSandboxBuildCacheReclaim", json!({})),
+            call(
+                "RunSandboxBuildCacheReclaim",
+                json!({"dry_run": false, "high_watermark": 1}),
+            ),
+        ] {
+            assert_eq!(forged.typed(), Err(OPERATOR_PARAMS_INVALID), "{forged:?}");
+        }
+        let typed = call("RunSandboxBuildCacheReclaim", json!({"dry_run": false}))
+            .typed()
+            .unwrap();
+        assert_eq!(typed.method(), "RunSandboxBuildCacheReclaim");
+        assert!(!typed.is_effect());
+        assert_eq!(typed.session_id(), None);
+        let status = call("GetSandboxStorageStatus", Value::Null)
+            .typed()
+            .unwrap();
+        assert_eq!(status.method(), "GetSandboxStorageStatus");
     }
 
     #[test]

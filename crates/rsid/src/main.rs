@@ -25,6 +25,12 @@ const MANAGER_ACTION_BACKSTOP_INTERVAL: Duration = Duration::from_secs(10);
 const MANAGER_COORDINATOR_STALL_AFTER: Duration = Duration::from_secs(30);
 const CONNECTION_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+const OPERATOR_DRAIN_LIMIT: Duration = Duration::from_secs(30);
+/// How long the process waits for tokio blocking tasks after `Shutdown complete`
+/// before it stops waiting and exits (#1057). Dropping a runtime otherwise
+/// blocks until every `spawn_blocking` task returns, and a blocking read of a
+/// provider child's pipe can outlive the daemon by minutes.
+const RUNTIME_DROP_GRACE: Duration = Duration::from_secs(2);
 
 async fn shutdown_stage<F: std::future::Future>(
     subsystem: &'static str,
@@ -101,8 +107,7 @@ where
     Some(start_dispatcher())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Informational flags exit here, before any daemon state exists. The
     // daemon starts after the match so no arm owns daemon startup: the
     // provider-capability scan reads a match arm's callees as one mapping.
@@ -119,12 +124,43 @@ async fn main() -> Result<()> {
             println!("rsid {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        CliAction::BuildInfo => {
+            // `<commit sha> <schema version>`: what `AgentRequestDeploy` probes.
+            println!("{}", rsid::deploy::build_info_line());
+            return Ok(());
+        }
         CliAction::Invalid => {
             eprintln!("Usage: rsid [--help | --version]");
             std::process::exit(2);
         }
     }
-    Box::pin(run_daemon()).await
+    // Allocator tuning must precede the runtime: glibc caps only arenas
+    // created after the call, and the runtime starts the worker threads
+    // that would otherwise take their own arenas first (#997).
+    rsid::process_memory::configure_allocator();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    run_to_bounded_exit(runtime, Box::pin(run_daemon()))
+}
+
+/// Runs the daemon future, then tears the runtime down within
+/// `RUNTIME_DROP_GRACE`. A plain runtime drop waits for every blocking task, so
+/// a stuck provider-child read kept rsid alive long after `Shutdown complete`
+/// (#1057). Blocking threads still running after the grace are abandoned; the
+/// process exits when `main` returns, so the result keeps its exit code.
+fn run_to_bounded_exit<F: std::future::Future<Output = Result<()>>>(
+    runtime: tokio::runtime::Runtime,
+    daemon: F,
+) -> Result<()> {
+    let result = runtime.block_on(daemon);
+    runtime.shutdown_timeout(RUNTIME_DROP_GRACE);
+    // #1045: a deploy restart exits 75 so `rsid-supervisor.sh` relaunches the
+    // new binary with its own environment.
+    if result.is_ok() && rsid::deploy::exit_75_requested() {
+        std::process::exit(rsid::watchdog::WATCHDOG_EXIT_CODE);
+    }
+    result
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -132,6 +168,7 @@ enum CliAction {
     Run,
     Help,
     Version,
+    BuildInfo,
     Invalid,
 }
 
@@ -140,6 +177,7 @@ fn cli_action(args: &[std::ffi::OsString]) -> CliAction {
         [] => CliAction::Run,
         [flag] if flag == "--help" || flag == "-h" => CliAction::Help,
         [flag] if flag == "--version" || flag == "-V" => CliAction::Version,
+        [flag] if flag == "--build-info" => CliAction::BuildInfo,
         _ => CliAction::Invalid,
     }
 }
@@ -171,6 +209,8 @@ async fn run_daemon() -> Result<()> {
 
     // Initialize tracing
     tracing_subscriber::fmt::init();
+    // Keep a redirected daemon.log bounded (#960); a no-op under journald.
+    rsid::log_rotation::spawn_bounded_log();
 
     // Route panics through tracing so they land in the same sink as everything
     // else instead of writing an unstructured line to raw stderr and vanishing
@@ -342,6 +382,13 @@ async fn run_daemon() -> Result<()> {
         RuntimeConfig::from_config_with_system_prompt_preset(&config, system_prompt_preset_seed);
     let persisted_daemon_settings =
         rsid::store::daemon_settings::apply_persisted_runtime_config(&store, &runtime_config)?;
+    // #1036: publish the operator's spend caps for scripts/cloud-spend.py.
+    if let Err(error) = rsid::cloud_spend::write_caps_file(
+        &rsid::cloud_spend::default_cloud_dir(),
+        &runtime_config.cloud_spend_caps(),
+    ) {
+        warn!(%error, "could not write the remote-gate spend caps file");
+    }
     if persisted_daemon_settings > 0 {
         config.apply_runtime_config_snapshot(&runtime_config);
         info!(
@@ -359,6 +406,7 @@ async fn run_daemon() -> Result<()> {
     if rsid::vault::install_global(vault).is_err() {
         warn!("key vault was already installed; keeping the first handle");
     }
+    rsid::vault::log_provider_credential_health(&rsid::vault::global());
 
     // Codegraph uses its own project-bound databases. An unavailable project
     // or index subsystem must not prevent the session daemon from starting.
@@ -414,6 +462,8 @@ async fn run_daemon() -> Result<()> {
     };
 
     let memory_handle = memory_manager.as_ref().map(|m| m.handle().clone());
+    // #1045: pin the start time and hash the running binary in the background.
+    rsid::daemon_info::DaemonInfoService::init_global(config.sandbox_base.clone());
     let mut session_manager = SessionManager::new(
         Arc::clone(&event_bus),
         store,
@@ -475,6 +525,18 @@ async fn run_daemon() -> Result<()> {
         .expect("successor_rx already taken");
 
     let session_manager = Arc::new(session_manager);
+
+    // Settle the operator queue's crash boundary before restore can start a
+    // monitor or the main loop can dispatch another provider turn.
+    let (retryable, uncertain) = session_manager
+        .reconcile_operator_messages_at_startup()
+        .await?;
+    if retryable > 0 || uncertain > 0 {
+        info!(
+            retryable,
+            uncertain, "Reconciled operator message claims after restart"
+        );
+    }
 
     // Restore sessions from previous daemon runs. A provider-inventory failure
     // is a daemon-wide startup fence: later best-effort reconciliation and
@@ -577,6 +639,43 @@ async fn run_daemon() -> Result<()> {
         let manager = Arc::clone(&session_manager);
         tokio::spawn(manager.run_agent_message_reconciliation_loop());
     }
+    {
+        let manager = Arc::clone(&session_manager);
+        tokio::spawn(manager.run_archived_sandbox_purge_loop());
+    }
+    // Issue #1007: the daemon-owned rolling merge queue. It reconciles
+    // interrupted runs once, then claims work only while the operator setting
+    // is on.
+    tokio::spawn(rsid::rolling_queue::run_rolling_queue_loop(
+        Arc::clone(session_manager.store()),
+        Arc::clone(&runtime_config),
+        rsid::rolling_queue::LanderLauncher::discover(),
+    ));
+
+    // Issue #1045: daemon-owned deploys. Verifies a `restarting` deploy once,
+    // then waits for a quiet point and restarts through the graceful drain.
+    {
+        let service = rsid::deploy::DeployService::init_global(config.sandbox_base.clone());
+        let manager = Arc::clone(&session_manager);
+        service.set_restart_trigger(Arc::new(move || {
+            rsid::deploy::request_exit_75();
+            manager.request_drain_restart();
+        }));
+        tokio::spawn(rsid::deploy::run_deploy_loop(
+            Arc::clone(session_manager.store()),
+            service,
+            session_manager.deploy_drain(),
+            Arc::clone(&runtime_config),
+        ));
+    }
+
+    // Issue #1002: daemon-owned durable agent jobs. The first poll reconciles
+    // units that finished while rsid was down; each job settles and wakes its
+    // owner exactly once.
+    tokio::spawn(rsid::agent_jobs::run_agent_jobs_loop(
+        Arc::clone(session_manager.store()),
+        Arc::new(rsid::agent_jobs::SystemdJobRuntime::default()),
+    ));
 
     // Restore has armed all retry candidates; now perform the one bounded C5
     // pending-journal replay without delaying startup or scanning sessions.
@@ -1046,6 +1145,7 @@ async fn run_daemon() -> Result<()> {
     let scheduler_heartbeat = config
         .scheduler_enabled
         .then(rsid::watchdog::LoopHeartbeat::new);
+    session_manager.clear_stale_harness_process_wakes().await;
     let scheduler_handle = if config.scheduler_enabled {
         let launcher =
             Arc::clone(&session_manager) as Arc<dyn rsid::issue_tracker::poller::SessionLauncher>;
@@ -1065,6 +1165,9 @@ async fn run_daemon() -> Result<()> {
         info!("Scheduled jobs scheduler disabled (RSI_SCHEDULER_ENABLED=false)");
         None
     };
+    if let Some(ref scheduler_handle) = scheduler_handle {
+        session_manager.install_harness_process_scheduler(scheduler_handle.clone());
+    }
 
     // A8: terminal-watch acceleration service — bridges bus events
     // (terminal flips, reconciled bypass flips, raised questions) to the
@@ -1113,6 +1216,13 @@ async fn run_daemon() -> Result<()> {
             }
         });
     }
+
+    // Registry controls and this poller ship together: disabled/unpaired peers
+    // never cause a socket connection or a remote daemon launch.
+    rsid::start_satellite_hub_poller(
+        Arc::clone(session_manager.store()),
+        Arc::clone(&runtime_config),
+    );
 
     let mut rpc_server = RpcServer::new(
         Arc::clone(&session_manager),
@@ -1168,33 +1278,14 @@ async fn run_daemon() -> Result<()> {
     let event_bus_for_spawn = Arc::clone(&event_bus);
     tokio::spawn(async move {
         while let Some(req) = spawn_rx.recv().await {
-            let parent_epic_id = req.epic_id;
-            let kind = req.kind;
-            let spawn_request_id = req.spawn_request_id;
-            match session_manager_for_spawn.launch_agent_child(req).await {
-                Ok(child_id) => {
-                    info!(
-                        spawn_request_id = %spawn_request_id,
-                        parent_epic_id = %parent_epic_id,
-                        child_id = %child_id,
-                        ?kind,
-                        "spawn_child: child session launched"
-                    );
-                    event_bus_for_spawn.publish(rsid::bus::DaemonEvent::ChildSpawned {
-                        parent_epic_id,
-                        child_id,
-                        kind,
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        spawn_request_id = %spawn_request_id,
-                        error = %e,
-                        parent_epic_id = %parent_epic_id,
-                        ?kind,
-                        "spawn_child: launch_session failed"
-                    );
-                }
+            // #1073: while a deploy drains, each spawn request waits in its own
+            // task so one held launch never stalls the consumer.
+            let manager = Arc::clone(&session_manager_for_spawn);
+            let bus = Arc::clone(&event_bus_for_spawn);
+            if manager.deploy_drain().is_draining() {
+                tokio::spawn(process_spawn_request(manager, bus, req));
+            } else {
+                process_spawn_request(manager, bus, req).await;
             }
         }
     });
@@ -1375,6 +1466,22 @@ async fn run_daemon() -> Result<()> {
         })
     }));
 
+    // #959: deliver due context-succession requests to idle managers and
+    // Epic leads (never mid-turn; a busy seat is retried on a later pass).
+    {
+        let succession_runtime = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = succession_runtime.deliver_due_context_successions().await {
+                    warn!(error = %error, "Context succession pass deferred");
+                }
+            }
+        });
+    }
+
     // Spawn stall-retry handler if RSI_RETRY_ON_STALL=true
     if config.retry_on_stall {
         let session_manager_for_stall = Arc::clone(&session_manager);
@@ -1444,6 +1551,13 @@ async fn run_daemon() -> Result<()> {
             .min(u128::from(u64::MAX)) as u64,
         "Daemon initialized, ready to accept connections"
     );
+    rsid::process_memory::on_request_ready();
+    // Sandbox diagnostics classify every retained sandbox; they run after
+    // readiness so they never delay restarts (#961).
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move { session_manager.run_startup_sandbox_diagnostics().await }
+    });
 
     let mut watchdog = Some(rsid::watchdog::start_watchdog(
         config.socket_path.clone(),
@@ -1472,8 +1586,14 @@ async fn run_daemon() -> Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut operator_drain_started: Option<tokio::time::Instant> = None;
+    let mut hard_shutdown_requested = false;
     let mut shutdown_deadline = tokio::time::Instant::now();
     let mut connections = tokio::task::JoinSet::new();
+    let mut operator_message_tick = tokio::time::interval(Duration::from_secs(1));
+    operator_message_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut drain_request_tick = tokio::time::interval(Duration::from_millis(250));
+    drain_request_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if drain_deadline.is_some() && connections.is_empty() {
             info!("Connection drain complete");
@@ -1481,8 +1601,33 @@ async fn run_daemon() -> Result<()> {
         }
         let deadline_snapshot = drain_deadline;
         tokio::select! {
+            _ = drain_request_tick.tick(), if drain_deadline.is_none() => {
+                if session_manager.drain_restart_requested() {
+                    let started = *operator_drain_started.get_or_insert_with(|| {
+                        info!("Operator DRAIN restart requested; status reads remain available during the wait");
+                        tokio::time::Instant::now()
+                    });
+                    shutdown_deadline = started + OPERATOR_DRAIN_LIMIT + SHUTDOWN_LIMIT;
+                    let snapshot = session_manager.drain_restart_status().await;
+                    let active_count = snapshot["active_sessions"].as_array().map_or(0, Vec::len);
+                    if active_count == 0 || tokio::time::Instant::now() >= started + OPERATOR_DRAIN_LIMIT {
+                        info!(active_count, "Operator DRAIN wait complete");
+                        if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
+                        if let Some(handle) = &scheduler_handle {
+                            let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
+                        }
+                        drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                    }
+                }
+            }
+            _ = operator_message_tick.tick(), if drain_deadline.is_none() => {
+                if let Err(error) = session_manager.dispatch_operator_messages_once().await {
+                    warn!(%error, "Operator message dispatch deferred");
+                }
+            }
             _ = &mut ctrl_c, if drain_deadline.is_none() => {
                 info!("Received shutdown signal (Ctrl+C)");
+                hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
                 if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
@@ -1494,6 +1639,7 @@ async fn run_daemon() -> Result<()> {
             }
             _ = sigterm.recv(), if drain_deadline.is_none() => {
                 info!("Received shutdown signal (SIGTERM)");
+                hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
                 if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
@@ -1608,12 +1754,24 @@ async fn run_daemon() -> Result<()> {
         shutdown_stage("memory", shutdown_deadline, mm.shutdown()).await;
     }
 
-    shutdown_stage(
-        "session_manager",
-        shutdown_deadline,
-        session_manager.shutdown(),
-    )
-    .await?;
+    if session_manager.drain_restart_requested() && !hard_shutdown_requested {
+        let remaining = operator_drain_started.map_or(Duration::ZERO, |started| {
+            (started + OPERATOR_DRAIN_LIMIT).saturating_duration_since(tokio::time::Instant::now())
+        });
+        shutdown_stage(
+            "session_manager",
+            shutdown_deadline,
+            session_manager.shutdown_drain(remaining),
+        )
+        .await?;
+    } else {
+        shutdown_stage(
+            "session_manager",
+            shutdown_deadline,
+            session_manager.shutdown(),
+        )
+        .await?;
+    }
 
     // Clean up socket
     if let Err(e) = tokio::fs::remove_file(&config.socket_path).await {
@@ -1653,6 +1811,41 @@ fn recursive_startup_recovery_budget(config: &Config) -> RecursiveRecoveryBudget
         max_graphs: config.recursive_dag_startup_recovery_max_graphs,
         time_budget_ms: Some(config.recursive_dag_startup_recovery_time_budget_ms),
         source: RecursiveRecoverySource::Startup,
+    }
+}
+
+async fn process_spawn_request(
+    session_manager: Arc<rsid::session::SessionManager>,
+    event_bus: Arc<rsid::bus::EventBus>,
+    req: rsid::session::spawn_coordinator::SpawnRequest,
+) {
+    let parent_epic_id = req.epic_id;
+    let kind = req.kind;
+    let spawn_request_id = req.spawn_request_id;
+    match session_manager.launch_agent_child(req).await {
+        Ok(child_id) => {
+            info!(
+                spawn_request_id = %spawn_request_id,
+                parent_epic_id = %parent_epic_id,
+                child_id = %child_id,
+                ?kind,
+                "spawn_child: child session launched"
+            );
+            event_bus.publish(rsid::bus::DaemonEvent::ChildSpawned {
+                parent_epic_id,
+                child_id,
+                kind,
+            });
+        }
+        Err(e) => {
+            error!(
+                spawn_request_id = %spawn_request_id,
+                error = %e,
+                parent_epic_id = %parent_epic_id,
+                ?kind,
+                "spawn_child: launch_session failed"
+            );
+        }
     }
 }
 
@@ -1813,15 +2006,23 @@ mod tests {
     #[test]
     #[ignore = "fixture entry point for the isolated real-daemon startup test"]
     fn sr2_real_daemon_fixture_process() {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("fixture runtime")
-            .block_on(run_daemon())
-            .expect("isolated daemon fixture");
+            .expect("fixture runtime");
+        if std::env::var_os("RSI_TEST_STUCK_BLOCKING_TASK").is_some() {
+            // Stands in for a blocking read of a provider child's pipe.
+            runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(600)));
+        }
+        run_to_bounded_exit(runtime, run_daemon()).expect("isolated daemon fixture");
     }
 
-    fn assert_isolated_sigint_exit(hold_client_open: bool, live_provider: bool, bound: Duration) {
+    fn assert_isolated_sigint_exit(
+        hold_client_open: bool,
+        live_provider: bool,
+        stuck_blocking_task: bool,
+        bound: Duration,
+    ) {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
@@ -1875,6 +2076,8 @@ mod tests {
             .env("HOME", &home)
             .env("RSI_DAEMON_SOCKET_PATH", &socket)
             .env("RSI_SANDBOX_BASE", &sandbox_base)
+            // Plain-text daemon log regardless of the ambient color setting.
+            .env("NO_COLOR", "1")
             .env("RSI_MEMORY_ENABLED", "false")
             .env("RSI_DREAM_ENABLED", "false")
             .env("RSI_QUEUE_ENABLED", "false")
@@ -1883,6 +2086,11 @@ mod tests {
             .env("RSI_SCHEDULER_ENABLED", "false")
             .env("RSI_SMOKE_SUPPRESS_RETRY_RESTORE", "true")
             .env("PATH", format!("{}:{inherited_path}", bin_dir.display()))
+            .envs(
+                stuck_blocking_task
+                    .then_some(("RSI_TEST_STUCK_BLOCKING_TASK", "1"))
+                    .into_iter(),
+            )
             .env_remove("RSI_PROCESS_OWNERSHIP_NAMESPACE")
             .env_remove("RSI_SESSION_ID")
             .env_remove("RSI_SESSION_TOKEN")
@@ -1897,8 +2105,20 @@ mod tests {
             "Daemon initialized, ready to accept connections",
             Duration::from_secs(15),
         );
-        let response = health_rpc(&socket).expect("isolated daemon health RPC");
-        assert!(response.contains("\"result\""));
+        // Readiness only: the SIGINT exit bound below is the assertion. A
+        // single 1 s health read timed out (WouldBlock) under shard load, so
+        // retry until the daemon answers, as the startup fixture does.
+        let health_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let response = loop {
+            match health_rpc(&socket) {
+                Ok(response) if response.contains("\"result\"") => break response,
+                _ if std::time::Instant::now() < health_deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => panic!("isolated daemon health RPC did not answer: {other:?}"),
+            }
+        };
+        assert!(response.contains("\"jsonrpc\":\"2.0\""));
         let session_id = if live_provider {
             let response = fixture_rpc(
                 &socket,
@@ -2016,17 +2236,24 @@ mod tests {
 
     #[test]
     fn idle_daemon_exits_cleanly_within_three_seconds_of_sigint() {
-        assert_isolated_sigint_exit(false, false, Duration::from_secs(3));
+        assert_isolated_sigint_exit(false, false, false, Duration::from_secs(3));
     }
 
     #[test]
     fn open_client_does_not_prevent_bounded_sigint_shutdown() {
-        assert_isolated_sigint_exit(true, false, Duration::from_secs(10));
+        assert_isolated_sigint_exit(true, false, false, Duration::from_secs(10));
     }
 
     #[test]
     fn live_provider_settles_restart_intent_within_ten_seconds_of_sigint() {
-        assert_isolated_sigint_exit(false, true, Duration::from_secs(10));
+        assert_isolated_sigint_exit(false, true, false, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn stuck_blocking_task_does_not_hold_process_after_shutdown_complete() {
+        // Exit must follow shutdown within RUNTIME_DROP_GRACE plus slack, even
+        // though a blocking task would otherwise run for ten minutes (#1057).
+        assert_isolated_sigint_exit(false, false, true, Duration::from_secs(6));
     }
 
     #[test]
@@ -2068,6 +2295,10 @@ mod tests {
             .env("RSI_SANDBOX_BASE", &sandbox_base)
             .env("RSI_SR2_TEST_RECLAIM_ENTERED", &reclaim_entered)
             .env("RSI_SR2_TEST_RECLAIM_RELEASE", &reclaim_release)
+            // The assertions match plain `field="value"` log text; without
+            // this the default tracing formatter styles fields with ANSI
+            // escapes unless the ambient environment happens to disable color.
+            .env("NO_COLOR", "1")
             .env("RSI_MEMORY_ENABLED", "false")
             .env("RSI_DREAM_ENABLED", "false")
             .env("RSI_QUEUE_ENABLED", "false")
@@ -2268,7 +2499,7 @@ mod tests {
     #[test]
     fn provider_inventory_fence_precedes_probes_workers_and_restore() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn main").expect("main function");
+        let main_start = source.find("async fn run_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)
@@ -2317,7 +2548,7 @@ mod tests {
     #[test]
     fn recursive_dag_live_startup_recovery_order_is_after_session_restore_before_graph_recovery() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn main").expect("main function");
+        let main_start = source.find("async fn run_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)
@@ -2345,7 +2576,7 @@ mod tests {
     #[test]
     fn startup_reclaim_is_after_authority_and_before_periodic_request_ready_and_accept() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn main").expect("main function");
+        let main_start = source.find("async fn run_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)
@@ -2418,7 +2649,7 @@ mod tests {
     #[test]
     fn daemon_instance_lease_precedes_store_open_and_socket_unlink() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn main").expect("main function");
+        let main_start = source.find("async fn run_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)

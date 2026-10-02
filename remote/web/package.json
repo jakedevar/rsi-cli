@@ -1,0 +1,8 @@
+{
+  "name": "rsi-remote-web-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -48,6 +48,8 @@ RSID_BIN="$TARGET_DIR/release/rsid"
 BUILD_RUSTC_BIN="$TARGET_DIR/release/rsi-build-rustc"
 RSI_RPC_BIN="$TARGET_DIR/release/rsi-rpc"
 RSI_AGENT_MCP_BIN="$TARGET_DIR/release/rsi-agent-mcp"
+# The worker preamble tells agents `rsi-contract-validate` parses their handoff.
+CONTRACT_VALIDATE_BIN="$TARGET_DIR/release/rsi-contract-validate"
 COMPAT_RELEASE_DIR="$ROOT/target/release"
 
 if [[ "$TUI_ONLY" -eq 1 ]]; then
@@ -75,10 +77,10 @@ if [[ "$TUI_ONLY" -eq 1 ]]; then
 fi
 
 if [[ "$LINK_ONLY" -eq 0 ]]; then
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc --bin rsi-contract-validate
 fi
 
-if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" || ! -x "$BUILD_RUSTC_BIN" ]]; then
+if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" || ! -x "$BUILD_RUSTC_BIN" || ! -x "$CONTRACT_VALIDATE_BIN" ]]; then
     echo "Release binaries not found at $TARGET_DIR/release" >&2
     exit 1
 fi
@@ -89,6 +91,7 @@ ln -sfn "$RSID_BIN" "$BIN_DIR/rsid"
 ln -sfn "$BUILD_RUSTC_BIN" "$BIN_DIR/rsi-build-rustc"
 ln -sfn "$RSI_RPC_BIN" "$BIN_DIR/rsi-rpc"
 ln -sfn "$RSI_AGENT_MCP_BIN" "$BIN_DIR/rsi-agent-mcp"
+ln -sfn "$CONTRACT_VALIDATE_BIN" "$BIN_DIR/rsi-contract-validate"
 
 if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
     mkdir -p "$COMPAT_RELEASE_DIR"
@@ -105,6 +108,7 @@ echo "  $BIN_DIR/rsid    -> $RSID_BIN"
 echo "  $BIN_DIR/rsi-build-rustc -> $BUILD_RUSTC_BIN"
 echo "  $BIN_DIR/rsi-rpc -> $RSI_RPC_BIN"
 echo "  $BIN_DIR/rsi-agent-mcp -> $RSI_AGENT_MCP_BIN"
+echo "  $BIN_DIR/rsi-contract-validate -> $CONTRACT_VALIDATE_BIN"
 if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
     echo "Compatibility links:"
     echo "  $COMPAT_RELEASE_DIR/rsi     -> $RSI_BIN"

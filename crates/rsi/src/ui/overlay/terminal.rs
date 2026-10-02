@@ -1,6 +1,7 @@
 //! Renderer for the embedded terminal overlay.
 
 use crate::app::App;
+use crate::types::ModalGeometry;
 use crate::ui::theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -17,14 +18,28 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Option<Color> {
     }
 }
 
-/// Render the terminal overlay as a floating panel.
-pub(super) fn render_terminal_overlay(frame: &mut Frame, area: Rect, app: &App) {
+/// Popup bounds shared by rendering and PTY sizing.
+pub(crate) fn popup_rect(area: Rect, geom: &ModalGeometry) -> Rect {
     // --- Compute popup rect: 90% width, 80% height, centered ---
     let popup_width = (area.width * 90 / 100).max(20);
     let popup_height = (area.height * 80 / 100).max(5);
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+    super::apply_geometry_deltas(
+        Rect::new(popup_x, popup_y, popup_width, popup_height),
+        geom,
+        area,
+    )
+}
+
+/// Render the terminal overlay as a floating panel.
+pub(super) fn render_terminal_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let geom = app
+        .modal_geometries
+        .get("Terminal")
+        .cloned()
+        .unwrap_or_default();
+    let popup_rect = popup_rect(area, &geom);
 
     frame.render_widget(Clear, popup_rect);
 

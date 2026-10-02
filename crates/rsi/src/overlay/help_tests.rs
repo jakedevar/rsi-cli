@@ -229,7 +229,13 @@ async fn browsers_and_modals_list_close_and_class_actions() {
     assert_help(
         &mut app,
         OverlayHelpClass::Notifications,
-        &["Esc / q", "Dismiss all active notifications"],
+        &[
+            "Esc / q",
+            "Dismiss all active notifications",
+            "Open linked session",
+            "Move modal",
+            "Resize modal",
+        ],
     );
 
     app.overlay = OverlayState::TrashBrowser {
@@ -418,4 +424,53 @@ async fn prompt_owned_model_picker_help_describes_the_picker_in_both_prompt_slot
         app.input_overlays.get(idx),
         Some(OverlayState::Prompt { model_dropdown, .. }) if model_dropdown.open
     ));
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn new_session_prompt_help_describes_each_side_and_the_continue_prompt() {
+    // Front side: launch keys, the flip to settings and the text tools.
+    let mut app = test_app();
+    prompt::open_blank_popup(&mut app);
+    assert_help(
+        &mut app,
+        OverlayHelpClass::LaunchPrompt,
+        &[
+            "Ctrl-Q",
+            "Close and keep the draft",
+            "Launch the session",
+            "Flip to launch settings",
+            "Cycle effort level",
+            "Toggle sandbox",
+            "Compile prompt",
+        ],
+    );
+
+    // Settings side: row navigation and value changes.
+    if let Some(OverlayState::Prompt { launch, .. }) = app.focused_input_overlay_mut() {
+        launch.open = true;
+    }
+    assert_help(
+        &mut app,
+        OverlayHelpClass::LaunchSettings,
+        &[
+            "Move between settings",
+            "Change the selected setting",
+            "Flip back to the prompt",
+        ],
+    );
+    assert!(matches!(
+        app.focused_input_overlay(),
+        Some(OverlayState::Prompt { launch, .. }) if launch.open
+    ));
+
+    // A continue prompt held in `app.overlay`.
+    let mut app = crate::app::app_test_helpers::with_session_list(1);
+    let session_id = app.selected_session_id().expect("fixture session");
+    prompt::open_continue_popup(&mut app, session_id);
+    assert_help(
+        &mut app,
+        OverlayHelpClass::ContinuePrompt,
+        &["Close without sending", "Send the follow-up"],
+    );
 }

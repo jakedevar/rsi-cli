@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tomllib
 
 sys.dont_write_bytecode = True
 
@@ -224,6 +223,19 @@ def lost_hunks(repo, base, source, candidate, proof=None):
     return errors
 
 
+def load_toml_module():
+    """Return a TOML parser: stdlib tomllib (Python >= 3.11) or tomli."""
+    for name in ("tomllib", "tomli"):
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            continue
+    raise GuardError(
+        "no TOML parser: Python >= 3.11 (tomllib) or the tomli package is required; "
+        f"this is Python {sys.version_info.major}.{sys.version_info.minor}"
+    )
+
+
 def affected_crates(repo, target, candidate):
     packages = set()
     for path in paths_changed(repo, target, candidate):
@@ -234,7 +246,7 @@ def affected_crates(repo, target, candidate):
         contents = blob(repo, candidate, manifest) or blob(repo, target, manifest)
         if contents is None:
             raise GuardError(f"missing crate manifest: {manifest}")
-        package = tomllib.loads(contents.decode())["package"]["name"]
+        package = load_toml_module().loads(contents.decode())["package"]["name"]
         packages.add(package)
     return sorted(packages)
 
@@ -243,11 +255,23 @@ def test_commands(packages, filters):
     selected = {}
     for item in filters:
         package, separator, test_filter = item.partition("=")
-        if not separator or package not in packages or not test_filter or test_filter.startswith("-"):
-            raise GuardError(f"invalid test filter (expected affected-package=filter): {item}")
+        if not separator or not package or not test_filter or test_filter.startswith("-"):
+            raise GuardError(f"invalid test filter (expected package=filter): {item}")
         selected.setdefault(package, []).append(test_filter)
-    return [["cargo", "test", "-p", package, "--lib", *([test_filter] if test_filter else [])]
-            for package in packages for test_filter in selected.get(package, [""])]
+
+    def command(package, test_filter):
+        # bin:NAME / test:NAME select a cargo target rather than a lib filter.
+        if test_filter.startswith("bin:"):
+            return ["cargo", "test", "-p", package, "--bin", test_filter[4:]]
+        if test_filter.startswith("test:"):
+            return ["cargo", "test", "-p", package, "--test", test_filter[5:]]
+        return ["cargo", "test", "-p", package, "--lib", *([test_filter] if test_filter else [])]
+
+    # A filter may name a package the diff did not touch (a reader of a changed
+    # doc or script); the Rust lander validates it against workspace members.
+    gated = list(packages) + [name for name in selected if name not in packages]
+    return [command(package, test_filter)
+            for package in gated for test_filter in selected.get(package, [""])]
 
 
 def run_tests(candidate, worktree, commands):

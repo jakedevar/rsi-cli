@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 use rsi_common::sandbox_storage::{
@@ -15,7 +15,7 @@ use rsi_common::sandbox_storage::{
 };
 use rsi_common::types::SessionProvider;
 
-use crate::memory::types::MemoryConfig;
+use crate::store_support::config_types::MemoryConfig;
 
 /// Read `RSI_<suffix>` first, falling back to `MOTHERSHIP_<suffix>` then
 /// `FLYWHEEL_<suffix>`. Returns the same `Result` shape as `std::env::var`
@@ -60,6 +60,20 @@ pub const WORKER_SCOPE_MEMORY_SWAP_MAX_MIB_DEFAULT: u64 = 0;
 pub const COMPLETED_TRANSCRIPT_CACHE_MAX_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 pub const SESSION_RETENTION_WINDOW_HOURS_DEFAULT: u64 = 24;
 pub const WORKER_SCOPE_CPU_WEIGHT_DEFAULT: u32 = 20;
+/// #966: live-context budget at which an OpenRouter session compacts. An
+/// agent step costs roughly its live context, so a small budget keeps cached
+/// re-reads cheap. `0` turns the absolute budget off.
+pub const OPENROUTER_CONTEXT_BUDGET_TOKENS_DEFAULT: u64 = 128_000;
+pub const OPENROUTER_CONTEXT_BUDGET_TOKENS_MIN: u64 = 32_000;
+pub const OPENROUTER_CONTEXT_BUDGET_TOKENS_MAX: u64 = 2_000_000;
+/// #1050: agent-loop iterations one Harness turn may use before the #1039
+/// wrap-up. A normal Issue (read, edit, build, test, commit, report) takes
+/// 50-150 tool calls, so the default lets it finish in one turn; context and
+/// cost stay bounded by compaction and the spend controls.
+pub const HARNESS_MAX_ITERATIONS_PER_TURN_DEFAULT: u32 = 150;
+pub const HARNESS_MAX_ITERATIONS_PER_TURN_MIN: u32 = 10;
+pub const HARNESS_MAX_ITERATIONS_PER_TURN_MAX: u32 = 1000;
+pub const MCP_DEFERRED_TOOL_THRESHOLD_DEFAULT: usize = 32;
 
 /// Runtime config fields whose user-initiated `UpdateDaemonConfig` mutations
 /// are durable daemon settings. Values are stored in SQLite's existing
@@ -70,6 +84,7 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "session_retention_window_hours",
     "completed_transcript_cache_max_bytes",
     "retry_enabled",
+    "satellite_polling_enabled",
     "retry_max_default",
     "retry_on_stall",
     "retry_max_backoff_ms",
@@ -131,12 +146,47 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // admission read path looks the key up by that exact string.
     // `orchestration_max_child_effort_field_name_matches_store_key` locks the two together.
     "orchestration_max_child_effort",
+    // Issue #692: operator launch-model allowlist, enforced at the launch funnel.
+    "launch_model_allowlist",
     "sandbox_build_cache_reclaim_enabled",
     "sandbox_build_cache_reclaim_ttl_secs",
     "sandbox_build_cache_reclaim_interval_secs",
     "sandbox_build_cache_reclaim_high_watermark_pct",
     "sandbox_build_cache_reclaim_low_watermark_pct",
     "sandbox_build_cache_reclaim_max_candidates",
+    "sandbox_max_source_roots",
+    "sandbox_min_free_gib",
+    "archived_sandbox_purge_enabled",
+    // Issue #1007: the daemon-owned rolling merge queue.
+    "rolling_queue_enabled",
+    // Issue #1073: hold new work while a deploy waits for its quiet point.
+    "deploy_drain_enabled",
+    "rolling_queue_batch_size",
+    "rolling_queue_speculation_depth",
+    // Issue #794 S3: child-aware continuation policy.
+    "program_hold_while_children_run",
+    "child_keepalive_enabled",
+    "child_keepalive_window_secs",
+    // Issue #1014: resource governor policy (defaults equal the retired cargo-slot).
+    "governor_build_slots",
+    "governor_lander_slots",
+    "governor_max_load",
+    "governor_min_free_disk_gb",
+    "governor_min_avail_mem_gb",
+    "governor_max_workers_slice_gb",
+    // Issue #792: daemon-wide Harness tool policy defaults. A session's own
+    // policy fills what it leaves unset from these.
+    "harness_web_access",
+    // Issue #774: `deny_private | offline`.
+    "harness_egress_mode",
+    "harness_max_search_calls",
+    "harness_max_fetch_calls",
+    "harness_max_result_bytes",
+    "harness_max_web_cost_usd_micros",
+    "completion_gates_enabled",
+    "mcp.deferred_tool_threshold",
+    "cloud_spend_stop_line_usd",
+    "cloud_spend_daily_cap_usd",
     "agent_build_jobs",
     "agent_build_line_tables_only",
     "agent_build_sccache_enabled",
@@ -153,15 +203,25 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "vault.env_compat",
     "vault.check_ttl_secs",
     "api_route.openrouter",
+    "api_route.bedrock",
     "api_route.fallback",
+    "openrouter_context_budget_tokens",
+    "harness_max_iterations_per_turn",
 ];
 
 pub fn is_persisted_runtime_config_field(field: &str) -> bool {
-    PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field) || openrouter_model_route_key(field).is_some()
+    PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field)
+        || openrouter_model_route_key(field).is_some()
+        || bedrock_model_route_key(field).is_some()
 }
 
 fn openrouter_model_route_key(field: &str) -> Option<&str> {
     let model = field.strip_prefix("api_route.openrouter.")?;
+    (!model.is_empty() && !model.chars().any(char::is_whitespace)).then_some(model)
+}
+
+fn bedrock_model_route_key(field: &str) -> Option<&str> {
+    let model = field.strip_prefix("api_route.bedrock.")?;
     (!model.is_empty() && !model.chars().any(char::is_whitespace)).then_some(model)
 }
 
@@ -454,6 +514,8 @@ pub struct RuntimeConfig {
     pub session_retention_window_hours: AtomicU64,
     pub completed_transcript_cache_max_bytes: AtomicU64,
     pub retry_enabled: AtomicBool,
+    /// Global kill switch for hub satellite polling. Default on.
+    pub satellite_polling_enabled: AtomicBool,
     pub retry_max_default: AtomicU8,
     pub retry_on_stall: AtomicBool,
     pub smoke_suppress_retry_restore: AtomicBool,
@@ -544,16 +606,89 @@ pub struct RuntimeConfig {
     /// `AGENT_VERBS`/`READ_VERBS`, so a session-attributed caller is refused by
     /// the pre-dispatch gate and cannot raise its own ceiling.
     pub orchestration_max_child_effort: RwLock<String>,
+    /// Issue #692: operator launch-model allowlist (model ids). Empty means
+    /// unrestricted. Every launch's EFFECTIVE model (request, else project
+    /// default, else provider default) is canonicalised (`[1m]`-style variant
+    /// tag and `openrouter/`/`bedrock/` routing prefix dropped) and must equal
+    /// an entry exactly, case-insensitively; a launch with no determinable
+    /// model is refused while the list is set. Checked before any side effect
+    /// at the launch chokepoint, preflighted for continuations and rotations,
+    /// and pre-checked on `AgentSpawnChild`; a change applies to the next
+    /// launch without a restart. Validated on write via
+    /// `rsi_common::launch_allowlist::normalize_launch_model_allowlist`.
+    /// Operator-only: reachable only through `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub launch_model_allowlist: RwLock<Vec<String>>,
     /// #694 K1: operator-only key-vault settings (`vault.env_compat`,
     /// `vault.check_ttl_secs`), shared with the daemon's `VaultHandle` so an
     /// `UpdateDaemonConfig` change applies to the next resolution/check.
     pub vault_settings: Arc<crate::vault::VaultSettings>,
     pub openrouter_route: RwLock<OpenRouterRoute>,
     pub openrouter_model_routes: RwLock<std::collections::HashMap<String, OpenRouterRoute>>,
+    pub bedrock_route: RwLock<OpenRouterRoute>,
+    pub bedrock_model_routes: RwLock<std::collections::HashMap<String, OpenRouterRoute>>,
     pub api_route_fallback: AtomicBool,
+    /// #966: absolute live-context budget for OpenRouter sessions (0 = off).
+    /// Read at each launch and each Harness compaction check.
+    pub openrouter_context_budget_tokens: AtomicU64,
+    /// #1050: operator cap on agent-loop iterations per Harness turn. Read
+    /// when a turn starts, so a change applies to the next turn.
+    pub harness_max_iterations_per_turn: AtomicU32,
     /// Issue #69: operator-owned target-cache lifecycle controls. These
     /// settings never grant worktree or branch deletion authority.
     sandbox_build_cache_reclaim: RwLock<SandboxBuildCacheReclaimConfig>,
+    /// Admission limits for new Git worktree roots. Only operator config RPC
+    /// may change these; allocation reads them while holding its permit.
+    pub sandbox_max_source_roots: AtomicU32,
+    pub sandbox_min_free_gib: AtomicU64,
+    pub archived_sandbox_purge_enabled: AtomicBool,
+    /// Issue #1007: rolling merge queue switch (default off), batch size
+    /// (1..=8; slice S1 always runs one source per gate) and speculation
+    /// depth (0..=2). Operator-only: reachable only through
+    /// `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub rolling_queue_enabled: AtomicBool,
+    /// Issue #1073: while an agent-requested deploy waits for its quiet point
+    /// (default on), the daemon holds new child launches, child continuations,
+    /// scheduled child wakes and new agent jobs so a busy hub can go quiet.
+    /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub deploy_drain_enabled: AtomicBool,
+    pub rolling_queue_batch_size: AtomicU32,
+    /// Issue #1014: resource governor policy. `governor_max_load` 0 means 1.25 x cores.
+    pub governor_build_slots: AtomicU32,
+    pub governor_lander_slots: AtomicU32,
+    pub governor_max_load: AtomicU32,
+    pub governor_min_free_disk_gb: AtomicU64,
+    pub governor_min_avail_mem_gb: AtomicU64,
+    pub governor_max_workers_slice_gb: AtomicU64,
+    pub rolling_queue_speculation_depth: AtomicU32,
+    /// Issue #794 S3: hold a program-mode master's due Resume wake while its
+    /// children run (default on) and, when `child_keepalive_enabled` (default
+    /// off), give an idle parent one bounded keep-alive Resume per
+    /// `child_keepalive_window_secs` window. Operator-only.
+    pub program_hold_while_children_run: AtomicBool,
+    pub child_keepalive_enabled: AtomicBool,
+    pub child_keepalive_window_secs: AtomicU64,
+    /// Issue #792: daemon-wide Harness tool policy defaults. `harness_web_access`
+    /// is `enabled | hosted_only | disabled`; each cap is 0 for unlimited. A
+    /// per-session `tool_policy` overrides a default it sets. Operator-only:
+    /// reachable through `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub harness_web_access: RwLock<String>,
+    /// Issue #774: default network egress mode for Harness network tools and
+    /// the shell: `deny_private` (public addresses only) or `offline`.
+    pub harness_egress_mode: RwLock<String>,
+    pub harness_max_search_calls: AtomicU64,
+    pub harness_max_fetch_calls: AtomicU64,
+    pub harness_max_result_bytes: AtomicU64,
+    pub harness_max_web_cost_usd_micros: AtomicU64,
+    /// #794: operator kill switch for session completion gates. A configured
+    /// gate still emits a visible disabled event when a Harness session ends.
+    pub completion_gates_enabled: AtomicBool,
+    /// Above this many permitted MCP tools, only `tool_search` is advertised.
+    /// Zero defers every tool; 256 is the current session tool cap.
+    pub mcp_deferred_tool_threshold: AtomicUsize,
+    /// #1036: remote-gate spend caps in whole USD. The daemon mirrors them
+    /// into `spend-caps.json` beside the ledger for `scripts/cloud-spend.py`.
+    pub cloud_spend_stop_line_usd: AtomicU64,
+    pub cloud_spend_daily_cap_usd: AtomicU64,
     /// Launch defaults for sandboxed agent builds. Read at each process spawn.
     pub agent_build_jobs: AtomicU32,
     pub agent_build_line_tables_only: AtomicBool,
@@ -667,6 +802,7 @@ impl RuntimeConfig {
                 COMPLETED_TRANSCRIPT_CACHE_MAX_BYTES_DEFAULT,
             ),
             retry_enabled: AtomicBool::new(config.retry_max_default > 0),
+            satellite_polling_enabled: AtomicBool::new(true),
             retry_max_default: AtomicU8::new(config.retry_max_default),
             retry_on_stall: AtomicBool::new(config.retry_on_stall),
             smoke_suppress_retry_restore: AtomicBool::new(config.smoke_suppress_retry_restore),
@@ -718,10 +854,19 @@ impl RuntimeConfig {
             orchestration_max_child_effort: RwLock::new(
                 rsi_common::model_control::ORCHESTRATION_MAX_CHILD_EFFORT_UNSET.to_string(),
             ),
+            launch_model_allowlist: RwLock::new(Vec::new()),
             vault_settings: Arc::new(crate::vault::VaultSettings::default()),
             openrouter_route: RwLock::new(OpenRouterRoute::CodexCli),
             openrouter_model_routes: RwLock::new(std::collections::HashMap::new()),
+            bedrock_route: RwLock::new(OpenRouterRoute::CodexCli),
+            bedrock_model_routes: RwLock::new(std::collections::HashMap::new()),
             api_route_fallback: AtomicBool::new(true),
+            openrouter_context_budget_tokens: AtomicU64::new(
+                OPENROUTER_CONTEXT_BUDGET_TOKENS_DEFAULT,
+            ),
+            harness_max_iterations_per_turn: AtomicU32::new(
+                HARNESS_MAX_ITERATIONS_PER_TURN_DEFAULT,
+            ),
             sandbox_build_cache_reclaim: RwLock::new(SandboxBuildCacheReclaimConfig {
                 enabled: true,
                 ttl_secs: SANDBOX_BUILD_CACHE_RECLAIM_TTL_SECS_DEFAULT,
@@ -730,6 +875,48 @@ impl RuntimeConfig {
                 low_watermark_pct: SANDBOX_BUILD_CACHE_RECLAIM_LOW_WATERMARK_PCT_DEFAULT,
                 max_candidates: SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_DEFAULT,
             }),
+            sandbox_max_source_roots: AtomicU32::new(4096),
+            // Match the interim cargo-slot host floor until the operator
+            // chooses a different allocation threshold.
+            sandbox_min_free_gib: AtomicU64::new(30),
+            archived_sandbox_purge_enabled: AtomicBool::new(false),
+            program_hold_while_children_run: AtomicBool::new(
+                rsi_common::child_autonomy::PROGRAM_HOLD_DEFAULT,
+            ),
+            child_keepalive_enabled: AtomicBool::new(
+                rsi_common::child_autonomy::KEEPALIVE_ENABLED_DEFAULT,
+            ),
+            child_keepalive_window_secs: AtomicU64::new(
+                rsi_common::child_autonomy::KEEPALIVE_WINDOW_DEFAULT_SECS,
+            ),
+            harness_web_access: RwLock::new("enabled".to_string()),
+            harness_egress_mode: RwLock::new("deny_private".to_string()),
+            harness_max_search_calls: AtomicU64::new(0),
+            harness_max_fetch_calls: AtomicU64::new(0),
+            harness_max_result_bytes: AtomicU64::new(0),
+            harness_max_web_cost_usd_micros: AtomicU64::new(0),
+            completion_gates_enabled: AtomicBool::new(true),
+            mcp_deferred_tool_threshold: AtomicUsize::new(MCP_DEFERRED_TOOL_THRESHOLD_DEFAULT),
+            cloud_spend_stop_line_usd: AtomicU64::new(
+                rsi_common::cloud_spend::DEFAULT_STOP_LINE_USD,
+            ),
+            cloud_spend_daily_cap_usd: AtomicU64::new(
+                rsi_common::cloud_spend::DEFAULT_DAILY_CAP_USD,
+            ),
+            rolling_queue_enabled: AtomicBool::new(false),
+            deploy_drain_enabled: AtomicBool::new(true),
+            rolling_queue_batch_size: AtomicU32::new(
+                rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_BATCH_SIZE,
+            ),
+            rolling_queue_speculation_depth: AtomicU32::new(
+                rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_SPECULATION_DEPTH,
+            ),
+            governor_build_slots: AtomicU32::new(4),
+            governor_lander_slots: AtomicU32::new(5),
+            governor_max_load: AtomicU32::new(0),
+            governor_min_free_disk_gb: AtomicU64::new(30),
+            governor_min_avail_mem_gb: AtomicU64::new(16),
+            governor_max_workers_slice_gb: AtomicU64::new(30),
             agent_build_jobs: AtomicU32::new(4),
             agent_build_line_tables_only: AtomicBool::new(true),
             agent_build_sccache_enabled: AtomicBool::new(true),
@@ -791,6 +978,7 @@ impl RuntimeConfig {
         let reclaim = self.sandbox_build_cache_reclaim_snapshot();
         let mut value = serde_json::json!({
             "retry_enabled": self.retry_enabled.load(Ordering::Relaxed),
+            "satellite_polling_enabled": self.satellite_polling_enabled.load(Ordering::Relaxed),
             "retry_max_default": self.retry_max_default.load(Ordering::Relaxed),
             "retry_on_stall": self.retry_on_stall.load(Ordering::Relaxed),
             "retry_max_backoff_ms": self.retry_max_backoff_ms.load(Ordering::Relaxed),
@@ -832,6 +1020,10 @@ impl RuntimeConfig {
             "stall_classifier_confidence_floor": *self.stall_classifier_confidence_floor.read(),
         });
         if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                rsi_common::launch_allowlist::LAUNCH_MODEL_ALLOWLIST_FIELD.to_string(),
+                self.launch_model_allowlist.read().clone().into(),
+            );
             map.insert(
                 "session_retention_enabled".to_string(),
                 self.session_retention_enabled
@@ -961,6 +1153,115 @@ impl RuntimeConfig {
                 reclaim.max_candidates.into(),
             );
             map.insert(
+                "sandbox_max_source_roots".to_string(),
+                self.sandbox_max_source_roots.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "sandbox_min_free_gib".to_string(),
+                self.sandbox_min_free_gib.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "archived_sandbox_purge_enabled".to_string(),
+                self.archived_sandbox_purge_enabled
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "program_hold_while_children_run".to_string(),
+                self.program_hold_while_children_run
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "child_keepalive_enabled".to_string(),
+                self.child_keepalive_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "child_keepalive_window_secs".to_string(),
+                self.child_keepalive_window_secs
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "governor_build_slots".to_string(),
+                self.governor_build_slots.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "governor_lander_slots".to_string(),
+                self.governor_lander_slots.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "governor_max_load".to_string(),
+                self.governor_max_load.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "governor_min_free_disk_gb".to_string(),
+                self.governor_min_free_disk_gb
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "governor_min_avail_mem_gb".to_string(),
+                self.governor_min_avail_mem_gb
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "governor_max_workers_slice_gb".to_string(),
+                self.governor_max_workers_slice_gb
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "harness_web_access".to_string(),
+                self.harness_web_access.read().clone().into(),
+            );
+            map.insert(
+                "harness_egress_mode".to_string(),
+                self.harness_egress_mode.read().clone().into(),
+            );
+            map.insert(
+                "mcp.deferred_tool_threshold".to_string(),
+                self.mcp_deferred_tool_threshold
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            for (field, atomic) in [
+                ("cloud_spend_stop_line_usd", &self.cloud_spend_stop_line_usd),
+                ("cloud_spend_daily_cap_usd", &self.cloud_spend_daily_cap_usd),
+                ("harness_max_search_calls", &self.harness_max_search_calls),
+                ("harness_max_fetch_calls", &self.harness_max_fetch_calls),
+                ("harness_max_result_bytes", &self.harness_max_result_bytes),
+                (
+                    "harness_max_web_cost_usd_micros",
+                    &self.harness_max_web_cost_usd_micros,
+                ),
+            ] {
+                map.insert(field.to_string(), atomic.load(Ordering::Relaxed).into());
+            }
+            map.insert(
+                "completion_gates_enabled".to_string(),
+                self.completion_gates_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "rolling_queue_enabled".to_string(),
+                self.rolling_queue_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "deploy_drain_enabled".to_string(),
+                self.deploy_drain_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "rolling_queue_batch_size".to_string(),
+                self.rolling_queue_batch_size.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "rolling_queue_speculation_depth".to_string(),
+                self.rolling_queue_speculation_depth
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
                 rsi_common::provider_credentials::SETTING_VAULT_ENV_COMPAT.to_string(),
                 self.vault_settings.env_compat().into(),
             );
@@ -973,14 +1274,33 @@ impl RuntimeConfig {
                 self.openrouter_route.read().as_str().into(),
             );
             map.insert(
+                "api_route.bedrock".to_string(),
+                self.bedrock_route.read().as_str().into(),
+            );
+            map.insert(
                 "api_route.fallback".to_string(),
                 self.api_route_fallback.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "openrouter_context_budget_tokens".to_string(),
+                self.openrouter_context_budget_tokens
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "harness_max_iterations_per_turn".to_string(),
+                self.harness_max_iterations_per_turn
+                    .load(Ordering::Relaxed)
+                    .into(),
             );
             for (model, route) in self.openrouter_model_routes.read().iter() {
                 map.insert(
                     format!("api_route.openrouter.{model}"),
                     route.as_str().into(),
                 );
+            }
+            for (model, route) in self.bedrock_model_routes.read().iter() {
+                map.insert(format!("api_route.bedrock.{model}"), route.as_str().into());
             }
             map.insert("recursive_dag_inspection".to_string(), true.into());
             map.insert("recursive_dag_run_inspection".to_string(), true.into());
@@ -1045,13 +1365,20 @@ impl RuntimeConfig {
                     .load(Ordering::Relaxed)
                     .into(),
             );
-            map.insert("recursive_dag_fake_executor_only".to_string(), true.into());
+            // Fixed Phase 5A.5 constants, not runtime state and not the live
+            // capability flags (those are `DaemonCapabilities.recursive_dag_*`,
+            // fed by `recursive_dag_live_scheduler_control_enabled`). The
+            // `_fixed_` infix keeps them from being mistaken for those flags.
             map.insert(
-                "recursive_dag_live_executor_enabled".to_string(),
+                "recursive_dag_fixed_fake_executor_only".to_string(),
+                true.into(),
+            );
+            map.insert(
+                "recursive_dag_fixed_live_executor_enabled".to_string(),
                 false.into(),
             );
             map.insert(
-                "recursive_dag_background_loop_enabled".to_string(),
+                "recursive_dag_fixed_background_loop_enabled".to_string(),
                 false.into(),
             );
             map.insert(
@@ -1070,6 +1397,74 @@ impl RuntimeConfig {
         value
     }
 
+    /// Current resource governor policy (#1014), read from the live atomics.
+    #[must_use]
+    pub fn governor_policy(&self) -> crate::store_support::config_types::GovernorPolicy {
+        crate::store_support::config_types::GovernorPolicy {
+            build_slots: self.governor_build_slots.load(Ordering::Relaxed),
+            lander_slots: self.governor_lander_slots.load(Ordering::Relaxed),
+            max_load: self.governor_max_load.load(Ordering::Relaxed),
+            min_free_disk_gb: self.governor_min_free_disk_gb.load(Ordering::Relaxed),
+            min_avail_mem_gb: self.governor_min_avail_mem_gb.load(Ordering::Relaxed),
+            max_workers_slice_gb: self.governor_max_workers_slice_gb.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The daemon-wide Harness tool policy defaults (#792). A cap of 0 is
+    /// unlimited; an all-default result restricts nothing.
+    pub fn harness_tool_policy_defaults(
+        &self,
+    ) -> rsi_common::harness_tool_policy::HarnessToolPolicy {
+        use rsi_common::harness_tool_policy::{HarnessToolPolicy, ToolBudgets, WebAccessMode};
+        let cap = |atomic: &AtomicU64| Some(atomic.load(Ordering::Relaxed)).filter(|&n| n > 0);
+        let web = WebAccessMode::parse(&self.harness_web_access.read())
+            .filter(|mode| *mode != WebAccessMode::Enabled);
+        HarnessToolPolicy {
+            enabled_tools: None,
+            denied_tools: Vec::new(),
+            web_access: web,
+            egress: rsi_common::egress_policy::EgressMode::parse(&self.harness_egress_mode.read())
+                .filter(|mode| *mode != rsi_common::egress_policy::EgressMode::DenyPrivate),
+            budgets: ToolBudgets {
+                max_search_calls: cap(&self.harness_max_search_calls)
+                    .and_then(|n| u32::try_from(n).ok()),
+                max_fetch_calls: cap(&self.harness_max_fetch_calls)
+                    .and_then(|n| u32::try_from(n).ok()),
+                max_result_bytes: cap(&self.harness_max_result_bytes),
+                max_web_cost_usd_micros: cap(&self.harness_max_web_cost_usd_micros),
+            },
+        }
+    }
+
+    /// The ONE predicate for "this session is under a Harness tool policy":
+    /// it has a stored per-session row, or it runs a Harness-loop provider that
+    /// the daemon-wide defaults (never stored) restrict. Child inheritance and
+    /// the provider-route guard both use it, so a default-only restriction
+    /// cannot be escaped through a CLI child or a Harness -> Codex CLI fallback.
+    pub fn session_is_under_tool_policy(
+        &self,
+        provider: rsi_common::types::SessionProvider,
+        stored: Option<&rsi_common::harness_tool_policy::HarnessToolPolicy>,
+    ) -> bool {
+        stored.is_some()
+            || (rsi_common::harness_tool_policy::provider_runs_harness_loop(provider)
+                && !self.harness_tool_policy_defaults().is_default())
+    }
+
+    /// #1036: the operator's remote-gate spend caps.
+    pub fn cloud_spend_caps(&self) -> rsi_common::cloud_spend::CloudSpendCaps {
+        rsi_common::cloud_spend::CloudSpendCaps {
+            stop_line_usd: self.cloud_spend_stop_line_usd.load(Ordering::Relaxed),
+            daily_cap_usd: self.cloud_spend_daily_cap_usd.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn mcp_deferred_tool_threshold(&self) -> usize {
+        self.mcp_deferred_tool_threshold
+            .load(Ordering::Relaxed)
+            .clamp(0, 256)
+    }
+
     pub fn persisted_field_value(&self, field: &str) -> Option<serde_json::Value> {
         if !is_persisted_runtime_config_field(field) {
             return None;
@@ -1082,6 +1477,45 @@ impl RuntimeConfig {
         )
     }
 
+    /// #1050: the operator's per-turn iteration cap for Harness sessions.
+    pub fn harness_max_iterations(&self) -> u32 {
+        self.harness_max_iterations_per_turn.load(Ordering::Relaxed)
+    }
+
+    /// Issue #692: the typed refusal for a launch of `model` on `provider`, or
+    /// `None` when the operator allowlist admits it (an empty list admits
+    /// everything). `model` must be the EFFECTIVE model (project and provider
+    /// defaults applied); `None` means no model could be determined. Read live,
+    /// so a change applies to the next launch.
+    pub fn launch_model_refusal(
+        &self,
+        provider: SessionProvider,
+        model: Option<&str>,
+    ) -> Option<String> {
+        let allowlist = self.launch_model_allowlist.read();
+        if rsi_common::launch_allowlist::launch_model_allowed(&allowlist, Some(provider), model) {
+            return None;
+        }
+        Some(rsi_common::launch_allowlist::launch_model_refusal(
+            &allowlist, model,
+        ))
+    }
+
+    /// #794: whether a Harness session runs its configured completion gates.
+    pub fn completion_gates_enabled(&self) -> bool {
+        self.completion_gates_enabled.load(Ordering::Relaxed)
+    }
+
+    /// #966: the absolute live-context budget for OpenRouter sessions, or
+    /// `None` when the operator turned it off.
+    pub fn openrouter_context_budget(&self) -> Option<u64> {
+        Some(
+            self.openrouter_context_budget_tokens
+                .load(Ordering::Relaxed),
+        )
+        .filter(|&n| n > 0)
+    }
+
     pub fn openrouter_route_for(&self, model: &str) -> OpenRouterRoute {
         let normalized = model.strip_prefix("openrouter/").unwrap_or(model);
         self.openrouter_model_routes
@@ -1089,6 +1523,15 @@ impl RuntimeConfig {
             .get(normalized)
             .copied()
             .unwrap_or_else(|| *self.openrouter_route.read())
+    }
+
+    pub fn bedrock_route_for(&self, model: &str) -> OpenRouterRoute {
+        let normalized = model.strip_prefix("bedrock/").unwrap_or(model);
+        self.bedrock_model_routes
+            .read()
+            .get(normalized)
+            .copied()
+            .unwrap_or_else(|| *self.bedrock_route.read())
     }
 
     pub fn any_openrouter_harness_route(&self) -> bool {
@@ -1163,6 +1606,18 @@ impl RuntimeConfig {
 
     /// Update a single field by name. Returns `Ok(true)` if the field was found and updated.
     pub fn update_field(&self, field: &str, value: &serde_json::Value) -> Result<bool, String> {
+        if let Some(model) = bedrock_model_route_key(field) {
+            if value.is_null() {
+                self.bedrock_model_routes.write().remove(model);
+            } else {
+                let route = OpenRouterRoute::parse(value.as_str().ok_or("expected string")?)
+                    .ok_or("expected harness or codex_cli")?;
+                self.bedrock_model_routes
+                    .write()
+                    .insert(model.to_string(), route);
+            }
+            return Ok(true);
+        }
         if let Some(model) = openrouter_model_route_key(field) {
             if value.is_null() {
                 self.openrouter_model_routes.write().remove(model);
@@ -1176,6 +1631,181 @@ impl RuntimeConfig {
             return Ok(true);
         }
         match field {
+            "sandbox_max_source_roots" => {
+                let value = bounded_u64(value, 1, 65_536)?;
+                self.sandbox_max_source_roots.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "sandbox_min_free_gib" => {
+                let value = bounded_u64(value, 0, 1024)?;
+                self.sandbox_min_free_gib.store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "archived_sandbox_purge_enabled" => {
+                self.archived_sandbox_purge_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "program_hold_while_children_run" => {
+                self.program_hold_while_children_run
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "child_keepalive_enabled" => {
+                self.child_keepalive_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "child_keepalive_window_secs" => {
+                let value = bounded_u64(
+                    value,
+                    rsi_common::child_autonomy::KEEPALIVE_WINDOW_MIN_SECS,
+                    rsi_common::child_autonomy::KEEPALIVE_WINDOW_MAX_SECS,
+                )?;
+                self.child_keepalive_window_secs
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "governor_build_slots" => {
+                let value = bounded_u64(value, 1, 16)?;
+                self.governor_build_slots.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "governor_lander_slots" => {
+                let value = bounded_u64(value, 1, 16)?;
+                self.governor_lander_slots.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "governor_max_load" => {
+                let value = bounded_u64(value, 0, 1024)?;
+                self.governor_max_load.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "governor_min_free_disk_gb" => {
+                let value = bounded_u64(value, 0, 4096)?;
+                self.governor_min_free_disk_gb
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "governor_min_avail_mem_gb" => {
+                let value = bounded_u64(value, 0, 4096)?;
+                self.governor_min_avail_mem_gb
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "governor_max_workers_slice_gb" => {
+                let value = bounded_u64(value, 1, 4096)?;
+                self.governor_max_workers_slice_gb
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "harness_web_access" => {
+                let text = value.as_str().ok_or("expected string")?;
+                let mode = rsi_common::harness_tool_policy::WebAccessMode::parse(text)
+                    .ok_or("expected enabled, hosted_only or disabled")?;
+                *self.harness_web_access.write() = mode.as_str().to_string();
+                Ok(true)
+            }
+            "harness_egress_mode" => {
+                let text = value.as_str().ok_or("expected string")?;
+                let mode = rsi_common::egress_policy::EgressMode::parse(text)
+                    .ok_or("expected deny_private or offline")?;
+                *self.harness_egress_mode.write() = mode.as_str().to_string();
+                Ok(true)
+            }
+            "harness_max_search_calls" | "harness_max_fetch_calls" => {
+                let value = bounded_u64(value, 0, 1_000_000)?;
+                let atomic = if field == "harness_max_search_calls" {
+                    &self.harness_max_search_calls
+                } else {
+                    &self.harness_max_fetch_calls
+                };
+                atomic.store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "completion_gates_enabled" => {
+                self.completion_gates_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "harness_max_result_bytes" => {
+                let value = bounded_u64(value, 0, 1 << 40)?;
+                self.harness_max_result_bytes
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "harness_max_web_cost_usd_micros" => {
+                let value = bounded_u64(value, 0, 1_000_000_000_000)?;
+                self.harness_max_web_cost_usd_micros
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "mcp.deferred_tool_threshold" => {
+                let value = bounded_u64(value, 0, 256)?;
+                self.mcp_deferred_tool_threshold.store(
+                    usize::try_from(value).expect("bounded usize"),
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "cloud_spend_stop_line_usd" => {
+                let value = bounded_u64(value, 0, rsi_common::cloud_spend::MAX_CAP_USD)?;
+                self.cloud_spend_stop_line_usd
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "cloud_spend_daily_cap_usd" => {
+                let value = bounded_u64(value, 0, rsi_common::cloud_spend::MAX_CAP_USD)?;
+                self.cloud_spend_daily_cap_usd
+                    .store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "rolling_queue_enabled" => {
+                self.rolling_queue_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "deploy_drain_enabled" => {
+                self.deploy_drain_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "rolling_queue_batch_size" => {
+                let value = bounded_u64(
+                    value,
+                    rsi_common::rolling_queue::ROLLING_QUEUE_MIN_BATCH_SIZE,
+                    rsi_common::rolling_queue::ROLLING_QUEUE_MAX_BATCH_SIZE,
+                )?;
+                self.rolling_queue_batch_size.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "rolling_queue_speculation_depth" => {
+                let value = bounded_u64(
+                    value,
+                    0,
+                    rsi_common::rolling_queue::ROLLING_QUEUE_MAX_SPECULATION_DEPTH,
+                )?;
+                self.rolling_queue_speculation_depth.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
             "completed_transcript_cache_max_bytes" => {
                 let cap = value.as_u64().ok_or("expected non-negative integer")?;
                 self.completed_transcript_cache_max_bytes
@@ -1188,9 +1818,44 @@ impl RuntimeConfig {
                 *self.openrouter_route.write() = route;
                 Ok(true)
             }
+            "api_route.bedrock" => {
+                let route = OpenRouterRoute::parse(value.as_str().ok_or("expected string")?)
+                    .ok_or("expected harness or codex_cli")?;
+                *self.bedrock_route.write() = route;
+                Ok(true)
+            }
             "api_route.fallback" => {
                 self.api_route_fallback
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "openrouter_context_budget_tokens" => {
+                let range =
+                    OPENROUTER_CONTEXT_BUDGET_TOKENS_MIN..=OPENROUTER_CONTEXT_BUDGET_TOKENS_MAX;
+                let tokens = value
+                    .as_u64()
+                    .filter(|tokens| *tokens == 0 || range.contains(tokens))
+                    .ok_or_else(|| {
+                        format!(
+                            "expected 0 (off) or an integer in {}..={}",
+                            range.start(),
+                            range.end()
+                        )
+                    })?;
+                self.openrouter_context_budget_tokens
+                    .store(tokens, Ordering::Relaxed);
+                Ok(true)
+            }
+            "harness_max_iterations_per_turn" => {
+                let iterations = bounded_u64(
+                    value,
+                    u64::from(HARNESS_MAX_ITERATIONS_PER_TURN_MIN),
+                    u64::from(HARNESS_MAX_ITERATIONS_PER_TURN_MAX),
+                )?;
+                self.harness_max_iterations_per_turn.store(
+                    u32::try_from(iterations).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
                 Ok(true)
             }
             "retry_enabled" => {
@@ -1199,6 +1864,11 @@ impl RuntimeConfig {
                 if !v {
                     self.retry_max_default.store(0, Ordering::Relaxed);
                 }
+                Ok(true)
+            }
+            "satellite_polling_enabled" => {
+                self.satellite_polling_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
                 Ok(true)
             }
             "retry_max_default" => {
@@ -1379,15 +2049,16 @@ impl RuntimeConfig {
             }
             "codex_sandbox_mode" => {
                 let v = value.as_str().ok_or("expected string")?;
-                let parsed = crate::codex::CodexSandboxMode::parse(v)
+                let parsed = crate::store_support::provider_settings::CodexSandboxMode::parse(v)
                     .ok_or("expected one of: read-only, workspace-write, danger-full-access")?;
                 *self.codex_sandbox_mode.write() = parsed.cli_arg().to_string();
                 Ok(true)
             }
             "claude_config_isolation" => {
                 let v = value.as_str().ok_or("expected string")?;
-                let parsed = crate::claude::ClaudeConfigIsolation::parse(v)
-                    .ok_or("expected one of: off, settings, strict")?;
+                let parsed =
+                    crate::store_support::provider_settings::ClaudeConfigIsolation::parse(v)
+                        .ok_or("expected one of: off, settings, strict")?;
                 *self.claude_config_isolation.write() = parsed.cli_arg().to_string();
                 Ok(true)
             }
@@ -1437,6 +2108,11 @@ impl RuntimeConfig {
                     rsi_common::model_control::normalize_orchestration_max_child_effort(v)
                         .ok_or("expected one of: unset, low, medium, high, xhigh, max, ultra")?;
                 *self.orchestration_max_child_effort.write() = canonical.to_string();
+                Ok(true)
+            }
+            "launch_model_allowlist" => {
+                *self.launch_model_allowlist.write() =
+                    rsi_common::launch_allowlist::normalize_launch_model_allowlist(value)?;
                 Ok(true)
             }
             "sandbox_build_cache_reclaim_enabled" => {
@@ -1684,7 +2360,8 @@ impl RuntimeConfig {
             }
             "topology_bulk_fanout_min_openrouter" => {
                 let value = value.as_u64().ok_or("expected number")?;
-                let max = u64::from(crate::topology::agent::BULK_FANOUT_MIN_OPENROUTER_MAX);
+                let max =
+                    u64::from(crate::store_support::config_types::BULK_FANOUT_MIN_OPENROUTER_MAX);
                 if value == 1 || value > max {
                     return Err(format!("expected 0 (off) or a fan-out width in 2..={max}"));
                 }
@@ -1712,7 +2389,7 @@ impl RuntimeConfig {
                     .store(v_u32, Ordering::Relaxed);
                 Ok(true)
             }
-            "recursive_dag_fake_executor_only" => {
+            "recursive_dag_fixed_fake_executor_only" => {
                 let enabled = value.as_bool().ok_or("expected bool")?;
                 if enabled {
                     Ok(true)
@@ -1720,7 +2397,7 @@ impl RuntimeConfig {
                     Err("recursive DAG execution is fake-only in Phase 5A.5".to_string())
                 }
             }
-            "recursive_dag_live_executor_enabled" => {
+            "recursive_dag_fixed_live_executor_enabled" => {
                 let enabled = value.as_bool().ok_or("expected bool")?;
                 if !enabled {
                     Ok(true)
@@ -1728,7 +2405,7 @@ impl RuntimeConfig {
                     Err("live recursive DAG execution is not available in Phase 5A.5".to_string())
                 }
             }
-            "recursive_dag_background_loop_enabled" => {
+            "recursive_dag_fixed_background_loop_enabled" => {
                 let enabled = value.as_bool().ok_or("expected bool")?;
                 if !enabled {
                     Ok(true)
@@ -2076,15 +2753,17 @@ impl Config {
 
         let codex_sandbox_mode = env_var_legacy!("CODEX_SANDBOX_MODE")
             .ok()
-            .map(|raw| match crate::codex::CodexSandboxMode::parse(&raw) {
-                Some(mode) => mode.cli_arg().to_string(),
-                None => {
-                    tracing::warn!(
-                        env_var = "RSI_CODEX_SANDBOX_MODE",
-                        value = %raw,
-                        "Invalid Codex sandbox mode; defaulting to danger-full-access"
-                    );
-                    "danger-full-access".to_string()
+            .map(|raw| {
+                match crate::store_support::provider_settings::CodexSandboxMode::parse(&raw) {
+                    Some(mode) => mode.cli_arg().to_string(),
+                    None => {
+                        tracing::warn!(
+                            env_var = "RSI_CODEX_SANDBOX_MODE",
+                            value = %raw,
+                            "Invalid Codex sandbox mode; defaulting to danger-full-access"
+                        );
+                        "danger-full-access".to_string()
+                    }
                 }
             })
             .unwrap_or_else(|| "danger-full-access".to_string());
@@ -2094,7 +2773,9 @@ impl Config {
         let claude_config_isolation = env_var_legacy!("CLAUDE_CONFIG_ISOLATION")
             .ok()
             .map(
-                |raw| match crate::claude::ClaudeConfigIsolation::parse(&raw) {
+                |raw| match crate::store_support::provider_settings::ClaudeConfigIsolation::parse(
+                    &raw,
+                ) {
                     Some(mode) => mode.cli_arg().to_string(),
                     None => {
                         tracing::warn!(
@@ -2192,7 +2873,7 @@ impl Config {
             });
         let topology_max_concurrent_build_nodes = 2;
         let topology_bulk_fanout_min_openrouter =
-            crate::topology::agent::DEFAULT_BULK_FANOUT_MIN_OPENROUTER;
+            crate::store_support::config_types::DEFAULT_BULK_FANOUT_MIN_OPENROUTER;
 
         let recursive_dag_run_lease_ttl_ms = env_var_legacy!("RECURSIVE_DAG_RUN_LEASE_TTL_MS")
             .ok()
@@ -2383,7 +3064,9 @@ impl Config {
     /// unchanged); `"local"` also requires a valid project UUID; any
     /// other value disables the tracker (`None`). Selection is exclusive —
     /// the manager holds a single `Box<dyn Tracker>`.
-    pub fn issue_tracker_config(&self) -> Option<crate::issue_tracker::types::IssueTrackerConfig> {
+    pub fn issue_tracker_config(
+        &self,
+    ) -> Option<crate::store_support::issue_tracker::IssueTrackerConfig> {
         let kind = env_var_legacy!("ISSUE_TRACKER_KIND")
             .ok()
             .unwrap_or_else(|| "linear".to_string());
@@ -2456,7 +3139,8 @@ impl Config {
     /// Today's Linear gate, byte-identical to the pre-C2 behavior: `Some`
     /// only when both `LINEAR_API_KEY` and `LINEAR_TEAM_ID` are set along
     /// with a working directory for dispatched sessions.
-    fn issue_tracker_config_linear() -> Option<crate::issue_tracker::types::IssueTrackerConfig> {
+    fn issue_tracker_config_linear()
+    -> Option<crate::store_support::issue_tracker::IssueTrackerConfig> {
         let api_key = env_var_legacy!("LINEAR_API_KEY").ok()?;
         let team_id = env_var_legacy!("LINEAR_TEAM_ID").ok()?;
         let working_dir_str = env_var_legacy!("ISSUE_TRACKER_WORKING_DIR").ok()?;
@@ -2469,7 +3153,7 @@ impl Config {
         let assignee = env_var_legacy!("LINEAR_ASSIGNEE").ok();
         let common = Self::issue_tracker_common_fields();
 
-        Some(crate::issue_tracker::types::IssueTrackerConfig {
+        Some(crate::store_support::issue_tracker::IssueTrackerConfig {
             enabled: true,
             kind: "linear".to_string(),
             api_key,
@@ -2494,7 +3178,8 @@ impl Config {
     /// `assignee` is always `None` — `LocalTracker` ignores it (D-C2-3,
     /// single-user store), so there is no point parsing `LINEAR_ASSIGNEE`
     /// for a local-only setup.
-    fn issue_tracker_config_local() -> Option<crate::issue_tracker::types::IssueTrackerConfig> {
+    fn issue_tracker_config_local()
+    -> Option<crate::store_support::issue_tracker::IssueTrackerConfig> {
         let working_dir_str = env_var_legacy!("ISSUE_TRACKER_WORKING_DIR").ok()?;
         let working_dir = std::path::PathBuf::from(working_dir_str);
 
@@ -2509,7 +3194,7 @@ impl Config {
             }
         };
 
-        Some(crate::issue_tracker::types::IssueTrackerConfig {
+        Some(crate::store_support::issue_tracker::IssueTrackerConfig {
             enabled: true,
             kind: "local".to_string(),
             api_key: String::new(),
@@ -2530,11 +3215,11 @@ impl Config {
     }
 
     /// Build a QueueConfig from this daemon config. Returns None if queue is disabled.
-    pub fn queue_config(&self) -> Option<crate::queue::types::QueueConfig> {
+    pub fn queue_config(&self) -> Option<crate::store_support::config_types::QueueConfig> {
         if !self.queue_enabled {
             return None;
         }
-        Some(crate::queue::types::QueueConfig {
+        Some(crate::store_support::config_types::QueueConfig {
             poll_interval_secs: self.queue_poll_interval_secs,
             default_token_threshold: self.queue_token_threshold,
             ..Default::default()
@@ -2681,6 +3366,336 @@ mod tests {
         assert_eq!(catalogued, persisted);
     }
 
+    /// #925: the satellite polling kill switch is a persisted daemon setting.
+    /// It defaults on and round-trips false -> true through the JSON view.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn satellite_polling_enabled_is_persisted_and_round_trips() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"satellite_polling_enabled"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["satellite_polling_enabled"], true);
+        assert!(
+            config
+                .update_field("satellite_polling_enabled", &serde_json::json!(false))
+                .is_ok()
+        );
+        assert_eq!(config.to_json()["satellite_polling_enabled"], false);
+        assert_eq!(
+            config.persisted_field_value("satellite_polling_enabled"),
+            Some(serde_json::json!(false))
+        );
+        assert!(
+            config
+                .update_field("satellite_polling_enabled", &serde_json::json!(true))
+                .is_ok()
+        );
+        assert_eq!(config.to_json()["satellite_polling_enabled"], true);
+        assert!(
+            config
+                .update_field("satellite_polling_enabled", &serde_json::json!("on"))
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn governor_settings_default_to_cargo_slot_and_validate() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            config.governor_policy(),
+            crate::store_support::config_types::GovernorPolicy::default()
+        );
+        for (field, good, bad) in [
+            ("governor_build_slots", 6, 0),
+            ("governor_lander_slots", 3, 17),
+            ("governor_max_load", 48, 5000),
+            ("governor_min_free_disk_gb", 50, 9000),
+            ("governor_min_avail_mem_gb", 24, 9000),
+            ("governor_max_workers_slice_gb", 36, 0),
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+            assert!(config.update_field(field, &serde_json::json!(good)).is_ok());
+            assert_eq!(
+                config.persisted_field_value(field),
+                Some(serde_json::json!(good))
+            );
+            assert!(config.update_field(field, &serde_json::json!(bad)).is_err());
+            assert_eq!(
+                config.to_json()[field],
+                good,
+                "{field} keeps accepted value"
+            );
+        }
+        assert_eq!(config.governor_policy().build_slots, 6);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn deploy_drain_setting_defaults_on_persists_and_validates() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"deploy_drain_enabled"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["deploy_drain_enabled"], true);
+        assert!(
+            config
+                .update_field("deploy_drain_enabled", &serde_json::json!(false))
+                .is_ok()
+        );
+        assert_eq!(
+            config.persisted_field_value("deploy_drain_enabled"),
+            Some(serde_json::json!(false))
+        );
+        assert!(!config.deploy_drain_enabled.load(Ordering::Relaxed));
+        assert!(
+            config
+                .update_field("deploy_drain_enabled", &serde_json::json!(1))
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rolling_queue_settings_default_persist_and_validate() {
+        for field in [
+            "rolling_queue_enabled",
+            "rolling_queue_batch_size",
+            "rolling_queue_speculation_depth",
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+        }
+        let config = RuntimeConfig::from_config(&Config::default());
+        let json = config.to_json();
+        assert_eq!(json["rolling_queue_enabled"], false);
+        assert_eq!(json["rolling_queue_batch_size"], 4);
+        assert_eq!(json["rolling_queue_speculation_depth"], 1);
+        for (field, value) in [
+            ("rolling_queue_enabled", serde_json::json!(true)),
+            ("rolling_queue_batch_size", serde_json::json!(8)),
+            ("rolling_queue_speculation_depth", serde_json::json!(0)),
+        ] {
+            assert!(config.update_field(field, &value).is_ok(), "{field}");
+            assert_eq!(config.persisted_field_value(field), Some(value));
+        }
+        for (field, value) in [
+            ("rolling_queue_enabled", serde_json::json!(1)),
+            ("rolling_queue_batch_size", serde_json::json!(0)),
+            ("rolling_queue_batch_size", serde_json::json!(9)),
+            ("rolling_queue_speculation_depth", serde_json::json!(3)),
+        ] {
+            assert!(
+                config.update_field(field, &value).is_err(),
+                "{field} {value}"
+            );
+        }
+        // A rejected write leaves the accepted value in place.
+        assert_eq!(config.to_json()["rolling_queue_batch_size"], 8);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn child_autonomy_settings_default_persist_and_validate() {
+        for field in [
+            "program_hold_while_children_run",
+            "child_keepalive_enabled",
+            "child_keepalive_window_secs",
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+        }
+        let config = RuntimeConfig::from_config(&Config::default());
+        let json = config.to_json();
+        assert_eq!(json["program_hold_while_children_run"], true);
+        assert_eq!(json["child_keepalive_enabled"], false);
+        assert_eq!(json["child_keepalive_window_secs"], 1500);
+        for (field, value) in [
+            ("program_hold_while_children_run", serde_json::json!(false)),
+            ("child_keepalive_enabled", serde_json::json!(true)),
+            ("child_keepalive_window_secs", serde_json::json!(300)),
+            ("child_keepalive_window_secs", serde_json::json!(21_600)),
+        ] {
+            assert!(config.update_field(field, &value).is_ok(), "{field}");
+            assert_eq!(config.persisted_field_value(field), Some(value));
+        }
+        for (field, value) in [
+            ("program_hold_while_children_run", serde_json::json!("off")),
+            ("child_keepalive_enabled", serde_json::json!(1)),
+            ("child_keepalive_window_secs", serde_json::json!(299)),
+            ("child_keepalive_window_secs", serde_json::json!(21_601)),
+            ("child_keepalive_window_secs", serde_json::json!(-5)),
+        ] {
+            assert!(
+                config.update_field(field, &value).is_err(),
+                "{field} {value}"
+            );
+        }
+        // A rejected write leaves the accepted value.
+        assert_eq!(config.to_json()["child_keepalive_window_secs"], 21_600);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn harness_egress_mode_persists_validates_and_layers_into_the_policy() {
+        use rsi_common::egress_policy::EgressMode;
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"harness_egress_mode"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["harness_egress_mode"], "deny_private");
+        assert_eq!(
+            config.harness_tool_policy_defaults().egress_mode(),
+            EgressMode::DenyPrivate
+        );
+        let value = serde_json::json!("offline");
+        assert!(config.update_field("harness_egress_mode", &value).is_ok());
+        assert_eq!(
+            config.persisted_field_value("harness_egress_mode"),
+            Some(value)
+        );
+        let defaults = config.harness_tool_policy_defaults();
+        assert_eq!(defaults.egress, Some(EgressMode::Offline));
+        // A session that sets nothing inherits the daemon default.
+        let effective =
+            rsi_common::harness_tool_policy::HarnessToolPolicy::default().or_defaults(&defaults);
+        assert_eq!(effective.egress_mode(), EgressMode::Offline);
+        for value in [serde_json::json!("allow"), serde_json::json!(true)] {
+            assert!(
+                config.update_field("harness_egress_mode", &value).is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(config.to_json()["harness_egress_mode"], "offline");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn harness_tool_policy_defaults_persist_validate_and_layer() {
+        use rsi_common::harness_tool_policy::{HarnessToolPolicy, ToolBudgets, WebAccessMode};
+        let fields = [
+            "harness_web_access",
+            "harness_max_search_calls",
+            "harness_max_fetch_calls",
+            "harness_max_result_bytes",
+            "harness_max_web_cost_usd_micros",
+        ];
+        for field in fields {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+        }
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["harness_web_access"], "enabled");
+        assert!(config.harness_tool_policy_defaults().is_default());
+        for (field, value) in [
+            ("harness_web_access", serde_json::json!("disabled")),
+            ("harness_max_search_calls", serde_json::json!(3)),
+            ("harness_max_fetch_calls", serde_json::json!(2)),
+            ("harness_max_result_bytes", serde_json::json!(4096)),
+            ("harness_max_web_cost_usd_micros", serde_json::json!(50_000)),
+        ] {
+            assert!(config.update_field(field, &value).is_ok(), "{field}");
+            assert_eq!(config.persisted_field_value(field), Some(value));
+        }
+        let defaults = config.harness_tool_policy_defaults();
+        assert_eq!(defaults.web_access, Some(WebAccessMode::Disabled));
+        assert_eq!(
+            defaults.budgets,
+            ToolBudgets {
+                max_search_calls: Some(3),
+                max_fetch_calls: Some(2),
+                max_result_bytes: Some(4096),
+                max_web_cost_usd_micros: Some(50_000),
+            }
+        );
+        // A session policy overrides only what it sets.
+        let session = HarnessToolPolicy {
+            web_access: Some(WebAccessMode::HostedOnly),
+            budgets: ToolBudgets {
+                max_search_calls: Some(1),
+                ..ToolBudgets::default()
+            },
+            ..HarnessToolPolicy::default()
+        };
+        let effective = session.or_defaults(&defaults);
+        assert_eq!(effective.web_access, Some(WebAccessMode::HostedOnly));
+        assert_eq!(effective.budgets.max_search_calls, Some(1));
+        assert_eq!(effective.budgets.max_fetch_calls, Some(2));
+        for (field, value) in [
+            ("harness_web_access", serde_json::json!("always")),
+            ("harness_web_access", serde_json::json!(1)),
+            ("harness_max_search_calls", serde_json::json!(-1)),
+            ("harness_max_search_calls", serde_json::json!(1_000_001)),
+            ("harness_max_result_bytes", serde_json::json!("big")),
+        ] {
+            assert!(
+                config.update_field(field, &value).is_err(),
+                "{field} {value}"
+            );
+        }
+        assert_eq!(config.to_json()["harness_max_search_calls"], 3);
+        // Zero returns a cap to unlimited.
+        assert!(
+            config
+                .update_field("harness_max_search_calls", &serde_json::json!(0))
+                .is_ok()
+        );
+        assert_eq!(
+            config
+                .harness_tool_policy_defaults()
+                .budgets
+                .max_search_calls,
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn cloud_spend_caps_default_validate_and_persist() {
+        let config = RuntimeConfig::from_config(&Config::from_env());
+        assert_eq!(config.to_json()["cloud_spend_stop_line_usd"], 90);
+        assert_eq!(config.to_json()["cloud_spend_daily_cap_usd"], 15);
+        for field in ["cloud_spend_stop_line_usd", "cloud_spend_daily_cap_usd"] {
+            assert!(is_persisted_runtime_config_field(field), "{field}");
+            for bad in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("9"),
+                serde_json::json!(rsi_common::cloud_spend::MAX_CAP_USD + 1),
+            ] {
+                assert!(config.update_field(field, &bad).is_err(), "{field} {bad}");
+            }
+            assert_eq!(config.update_field(field, &serde_json::json!(7)), Ok(true));
+        }
+        let caps = config.cloud_spend_caps();
+        assert_eq!((caps.stop_line_usd, caps.daily_cap_usd), (7, 7));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn mcp_deferred_tool_threshold_defaults_validate_and_round_trips() {
+        let field = "mcp.deferred_tool_threshold";
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()[field], MCP_DEFERRED_TOOL_THRESHOLD_DEFAULT);
+        assert_eq!(config.mcp_deferred_tool_threshold(), 32);
+        for value in [0, 256] {
+            assert!(
+                config
+                    .update_field(field, &serde_json::json!(value))
+                    .is_ok()
+            );
+            assert_eq!(
+                config.persisted_field_value(field),
+                Some(serde_json::json!(value))
+            );
+            assert_eq!(config.to_json()[field], value);
+            assert_eq!(config.mcp_deferred_tool_threshold(), value);
+        }
+        for invalid in [
+            serde_json::json!(257),
+            serde_json::json!(-1),
+            serde_json::json!("32"),
+            serde_json::Value::Null,
+        ] {
+            assert!(config.update_field(field, &invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(config.to_json()[field], 256);
+        assert_eq!(config.mcp_deferred_tool_threshold(), 256);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn session_retention_settings_validate_and_round_trip() {
@@ -2737,6 +3752,61 @@ mod tests {
         crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
             .unwrap();
         assert_eq!(restarted.to_json()[field], 0);
+    }
+
+    /// Issue #692: the launch-model allowlist defaults to empty (unrestricted),
+    /// validates on write, appears in `GetDaemonConfig`, and survives a daemon
+    /// restart through the durable `daemon_settings` row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn launch_model_allowlist_validates_round_trips_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rsi.db");
+        let store = crate::store::Store::open(&path).unwrap();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let field = "launch_model_allowlist";
+        assert_eq!(runtime.to_json()[field], serde_json::json!([]));
+
+        for bad in [
+            serde_json::json!(7),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!({"model": "x"}),
+        ] {
+            runtime
+                .update_field(field, &bad)
+                .expect_err("a malformed allowlist must be refused");
+            assert!(runtime.launch_model_allowlist.read().is_empty());
+        }
+
+        assert!(
+            runtime
+                .update_field(field, &serde_json::json!("gpt-6-sol, z-ai/glm-5.3-flashx"))
+                .unwrap()
+        );
+        assert_eq!(
+            runtime.to_json()[field],
+            serde_json::json!(["gpt-6-sol", "z-ai/glm-5.3-flashx"])
+        );
+        crate::store::daemon_settings::persist_runtime_config_field(&store, &runtime, field)
+            .unwrap();
+        drop(store);
+
+        let reopened = crate::store::Store::open(&path).unwrap();
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
+            .unwrap();
+        assert_eq!(
+            restarted.to_json()[field],
+            serde_json::json!(["gpt-6-sol", "z-ai/glm-5.3-flashx"])
+        );
+
+        assert!(
+            runtime
+                .update_field(field, &serde_json::Value::Null)
+                .unwrap()
+        );
+        assert_eq!(runtime.to_json()[field], serde_json::json!([]));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -4067,6 +5137,68 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
+    fn sandbox_allocation_limits_default_validate_and_persist_as_runtime_fields() {
+        with_clean_env(|| {
+            let config = Config::from_env();
+            let runtime = RuntimeConfig::from_config(&config);
+            assert_eq!(
+                runtime.sandbox_max_source_roots.load(Ordering::Relaxed),
+                4096
+            );
+            assert_eq!(runtime.sandbox_min_free_gib.load(Ordering::Relaxed), 30);
+
+            assert_eq!(runtime.to_json()["sandbox_max_source_roots"], 4096);
+            assert_eq!(runtime.to_json()["sandbox_min_free_gib"], 30);
+            assert!(is_persisted_runtime_config_field(
+                "sandbox_max_source_roots"
+            ));
+            assert!(is_persisted_runtime_config_field("sandbox_min_free_gib"));
+            assert_eq!(
+                runtime.persisted_field_value("sandbox_max_source_roots"),
+                Some(serde_json::json!(4096))
+            );
+            assert_eq!(
+                runtime.persisted_field_value("sandbox_min_free_gib"),
+                Some(serde_json::json!(30))
+            );
+
+            assert!(
+                runtime
+                    .update_field("sandbox_max_source_roots", &serde_json::json!(1))
+                    .unwrap()
+            );
+            assert!(
+                runtime
+                    .update_field("sandbox_min_free_gib", &serde_json::json!(0))
+                    .unwrap()
+            );
+            assert_eq!(
+                runtime.persisted_field_value("sandbox_max_source_roots"),
+                Some(serde_json::json!(1))
+            );
+            assert_eq!(
+                runtime.persisted_field_value("sandbox_min_free_gib"),
+                Some(serde_json::json!(0))
+            );
+
+            let before = runtime.to_json();
+            for (field, invalid) in [
+                ("sandbox_max_source_roots", serde_json::json!(0)),
+                ("sandbox_max_source_roots", serde_json::json!(65_537)),
+                ("sandbox_min_free_gib", serde_json::json!(1025)),
+                ("sandbox_min_free_gib", serde_json::json!(-1)),
+            ] {
+                assert!(
+                    runtime.update_field(field, &invalid).is_err(),
+                    "{field}={invalid}"
+                );
+                assert_eq!(runtime.to_json()[field], before[field], "{field}");
+            }
+        });
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
     fn sandbox_build_cache_runtime_config_validates_bounds_atomically() {
         with_clean_env(|| {
             let config = Config::from_env();
@@ -4295,12 +5427,15 @@ mod tests {
             let rc = RuntimeConfig::from_config(&config);
 
             assert!(
-                rc.update_field("recursive_dag_fake_executor_only", &serde_json::json!(true))
-                    .unwrap()
+                rc.update_field(
+                    "recursive_dag_fixed_fake_executor_only",
+                    &serde_json::json!(true)
+                )
+                .unwrap()
             );
             let err = rc
                 .update_field(
-                    "recursive_dag_fake_executor_only",
+                    "recursive_dag_fixed_fake_executor_only",
                     &serde_json::json!(false),
                 )
                 .expect_err("fake-only=false should be rejected");
@@ -4308,14 +5443,14 @@ mod tests {
 
             assert!(
                 rc.update_field(
-                    "recursive_dag_live_executor_enabled",
+                    "recursive_dag_fixed_live_executor_enabled",
                     &serde_json::json!(false),
                 )
                 .unwrap()
             );
             let err = rc
                 .update_field(
-                    "recursive_dag_live_executor_enabled",
+                    "recursive_dag_fixed_live_executor_enabled",
                     &serde_json::json!(true),
                 )
                 .expect_err("live execution should be rejected");
@@ -4350,14 +5485,14 @@ mod tests {
 
             assert!(
                 rc.update_field(
-                    "recursive_dag_background_loop_enabled",
+                    "recursive_dag_fixed_background_loop_enabled",
                     &serde_json::json!(false),
                 )
                 .unwrap()
             );
             let err = rc
                 .update_field(
-                    "recursive_dag_background_loop_enabled",
+                    "recursive_dag_fixed_background_loop_enabled",
                     &serde_json::json!(true),
                 )
                 .expect_err("background loop should be rejected");
@@ -4365,7 +5500,7 @@ mod tests {
 
             let err = rc
                 .update_field(
-                    "recursive_dag_live_executor_enabled",
+                    "recursive_dag_fixed_live_executor_enabled",
                     &serde_json::json!("false"),
                 )
                 .expect_err("non-bool live config should be rejected");
@@ -4386,9 +5521,9 @@ mod tests {
             assert_eq!(json["recursive_dag_live_scheduler_control_enabled"], false);
             assert_eq!(json["gv_render_recursive_origin"], false);
             assert_eq!(json["gv_info_dashboard"], false);
-            assert_eq!(json["recursive_dag_fake_executor_only"], true);
-            assert_eq!(json["recursive_dag_live_executor_enabled"], false);
-            assert_eq!(json["recursive_dag_background_loop_enabled"], false);
+            assert_eq!(json["recursive_dag_fixed_fake_executor_only"], true);
+            assert_eq!(json["recursive_dag_fixed_live_executor_enabled"], false);
+            assert_eq!(json["recursive_dag_fixed_background_loop_enabled"], false);
         });
     }
 
@@ -5303,6 +6438,87 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
+    fn openrouter_context_budget_defaults_bounds_and_turns_off_at_zero() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(runtime.openrouter_context_budget(), Some(128_000));
+        assert_eq!(
+            runtime.to_json()["openrouter_context_budget_tokens"],
+            128_000
+        );
+        assert!(is_persisted_runtime_config_field(
+            "openrouter_context_budget_tokens"
+        ));
+        for accepted in [32_000, 200_000, 2_000_000] {
+            runtime
+                .update_field(
+                    "openrouter_context_budget_tokens",
+                    &serde_json::json!(accepted),
+                )
+                .unwrap();
+            assert_eq!(runtime.openrouter_context_budget(), Some(accepted));
+        }
+        for refused in [
+            serde_json::json!(31_999),
+            serde_json::json!(2_000_001),
+            serde_json::json!(-1),
+            serde_json::json!("128000"),
+        ] {
+            let error = runtime
+                .update_field("openrouter_context_budget_tokens", &refused)
+                .unwrap_err();
+            assert!(error.contains("32000..=2000000"), "{error}");
+        }
+        assert_eq!(runtime.openrouter_context_budget(), Some(2_000_000));
+        runtime
+            .update_field("openrouter_context_budget_tokens", &serde_json::json!(0))
+            .unwrap();
+        assert_eq!(runtime.openrouter_context_budget(), None);
+        assert_eq!(runtime.to_json()["openrouter_context_budget_tokens"], 0);
+    }
+
+    /// #1050: the per-turn Harness iteration cap defaults to 150, accepts
+    /// 10..=1000 and refuses anything else without changing the value.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn harness_max_iterations_default_bounds_and_persistence() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(runtime.harness_max_iterations(), 150);
+        assert_eq!(runtime.to_json()["harness_max_iterations_per_turn"], 150);
+        assert!(is_persisted_runtime_config_field(
+            "harness_max_iterations_per_turn"
+        ));
+        for accepted in [10_u64, 25, 1000] {
+            runtime
+                .update_field(
+                    "harness_max_iterations_per_turn",
+                    &serde_json::json!(accepted),
+                )
+                .unwrap();
+            assert_eq!(runtime.harness_max_iterations(), accepted as u32);
+        }
+        for refused in [
+            serde_json::json!(9),
+            serde_json::json!(1001),
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("150"),
+        ] {
+            assert!(
+                runtime
+                    .update_field("harness_max_iterations_per_turn", &refused)
+                    .is_err(),
+                "{refused}"
+            );
+        }
+        assert_eq!(runtime.harness_max_iterations(), 1000);
+        assert_eq!(
+            runtime.persisted_field_value("harness_max_iterations_per_turn"),
+            Some(serde_json::json!(1000))
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
     fn openrouter_route_settings_survive_daemon_restart() {
         let directory = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open(&directory.path().join("settings.db")).unwrap();
@@ -5330,5 +6546,59 @@ mod tests {
             OpenRouterRoute::CodexCli
         );
         assert!(!restarted.api_route_fallback.load(Ordering::Relaxed));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn bedrock_route_settings_round_trip_and_survive_daemon_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&directory.path().join("settings.db")).unwrap();
+        let active = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            active.bedrock_route_for("global.openai.gpt-5.6-sol"),
+            OpenRouterRoute::CodexCli
+        );
+        for (field, value) in [
+            ("api_route.bedrock", serde_json::json!("harness")),
+            (
+                "api_route.bedrock.global.openai.gpt-5.6-sol",
+                serde_json::json!("codex_cli"),
+            ),
+        ] {
+            active.update_field(field, &value).unwrap();
+            crate::store::daemon_settings::persist_runtime_config_field(&store, &active, field)
+                .unwrap();
+        }
+        assert_eq!(active.to_json()["api_route.bedrock"], "harness");
+        assert_eq!(
+            active.to_json()["api_route.bedrock.global.openai.gpt-5.6-sol"],
+            "codex_cli"
+        );
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&store, &restarted).unwrap();
+        assert_eq!(
+            restarted.bedrock_route_for("other-model"),
+            OpenRouterRoute::Harness
+        );
+        assert_eq!(
+            restarted.bedrock_route_for("bedrock/global.openai.gpt-5.6-sol"),
+            OpenRouterRoute::CodexCli
+        );
+        assert!(
+            restarted
+                .update_field("api_route.bedrock", &serde_json::json!("invalid"))
+                .is_err()
+        );
+        restarted
+            .update_field(
+                "api_route.bedrock.global.openai.gpt-5.6-sol",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.bedrock_route_for("global.openai.gpt-5.6-sol"),
+            OpenRouterRoute::Harness
+        );
     }
 }

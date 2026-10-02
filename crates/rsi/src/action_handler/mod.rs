@@ -11,6 +11,7 @@
 
 mod cohort_settlement;
 pub(crate) mod daemon_config;
+pub(crate) mod mcp_servers;
 mod navigation;
 mod overlay;
 pub(crate) mod provider_credentials;
@@ -281,6 +282,9 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::ClearHarnessManagerScope => {
             crate::overlay::harness_manager::dispatch(app, action).await;
         }
+        LcAction::ManagerNodeCommand(command) => {
+            crate::overlay::harness_manager::dispatch_node_command(app, &command).await;
+        }
 
         // Window/layout: tabs, splits, input bar, settings, quit
         LcAction::OpenSessionInNewTab
@@ -309,6 +313,9 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::RefreshDaemonFeatures => {
             daemon_config::refresh_daemon_features(app).await;
+        }
+        LcAction::OpenSatelliteRegistry => {
+            crate::overlay::satellite_registry::open(app).await;
         }
         LcAction::SyncTitleModelConfig => {
             daemon_config::sync_title_model_config(app).await;
@@ -354,6 +361,24 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::ImportProviderCredentialsFromEnv => {
             provider_credentials::import_provider_credentials_from_env(app).await;
+        }
+        LcAction::RefreshMcpServers => {
+            mcp_servers::refresh_mcp_servers(app).await;
+        }
+        LcAction::UpsertMcpServer { server } => {
+            mcp_servers::upsert_mcp_server(app, server).await;
+        }
+        LcAction::SetMcpServerEnabled { id, enabled } => {
+            mcp_servers::set_mcp_server_enabled(app, id, enabled).await;
+        }
+        LcAction::SetMcpServerSecret { id, secret } => {
+            mcp_servers::set_mcp_server_secret(app, id, secret).await;
+        }
+        LcAction::RotateMcpServerSecret { id, secret } => {
+            mcp_servers::rotate_mcp_server_secret(app, id, secret).await;
+        }
+        LcAction::ClearMcpServerSecret { id } => {
+            mcp_servers::clear_mcp_server_secret(app, id).await;
         }
     }
 }
@@ -451,6 +476,8 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::SettingsAdd
         | ActionId::SettingsDelete
         | ActionId::SettingsEnable
+        | ActionId::SettingsMoveColumnUp
+        | ActionId::SettingsMoveColumnDown
         | ActionId::SettingsRefresh
         | ActionId::ProviderKeySet
         | ActionId::ProviderKeyRotate
@@ -470,6 +497,8 @@ pub(crate) async fn dispatch_registered_action(
                 ActionId::SettingsAdd => KeyCode::Char('a'),
                 ActionId::SettingsDelete => KeyCode::Char('d'),
                 ActionId::SettingsEnable => KeyCode::Char('e'),
+                ActionId::SettingsMoveColumnUp => KeyCode::Char('K'),
+                ActionId::SettingsMoveColumnDown => KeyCode::Char('J'),
                 ActionId::SettingsRefresh => KeyCode::Char('R'),
                 ActionId::ProviderKeySet => KeyCode::Char('s'),
                 ActionId::ProviderKeyRotate => KeyCode::Char('r'),
@@ -537,6 +566,8 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::ScheduleArmDelete
         | ActionId::ScheduleDelete
         | ActionId::ScheduleRefresh
+        | ActionId::ScheduleToggleHistory
+        | ActionId::ScheduleLoadMore
         | ActionId::Close
             if context.surface == ActionSurface::ScheduleBrowser =>
         {
@@ -549,6 +580,8 @@ pub(crate) async fn dispatch_registered_action(
                 ActionId::ScheduleTrigger => KeyCode::Char('t'),
                 ActionId::ScheduleArmDelete | ActionId::ScheduleDelete => KeyCode::Char('d'),
                 ActionId::ScheduleRefresh => KeyCode::Char('r'),
+                ActionId::ScheduleToggleHistory => KeyCode::Char('H'),
+                ActionId::ScheduleLoadMore => KeyCode::Char('m'),
                 _ => KeyCode::Char('q'),
             };
             crate::overlay::schedule_browser::handle_schedule_browser_key(app, key(code)).await;
@@ -792,6 +825,12 @@ pub async fn dispatch_catalog_command(app: &mut App, command: &str) {
             return;
         }
     }
+    if let Some(args) = command.trim().strip_prefix("launch-allow") {
+        if args.is_empty() || args.starts_with(char::is_whitespace) {
+            daemon_config::set_launch_model_allowlist(app, args).await;
+            return;
+        }
+    }
     match parse_command(command) {
         CommandResult::LcAction(action) => {
             dispatch_lc_action(app, action).await;
@@ -857,6 +896,47 @@ mod tests {
         let mut app = test_app();
         dispatch_action(&mut app, Action::Application(LcAction::Quit)).await;
         assert!(app.quit);
+    }
+
+    /// A live-discovered Claude model (absent from the static fallback) stays
+    /// selectable: picking a Claude model while already on Claude keeps the
+    /// discovered list, and switching in from another provider shows the
+    /// fallback and asks the daemon for the live list.
+    #[tokio::test]
+    async fn select_claude_model_keeps_discovered_list_and_refreshes_on_switch() {
+        use rsi_common::types::SessionProvider;
+        let live = vec![
+            ("claude-opus-5-5".to_string(), "Opus 5.5 (1M)".to_string()),
+            ("claude-opus-4-7".to_string(), "Opus 4.7".to_string()),
+        ];
+
+        let mut app = test_app();
+        app.selected_provider = SessionProvider::Claude;
+        app.available_models = live.clone();
+        app.needs_model_refresh = false;
+        dispatch_lc_action(
+            &mut app,
+            LcAction::SelectModel(Some("claude-opus-4-7".to_string())),
+        )
+        .await;
+        assert_eq!(app.available_models, live);
+        assert_eq!(app.selected_model.as_deref(), Some("claude-opus-4-7"));
+        assert!(!app.needs_model_refresh);
+
+        let mut app = test_app();
+        app.selected_provider = SessionProvider::Codex;
+        app.needs_model_refresh = false;
+        dispatch_lc_action(
+            &mut app,
+            LcAction::SelectModel(Some("claude-opus-5-5".to_string())),
+        )
+        .await;
+        assert_eq!(app.selected_provider, SessionProvider::Claude);
+        assert_eq!(
+            app.available_models,
+            crate::app::models_for_provider(SessionProvider::Claude)
+        );
+        assert!(app.needs_model_refresh);
     }
 
     #[tokio::test]
@@ -935,6 +1015,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -1062,6 +1143,7 @@ mod tests {
                 context_window: None,
                 resolved_context_budget: None,
                 total_input_tokens: None,
+                total_prompt_tokens: None,
                 total_output_tokens: None,
                 total_cache_creation_tokens: None,
                 total_cache_read_tokens: None,
@@ -1206,6 +1288,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

@@ -16,6 +16,9 @@ use uuid::Uuid;
 use super::Store;
 use crate::error::{DaemonError, Result};
 
+#[path = "manager_node_authority.rs"]
+mod manager_node_authority;
+
 pub(crate) fn refused(code: &str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
 }
@@ -247,7 +250,7 @@ impl Store {
         if !rsi_common::is_leaf_kind(scope.target.session_kind) {
             return Err(refused("manager_v2_leaf_required"));
         }
-        let grant = self.get_harness_manager_policy(scope.config.project_id)?;
+        let grant = self.manager_policy_for_config(&scope.config)?;
         let Some(grant) = grant.filter(|grant| {
             !grant.revoked
                 && grant
@@ -430,6 +433,7 @@ impl Store {
             &payload,
             &serde_json::to_value(&result)?,
         )?;
+        self.sync_legacy_manager_root_on(&tx, config.project_id)?;
         tx.commit()?;
         Ok(result)
     }
@@ -442,7 +446,39 @@ impl Store {
         capability: Option<ManagerCapabilityV2>,
     ) -> Result<ManagerAuthorityV2> {
         fence.validate().map_err(refused)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (mut config, is_manager) = match self.manager_config_for_caller(caller) {
+            Ok(current) => current,
+            Err(legacy_denial) => {
+                if let Some(authority) =
+                    manager_node_authority::authorize_area_node(self, caller, fence, capability)?
+                {
+                    return Ok(authority);
+                }
+                return Err(legacy_denial);
+            }
+        };
+        if !is_manager {
+            let epic = self
+                .get_session(caller)?
+                .and_then(|session| session.parent_id)
+                .ok_or_else(|| refused("manager_v2_scope_denied"))?;
+            if let Some(seat) = self.manager_node_seat_for_epic(&config, epic)? {
+                let mut authority = self
+                    .manager_area_authority_current(seat)?
+                    .ok_or_else(|| refused("manager_node_authority_changed"))?;
+                if fence.scope_version != authority.config.row_version
+                    || fence.policy_version != authority.grant.row_version
+                {
+                    return Err(refused("manager_node_authority_changed"));
+                }
+                if capability.is_some() {
+                    return Err(refused("manager_v2_capability_denied"));
+                }
+                authority.caller = caller;
+                authority.is_manager = false;
+                return Ok(authority);
+            }
+        }
         if config.row_version != fence.scope_version {
             return Err(refused("manager_v2_scope_changed"));
         }
@@ -454,6 +490,10 @@ impl Store {
         }
         if capability.is_some_and(|c| !is_manager || !grant.policy.capabilities.contains(&c)) {
             return Err(refused("manager_v2_capability_denied"));
+        }
+        if is_manager {
+            config.epic_ids = self.manager_direct_epics(&config, config.manager_session_id)?;
+            config.selected_epic_ids = Some(config.epic_ids.clone());
         }
         Ok(ManagerAuthorityV2 {
             config,
@@ -1334,6 +1374,250 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_fixture(
+        store: &Store,
+        seat_project: Option<Uuid>,
+    ) -> (Uuid, Uuid, Uuid, Uuid, Uuid) {
+        use rsi_common::manager_nodes::{ManagerNodeAllowanceV1, ManagerNodeSelectorV1};
+
+        let (project, manager, epic) = fixture(store);
+        let root: Uuid = store
+            .conn
+            .query_row(
+                "SELECT id FROM manager_nodes WHERE legacy_project_id=?1",
+                [project.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: project,
+                expected_scope_version: 1,
+                expected_policy_version: 0,
+                idempotency_key: "root-node-authority".into(),
+                policy: ManagerPolicyV2 {
+                    capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let mut seat = store.get_session(manager).unwrap().unwrap();
+        seat.id = Uuid::new_v4();
+        seat.project_id = Some(seat_project.unwrap_or(project));
+        seat.parent_id = None;
+        store.insert_session(&seat).unwrap();
+        let node = Uuid::new_v4();
+        let selector = ManagerNodeSelectorV1::Selected {
+            group_ids: vec![],
+            epic_ids: vec![epic],
+        };
+        let policy = ManagerPolicyV2 {
+            capabilities: vec![ManagerCapabilityV2::WorkPlan],
+            ..Default::default()
+        };
+        let grant = rsi_common::manager_nodes::ManagerNodeGrantV1 {
+            capabilities: policy.capabilities.clone(),
+            allowed_launches: vec![],
+            allowance: ManagerNodeAllowanceV1 {
+                max_created_containers: policy.max_created_containers,
+                max_created_sessions: policy.max_created_sessions,
+                max_active_sessions: policy.max_active_sessions,
+                max_build_slots: 0,
+                max_disk_gib: 0,
+                provider_limits: policy.provider_limits.clone(),
+                max_spend_usd: policy.max_spend_usd,
+            },
+            max_direct_reports: 5,
+        };
+        let timestamp = now();
+        store.conn.execute(
+            "INSERT INTO manager_nodes(id,parent_node_id,legacy_project_id,seat_root_session_id,state,grant_version,policy_version,authority_epoch,created_at,updated_at)
+             VALUES(?1,?2,NULL,?3,'active',1,1,1,?4,?4)",
+            params![node.to_string(),root.to_string(),seat.id.to_string(),timestamp],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO manager_node_scopes(node_id,project_id,selector_json,grant_version) VALUES(?1,?2,?3,1)",
+            params![node.to_string(),project.to_string(),serde_json::to_string(&selector).unwrap()],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO manager_node_grants(node_id,grant_version,state,grant_json,policy_json,operator_origin,created_at)
+             VALUES(?1,1,'granted',?2,?3,'test',?4)",
+            params![node.to_string(),serde_json::to_string(&grant).unwrap(),serde_json::to_string(&policy).unwrap(),timestamp],
+        ).unwrap();
+        (project, manager, epic, node, seat.id)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_authority_uses_node_identity_and_live_selected_epics() {
+        let store = Store::open_in_memory().unwrap();
+        let (project, manager, epic, node, seat) = area_node_fixture(&store, None);
+        let fence = ManagerFenceV2 {
+            scope_version: 1,
+            policy_version: 1,
+        };
+        let authority = store
+            .manager_v2_authorize(seat, &fence, Some(ManagerCapabilityV2::WorkPlan))
+            .unwrap();
+        assert_eq!(authority.config.project_id, project);
+        assert_eq!(authority.config.manager_session_id, seat);
+        assert_eq!(authority.caller, seat);
+        assert_eq!(authority.grant.manager_session_id, node);
+        assert_eq!(authority.config.epic_ids, vec![epic]);
+        let ancestor = store
+            .manager_v2_authorize(manager, &fence, Some(ManagerCapabilityV2::WorkPlan))
+            .unwrap();
+        assert!(store.manager_v2_require_epic(&ancestor, epic).is_err());
+        assert_eq!(
+            store.manager_v2_require_epic(&authority, epic).unwrap().id,
+            epic
+        );
+        assert!(
+            store
+                .manager_v2_authorize(seat, &fence, Some(ManagerCapabilityV2::LeadControl))
+                .unwrap_err()
+                .to_string()
+                .contains("manager_v2_capability_denied")
+        );
+        assert!(
+            store
+                .manager_v2_require_epic(&authority, Uuid::new_v4())
+                .unwrap_err()
+                .to_string()
+                .contains("manager_v2_epic_out_of_scope")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_authority_fences_changed_epoch_and_denies_cross_project_seats() {
+        let store = Store::open_in_memory().unwrap();
+        let (_project, _manager, _epic, node, seat) = area_node_fixture(&store, None);
+        let fence = ManagerFenceV2 {
+            scope_version: 1,
+            policy_version: 1,
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE manager_nodes SET authority_epoch=authority_epoch+1 WHERE id=?1",
+                [node.to_string()],
+            )
+            .unwrap();
+        let error = store
+            .manager_v2_authorize(seat, &fence, Some(ManagerCapabilityV2::WorkPlan))
+            .unwrap_err();
+        assert!(error.to_string().contains("manager_node_authority_changed"));
+
+        let foreign_store = Store::open_in_memory().unwrap();
+        let other_project = Uuid::new_v4();
+        let stamp = Utc::now();
+        foreign_store
+            .insert_project(&rsi_common::types::Project {
+                id: other_project,
+                name: "Other authority project".into(),
+                path: None,
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: stamp,
+                updated_at: stamp,
+            })
+            .unwrap();
+        let (project, _manager, _epic, _node, foreign_seat) =
+            area_node_fixture(&foreign_store, Some(other_project));
+        let error = foreign_store
+            .manager_v2_authorize(foreign_seat, &fence, Some(ManagerCapabilityV2::WorkPlan))
+            .unwrap_err();
+        assert!(error.to_string().contains("manager_node_project_denied"));
+        assert_ne!(project, other_project);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_session_scope_excludes_the_root_seat() {
+        let store = Store::open_in_memory().unwrap();
+        let (_project, manager, epic, node, seat) = area_node_fixture(&store, None);
+        let mut target = store.get_session(manager).unwrap().unwrap();
+        target.id = Uuid::new_v4();
+        target.parent_id = Some(epic);
+        target.session_kind = SessionKind::Feature;
+        store.insert_session(&target).unwrap();
+        let scope = store
+            .manager_session_scope(seat, target.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.config.manager_session_id, seat);
+        assert_eq!(scope.epic_id, epic);
+        assert!(
+            store
+                .manager_session_scope(manager, target.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_commits_work_under_stable_storage_principal() {
+        use crate::store::manager_ledger::LedgerObservation;
+        let store = Store::open_in_memory().unwrap();
+        let (_project, manager, epic, node, seat) = area_node_fixture(&store, None);
+        let request = AgentManagerUpdateRequestV2 {
+            fence: ManagerFenceV2 {
+                scope_version: 1,
+                policy_version: 1,
+            },
+            idempotency_key: "area-work".into(),
+            change: ManagerUpdateV2::Work {
+                key: "area-work".into(),
+                expected_row_version: 0,
+                epic_id: epic,
+                title: "Area work".into(),
+                kind: ManagerWorkKindV2::Program,
+                priority: 1,
+                weight: 1,
+                required_gates: vec![ManagerWorkStageV2::Planning],
+                risk_tier: Default::default(),
+            },
+        };
+        store
+            .manager_v2_commit_update(seat, &request, &LedgerObservation::default())
+            .unwrap();
+        let fact = store
+            .manager_v2_fact(
+                store
+                    .get_session(seat)
+                    .unwrap()
+                    .unwrap()
+                    .project_id
+                    .unwrap(),
+                "work",
+                "area-work",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.epic_id, Some(epic));
+        let authority = store
+            .manager_v2_authorize(seat, &request.fence, None)
+            .unwrap();
+        assert_eq!(authority.grant.manager_session_id, node);
+        assert_eq!(authority.config.manager_session_id, seat);
+        assert!(
+            store
+                .manager_v2_commit_update(manager, &request, &LedgerObservation::default())
+                .is_err()
+        );
+    }
+
     #[allow(clippy::unwrap_used)]
     fn session_control_fixture(store: &Store) -> (Uuid, Uuid, Uuid, [Uuid; 3]) {
         let (project, manager, epic) = fixture(store);
@@ -1709,6 +1993,21 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
+    fn tier2_reviewer_minimum_survives_operator_policy_storage() {
+        let store = Store::open_in_memory().unwrap();
+        let (project, _, _) = fixture(&store);
+        let mut request = grant(project);
+        request.policy.minimum_tier2_reviewer_tier = rsi_common::model_control::ModelTier::Premium;
+        store.configure_harness_manager_policy(&request).unwrap();
+        let saved = store.get_harness_manager_policy(project).unwrap().unwrap();
+        assert_eq!(
+            saved.policy.minimum_tier2_reviewer_tier,
+            rsi_common::model_control::ModelTier::Premium
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
     fn manager_v2_record_and_event_roll_back_together_on_a_failed_transition() {
         let store = Store::open_in_memory().unwrap();
         let (project, _, epic) = fixture(&store);
@@ -1810,6 +2109,7 @@ mod tests {
             priority: 1,
             weight: 1,
             required_gates: vec![],
+            risk_tier: Default::default(),
             spec_revision: 0,
             source_session_id: None,
             source_commit: Some(source_commit.into()),

@@ -433,6 +433,7 @@ fn render_pane(
         }
         Pane::Settings => {
             settings::render_settings(app, frame, area);
+            settings::record_rendered_layout(app, area);
         }
         Pane::PromptCreator => {
             prompt_creator::render_prompt_creator(frame, area, focused, app);
@@ -1254,7 +1255,7 @@ mod tests {
             .expect("draw");
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("Model ["),
+            text.contains("Model  "),
             "dropdown must render post-cut: {text:?}"
         );
     }
@@ -1659,6 +1660,7 @@ mod tests {
                     selected_index: 0,
                     loading: false,
                     pending_delete: false,
+                    paging: Default::default(),
                 };
                 let schedules = render_text(&mut app);
                 assert!(
@@ -1718,6 +1720,7 @@ mod tests {
                 selected_index: 0,
                 loading: false,
                 pending_delete: false,
+                paging: Default::default(),
             };
             theme::set_theme_role_override(ThemeRole::Accent, Some([34, 44, 54]));
             assert!(render_text(&mut app).contains("> [+] matrix-job"));

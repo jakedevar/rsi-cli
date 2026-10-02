@@ -783,6 +783,7 @@ async fn manager_recovery_retirement_admission_pauses_intent_until_explicit_resu
                         ManagerWorkStageV2::Review,
                         ManagerWorkStageV2::Verification,
                     ],
+                    risk_tier: Default::default(),
                 },
             },
         )

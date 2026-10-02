@@ -23,6 +23,18 @@ use rsi_graph::format::*;
 use rsi_graph::generate::templates::starter_templates;
 use std::collections::{HashMap, HashSet};
 
+fn review_popup_rect(area: Rect) -> Rect {
+    super::scoped_popup_rect(
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(2),
+        ),
+        area,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_graph_review(
     frame: &mut Frame,
@@ -47,12 +59,7 @@ pub fn render_graph_review(
 ) {
     let validation = rsi_graph::validate_executable_workflow(workflow);
 
-    let popup_area = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(2),
-    );
+    let popup_area = review_popup_rect(area);
 
     frame.render_widget(Clear, popup_area);
 
@@ -1765,6 +1772,7 @@ fn camera_status(mode: GraphMode, viewport: GraphViewport) -> String {
 }
 
 pub fn render_missing_graph_review(frame: &mut Frame, area: Rect) {
+    let area = review_popup_rect(area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::overlay_border()))

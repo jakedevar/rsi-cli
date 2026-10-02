@@ -156,6 +156,7 @@ fn test_health_status_response_format() {
         provider_antigravity_available: false,
         provider_codex_app_server_available: false,
         provider_harness_available: true,
+        provider_clis_missing: Vec::new(),
         queue_pending: 10,
         queue_claimed: 2,
         queue_completed: 50,
@@ -163,6 +164,8 @@ fn test_health_status_response_format() {
         rate_limits: Vec::new(),
         latest_daemon_restart: None,
         worker_slice_memory_pressure: None,
+        process_memory: None,
+        provider_credentials: None,
     };
 
     let json = serde_json::to_value(&response).expect("serialize HealthStatusResponse");

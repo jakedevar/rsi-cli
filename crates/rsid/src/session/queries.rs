@@ -2,7 +2,7 @@
 
 use crate::error::{DaemonError, Result};
 use crate::profiling;
-use crate::sandbox::{SandboxAllocation, SandboxAllocator};
+use crate::sandbox::{AllocationPermit, SandboxAllocation, SandboxAllocator};
 use rsi_common::types::{
     ConversationEvent, SandboxCleanupState, SandboxKind, Session, SessionDiagnosticV1, TurnMetric,
 };
@@ -35,11 +35,12 @@ fn rehydrate_context_budget_projection(session: &mut Session) {
 fn fresh_unarchive_sandbox_binding(
     session: &Session,
     sandbox_base: std::path::PathBuf,
+    permit: AllocationPermit,
 ) -> Result<(
     SandboxAllocation,
     crate::store::sandbox_custody::SessionCustodyBinding,
 )> {
-    fresh_replacement_sandbox_binding(session, None, sandbox_base)
+    fresh_replacement_sandbox_binding(session, None, sandbox_base, permit)
 }
 
 /// Resolve `branch` in the canonical repository to its full commit id, or
@@ -70,6 +71,7 @@ pub(super) fn fresh_replacement_sandbox_binding(
     session: &Session,
     preferred_branch: Option<&str>,
     sandbox_base: std::path::PathBuf,
+    permit: AllocationPermit,
 ) -> Result<(
     SandboxAllocation,
     crate::store::sandbox_custody::SessionCustodyBinding,
@@ -83,7 +85,8 @@ pub(super) fn fresh_replacement_sandbox_binding(
     if let Some(source_commit) =
         preferred_branch.and_then(|branch| resolve_branch_commit(&working_dir, branch))
     {
-        let allocation = SandboxAllocator::new(sandbox_base).allocate_replacement(
+        let allocation = SandboxAllocator::new(sandbox_base).allocate_replacement_with_permit(
+            permit,
             session.id,
             &working_dir,
             SandboxKind::GitWorktree,
@@ -124,7 +127,8 @@ pub(super) fn fresh_replacement_sandbox_binding(
     )?;
     let source_commit = selection.commit.clone();
     let allocation = selection.allocate_with_cleanup(|commit| {
-        SandboxAllocator::new(sandbox_base.clone()).allocate_replacement(
+        SandboxAllocator::new(sandbox_base.clone()).allocate_replacement_with_permit(
+            permit,
             session.id,
             &working_dir,
             SandboxKind::GitWorktree,
@@ -249,6 +253,493 @@ pub(super) async fn load_completed_events_from_store(
 }
 
 impl SessionManager {
+    /// Copy bounded selected detail under one nonblocking runtime map guard.
+    /// This precedes the Store miss and the later scalar reread.
+    pub(crate) fn remote_selected_runtime_session(
+        &self,
+        project: Uuid,
+        session: Uuid,
+    ) -> crate::remote_read::Result<Option<crate::remote_read::SelectedRuntimeSession>> {
+        use crate::remote_read::{ReadError, SelectedRuntimeSession, SessionCandidateOrigin};
+
+        let active = self.active.try_read().map_err(|_| ReadError::Busy)?;
+        if let Some(tracked) = active.get(&session) {
+            if tracked.session.project_id != Some(project) {
+                return Err(ReadError::SourceUnavailable);
+            }
+            return SelectedRuntimeSession::capture(
+                &tracked.session,
+                SessionCandidateOrigin::Active,
+                Some(tracked.spawn_generation),
+                Some(&tracked.events),
+                chrono::Utc::now(),
+            )
+            .map(Some);
+        }
+        drop(active);
+        let completed = self.completed.try_read().map_err(|_| ReadError::Busy)?;
+        let Some(entry) = completed.get(&session) else {
+            return Ok(None);
+        };
+        if entry.session.project_id != Some(project) {
+            return Err(ReadError::SourceUnavailable);
+        }
+        let selected = SelectedRuntimeSession::capture(
+            &entry.session,
+            SessionCandidateOrigin::Completed,
+            None,
+            entry.events_hydrated.then_some(entry.events.as_slice()),
+            chrono::Utc::now(),
+        )
+        .map(Some);
+        drop(completed);
+        selected
+    }
+
+    /// Use the real nonblocking session and native-writer sources before the
+    /// Store miss. The matching finish call runs only after Store unlock.
+    pub(crate) fn remote_runtime_only_pending_capture(
+        &self,
+        project: Uuid,
+        session: Uuid,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeOnlyPendingCapture> {
+        crate::remote_read::capture_runtime_only_pending_sources(
+            project,
+            session,
+            |project, session| self.remote_question_slot_list(project, session),
+            super::pending_approvals::remote_native_approval_list,
+        )
+    }
+
+    pub(crate) fn remote_runtime_only_pending_finish(
+        &self,
+        selected: &crate::remote_read::SelectedRuntimeOnlySession,
+        capture: crate::remote_read::RuntimeOnlyPendingCapture,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeOnlyPendingSources> {
+        crate::remote_read::finish_runtime_only_pending_sources(
+            selected,
+            capture,
+            |before| self.remote_question_slot_list_recheck(before),
+            super::pending_approvals::remote_native_approval_list_recheck,
+        )
+    }
+
+    /// Capture real nonblocking pending sources before the saved Store read.
+    pub(crate) fn remote_saved_pending_capture(
+        &self,
+        project: Uuid,
+        session: Uuid,
+    ) -> crate::remote_read::Result<crate::remote_read::SavedPendingRuntimeCapture> {
+        crate::remote_read::capture_saved_pending_runtime_sources(
+            project,
+            session,
+            |project, session| self.remote_question_slot_list(project, session),
+            super::pending_approvals::remote_native_approval_list,
+        )
+    }
+
+    /// Run only after the saved Store read has released its lock.
+    pub(crate) fn remote_saved_pending_finish(
+        &self,
+        selected: &crate::remote_read::SelectedSavedSession,
+        capture: crate::remote_read::SavedPendingRuntimeCapture,
+        store: crate::remote_read::PendingStoreSources,
+    ) -> crate::remote_read::Result<crate::remote_read::PendingAcquiredSources> {
+        crate::remote_read::finish_saved_pending_sources(
+            selected,
+            capture,
+            store,
+            |before| self.remote_question_slot_list_recheck(before),
+            super::pending_approvals::remote_native_approval_list_recheck,
+        )
+    }
+
+    /// Copy only candidate scalars from each runtime map. Neither lock is
+    /// awaited, and the active guard is dropped before completed is tried.
+    /// The Store read and any payload projection happen after this returns.
+    pub(crate) fn remote_runtime_session_candidates(
+        &self,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeSessionCandidateSnapshot> {
+        use crate::remote_read::{
+            ReadError, RuntimeSessionCandidate, RuntimeSessionCandidateSnapshot,
+        };
+
+        let active = self.active.try_read().map_err(|_| ReadError::Busy)?;
+        if active.len() > 10_000 {
+            return Err(ReadError::ResourceLimit);
+        }
+        let mut active_rows: Vec<RuntimeSessionCandidate> = active
+            .values()
+            .map(|tracked| RuntimeSessionCandidate {
+                id: tracked.session.id,
+                project_id: tracked.session.project_id,
+                status: tracked.session.status,
+                is_eval: tracked.session.is_eval,
+                updated_at_seconds: tracked.session.updated_at.timestamp(),
+                updated_at_nanosecond: tracked.session.updated_at.timestamp_subsec_nanos(),
+                spawn_generation: Some(tracked.spawn_generation),
+            })
+            .collect();
+        active_rows.sort_unstable_by_key(|row| row.id);
+        let active_observed_at = chrono::Utc::now();
+        drop(active);
+
+        let completed = self.completed.try_read().map_err(|_| ReadError::Busy)?;
+        if completed.len() > 10_000 - active_rows.len() {
+            return Err(ReadError::ResourceLimit);
+        }
+        let mut completed_rows: Vec<RuntimeSessionCandidate> = completed
+            .values()
+            .map(|entry| RuntimeSessionCandidate {
+                id: entry.session.id,
+                project_id: entry.session.project_id,
+                status: entry.session.status,
+                is_eval: entry.session.is_eval,
+                updated_at_seconds: entry.session.updated_at.timestamp(),
+                updated_at_nanosecond: entry.session.updated_at.timestamp_subsec_nanos(),
+                spawn_generation: None,
+            })
+            .collect();
+        completed_rows.sort_unstable_by_key(|row| row.id);
+        let completed_observed_at = chrono::Utc::now();
+        Ok(RuntimeSessionCandidateSnapshot {
+            active: active_rows,
+            active_observed_at,
+            completed: completed_rows,
+            completed_observed_at,
+        })
+    }
+
+    /// Recopy both maps after Store work to detect observed source changes.
+    /// Matching scalar witnesses do not prove a frozen runtime snapshot; the
+    /// caller still reports source coverage and may retry a stale page.
+    pub(crate) fn remote_runtime_session_recheck(
+        &self,
+        before: &crate::remote_read::RuntimeSessionCandidateSnapshot,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeSessionRecheckObservation> {
+        use crate::remote_read::{RuntimeSessionRecheck, RuntimeSessionRecheckObservation};
+        let after = self.remote_runtime_session_candidates()?;
+        let state = if before.active == after.active && before.completed == after.completed {
+            RuntimeSessionRecheck::NoObservedChange
+        } else {
+            RuntimeSessionRecheck::Changed
+        };
+        Ok(RuntimeSessionRecheckObservation {
+            state,
+            active_observed_at: after.active_observed_at,
+            completed_observed_at: after.completed_observed_at,
+        })
+    }
+
+    /// Copy at most 100 selected runtime summary rows after Store release.
+    /// Exact scalar witnesses from the pre-Store snapshot fence every copy.
+    pub(crate) fn remote_runtime_session_page_rows(
+        &self,
+        project: Uuid,
+        selected: &[crate::remote_read::SessionCandidateSelection],
+        before: &crate::remote_read::RuntimeSessionCandidateSnapshot,
+    ) -> crate::remote_read::Result<Vec<Option<crate::remote_read::SessionRow>>> {
+        use crate::remote_read::{ReadError, SessionCandidateOrigin, runtime_summary_row};
+        if selected.len() > 100 {
+            return Err(ReadError::ResourceLimit);
+        }
+        if selected.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err(ReadError::InvalidSource);
+        }
+        let mut rows = vec![None; selected.len()];
+        let active = self.active.try_read().map_err(|_| ReadError::Busy)?;
+        for (index, choice) in selected.iter().enumerate() {
+            if choice.origin != SessionCandidateOrigin::Active {
+                continue;
+            }
+            let tracked = active.get(&choice.id).ok_or(ReadError::SourceUnavailable)?;
+            let position = before
+                .active
+                .binary_search_by_key(&choice.id, |row| row.id)
+                .map_err(|_| ReadError::SourceUnavailable)?;
+            rows[index] = Some(runtime_summary_row(
+                &tracked.session,
+                project,
+                before.active[position],
+                Some(tracked.spawn_generation),
+            )?);
+        }
+        drop(active);
+        let completed = self.completed.try_read().map_err(|_| ReadError::Busy)?;
+        for (index, choice) in selected.iter().enumerate() {
+            if choice.origin != SessionCandidateOrigin::Completed {
+                continue;
+            }
+            let entry = completed
+                .get(&choice.id)
+                .ok_or(ReadError::SourceUnavailable)?;
+            let position = before
+                .completed
+                .binary_search_by_key(&choice.id, |row| row.id)
+                .map_err(|_| ReadError::SourceUnavailable)?;
+            rows[index] = Some(runtime_summary_row(
+                &entry.session,
+                project,
+                before.completed[position],
+                None,
+            )?);
+        }
+        drop(completed);
+        Ok(rows)
+    }
+
+    /// Observe one selected question slot under one nonblocking runtime map
+    /// lock. The generation is an exact slot fence, never an occurrence ID.
+    /// The caller releases this observation before Store reads and then uses
+    /// the recheck below; absence/replacement cannot become a tombstone.
+    pub(crate) fn remote_selected_question_slot(
+        &self,
+        project: Uuid,
+        session: Uuid,
+        generation: crate::remote_read::QuestionSlotGeneration,
+        mirror: crate::remote_read::QuestionSlotMirror,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeQuestionSlotSnapshot> {
+        use crate::remote_read::{
+            QuestionSlotGeneration, QuestionSlotMirror, ReadError, RuntimeQuestionSlotSnapshot,
+            RuntimeQuestionSlotState, project_questions,
+        };
+        let started = std::time::Instant::now();
+        let state = match generation {
+            QuestionSlotGeneration::Spawn(expected) => {
+                let active = self.active.try_read().map_err(|_| ReadError::Busy)?;
+                let state = match active.get(&session) {
+                    None => RuntimeQuestionSlotState::SourceChanged,
+                    Some(tracked) => {
+                        if tracked.session.project_id != Some(project) {
+                            return Err(ReadError::SourceUnavailable);
+                        }
+                        if tracked.session.is_eval
+                            || matches!(
+                                tracked.session.status,
+                                rsi_common::types::SessionStatus::Archived
+                                    | rsi_common::types::SessionStatus::Deleted
+                            )
+                        {
+                            return Err(ReadError::NotFound);
+                        }
+                        if tracked.spawn_generation != expected {
+                            RuntimeQuestionSlotState::SourceChanged
+                        } else {
+                            let question = match mirror {
+                                QuestionSlotMirror::Tracked => tracked.pending_question.as_ref(),
+                                QuestionSlotMirror::Session => {
+                                    tracked.session.pending_question.as_ref()
+                                }
+                            };
+                            match question {
+                                Some(question) => RuntimeQuestionSlotState::Present(
+                                    project_questions(Some(question))?,
+                                ),
+                                None => RuntimeQuestionSlotState::Missing,
+                            }
+                        }
+                    }
+                };
+                drop(active);
+                state
+            }
+            QuestionSlotGeneration::Completed => {
+                let completed = self.completed.try_read().map_err(|_| ReadError::Busy)?;
+                let state = match completed.get(&session) {
+                    None => RuntimeQuestionSlotState::SourceChanged,
+                    Some(entry) => {
+                        if entry.session.project_id != Some(project) {
+                            return Err(ReadError::SourceUnavailable);
+                        }
+                        if entry.session.is_eval
+                            || matches!(
+                                entry.session.status,
+                                rsi_common::types::SessionStatus::Archived
+                                    | rsi_common::types::SessionStatus::Deleted
+                            )
+                        {
+                            return Err(ReadError::NotFound);
+                        }
+                        match (mirror, entry.session.pending_question.as_ref()) {
+                            (QuestionSlotMirror::Session, Some(question)) => {
+                                RuntimeQuestionSlotState::Present(project_questions(Some(
+                                    question,
+                                ))?)
+                            }
+                            (QuestionSlotMirror::Session, None) => {
+                                RuntimeQuestionSlotState::Missing
+                            }
+                            (QuestionSlotMirror::Tracked, _) => {
+                                RuntimeQuestionSlotState::SourceChanged
+                            }
+                        }
+                    }
+                };
+                drop(completed);
+                state
+            }
+        };
+        let observed_at = chrono::Utc::now();
+        if started.elapsed() > std::time::Duration::from_millis(5) {
+            return Err(ReadError::ResourceLimit);
+        }
+        Ok(RuntimeQuestionSlotSnapshot {
+            project,
+            session,
+            generation,
+            mirror,
+            observed_at,
+            state,
+        })
+    }
+
+    /// A matching post-Store slot proves only that no bounded change was
+    /// observed. The caller still reports source coverage, not a frozen view.
+    pub(crate) fn remote_selected_question_slot_recheck(
+        &self,
+        before: &crate::remote_read::RuntimeQuestionSlotSnapshot,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeQuestionSlotRecheckObservation> {
+        use crate::remote_read::{
+            RuntimeQuestionSlotRecheck, RuntimeQuestionSlotRecheckObservation,
+        };
+        let after = self.remote_selected_question_slot(
+            before.project,
+            before.session,
+            before.generation,
+            before.mirror,
+        )?;
+        Ok(RuntimeQuestionSlotRecheckObservation {
+            state: if matches!(
+                &before.state,
+                crate::remote_read::RuntimeQuestionSlotState::Present(_)
+            ) && before.state == after.state
+            {
+                RuntimeQuestionSlotRecheck::NoObservedChange
+            } else {
+                RuntimeQuestionSlotRecheck::Changed
+            },
+            observed_at: after.observed_at,
+        })
+    }
+
+    /// Capture every question mirror for one project-scoped session. Each
+    /// runtime map uses its own nonblocking guard; the result has at most
+    /// three bounded projections and is not a frozen view across both maps.
+    pub(crate) fn remote_question_slot_list(
+        &self,
+        project: Uuid,
+        session: Uuid,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeQuestionSlotListSnapshot> {
+        use crate::remote_read::{
+            QuestionSlotGeneration, QuestionSlotMirror, ReadError, RuntimeQuestionSlotListEntry,
+            RuntimeQuestionSlotListSnapshot, project_questions,
+        };
+        let started = std::time::Instant::now();
+        let mut slots = Vec::with_capacity(3);
+        let active = self.active.try_read().map_err(|_| ReadError::Busy)?;
+        let active_generation = match active.get(&session) {
+            None => None,
+            Some(tracked) => {
+                if tracked.session.project_id != Some(project) {
+                    return Err(ReadError::SourceUnavailable);
+                }
+                if tracked.session.is_eval
+                    || matches!(
+                        tracked.session.status,
+                        rsi_common::types::SessionStatus::Archived
+                            | rsi_common::types::SessionStatus::Deleted
+                    )
+                {
+                    return Err(ReadError::NotFound);
+                }
+                let generation = QuestionSlotGeneration::Spawn(tracked.spawn_generation);
+                if let Some(question) = tracked.pending_question.as_ref() {
+                    slots.push(RuntimeQuestionSlotListEntry {
+                        generation,
+                        mirror: QuestionSlotMirror::Tracked,
+                        projection: project_questions(Some(question))?,
+                    });
+                }
+                if let Some(question) = tracked.session.pending_question.as_ref() {
+                    slots.push(RuntimeQuestionSlotListEntry {
+                        generation,
+                        mirror: QuestionSlotMirror::Session,
+                        projection: project_questions(Some(question))?,
+                    });
+                }
+                Some(tracked.spawn_generation)
+            }
+        };
+        let active_observed_at = chrono::Utc::now();
+        drop(active);
+
+        let completed = self.completed.try_read().map_err(|_| ReadError::Busy)?;
+        let completed_found = match completed.get(&session) {
+            None => false,
+            Some(entry) => {
+                if entry.session.project_id != Some(project) {
+                    return Err(ReadError::SourceUnavailable);
+                }
+                if entry.session.is_eval
+                    || matches!(
+                        entry.session.status,
+                        rsi_common::types::SessionStatus::Archived
+                            | rsi_common::types::SessionStatus::Deleted
+                    )
+                {
+                    return Err(ReadError::NotFound);
+                }
+                if let Some(question) = entry.session.pending_question.as_ref() {
+                    slots.push(RuntimeQuestionSlotListEntry {
+                        generation: QuestionSlotGeneration::Completed,
+                        mirror: QuestionSlotMirror::Session,
+                        projection: project_questions(Some(question))?,
+                    });
+                }
+                true
+            }
+        };
+        let completed_observed_at = chrono::Utc::now();
+        drop(completed);
+        if started.elapsed() > std::time::Duration::from_millis(5) {
+            return Err(ReadError::ResourceLimit);
+        }
+        Ok(RuntimeQuestionSlotListSnapshot {
+            project,
+            session,
+            active_observed_at,
+            completed_observed_at,
+            active_generation,
+            completed_found,
+            slots,
+        })
+    }
+
+    /// Equality means no bounded source change was observed at the reread.
+    /// It cannot prove either cache stayed stable between observations.
+    pub(crate) fn remote_question_slot_list_recheck(
+        &self,
+        before: &crate::remote_read::RuntimeQuestionSlotListSnapshot,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeQuestionSlotListRecheckObservation>
+    {
+        use crate::remote_read::{
+            RuntimeQuestionSlotListRecheckObservation, RuntimeQuestionSlotRecheck,
+        };
+        let after = self.remote_question_slot_list(before.project, before.session)?;
+        Ok(RuntimeQuestionSlotListRecheckObservation {
+            state: if before.active_generation == after.active_generation
+                && before.completed_found == after.completed_found
+                && before.slots == after.slots
+            {
+                RuntimeQuestionSlotRecheck::NoObservedChange
+            } else {
+                RuntimeQuestionSlotRecheck::Changed
+            },
+            active_observed_at: after.active_observed_at,
+            completed_observed_at: after.completed_observed_at,
+        })
+    }
+
     /// Publish the operator's durably committed completed-transcript limit.
     pub(crate) async fn publish_completed_transcript_cache_cap(&self, cap: u64) {
         self.completed_transcript_cache
@@ -600,8 +1091,9 @@ impl SessionManager {
         ) {
             let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
             let archived_for_restore = archived.clone();
+            let permit = self.admit_sandbox_allocation().await?;
             let (allocation, binding) = tokio::task::spawn_blocking(move || {
-                fresh_unarchive_sandbox_binding(&archived_for_restore, sandbox_base)
+                fresh_unarchive_sandbox_binding(&archived_for_restore, sandbox_base, permit)
             })
             .await
             .map_err(|error| DaemonError::Store(error.to_string()))??;
@@ -785,6 +1277,7 @@ impl SessionManager {
             provider_local_available: self.local_client.is_some(),
             provider_antigravity_available: self.agy_client.is_some(),
             provider_harness_available: true,
+            provider_clis_missing: crate::provider_cli::missing_provider_clis(),
             provider_codex_app_server_available:
                 crate::codex_app_server::CodexAppServerClient::is_available(),
             queue_pending: queue_metrics.as_ref().map(|m| m.pending).unwrap_or(0),
@@ -793,6 +1286,8 @@ impl SessionManager {
             queue_failed: queue_metrics.as_ref().map(|m| m.failed).unwrap_or(0),
             latest_daemon_restart: self.latest_daemon_restart.clone(),
             worker_slice_memory_pressure,
+            process_memory: crate::process_memory::report(),
+            provider_credentials: Some(crate::vault::global().health_summary()),
         }
     }
 

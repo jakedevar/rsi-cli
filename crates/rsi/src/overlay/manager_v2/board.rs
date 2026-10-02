@@ -5,7 +5,7 @@ use rsi_common::{harness_manager::HarnessManagerConfigV1, harness_manager_v2::*}
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const SECTIONS: [ManagerInspectSectionV2; 12] = [
+pub const SECTIONS: [ManagerInspectSectionV2; 13] = [
     ManagerInspectSectionV2::Overview,
     ManagerInspectSectionV2::Workers,
     ManagerInspectSectionV2::Work,
@@ -18,6 +18,7 @@ pub const SECTIONS: [ManagerInspectSectionV2; 12] = [
     ManagerInspectSectionV2::Archive,
     ManagerInspectSectionV2::Health,
     ManagerInspectSectionV2::MigrationAllocations,
+    ManagerInspectSectionV2::Satellites,
 ];
 
 pub struct BoardState {
@@ -358,7 +359,36 @@ fn action_target_label(value: &str) -> String {
     }
 }
 
+/// #1046: the journal line of a manager's daemon setting change: key, the
+/// value it moved to, the receipt state and the reason it gave.
+fn daemon_setting_title(row: &Value) -> Option<String> {
+    let call = action_operation(row)?.get("call")?;
+    if call.get("method")?.as_str()? != "ProposeDaemonSetting" {
+        return None;
+    }
+    let params = call.get("params")?;
+    let key = params.get("key")?.as_str()?;
+    let value = params.get("value")?;
+    let state = action_receipt_state(row)?;
+    let mut title = format!("Daemon setting · {key} → {} · {state}", scalar(value));
+    if let Some(previous) = row
+        .get("outcome")
+        .and_then(|receipt| receipt.get("operator_result"))
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("previous"))
+    {
+        title.push_str(&format!(" (was {})", scalar(previous)));
+    }
+    if let Some(reason) = params.get("reason").and_then(Value::as_str) {
+        title.push_str(&format!(" · {reason}"));
+    }
+    Some(title)
+}
+
 fn action_title(row: &Value) -> Option<String> {
+    if let Some(title) = daemon_setting_title(row) {
+        return Some(title);
+    }
     let action = sentence_label(action_kind(row)?);
     let target = action_target_label(action_target_type(row)?);
     let receipt = action_receipt_state(row)?;

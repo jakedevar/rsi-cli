@@ -85,7 +85,7 @@ mod tests {
         capability_ident: "execution",
         primitive_kind: PrimitiveKind::ProviderChat,
         consumption: CapabilityConsumption::ProviderChatArgument,
-        runtime_route: RuntimeExecutionRoute::HarnessOpenAiHttp,
+        runtime_route: RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
         occurrences: 1,
     };
 
@@ -1011,6 +1011,93 @@ fn execute(execution: CliExecutionCapability) {
         validate_repository(ValidationInput::production(root.clone()))
             .expect_err("additional associated-form Dialectic send must fail");
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn rejects_registered_utility_response_and_credential_probe_drift() {
+        let root = production_fixture_root("registered-probe-drift");
+        validate_repository(ValidationInput::production(root.clone()))
+            .expect("all production sinks have one explicit contract");
+
+        let cases = [
+            (
+                "crates/rsid/src/bin/rsi-rolling-land/canary_runner.rs",
+                "canary::runner_command(&exe, root, wrapper.as_deref())",
+                "std::process::Command::new(\"claude\")",
+            ),
+            (
+                "crates/rsid/src/deploy.rs",
+                ".arg(\"--build-info\")",
+                ".arg(\"--model\")",
+            ),
+            (
+                "crates/rsid/src/rolling_queue.rs",
+                "\"--accepted\",",
+                "\"--unregistered\",",
+            ),
+            (
+                "crates/rsid/src/session/harness/mcp/stdio.rs",
+                "Command::new(&spec.command)",
+                "Command::new(\"claude\")",
+            ),
+            (
+                "crates/rsid/src/session/harness/providers/openai_responses.rs",
+                "RuntimeExecutionRoute::SessionHarnessOpenAiHttp, req",
+                "RuntimeExecutionRoute::SessionHarnessAnthropicHttp, req",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "\"max_tokens\": 1,",
+                "\"max_tokens\": 2,",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "crate::bedrock::BEDROCK_DEFAULT_MODEL,",
+                "\"uncontrolled-model\",",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "\"content\": \"ping\"",
+                "\"content\": \"perform a task\"",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "{base}/openai/v1/chat/completions",
+                "{base}/v1/chat/completions",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "request.send().await",
+                "other_request.send().await",
+            ),
+            (
+                "crates/rsid/src/vault/check.rs",
+                "let response = match request.send().await",
+                "let _extra = request.send().await; let response = match request.send().await",
+            ),
+        ];
+        for (path, before, after) in cases {
+            let source_path = root.join(path);
+            let source = fs::read_to_string(&source_path).expect("registered sink source");
+            let drift = source.replacen(before, after, 1);
+            assert_ne!(source, drift, "mutation applied: {path}: {before}");
+            // Exercise the actual source and contract without reparsing every
+            // unrelated production file for each mutation.
+            let isolated = fixture_root("registered-sink-drift");
+            write(&isolated, path, &source);
+            let mut input = ValidationInput::production(isolated.clone());
+            input.markdown = None;
+            input.purposes.clear();
+            input.boundaries.retain(|contract| contract.path == path);
+            input.exclusions.retain(|contract| contract.path == path);
+            validate_repository(input.clone()).expect("canonical registered sink");
+            write(&isolated, path, &drift);
+            let error = validate_repository(input)
+                .expect_err("registered sink drift must fail structural validation");
+            assert!(error.contains(path), "{path}: {error}");
+            fs::remove_dir_all(isolated).expect("cleanup isolated sink");
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

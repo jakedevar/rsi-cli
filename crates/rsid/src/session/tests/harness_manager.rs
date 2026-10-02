@@ -2199,3 +2199,696 @@ async fn v1_failed_seat_beyond_first_page_is_signalled_within_bounded_passes() {
         Some((ManagerSeatConditionV1::Down, owner))
     );
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
+    use rsi_common::rolling_queue::{AgentEnqueueLandingSourceRequestV1, RollingQueueEntryState};
+
+    let pilot = pilot().await;
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "work"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let second = git(&["rev-parse", "HEAD"]);
+
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        for id in [pilot.owner, pilot.leads[0], worker] {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET working_dir=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), repo.path().display().to_string()],
+                )
+                .unwrap();
+        }
+    }
+    let request = |commit: &str, key: &str| AgentEnqueueLandingSourceRequestV1 {
+        source_commit: commit.to_string(),
+        test_filters: vec!["rsid=rolling_queue".into()],
+        idempotency_key: key.into(),
+    };
+    let control = pilot.manager.agent_control();
+
+    let refused = control
+        .agent_enqueue_landing_source(worker, request(&first, "w"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("queue_not_authorized"),
+        "{refused}"
+    );
+    let disabled = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&first, "d"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        disabled.to_string().contains("queue_disabled"),
+        "{disabled}"
+    );
+    let invalid = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&"1".repeat(40), "i"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.to_string().contains("queue_source_invalid"),
+        "{invalid}"
+    );
+
+    let lead = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&first, "l"), true)
+        .await
+        .unwrap();
+    assert!(!lead.replayed);
+    assert_eq!(lead.entry.state, RollingQueueEntryState::Queued);
+    assert_eq!(lead.entry.source_session_id, pilot.leads[0]);
+    assert_eq!(lead.entry.owner_epic_id, Some(pilot.epics[0]));
+    let replay = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&first, "l"), true)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.entry.id, lead.entry.id);
+    let duplicate = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&first, "l2"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        duplicate.to_string().contains("queue_duplicate_source"),
+        "{duplicate}"
+    );
+
+    let manager = control
+        .agent_enqueue_landing_source(pilot.owner, request(&second, "m"), true)
+        .await
+        .unwrap();
+    assert_eq!(manager.entry.source_session_id, pilot.owner);
+    assert_eq!(manager.entry.owner_epic_id, None);
+    assert!(manager.entry.sequence > lead.entry.sequence);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn provider_status_admits_manager_and_lead_and_refuses_workers_without_a_key() {
+    use crate::provider_status::{OpenRouterApi, ProviderStatusService};
+    use crate::vault::check::ProbeOutcome;
+    use crate::vault::secret::SecretString;
+    use crate::vault::{VaultHandleBuilder, VaultSettings};
+    use rsi_common::agent_provider_status::AgentGetProviderStatusRequestV1;
+    use std::sync::Arc;
+
+    const KEY: &str = "sk-or-test-verb-key-0009";
+    struct Stub;
+    #[async_trait::async_trait]
+    impl OpenRouterApi for Stub {
+        async fn key(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Http {
+                status: 200,
+                body: br#"{"data":{"limit":10.0,"usage":9.0,"limit_remaining":1.0}}"#.to_vec(),
+            }
+        }
+        async fn credits(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Http {
+                status: 200,
+                body: br#"{"data":{"total_credits":20.0,"total_usage":19.0}}"#.to_vec(),
+            }
+        }
+    }
+
+    let pilot = pilot().await;
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+    }
+    let vault = VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+        .env(|name| (name == "OPEN_ROUTER").then(|| KEY.to_string()))
+        .open()
+        .unwrap();
+    let service = ProviderStatusService::new(Arc::new(Stub), std::time::Duration::from_secs(60));
+    let control = pilot.manager.agent_control();
+    let request = || AgentGetProviderStatusRequestV1 {
+        provider: Some("openrouter".into()),
+    };
+
+    let refused = control
+        .agent_get_provider_status_with(worker, request(), &service, &vault)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("provider_status_not_authorized"),
+        "{refused}"
+    );
+    for caller in [pilot.leads[0], pilot.owner] {
+        let result = control
+            .agent_get_provider_status_with(caller, request(), &service, &vault)
+            .await
+            .unwrap();
+        assert_eq!(result.providers.len(), 1);
+        let entry = &result.providers[0];
+        assert_eq!(entry.provider, "openrouter");
+        assert_eq!(entry.configured, Some(true));
+        assert_eq!(
+            entry
+                .credit
+                .as_ref()
+                .and_then(|credit| credit.account_remaining),
+            Some(1.0)
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains(KEY));
+    }
+    let unknown = control
+        .agent_get_provider_status_with(
+            pilot.owner,
+            AgentGetProviderStatusRequestV1 {
+                provider: Some("nope".into()),
+            },
+            &service,
+            &vault,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        unknown
+            .to_string()
+            .contains("provider_status_unknown_provider"),
+        "{unknown}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
+async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them() {
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use crate::daemon_info::DaemonInfoService;
+    use crate::store::agent_deploys::DeployRow;
+    use rsi_common::agent_jobs::{AgentSubmitJobRequestV1, JobKind, JobState};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    let pilot = pilot().await;
+    let sandbox = TempDir::new().unwrap();
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Completed;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                rusqlite::params![worker.to_string(), sandbox.path().display().to_string()],
+            )
+            .unwrap();
+    }
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let request = || AgentSubmitJobRequestV1 {
+        kind: JobKind::Build,
+        params: serde_json::json!({"command": "check", "workspace": true}),
+        name: Some("check".into()),
+        idempotency_key: None,
+        worktree: None,
+        wake: None,
+    };
+    let control = pilot.manager.agent_control();
+    let recorder = std::sync::Arc::new(Recorder::default());
+
+    // The deploy's caller is the appointed manager; its deploy is waiting.
+    let deadline = chrono::Utc::now() + chrono::Duration::seconds(600);
+    let live = DeployRow {
+        id: Uuid::new_v4(),
+        owner_session_id: pilot.owner,
+        sha: "0".repeat(40),
+        manifest: Vec::new(),
+        state: rsi_common::agent_deploy::DeployState::Staged,
+        reason: None,
+        deadline_at: deadline,
+    };
+    pilot
+        .manager
+        .deploy_drain()
+        .sync(Some(&live), true, chrono::Utc::now());
+
+    // A child's new job is refused with the typed code; nothing launches.
+    let refused = control
+        .agent_submit_job(worker, request(), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("deploy_draining"), "{refused}");
+    assert!(
+        matches!(
+            &refused,
+            crate::error::DaemonError::StructuredRpc { rpc_code, data, .. }
+                if *rpc_code == crate::deploy_drain::DEPLOY_DRAINING_RPC_CODE
+                    && data["retryable"] == true
+        ),
+        "a structured, retryable refusal: {refused}"
+    );
+    assert!(recorder.0.lock().unwrap().is_empty());
+    // A child's continuation is refused the same way, before any effect.
+    let continued = pilot
+        .manager
+        .continue_session(worker, "more work".into())
+        .await
+        .unwrap_err();
+    assert!(
+        continued.to_string().contains("deploy_draining"),
+        "{continued}"
+    );
+    // The hold is visible to the manager.
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("rsid");
+    std::fs::write(&exe, b"abc").unwrap();
+    let service =
+        DaemonInfoService::new(dir.path().to_path_buf(), dir.path().join("sandboxes"), exe);
+    let info = control
+        .agent_get_daemon_info_with(pilot.owner, &service)
+        .await
+        .unwrap();
+    assert!(info.deploy_drain.draining);
+    assert_eq!(info.deploy_drain.deploy_id, Some(live.id));
+    assert_eq!(info.deploy_drain.refused_total, 2);
+
+    // The deploy settles: the same submit now runs.
+    pilot
+        .manager
+        .deploy_drain()
+        .sync(None, true, chrono::Utc::now());
+    let receipt = control
+        .agent_submit_job(worker, request(), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(receipt.job.state, JobState::Running);
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
+    let info = control
+        .agent_get_daemon_info_with(pilot.owner, &service)
+        .await
+        .unwrap();
+    assert!(!info.deploy_drain.draining);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
+async fn daemon_info_is_manager_and_lead_only_and_well_formed() {
+    use crate::daemon_info::DaemonInfoService;
+
+    let pilot = pilot().await;
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("rsid");
+    std::fs::write(&exe, b"abc").unwrap();
+    let service =
+        DaemonInfoService::new(dir.path().to_path_buf(), dir.path().join("sandboxes"), exe);
+    let control = pilot.manager.agent_control();
+
+    let refused = control
+        .agent_get_daemon_info_with(worker, &service)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("daemon_info_not_authorized"),
+        "{refused}"
+    );
+    for caller in [pilot.leads[0], pilot.owner] {
+        let hub = control
+            .agent_get_daemon_info_with(caller, &service)
+            .await
+            .unwrap()
+            .hub;
+        assert!(!hub.build_sha.is_empty());
+        assert_eq!(
+            hub.binary_sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert!(hub.schema_version > 0);
+        assert!(chrono::DateTime::parse_from_rfc3339(&hub.started_at).is_ok());
+        assert!(hub.disk_free.data_dir_free_bytes.unwrap() > 0);
+        assert!(hub.disk_free.sandbox_base_free_bytes.unwrap() > 0);
+        let json = serde_json::to_value(&hub).unwrap();
+        assert!(json.get("build_sha").is_some() && json.get("schema_version").is_some());
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use rsi_common::agent_jobs::{
+        AgentGetJobRequestV1, AgentListJobsRequestV1, AgentSubmitJobRequestV1, JobKind, JobState,
+    };
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    let pilot = pilot().await;
+    let sandbox = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                rusqlite::params![worker.to_string(), sandbox.path().display().to_string()],
+            )
+            .unwrap();
+    }
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let request = |worktree: Option<&std::path::Path>| AgentSubmitJobRequestV1 {
+        kind: JobKind::Build,
+        params: serde_json::json!({"command": "check", "workspace": true}),
+        name: Some("check".into()),
+        idempotency_key: None,
+        worktree: worktree.map(|p| p.display().to_string()),
+        wake: None,
+    };
+    let control = pilot.manager.agent_control();
+    let recorder = std::sync::Arc::new(Recorder::default());
+
+    let receipt = control
+        .agent_submit_job(worker, request(None), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(receipt.job.state, JobState::Running);
+    assert_eq!(receipt.job.owner_session_id, worker);
+    assert_eq!(
+        std::path::PathBuf::from(&receipt.job.cwd),
+        sandbox.path().canonicalize().unwrap()
+    );
+    let launched = recorder.0.lock().unwrap().clone();
+    assert_eq!(launched.len(), 1);
+    assert_eq!(launched[0].cwd, sandbox.path().canonicalize().unwrap());
+
+    // A worker cannot point the job at another directory.
+    let refused = control
+        .agent_submit_job(
+            worker,
+            request(Some(other.path())),
+            recorder.clone(),
+            tools(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("job_directory_not_allowed"),
+        "{refused}"
+    );
+    // Invalid typed parameters are refused before anything is recorded.
+    let mut bad = request(None);
+    bad.params = serde_json::json!({"command": "check; id", "workspace": true});
+    let invalid = control
+        .agent_submit_job(worker, bad, recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.to_string().contains("job_invalid_params"),
+        "{invalid}"
+    );
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
+
+    // Reads are scoped to the owner.
+    let got = control
+        .agent_get_job(
+            worker,
+            AgentGetJobRequestV1 {
+                job_id: receipt.job.id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.id, receipt.job.id);
+    let foreign = control
+        .agent_get_job(
+            pilot.owner,
+            AgentGetJobRequestV1 {
+                job_id: receipt.job.id,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(foreign.to_string().contains("job_not_found"), "{foreign}");
+    let mine = control
+        .agent_list_jobs(worker, AgentListJobsRequestV1 { limit: None })
+        .await
+        .unwrap();
+    assert_eq!(mine.jobs.len(), 1);
+    let theirs = control
+        .agent_list_jobs(pilot.owner, AgentListJobsRequestV1 { limit: None })
+        .await
+        .unwrap();
+    assert!(theirs.jobs.is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn landing_cloud_gate_and_cloud_sweep_jobs_need_the_manager_or_epic_lead() {
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use rsi_common::agent_jobs::{AgentSubmitJobRequestV1, JobKind};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    let pilot = pilot().await;
+    let worker = Uuid::new_v4();
+    let sandboxes: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        for (id, dir) in [worker, pilot.leads[0], pilot.owner]
+            .into_iter()
+            .zip(&sandboxes)
+        {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), dir.path().display().to_string()],
+                )
+                .unwrap();
+        }
+    }
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let request = |kind: JobKind, key: &str| AgentSubmitJobRequestV1 {
+        kind,
+        params: if kind == JobKind::CloudSweep {
+            serde_json::json!({"sha": oid})
+        } else {
+            serde_json::json!({"accepted": oid})
+        },
+        name: None,
+        idempotency_key: Some(key.into()),
+        worktree: None,
+        wake: None,
+    };
+    let control = pilot.manager.agent_control();
+    let recorder = std::sync::Arc::new(Recorder::default());
+
+    // An ordinary worker cannot publish to rolling or spend the cloud grant.
+    for kind in [JobKind::Landing, JobKind::CloudGate, JobKind::CloudSweep] {
+        let refused = control
+            .agent_submit_job(worker, request(kind, "w"), recorder.clone(), tools())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("job_kind_not_authorized"),
+            "{kind:?}: {refused}"
+        );
+    }
+    assert!(recorder.0.lock().unwrap().is_empty(), "nothing launched");
+
+    // The current Epic lead and the appointed manager may land.
+    for (caller, key) in [(pilot.leads[0], "l"), (pilot.owner, "m")] {
+        let receipt = control
+            .agent_submit_job(
+                caller,
+                request(JobKind::Landing, key),
+                recorder.clone(),
+                tools(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.job.owner_session_id, caller);
+    }
+    assert_eq!(recorder.0.lock().unwrap().len(), 2);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn send_satellite_message_admits_only_the_appointed_manager() {
+    use rsi_common::satellite::{
+        SatellitePeerConfigV1, SatellitePutPeerRequestV1, SatelliteUuidV1,
+    };
+    use rsi_common::satellite_dispatch::AgentSendSatelliteMessageRequestV1;
+
+    let pilot = pilot().await;
+    let peer = Uuid::new_v4();
+    let remote = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        store
+            .put_satellite_peer(
+                &SatellitePutPeerRequestV1 {
+                    expected_registry_revision: 1,
+                    peer: SatellitePeerConfigV1 {
+                        peer_id: SatelliteUuidV1(peer),
+                        label: "work laptop".into(),
+                        expected_installation_id: Some(SatelliteUuidV1(Uuid::new_v4())),
+                        enabled: true,
+                        read_enabled: true,
+                        dispatch_enabled: true,
+                    },
+                    repair_quarantine: false,
+                },
+                std::path::Path::new("/tmp/satellites"),
+            )
+            .unwrap();
+        store
+            .put_satellite_peer_scope(2, peer, &[SatelliteUuidV1(remote)])
+            .unwrap();
+    }
+    let request = |key: &str| AgentSendSatelliteMessageRequestV1 {
+        peer_id: SatelliteUuidV1(peer),
+        remote_session_id: SatelliteUuidV1(remote),
+        message: "please report status".into(),
+        idempotency_key: key.into(),
+        expires_at: None,
+    };
+    let control = pilot.manager.agent_control();
+
+    let lead = control
+        .agent_send_satellite_message(pilot.leads[0], request("l"))
+        .await
+        .unwrap_err();
+    assert!(lead.to_string().contains("target_not_authorized"), "{lead}");
+
+    let receipt = control
+        .agent_send_satellite_message(pilot.owner, request("m"))
+        .await
+        .unwrap();
+    assert_eq!(receipt.state, "queued");
+    assert!(!receipt.replayed);
+    let replay = control
+        .agent_send_satellite_message(pilot.owner, request("m"))
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.message_id, receipt.message_id);
+}

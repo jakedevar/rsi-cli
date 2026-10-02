@@ -108,6 +108,7 @@ pub(crate) fn make_test_session() -> Session {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -1082,7 +1083,11 @@ fn current_schema_template_backup_budgets_are_enforced() {
     assert_eq!(step_limit, 272);
     assert_eq!(no_progress_limit, 8);
     assert_eq!(busy_limit, 8);
-    assert_eq!(deadline, std::time::Duration::from_millis(500));
+    // The wall clock is only a hang net for a wedged copy or a deadlocked
+    // source mutex; the step/no-progress/busy budgets above bound real
+    // progress. It must stay generous under parallel cargo-slot load, where a
+    // thread can be descheduled for far longer than the copy itself takes.
+    assert_eq!(deadline, std::time::Duration::from_secs(30));
 
     let mutex = std::sync::Mutex::new(());
     current_schema_template_backup_seam_for_test(
@@ -7122,6 +7127,376 @@ fn h1_v83_startup_includes_archived_and_deleted_live_owners() {
     }
 }
 
+/// Everything startup reconciliation writes, minus timestamps, plus the
+/// order in which custody events were written (#961).
+fn startup_custody_dump_961(store: &Store) -> Vec<String> {
+    let mut dump = Vec::new();
+    for sql in [
+        "SELECT 'root|'||custody_id||'|'||state||'|'||COALESCE(owner_session_id,'')||'|'||generation||'|'||
+                event_sequence||'|'||validation_state||'|'||COALESCE(validated_generation,'')||'|'||
+                COALESCE(validation_error_code,'')
+           FROM sandbox_custody_roots ORDER BY custody_id",
+        "SELECT 'event|'||custody_id||'|'||sequence||'|'||event_kind||'|'||cause||'|'||
+                COALESCE(error_code,'')||'|'||COALESCE(from_generation,'')||'|'||to_generation
+           FROM sandbox_custody_events ORDER BY rowid",
+        "SELECT 'projection|'||session_id||'|'||execution_state||'|'||freshness||'|'||
+                COALESCE(effective_cwd,'')||'|'||COALESCE(custody_id,'')||'|'||
+                COALESCE(custody_generation,'')||'|'||COALESCE(error_code,'')
+           FROM session_execution_projections ORDER BY session_id",
+        "SELECT 'session|'||id||'|'||status||'|'||COALESCE(stop_reason,'')
+           FROM sessions ORDER BY id",
+    ] {
+        let mut statement = store.conn.prepare(sql).unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        dump.extend(rows);
+    }
+    dump
+}
+
+struct MultiRootStartup961 {
+    _tempdir: tempfile::TempDir,
+    tempdir_path: PathBuf,
+    sandbox_base: PathBuf,
+    db: PathBuf,
+    /// (custody_id, owner session_id, expected root state, expected error)
+    roots: Vec<(Uuid, Uuid, &'static str, Option<&'static str>)>,
+}
+
+/// One store holding several live roots of one repository, with mixed owner
+/// statuses and filesystem faults, persisted to a file so it can be copied.
+fn multi_root_startup_store_961() -> MultiRootStartup961 {
+    use super::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
+    use rsi_common::types::{SandboxCleanupState, SandboxKind};
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let canonical = tempdir.path().join("canonical");
+    let sandbox_base = tempdir.path().join("sandboxes");
+    std::fs::create_dir_all(&canonical).unwrap();
+    std::fs::create_dir(&sandbox_base).unwrap();
+    h1_v83_git(&canonical, &["init", "-q"]);
+    h1_v83_git(&canonical, &["config", "user.email", "h1@example.test"]);
+    h1_v83_git(&canonical, &["config", "user.name", "H1"]);
+    std::fs::write(canonical.join("tracked"), "canonical").unwrap();
+    h1_v83_git(&canonical, &["add", "tracked"]);
+    h1_v83_git(&canonical, &["commit", "-qm", "initial"]);
+    let repository_identity = std::fs::canonicalize(canonical.join(".git"))
+        .unwrap()
+        .display()
+        .to_string();
+    let source_commit = h1_v83_git(&canonical, &["rev-parse", "HEAD"]);
+    let db = tempdir.path().join("custody.db");
+    let mut store = Store::open(&db).unwrap();
+    let specs = [
+        (SessionStatus::Completed, None, "live", None),
+        (
+            SessionStatus::Completed,
+            Some(RootFault961::MissingRoot),
+            "quarantined",
+            Some("root_missing"),
+        ),
+        (
+            SessionStatus::Running,
+            Some(RootFault961::SwitchedBranch),
+            "quarantined",
+            Some("worktree_mismatch"),
+        ),
+        (SessionStatus::Archived, None, "live", None),
+        (
+            SessionStatus::Failed,
+            Some(RootFault961::SwitchedBranch),
+            "quarantined",
+            Some("worktree_mismatch"),
+        ),
+        (SessionStatus::Interrupted, None, "live", None),
+        (SessionStatus::Running, None, "live", None),
+        (
+            SessionStatus::Deleted,
+            Some(RootFault961::MissingRoot),
+            "quarantined",
+            Some("root_missing"),
+        ),
+    ];
+    let mut roots = Vec::new();
+    for (index, (status, fault, expected_state, expected_error)) in specs.into_iter().enumerate() {
+        let mut owner = make_test_session();
+        let root = sandbox_base.join(owner.id.to_string());
+        let branch = format!("rsi/multi-961-{index}");
+        h1_v83_git(
+            &canonical,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                &branch,
+                root.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        owner.status = status;
+        owner.working_dir = canonical.clone();
+        owner.sandbox_kind = Some(SandboxKind::GitWorktree);
+        owner.sandbox_root = Some(root.clone());
+        owner.sandbox_branch = Some(branch.clone());
+        owner.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+        let custody_id = Uuid::new_v4();
+        store
+            .insert_session_with_custody(
+                &owner,
+                SessionCustodyBinding::New(NewCustodyRoot {
+                    custody_id,
+                    canonical_repo_dir: canonical.display().to_string(),
+                    sandbox_root: root.display().to_string(),
+                    sandbox_branch: branch,
+                    repository_identity: repository_identity.clone(),
+                    source_commit: source_commit.clone(),
+                    cause: CustodyCause::FreshLaunch,
+                }),
+            )
+            .unwrap();
+        match fault {
+            None => {}
+            Some(RootFault961::MissingRoot) => std::fs::remove_dir_all(&root).unwrap(),
+            Some(RootFault961::SwitchedBranch) => {
+                h1_v83_git(&root, &["switch", "-qc", &format!("rsi/elsewhere-{index}")]);
+            }
+            Some(RootFault961::None) => unreachable!(),
+        }
+        roots.push((custody_id, owner.id, expected_state, expected_error));
+    }
+    // Two terminal (quarantined) roots that keep their directories, one of
+    // them on a switched branch: their evidence probes join the prefetch.
+    for (index, switched) in [(100, false), (101, true)] {
+        let mut owner = make_test_session();
+        let root = sandbox_base.join(owner.id.to_string());
+        let branch = format!("rsi/multi-961-{index}");
+        h1_v83_git(
+            &canonical,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                &branch,
+                root.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        owner.status = SessionStatus::Completed;
+        owner.working_dir = canonical.clone();
+        owner.sandbox_kind = Some(SandboxKind::GitWorktree);
+        owner.sandbox_root = Some(root.clone());
+        owner.sandbox_branch = Some(branch.clone());
+        owner.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+        let custody_id = Uuid::new_v4();
+        store
+            .insert_session_with_custody(
+                &owner,
+                SessionCustodyBinding::New(NewCustodyRoot {
+                    custody_id,
+                    canonical_repo_dir: canonical.display().to_string(),
+                    sandbox_root: root.display().to_string(),
+                    sandbox_branch: branch,
+                    repository_identity: repository_identity.clone(),
+                    source_commit: source_commit.clone(),
+                    cause: CustodyCause::FreshLaunch,
+                }),
+            )
+            .unwrap();
+        store
+            .record_failed_revalidation(
+                custody_id,
+                1,
+                rsi_common::types::SandboxCustodyErrorCodeV1::WorktreeMismatch,
+                rsi_common::types::SandboxCustodyTransitionV1::EffectRevalidation,
+            )
+            .unwrap();
+        if switched {
+            h1_v83_git(&root, &["switch", "-qc", &format!("rsi/elsewhere-{index}")]);
+        }
+        roots.push((
+            custody_id,
+            owner.id,
+            "quarantined",
+            Some("worktree_mismatch"),
+        ));
+    }
+    drop(store);
+    MultiRootStartup961 {
+        tempdir_path: tempdir.path().to_path_buf(),
+        _tempdir: tempdir,
+        sandbox_base,
+        db,
+        roots,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RootFault961 {
+    None,
+    MissingRoot,
+    SwitchedBranch,
+}
+
+/// Copy the fixture store so several passes start from identical bytes.
+fn copy_multi_root_store_961(fixture: &MultiRootStartup961, name: &str) -> Store {
+    let path = fixture.tempdir_path.join(format!("{name}.db"));
+    let source = Store::open(&fixture.db).unwrap();
+    source
+        .conn
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    drop(source);
+    Store::open(&path).unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn parallel_startup_proofs_apply_in_serial_order_with_serial_outcomes_961() {
+    use crate::sandbox::custody::{CustodyService, reverse_startup_probe_completion_for_test};
+
+    let fixture = multi_root_startup_store_961();
+
+    let mut serial = copy_multi_root_store_961(&fixture, "serial");
+    CustodyService::reconcile_startup_with_pool(&mut serial, &fixture.sandbox_base, 1).unwrap();
+    let expected = startup_custody_dump_961(&serial);
+
+    let mut parallel = copy_multi_root_store_961(&fixture, "parallel");
+    CustodyService::reconcile_startup_with_pool(&mut parallel, &fixture.sandbox_base, 8).unwrap();
+    assert_eq!(
+        startup_custody_dump_961(&parallel),
+        expected,
+        "concurrent proofs publish exactly the serial outcomes, in the serial order"
+    );
+
+    // Force probes to finish in the reverse of their job order.
+    let mut reversed = copy_multi_root_store_961(&fixture, "reversed");
+    reverse_startup_probe_completion_for_test(Some(&fixture.sandbox_base));
+    CustodyService::reconcile_startup_with_pool(&mut reversed, &fixture.sandbox_base, 8).unwrap();
+    let completion = reverse_startup_probe_completion_for_test(None);
+    // Jobs are claimed terminal roots first, then live roots, each in
+    // custody order.
+    let mut terminal: Vec<Uuid> = fixture.roots[8..].iter().map(|root| root.0).collect();
+    let mut live: Vec<Uuid> = fixture.roots[..8].iter().map(|root| root.0).collect();
+    terminal.sort();
+    live.sort();
+    let job_order: Vec<Uuid> = terminal.into_iter().chain(live).collect();
+    assert_eq!(
+        completion.len(),
+        job_order.len(),
+        "every root with retained evidence was probed"
+    );
+    assert_ne!(completion, job_order, "probes completed out of job order");
+    assert_eq!(
+        startup_custody_dump_961(&reversed),
+        expected,
+        "probe completion order does not change what is applied or its order"
+    );
+
+    for (custody_id, owner_id, expected_state, expected_error) in &fixture.roots {
+        let (state, error): (String, Option<String>) = serial
+            .conn
+            .query_row(
+                "SELECT state,validation_error_code FROM sandbox_custody_roots WHERE custody_id=?1",
+                [custody_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), error.as_deref()),
+            (*expected_state, *expected_error),
+            "{owner_id}"
+        );
+    }
+    let failed_running: String = serial
+        .conn
+        .query_row(
+            "SELECT status||'|'||COALESCE(stop_reason,'') FROM sessions WHERE id=?1",
+            [fixture.roots[2].1.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_running, "Failed|sandbox_custody:worktree_mismatch");
+}
+
+/// A worktree that changes between the concurrent prefetch and the serial
+/// pass is judged on its current state, exactly as the serial pass alone
+/// would judge it (#961).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn worktree_changed_after_prefetch_is_judged_as_the_serial_pass_would_961() {
+    use crate::sandbox::custody::{CustodyService, set_after_startup_prefetch_for_test};
+
+    let fixture = multi_root_startup_store_961();
+    // Healthy roots of a Completed, an Archived and a live Running owner, and
+    // a retained terminal root whose evidence is valid.
+    let completed = fixture.roots[0];
+    let archived = fixture.roots[3];
+    let running = fixture.roots[6];
+    let terminal = fixture.roots[8];
+    let root_of = |session_id: Uuid| fixture.sandbox_base.join(session_id.to_string());
+    let mutate = {
+        let switch_completed = root_of(completed.1);
+        let remove_archived = root_of(archived.1);
+        let switch_running = root_of(running.1);
+        let switch_terminal = root_of(terminal.1);
+        move || {
+            h1_v83_git(
+                &switch_completed,
+                &["switch", "-qc", "rsi/after-prefetch-a"],
+            );
+            h1_v83_git(&switch_running, &["switch", "-qc", "rsi/after-prefetch-b"]);
+            std::fs::remove_dir_all(&remove_archived).unwrap();
+            h1_v83_git(&switch_terminal, &["switch", "-qc", "rsi/after-prefetch-c"]);
+        }
+    };
+
+    let mut parallel = copy_multi_root_store_961(&fixture, "prefetch-then-change");
+    set_after_startup_prefetch_for_test(&fixture.sandbox_base, Box::new(mutate));
+    CustodyService::reconcile_startup_with_pool(&mut parallel, &fixture.sandbox_base, 8).unwrap();
+
+    // The serial pass alone, on the already changed worktrees.
+    let mut serial = copy_multi_root_store_961(&fixture, "serial-after-change");
+    CustodyService::reconcile_startup_with_pool(&mut serial, &fixture.sandbox_base, 1).unwrap();
+    assert_eq!(
+        startup_custody_dump_961(&parallel),
+        startup_custody_dump_961(&serial)
+    );
+
+    let root_state = |store: &Store, custody_id: Uuid| -> (String, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT state,validation_error_code FROM sandbox_custody_roots WHERE custody_id=?1",
+                [custody_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    for (custody_id, expected) in [
+        (completed.0, "worktree_mismatch"),
+        (running.0, "worktree_mismatch"),
+        (archived.0, "root_missing"),
+    ] {
+        assert_eq!(
+            root_state(&parallel, custody_id),
+            ("quarantined".into(), Some(expected.into())),
+            "a cached admission is not used for a changed worktree"
+        );
+    }
+    let running_status: String = parallel
+        .conn
+        .query_row(
+            "SELECT status||'|'||COALESCE(stop_reason,'') FROM sessions WHERE id=?1",
+            [running.1.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(running_status, "Failed|sandbox_custody:worktree_mismatch");
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_startup_retains_authenticated_failed_terminal_history() {
@@ -7882,6 +8257,7 @@ fn test_insert_and_load_session() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -8109,6 +8485,48 @@ fn test_insert_and_load_events() {
     assert!(events[1].tool_input.is_some());
 
     assert_eq!(events[2].content, "Message 3");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn plan_events_round_trip_through_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("test.db")).unwrap();
+    let session = make_test_session();
+    store.insert_session(&session).unwrap();
+
+    let event = ConversationEvent {
+        id: 0,
+        session_id: session.id,
+        sequence: 1,
+        event_type: EventType::Plan,
+        role: None,
+        content: "Plan updated: Continue #787\n- [in_progress] Add utility tools".to_string(),
+        tool_name: None,
+        tool_input: None,
+        created_at: chrono::Utc::now(),
+        offload_id: None,
+        tool_use_id: None,
+        metadata: Some(Box::new(serde_json::json!({
+            "explanation": "Continue #787",
+            "plan": [
+                {"step": "Add utility tools", "status": "in_progress"},
+                {"step": "Verify persistence", "status": "pending"}
+            ]
+        }))),
+    };
+    store.insert_event(&event).unwrap();
+
+    let loaded = store.load_events(session.id).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].event_type, EventType::Plan);
+    assert_eq!(loaded[0].content, event.content);
+    let metadata = loaded[0].metadata.as_ref().expect("plan metadata survives");
+    assert_eq!(metadata["explanation"], "Continue #787");
+    assert_eq!(metadata["plan"][0]["step"], "Add utility tools");
+    assert_eq!(metadata["plan"][0]["status"], "in_progress");
+    assert_eq!(metadata["plan"][1]["step"], "Verify persistence");
+    assert_eq!(metadata["plan"][1]["status"], "pending");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -17458,6 +17876,7 @@ fn h1_v88_post_fixture_columns(table: &str) -> &'static [&'static str] {
             "context_window_configured_tokens",
             "agent_role",
             "epic_spawn_ordinal",
+            "total_prompt_tokens",
         ],
         _ => &[],
     }
@@ -18574,32 +18993,40 @@ fn h1_fqrrev_build_active_terminal_hostile(
     binding
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
-#[test]
-fn h1_fqrrev_v88_active_terminal_invocation_and_c5_hostiles_refuse_before_every_seam() {
-    for sandbox in [false, true] {
-        for terminal_phase in [false, true] {
-            for hostile in [
-                H1FqrrevV87TerminalHostile::MissingInvocation,
-                H1FqrrevV87TerminalHostile::ForeignInvocation,
-                H1FqrrevV87TerminalHostile::NonterminalInvocation,
-                H1FqrrevV87TerminalHostile::MissingC5Setting,
-                H1FqrrevV87TerminalHostile::WrongC5Setting,
-            ] {
-                let directory = tempfile::tempdir().unwrap();
-                let source = directory.path().join(format!(
-                    "fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
-                ));
-                h1_fqrrev_build_active_terminal_hostile(&source, sandbox, terminal_phase, hostile);
-                h1_trrev_assert_refusal_at_every_v88_seam(
-                    &source,
-                    directory.path(),
-                    &format!("fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
-                    "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)",
-                );
-            }
+fn h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(sandbox: bool) {
+    for terminal_phase in [false, true] {
+        for hostile in [
+            H1FqrrevV87TerminalHostile::MissingInvocation,
+            H1FqrrevV87TerminalHostile::ForeignInvocation,
+            H1FqrrevV87TerminalHostile::NonterminalInvocation,
+            H1FqrrevV87TerminalHostile::MissingC5Setting,
+            H1FqrrevV87TerminalHostile::WrongC5Setting,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join(format!(
+                "fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
+            ));
+            h1_fqrrev_build_active_terminal_hostile(&source, sandbox, terminal_phase, hostile);
+            h1_trrev_assert_refusal_at_every_v88_seam(
+                &source,
+                directory.path(),
+                &format!("fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
+                "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)",
+            );
         }
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_fqrrev_v88_ordinary_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(false);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_fqrrev_v88_sandbox_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(true);
 }
 
 fn h1_fqrrev_pin_exact_v90(path: &std::path::Path) {
@@ -18676,41 +19103,44 @@ fn h1_fqrrev_assert_refusal_at_every_v91_seam(
     }
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
-#[test]
-fn h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam() {
-    for sandbox in [false, true] {
-        for terminal_phase in [false, true] {
-            for hostile in [
-                H1FqrrevV87TerminalHostile::MissingInvocation,
-                H1FqrrevV87TerminalHostile::ForeignInvocation,
-                H1FqrrevV87TerminalHostile::NonterminalInvocation,
-                H1FqrrevV87TerminalHostile::MissingC5Setting,
-                H1FqrrevV87TerminalHostile::WrongC5Setting,
-            ] {
-                let directory = tempfile::tempdir().unwrap();
-                let source = directory.path().join(format!(
-                    "v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
-                ));
-                let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, "settling", false);
-                h1_fqrrev_pin_exact_v90(&source);
-                let connection = h1_trrev_open_exact_v87(&source);
-                h1_fqrrev_apply_active_terminal_hostile(
-                    &connection,
-                    &binding,
-                    terminal_phase,
-                    hostile,
-                );
-                drop(connection);
-                h1_fqrrev_assert_refusal_at_every_v91_seam(
-                    &source,
-                    directory.path(),
-                    &format!("v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
-                    "Store error: V91 cannot classify 1 active V90 authority/claim binding(s)",
-                );
-            }
+fn h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(sandbox: bool) {
+    for terminal_phase in [false, true] {
+        for hostile in [
+            H1FqrrevV87TerminalHostile::MissingInvocation,
+            H1FqrrevV87TerminalHostile::ForeignInvocation,
+            H1FqrrevV87TerminalHostile::NonterminalInvocation,
+            H1FqrrevV87TerminalHostile::MissingC5Setting,
+            H1FqrrevV87TerminalHostile::WrongC5Setting,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join(format!(
+                "v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
+            ));
+            let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, "settling", false);
+            h1_fqrrev_pin_exact_v90(&source);
+            let connection = h1_trrev_open_exact_v87(&source);
+            h1_fqrrev_apply_active_terminal_hostile(&connection, &binding, terminal_phase, hostile);
+            drop(connection);
+            h1_fqrrev_assert_refusal_at_every_v91_seam(
+                &source,
+                directory.path(),
+                &format!("v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
+                "Store error: V91 cannot classify 1 active V90 authority/claim binding(s)",
+            );
         }
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_v91_ordinary_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(false);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_v91_sandbox_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(true);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19778,9 +20208,7 @@ fn h1_trrev_v88_session_bound_live_phases_refuse_laundering_before_every_seam() 
     }
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
-#[test]
-fn h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating() {
+fn h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating(sandbox: bool) {
     #[derive(Clone, Copy, Debug)]
     enum Hostile {
         MissingActiveClaim,
@@ -19794,130 +20222,140 @@ fn h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating()
         CrossSessionBinding,
     }
 
-    for sandbox in [false, true] {
-        for hostile in [
-            Hostile::MissingActiveClaim,
-            Hostile::WrongActiveClaim,
-            Hostile::IdleAuthority,
-            Hostile::WrongClaim,
-            Hostile::WrongCurrentEvent,
-            Hostile::WrongSessionStatus,
-            Hostile::WrongSessionSequence,
-            Hostile::DuplicateSessionBinding,
-            Hostile::CrossSessionBinding,
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let source = directory
-                .path()
-                .join(format!("source-{sandbox}-{hostile:?}.sqlite"));
-            let phase = if matches!(hostile, Hostile::MissingActiveClaim) {
-                "recovery_quarantined"
-            } else {
-                "claimed"
-            };
-            let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, phase, false);
-            let connection = h1_trrev_open_exact_v87(&source);
-            match hostile {
-                Hostile::MissingActiveClaim => h1_v87_force_sql(
-                    &connection,
-                    "execution_origin_authorities",
-                    &format!(
-                        "UPDATE execution_origin_authorities SET active_claim_id=NULL WHERE authority_kind='{}' AND authority_uuid='{}'",
-                        binding.authority_kind, binding.authority
-                    ),
+    for hostile in [
+        Hostile::MissingActiveClaim,
+        Hostile::WrongActiveClaim,
+        Hostile::IdleAuthority,
+        Hostile::WrongClaim,
+        Hostile::WrongCurrentEvent,
+        Hostile::WrongSessionStatus,
+        Hostile::WrongSessionSequence,
+        Hostile::DuplicateSessionBinding,
+        Hostile::CrossSessionBinding,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory
+            .path()
+            .join(format!("source-{sandbox}-{hostile:?}.sqlite"));
+        let phase = if matches!(hostile, Hostile::MissingActiveClaim) {
+            "recovery_quarantined"
+        } else {
+            "claimed"
+        };
+        let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, phase, false);
+        let connection = h1_trrev_open_exact_v87(&source);
+        match hostile {
+            Hostile::MissingActiveClaim => h1_v87_force_sql(
+                &connection,
+                "execution_origin_authorities",
+                &format!(
+                    "UPDATE execution_origin_authorities SET active_claim_id=NULL WHERE authority_kind='{}' AND authority_uuid='{}'",
+                    binding.authority_kind, binding.authority
                 ),
-                Hostile::WrongActiveClaim => h1_v87_force_sql(
-                    &connection,
-                    "execution_origin_authorities",
-                    &format!(
-                        "UPDATE execution_origin_authorities SET active_claim_id='{}' WHERE authority_kind='{}' AND authority_uuid='{}'",
-                        Uuid::from_u128(0x8804_0100),
-                        binding.authority_kind,
-                        binding.authority
-                    ),
+            ),
+            Hostile::WrongActiveClaim => h1_v87_force_sql(
+                &connection,
+                "execution_origin_authorities",
+                &format!(
+                    "UPDATE execution_origin_authorities SET active_claim_id='{}' WHERE authority_kind='{}' AND authority_uuid='{}'",
+                    Uuid::from_u128(0x8804_0100),
+                    binding.authority_kind,
+                    binding.authority
                 ),
-                Hostile::IdleAuthority => h1_v87_force_sql(
-                    &connection,
-                    "execution_origin_authorities",
-                    &format!(
-                        "UPDATE execution_origin_authorities SET phase='idle',active_claim_id=NULL,boot_id=NULL,quarantine_code=NULL WHERE authority_kind='{}' AND authority_uuid='{}'",
-                        binding.authority_kind, binding.authority
-                    ),
+            ),
+            Hostile::IdleAuthority => h1_v87_force_sql(
+                &connection,
+                "execution_origin_authorities",
+                &format!(
+                    "UPDATE execution_origin_authorities SET phase='idle',active_claim_id=NULL,boot_id=NULL,quarantine_code=NULL WHERE authority_kind='{}' AND authority_uuid='{}'",
+                    binding.authority_kind, binding.authority
                 ),
-                Hostile::WrongClaim => h1_v87_force_sql(
-                    &connection,
-                    "sessions",
-                    &format!(
-                        "UPDATE sessions SET execution_origin_claim_id='{}' WHERE id='{}'",
-                        Uuid::from_u128(0x8804_dead),
-                        binding.session
-                    ),
+            ),
+            Hostile::WrongClaim => h1_v87_force_sql(
+                &connection,
+                "sessions",
+                &format!(
+                    "UPDATE sessions SET execution_origin_claim_id='{}' WHERE id='{}'",
+                    Uuid::from_u128(0x8804_dead),
+                    binding.session
                 ),
-                Hostile::WrongCurrentEvent => h1_v87_force_sql(
-                    &connection,
-                    "execution_origin_events",
-                    &format!(
-                        "UPDATE execution_origin_events SET claim_id=NULL WHERE authority_kind='{}' AND authority_uuid='{}' AND sequence=(SELECT event_sequence FROM execution_origin_authorities WHERE authority_kind='{}' AND authority_uuid='{}')",
-                        binding.authority_kind,
-                        binding.authority,
-                        binding.authority_kind,
-                        binding.authority
-                    ),
+            ),
+            Hostile::WrongCurrentEvent => h1_v87_force_sql(
+                &connection,
+                "execution_origin_events",
+                &format!(
+                    "UPDATE execution_origin_events SET claim_id=NULL WHERE authority_kind='{}' AND authority_uuid='{}' AND sequence=(SELECT event_sequence FROM execution_origin_authorities WHERE authority_kind='{}' AND authority_uuid='{}')",
+                    binding.authority_kind,
+                    binding.authority,
+                    binding.authority_kind,
+                    binding.authority
                 ),
-                Hostile::WrongSessionStatus => h1_v87_force_sql(
-                    &connection,
-                    "sessions",
-                    &format!(
-                        "UPDATE sessions SET status='Running' WHERE id='{}'",
-                        binding.session
-                    ),
+            ),
+            Hostile::WrongSessionStatus => h1_v87_force_sql(
+                &connection,
+                "sessions",
+                &format!(
+                    "UPDATE sessions SET status='Running' WHERE id='{}'",
+                    binding.session
                 ),
-                Hostile::WrongSessionSequence => h1_v87_force_sql(
-                    &connection,
-                    "sessions",
-                    &format!(
-                        "UPDATE sessions SET execution_origin_write_seq=2 WHERE id='{}'",
-                        binding.session
-                    ),
+            ),
+            Hostile::WrongSessionSequence => h1_v87_force_sql(
+                &connection,
+                "sessions",
+                &format!(
+                    "UPDATE sessions SET execution_origin_write_seq=2 WHERE id='{}'",
+                    binding.session
                 ),
-                Hostile::DuplicateSessionBinding => h1_v87_force_sql(
-                    &connection,
-                    "sessions",
-                    &format!(
-                        "UPDATE sessions SET status='Starting',execution_origin_claim_id='{}',execution_origin_write_seq=1 WHERE id='{}'",
-                        binding.claim,
-                        Uuid::from_u128(0x8804_0020)
-                    ),
+            ),
+            Hostile::DuplicateSessionBinding => h1_v87_force_sql(
+                &connection,
+                "sessions",
+                &format!(
+                    "UPDATE sessions SET status='Starting',execution_origin_claim_id='{}',execution_origin_write_seq=1 WHERE id='{}'",
+                    binding.claim,
+                    Uuid::from_u128(0x8804_0020)
                 ),
-                Hostile::CrossSessionBinding => h1_v87_force_sql(
-                    &connection,
-                    "sessions",
-                    &format!(
-                        "UPDATE sessions SET execution_origin_claim_id='{}' WHERE id='{}'",
-                        if sandbox {
-                            Uuid::from_u128(0x8804_0002)
-                        } else {
-                            Uuid::from_u128(0x8804_0110)
-                        },
-                        binding.session
-                    ),
+            ),
+            Hostile::CrossSessionBinding => h1_v87_force_sql(
+                &connection,
+                "sessions",
+                &format!(
+                    "UPDATE sessions SET execution_origin_claim_id='{}' WHERE id='{}'",
+                    if sandbox {
+                        Uuid::from_u128(0x8804_0002)
+                    } else {
+                        Uuid::from_u128(0x8804_0110)
+                    },
+                    binding.session
                 ),
-            }
-            h1_v87_assert_catalog_clean(&connection, &format!("{sandbox} {hostile:?}"));
-            drop(connection);
-            let expected = if matches!(hostile, Hostile::WrongActiveClaim) {
-                "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)"
-            } else {
-                "Store error: V88 cannot classify 1 V87 Session origin binding(s)"
-            };
-            h1_trrev_assert_refusal_at_every_v88_seam(
-                &source,
-                directory.path(),
-                &format!("binding-{sandbox}-{hostile:?}"),
-                expected,
-            );
+            ),
         }
+        h1_v87_assert_catalog_clean(&connection, &format!("{sandbox} {hostile:?}"));
+        drop(connection);
+        let expected = if matches!(hostile, Hostile::WrongActiveClaim) {
+            "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)"
+        } else {
+            "Store error: V88 cannot classify 1 V87 Session origin binding(s)"
+        };
+        h1_trrev_assert_refusal_at_every_v88_seam(
+            &source,
+            directory.path(),
+            &format!("binding-{sandbox}-{hostile:?}"),
+            expected,
+        );
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_trrev_v88_ordinary_session_binding_classifier_hostiles_are_exact_and_non_mutating() {
+    h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating(false);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_trrev_v88_sandbox_session_binding_classifier_hostiles_are_exact_and_non_mutating() {
+    h1_trrev_v88_session_binding_classifier_hostiles_are_exact_and_non_mutating(true);
 }
 
 fn h1_trrev_assert_valid_v87_control_upgrades(
@@ -23376,6 +23814,239 @@ fn agent_list_issues_ready_filter_matches_operator_projection_and_pages() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
+fn agent_issue_verbs_resolve_display_number_within_the_project() {
+    use rsi_common::rpc::{
+        AgentGetIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
+    };
+    let (store, lead, project) = issue_v97_authority_fixture();
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("addressable by number")
+        })
+        .unwrap();
+    let by_number = store
+        .agent_get_issue(
+            lead,
+            &AgentGetIssueRequestV1 {
+                issue_id: None,
+                display_number: Some(issue.display_number),
+            },
+        )
+        .unwrap();
+    assert_eq!(by_number.issue.id, issue.id);
+
+    let edit = || AgentUpdateIssueRequestV1 {
+        issue_id: None,
+        display_number: Some(issue.display_number),
+        expected_row_version: issue.row_version,
+        idempotency_key: "by-number-edit".into(),
+        title: Some("renamed by number".into()),
+        body: None,
+        labels: None,
+        priority: None,
+        clear_priority: false,
+        assignee: None,
+        clear_assignee: false,
+    };
+    let updated = store.agent_update_issue(lead, &edit()).unwrap();
+    assert_eq!(updated.issue.id, issue.id);
+    assert_eq!(updated.issue.title, "renamed by number");
+    let replay = store.agent_update_issue(lead, &edit()).unwrap();
+    assert!(replay.deduplicated);
+
+    let closed = store
+        .agent_update_issue_status(
+            lead,
+            &AgentUpdateIssueStatusRequestV1 {
+                issue_id: None,
+                display_number: Some(issue.display_number),
+                status: IssueStatus::Closed,
+                expected_row_version: updated.issue.row_version,
+                idempotency_key: "by-number-close".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(closed.issue.id, issue.id);
+    assert_eq!(closed.issue.status, IssueStatus::Closed);
+
+    let missing = store
+        .agent_get_issue(
+            lead,
+            &AgentGetIssueRequestV1 {
+                issue_id: None,
+                display_number: Some(issue.display_number + 10_000),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    let unknown_id = store
+        .agent_get_issue(
+            lead,
+            &AgentGetIssueRequestV1 {
+                issue_id: Some(Uuid::new_v4()),
+                display_number: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert_eq!(missing, unknown_id, "unknown number reads like unknown id");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
+    use rsi_common::rpc::{
+        AgentGetIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
+    };
+    let (store, lead, project) = issue_v97_authority_fixture();
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("target rule")
+        })
+        .unwrap();
+    for (issue_id, display_number) in [
+        (Some(issue.id), Some(issue.display_number)),
+        (None, None),
+        (None, Some(0)),
+    ] {
+        assert!(
+            store
+                .agent_get_issue(
+                    lead,
+                    &AgentGetIssueRequestV1 {
+                        issue_id,
+                        display_number,
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_update_issue(
+                    lead,
+                    &AgentUpdateIssueRequestV1 {
+                        issue_id,
+                        display_number,
+                        expected_row_version: issue.row_version,
+                        idempotency_key: "bad-target".into(),
+                        title: Some("nope".into()),
+                        body: None,
+                        labels: None,
+                        priority: None,
+                        clear_priority: false,
+                        assignee: None,
+                        clear_assignee: false,
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_update_issue_status(
+                    lead,
+                    &AgentUpdateIssueStatusRequestV1 {
+                        issue_id,
+                        display_number,
+                        status: IssueStatus::Closed,
+                        expected_row_version: issue.row_version,
+                        idempotency_key: "bad-target".into(),
+                    },
+                )
+                .is_err()
+        );
+    }
+    let unchanged = store.get_issue(issue.id).unwrap().unwrap();
+    assert_eq!(unchanged.row_version, issue.row_version);
+    assert_eq!(unchanged.title, "target rule");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn agent_list_issues_desc_order_pages_with_cursor_and_filters_title() {
+    use rsi_common::rpc::{AgentListIssuesRequestV1, IssueListOrderV1};
+    let (store, lead, project) = issue_v97_authority_fixture();
+    let mut created = Vec::new();
+    for title in [
+        "Alpha catalog",
+        "beta thing",
+        "Gamma CATALOG entry",
+        "delta 100%_done",
+        "epsilon",
+    ] {
+        created.push(
+            store
+                .create_issue(&NewIssue {
+                    project_id: project.id,
+                    ..make_new_issue(title)
+                })
+                .unwrap(),
+        );
+    }
+    let collect = |order: IssueListOrderV1, title_contains: Option<&str>, limit: u32| {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store
+                .agent_list_issues(
+                    lead,
+                    &AgentListIssuesRequestV1 {
+                        limit: Some(limit),
+                        order,
+                        title_contains: title_contains.map(str::to_string),
+                        cursor,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            ids.extend(page.issues.into_iter().map(|issue| issue.id));
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        ids
+    };
+    let ascending: Vec<Uuid> = created.iter().map(|issue| issue.id).collect();
+    let mut descending = ascending.clone();
+    descending.reverse();
+
+    assert_eq!(collect(IssueListOrderV1::Asc, None, 2), ascending);
+    assert_eq!(collect(IssueListOrderV1::Desc, None, 2), descending);
+    assert_eq!(collect(IssueListOrderV1::Desc, None, 1), descending);
+    assert_eq!(
+        store
+            .agent_list_issues(lead, &AgentListIssuesRequestV1::default())
+            .unwrap()
+            .issues
+            .iter()
+            .map(|issue| issue.id)
+            .collect::<Vec<_>>(),
+        ascending,
+        "default order is unchanged ascending"
+    );
+
+    assert_eq!(
+        collect(IssueListOrderV1::Asc, Some("CaTaLoG"), 1),
+        vec![created[0].id, created[2].id],
+        "title filter is a case-insensitive substring"
+    );
+    assert_eq!(
+        collect(IssueListOrderV1::Desc, Some("catalog"), 1),
+        vec![created[2].id, created[0].id],
+        "filter composes with desc order and cursor"
+    );
+    assert_eq!(
+        collect(IssueListOrderV1::Asc, Some("%_"), 5),
+        vec![created[3].id],
+        "LIKE metacharacters match literally"
+    );
+    assert!(collect(IssueListOrderV1::Asc, Some("no such title"), 5).is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
 #[allow(clippy::unwrap_used)]
 fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager() {
     use rsi_common::rpc::AgentGetIssueRequestV1;
@@ -23409,7 +24080,8 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
             .agent_get_issue(
                 caller,
                 &AgentGetIssueRequestV1 {
-                    issue_id: target.id,
+                    issue_id: Some(target.id),
+                    display_number: None,
                 },
             )
             .unwrap();
@@ -23460,7 +24132,8 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
         .agent_get_issue(
             lead,
             &AgentGetIssueRequestV1 {
-                issue_id: target.id,
+                issue_id: Some(target.id),
+                display_number: None,
             },
         )
         .unwrap();
@@ -23490,7 +24163,8 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
         .agent_get_issue(
             worker.id,
             &AgentGetIssueRequestV1 {
-                issue_id: target.id,
+                issue_id: Some(target.id),
+                display_number: None,
             },
         )
         .unwrap_err()
@@ -24140,7 +24814,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::InProgress,
                 expected_row_version: issue.row_version,
                 idempotency_key: "v97-start".into(),
@@ -24152,7 +24827,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::InProgress,
                 expected_row_version: issue.row_version,
                 idempotency_key: "v97-start".into(),
@@ -24165,7 +24841,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::Closed,
                 expected_row_version: in_progress.issue.row_version,
                 idempotency_key: "v97-close".into(),
@@ -24259,7 +24936,8 @@ fn agent_issue_authority_hides_cross_project_target() {
         .agent_get_issue(
             caller,
             &rsi_common::rpc::AgentGetIssueRequestV1 {
-                issue_id: Uuid::new_v4(),
+                issue_id: Some(Uuid::new_v4()),
+                display_number: None,
             },
         )
         .unwrap_err();
@@ -24267,7 +24945,8 @@ fn agent_issue_authority_hides_cross_project_target() {
         .agent_get_issue(
             caller,
             &rsi_common::rpc::AgentGetIssueRequestV1 {
-                issue_id: remote.id,
+                issue_id: Some(remote.id),
+                display_number: None,
             },
         )
         .unwrap_err();
@@ -24276,7 +24955,10 @@ fn agent_issue_authority_hides_cross_project_target() {
         store
             .agent_get_issue(
                 caller,
-                &rsi_common::rpc::AgentGetIssueRequestV1 { issue_id: local.id },
+                &rsi_common::rpc::AgentGetIssueRequestV1 {
+                    issue_id: Some(local.id),
+                    display_number: None
+                },
             )
             .is_ok()
     );
@@ -24300,7 +24982,10 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
         store
             .agent_get_issue(
                 caller,
-                &rsi_common::rpc::AgentGetIssueRequestV1 { issue_id },
+                &rsi_common::rpc::AgentGetIssueRequestV1 {
+                    issue_id: Some(issue_id),
+                    display_number: None,
+                },
             )
             .unwrap_err()
             .to_string()
@@ -24312,7 +24997,8 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                    issue_id,
+                    issue_id: Some(issue_id),
+                    display_number: None,
                     expected_row_version: 1,
                     idempotency_key: format!("v97-equality-update-{suffix}"),
                     title: Some("hidden update".to_string()),
@@ -24337,7 +25023,8 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                    issue_id,
+                    issue_id: Some(issue_id),
+                    display_number: None,
                     status: IssueStatus::InProgress,
                     expected_row_version: 1,
                     idempotency_key: format!("v97-equality-status-{suffix}"),
@@ -24491,7 +25178,8 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::Closed,
                 expected_row_version: issue.row_version,
                 idempotency_key: "archive-dispatch-close".into(),
@@ -24637,7 +25325,8 @@ fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
                 .agent_update_issue(
                     caller,
                     &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                        issue_id: issue.id,
+                        issue_id: Some(issue.id),
+                        display_number: None,
                         expected_row_version: issue.row_version,
                         idempotency_key: format!("rollback-agent-{index}"),
                         title: Some("must roll back".to_string()),
@@ -24725,7 +25414,8 @@ fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
         .agent_update_issue(
             caller,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                issue_id: ordinary.id,
+                issue_id: Some(ordinary.id),
+                display_number: None,
                 expected_row_version: ordinary.row_version,
                 idempotency_key: "lead-writer-key".to_string(),
                 title: Some("lead patch".to_string()),
@@ -25136,7 +25826,8 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: "lead-update".into(),
                 title: Some("lead updated issue".into()),
@@ -25162,7 +25853,13 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .unwrap();
     assert_eq!(page.issues, vec![issue.clone(), operator_issue]);
     let manager_read = store
-        .agent_get_issue(manager.id, &AgentGetIssueRequestV1 { issue_id: issue.id })
+        .agent_get_issue(
+            manager.id,
+            &AgentGetIssueRequestV1 {
+                issue_id: Some(issue.id),
+                display_number: None,
+            },
+        )
         .unwrap();
     assert_eq!(manager_read.issue, issue);
     assert!(manager_read.blocked_by.is_empty());
@@ -25198,7 +25895,8 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             manager.id,
             &AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: "manager-update".into(),
                 title: Some("manager updated issue".into()),
@@ -25215,7 +25913,8 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue_status(
             manager.id,
             &AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::Closed,
                 expected_row_version: updated.issue.row_version,
                 idempotency_key: "manager-close".into(),
@@ -25266,7 +25965,13 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         )
         .unwrap();
     let changed_scope = store
-        .agent_get_issue(manager.id, &AgentGetIssueRequestV1 { issue_id: issue.id })
+        .agent_get_issue(
+            manager.id,
+            &AgentGetIssueRequestV1 {
+                issue_id: Some(issue.id),
+                display_number: None,
+            },
+        )
         .unwrap_err()
         .to_string();
     assert!(changed_scope.contains("authority_denied"));
@@ -25295,7 +26000,13 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
     };
     store.configure_harness_manager_policy(&revoked).unwrap();
     let denied = store
-        .agent_get_issue(manager.id, &AgentGetIssueRequestV1 { issue_id: issue.id })
+        .agent_get_issue(
+            manager.id,
+            &AgentGetIssueRequestV1 {
+                issue_id: Some(issue.id),
+                display_number: None,
+            },
+        )
         .unwrap_err()
         .to_string();
     assert!(denied.contains("authority_denied"));
@@ -25389,7 +26100,8 @@ fn agent_issue_lead_concurrent_cas_has_one_winner_alongside_manager_coordinate_g
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: key.into(),
                 title: Some(format!("updated by {key}")),
@@ -25550,7 +26262,8 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: "lead-update".into(),
                 title: Some("lead updated".into()),
@@ -25567,7 +26280,8 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue_status(
             lead,
             &AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status: IssueStatus::InProgress,
                 expected_row_version: updated.issue.row_version,
                 idempotency_key: "lead-start".into(),
@@ -25948,7 +26662,8 @@ fn lead_set_status(store: &Store, lead: Uuid, issue: &Issue, status: IssueStatus
         .agent_update_issue_status(
             lead,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 status,
                 expected_row_version: issue.row_version,
                 idempotency_key: format!("lead-status-{}", issue.row_version),
@@ -25968,7 +26683,8 @@ fn manager_issue_update_content_records_manager_actor_replays_and_refuses_stale_
             store.agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                    issue_id: issue.id,
+                    issue_id: Some(issue.id),
+                    display_number: None,
                     expected_row_version: issue.row_version,
                     idempotency_key: key.into(),
                     title: Some(format!("manager retitled {}", issue.row_version)),
@@ -26005,7 +26721,8 @@ fn manager_issue_update_status_records_manager_actor_replays_and_refuses_stale_o
             store.agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
-                    issue_id: issue.id,
+                    issue_id: Some(issue.id),
+                    display_number: None,
                     status,
                     expected_row_version: issue.row_version,
                     idempotency_key: key.into(),
@@ -26098,7 +26815,8 @@ fn manager_issue_mutations_refuse_ordinary_worker_without_coordinator_grant() {
         .agent_update_issue(
             worker.id,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: "worker-update".into(),
                 title: Some("worker retitle".into()),
@@ -26146,7 +26864,8 @@ fn manager_issue_concurrent_cas_has_one_winner_and_one_stale_version() {
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
-                issue_id: issue.id,
+                issue_id: Some(issue.id),
+                display_number: None,
                 expected_row_version: issue.row_version,
                 idempotency_key: key.into(),
                 title: Some(format!("updated by {key}")),
@@ -26358,7 +27077,10 @@ fn agent_issue_manager_coordinate_is_bound_to_its_own_project() {
     let get = |caller: Uuid, issue_id: Uuid| {
         store.agent_get_issue(
             caller,
-            &rsi_common::rpc::AgentGetIssueRequestV1 { issue_id },
+            &rsi_common::rpc::AgentGetIssueRequestV1 {
+                issue_id: Some(issue_id),
+                display_number: None,
+            },
         )
     };
     assert_eq!(get(manager_b.id, issue_b.id).unwrap().issue, issue_b);
@@ -26458,7 +27180,8 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
         store.agent_update_issue(
             old_lead,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                issue_id: mutation_issue.id,
+                issue_id: Some(mutation_issue.id),
+                display_number: None,
                 expected_row_version: mutation_issue.row_version,
                 idempotency_key: "lead-transfer-race".to_string(),
                 title: Some("serialized old-lead write".to_string()),
@@ -29485,6 +30208,9 @@ fn d01_legacy_fingerprints(connection: &Connection) -> anyhow::Result<Vec<(Strin
                             | "context_window_source_digest"
                             | "context_window_observed_at"
                             | "context_window_configured_tokens"
+                            // V139 (#1000) cumulative prompt tokens: added
+                            // by a forward migration, never in a V74 copy.
+                            | "total_prompt_tokens"
                             // V99 provider telemetry: same class as the links
                             // above. A copied legacy source cannot carry these
                             // and the forward migration must add them, so they
@@ -34957,7 +35683,9 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 137;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 149;
+/// #1000: provisional schema version of `sessions.total_prompt_tokens`.
+const TOTAL_PROMPT_TOKENS_REWIND_VERSION: i32 = 139;
 /// Catalog objects installed by the V131 sandbox reclaim journal migration.
 const V131_SANDBOX_RECLAIM_OBJECTS: [(&str, &str); 16] = [
     ("table", "sandbox_reclaim_runs"),
@@ -35113,12 +35841,31 @@ fn rewind_session_model_updates_v132_fixture_to_v131(connection: &Connection) {
 // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-rewind
 
 /// Exact teardown of the post-V121 tail down to `target` (121..=head), always
-/// in descending version order through the current schema head.
-/// V136 -> V135 -> V134 -> V133 -> V132 -> V131 -> V130 -> V129 ->
+/// in descending version order through the current schema head:
+/// manager nodes -> V137 -> V136 -> V135 -> V134 -> V133 -> V132 -> V131 -> V130 -> V129 ->
 /// V128 -> V127 -> V126 -> V125 -> V124 -> V123 -> V122 so each helper receives
 /// the exact source version it requires. The generic fixture validator cannot claim a
 /// V120+ catalog, so tests that need an exact V121..V123 source use this.
 #[allow(clippy::expect_used)]
+/// A rewound fixture that keeps writing sessions through the current
+/// serializer needs the newer nullable sessions columns back. #1000's
+/// `total_prompt_tokens` is the first one added after V99; its migration uses
+/// add_column_if_not_exists, so a later upgrade over it is a no-op.
+pub(crate) fn readd_current_session_columns(connection: &Connection) {
+    let present: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'total_prompt_tokens'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("probe total_prompt_tokens");
+    if present == 0 {
+        connection
+            .execute_batch("ALTER TABLE sessions ADD COLUMN total_prompt_tokens INTEGER;")
+            .expect("re-add total_prompt_tokens for the current serializer");
+    }
+}
+
 pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
     let version = |connection: &Connection| -> i32 {
         connection
@@ -35134,7 +35881,264 @@ pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
-    if active >= REWIND_TEARDOWN_COVERED_THROUGH && target < REWIND_TEARDOWN_COVERED_THROUGH {
+    if active >= AGENT_JOBS_CLOUD_SWEEP_SCHEMA_VERSION
+        && target < AGENT_JOBS_CLOUD_SWEEP_SCHEMA_VERSION
+    {
+        // #1077: back to the V144 kind CHECK. A cloud_sweep row cannot exist
+        // under it, so refuse to rewind over one instead of losing it.
+        let sweep_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_jobs WHERE kind = 'cloud_sweep'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count #1077 cloud_sweep jobs");
+        assert_eq!(
+            sweep_rows, 0,
+            "cannot rewind the cloud_sweep migration over cloud_sweep jobs"
+        );
+        rebuild_agent_jobs(
+            connection,
+            &AGENT_JOBS_CLOUD_SWEEP_TABLE.replace(",'cloud_sweep'", ""),
+        )
+        .expect("rewind #1077 agent jobs kind check");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                AGENT_JOBS_CLOUD_SWEEP_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1077");
+    }
+    if active >= super::session_completion_gates::SESSION_COMPLETION_GATES_SCHEMA_VERSION
+        && target < super::session_completion_gates::SESSION_COMPLETION_GATES_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER session_completion_gates_no_update;
+                 DROP TRIGGER session_completion_gates_no_delete;
+                 DROP TABLE session_completion_gates;",
+            )
+            .expect("rewind #794 session completion gates catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::session_completion_gates::SESSION_COMPLETION_GATES_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #794 completion gates");
+    }
+    if active >= super::satellite_inbound_attempts::SATELLITE_INBOUND_ATTEMPTS_SCHEMA_VERSION
+        && target < super::satellite_inbound_attempts::SATELLITE_INBOUND_ATTEMPTS_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER satellite_inbound_attempts_identity_immutable;
+                 DROP TRIGGER satellite_inbound_attempts_delivered_immutable;
+                 DROP TRIGGER satellite_inbound_attempts_no_delete;
+                 DROP TABLE satellite_inbound_attempts;",
+            )
+            .expect("rewind #1059 satellite inbound attempts catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::satellite_inbound_attempts::SATELLITE_INBOUND_ATTEMPTS_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1059");
+    }
+    if active >= super::agent_deploys::AGENT_DEPLOYS_SCHEMA_VERSION
+        && target < super::agent_deploys::AGENT_DEPLOYS_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER agent_deploys_terminal_immutable;
+                 DROP TRIGGER agent_deploys_no_delete;
+                 DROP INDEX agent_deploys_one_live;
+                 DROP TABLE agent_deploys;",
+            )
+            .expect("rewind #1045 agent deploys catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::agent_deploys::AGENT_DEPLOYS_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1045");
+    }
+    if active >= super::satellite_dispatch::SATELLITE_DISPATCH_SCHEMA_VERSION
+        && target < super::satellite_dispatch::SATELLITE_DISPATCH_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER satellite_inbound_deliveries_no_delete;
+                 DROP TRIGGER satellite_inbound_deliveries_no_update;
+                 DROP TRIGGER satellite_messages_identity_immutable;
+                 DROP TRIGGER satellite_messages_settled_immutable;
+                 DROP TRIGGER satellite_messages_no_delete;
+                 DROP INDEX satellite_messages_by_state;
+                 DROP TABLE satellite_inbound_deliveries;
+                 DROP TABLE satellite_inbound_policy;
+                 DROP TABLE satellite_messages;
+                 DROP TABLE satellite_peer_scope;",
+            )
+            .expect("rewind #1017 satellite dispatch catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::satellite_dispatch::SATELLITE_DISPATCH_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1017 dispatch");
+    }
+    if active >= super::agent_jobs::AGENT_JOBS_SCHEMA_VERSION
+        && target < super::agent_jobs::AGENT_JOBS_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER agent_jobs_no_delete;
+                 DROP TRIGGER agent_jobs_terminal_immutable;
+                 DROP INDEX agent_jobs_owner_key;
+                 DROP INDEX agent_jobs_by_state;
+                 DROP INDEX agent_jobs_by_owner;
+                 DROP TABLE agent_jobs;",
+            )
+            .expect("rewind #1002 agent jobs catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::agent_jobs::AGENT_JOBS_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1002");
+    }
+    if active >= super::session_tool_policy::SESSION_TOOL_POLICY_SCHEMA_VERSION
+        && target < super::session_tool_policy::SESSION_TOOL_POLICY_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER session_tool_policies_no_update;
+                 DROP TRIGGER session_tool_policies_no_delete;
+                 DROP TABLE session_tool_policies;",
+            )
+            .expect("rewind #792 session tool policy catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::session_tool_policy::SESSION_TOOL_POLICY_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #792");
+    }
+    if active >= super::operator_messages::PROVISIONAL_VERSION
+        && target < super::operator_messages::PROVISIONAL_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP INDEX operator_messages_one_dispatching;
+                 DROP INDEX operator_messages_fifo;
+                 DROP TABLE operator_messages;",
+            )
+            .expect("rewind #929 operator message queue");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::operator_messages::PROVISIONAL_VERSION - 1,
+            )
+            .expect("restore version before #929");
+    }
+    if active >= super::target_reclaim_sweep::TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION
+        && target < super::target_reclaim_sweep::TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION
+    {
+        // Restore the V119 per-generation uniqueness of terminal evidence.
+        connection
+            .execute_batch("PRAGMA legacy_alter_table=ON;")
+            .expect("allow the terminal evidence rebuild to keep trigger references");
+        connection
+            .execute_batch(&super::target_reclaim_sweep::rebuild_events_table_sql(
+                false,
+            ))
+            .expect("rewind #1035 identity-keyed terminal evidence");
+        connection
+            .execute_batch("PRAGMA legacy_alter_table=OFF;")
+            .expect("restore alter table semantics");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::target_reclaim_sweep::TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1035");
+    }
+    if active >= super::rolling_queue::ROLLING_QUEUE_SCHEMA_VERSION
+        && target < super::rolling_queue::ROLLING_QUEUE_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER rolling_queue_entries_no_delete;
+                 DROP TRIGGER rolling_queue_entries_terminal_immutable;
+                 DROP TRIGGER rolling_queue_batches_no_delete;
+                 DROP TRIGGER rolling_queue_batches_terminal_immutable;
+                 DROP TRIGGER rolling_queue_events_no_update;
+                 DROP TRIGGER rolling_queue_events_no_delete;
+                 DROP INDEX rolling_queue_events_by_batch;
+                 DROP INDEX rolling_queue_by_state;
+                 DROP INDEX rolling_queue_live_source;
+                 DROP TABLE rolling_queue_events;
+                 DROP TABLE rolling_queue_batches;
+                 DROP TABLE rolling_queue_entries;",
+            )
+            .expect("rewind #1007 rolling queue catalog");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::rolling_queue::ROLLING_QUEUE_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1007");
+    }
+    if active >= TOTAL_PROMPT_TOKENS_REWIND_VERSION && target < TOTAL_PROMPT_TOKENS_REWIND_VERSION {
+        connection
+            .execute_batch("ALTER TABLE sessions DROP COLUMN total_prompt_tokens;")
+            .expect("rewind #1000 total_prompt_tokens");
+        connection
+            .pragma_update(None, "user_version", TOTAL_PROMPT_TOKENS_REWIND_VERSION - 1)
+            .expect("restore version before #1000");
+    }
+    if active >= super::manager_nodes::MANAGER_NODE_SCHEMA_VERSION
+        && target < super::manager_nodes::MANAGER_NODE_SCHEMA_VERSION
+    {
+        connection
+            .execute_batch(
+                "DROP TRIGGER manager_node_epic_insert_overlap;
+                 DROP TRIGGER manager_node_epic_update_overlap;
+                 DROP TRIGGER manager_node_escalation_events_no_update;
+                 DROP TRIGGER manager_node_escalation_events_no_delete;
+                 DROP TRIGGER manager_node_escalations_no_delete;
+                 DROP TRIGGER manager_node_grants_no_update;
+                 DROP TRIGGER manager_node_grants_no_delete;
+                 DROP TRIGGER manager_nodes_parent_immutable;
+                 DROP TRIGGER manager_nodes_no_delete;
+                 DROP INDEX manager_agent_mail_authority_lookup;
+                 DROP TABLE manager_node_escalation_events;
+                 DROP TABLE manager_node_escalations;
+                 DROP TABLE manager_node_operations;
+                 DROP TABLE manager_node_reservations;
+                 DROP TABLE manager_node_grants;
+                 DROP TABLE manager_node_scopes;
+                 DROP TABLE manager_nodes;",
+            )
+            .expect("rewind manager nodes migration");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::manager_nodes::MANAGER_NODE_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before manager node migration");
+    }
+    if active >= 137 && target <= 136 {
         connection
             .execute_batch(
                 "DROP TRIGGER migration_allocation_claims_no_delete;
@@ -37348,6 +38352,7 @@ pub(crate) fn rewind_store_to_schema_version(connection: &Connection, target_ver
         && target_version != 121
         && target_version != 122
         && target_version != 123
+        && target_version != 147
     {
         assert_eq!(
             target_version, LATEST_SCHEMA_VERSION,
@@ -38030,7 +39035,7 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             "fixture V{target_version} has incorrect V131 {kind} `{name}` presence"
         );
     }
-    for (kind, name, _) in crate::daemon_restart_persistence::CATALOG_OBJECTS {
+    for (kind, name, _) in crate::store::daemon_restart_persistence::CATALOG_OBJECTS {
         let present: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
@@ -38220,6 +39225,16 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             .unchecked_transaction()
             .expect("open projection catalog fixture assertion");
         let detached = target_version >= 90;
+        if target_version >= 120 {
+            tx.execute_batch(
+                "DROP INDEX idx_swc_v120_execution_custody_health;
+                 DROP INDEX idx_swc_v120_execution_cwd;
+                 DROP TRIGGER execution_projections_v120_session_health_after_insert;
+                 DROP TRIGGER execution_projections_v120_session_health_after_update;
+                 DROP TRIGGER execution_projections_v120_session_health_after_delete;",
+            )
+            .expect("project V120 execution objects out of the fixture assertion");
+        }
         assert!(
             super::session_execution_projection_catalog_matches(&tx, detached)
                 .expect("authenticate claimed projection catalog"),
@@ -38568,7 +39583,7 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             .expect("probe migration allocation catalog object");
         assert_eq!(
             present,
-            target_version >= REWIND_TEARDOWN_COVERED_THROUGH,
+            target_version >= 137,
             "fixture V{target_version} has incorrect migration allocation {kind} `{name}` presence"
         );
     }
@@ -38589,6 +39604,137 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
             );
         }
     }
+    {
+        let identity_unique: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                   WHERE type='table' AND name='sandbox_target_reclaim_intent_events'
+                     AND sql LIKE '%UNIQUE(custody_id,generation,expected_device,expected_inode)%')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("probe #1035 identity-keyed terminal evidence");
+        if target_version >= 119 {
+            assert_eq!(
+                identity_unique,
+                target_version
+                    >= super::target_reclaim_sweep::TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION,
+                "fixture V{target_version} has incorrect #1035 terminal evidence uniqueness"
+            );
+        }
+    }
+    for (kind, name) in super::session_completion_gates::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #794 session completion gates catalog object");
+        assert_eq!(
+            present,
+            target_version
+                >= super::session_completion_gates::SESSION_COMPLETION_GATES_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #794 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::satellite_inbound_attempts::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1059 satellite inbound attempts catalog object");
+        assert_eq!(
+            present,
+            target_version
+                >= super::satellite_inbound_attempts::SATELLITE_INBOUND_ATTEMPTS_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1059 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::agent_deploys::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1045 agent deploys catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::agent_deploys::AGENT_DEPLOYS_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1045 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::satellite_dispatch::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1017 satellite dispatch catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::satellite_dispatch::SATELLITE_DISPATCH_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1017 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::session_tool_policy::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #792 session tool policy catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::session_tool_policy::SESSION_TOOL_POLICY_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #792 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::agent_jobs::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1002 agent jobs catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::agent_jobs::AGENT_JOBS_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1002 {kind} `{name}` presence"
+        );
+    }
+    for (kind, name) in super::rolling_queue::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1007 rolling queue catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::rolling_queue::ROLLING_QUEUE_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1007 {kind} `{name}` presence"
+        );
+    }
+    let prompt_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'total_prompt_tokens'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("probe #1000 total_prompt_tokens");
+    assert_eq!(
+        prompt_column == 1,
+        target_version >= TOTAL_PROMPT_TOKENS_REWIND_VERSION,
+        "fixture V{target_version} has incorrect #1000 total_prompt_tokens presence"
+    );
 }
 
 /// Assert that the migration steps from V77 up **actually executed** during the
@@ -38765,7 +39911,7 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
             .expect("probe V131 sandbox reclaim catalog object");
         assert_eq!(found, 1, "V131 did not execute: {kind} {name} is missing");
     }
-    crate::daemon_restart_persistence::validate_v128_catalog(connection)
+    crate::store::daemon_restart_persistence::validate_v128_catalog(connection)
         .expect("V128 did not replay the exact watchdog restart catalog");
     super::agent_coordination::watch_repair_v123::validate_v123_catalog(connection)
         .expect("V123 did not replay the exact watch-repair catalog");
@@ -47551,4 +48697,210 @@ fn session_diagnostics_v127_migration_installs_and_rewinds_catalog() {
             .expect("probe replayed V127 schema object");
         assert_eq!(found, 1, "V127 replay restores {object_type} {name}");
     }
+}
+
+/// Run `operation` while another connection holds the database write lock and
+/// releases it 300 ms later. A store write whose DEFERRED transaction reads
+/// first cannot wait for that writer: `SQLite` answers its read -> write upgrade
+/// with an instant `SQLITE_BUSY` and never invokes `busy_timeout` (#919,
+/// #980). A write transaction that begins IMMEDIATE waits for the lock.
+#[cfg(any(
+    not(feature = "test-shard-mode"),
+    feature = "test-shard-store-01",
+    feature = "test-shard-store-02"
+))]
+#[allow(clippy::expect_used)]
+pub fn while_another_connection_writes<T>(
+    database: &std::path::Path,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let database = database.to_path_buf();
+    let writer = std::thread::spawn(move || {
+        let writer = rusqlite::Connection::open(&database).expect("concurrent writer connection");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("concurrent writer holds the write lock");
+        locked_tx.send(()).expect("announce the held write lock");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        writer
+            .execute_batch("COMMIT")
+            .expect("concurrent writer releases the write lock");
+    });
+    locked_rx
+        .recv()
+        .expect("concurrent writer took the write lock");
+    let result = operation();
+    writer.join().expect("concurrent writer thread");
+    result
+}
+
+/// #980: adding an Issue dependency reads both Issues and walks the cycle
+/// graph before it inserts the edge, so it must wait out a concurrent writer.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+#[allow(clippy::expect_used)]
+fn add_issue_dep_waits_for_a_concurrent_writer_instead_of_failing_busy() {
+    let directory = tempfile::tempdir().expect("issue dependency fixture dir");
+    let database = directory.path().join("rsi.db");
+    let store = Store::open(&database).expect("issue dependency store");
+    let project = make_test_project("issue dependency under a concurrent writer");
+    store.insert_project(&project).expect("insert project");
+    let blocker = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("blocker")
+        })
+        .expect("create blocker");
+    let target = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("target")
+        })
+        .expect("create target");
+
+    while_another_connection_writes(&database, || store.add_issue_dep(target.id, blocker.id))
+        .expect("the dependency is recorded after the concurrent writer commits");
+
+    let edges: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM issue_deps WHERE issue_id=?1 AND depends_on_id=?2",
+            params![target.id.to_string(), blocker.id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count dependency edges");
+    assert_eq!(edges, 1);
+}
+
+/// Build a file database at `LATEST_SCHEMA_VERSION + ahead` in rollback-journal
+/// mode (not WAL) carrying a marker row, then drop every connection so the file
+/// bytes are the whole state.
+fn newer_schema_fixture(path: &Path, ahead: i32) -> i32 {
+    {
+        let store = Store::open(path).unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .ok();
+    }
+    let connection = Connection::open(path).unwrap();
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    connection
+        .execute_batch(
+            "CREATE TABLE future_marker (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+             INSERT INTO future_marker (id, note) VALUES (1, 'written by a newer build');",
+        )
+        .unwrap();
+    let future = LATEST_SCHEMA_VERSION + ahead;
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {future};"))
+        .unwrap();
+    drop(connection);
+    future
+}
+
+fn file_digest(path: &Path) -> String {
+    format!("{:x}", sha2::Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn store_open_refuses_newer_schema_without_mutating_the_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("newer.sqlite");
+    let future = newer_schema_fixture(&database, 1);
+    let before_bytes = file_digest(&database);
+    let before_catalog = schema_catalog_snapshot(&Connection::open(&database).unwrap());
+    // Opening the read-only observer above must not have changed the file.
+    assert_eq!(file_digest(&database), before_bytes);
+
+    for attempt in 0..2 {
+        let error = match Store::open(&database) {
+            Ok(_) => panic!("attempt {attempt}: a newer schema must be refused"),
+            Err(error) => error,
+        };
+        match &error {
+            DaemonError::SchemaTooNew {
+                database_version,
+                supported_version,
+            } => {
+                assert_eq!(*database_version, future);
+                assert_eq!(*supported_version, LATEST_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains(&future.to_string()), "{message}");
+        assert!(
+            message.contains(&LATEST_SCHEMA_VERSION.to_string()),
+            "{message}"
+        );
+
+        // Byte-identical file: no PRAGMA journal_mode/WAL write, no DDL, no DML.
+        assert_eq!(file_digest(&database), before_bytes, "attempt {attempt}");
+        assert!(
+            !database.with_extension("sqlite-wal").exists(),
+            "a refused open must not create a WAL sidecar"
+        );
+    }
+
+    let observer = Connection::open(&database).unwrap();
+    assert_eq!(
+        observer
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        future
+    );
+    assert_eq!(schema_catalog_snapshot(&observer), before_catalog);
+    let note: String = observer
+        .query_row("SELECT note FROM future_marker WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(note, "written by a newer build");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn store_open_refuses_a_schema_far_ahead_of_latest() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("far-ahead.sqlite");
+    let future = newer_schema_fixture(&database, 500);
+    assert!(matches!(
+        Store::open(&database),
+        Err(DaemonError::SchemaTooNew { database_version, supported_version })
+            if database_version == future && supported_version == LATEST_SCHEMA_VERSION
+    ));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn store_open_accepts_the_latest_schema_and_migrates_an_older_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("current.sqlite");
+    {
+        let store = Store::open(&database).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        rewind_store_to_schema_version(&store.conn, 83);
+    }
+    let store = Store::open(&database).expect("an older schema still migrates forward");
+    assert_eq!(
+        store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        LATEST_SCHEMA_VERSION
+    );
+    drop(store);
+    Store::open(&database).expect("a database at LATEST reopens");
 }

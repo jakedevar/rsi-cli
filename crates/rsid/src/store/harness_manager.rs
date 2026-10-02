@@ -5,9 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::harness_manager::*;
 use rsi_common::harness_manager_v2::ManagerRequestStateV2;
+use rsi_common::manager_nodes::ManagerNodeSelectorV1;
 use rsi_common::types::{
     Recurrence, ScheduleSpec, ScheduledJob, Session, SessionKind, SessionStatus, WakeMode,
 };
@@ -16,6 +17,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::Store;
+use super::manager_nodes::{
+    AreaNode, area_node_on, canonical_uuid, live_topology, node_refused, record_operation,
+    replay_operation,
+};
 use crate::error::{DaemonError, Result};
 
 const LINEAGE_LIMIT: usize = 256;
@@ -25,6 +30,10 @@ const MAX_ACTIVE_MANAGERS: usize = 64;
 pub(super) const MAX_PENDING_REQUESTS_PER_EPIC: u32 = 32;
 /// #664 (c): project-wide ceiling across every Epic in the current scope.
 pub(super) const MAX_PENDING_REQUESTS_PER_PROJECT: u32 = 256;
+/// #973: at most this many open requests move to a replacement lead. Older
+/// open requests are settled as superseded (the newest manager instruction
+/// wins), so a normal replace cycle never fills the per-Epic request cap.
+pub(crate) const MAX_READDRESSED_REQUESTS: usize = (MAX_PENDING_REQUESTS_PER_EPIC / 2) as usize;
 /// Surfaced when the project or any Epic reaches 75% of its limit.
 const MAIL_CAPACITY_WARNING: &str = "manager_mail_capacity_75pct";
 pub(crate) const MAX_NOTICE_EPICS_PER_PASS: usize = 32;
@@ -292,6 +301,19 @@ struct StoredMessage {
     idempotency_key: String,
 }
 
+/// Immutable address of node mail. The legacy message columns retain the
+/// project root for their existing ledger and capacity keys.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NodeMailAddress {
+    node_id: Uuid,
+    grant_version: i64,
+    seat_root_session_id: Uuid,
+    addressed_seat_session_id: Uuid,
+}
+
+const NODE_MAIL_ADDRESS_KIND: &str = "node_mail_address";
+const NODE_MAIL_READ_KIND: &str = "node_mail_read";
+
 impl StoredMessage {
     /// Lead-origin informational notice (#404), fixed at insert time.
     fn is_lead_notice(&self) -> bool {
@@ -357,6 +379,443 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
 }
 
 impl Store {
+    pub(crate) fn manager_mail_route_for_config(
+        &self,
+        config: &HarnessManagerConfigV1,
+    ) -> Result<(HarnessManagerConfigV1, Option<Uuid>)> {
+        let root = self
+            .get_harness_manager(config.project_id)?
+            .ok_or_else(|| refused("manager_not_configured"))?;
+        if root.manager_session_id == config.manager_session_id {
+            return Ok((root, None));
+        }
+        let node: String = self.conn.query_row(
+            "SELECT id FROM manager_nodes WHERE seat_root_session_id=?1 AND state='active'",
+            [config.manager_session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok((root, Some(uuid(node)?)))
+    }
+
+    pub(crate) fn manager_node_seat_for_epic(
+        &self,
+        root: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<Option<Uuid>> {
+        Ok(self
+            .manager_mail_node_for_epic(root, epic)?
+            .map(|address| address.addressed_seat_session_id))
+    }
+
+    /// Return only Epics for which this node is the deepest live owner.
+    /// A parent retains its grant for delegation, but raw Epic operations
+    /// must be routed to the child while that child's grant is live.
+    pub(crate) fn manager_direct_epics(
+        &self,
+        config: &HarnessManagerConfigV1,
+        node_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let root = self
+            .get_harness_manager(config.project_id)?
+            .ok_or_else(|| refused("manager_not_configured"))?;
+        let is_root = root.manager_session_id == node_id;
+        let owner_node_id = if is_root {
+            None
+        } else {
+            Some(self.conn.query_row(
+                "SELECT id FROM manager_nodes WHERE seat_root_session_id=?1 AND state='active'",
+                [node_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?.parse::<Uuid>().map_err(|_| refused("manager_node_invalid_stored_identity"))?)
+        };
+        let mut direct = Vec::new();
+        for epic in &config.epic_ids {
+            // Area selectors resolve over live topology only. An archived,
+            // deleted or detached Epic has no area owner, so it stays with the
+            // root manager exactly as before recursive nodes (for example the
+            // archive listing); no area node ever receives it.
+            let owner = if self
+                .manager_live_epic_group(root.project_id, *epic)?
+                .is_some()
+            {
+                self.manager_mail_node_for_epic(&root, *epic)?
+            } else {
+                None
+            };
+            if (is_root && owner.is_none())
+                || owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner.node_id) == owner_node_id)
+            {
+                direct.push(*epic);
+            }
+        }
+        Ok(direct)
+    }
+
+    /// The live root Group of a live Epic in `project`, or `None` when the Epic
+    /// is archived, deleted, detached or not an Epic of that project.
+    fn manager_live_epic_group(&self, project: Uuid, epic: Uuid) -> Result<Option<Uuid>> {
+        let group: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT e.parent_id FROM sessions e JOIN sessions g ON g.id=e.parent_id
+             WHERE e.id=?1 AND e.project_id=?2 AND e.session_kind='Epic'
+             AND e.status NOT IN ('Archived','Deleted') AND g.project_id=e.project_id
+             AND g.session_kind='Group' AND g.parent_id IS NULL
+             AND g.status NOT IN ('Archived','Deleted')",
+                params![epic.to_string(), project.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        group.map(uuid).transpose()
+    }
+
+    /// Resolve the live topology on each mail operation. Sibling selectors are
+    /// disjoint at appointment time, but a moved Epic can make them overlap;
+    /// that is an ambiguity, never a reason to pick an arbitrary node.
+    fn manager_mail_node_for_epic(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<Option<NodeMailAddress>> {
+        let Some(group) = self.manager_live_epic_group(config.project_id, epic)? else {
+            return Err(refused("manager_legal_epic_required"));
+        };
+        let mut statement = self.conn.prepare(
+            "WITH RECURSIVE tree(id,depth) AS (
+                SELECT id,0 FROM manager_nodes WHERE legacy_project_id=?1 AND state='active'
+                UNION ALL
+                SELECT child.id,tree.depth+1 FROM manager_nodes child JOIN tree ON child.parent_node_id=tree.id
+                JOIN manager_node_grants grant_row ON grant_row.node_id=child.id
+                    AND grant_row.grant_version=child.grant_version AND grant_row.state='granted'
+                WHERE child.state='active' AND tree.depth<64
+             ) SELECT n.id,n.parent_node_id,n.grant_version,n.seat_root_session_id,s.selector_json,tree.depth
+               FROM tree JOIN manager_nodes n ON n.id=tree.id
+               LEFT JOIN manager_node_scopes s ON s.node_id=n.id AND s.project_id=?1
+               ORDER BY tree.depth,n.id"
+        )?;
+        let rows = statement
+            .query_map([config.project_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut eligible = BTreeMap::new();
+        let mut winner: Option<(i64, NodeMailAddress)> = None;
+        for (id, parent, version, seat, selector, depth) in rows {
+            let id = uuid(id)?;
+            let parent = parent.map(uuid).transpose()?;
+            let covers = selector
+                .map(|json| serde_json::from_str::<ManagerNodeSelectorV1>(&json))
+                .transpose()?
+                .is_some_and(|selector| selector.covers_epic(epic, Some(group)));
+            let parent_covers = parent.is_none_or(|parent| eligible.get(&parent) == Some(&true));
+            eligible.insert(id, covers && parent_covers);
+            if !covers || !parent_covers || depth == 0 {
+                continue;
+            }
+            if winner.as_ref().is_some_and(|(best, _)| *best == depth) {
+                return Err(refused("manager_node_mail_ambiguous_scope"));
+            }
+            let seat_root_session_id = uuid(seat)?;
+            let addressed_seat_session_id = self.manager_lineage_tip(seat_root_session_id)?;
+            if matches!(
+                manager_lineage_session_on(&self.conn, addressed_seat_session_id)?.status,
+                SessionStatus::Archived | SessionStatus::Deleted
+            ) {
+                return Err(refused("manager_node_mail_seat_unavailable"));
+            }
+            winner = Some((
+                depth,
+                NodeMailAddress {
+                    node_id: id,
+                    grant_version: version,
+                    seat_root_session_id,
+                    addressed_seat_session_id,
+                },
+            ));
+        }
+        Ok(winner.map(|(_, node)| node))
+    }
+
+    fn manager_mail_node_for_caller(&self, project: Uuid, caller: Uuid) -> Result<Option<Uuid>> {
+        let mut statement = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                SELECT id FROM manager_nodes WHERE legacy_project_id=?1 AND state='active'
+                UNION ALL SELECT child.id FROM manager_nodes child JOIN tree ON child.parent_node_id=tree.id
+                JOIN manager_node_grants g ON g.node_id=child.id AND g.grant_version=child.grant_version
+                    AND g.state='granted' WHERE child.state='active'
+             ) SELECT n.id,n.seat_root_session_id FROM tree JOIN manager_nodes n ON n.id=tree.id
+               JOIN manager_node_scopes s ON s.node_id=n.id AND s.project_id=?1
+               WHERE n.parent_node_id IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([project.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut found = None;
+        for (node, root) in rows {
+            if self.manager_lineage_tip(uuid(root)?)? == caller {
+                if found.is_some() {
+                    return Err(refused("manager_node_mail_ambiguous_seat"));
+                }
+                found = Some(uuid(node)?);
+            }
+        }
+        Ok(found)
+    }
+
+    fn manager_mail_address(
+        &self,
+        config: &HarnessManagerConfigV1,
+        message: Uuid,
+    ) -> Result<Option<NodeMailAddress>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM harness_manager_v2_events WHERE project_id=?1
+             AND manager_session_id=?2 AND scope_version=?3 AND kind=?4 AND record_key=?5",
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    NODE_MAIL_ADDRESS_KIND,
+                    message.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+
+    fn manager_mail_address_of_message(
+        &self,
+        record: &StoredMessage,
+    ) -> Result<Option<NodeMailAddress>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM harness_manager_v2_events WHERE project_id=?1
+             AND manager_session_id=?2 AND scope_version=?3 AND kind=?4 AND record_key=?5",
+                params![
+                    record.project_id.to_string(),
+                    record.manager_session_id.to_string(),
+                    record.scope_version,
+                    NODE_MAIL_ADDRESS_KIND,
+                    record.public.message_id.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+
+    fn bind_manager_mail_address(
+        &self,
+        config: &HarnessManagerConfigV1,
+        message: Uuid,
+        epic: Uuid,
+        address: &NodeMailAddress,
+    ) -> Result<()> {
+        // The event is immutable and inserted in the message transaction.
+        // Mail has its own caps and never consumes the coordination budget.
+        self.conn.execute(
+            "INSERT INTO harness_manager_v2_events(project_id,manager_session_id,scope_version,
+             actor_session_id,kind,record_key,row_version,payload_json,created_at)
+             VALUES(?1,?2,?3,NULL,?4,?5,1,?6,?7)",
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                NODE_MAIL_ADDRESS_KIND,
+                message.to_string(),
+                serde_json::json!({"epic_id":epic,"node_id":address.node_id,
+                    "grant_version":address.grant_version,
+                    "seat_root_session_id":address.seat_root_session_id,
+                    "addressed_seat_session_id":address.addressed_seat_session_id})
+                .to_string(),
+                stamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn mark_manager_node_mail_read(
+        &self,
+        config: &HarnessManagerConfigV1,
+        message: Uuid,
+        epic: Uuid,
+        caller: Uuid,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO harness_manager_v2_events(project_id,manager_session_id,scope_version,
+             actor_session_id,kind,record_key,row_version,payload_json,created_at)
+             SELECT ?1,?2,?3,?4,?5,?6,1,?7,?8 WHERE NOT EXISTS (
+                SELECT 1 FROM harness_manager_v2_events WHERE project_id=?1
+                AND manager_session_id=?2 AND scope_version=?3 AND kind=?5 AND record_key=?6)",
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                caller.to_string(),
+                NODE_MAIL_READ_KIND,
+                message.to_string(),
+                serde_json::json!({"epic_id":epic}).to_string(),
+                stamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn pending_manager_node_notices(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+        node: Uuid,
+    ) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM harness_manager_messages m JOIN harness_manager_v2_events a
+                 ON a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+                 AND a.scope_version=m.scope_version AND a.kind=?4 AND a.record_key=m.id
+             WHERE m.project_id=?1 AND m.manager_session_id=?2 AND m.scope_version=?3
+                 AND m.epic_id=?5 AND m.request_fingerprint GLOB 'lead-notice:*'
+                 AND json_extract(a.payload_json,'$.node_id')=?6
+                 AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_events r
+                     WHERE r.project_id=m.project_id AND r.manager_session_id=m.manager_session_id
+                     AND r.scope_version=m.scope_version AND r.kind=?7 AND r.record_key=m.id)",
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                NODE_MAIL_ADDRESS_KIND,
+                epic.to_string(),
+                node.to_string(),
+                NODE_MAIL_READ_KIND
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn settle_manager_node_mail_watch(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+        node: Uuid,
+        to_manager: bool,
+    ) -> Result<()> {
+        let direction = if to_manager { "to_manager" } else { "to_lead" };
+        let unread: i64 = self.conn.query_row(
+            "SELECT count(*) FROM harness_manager_messages m JOIN harness_manager_v2_events a
+                 ON a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+                 AND a.scope_version=m.scope_version AND a.kind=?4 AND a.record_key=m.id
+             WHERE m.project_id=?1 AND m.manager_session_id=?2 AND m.scope_version=?3
+                 AND m.epic_id=?5 AND json_extract(a.payload_json,'$.node_id')=?6
+                 AND (?7='to_manager' AND (m.request_id IS NOT NULL OR
+                     m.request_fingerprint GLOB 'lead-notice:*')
+                   OR ?7='to_lead' AND m.request_id IS NULL AND
+                     m.request_fingerprint NOT GLOB 'lead-notice:*')
+                 AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_events r
+                     WHERE r.project_id=m.project_id AND r.manager_session_id=m.manager_session_id
+                     AND r.scope_version=m.scope_version AND r.kind=?8 AND r.record_key=m.id)",
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                NODE_MAIL_ADDRESS_KIND,
+                epic.to_string(),
+                node.to_string(),
+                direction,
+                NODE_MAIL_READ_KIND
+            ],
+            |row| row.get(0),
+        )?;
+        if unread != 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET enabled=0,updated_at=?5 WHERE id IN (
+                SELECT w.job_id FROM harness_manager_watches w JOIN harness_manager_v2_events a
+                    ON a.project_id=w.project_id AND a.manager_session_id=?2
+                    AND a.scope_version=w.scope_version AND a.kind=?6 AND a.record_key=w.job_id
+                WHERE w.project_id=?1 AND w.scope_version=?3 AND w.epic_id=?4
+                    AND w.direction=?7 AND json_extract(a.payload_json,'$.node_id')=?8)",
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                epic.to_string(),
+                stamp(),
+                NODE_MAIL_ADDRESS_KIND,
+                direction,
+                node.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A supervisor receives only two capacity signals per node and Epic in
+    /// one scope. Exact child mail never enters the root inbox.
+    fn escalate_manager_node_mail_capacity(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+        node: Uuid,
+        pending: i64,
+    ) -> Result<()> {
+        let level = if pending >= MAX_PENDING_LEAD_NOTICES {
+            "full"
+        } else if pending >= MAX_PENDING_LEAD_NOTICES * 3 / 4 {
+            "75pct"
+        } else {
+            return Ok(());
+        };
+        let (job_id, _, _) = self.manager_action_watch_identity(config);
+        let subject = format!("node-mail-capacity:{node}:{epic}");
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices WHERE job_id=?1
+             AND kind='ledger_change' AND subject_id=?2 AND subject_version=?3)",
+            params![job_id.to_string(), subject, level],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        self.ensure_manager_action_watch(config, &format!("{subject}:{level}"))?;
+        let recorded = stamp();
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'to_manager',NULL,?4,'ledger_change',?7,?8,?9,?10,?10)",
+            params![
+                Uuid::new_v4().to_string(),
+                job_id.to_string(),
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                epic.to_string(),
+                subject,
+                level,
+                serde_json::json!({"record_kind":"node_mail_capacity","node_id":node,
+                    "epic_id":epic,"pending":pending,"limit":MAX_PENDING_LEAD_NOTICES})
+                .to_string(),
+                recorded
+            ],
+        )?;
+        Ok(())
+    }
     /// One bounded page includes empty Groups and preserves each row's identity.
     pub fn list_harness_manager_scope(
         &self,
@@ -627,9 +1086,8 @@ impl Store {
 
     /// Server-bound reach of the appointed manager over one session.
     ///
-    /// Returns `Some` only when `caller` is the daemon-resolved current
-    /// manager principal of `target`'s project and the nearest Epic at or
-    /// above `target` is covered by the live scope. Every other caller —
+    /// Returns `Some` only when `caller` is the current seat of the deepest
+    /// manager node for the nearest Epic at or above `target`. Every other caller —
     /// leads, workers, a stale manager predecessor, a revoked or foreign
     /// manager — gets `None`, so callers fall through to their ordinary
     /// self/child/lead rules. Scope only: capability, mode and pause checks
@@ -645,12 +1103,28 @@ impl Store {
         let Some(project_id) = self.get_session(caller)?.and_then(|s| s.project_id) else {
             return Ok(None);
         };
-        let Some(config) = self.get_harness_manager_notice_config(project_id)? else {
+        let Some(root) = self.get_harness_manager_notice_config(project_id)? else {
             return Ok(None);
         };
-        if config.current_session_id != Some(caller) || config.is_revoked() {
+        let config = if root.current_session_id == Some(caller) && !root.is_revoked() {
+            // The direct-owner check below needs the effective Epic set. A
+            // project or Group scope stores no explicit Epic IDs, so the raw
+            // notice config would deny every target (#1031).
+            // Re-check the seat on the config actually used, so the two reads
+            // cannot pair one seat's check with another seat's scope.
+            match self.get_harness_manager(project_id)? {
+                Some(effective)
+                    if effective.current_session_id == Some(caller) && !effective.is_revoked() =>
+                {
+                    effective
+                }
+                _ => return Ok(None),
+            }
+        } else if let Some(authority) = self.manager_area_authority_current(caller)? {
+            authority.config
+        } else {
             return Ok(None);
-        }
+        };
         let Some(target) = self.get_session(target)? else {
             return Ok(None);
         };
@@ -680,6 +1154,12 @@ impl Store {
             return Ok(None);
         };
         if !self.manager_config_covers_epic(&config, epic_id)? {
+            return Ok(None);
+        }
+        if !self
+            .manager_direct_epics(&config, config.manager_session_id)?
+            .contains(&epic_id)
+        {
             return Ok(None);
         }
         Ok(Some(ManagerSessionScope {
@@ -1005,6 +1485,7 @@ impl Store {
                 }
             }
         }
+        self.sync_legacy_manager_root_on(&tx, project_id)?;
         tx.commit()?;
         self.get_harness_manager(project_id)?
             .ok_or_else(|| refused("manager_scope_missing"))
@@ -1227,6 +1708,37 @@ impl Store {
         Ok((config, is_manager))
     }
 
+    /// Mail-only node authority; it must not confer legacy root ledger,
+    /// topology, Issue, or operator control through manager_config_for_caller.
+    fn manager_mail_config_for_caller(
+        &self,
+        caller: Uuid,
+    ) -> Result<(HarnessManagerConfigV1, bool)> {
+        if let Ok(value) = self.manager_config_for_caller(caller) {
+            return Ok(value);
+        }
+        let session = self.manager_session(caller)?;
+        if matches!(
+            session.status,
+            SessionStatus::Archived | SessionStatus::Deleted
+        ) {
+            return Err(refused("manager_current_session_required"));
+        }
+        let project = session
+            .project_id
+            .ok_or_else(|| refused("manager_project_required"))?;
+        let config = self
+            .get_harness_manager(project)?
+            .ok_or_else(|| refused("manager_not_configured"))?;
+        if self
+            .manager_mail_node_for_caller(project, caller)?
+            .is_none()
+        {
+            return Err(refused("manager_scope_denied"));
+        }
+        Ok((config, true))
+    }
+
     #[cfg(test)]
     pub(crate) fn manager_progress(&self, caller: Uuid) -> Result<AgentManagerProgressResultV1> {
         self.manager_progress_page(caller, &AgentManagerProgressRequestV1::default())
@@ -1240,12 +1752,37 @@ impl Store {
         request.validate().map_err(refused)?;
         // Immediate: the #664 orphan sweep may append settle markers.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (mut config, is_manager, is_area) = match self.manager_config_for_caller(caller) {
+            Ok((config, is_manager)) => (config, is_manager, false),
+            Err(legacy_denial) => {
+                let Some(authority) = self.manager_area_authority_current(caller)? else {
+                    return Err(legacy_denial);
+                };
+                (authority.config, true, true)
+            }
+        };
         if !is_manager {
             return Err(refused("manager_scope_denied"));
         }
-        self.settle_orphaned_manager_requests(&config)?;
-        let (mail_capacity, per_epic) = self.manager_mail_capacity(&config)?;
+        if !is_area {
+            config.epic_ids = self.manager_direct_epics(&config, config.manager_session_id)?;
+            config.selected_epic_ids = Some(config.epic_ids.clone());
+        }
+        let mail_config = self
+            .get_harness_manager(config.project_id)?
+            .ok_or_else(|| refused("manager_not_configured"))?;
+        if !is_area {
+            self.settle_orphaned_manager_requests(&mail_config)?;
+        }
+        let (mut mail_capacity, mut per_epic) = self.manager_mail_capacity(&mail_config)?;
+        per_epic.retain(|epic, _| config.epic_ids.contains(epic));
+        mail_capacity.project_pending = per_epic.values().copied().sum();
+        mail_capacity.warning = (u64::from(mail_capacity.project_pending) * 4
+            >= u64::from(mail_capacity.project_limit) * 3
+            || per_epic
+                .values()
+                .any(|pending| u64::from(*pending) * 4 >= u64::from(mail_capacity.epic_limit) * 3))
+        .then(|| MAIL_CAPACITY_WARNING.to_owned());
         let mut rows = Vec::new();
         let first = config
             .epic_ids
@@ -1299,14 +1836,23 @@ impl Store {
             rows.push(row);
         }
         let query = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages WHERE project_id=?1 AND manager_session_id=?2 AND {MANAGER_REQUEST_ROW} ORDER BY sequence DESC LIMIT 32"
+            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages m WHERE project_id=?1 AND manager_session_id=?2 AND {MANAGER_REQUEST_ROW}
+             AND ((?3 IS NULL AND NOT EXISTS (SELECT 1 FROM harness_manager_v2_events a
+               WHERE a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+               AND a.scope_version=m.scope_version AND a.kind='node_mail_address'
+               AND a.record_key=m.id)) OR (?3 IS NOT NULL AND EXISTS (SELECT 1 FROM harness_manager_v2_events a
+               WHERE a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+               AND a.scope_version=m.scope_version AND a.kind='node_mail_address'
+               AND a.record_key=m.id AND json_extract(a.payload_json,'$.node_id')=?3)))
+             ORDER BY sequence DESC LIMIT 32"
         );
         let mut statement = self.conn.prepare(&query)?;
         let messages = statement
             .query_map(
                 params![
-                    config.project_id.to_string(),
-                    config.manager_session_id.to_string()
+                    mail_config.project_id.to_string(),
+                    mail_config.manager_session_id.to_string(),
+                    is_area.then(|| config.manager_session_id.to_string())
                 ],
                 read_message,
             )?
@@ -1315,21 +1861,21 @@ impl Store {
         let mut recent_requests = Vec::new();
         for record in messages {
             let readdressed_to =
-                self.manager_request_readdressed(&config, record.public.message_id)?;
+                self.manager_request_readdressed(&mail_config, record.public.message_id)?;
             let rolled_over_to =
-                self.manager_request_rolled_over(&config, record.public.message_id)?;
-            let state = if record.scope_version != config.row_version
+                self.manager_request_rolled_over(&mail_config, record.public.message_id)?;
+            let state = if record.scope_version != mail_config.row_version
                 || !config.epic_ids.contains(&record.public.epic_id)
             {
                 "scope_revoked"
             } else if readdressed_to.is_some() {
                 "readdressed"
             } else if self
-                .manager_request_settlement(&config, record.public.message_id)?
+                .manager_request_settlement(&mail_config, record.public.message_id)?
                 .is_some()
             {
                 "settled"
-            } else if !self.manager_message_live(&config, &record)? {
+            } else if !self.manager_message_live(&mail_config, &record)? {
                 "lead_changed"
             } else if rolled_over_to.is_some() {
                 "rolled_over"
@@ -1365,7 +1911,12 @@ impl Store {
     ) -> Result<AgentManagerInboxResultV1> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (config, is_manager) = self.manager_mail_config_for_caller(caller)?;
+        let node = if is_manager && config.current_session_id != Some(caller) {
+            self.manager_mail_node_for_caller(config.project_id, caller)?
+        } else {
+            None
+        };
         let epic = if is_manager {
             None
         } else {
@@ -1379,10 +1930,19 @@ impl Store {
             .transpose()?
             .map(|chain| chain.json());
         let query = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages
+            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages m
             WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND sequence>?4
             AND (?5 IS NULL OR epic_id=?5) AND (?6 IS NULL
               OR id IN (SELECT value FROM json_each(?6)) OR request_id IN (SELECT value FROM json_each(?6)))
+            AND (?8=0 OR (?9 IS NULL AND NOT EXISTS (
+                SELECT 1 FROM harness_manager_v2_events a WHERE a.project_id=m.project_id
+                AND a.manager_session_id=m.manager_session_id AND a.scope_version=m.scope_version
+                AND a.kind='node_mail_address' AND a.record_key=m.id))
+                OR (?9 IS NOT NULL AND EXISTS (
+                SELECT 1 FROM harness_manager_v2_events a WHERE a.project_id=m.project_id
+                AND a.manager_session_id=m.manager_session_id AND a.scope_version=m.scope_version
+                AND a.kind='node_mail_address' AND a.record_key=m.id
+                AND json_extract(a.payload_json,'$.node_id')=?9)))
             ORDER BY sequence LIMIT ?7"
         );
         let mut statement = self.conn.prepare(&query)?;
@@ -1395,7 +1955,9 @@ impl Store {
                     request.after_sequence,
                     epic.map(|id| id.to_string()),
                     filter,
-                    i64::from(request.limit) + 1
+                    i64::from(request.limit) + 1,
+                    is_manager as i64,
+                    node.map(|id| id.to_string())
                 ],
                 read_message,
             )?
@@ -1429,14 +1991,44 @@ impl Store {
                 messages.push(record.public);
             }
         }
-        self.manager_v2_track_retrieval(&config, caller, &messages)?;
-        let (notices, more_notices) = self.retrieve_manager_notices(
-            &config,
-            caller,
-            is_manager,
-            request.limit,
-            request.request_id,
-        )?;
+        let mut routes_read = BTreeSet::new();
+        for message in &messages {
+            let Some(record) = self.get_manager_message(message.message_id)? else {
+                continue;
+            };
+            if let Some(address) = self.manager_mail_address_of_message(&record)?
+                && self.manager_lineage_tip(record.public.recipient_session_id)? == caller
+            {
+                self.mark_manager_node_mail_read(
+                    &config,
+                    message.message_id,
+                    message.epic_id,
+                    caller,
+                )?;
+                routes_read.insert((
+                    message.epic_id,
+                    address.node_id,
+                    record.public.request_id.is_some() || record.is_lead_notice(),
+                ));
+            }
+        }
+        for (epic, node, to_manager) in routes_read {
+            self.settle_manager_node_mail_watch(&config, epic, node, to_manager)?;
+        }
+        if node.is_none() {
+            self.manager_v2_track_retrieval(&config, caller, &messages)?;
+        }
+        let (notices, more_notices) = if node.is_some() {
+            (Vec::new(), false)
+        } else {
+            self.retrieve_manager_notices(
+                &config,
+                caller,
+                is_manager,
+                request.limit,
+                request.request_id,
+            )?
+        };
         let manager_seat = self.manager_seat_state(&config)?;
         tx.commit()?;
         Ok(AgentManagerInboxResultV1 {
@@ -1463,7 +2055,26 @@ impl Store {
         let Ok(lead) = self.manager_lead(config.project_id, record.public.epic_id) else {
             return Ok(false);
         };
-        let manager = self.manager_lineage_tip(config.manager_session_id)?;
+        let address = self.manager_mail_address(config, record.public.message_id)?;
+        let manager = if let Some(address) = &address {
+            let Some(current) = self.manager_mail_node_for_epic(config, record.public.epic_id)?
+            else {
+                return Ok(false);
+            };
+            if current.node_id != address.node_id
+                || current.grant_version != address.grant_version
+                || current.seat_root_session_id != address.seat_root_session_id
+                || self
+                    .manager_lineage_tip(address.addressed_seat_session_id)
+                    .ok()
+                    != Some(current.addressed_seat_session_id)
+            {
+                return Ok(false);
+            }
+            current.addressed_seat_session_id
+        } else {
+            self.manager_lineage_tip(config.manager_session_id)?
+        };
         // Direction is fixed at insert time: replies and lead notices flow
         // lead->manager, manager requests manager->lead. Either binding still
         // requires both lineage tips to be the CURRENT lead and manager, so
@@ -1725,6 +2336,29 @@ impl Store {
             if !config.epic_ids.contains(&epic) {
                 continue;
             }
+            if let Some(address) = self.manager_mail_address_of_message(&row)? {
+                let current = match self.manager_mail_node_for_epic(config, epic) {
+                    Ok(current) => current,
+                    Err(_) => continue,
+                };
+                if current.as_ref().is_none_or(|current| {
+                    current.node_id != address.node_id
+                        || current.grant_version != address.grant_version
+                        || current.seat_root_session_id != address.seat_root_session_id
+                }) {
+                    self.manager_v2_put_record(
+                        config,
+                        REQUEST_SETTLE_KIND,
+                        &row.public.message_id.to_string(),
+                        Some(epic),
+                        0,
+                        &serde_json::json!({"disposition":"node_scope_changed","actor":"daemon",
+                            "node_id":address.node_id,"grant_version":address.grant_version}),
+                    )?;
+                    settled += 1;
+                    continue;
+                }
+            }
             let lead = *leads.entry(epic).or_insert_with(|| {
                 self.manager_lead(config.project_id, epic)
                     .ok()
@@ -1941,15 +2575,98 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut jobs = Vec::new();
+        let mut reissuable = Vec::new();
         for original in requests {
+            if self
+                .manager_request_reissuable(&config, manager, old_tip, &original)?
+                .is_some()
+            {
+                reissuable.push(original);
+            }
+        }
+        // #973: only the newest open requests move; older ones are settled
+        // as superseded with an audited daemon disposition.
+        let superseded = reissuable.len().saturating_sub(MAX_READDRESSED_REQUESTS);
+        let mut jobs = Vec::new();
+        for (index, original) in reissuable.iter().enumerate() {
+            if index < superseded {
+                self.manager_v2_put_record(
+                    &config,
+                    REQUEST_SETTLE_KIND,
+                    &original.public.message_id.to_string(),
+                    Some(epic),
+                    0,
+                    &serde_json::json!({
+                        "disposition": "superseded_on_replace",
+                        "actor": "daemon",
+                        "previous_lead": old_lead,
+                        "current_lead": new_lead,
+                        "readdress_limit": MAX_READDRESSED_REQUESTS,
+                    }),
+                )?;
+                continue;
+            }
             if let Some(job) =
-                self.reissue_manager_request(&config, &lead, manager, old_tip, &original)?
+                self.reissue_manager_request(&config, &lead, manager, old_tip, original)?
             {
                 jobs.push(job);
             }
         }
         Ok(jobs)
+    }
+
+    /// An open request moves to a replacement lead only while it is still
+    /// addressed to the replaced lineage, unanswered, not already moved and
+    /// without a terminal lifecycle record. Node-addressed mail (#888) moves
+    /// only while the same live node grant still owns the Epic, and its
+    /// sender is that node's current seat. Returns the effective sender when
+    /// the request may move.
+    fn manager_request_reissuable(
+        &self,
+        config: &HarnessManagerConfigV1,
+        manager: Uuid,
+        old_tip: Uuid,
+        original: &StoredMessage,
+    ) -> Result<Option<Uuid>> {
+        let id = original.public.message_id;
+        let sender = if let Some(address) = self.manager_mail_address_of_message(original)? {
+            let Some(current) = self.manager_mail_node_for_epic(config, original.public.epic_id)?
+            else {
+                return Ok(None);
+            };
+            if current.node_id != address.node_id
+                || current.grant_version != address.grant_version
+                || current.seat_root_session_id != address.seat_root_session_id
+                || self
+                    .manager_lineage_tip(address.addressed_seat_session_id)
+                    .ok()
+                    != Some(current.addressed_seat_session_id)
+            {
+                return Ok(None);
+            }
+            current.addressed_seat_session_id
+        } else {
+            manager
+        };
+        if self.manager_lineage_tip(original.public.recipient_session_id)? != old_tip
+            || self.manager_lineage_tip(original.public.sender_session_id)? != sender
+            || self.manager_request_replied(id)?
+            || self.manager_request_readdressed(config, id)?.is_some()
+        {
+            return Ok(None);
+        }
+        if self
+            .manager_v2_record(config, "request", &id.to_string())?
+            .is_some_and(|record| {
+                matches!(
+                    record.payload["state"].as_str(),
+                    Some("completed" | "failed" | "declined")
+                )
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(sender))
     }
 
     fn reissue_manager_request(
@@ -1962,21 +2679,11 @@ impl Store {
     ) -> Result<Option<Uuid>> {
         let id = original.public.message_id;
         let epic = original.public.epic_id;
-        if self.manager_lineage_tip(original.public.recipient_session_id)? != old_tip
-            || self.manager_lineage_tip(original.public.sender_session_id)? != manager
-            || self.manager_request_replied(id)?
-            || self.manager_request_readdressed(config, id)?.is_some()
-        {
+        let address = self.manager_mail_address_of_message(original)?;
+        let Some(manager) = self.manager_request_reissuable(config, manager, old_tip, original)?
+        else {
             return Ok(None);
-        }
-        if let Some(record) = self.manager_v2_record(config, "request", &id.to_string())?
-            && matches!(
-                record.payload["state"].as_str(),
-                Some("completed" | "failed" | "declined")
-            )
-        {
-            return Ok(None);
-        }
+        };
         let key = format!("readdress:{id}:{}", lead.id);
         let digest = fingerprint(&AgentManagerSendRequestV1 {
             epic_id: epic,
@@ -1984,7 +2691,13 @@ impl Store {
             idempotency_key: key.clone(),
             informational: false,
         })?;
-        let receipt = if let Some(receipt) = self.manager_replay(manager, config, &key, &digest)? {
+        let receipt = if let Some(receipt) = self.manager_replay(
+            manager,
+            config,
+            &key,
+            &digest,
+            address.as_ref().map(|node| node.node_id),
+        )? {
             let replayed = self
                 .get_manager_message(receipt.message_id)?
                 .ok_or_else(|| refused("manager_idempotency_conflict"))?;
@@ -1996,7 +2709,7 @@ impl Store {
             }
             receipt
         } else {
-            self.insert_manager_message(
+            let receipt = self.insert_manager_message(
                 config,
                 manager,
                 lead.id,
@@ -2005,7 +2718,11 @@ impl Store {
                 &original.public.message,
                 &key,
                 &digest,
-            )?
+            )?;
+            if let Some(address) = &address {
+                self.bind_manager_mail_address(config, receipt.message_id, epic, address)?;
+            }
+            receipt
         };
         self.manager_v2_put_record(
             config,
@@ -2015,8 +2732,13 @@ impl Store {
             0,
             &serde_json::json!({"new_request_id":receipt.message_id}),
         )?;
-        self.ensure_manager_watch(config, lead, false, &receipt.sequence.to_string(), true)?;
-        self.record_manager_message_notice(config, lead, &receipt, false)
+        if let Some(address) = &address {
+            self.ensure_manager_node_mail_watch(config, lead, address, false, receipt.sequence)?;
+            Ok(None)
+        } else {
+            self.ensure_manager_watch(config, lead, false, &receipt.sequence.to_string(), true)?;
+            self.record_manager_message_notice(config, lead, &receipt, false)
+        }
     }
 
     fn get_manager_message(&self, id: Uuid) -> Result<Option<StoredMessage>> {
@@ -2043,9 +2765,19 @@ impl Store {
             return Err(refused("manager_reserved_idempotency_key"));
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (config, is_manager) = self.manager_mail_config_for_caller(caller)?;
         if !is_manager {
             return Err(refused("manager_scope_denied"));
+        }
+        if !config.epic_ids.contains(&request.epic_id) {
+            return Err(refused("manager_epic_out_of_scope"));
+        }
+        let address = self.manager_mail_node_for_epic(&config, request.epic_id)?;
+        let expected = address.as_ref().map_or(config.current_session_id, |node| {
+            Some(node.addressed_seat_session_id)
+        });
+        if expected != Some(caller) {
+            return Err(refused("manager_node_mail_not_addressed_seat"));
         }
         let digest = fingerprint(request)?;
         let digest = if request.informational {
@@ -2053,15 +2785,24 @@ impl Store {
         } else {
             digest
         };
-        if let Some(mut receipt) =
-            self.manager_replay(caller, &config, &request.idempotency_key, &digest)?
-        {
+        if let Some(mut receipt) = self.manager_replay(
+            caller,
+            &config,
+            &request.idempotency_key,
+            &digest,
+            address.as_ref().map(|node| node.node_id),
+        )? {
+            let prior = self
+                .get_manager_message(receipt.message_id)?
+                .ok_or_else(|| refused("manager_idempotency_conflict"))?;
+            if self.manager_mail_address_of_message(&prior)?.is_some()
+                && !self.manager_message_live(&config, &prior)?
+            {
+                return Err(refused("manager_node_mail_scope_changed"));
+            }
             receipt.manager_seat = self.manager_seat_state(&config)?;
             tx.commit()?;
             return Ok(receipt);
-        }
-        if !config.epic_ids.contains(&request.epic_id) {
-            return Err(refused("manager_epic_out_of_scope"));
         }
         let lead = self.manager_lead(config.project_id, request.epic_id)?;
         if lead.id == caller {
@@ -2095,8 +2836,13 @@ impl Store {
             &request.idempotency_key,
             &digest,
         )?;
-        self.ensure_manager_watch(&config, &lead, false, &receipt.sequence.to_string(), true)?;
-        self.record_manager_message_notice(&config, &lead, &receipt, false)?;
+        if let Some(address) = &address {
+            self.bind_manager_mail_address(&config, receipt.message_id, request.epic_id, address)?;
+            self.ensure_manager_node_mail_watch(&config, &lead, address, false, receipt.sequence)?;
+        } else {
+            self.ensure_manager_watch(&config, &lead, false, &receipt.sequence.to_string(), true)?;
+            self.record_manager_message_notice(&config, &lead, &receipt, false)?;
+        }
         receipt.manager_seat = self.manager_seat_state(&config)?;
         tx.commit()?;
         Ok(receipt)
@@ -2182,7 +2928,11 @@ impl Store {
                 "manager_request_settled: next_action=send_notice_or_reply_to_standing",
             ));
         }
-        let target = self.manager_lineage_tip(config.manager_session_id)?;
+        let address = self.manager_mail_address(&config, original.public.message_id)?;
+        let target = address.as_ref().map_or_else(
+            || self.manager_lineage_tip(config.manager_session_id),
+            |node| self.manager_lineage_tip(node.seat_root_session_id),
+        )?;
         // #656: store on the first generation (from the named one) with room;
         // earlier generations are full by construction. A full tip rolls over.
         let named = chain
@@ -2216,6 +2966,14 @@ impl Store {
             &request.idempotency_key,
             &digest,
         )?;
+        if let Some(address) = &address {
+            self.bind_manager_mail_address(
+                &config,
+                receipt.message_id,
+                original.public.epic_id,
+                address,
+            )?;
+        }
         let key = request.request_id.to_string();
         let previous = self.manager_v2_record(&config, "request", &key)?;
         let state = if request.still_running {
@@ -2255,8 +3013,12 @@ impl Store {
         }
         receipt.rolled_over_from = (generation != chain.root).then_some(chain.root);
         let lead = self.manager_lead(config.project_id, original.public.epic_id)?;
-        self.ensure_manager_watch(&config, &lead, true, &lead.updated_at.to_rfc3339(), true)?;
-        self.record_manager_message_notice(&config, &lead, &receipt, true)?;
+        if address.is_none() {
+            self.ensure_manager_watch(&config, &lead, true, &lead.updated_at.to_rfc3339(), true)?;
+            self.record_manager_message_notice(&config, &lead, &receipt, true)?;
+        } else if let Some(address) = &address {
+            self.ensure_manager_node_mail_watch(&config, &lead, address, true, receipt.sequence)?;
+        }
         // Mail stays durably queued; the lead learns the seat is down (#669).
         receipt.manager_seat = self.manager_seat_state(&config)?;
         tx.commit()?;
@@ -2301,6 +3063,9 @@ impl Store {
             &key,
             &digest,
         )?;
+        if let Some(address) = self.manager_mail_address(config, original.public.message_id)? {
+            self.bind_manager_mail_address(config, successor.message_id, epic, &address)?;
+        }
         let generations = chain
             .ids
             .iter()
@@ -2406,6 +3171,7 @@ impl Store {
         if lead.id != caller {
             return Err(refused("manager_scope_denied"));
         }
+        let address = self.manager_mail_node_for_epic(&config, epic)?;
         let digest = format!(
             "{LEAD_NOTICE_FINGERPRINT_PREFIX}{}",
             fingerprint(&serde_json::json!({
@@ -2432,6 +3198,7 @@ impl Store {
                 || record.manager_session_id != config.manager_session_id
                 || record.scope_version != config.row_version
                 || record.public.epic_id != epic
+                || !self.manager_message_live(&config, &record)?
             {
                 return Err(refused("manager_idempotency_conflict"));
             }
@@ -2445,25 +3212,32 @@ impl Store {
                 manager_seat: None,
             });
         }
-        let manager = config
-            .current_session_id
+        let manager = address
+            .as_ref()
+            .map_or(config.current_session_id, |node| {
+                Some(node.addressed_seat_session_id)
+            })
             .ok_or_else(|| refused("manager_current_session_required"))?;
         if manager == caller {
             return Err(refused("manager_cannot_supervise_itself"));
         }
-        let pending: i64 = self.conn.query_row(
-            "SELECT count(*) FROM harness_manager_notices
+        let pending: i64 = if let Some(address) = &address {
+            self.pending_manager_node_notices(&config, epic, address.node_id)?
+        } else {
+            self.conn.query_row(
+                "SELECT count(*) FROM harness_manager_notices
              WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND epic_id=?4
                AND direction='to_manager' AND kind='message'
                AND retired_at IS NULL AND settled_at IS NULL",
-            params![
-                config.project_id.to_string(),
-                config.manager_session_id.to_string(),
-                config.row_version,
-                epic.to_string()
-            ],
-            |row| row.get(0),
-        )?;
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    epic.to_string()
+                ],
+                |row| row.get(0),
+            )?
+        };
         if pending >= MAX_PENDING_LEAD_NOTICES {
             return Err(refused("manager_pending_notice_limit"));
         }
@@ -2477,8 +3251,14 @@ impl Store {
             idempotency_key,
             &digest,
         )?;
-        self.ensure_manager_watch(&config, &lead, true, &receipt.sequence.to_string(), true)?;
-        self.record_manager_message_notice(&config, &lead, &receipt, true)?;
+        if let Some(address) = &address {
+            self.bind_manager_mail_address(&config, receipt.message_id, epic, address)?;
+            self.ensure_manager_node_mail_watch(&config, &lead, address, true, receipt.sequence)?;
+            self.escalate_manager_node_mail_capacity(&config, epic, address.node_id, pending + 1)?;
+        } else {
+            self.ensure_manager_watch(&config, &lead, true, &receipt.sequence.to_string(), true)?;
+            self.record_manager_message_notice(&config, &lead, &receipt, true)?;
+        }
         tx.commit()?;
         Ok(receipt)
     }
@@ -2489,14 +3269,23 @@ impl Store {
         config: &HarnessManagerConfigV1,
         key: &str,
         digest: &str,
+        node_id: Option<Uuid>,
     ) -> Result<Option<HarnessManagerMessageReceiptV1>> {
         // Manager-origin requests: the same logical manager survives rotation.
         // Actual sender remains immutable attribution. Lead replies replay
         // chain-wide through `manager_reply_replay` (#656).
         let query = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages WHERE idempotency_key=?1
+            "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages m WHERE idempotency_key=?1
             AND (sender_session_id=?2 OR (project_id=?3 AND manager_session_id=?4 AND
-              {MANAGER_REQUEST_ROW})) ORDER BY sequence LIMIT 2"
+              {MANAGER_REQUEST_ROW}))
+            AND ((?5 IS NULL AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_events a
+                 WHERE a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+                 AND a.scope_version=m.scope_version AND a.kind='node_mail_address' AND a.record_key=m.id))
+              OR (?5 IS NOT NULL AND EXISTS(SELECT 1 FROM harness_manager_v2_events a
+                 WHERE a.project_id=m.project_id AND a.manager_session_id=m.manager_session_id
+                 AND a.scope_version=m.scope_version AND a.kind='node_mail_address' AND a.record_key=m.id
+                 AND json_extract(a.payload_json,'$.node_id')=?5)))
+            ORDER BY sequence LIMIT 2"
         );
         let mut statement = self.conn.prepare(&query)?;
         let found = statement
@@ -2505,7 +3294,8 @@ impl Store {
                     key,
                     caller.to_string(),
                     config.project_id.to_string(),
-                    config.manager_session_id.to_string()
+                    config.manager_session_id.to_string(),
+                    node_id.map(|id| id.to_string())
                 ],
                 read_message,
             )?
@@ -2822,6 +3612,125 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_manager_node_mail_watch(
+        &self,
+        config: &HarnessManagerConfigV1,
+        lead: &Session,
+        address: &NodeMailAddress,
+        to_manager: bool,
+        sequence: i64,
+    ) -> Result<()> {
+        let epic = lead
+            .parent_id
+            .ok_or_else(|| refused("manager_legal_epic_required"))?;
+        let lead_root = self.manager_lineage_root(lead.id)?;
+        let (source, target, direction) = if to_manager {
+            (lead_root, address.seat_root_session_id, "to_manager")
+        } else {
+            (address.seat_root_session_id, lead_root, "to_lead")
+        };
+        let key = format!(
+            "manager-node-mail:{}:{}:{}:{}:{}:{direction}:{source}:{target}",
+            config.project_id, config.row_version, epic, address.node_id, address.grant_version
+        );
+        let job_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
+        // Only enabled watches for this exact recipient consume its finite
+        // scheduler slots. Retire obsolete node routes before admission.
+        let mut stale_query = self.conn.prepare(
+            "SELECT w.job_id FROM harness_manager_watches w JOIN scheduled_jobs j ON j.id=w.job_id
+             WHERE w.project_id=?1 AND w.epic_id=?2 AND w.target_session_id=?3 AND j.enabled=1
+               AND EXISTS(SELECT 1 FROM harness_manager_v2_events a WHERE a.project_id=w.project_id
+                   AND a.kind='node_mail_address' AND a.record_key=w.job_id)
+             ORDER BY w.job_id LIMIT 64",
+        )?;
+        let candidates = stale_query
+            .query_map(
+                params![
+                    config.project_id.to_string(),
+                    epic.to_string(),
+                    target.to_string()
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stale_query);
+        for candidate in candidates {
+            let candidate = uuid(candidate)?;
+            if candidate != job_id && self.harness_manager_watch_route(candidate)?.is_none() {
+                self.conn.execute(
+                    "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1",
+                    params![candidate.to_string(), stamp()],
+                )?;
+            }
+        }
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT attention_signature FROM harness_manager_watches WHERE job_id=?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let now = Utc::now();
+        if previous.is_none() {
+            let active: i64 = self.conn.query_row(
+                "SELECT count(*) FROM scheduled_jobs WHERE enabled=1 AND wake_session_id=?1
+                 AND wake_mode LIKE 'on_terminal:%'",
+                [target.to_string()],
+                |row| row.get(0),
+            )?;
+            if active >= 64 {
+                return Err(refused("manager_watch_limit_reached"));
+            }
+            let job = ScheduledJob {
+                id: job_id, name: format!("Manager node mail {direction} {epic}"),
+                message: "Manager node mail is ready. Read AgentManagerInbox and reply using the exact request ID.".into(),
+                schedule: ScheduleSpec { recurrence: Recurrence::EverySeconds(60), anchor: now },
+                last_fired_at: None, next_fire_at: now, enabled: true,
+                working_dir: None, provider: None, model: None, project_id: Some(config.project_id),
+                created_at: now, updated_at: now, wake_mode: WakeMode::OnTerminal(source),
+                wake_session_id: Some(target),
+            };
+            super::scheduled_jobs::insert_harness_manager_watch_job_conn(&self.conn, &job)?;
+            self.conn.execute(
+                "INSERT INTO harness_manager_watches(job_id,project_id,epic_id,scope_version,direction,
+                 source_session_id,target_session_id,attention_signature)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![job_id.to_string(),config.project_id.to_string(),epic.to_string(),
+                    config.row_version,direction,source.to_string(),target.to_string(),sequence.to_string()],
+            )?;
+            self.bind_manager_mail_address(config, job_id, epic, address)?;
+        } else {
+            let job = self
+                .get_scheduled_job(&job_id)?
+                .ok_or_else(|| refused("manager_node_mail_watch_missing"))?;
+            if job.project_id != Some(config.project_id)
+                || job.wake_mode != WakeMode::OnTerminal(source)
+                || job.wake_session_id != Some(target)
+            {
+                return Err(refused("manager_node_mail_watch_identity_collision"));
+            }
+            let stored = self
+                .manager_mail_address(config, job_id)?
+                .ok_or_else(|| refused("manager_node_mail_watch_address_missing"))?;
+            if stored.node_id != address.node_id
+                || stored.grant_version != address.grant_version
+                || stored.seat_root_session_id != address.seat_root_session_id
+            {
+                return Err(refused("manager_node_mail_watch_scope_changed"));
+            }
+            self.conn.execute(
+                "UPDATE scheduled_jobs SET enabled=1,last_fired_at=NULL,next_fire_at=?2,updated_at=?2 WHERE id=?1",
+                params![job_id.to_string(),stamp()],
+            )?;
+            self.conn.execute(
+                "UPDATE harness_manager_watches SET attention_signature=?2 WHERE job_id=?1",
+                params![job_id.to_string(), sequence.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Indexed recognition; no name or caller-provided marker confers authority.
     pub(crate) fn is_harness_manager_watch(&self, job_id: Uuid) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -2899,6 +3808,40 @@ impl Store {
                 return Ok(None);
             }
             return Ok(Some((manager, manager)));
+        }
+        if let Some(address) = self.manager_mail_address(&config, job_id)? {
+            if route_kind != "epic" || !self.manager_config_covers_epic(&config, epic)? {
+                return Ok(None);
+            }
+            let Some(current) = self.manager_mail_node_for_epic(&config, epic)? else {
+                return Ok(None);
+            };
+            if current.node_id != address.node_id
+                || current.grant_version != address.grant_version
+                || current.seat_root_session_id != address.seat_root_session_id
+                || self
+                    .manager_lineage_tip(address.addressed_seat_session_id)
+                    .ok()
+                    != Some(current.addressed_seat_session_id)
+            {
+                return Ok(None);
+            }
+            let Ok(lead) = self.manager_lead(project, epic) else {
+                return Ok(None);
+            };
+            let (expected_source, expected_target) = if direction == "to_manager" {
+                (lead.id, current.addressed_seat_session_id)
+            } else if direction == "to_lead" {
+                (current.addressed_seat_session_id, lead.id)
+            } else {
+                return Ok(None);
+            };
+            if self.manager_lineage_tip(source).ok() != Some(expected_source)
+                || self.manager_lineage_tip(target).ok() != Some(expected_target)
+            {
+                return Ok(None);
+            }
+            return Ok(Some((expected_source, expected_target)));
         }
         if route_kind != "epic" || !self.manager_config_covers_epic(&config, epic)? {
             return Ok(None);
@@ -3032,6 +3975,372 @@ impl Store {
     }
 }
 
+// Recursive manager escalation store path. Node IDs remain stable across seat succession.
+fn escalation_path_on(tx: &Transaction<'_>, project: Uuid, node: Uuid) -> Result<Vec<AreaNode>> {
+    let mut path = Vec::new();
+    let mut cursor = Some(node);
+    for _ in 0..64 {
+        let Some(id) = cursor else {
+            path.reverse();
+            if path
+                .first()
+                .is_some_and(|root: &AreaNode| root.parent_node_id.is_none())
+            {
+                return Ok(path);
+            }
+            return Err(node_refused("manager_node_escalation_scope_changed"));
+        };
+        let row = area_node_on(tx, project, id)?
+            .ok_or_else(|| node_refused("manager_node_escalation_scope_changed"))?;
+        if !row.active || row.grant.is_none() || row.selector.is_none() {
+            return Err(node_refused("manager_node_escalation_revoked"));
+        }
+        cursor = row.parent_node_id;
+        path.push(row);
+    }
+    Err(node_refused("manager_node_escalation_depth_limit"))
+}
+
+fn escalation_caller_on(tx: &Transaction<'_>, project: Uuid, caller: Uuid) -> Result<AreaNode> {
+    let mut stmt = tx.prepare("SELECT n.id,n.seat_root_session_id,n.state FROM manager_nodes n JOIN manager_node_scopes s ON s.node_id=n.id AND s.project_id=?1")?;
+    let seats: Vec<(String, String, String)> = stmt
+        .query_map([project.to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let mut found = None;
+    let mut retired = false;
+    for (id, seat, state) in seats {
+        let seat = canonical_uuid(&seat)?;
+        if manager_lineage_tip_on(tx, seat).ok() == Some(caller) {
+            if state != "active" {
+                retired = true;
+                continue;
+            }
+            let status: String = tx.query_row(
+                "SELECT status FROM sessions WHERE id=?1",
+                [caller.to_string()],
+                |r| r.get(0),
+            )?;
+            if status == "Archived" || status == "Deleted" || found.is_some() {
+                return Err(node_refused("manager_node_escalation_seat_unavailable"));
+            }
+            found = Some(canonical_uuid(&id)?);
+        }
+    }
+    let id = found.ok_or_else(|| {
+        node_refused(if retired {
+            "manager_node_escalation_revoked"
+        } else {
+            "manager_node_escalation_seat_unavailable"
+        })
+    })?;
+    escalation_path_on(tx, project, id)?
+        .pop()
+        .ok_or_else(|| node_refused("manager_node_escalation_scope_changed"))
+}
+
+fn deepest_escalation_owner_on(
+    tx: &Transaction<'_>,
+    project: Uuid,
+    epic: Uuid,
+) -> Result<Vec<AreaNode>> {
+    let (_, epics) = live_topology(tx, project)?;
+    let group = epics
+        .iter()
+        .find(|(id, _)| *id == epic)
+        .map(|(_, group)| *group)
+        .ok_or_else(|| node_refused("manager_node_escalation_epic_unavailable"))?;
+    let mut stmt = tx.prepare("SELECT n.id FROM manager_nodes n JOIN manager_node_scopes s ON s.node_id=n.id AND s.project_id=?1 WHERE n.state='active'")?;
+    let ids: Vec<String> = stmt
+        .query_map([project.to_string()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let mut best: Option<Vec<AreaNode>> = None;
+    for id in ids {
+        let path = match escalation_path_on(tx, project, canonical_uuid(&id)?) {
+            Ok(path) => path,
+            Err(DaemonError::InvalidParam(code)) if code == "manager_node_escalation_revoked" => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if path.iter().all(|node| {
+            node.selector
+                .as_ref()
+                .is_some_and(|s| s.covers_epic(epic, group))
+        }) {
+            if best.as_ref().is_some_and(|prior| prior.len() == path.len()) {
+                return Err(node_refused("manager_node_escalation_ambiguous_scope"));
+            }
+            if best.as_ref().is_none_or(|prior| path.len() > prior.len()) {
+                best = Some(path);
+            }
+        }
+    }
+    best.ok_or_else(|| node_refused("manager_node_escalation_epic_unavailable"))
+}
+
+fn escalation_target_on(
+    tx: &Transaction<'_>,
+    project: Uuid,
+    source: &AreaNode,
+    route: &ManagerNodeEscalationRouteV1,
+) -> Result<AreaNode> {
+    let id = match route {
+        ManagerNodeEscalationRouteV1::Parent => source
+            .parent_node_id
+            .ok_or_else(|| node_refused("manager_node_escalation_root"))?,
+        ManagerNodeEscalationRouteV1::EpicConflict {
+            left_epic_id,
+            right_epic_id,
+        } => {
+            let left = deepest_escalation_owner_on(tx, project, *left_epic_id)?;
+            let right = deepest_escalation_owner_on(tx, project, *right_epic_id)?;
+            if left.last().map(|node| node.id) != Some(source.id)
+                || right.last().map(|node| node.id) == Some(source.id)
+            {
+                return Err(node_refused("manager_node_escalation_conflict_scope"));
+            }
+            left.iter()
+                .zip(right.iter())
+                .take_while(|(a, b)| a.id == b.id)
+                .last()
+                .map(|(node, _)| node.id)
+                .ok_or_else(|| node_refused("manager_node_escalation_conflict_scope"))?
+        }
+    };
+    let path = escalation_path_on(tx, project, id)?;
+    let target = path
+        .last()
+        .ok_or_else(|| node_refused("manager_node_escalation_scope_changed"))?;
+    let tip = manager_lineage_tip_on(tx, target.seat_root_session_id)?;
+    let status: String = tx.query_row(
+        "SELECT status FROM sessions WHERE id=?1",
+        [tip.to_string()],
+        |r| r.get(0),
+    )?;
+    if status == "Archived" || status == "Deleted" {
+        return Err(node_refused("manager_node_escalation_seat_unavailable"));
+    }
+    Ok(target.clone())
+}
+
+fn escalation_on(tx: &Transaction<'_>, id: Uuid) -> Result<Option<ManagerNodeEscalationV1>> {
+    let row: Option<(String,String,String,String,String,i64,i64,i64,i64,String,i64,String,Option<String>,String,String)> = tx.query_row(
+        "SELECT project_id,subject_id,source_node_id,target_node_id,reason,source_authority_epoch,source_grant_version,target_authority_epoch,target_grant_version,target_session_id,version,state,ruling,created_at,updated_at FROM manager_node_escalations WHERE id=?1",
+        [id.to_string()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?))
+    ).optional()?;
+    row.map(
+        |(
+            project,
+            subject,
+            source,
+            target,
+            reason,
+            source_epoch,
+            source_grant,
+            target_epoch,
+            target_grant,
+            target_session,
+            version,
+            state,
+            ruling,
+            created,
+            updated,
+        )| {
+            Ok(ManagerNodeEscalationV1 {
+                id,
+                project_id: canonical_uuid(&project)?,
+                subject_id: canonical_uuid(&subject)?,
+                source_node_id: canonical_uuid(&source)?,
+                target_node_id: canonical_uuid(&target)?,
+                reason,
+                source_authority_epoch: source_epoch,
+                source_grant_version: source_grant,
+                target_authority_epoch: target_epoch,
+                target_grant_version: target_grant,
+                target_session_id: canonical_uuid(&target_session)?,
+                version,
+                state: match state.as_str() {
+                    "open" => ManagerNodeEscalationStateV1::Open,
+                    "ruled" => ManagerNodeEscalationStateV1::Ruled,
+                    _ => return Err(DaemonError::Store("invalid escalation state".into())),
+                },
+                ruling,
+                created_at: DateTime::parse_from_rfc3339(&created)
+                    .map_err(|_| DaemonError::Store("invalid escalation timestamp".into()))?
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&updated)
+                    .map_err(|_| DaemonError::Store("invalid escalation timestamp".into()))?
+                    .with_timezone(&Utc),
+            })
+        },
+    )
+    .transpose()
+}
+
+impl Store {
+    pub(crate) fn create_manager_node_escalation(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerEscalateRequestV1,
+    ) -> Result<ManagerNodeEscalationV1> {
+        request.validate().map_err(node_refused)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let source = escalation_caller_on(&tx, request.project_id, caller)?;
+        let replay_key = (&source.id, request);
+        if let Some(previous) = replay_operation(
+            &tx,
+            request.project_id,
+            Some(&request.idempotency_key),
+            &replay_key,
+        )? {
+            tx.commit()?;
+            return Ok(previous);
+        }
+        if source.authority_epoch != request.expected_source_authority_epoch
+            || source.grant_version != request.expected_source_grant_version
+        {
+            return Err(node_refused("manager_node_escalation_stale_source"));
+        }
+        let target = escalation_target_on(&tx, request.project_id, &source, &request.route)?;
+        let target_session = manager_lineage_tip_on(&tx, target.seat_root_session_id)?;
+        if target.authority_epoch != request.expected_target_authority_epoch
+            || target.grant_version != request.expected_target_grant_version
+            || target_session != request.expected_target_session_id
+        {
+            return Err(node_refused("manager_node_escalation_stale_target"));
+        }
+        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM manager_node_escalations WHERE project_id=?1 AND subject_id=?2 AND state='open')",
+            params![request.project_id.to_string(),request.subject_id.to_string()], |r| r.get(0))?;
+        if occupied {
+            return Err(node_refused("manager_node_escalation_subject_open"));
+        }
+        let id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        tx.execute("INSERT INTO manager_node_escalations(id,project_id,subject_id,source_node_id,target_node_id,reason,source_authority_epoch,source_grant_version,target_authority_epoch,target_grant_version,target_session_id,idempotency_key,version,state,ruling,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,'open',NULL,?13,?13)",
+            params![id.to_string(),request.project_id.to_string(),request.subject_id.to_string(),source.id.to_string(),target.id.to_string(),request.reason,source.authority_epoch,source.grant_version,target.authority_epoch,target.grant_version,target_session.to_string(),request.idempotency_key,now])?;
+        tx.execute("INSERT INTO manager_node_escalation_events(escalation_id,version,actor_node_id,target_node_id,action,ruling,created_at) VALUES(?1,1,?2,?3,'created',NULL,?4)",
+            params![id.to_string(),source.id.to_string(),target.id.to_string(),now])?;
+        let result = escalation_on(&tx, id)?
+            .ok_or_else(|| DaemonError::Store("escalation insert missing".into()))?;
+        record_operation(
+            &tx,
+            request.project_id,
+            Some(&request.idempotency_key),
+            &replay_key,
+            &result,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn list_manager_node_escalations(
+        &self,
+        caller: Uuid,
+        project: Uuid,
+    ) -> Result<Vec<ManagerNodeEscalationV1>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let node = escalation_caller_on(&tx, project, caller)?;
+        let mut stmt = tx.prepare("SELECT id FROM manager_node_escalations WHERE project_id=?1 AND (target_node_id=?2 OR source_node_id=?2) ORDER BY created_at,id")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![project.to_string(), node.id.to_string()], |r| {
+                r.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut result = Vec::with_capacity(ids.len());
+        for id in ids {
+            result.push(
+                escalation_on(&tx, canonical_uuid(&id)?)?
+                    .ok_or_else(|| DaemonError::Store("escalation read missing".into()))?,
+            );
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn resolve_manager_node_escalation(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerResolveEscalationRequestV1,
+    ) -> Result<ManagerNodeEscalationV1> {
+        request.validate().map_err(node_refused)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = escalation_on(&tx, request.escalation_id)?
+            .ok_or_else(|| node_refused("manager_node_escalation_absent"))?;
+        let actor = escalation_caller_on(&tx, current.project_id, caller)?;
+        let replay_key = (&actor.id, request);
+        if let Some(previous) = replay_operation(
+            &tx,
+            current.project_id,
+            Some(&request.idempotency_key),
+            &replay_key,
+        )? {
+            tx.commit()?;
+            return Ok(previous);
+        }
+        let source = escalation_path_on(&tx, current.project_id, current.source_node_id)?
+            .pop()
+            .ok_or_else(|| node_refused("manager_node_escalation_scope_changed"))?;
+        if source.authority_epoch != current.source_authority_epoch
+            || source.grant_version != current.source_grant_version
+        {
+            return Err(node_refused("manager_node_escalation_stale_source"));
+        }
+        if current.state != ManagerNodeEscalationStateV1::Open || current.target_node_id != actor.id
+        {
+            return Err(node_refused("manager_node_escalation_not_addressed"));
+        }
+        if current.version != request.expected_version
+            || actor.authority_epoch != request.expected_target_authority_epoch
+            || actor.grant_version != request.expected_target_grant_version
+            || current.target_authority_epoch != actor.authority_epoch
+            || current.target_grant_version != actor.grant_version
+            || manager_lineage_tip_on(&tx, actor.seat_root_session_id)?
+                != request.expected_target_session_id
+        {
+            return Err(node_refused("manager_node_escalation_stale_target"));
+        }
+        let next = current
+            .version
+            .checked_add(1)
+            .ok_or_else(|| node_refused("manager_node_version_exhausted"))?;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let (target, state, action) = if request.ruling.is_some() {
+            (actor.clone(), "ruled", "ruled")
+        } else {
+            let parent = escalation_target_on(
+                &tx,
+                current.project_id,
+                &actor,
+                &ManagerNodeEscalationRouteV1::Parent,
+            )?;
+            (parent, "open", "forwarded")
+        };
+        let target_session = manager_lineage_tip_on(&tx, target.seat_root_session_id)?;
+        tx.execute("UPDATE manager_node_escalations SET target_node_id=?2,target_authority_epoch=?3,target_grant_version=?4,target_session_id=?5,version=?6,state=?7,ruling=?8,updated_at=?9 WHERE id=?1 AND version=?10 AND state='open'",
+            params![current.id.to_string(),target.id.to_string(),target.authority_epoch,target.grant_version,target_session.to_string(),next,state,request.ruling,now,current.version])?;
+        tx.execute("INSERT INTO manager_node_escalation_events(escalation_id,version,actor_node_id,target_node_id,action,ruling,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![current.id.to_string(),next,actor.id.to_string(),target.id.to_string(),action,request.ruling,now])?;
+        let result = escalation_on(&tx, current.id)?
+            .ok_or_else(|| DaemonError::Store("escalation update missing".into()))?;
+        record_operation(
+            &tx,
+            current.project_id,
+            Some(&request.idempotency_key),
+            &replay_key,
+            &result,
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod lead_notice_tests;
 
@@ -3119,6 +4428,689 @@ mod tests {
             idempotency_key: key.into(),
             informational: false,
         }
+    }
+
+    fn area_mail_seat(f: &Fixture, epic: Uuid) -> (Uuid, Uuid) {
+        let mut seat = f.store.get_session(f.manager).unwrap().unwrap();
+        seat.id = Uuid::new_v4();
+        f.store.insert_session(&seat).unwrap();
+        let root: String = f
+            .store
+            .conn
+            .query_row(
+                "SELECT id FROM manager_nodes WHERE legacy_project_id=?1",
+                [f.project.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let node = Uuid::new_v4();
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO manager_nodes(id,parent_node_id,seat_root_session_id,state,
+             grant_version,policy_version,authority_epoch,created_at,updated_at)
+             VALUES(?1,?2,?3,'active',1,1,1,?4,?4)",
+                params![node.to_string(), root, seat.id.to_string(), stamp()],
+            )
+            .unwrap();
+        let selector = ManagerNodeSelectorV1::Selected {
+            group_ids: Vec::new(),
+            epic_ids: vec![epic],
+        };
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO manager_node_scopes(node_id,project_id,selector_json,grant_version)
+             VALUES(?1,?2,?3,1)",
+                params![
+                    node.to_string(),
+                    f.project.to_string(),
+                    serde_json::to_string(&selector).unwrap()
+                ],
+            )
+            .unwrap();
+        let policy = rsi_common::harness_manager_v2::ManagerPolicyV2 {
+            mode: rsi_common::harness_manager_v2::ManagerOperatingModeV2::Execute,
+            capabilities: vec![
+                rsi_common::harness_manager_v2::ManagerCapabilityV2::SessionControl,
+                rsi_common::harness_manager_v2::ManagerCapabilityV2::WorkPlan,
+            ],
+            ..Default::default()
+        };
+        let grant = rsi_common::manager_nodes::ManagerNodeGrantV1 {
+            capabilities: policy.capabilities.clone(),
+            allowed_launches: policy.allowed_launches.clone(),
+            allowance: rsi_common::manager_nodes::ManagerNodeAllowanceV1 {
+                max_created_containers: policy.max_created_containers,
+                max_created_sessions: policy.max_created_sessions,
+                max_active_sessions: policy.max_active_sessions,
+                max_build_slots: 0,
+                max_disk_gib: 0,
+                provider_limits: policy.provider_limits.clone(),
+                max_spend_usd: policy.max_spend_usd,
+            },
+            max_direct_reports: 5,
+        };
+        f.store.conn.execute(
+            "INSERT INTO manager_node_grants(node_id,grant_version,state,grant_json,policy_json,
+             operator_origin,created_at) VALUES(?1,1,'granted',?2,?3,'test',?4)",
+            params![node.to_string(),serde_json::to_string(&grant).unwrap(),
+                serde_json::to_string(&policy).unwrap(),stamp()],
+        ).unwrap();
+        (node, seat.id)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_node_progress_and_inspect_use_current_grant() {
+        use rsi_common::harness_manager_v2::{
+            AgentManagerInspectRequestV2, ConfigureHarnessManagerPolicyRequestV2,
+            ManagerInspectSectionV2, ManagerPolicyV2,
+        };
+
+        let f = fixture(Store::open_in_memory().unwrap());
+        f.store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: f.project,
+                expected_scope_version: f.config.row_version,
+                expected_policy_version: 0,
+                idempotency_key: "area-read-root-grant".into(),
+                policy: ManagerPolicyV2::default(),
+            })
+            .unwrap();
+        let (node, seat) = area_mail_seat(&f, f.epics[0]);
+        let progress = f
+            .store
+            .manager_progress_page(seat, &Default::default())
+            .unwrap();
+        assert_eq!(progress.config.manager_session_id, seat);
+        assert_eq!(progress.rows.len(), 1);
+        assert_eq!(progress.rows[0].epic_id, f.epics[0]);
+        let root_progress = f
+            .store
+            .manager_progress_page(f.manager, &Default::default())
+            .unwrap();
+        assert_eq!(root_progress.rows.len(), 1);
+        assert_eq!(root_progress.rows[0].epic_id, f.epics[1]);
+        let query = AgentManagerInspectRequestV2 {
+            section: ManagerInspectSectionV2::Work,
+            epic_id: Some(f.epics[0]),
+            ..Default::default()
+        };
+        let inspection = f.store.manager_v2_inspect(seat, &query).unwrap();
+        assert_eq!(inspection.policy.unwrap().manager_session_id, node);
+        assert!(f.store.manager_v2_inspect(f.manager, &query).is_err());
+        assert!(
+            f.store
+                .manager_v2_inspect(
+                    seat,
+                    &AgentManagerInspectRequestV2 {
+                        epic_id: None,
+                        ..query.clone()
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("manager_v2_epic_filter_required")
+        );
+        assert!(
+            f.store
+                .manager_v2_inspect(
+                    seat,
+                    &AgentManagerInspectRequestV2 {
+                        epic_id: Some(f.epics[1]),
+                        ..query
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("manager_v2_epic_out_of_scope")
+        );
+        f.store.conn.execute(
+            "UPDATE manager_nodes SET state='revoked',authority_epoch=authority_epoch+1 WHERE id=?1",
+            [node.to_string()],
+        ).unwrap();
+        assert!(
+            f.store
+                .manager_progress_page(seat, &Default::default())
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn queued_manager_agent_mail_loses_claim_after_node_revoke() {
+        use rsi_common::agent_coordination::AgentSendMessageRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerOperatingModeV2,
+            ManagerPolicyV2,
+        };
+        let f = fixture(Store::open_in_memory().unwrap());
+        f.store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: f.project,
+                expected_scope_version: f.config.row_version,
+                expected_policy_version: 0,
+                idempotency_key: "generic-mail-root-grant".into(),
+                policy: ManagerPolicyV2 {
+                    mode: ManagerOperatingModeV2::Execute,
+                    capabilities: vec![ManagerCapabilityV2::SessionControl],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let (node, seat) = area_mail_seat(&f, f.epics[0]);
+        let target = f.leads[0];
+        f.store
+            .update_session_status(target, SessionStatus::Running)
+            .unwrap();
+        let receipt = f
+            .store
+            .accept_authorized_agent_message(
+                seat,
+                None,
+                Some(f.epics[0]),
+                &AgentSendMessageRequestV1 {
+                    target_session_id: target,
+                    message: "Area status request".into(),
+                    idempotency_key: "area-agent-mail".into(),
+                    expires_at: None,
+                },
+            )
+            .unwrap()
+            .receipt()
+            .clone();
+        let tx = Transaction::new_unchecked(&f.store.conn, TransactionBehavior::Deferred).unwrap();
+        assert!(
+            f.store
+                .manager_mail_claim_current(&tx, receipt.message_id, seat, target)
+                .unwrap()
+        );
+        tx.commit().unwrap();
+        f.store.conn.execute(
+            "UPDATE manager_nodes SET state='revoked',authority_epoch=authority_epoch+1 WHERE id=?1",
+            [node.to_string()],
+        ).unwrap();
+        let tx = Transaction::new_unchecked(&f.store.conn, TransactionBehavior::Deferred).unwrap();
+        assert!(
+            !f.store
+                .manager_mail_claim_current(&tx, receipt.message_id, seat, target)
+                .unwrap()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn area_request_ledger_routes_by_immutable_node_address() {
+        use crate::store::manager_ledger::LedgerObservation;
+        use rsi_common::harness_manager_v2::{
+            AgentManagerUpdateRequestV2, ConfigureHarnessManagerPolicyRequestV2,
+            ManagerCapabilityV2, ManagerFenceV2, ManagerOperatingModeV2, ManagerPolicyV2,
+            ManagerRequestStateV2, ManagerUpdateV2,
+        };
+        let f = fixture(Store::open_in_memory().unwrap());
+        f.store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: f.project,
+                expected_scope_version: f.config.row_version,
+                expected_policy_version: 0,
+                idempotency_key: "area-request-root-grant".into(),
+                policy: ManagerPolicyV2 {
+                    mode: ManagerOperatingModeV2::Execute,
+                    capabilities: vec![
+                        ManagerCapabilityV2::SessionControl,
+                        ManagerCapabilityV2::WorkPlan,
+                    ],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let (_node, seat) = area_mail_seat(&f, f.epics[0]);
+        let sent = f
+            .store
+            .manager_send(seat, &request(f.epics[0], "area-ledger-route"))
+            .unwrap();
+        let authority = f
+            .store
+            .manager_v2_authorize(
+                seat,
+                &ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version: 1,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            f.store
+                .manager_v2_request_target(&authority, sent.message_id)
+                .unwrap(),
+            f.epics[0]
+        );
+        let rows = f
+            .store
+            .manager_v2_request_rows(&authority.config, Some(f.epics[0]), "", 32, false)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["request_id"], serde_json::json!(sent.message_id));
+        let lead = f.leads[0];
+        let inbox = f.store.manager_inbox(lead, &Default::default()).unwrap();
+        assert!(
+            inbox
+                .messages
+                .iter()
+                .any(|row| row.message_id == sent.message_id)
+        );
+        let lead_authority = f
+            .store
+            .manager_v2_authorize(
+                lead,
+                &ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version: 1,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(lead_authority.config.manager_session_id, seat);
+        f.store
+            .manager_v2_commit_update(
+                lead,
+                &AgentManagerUpdateRequestV2 {
+                    fence: ManagerFenceV2 {
+                        scope_version: 1,
+                        policy_version: 1,
+                    },
+                    idempotency_key: "area-lead-accepted".into(),
+                    change: ManagerUpdateV2::Request {
+                        request_id: sent.message_id,
+                        expected_row_version: 0,
+                        state: ManagerRequestStateV2::Accepted,
+                        message: "Accepted by area lead".into(),
+                        work_key: None,
+                    },
+                },
+                &LedgerObservation::default(),
+            )
+            .unwrap();
+        let rows = f
+            .store
+            .manager_v2_request_rows(&authority.config, Some(f.epics[0]), "", 32, false)
+            .unwrap();
+        assert_eq!(rows[0]["state"], "accepted");
+        let root = f.store.get_harness_manager(f.project).unwrap().unwrap();
+        assert!(
+            f.store
+                .manager_v2_request_rows(&root, Some(f.epics[0]), "", 32, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn node_mail_routes_to_deepest_seat_and_reply_survives_succession() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let (node, seat) = area_mail_seat(&f, f.epics[0]);
+        assert!(
+            f.store
+                .manager_send(f.manager, &request(f.epics[0], "root-delegated"))
+                .is_err()
+        );
+        let sent = f
+            .store
+            .manager_send(seat, &request(f.epics[0], "node-request"))
+            .unwrap();
+        let address = f
+            .store
+            .manager_mail_address(&f.config, sent.message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                address.node_id,
+                address.grant_version,
+                address.addressed_seat_session_id
+            ),
+            (node, 1, seat)
+        );
+        let watch: String = f
+            .store
+            .conn
+            .query_row(
+                "SELECT job_id FROM harness_manager_watches WHERE project_id=?1 AND epic_id=?2
+             AND direction='to_lead' AND source_session_id=?3",
+                params![
+                    f.project.to_string(),
+                    f.epics[0].to_string(),
+                    seat.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let watch = uuid(watch).unwrap();
+        assert_eq!(
+            f.store.harness_manager_watch_route(watch).unwrap(),
+            Some((seat, f.leads[0]))
+        );
+        assert_eq!(
+            f.store
+                .manager_inbox(f.leads[0], &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages[0]
+                .message_id,
+            sent.message_id
+        );
+        assert!(
+            !f.store
+                .harness_manager_wake_authorized(watch, f.leads[0])
+                .unwrap()
+        );
+        assert_eq!(
+            f.store
+                .manager_inbox(seat, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages[0]
+                .message_id,
+            sent.message_id
+        );
+        assert!(
+            f.store
+                .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+
+        let mut next = f.store.get_session(seat).unwrap().unwrap();
+        next.id = Uuid::new_v4();
+        next.continued_from = Some(seat);
+        next.rotation_depth += 1;
+        f.store.insert_session(&next).unwrap();
+        f.store
+            .update_session_status(seat, SessionStatus::Archived)
+            .unwrap();
+        f.store
+            .record_harness_manager_rotation(seat, next.id)
+            .unwrap();
+        assert_eq!(
+            f.store.harness_manager_watch_route(watch).unwrap(),
+            Some((next.id, f.leads[0]))
+        );
+        let reply = f
+            .store
+            .manager_reply(
+                f.leads[0],
+                &AgentManagerReplyRequestV1 {
+                    request_id: sent.message_id,
+                    message: "Verified ready".into(),
+                    idempotency_key: "node-reply".into(),
+                    still_running: false,
+                },
+            )
+            .unwrap();
+        let stored = f
+            .store
+            .get_manager_message(reply.message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.public.recipient_session_id, next.id);
+        assert_eq!(
+            f.store
+                .manager_mail_address(&f.config, reply.message_id)
+                .unwrap()
+                .unwrap()
+                .node_id,
+            node
+        );
+        assert!(
+            f.store
+                .manager_inbox(next.id, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.message_id == reply.message_id)
+        );
+        assert!(
+            f.store
+                .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn node_mail_scope_change_retires_exact_mail_without_rerouting() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let (node, seat) = area_mail_seat(&f, f.epics[0]);
+        let sent = f
+            .store
+            .manager_send(seat, &request(f.epics[0], "before-scope-change"))
+            .unwrap();
+        let notice = f
+            .store
+            .manager_lead_notice(f.leads[0], "Needs decision", "node-notice")
+            .unwrap();
+        assert_eq!(
+            f.store
+                .pending_manager_node_notices(&f.config, f.epics[0], node)
+                .unwrap(),
+            1
+        );
+        assert!(
+            f.store
+                .manager_inbox(seat, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.message_id == notice.message_id)
+        );
+        assert_eq!(
+            f.store
+                .pending_manager_node_notices(&f.config, f.epics[0], node)
+                .unwrap(),
+            0
+        );
+        let watch: String = f
+            .store
+            .conn
+            .query_row(
+                "SELECT job_id FROM harness_manager_watches WHERE project_id=?1 AND epic_id=?2
+             AND direction='to_manager' AND target_session_id=?3",
+                params![
+                    f.project.to_string(),
+                    f.epics[0].to_string(),
+                    seat.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let watch = uuid(watch).unwrap();
+        assert!(
+            !f.store
+                .harness_manager_wake_authorized(watch, seat)
+                .unwrap()
+        );
+        assert_eq!(
+            f.store.harness_manager_watch_route(watch).unwrap(),
+            Some((f.leads[0], seat))
+        );
+        let selector = ManagerNodeSelectorV1::Selected {
+            group_ids: Vec::new(),
+            epic_ids: vec![f.epics[1]],
+        };
+        f.store
+            .conn
+            .execute(
+                "UPDATE manager_node_scopes SET selector_json=?2 WHERE node_id=?1",
+                params![node.to_string(), serde_json::to_string(&selector).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            f.store
+                .harness_manager_watch_route(watch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.store
+                .manager_inbox(seat, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(
+            f.store
+                .manager_reply(
+                    f.leads[0],
+                    &AgentManagerReplyRequestV1 {
+                        request_id: sent.message_id,
+                        message: "late".into(),
+                        idempotency_key: "late-node-reply".into(),
+                        still_running: false,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            f.store
+                .manager_send(seat, &request(f.epics[0], "stale-node-send"))
+                .is_err()
+        );
+        let root = f
+            .store
+            .manager_send(f.manager, &request(f.epics[0], "root-after-scope-change"))
+            .unwrap();
+        assert_eq!(
+            f.store
+                .manager_request_settlement(&f.config, sent.message_id)
+                .unwrap()
+                .as_deref(),
+            Some("node_scope_changed")
+        );
+        assert_eq!(
+            f.store
+                .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages[0]
+                .message_id,
+            root.message_id
+        );
+        f.store
+            .conn
+            .execute(
+                "UPDATE manager_nodes SET state='revoked' WHERE id=?1",
+                [node.to_string()],
+            )
+            .unwrap();
+        assert!(
+            f.store
+                .manager_inbox(seat, &AgentManagerInboxRequestV1::default())
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn node_mail_grant_revision_retires_old_request_and_readdresses_new_one() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let (node, seat) = area_mail_seat(&f, f.epics[0]);
+        let old = f
+            .store
+            .manager_send(seat, &request(f.epics[0], "old-grant"))
+            .unwrap();
+        f.store.conn.execute(
+            "INSERT INTO manager_node_grants(node_id,grant_version,state,grant_json,policy_json,
+             operator_origin,created_at) VALUES(?1,2,'granted','{}','{}','test',?2)",
+            params![node.to_string(),stamp()],
+        ).unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE manager_nodes SET grant_version=2 WHERE id=?1",
+                [node.to_string()],
+            )
+            .unwrap();
+        f.store.manager_progress(f.manager).unwrap();
+        assert_eq!(
+            f.store
+                .manager_request_settlement(&f.config, old.message_id)
+                .unwrap()
+                .as_deref(),
+            Some("node_scope_changed")
+        );
+        assert!(
+            f.store
+                .manager_reply(
+                    f.leads[0],
+                    &AgentManagerReplyRequestV1 {
+                        request_id: old.message_id,
+                        message: "stale".into(),
+                        idempotency_key: "old-grant-reply".into(),
+                        still_running: false,
+                    }
+                )
+                .is_err()
+        );
+        let new = f
+            .store
+            .manager_send(seat, &request(f.epics[0], "new-grant"))
+            .unwrap();
+        assert_eq!(
+            f.store
+                .manager_mail_address(&f.config, new.message_id)
+                .unwrap()
+                .unwrap()
+                .grant_version,
+            2
+        );
+        assert_eq!(
+            f.store
+                .manager_inbox(f.leads[0], &AgentManagerInboxRequestV1::default())
+                .unwrap()
+                .messages
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![new.message_id]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn node_mail_escalates_only_bounded_capacity_digest_to_root() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let (node, _) = area_mail_seat(&f, f.epics[0]);
+        for pending in [95, 96, 96, 128, 128] {
+            f.store
+                .escalate_manager_node_mail_capacity(&f.config, f.epics[0], node, pending)
+                .unwrap();
+        }
+        let inbox = f
+            .store
+            .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
+            .unwrap();
+        let digests = inbox
+            .notices
+            .iter()
+            .filter(|notice| notice.state["record_kind"] == "node_mail_capacity")
+            .collect::<Vec<_>>();
+        assert_eq!(digests.len(), 2);
+        assert!(
+            digests
+                .iter()
+                .all(|notice| notice.state["record_kind"] == "node_mail_capacity"
+                    && notice.state["node_id"] == node.to_string())
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -5089,6 +7081,87 @@ mod tests {
         assert!(
             f.store
                 .manager_session_scope(f.manager, f.leads[0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn manager_session_scope_reaches_sessions_under_project_and_group_scopes() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let mut worker = f.store.get_session(f.leads[0]).unwrap().unwrap();
+        worker.id = Uuid::new_v4();
+        worker.parent_id = Some(f.epics[0]);
+        f.store.insert_session(&worker).unwrap();
+        let other_group = add_group(&f, "Other features");
+        let (other_epic, other_lead) = add_epic(&f, other_group.id, "Other feature");
+
+        // A whole-project scope stores no explicit Epic IDs (#1031).
+        let project = f
+            .store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: f.project,
+                session_id: f.manager,
+                epic_ids: None,
+                group_ids: Vec::new(),
+                expected_row_version: f.config.row_version,
+            })
+            .unwrap();
+        assert_eq!(project.scope_mode, HarnessManagerScopeModeV1::Project);
+        assert_eq!(project.explicit_epic_ids(), &[] as &[Uuid]);
+        for (target, epic) in [
+            (f.leads[0], f.epics[0]),
+            (f.leads[1], f.epics[1]),
+            (worker.id, f.epics[0]),
+            (other_lead, other_epic),
+        ] {
+            let scope = f
+                .store
+                .manager_session_scope(f.manager, target)
+                .unwrap()
+                .expect("a whole-project manager reaches every covered session");
+            assert_eq!(scope.epic_id, epic);
+            assert_eq!(scope.target.id, target);
+        }
+
+        // A Group scope reaches the Epics under its Groups only.
+        let pilot_group = f
+            .store
+            .get_session(f.epics[0])
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .unwrap();
+        let grouped = f
+            .store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: f.project,
+                session_id: f.manager,
+                epic_ids: None,
+                group_ids: vec![pilot_group],
+                expected_row_version: project.row_version,
+            })
+            .unwrap();
+        assert_eq!(grouped.scope_mode, HarnessManagerScopeModeV1::Selected);
+        assert_eq!(grouped.explicit_epic_ids(), &[] as &[Uuid]);
+        let scope = f
+            .store
+            .manager_session_scope(f.manager, worker.id)
+            .unwrap()
+            .expect("a Group-scoped manager reaches a session under its Group");
+        assert_eq!(scope.epic_id, f.epics[0]);
+        assert!(
+            f.store
+                .manager_session_scope(f.manager, other_lead)
+                .unwrap()
+                .is_none()
+        );
+
+        // Leads and workers still never inherit manager reach.
+        assert!(
+            f.store
+                .manager_session_scope(worker.id, f.leads[1])
                 .unwrap()
                 .is_none()
         );

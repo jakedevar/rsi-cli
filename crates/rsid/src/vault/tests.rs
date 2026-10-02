@@ -3,6 +3,26 @@
 //! leaked-secret checks, not hidden-identity checks.
 
 use super::check::ProbeOutcome;
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+#[test]
+fn live_credit_exhaustion_is_fingerprint_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+        .dir(dir.path().join("vault"))
+        .env(|_| None)
+        .open()
+        .unwrap();
+    let old = vault.set(Slot::Openai, "sk-old").unwrap();
+    assert!(vault.mark_exhausted(Slot::Openai, &old, 402));
+    let refusal = vault.admission(Slot::Openai).unwrap_err();
+    assert_eq!(refusal.check.class, CredentialCheckClass::Exhausted);
+    assert_eq!(refusal.check.detail_code, "live_credit_exhausted");
+    let new = vault.rotate(Slot::Openai, "sk-new").unwrap();
+    assert!(!vault.mark_exhausted(Slot::Openai, &old, 402));
+    assert!(vault.admission(Slot::Openai).is_ok());
+    assert!(vault.mark_exhausted(Slot::Openai, &new, 402));
+}
 use super::check::tests::{ScriptedProbe, http};
 use super::*;
 use chrono::Duration as ChronoDuration;
@@ -449,6 +469,42 @@ fn list_metadata_has_no_secret_field_and_round_trip_carries_no_secret_bytes() {
     assert_eq!(by_slot[&Slot::Openrouter].cli_exposure, CliExposure::Always);
     assert_eq!(by_slot[&Slot::Anthropic].route, CredentialRoute::Harness);
     assert_eq!(list.credentials.len(), Slot::ALL.len());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+#[test]
+fn health_summary_reports_missing_slots_without_secrets() {
+    let f = fixture(&[("OPEN_ROUTER", ENV_SECRET)]);
+    let mut summary = f.vault.health_summary();
+    let openrouter = summary
+        .credentials
+        .iter()
+        .find(|credential| credential.slot == Slot::Openrouter)
+        .expect("health includes every credential slot");
+    assert_eq!(openrouter.state, CredentialState::EnvCompat);
+    assert_eq!(
+        openrouter.env_var_names,
+        vec!["OPEN_ROUTER".to_string(), "OPENROUTER_API_KEY".to_string()]
+    );
+    assert!(summary.missing.contains(&Slot::Openai));
+    assert!(!summary.missing.contains(&Slot::Openrouter));
+
+    f.vault.clear(Slot::Openrouter).unwrap();
+    summary = f.vault.health_summary();
+    let openrouter = summary
+        .credentials
+        .iter()
+        .find(|credential| credential.slot == Slot::Openrouter)
+        .expect("health includes every credential slot");
+    assert_eq!(openrouter.state, CredentialState::Cleared);
+    assert!(summary.missing.contains(&Slot::Openrouter));
+
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(!json.contains(ENV_SECRET));
+    let parsed: rsi_common::rpc::ProviderCredentialHealthSummary =
+        serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, summary);
+    assert!(parsed.missing.contains(&Slot::Openai));
 }
 
 // ---------------------------------------------------------------------------

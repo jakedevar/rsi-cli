@@ -16,6 +16,14 @@ one to the guard. Use these for an explicit focused test gate when a crate's
 full suite has known baseline failures. The guard rejects a filter whose
 package is not affected by the candidate.
 
+Use `cargo run -p rsi-codegraph --bin rsi-test-impact -- --repo REPO --base BASE --head HEAD`
+to choose focused filters. The command prints `--test-filter` arguments, the
+equivalent Cargo commands, and JSON reasons. It uses a fresh rsi-codegraph
+snapshot when `--graph PATH --workspace-id UUID` is supplied; otherwise it
+uses module-path mapping. Build inputs, macros, shared test support, rsid
+store migrations, shared `rsi-common` source, unknown paths, stale graphs, and
+more than 128 changed files fall back conservatively to full package gates.
+
 The command requires `CARGO_TARGET_DIR` to name an existing target directory
 outside the system temporary directory. It preserves that caller-provided
 setting when affected-crate tests run, so candidate builds use the current

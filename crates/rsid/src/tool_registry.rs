@@ -150,7 +150,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_reserve_successor".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::ReserveSuccessor).to_string(),
             description: "Reserve one daemon-authored same-Epic successor and transfer the master baton only after provider establishment. Exact retries return the original successor; authority identities are server-bound.".to_string(),
             parameters: AgentControlVerbV1::ReserveSuccessor
                 .descriptor()
@@ -172,7 +172,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_spawn".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::SpawnChild).to_string(),
             description: "Spawn a child agent session under the Epic you lead. Validated \
                  through the same lead-identity, recursion-depth, and rate-limit checks as \
                  the spawn coordinator; the spawning session is bound server-side."
@@ -204,7 +204,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_progress".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::GetProgress).to_string(),
             description: "Read one bounded durable snapshot for the child cohort you are authorized to observe, including status counts, event cursors, freshness, watch state, and message counts."
                 .to_string(),
             parameters: AgentControlVerbV1::GetProgress.descriptor().parameters(),
@@ -227,7 +227,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_send_message".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::SendMessage).to_string(),
             description: "Queue durable mail for a child agent you own (your own \
                  reserved or direct child, or a child of an Epic you lead). A queued \
                  receipt proves acceptance, not provider delivery. Delivery requires a \
@@ -280,7 +280,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_status".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::GetStatus).to_string(),
             description: "Read the status of a session you are authorized to observe \
                  (yourself, a direct child, or a child of an Epic you lead). Omit \
                  session_id to target your own session."
@@ -299,11 +299,72 @@ fn register_rsi_control_tools(
         registry.register(spec, handler);
     }
 
+    // read_session_events (#1041)
+    {
+        let control = control.clone();
+        let spec = ToolSpec {
+            name: rsi_control::native_tool_name(AgentControlVerbV1::ReadSessionEvents).to_string(),
+            description: "Read a bounded page of a session's conversation events (tail, or \
+                 forward from after_sequence) plus its final assistant message and terminal \
+                 reason. Scope: your own child, a child of an Epic you lead, or a session in \
+                 your manager scope."
+                .to_string(),
+            parameters: AgentControlVerbV1::ReadSessionEvents
+                .descriptor()
+                .parameters(),
+        };
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                let request: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
+                    serde_json::from_value(args).map_err(|error| {
+                        crate::error::DaemonError::InvalidParam(format!(
+                            "invalid read_session_events arguments: {error}"
+                        ))
+                    })?;
+                let result = control.agent_read_session_events(caller, request).await?;
+                Ok(serde_json::to_value(result).map_err(crate::error::DaemonError::Json)?)
+            })
+        });
+        registry.register(spec, handler);
+    }
+
+    // query_failure_signatures (#1016)
+    {
+        let control = control.clone();
+        let spec = ToolSpec {
+            name: "rsi_control_query_failure_signatures".to_string(),
+            description: "Before debugging a red, ask whether it is already known: read the \
+                 known-failure signature records of open Issues in your project by exact \
+                 test_id and/or failure digest. Records of closed Issues are never returned."
+                .to_string(),
+            parameters: AgentControlVerbV1::QueryFailureSignatures
+                .descriptor()
+                .parameters(),
+        };
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                let request: rsi_common::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1 =
+                    serde_json::from_value(args).map_err(|error| {
+                        crate::error::DaemonError::InvalidParam(format!(
+                            "invalid query_failure_signatures arguments: {error}"
+                        ))
+                    })?;
+                let result = control
+                    .agent_query_failure_signatures(caller, request)
+                    .await?;
+                Ok(serde_json::to_value(result).map_err(crate::error::DaemonError::Json)?)
+            })
+        });
+        registry.register(spec, handler);
+    }
+
     // halt
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_halt".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::Halt).to_string(),
             description: "Interrupt a session you are authorized to control (yourself, a \
                  direct child, or a child of an Epic you lead). Omit session_id to halt \
                  your own session."
@@ -326,7 +387,7 @@ fn register_rsi_control_tools(
     {
         let control = control.clone();
         let spec = ToolSpec {
-            name: "rsi_control_create_issue".to_string(),
+            name: rsi_control::native_tool_name(AgentControlVerbV1::CreateIssue).to_string(),
             description: "Create one durable local issue follow-up. The creator is bound to this session; use a stable idempotency_key for safe retries.".to_string(),
             parameters: AgentControlVerbV1::CreateIssue.descriptor().parameters(),
         };
@@ -707,7 +768,24 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             rpc_only,
-            std::collections::BTreeSet::from(["AgentContinueChild", "AgentArchiveChild"]),
+            std::collections::BTreeSet::from([
+                "AgentContinueChild",
+                "AgentArchiveChild",
+                "AgentCancelWake",
+                "AgentListWakes",
+                "AgentManagerDelegateNode",
+                "AgentManagerEscalate",
+                "AgentManagerListEscalations",
+                "AgentManagerResolveEscalation",
+                "AgentEnqueueLandingSource",
+                "AgentGetProviderStatus",
+                "AgentSubmitJob",
+                "AgentGetJob",
+                "AgentListJobs",
+                "AgentSendSatelliteMessage",
+                "AgentGetDaemonInfo",
+                "AgentRequestDeploy",
+            ]),
             "the native CodexAppServer RPC-only verb set changed without review"
         );
         for descriptor in catalog {
@@ -729,6 +807,71 @@ mod tests {
                 native.name()
             );
         }
+    }
+
+    /// The native catalog tool reaches the same guarded service as the RPC
+    /// verb, bound to the registration caller rather than any input field.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn authority_catalog_native_tool_returns_the_bound_callers_manual() {
+        use crate::session::spawn_coordinator::SpawnCoordinator;
+
+        let caller = uuid::Uuid::new_v4();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .await
+            .insert_session(&crate::session::agent_verbs::tests::test_session(
+                caller,
+                std::path::PathBuf::from("/tmp/catalog-caller"),
+            ))
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let control = crate::session::agent_verbs::AgentControlHandle::new(
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            store,
+            Arc::new(crate::bus::EventBus::new(16)),
+            Arc::new(SpawnCoordinator::new(tx)),
+        );
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry, None, None, Some(control), Some(caller));
+
+        let value = registry
+            .execute(
+                "rsi_control_authority_catalog",
+                json!({"verb": "rsi_control_status"}),
+            )
+            .await
+            .unwrap();
+        let catalog: rsi_common::agent_authority_catalog::AgentAuthorityCatalogV1 =
+            serde_json::from_value(value).unwrap();
+        assert_eq!(catalog.session_id, caller);
+        assert_eq!(catalog.roles, ["worker"]);
+        // A `verb` request is the compact envelope plus one control detail.
+        assert!(catalog.controls.is_empty() && catalog.guidance.is_empty());
+        let detail = catalog.control.expect("requested control detail");
+        assert_eq!(detail.method, "AgentGetStatus");
+        assert!(detail.permitted);
+        assert_eq!(detail.example, json!({}));
+
+        let value = registry
+            .execute("rsi_control_authority_catalog", json!({}))
+            .await
+            .unwrap();
+        let catalog: rsi_common::agent_authority_catalog::AgentAuthorityCatalogV1 =
+            serde_json::from_value(value).unwrap();
+        assert!(catalog.guidance.contains("## RSI worker baseline"));
+        assert!(
+            catalog
+                .controls
+                .iter()
+                .any(|control| control.native_tool.as_deref()
+                    == Some("rsi_control_authority_catalog"))
+        );
+        assert!(catalog.control.is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -755,11 +898,12 @@ mod tests {
             Some(test_control_handle()),
             Some(uuid::Uuid::new_v4()),
         );
-        assert_eq!(registry.len(), 34);
+        assert_eq!(registry.len(), 37);
         for kind in ManagerControlToolKind::ALL {
             let reference = uuid::Uuid::new_v4();
             let mut args = match kind {
-                ManagerControlToolKind::Progress
+                ManagerControlToolKind::AuthorityCatalog
+                | ManagerControlToolKind::Progress
                 | ManagerControlToolKind::Inbox
                 | ManagerControlToolKind::Inspect
                 | ManagerControlToolKind::WorkView => json!({}),

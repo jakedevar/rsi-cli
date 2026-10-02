@@ -167,5 +167,59 @@ class PrePushTest(unittest.TestCase):
         self.assertEqual(self.remote_ref("refs/heads/rolling"), git(private, "rev-parse", "HEAD").stdout.strip())
 
 
+    def commit_shard_checker(self, bad: bool) -> str:
+        """Commit a stand-in shard checker that fails iff the exported tree holds
+        crates/rsid/BAD, so the check is proven to run on the pushed commit."""
+        script = self.repo / "scripts" / "check-rsid-test-shards.py"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "root = Path(__file__).resolve().parent.parent\n"
+            "if (root / 'crates/rsid/BAD').exists():\n"
+            "    print('strict inventory red'); sys.exit(1)\n"
+            "print('ok')\n"
+        )
+        crate = self.repo / "crates" / "rsid"
+        crate.mkdir(parents=True, exist_ok=True)
+        (crate / "Cargo.toml").write_text("[package]\n")
+        bad_marker = crate / "BAD"
+        if bad:
+            bad_marker.write_text("x\n")
+        elif bad_marker.exists():
+            bad_marker.unlink()
+        self.assert_git(self.repo, "add", "-A", "scripts", "crates")
+        self.assert_git(self.repo, "commit", "-q", "-m", "shard checker fixture")
+        return git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_rolling_push_of_a_strict_inventory_failure_is_refused(self) -> None:
+        self.commit_shard_checker(bad=True)
+        for kwargs in ({}, {"agent_marker": "RSI_SESSION_ID", "lander_marker": True}):
+            with self.subTest(kwargs=kwargs):
+                result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling", **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("strict rsid test shard inventory", result.stderr)
+                self.assertEqual(self.remote_ref("refs/heads/rolling"), "")
+
+    def test_rolling_push_checks_the_pushed_commit_not_the_working_tree(self) -> None:
+        good = self.commit_shard_checker(bad=False)
+        (self.repo / "crates" / "rsid" / "BAD").write_text("uncommitted\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
+
+    def test_strict_inventory_failure_does_not_block_other_refs(self) -> None:
+        bad = self.commit_shard_checker(bad=True)
+        result = git(
+            self.repo,
+            "push",
+            "publish",
+            "HEAD:refs/heads/feature",
+            agent_marker="RSI_SESSION_ID",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/feature"), bad)
+
+
 if __name__ == "__main__":
     unittest.main()

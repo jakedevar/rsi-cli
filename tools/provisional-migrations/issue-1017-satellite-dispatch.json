@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": 145,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v145.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:a85a7419937764eac48af6346862e7d5ae79275b567869e22df81ed2a9638f7c",
+      "sites": [
+        {
+          "anchor": "fn migrate_v145(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 145 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "satellite_dispatch::apply_migration(self, 145)?;",
+          "replacement": "satellite_dispatch::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/satellite_dispatch.rs",
+      "path_template": "crates/rsid/src/store/satellite_dispatch.rs",
+      "source_blob": "sha256:7c2d3702d5e2717ec31e9f66a692ec0a7cfbbc0d338060272cd5691c9c905373",
+      "sites": [
+        {
+          "anchor": "pub(crate) const SATELLITE_DISPATCH_SCHEMA_VERSION: i32 = 145;",
+          "replacement": "pub(crate) const SATELLITE_DISPATCH_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:28a42a8bf485308d40bf48a4bd220bb795f0dc1d569db38a5ebfdf2acb24129b",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 145;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

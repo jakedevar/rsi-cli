@@ -13,7 +13,7 @@ You are tasked with interacting with the rsi SQLite database safely and efficien
 | --- | --- | --- |
 | SQLite database | `~/.rsi/rsi.db` | Override with `$RSI_DB` (`${RSI_DB:-$HOME/.rsi/rsi.db}`) |
 | Unix socket | `~/.rsi/daemon.sock` | JSON-RPC endpoint; daemon must be running for RPC |
-| Schema truth (code) | `crates/rsid/src/store/mod.rs` | `init_schema()` migrations + `LATEST_SCHEMA_VERSION` |
+| Schema truth (code) | `crates/rsid/src/store/migrations/vNNN.rs` (runner: `store/mod.rs`) | one file per version, head = highest file (`LATEST_SCHEMA_VERSION`) |
 
 ## Discover the schema (do this FIRST — never guess columns)
 

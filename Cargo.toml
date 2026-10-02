@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/rsid",
+    "crates/rsid-core",
     "crates/rsi",
     "crates/rsi-common",
     "crates/rsi-signal",
@@ -10,6 +11,7 @@ members = [
     "crates/rsi-diag",
     "crates/rsi-baseline",
     "crates/rsi-codegraph",
+    "crates/rsi-remote",
     "crates/flywheel-imessage",
     "crates/flywheel-signal",
 ]
@@ -49,7 +51,7 @@ serde_path_to_error = "0.1"
 
 # Process utilities
 which = "7"
-nix = { version = "0.29", features = ["dir", "fs", "process", "signal"] }
+nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] }
 rustix = { version = "1.1", features = ["process"] }
 portable-pty = "0.8"
 vt100 = "0.15"
@@ -82,6 +84,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 fuzzy-matcher = "0.3"
 ignore = "0.4"
+unicode-normalization = "0.1"
 rand = "0.8"
 regex = "1"
 
@@ -110,7 +113,8 @@ minijinja = { version = "2", features = ["builtins"] }
 
 # Clipboard
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 # Test-only env-var scoping (RSI-020)
 temp-env = "0.3"

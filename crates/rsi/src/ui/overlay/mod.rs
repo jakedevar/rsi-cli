@@ -21,6 +21,7 @@ pub(crate) mod keybindings_help;
 mod label_form;
 mod label_picker;
 mod manager_v2;
+mod mcp_server_form;
 mod memory_search;
 mod message_bridge_form;
 mod notification_browser;
@@ -35,13 +36,14 @@ mod question_modal;
 mod rating;
 pub(crate) mod recursive_dag;
 mod rename_session;
+mod satellite_registry;
 mod schedule_browser;
 mod schedule_form;
 mod session_info;
 mod sort_picker;
 mod suggestion_dropdown;
 mod telescope;
-mod terminal;
+pub(crate) mod terminal;
 mod text_area_bg_editor;
 mod theme_picker;
 mod theme_role_editor;
@@ -55,7 +57,40 @@ use crate::app::App;
 use crate::types::{ModalGeometry, OverlayState, PromptPurpose};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+thread_local! {
+    /// Geometry for the centered popup currently being painted. The scoped
+    /// guard restores it even if rendering unwinds, so nested overlays and
+    /// parallel render tests cannot leak one popup's offsets into another.
+    static PAINT_GEOMETRY: RefCell<Option<ModalGeometry>> = const { RefCell::new(None) };
+}
+
+struct PaintGeometryGuard(Option<ModalGeometry>);
+
+impl Drop for PaintGeometryGuard {
+    fn drop(&mut self) {
+        PAINT_GEOMETRY.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+fn with_paint_geometry<R>(geometry: Option<ModalGeometry>, paint: impl FnOnce() -> R) -> R {
+    let previous = PAINT_GEOMETRY.with(|slot| slot.replace(geometry));
+    let _guard = PaintGeometryGuard(previous);
+    paint()
+}
+
+/// Apply the active popup's saved offsets to its base rectangle.
+pub(super) fn scoped_popup_rect(base: Rect, viewport: Rect) -> Rect {
+    PAINT_GEOMETRY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(base, |geom| apply_geometry_deltas(base, geom, viewport))
+    })
+}
 
 /// Compute a centered rectangle for the popup.
 /// Uses 80% width and 70% height, clamped to [40..120] x [10..30].
@@ -74,7 +109,7 @@ pub(crate) fn fixed_centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let h = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect::new(x, y, w, h)
+    scoped_popup_rect(Rect::new(x, y, w, h), area)
 }
 
 /// Compute a centered rectangle aligned to the top third of the screen.
@@ -85,7 +120,7 @@ pub(crate) fn centered_top_third_rect(area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     // Position at top third: y = ~1/3 of available height, clamped to at least 1 row from top
     let y = area.y + (area.height / 3).saturating_sub(popup_height / 2).max(1);
-    Rect::new(x, y, popup_width, popup_height)
+    scoped_popup_rect(Rect::new(x, y, popup_width, popup_height), area)
 }
 
 /// Compute a rectangle with a given width and 75% of screen height,
@@ -97,7 +132,7 @@ pub(crate) fn tall_centered_rect(area: Rect, width: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     // Pin top to row 1 — status bar occupies row 0 of the full frame area.
     let y = area.y + 1;
-    Rect::new(x, y, w, h)
+    scoped_popup_rect(Rect::new(x, y, w, h), area)
 }
 
 /// Count the number of visual (wrapped) lines a textarea would produce at a given content width.
@@ -415,11 +450,14 @@ fn render_stacked_first_overlay(
             purpose,
             available_commands,
             model_override,
+            provider_override,
             model_dropdown,
             sandbox_enabled,
+            launch,
             ..
         } => {
             let max_h = (area.height * 50 / 100).max(9); // 6 chrome + 3 min textarea
+            let min_rows = prompt::body_min_rows(purpose, launch);
             let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
             let geom = app
                 .modal_geometries
@@ -432,7 +470,7 @@ fn render_stacked_first_overlay(
                     &surface.textarea,
                     preview,
                     6,
-                    3,
+                    min_rows,
                     area.y + 1,
                     max_h,
                     Some(purpose),
@@ -443,7 +481,7 @@ fn render_stacked_first_overlay(
                     area,
                     &surface.textarea,
                     6,
-                    3,
+                    min_rows,
                     area.y + 1,
                     max_h,
                     Some(purpose),
@@ -451,6 +489,20 @@ fn render_stacked_first_overlay(
                     &geom,
                 )
             };
+            let effort_bar_counts = app.model_effort_bar_counts(
+                model_override.as_deref(),
+                provider_override.unwrap_or(app.selected_provider),
+            );
+            let view = prompt::launch_view(
+                app,
+                purpose,
+                launch,
+                working_dir,
+                model_override.as_deref(),
+                *provider_override,
+                *sandbox_enabled,
+                effort_bar_counts,
+            );
             prompt::render_prompt_popup(
                 frame,
                 area,
@@ -459,15 +511,14 @@ fn render_stacked_first_overlay(
                 purpose,
                 available_commands,
                 app.selected_model.as_deref(),
-                app.selected_effort.as_deref(),
+                effort_bar_counts,
                 Some(rect),
                 false, // stacked = not focused
                 None,
                 &geom,
                 model_override.as_deref(),
                 Some(model_dropdown),
-                *sandbox_enabled,
-                app.poll.sandbox_supported,
+                &view,
             );
             Some(rect)
         }
@@ -532,8 +583,10 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         purpose: purpose @ PromptPurpose::TaskRabbit,
         available_commands: tr_cmds,
         model_override: tr_model_override,
+        provider_override: tr_provider_override,
         model_dropdown: tr_model_dropdown,
         sandbox_enabled: tr_sandbox_enabled,
+        launch: tr_launch,
         ..
     } = &app.overlay
     {
@@ -545,6 +598,7 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                 let tr_y = first_rect.y + first_rect.height + 1;
                 if tr_y < area.y + area.height {
                     let max_h = (area.y + area.height).saturating_sub(tr_y);
+                    let min_rows = prompt::body_min_rows(purpose, tr_launch);
                     let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
                     let geometry_changed = if tr_surface.corrected_preview.is_none() {
                         normalize_prompt_manual_height(
@@ -553,7 +607,7 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                             area,
                             &tr_surface.textarea,
                             6,
-                            3,
+                            min_rows,
                             tr_y,
                             max_h,
                             Some(purpose),
@@ -576,7 +630,7 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                             &tr_surface.textarea,
                             preview,
                             6,
-                            3,
+                            min_rows,
                             tr_y,
                             max_h,
                             Some(purpose),
@@ -587,7 +641,7 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                             area,
                             &tr_surface.textarea,
                             6,
-                            3,
+                            min_rows,
                             tr_y,
                             max_h,
                             Some(purpose),
@@ -595,6 +649,20 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                             &geom,
                         )
                     };
+                    let effort_bar_counts = app.model_effort_bar_counts(
+                        tr_model_override.as_deref(),
+                        tr_provider_override.unwrap_or(app.selected_provider),
+                    );
+                    let view = prompt::launch_view(
+                        app,
+                        purpose,
+                        tr_launch,
+                        tr_wd,
+                        tr_model_override.as_deref(),
+                        *tr_provider_override,
+                        *tr_sandbox_enabled,
+                        effort_bar_counts,
+                    );
                     prompt::render_prompt_popup(
                         frame,
                         area,
@@ -603,15 +671,14 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                         purpose,
                         tr_cmds,
                         app.selected_model.as_deref(),
-                        app.selected_effort.as_deref(),
+                        effort_bar_counts,
                         Some(tr_rect),
                         true, // focused
                         Some(list_w),
                         &geom,
                         tr_model_override.as_deref(),
                         Some(tr_model_dropdown),
-                        *tr_sandbox_enabled,
-                        app.poll.sandbox_supported,
+                        &view,
                     );
                 }
                 return;
@@ -632,8 +699,6 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
     let count = app.input_overlays.len();
     let list_w = crate::ui::compute_session_list_width(app);
     let selected_model = app.selected_model.clone();
-    let selected_effort = app.selected_effort.clone();
-    let sandbox_supported = app.poll.sandbox_supported;
     let mut geometry_changed = false;
 
     // Ensure the focused overlay is visible by estimating how many fit on screen
@@ -662,8 +727,10 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
             purpose,
             available_commands,
             model_override,
+            provider_override,
             model_dropdown,
             sandbox_enabled,
+            launch,
             ..
         } = overlay
         {
@@ -683,6 +750,7 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                 (area.height * 50 / 100).max(9)
             };
             let max_h = remaining_h.min(per_overlay_max);
+            let min_rows = prompt::body_min_rows(purpose, launch);
             let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
             if is_focused && surface.corrected_preview.is_none() {
                 geometry_changed |= normalize_prompt_manual_height(
@@ -691,7 +759,7 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                     area,
                     &surface.textarea,
                     6,
-                    3,
+                    min_rows,
                     y,
                     max_h,
                     Some(purpose),
@@ -710,7 +778,7 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                     &surface.textarea,
                     preview,
                     6,
-                    3,
+                    min_rows,
                     y,
                     max_h,
                     Some(purpose),
@@ -721,7 +789,7 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                     area,
                     &surface.textarea,
                     6,
-                    3,
+                    min_rows,
                     y,
                     max_h,
                     Some(purpose),
@@ -729,6 +797,20 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                     &geom,
                 )
             };
+            let effort_bar_counts = app.model_effort_bar_counts(
+                model_override.as_deref(),
+                provider_override.unwrap_or(app.selected_provider),
+            );
+            let view = prompt::launch_view(
+                app,
+                purpose,
+                launch,
+                working_dir,
+                model_override.as_deref(),
+                *provider_override,
+                *sandbox_enabled,
+                effort_bar_counts,
+            );
             prompt::render_prompt_popup(
                 frame,
                 area,
@@ -737,15 +819,14 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
                 purpose,
                 available_commands,
                 selected_model.as_deref(),
-                selected_effort.as_deref(),
+                effort_bar_counts,
                 Some(rect),
                 is_focused,
                 Some(list_w),
                 &geom,
                 model_override.as_deref(),
                 Some(model_dropdown),
-                *sandbox_enabled,
-                sandbox_supported,
+                &view,
             );
 
             y = rect.y + rect.height + 1; // 1-row gap
@@ -758,6 +839,14 @@ fn render_input_overlay_stack(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// Render overlays that live in `app.overlay` (everything except the input overlay stack).
 fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
+    let geometry = App::regular_overlay_geometry_key(&app.overlay)
+        // These three renderers already apply their own geometry.
+        .filter(|key| !matches!(*key, "NotificationBrowser" | "Terminal"))
+        .and_then(|key| app.modal_geometries.get(key).cloned());
+    with_paint_geometry(geometry, || render_regular_overlay_inner(frame, area, app));
+}
+
+fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
     match &app.overlay {
         OverlayState::None => {}
         OverlayState::ThemePicker {
@@ -798,8 +887,10 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             purpose,
             available_commands,
             model_override,
+            provider_override,
             model_dropdown,
             sandbox_enabled,
+            launch,
             ..
         } => {
             let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
@@ -811,7 +902,7 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                     area,
                     &surface.textarea,
                     6,
-                    3,
+                    prompt::body_min_rows(purpose, launch),
                     area.y + 1,
                     max_h,
                     Some(purpose),
@@ -828,6 +919,20 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                 .get(&geom_key)
                 .cloned()
                 .unwrap_or_default();
+            let effort_bar_counts = app.model_effort_bar_counts(
+                model_override.as_deref(),
+                provider_override.unwrap_or(app.selected_provider),
+            );
+            let view = prompt::launch_view(
+                app,
+                purpose,
+                launch,
+                working_dir,
+                model_override.as_deref(),
+                *provider_override,
+                *sandbox_enabled,
+                effort_bar_counts,
+            );
             prompt::render_prompt_popup(
                 frame,
                 area,
@@ -836,15 +941,14 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
                 purpose,
                 available_commands,
                 app.selected_model.as_deref(),
-                app.selected_effort.as_deref(),
+                effort_bar_counts,
                 None,
                 true, // focused
                 None,
                 &geom,
                 model_override.as_deref(),
                 Some(model_dropdown),
-                *sandbox_enabled,
-                app.poll.sandbox_supported,
+                &view,
             );
         }
         OverlayState::ProjectPicker {
@@ -887,6 +991,9 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         OverlayState::SourceWorktreeSettlement(state) => {
             cohort_settlement::render_source_worktree_settlement(frame, area, state);
         }
+        OverlayState::SatelliteRegistry(state) => {
+            satellite_registry::render(frame, area, state);
+        }
         OverlayState::HarnessManagerV2(state) => {
             manager_v2::render(frame, area, state);
         }
@@ -915,7 +1022,18 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             selected_index,
             scroll_offset: _,
         } => {
-            notification_browser::render_notification_browser(frame, area, app, *selected_index);
+            let geom = app
+                .modal_geometries
+                .get("NotificationBrowser")
+                .cloned()
+                .unwrap_or_default();
+            notification_browser::render_notification_browser(
+                frame,
+                area,
+                app,
+                *selected_index,
+                &geom,
+            );
         }
         OverlayState::ProjectForm {
             focused_field,
@@ -1038,6 +1156,37 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         } => {
             provider_credential_form::render_provider_credential_form(
                 frame, area, *slot, *rotate, secret,
+            );
+        }
+        OverlayState::McpServerForm {
+            focused_field,
+            id,
+            command,
+            args,
+            secret_env_names,
+            working_dir,
+            enabled,
+            ..
+        } => {
+            mcp_server_form::render_mcp_server_form(
+                frame,
+                area,
+                *focused_field,
+                id,
+                command,
+                args,
+                secret_env_names,
+                working_dir,
+                *enabled,
+            );
+        }
+        OverlayState::McpServerSecretForm { id, rotate, secret } => {
+            mcp_server_form::render_mcp_server_secret_form(
+                frame,
+                area,
+                id,
+                *rotate,
+                secret.expose(),
             );
         }
         OverlayState::SkillPreview {
@@ -1263,9 +1412,18 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
             jobs,
             selected_index,
             loading,
+            paging,
             ..
         } => {
-            schedule_browser::render_schedule_browser(frame, area, jobs, *selected_index, *loading);
+            schedule_browser::render_schedule_browser(
+                frame,
+                area,
+                jobs,
+                &app.schedule_holds,
+                *selected_index,
+                *loading,
+                paging,
+            );
         }
         OverlayState::ScheduleForm {
             focused_field,

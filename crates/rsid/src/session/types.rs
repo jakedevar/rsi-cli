@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::openai::OpenAiProcess;
 use crate::provider_capabilities;
 use crate::store::successor_reservations::AgentSuccessorReservation;
+pub(crate) use crate::store_support::event_types::MonitorBreakReason;
 use regex::Regex;
 use rsi_common::types::{
     ContextUsageConfidence, ConversationEvent, IdeaControllerLaunchConfirmationV1,
@@ -421,7 +422,13 @@ pub struct TrackedSession {
     pub(crate) deferred_successor_start_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     /// Stop signal sender. `pub(crate)` for reconciliation to signal finalization.
     pub(crate) stop_tx: mpsc::Sender<()>,
+    /// Boundary-delivered operator messages waiting for the monitor (which owns
+    /// the transcript sequence counter) to write them (#1062).
+    pub(crate) operator_inbox: Arc<super::boundary_mail::OperatorTranscriptInbox>,
     pub(super) interrupt_requested: bool,
+    /// First recorded interrupt source for the active turn (#588); the
+    /// finalizer persists it as the `Interrupted` terminal cause.
+    pub(super) interrupt_source: Option<crate::terminal_cause::InterruptSource>,
     pub(super) pending_archive: bool,
     /// Context rotation state machine. Owns all rotation lifecycle state.
     /// `pub(crate)` for reconciliation to check rotation state before intervention.
@@ -433,6 +440,10 @@ pub struct TrackedSession {
     pub(super) live_input_tokens: u64,
     /// Live accumulator: total output tokens across all turns.
     pub(super) live_output_tokens: u64,
+    /// Cumulative full-prompt tokens across all model calls.
+    /// Fed per provider: Claude sums usage.total_input; Codex sums raw
+    /// turn.completed input_tokens; Harness copies cumulative value.
+    pub(super) live_prompt_tokens: u64,
     /// Confidence of the latest usage data from the stream.
     pub(super) live_usage_confidence: ContextUsageConfidence,
     /// Daemon-counted input tokens (query + tool results), accumulated from raw text.
@@ -568,11 +579,14 @@ impl TrackedSession {
             process: None,
             deferred_successor_start_gate: None,
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             rotation: super::rotation_coordinator::RotationCoordinator::new(session_id, 0, false),
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence: ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,
@@ -855,14 +869,18 @@ pub(super) fn sanitize_codex_restored_context_usage(
     session.total_cache_read_tokens = Some(0);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MonitorBreakReason {
-    Result,
-    StreamClosed,
-    Interrupted,
-    Rotation,
-    /// Session was interrupted due to stall detection (eligible for retry).
-    StallTimeout,
+/// #1000: a session's cumulative full prompt for invocation accounting and
+/// usage stats. Rows written before `total_prompt_tokens` existed fall back
+/// to the legacy `total_input_tokens` (a per-call peak).
+pub(crate) fn session_prompt_total(session: &Session) -> Option<u64> {
+    session.total_prompt_tokens.or(session.total_input_tokens)
+}
+
+/// #1000: the prompt baseline a resumed incarnation is measured from. The
+/// monitor restores `live_prompt_tokens` from `total_prompt_tokens`, so the
+/// baseline is exactly that value (a legacy row restarts from zero).
+pub(crate) fn session_prompt_baseline(session: &Session) -> u64 {
+    session.total_prompt_tokens.unwrap_or(0)
 }
 
 /// Invocation-local semantic evidence carried by a normalized result event.
@@ -1099,6 +1117,12 @@ pub enum StoreCommand {
     UpdateSessionStatus {
         session_id: Uuid,
         status: rsi_common::types::SessionStatus,
+    },
+    /// Terminal status and its normalized cause in one statement (#588).
+    UpdateTerminalSessionStatus {
+        session_id: Uuid,
+        status: rsi_common::types::SessionStatus,
+        cause: String,
     },
     /// Acknowledged C5 terminal failure write: status and the durable pending
     /// auto-file marker commit together before a post-disposition feed runs.

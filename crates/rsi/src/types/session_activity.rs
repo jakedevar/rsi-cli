@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use rsi_common::types::{SessionKind, SessionStatus};
+use rsi_common::types::{SessionKind, SessionProvider, SessionStatus};
 use uuid::Uuid;
 
 use crate::types::{
@@ -32,11 +32,24 @@ pub struct SessionFlowSummary {
     pub failed: usize,
 }
 
+/// Live (`Starting` or `Running`) leaf sessions of one provider, by model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningProviderSummary {
+    pub provider: SessionProvider,
+    pub count: usize,
+    /// Canonical model ID (`None` when the session has not reported one) and
+    /// its live count, most used first.
+    pub models: Vec<(Option<String>, usize)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionActivityViewModel {
     pub operator_queue: Vec<SessionActivityItem>,
     pub recent_changes: Vec<SessionActivityItem>,
     pub flow: SessionFlowSummary,
+    /// Fleet-wide live sessions by provider and model, across every project:
+    /// the same population as the top chrome's running count.
+    pub running: Vec<RunningProviderSummary>,
 }
 
 pub fn compute_session_activity(
@@ -79,8 +92,57 @@ pub fn compute_session_activity(
         }
         insert_recent(&mut model.recent_changes, item, rank);
     }
+    model.running = running_by_provider(sessions);
 
     model
+}
+
+/// Group live leaf sessions by provider, then model. Providers and models are
+/// ordered by live count (descending), ties by name, so the pane is stable.
+pub fn running_by_provider(sessions: &HashMap<Uuid, SessionState>) -> Vec<RunningProviderSummary> {
+    let mut running: Vec<RunningProviderSummary> = Vec::new();
+    for state in sessions.values() {
+        let session = &state.session;
+        if !matches!(
+            session.status,
+            SessionStatus::Running | SessionStatus::Starting
+        ) || !rsi_common::is_leaf_kind(session.session_kind)
+        {
+            continue;
+        }
+        let index = running
+            .iter()
+            .position(|summary| summary.provider == session.provider)
+            .unwrap_or_else(|| {
+                running.push(RunningProviderSummary {
+                    provider: session.provider,
+                    count: 0,
+                    models: Vec::new(),
+                });
+                running.len() - 1
+            });
+        let summary = &mut running[index];
+        summary.count += 1;
+        match summary
+            .models
+            .iter_mut()
+            .find(|(model, _)| model.as_deref() == session.model.as_deref())
+        {
+            Some((_, count)) => *count += 1,
+            None => summary.models.push((session.model.clone(), 1)),
+        }
+    }
+    for summary in &mut running {
+        summary
+            .models
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    running.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| format!("{:?}", a.provider).cmp(&format!("{:?}", b.provider)))
+    });
+    running
 }
 
 fn insert_recent(

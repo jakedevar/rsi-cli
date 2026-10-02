@@ -256,6 +256,84 @@ impl Health {
             .unwrap();
         id
     }
+    /// A completed `continue_session` (resume) turn of `lead` over
+    /// `[start, end]`, exactly as the daemon records one.
+    fn resume_turn(&self, lead: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Uuid {
+        let id = Uuid::new_v4();
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations
+                 (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                  trigger_source,session_id,created_at,started_at,completed_at)
+                 VALUES(?1,'session.continue','resume','yes','none','admitted','completed',
+                        'continue_session',?2,?3,?4,?5)",
+                params![
+                    id.to_string(),
+                    lead.to_string(),
+                    stamp(start),
+                    stamp(start),
+                    stamp(end)
+                ],
+            )
+            .unwrap();
+        id
+    }
+    /// Three consecutive short effect-free resume turns ending at `end`
+    /// (newest turn is `[end-3m, end-2m]`); returns ids newest-first.
+    fn poll_turns(&self, lead: Uuid, end: DateTime<Utc>) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let start = end - Duration::minutes(3 * (3 - i));
+                self.resume_turn(lead, start, start + Duration::minutes(1))
+            })
+            .collect();
+        ids.reverse();
+        ids
+    }
+    /// A lead->manager reply recorded at `at`.
+    fn lead_reply(&self, index: usize, at: DateTime<Utc>) -> Uuid {
+        let (epic, lead) = self.epics[index];
+        let id = Uuid::new_v4();
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_messages
+                 (id,project_id,manager_session_id,epic_id,scope_version,sender_session_id,
+                  recipient_session_id,request_id,idempotency_key,request_fingerprint,message,created_at)
+                 VALUES(?1,?2,?3,?4,1,?5,?3,?6,?1,'request-fingerprint','Report status',?7)",
+                params![
+                    id.to_string(),
+                    self.project.to_string(),
+                    self.manager.to_string(),
+                    epic.to_string(),
+                    lead.to_string(),
+                    Uuid::new_v4().to_string(),
+                    stamp(at)
+                ],
+            )
+            .unwrap();
+        id
+    }
+    /// A scoped ledger event recorded by the lead at `at`.
+    fn lead_ledger_event(&self, index: usize, at: DateTime<Utc>) {
+        let (_, lead) = self.epics[index];
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_events
+                 (project_id,manager_session_id,scope_version,actor_session_id,kind,record_key,
+                  row_version,payload_json,created_at)
+                 VALUES(?1,?2,1,?3,'work','poll-signature',0,'{}',?4)",
+                params![
+                    self.project.to_string(),
+                    self.manager.to_string(),
+                    lead.to_string(),
+                    stamp(at)
+                ],
+            )
+            .unwrap();
+    }
 }
 
 fn stuck(row: &Value, code: &str) -> Vec<Value> {
@@ -910,4 +988,69 @@ fn per_epic_successor_and_report_reads_seek_by_the_epic_children() {
             .unwrap_or_else(|| panic!("no keyed {inner} in {steps:?}"));
         assert!(outer < joined, "{steps:?}");
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn three_short_effect_free_resume_turns_are_lead_poll_signature() {
+    let h = health_fixture();
+    let (_, lead) = h.epics[0];
+    let end = Utc::now() - Duration::minutes(1);
+    let ids = h.poll_turns(lead, end);
+    let row = h.row(0);
+    let fact = &row["facts"]["lead_poll_signature"];
+    assert_eq!(fact["consecutive_poll_turns"], 3);
+    assert_eq!(fact["invocation_ids"], json!(ids));
+    let since = fact["since"].as_str().unwrap();
+    let latest = fact["latest"].as_str().unwrap();
+    assert!(since < latest, "since {since} must precede latest {latest}");
+    // The stuck entry carries the value as its single evidence item.
+    assert_eq!(stuck(&row, "lead_poll_signature"), vec![fact.clone()]);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn durable_effect_inside_the_newest_window_clears_lead_poll_signature() {
+    let h = health_fixture();
+    let end = Utc::now() - Duration::minutes(1);
+    // Newest window of each lead is `[end-3m, end-2m]`.
+    let inside = end - Duration::minutes(2) - Duration::seconds(30);
+    // Epic 0: the signature first reports, then a lead->manager mail reply
+    // inside the newest window clears it.
+    let (_, lead) = h.epics[0];
+    h.poll_turns(lead, end);
+    let row = h.row(0);
+    assert_eq!(
+        row["facts"]["lead_poll_signature"]["consecutive_poll_turns"],
+        3
+    );
+    h.lead_reply(0, inside);
+    let row = h.row(0);
+    assert!(row["facts"]["lead_poll_signature"].is_null(), "{row}");
+    assert_eq!(row["facts"]["lead_poll_signature"], Value::Null);
+    let codes: Vec<&str> = row["stuck"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["code"].as_str().unwrap())
+        .collect();
+    assert!(!codes.contains(&"lead_poll_signature"), "{codes:?}");
+    // Epic 1: the same, cleared by a ledger event by the lead.
+    let (_, lead) = h.epics[1];
+    h.poll_turns(lead, end);
+    let row = h.row(1);
+    assert_eq!(
+        row["facts"]["lead_poll_signature"]["consecutive_poll_turns"],
+        3
+    );
+    h.lead_ledger_event(1, inside);
+    let row = h.row(1);
+    assert_eq!(row["facts"]["lead_poll_signature"], Value::Null);
+    let codes: Vec<&str> = row["stuck"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["code"].as_str().unwrap())
+        .collect();
+    assert!(!codes.contains(&"lead_poll_signature"), "{codes:?}");
 }

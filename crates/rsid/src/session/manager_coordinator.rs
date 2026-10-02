@@ -76,6 +76,8 @@ impl SessionManager {
         let mut changed = closure_changes + {
             let live = super::pending_approvals::live_incarnations();
             let store = self.store.lock().await;
+            // Synchronous under the guard already held: no extra await state.
+            sweep_superseded_resume_wakes(&store);
             store.expire_appserver_approvals(&live)?
                 + store.manager_v2_recover_decision_deliveries(self.program_run_boot_id)?
                 + store.recover_manager_actions_startup(self.program_run_boot_id)?
@@ -371,4 +373,18 @@ pub(super) fn decision_session(delivery: &ManagerDecisionDeliveryV2) -> Result<U
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
         .ok_or_else(|| refused("manager_v2_decision_target_required"))
+}
+
+/// #953: superseded lineages (rotation leftovers, gone targets) never keep a
+/// live resume wake. Hygiene only: a failure defers, never aborts the pass.
+fn sweep_superseded_resume_wakes(store: &crate::store::Store) {
+    match store.sweep_superseded_resume_wakes() {
+        Ok(retired) if !retired.is_empty() => tracing::info!(
+            count = retired.len(),
+            job_ids = ?retired,
+            "retired superseded-lineage resume wakes"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "superseded resume wake sweep deferred"),
+    }
 }

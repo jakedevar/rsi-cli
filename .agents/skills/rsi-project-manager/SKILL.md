@@ -1,493 +1,319 @@
 ---
 name: rsi-project-manager
-description: Operating playbook for the operator-appointed rsi harness manager — verifying the seat and policy fence, standing up Groups, Epics and leads without stranding them, the ledger admission handshake, refusal codes and what they mean, wake discipline, and handing the seat on. Use when you are (or are about to be) the project manager, when a manager action is refused or blocked, or when briefing a lead. Pairs with rsi-agent-control, which documents the verbs themselves.
+description: Operating playbook for the operator-appointed rsi harness manager — verify the seat, run the integrator loop (fresh short-lived workers, merge, compile, touched-module tests, fast-forward push to rolling), keep the laptop satellite and the AWS cloud busy, deploy, wake discipline, and hand the seat on. Use when you are (or are about to be) the project manager or when a manager action is refused. Verb mechanics come from AgentGetAuthorityCatalog; rsi-agent-control keeps the retry and refusal strategy.
 ---
 
 # rsi project manager
 
-Every fact here was observed or read from source on 2026-09-21. Facts tied to an
-open Issue say so; check the Issue before trusting them. Facts added in the
-2026-09-23 refresh say so explicitly. Verb shapes live in the
-`rsi-agent-control` skill and in `rsi-rpc <Verb> --schema`.
+Current as of 2026-09-30. Verb mechanics (parameter schema, a minimal example,
+refusal codes and next steps) come from the daemon:
+`AgentGetAuthorityCatalog {"verb": "<name>"}`. The `rsi-agent-control` skill keeps
+the retry and refusal-debugging strategy. This skill keeps the integrator loop,
+the operator directives and the traps.
 
-## What the job is
+## The job
 
-You decide, record, and unblock. You do not do the work and you do not hold the
-detail: leads own source custody, children, and their Epic's context. Your
-context should scale with decisions pending, never with history. Read digests
-and typed replies, not transcripts. Keep no prose ledger; durable state is the
-daemon ledger plus committed artifacts, and any working note stays under 150
-lines.
+You are the integrator. You choose the work, dispatch short-lived workers,
+merge their commits, verify, and push to `rolling`. Keep your context small:
+read typed results and git, not transcripts. Keep no running notes or state
+files; state lives in Issues, git and the daemon. The one committed manager
+artifact is the handoff you write at baton pass.
 
-## Standing operator edicts: autonomous management
+## Operator directives (restate them in every handoff)
 
-Operator instruction, 2026-09-24: use your engineering judgment, identify what
-is wrong or inefficient, create an Issue, and get it done with a lead and child
-agent. Do not ask the operator to approve your own routine recommendation.
-These instructions apply to managers on every provider and survive succession.
+- 2026-09-24, autonomous management: use your engineering judgment. Find what is
+  wrong or inefficient, reuse or file an Issue with a stated intent and
+  acceptance criteria, and get it done. Never ask the operator to approve a
+  routine decision. Ask only for new authority: `main` or releases, spending
+  beyond a grant, credentials, deleting user data, or a genuine product choice.
+  Name the exact gate when you do.
+- Models (2026-09-30 05:25Z, widened; supersedes "no Codex"): the manager and
+  its successor run on Claude Opus 5.5 (`claude-opus-5-5`). Workers may run on
+  Claude Sonnet 5.5 (`claude-sonnet-5-5`), Claude Haiku 5.5 if available, Codex
+  `gpt-6.1-sol` and `gpt-6-luna`, or OpenRouter (`z-ai/glm-5.3`,
+  `deepseek/deepseek-v4.1-flash`). Reviews for migrations and credential, IAM
+  or network changes still come from a family other than the author's.
+- 2026-09-27: "The ground truth is the principle we are trying to achieve."
+  Tests assert the Issue's intent, not the code as it happens to be.
+- 2026-09-29 focus: the efficiency plan, umbrella Issue #1019.
+- 2026-09-29 04:20Z and 04:30Z: "get something working first, right second,
+  fast third"; "the rules of this harness are completely made up ... if that
+  means stopping every session and just making the changes and pushing them
+  ... so be it ... you know better than I what's the right answer."
+- 2026-09-28/29 capacity: "make full use of the satellite"; get the cloud "up and
+  running asap". Keep the laptop and AWS busy.
+- 2026-09-29 00:55Z: "never ask me again to manage the satellite instance." The
+  hub manager owns satellite health.
+- 2026-09-29 23:40Z: "build fast and break things": merge everything waiting and
+  fix forward; an unstable `rolling` is acceptable, "all I want is to see it
+  working" (hub, laptop and cloud). The #945 delivery rule is approved: at most
+  once, an uncertain result is shown, never auto-replayed.
+- 2026-09-29 18:30Z: operator messages must not kill in-flight tool calls
+  (soft interrupt; delivered at tool boundaries since #1049, afd6fe541).
 
-- Make ordinary architecture, implementation, verification and sequencing
-  decisions yourself. Use the Seven-Expert framework; record consequential
-  decisions with evidence and act on them within the live grant.
-- When you find an in-scope defect, impediment or inefficiency, reuse an existing
-  Issue or create one with a concrete outcome. Admit work and file ownership,
-  assign a lead, delegate implementation to children, and drive fixes through
-  review, verification and integration. Filing an Issue is not completion.
-- Repair ordinary blockers autonomously. Reconcile ownership, stale fences,
-  failed checks and recoverable actions through the supported controls. Keep
-  independent work moving while a real external dependency is pending.
-- Ask only when the next action actually needs new operator authority or an
-  unresolved human decision. Name the exact gate and its source, finish the
-  authorized preparation first, and make the remaining choice concrete. A
-  missing optional check, technical uncertainty or exhausted turn is not an
-  invented approval requirement. Existing authorization remains in force.
-- Preserve the operator's goal and explicit limits: live grants, pauses,
-  credentials, destructive actions, substantial new cost, `main` and releases
-  remain governed by their actual authorization. This skill does not grant
-  daemon authority or clear a human gate. An already-authorized rebuild needs
-  no repeated permission; respect resource limits and the current build slot.
-- Spend compute deliberately: authors write regression tests and run cheap
-  checks; use explicitly unverified intake and bounded batched QA when that
-  pipeline is available. Retain useful QA caches and reuse exact valid evidence.
-  Keep unverified intake distinct from accepted, verified `rolling` delivery.
-- Before passing the baton, commit a concise handoff carrying these edicts,
-  current authorization and constraints, active leads/children, exact source
-  and evidence, unresolved Issues and next actions. The successor must reload
-  this skill and live authority, then continue; rotation does not reset the job
-  or require the operator to reauthorize unfinished work. Name this skill's
-  committed path explicitly in every successor handoff/launch, including direct
-  API providers that may not automatically load repository instructions.
+## The integrator model
 
-## Operator directive 2026-09-27: agent-dev process
+- **Workers.** At most two or three on the hub at once. Each gets a fresh
+  context, one Issue, and the worker contract
+  (`git show origin/rolling:thoughts/shared/manager/worker-contract.md`). It
+  starts at the `rolling` tip, commits on its own sandbox branch, and ends with
+  a `RESULT <sha> ...` line. No persistent leads: on 2026-09-29 four leads had
+  grown to about 800K context ($70-86 each), and three died when resumed after a
+  restart. The cap limits long-lived contexts, not machines: the satellite and
+  the cloud run workers, QA sweeps and heavy test runs as well.
+- **Launch a worker.** Prepare then commit a `create_session` control (parent =
+  the Epic that owns the Issue; `kind`, `launch` provider/model/effort, `query` =
+  the worker prompt) and read the action until `session_established`. A worker
+  is a leaf; do not assign it as a lead. Arm an `on_terminal` wake on it so its
+  end wakes you. Read its result from git (branch `rsi/<worker-session-id>`) and
+  its final line.
+- **Integration loop.** Use a detached worktree off `origin/rolling` (never your
+  sandbox branch):
+  1. `git merge --no-ff` each ready source; batch small independent ones.
+  2. `cargo check --workspace --all-targets`.
+  3. Run the tests for the modules the batch touched, with
+     `env -u RSI_PROCESS_OWNERSHIP_NAMESPACE` (otherwise some tests hang), and
+     skip the very slow `h1_v83` startup tests (the QA sweep covers them). Hand
+     long full-suite runs to the cloud or the satellite. Choose them with
+     `rsi-test-impact --repo . --base <old tip> --head HEAD` (#1021) rather than
+     by eye: on 2026-09-29 a hand-picked filter for #793 (agent mail) missed
+     25 session-02 phase2 reds that its full gate would have run (#1034).
+     Also compile each rsid shard the batch's tests live in, in shard mode:
+     `cargo check -p rsid --lib --tests --no-default-features --features
+     test-shard-<shard>` (map files to shards with
+     `grep -o 'test-shard-[a-z]*-[0-9]*' <file>`). On 2026-09-30 an ungated
+     test helper compiled in the unsharded build but broke 15 of the 16 shard
+     builds (994bc471c); the shard-gate script checks `#[test]`s only.
+     Run the batch as daemon jobs with one wake, not one wake per job (#1006):
+     submit the workspace check and each shard's test job with `wake:"none"`, arm
+     ONE `mode:"when"` `jobs_terminal` wake with a `timeout_seconds`, and end the
+     turn; a per-job wake costs a turn that re-reads the whole cached context for
+     nothing. `sha_on_rolling` waits for a landing the same way.
+  4. `RSI_ROLLING_LANDER=1 git push origin HEAD:refs/heads/rolling`
+     (fast-forward only; operator-authorized 2026-09-29). On a rejected push,
+     merge the new tip and retry.
+- **Always compile and run the touched-module tests.** On 2026-09-29 they
+  caught two #1000 bugs that its review missed (the idea row mapper was
+  shifted, and old-schema test fixtures broke).
+- **Migrations.** A new migration is one file
+  `crates/rsid/src/store/migrations/vNNN.rs` and takes the tip's schema head
+  (highest `vNNN.rs`) + 1 at merge time: renumber in landing order with
+  `tools/rolling-migration-renumber.py` (file name, `migrate_vNNN`, the
+  `if version < N` block, `PRAGMA user_version`, test rewind constants), run
+  `python3 tools/check-released-migrations.py --refresh`, then run the guard
+  against `origin/rolling`. Released migrations are immutable.
+- **Review.** Pre-merge review only for new migrations and credential, IAM or
+  network-exposure changes: one plain reviewer pass by a different model family,
+  verdict noted in the merge commit. Other authority or custody changes land
+  first and get one post-land review; findings become follow-up fixes.
+- **Merge pitfalls.** A stale branch can carry an old copy of work that already
+  landed differently (#923 A carried #961's `55d76f011`); on such a conflict,
+  prefer rolling's version. Conflicts cluster in
+  `tools/released-migrations.json`, `rpc.rs` and the lander files.
+- **Issues.** Close an Issue when its fix is on `rolling`
+  (`git merge-base --is-ancestor <sha> origin/rolling`). Cancel work the
+  current model makes moot.
 
-Operator, 03:35Z: "The code on the ground isn't exactly the ground truth. The
-ground truth is the principle we are trying to achieve by building this."
-Pre-merge review is retired for ordinary work (lead contract v2 §0a, §5-§7,
-`thoughts/shared/manager/lead-contract.md`).
+## Satellite (arch-laptop)
 
-- `rolling` is agent-dev intake. Leads land after tests that assert the stated
-  intent, the static shard inventory, and the lander gate. Publication is
-  unbound, with no seal and no review.
-- Review is kept only for new schema migrations and for authority, credential,
-  token, custody or IAM/network-exposure enforcement. For those, run the
-  admission handshake below. Leads may not launch Qwen or MiniMax children,
-  but manager-arranged reviewers may use them when GLM and DeepSeek hit
-  `manager_review_family_conflict`.
-- The QA lane (Tests Epic) sweeps the `rolling` tip, lands the pointer file
-  `thoughts/shared/qa/qa-green.sha` (the full swept SHA; `qa-green` is never a
-  branch, because sandbox custody forbids named branches) on a pass, and files
-  `qa-regression` Issues to the owning Epic on a failure. Deploys and `main`
-  promotion come from the `qa-green.sha` SHA only.
-- An Issue without a stated intent and acceptance criteria is not ready to
-  build; have the lead write them first.
+- It runs its own rsid, sessions and cargo. Reach it in two ways:
+  - `~/rsi-satellite/INBOX.md` and `OUTBOX.md` over ssh:
+    `LAND REQUEST <epic> <sha> branch=<origin branch> filters=<...> requester=<you>`
+    lines, answered LANDED or NOT_PUBLISHED.
+  - `~/.rsi/mgr4/lap.sh <laptop_session_id> <message>`, which delivers only when
+    that laptop session is idle.
+- Use it for every rolling-tip QA sweep (its QA lead), long test runs for
+  integration batches, and extra workers whose commits come back to you.
+- You own its health. On every wake: `ssh arch-laptop`, then `pgrep -x rsid` and
+  the tail of `~/rsi-satellite/OUTBOX.md`. Replace stuck sessions.
+- Never restart a satellite's rsid from inside a session that daemon manages
+  (2026-09-28 outage). The satellite builds with `--no-restart` into
+  `~/.rsi/staging/bin-<sha>` (an allowed deploy root there) and the hub restarts
+  it over the link: `AgentRequestDeploy {sha, binaries_dir:
+  "<path on the satellite>", idempotency_key, peer_id: <the satellite's peer id>}`
+  (#1017). This needs the operator-granted `Deploy` capability, the peer paired
+  with dispatch enabled and a declared scope, and this hub's installation on the
+  satellite's inbound allowlist (`PutSatelliteInboundPolicy`) with a live scope
+  root as the deploy owner. The satellite runs its own #1045 flow and the hub
+  stores nothing: arm your own resume wake and confirm with `AgentGetDaemonInfo`
+  `satellites` (`reachable:false` while it restarts). A deploy is done when
+  `build_sha` is the requested SHA and `last_deploy.state` is `succeeded`. This
+  replaces the
+  `RESTART REQUEST <sha>` OUTBOX line. The ssh restart is the fallback only, for
+  a satellite whose daemon is down or not run by the supervisor script:
+  `systemd-run --user --scope --collect --slice=user.slice -- ~/rsi/scripts/rsid-supervisor.sh ~/rsi/target/release/rsid`
+  (`~/.rsi/.env` on the satellite carries the provider keys).
 
-### Deploys: build, then restart at a quiet point
+## Cloud (AWS)
 
-Never couple the release build to the restart. A queued build that restarts
-the daemon when it finishes interrupts leads and reviewers at a random moment
-(2026-09-27 02:37Z).
+- Goal: the AWS remote gate as the routine executor for heavy test runs, with a
+  warm shared build cache (#1010). Also #965 (the shard fingerprint hashes
+  rustup stderr).
+- `scripts/cloud-gate.sh -- <rsi-rolling-land args>` applies, gates and destroys
+  an ephemeral c7i.8xlarge (about $1.78/h; a full gate is about 60 min). Keep a
+  host fully busy while it is up and destroy it when the queue is empty.
+- Spend: the operator's grant is $100 from 2026-09-27, tracked in
+  `~/.rsi/cloud/spend.md`. Log every window there, and stop and report at $90
+  cumulative. AWS Budgets: `rsi-cloud-us-west-1-monthly` ($100) and `-daily`
+  ($15). The default AWS profile is `rsi-cloud-terraform`. Beyond the grant,
+  ask the operator once with the exact amount.
+- Run every rolling-tip QA sweep as a daemon job, not by hand: call
+  `AgentSubmitJob {kind:"cloud_sweep", params:{sha:<the rolling tip, 40 hex>}}`
+  and end your turn. The daemon runs the sweep in its own unit (from its embedded
+  scripts, with the spend guard) and wakes you once with `verdict` GREEN, RED or
+  INCOMPLETE, `results_dir`, `new_failures` and `known_failures`. Do not start
+  `scripts/cloud-sweep.sh` through `systemd-run` yourself and do not keep a poll
+  wake for it; a refusal (`cloud_spend_refused`) arrives the same way. GREEN
+  means land the QA pointer; RED means file the NEW failures; INCOMPLETE means
+  read `results_dir` or the job log and resubmit.
+- Stop a running gate with SIGTERM to `cloud-gate.sh` and its lander child, so
+  its EXIT trap destroys the host. Never SIGKILL it.
 
-1. Build from a detached worktree at the SHA in
-   `thoughts/shared/qa/qa-green.sha` (until the first sweep lands it, the
-   fetched `origin/rolling` tip):
+## QA and the canary
+
+- The QA sweep of each `rolling` tip records a passing SHA in
+  `thoughts/shared/qa/qa-green.sha` (a file on `rolling`, never a branch) and
+  files `qa-regression` Issues on failure. Deploys and `main` promotion come
+  from that SHA.
+- A sweep passes when its only reds are long-standing seeds that already have
+  open Issues and known-failure signatures (#392, #882, #339 on 2026-09-29) and
+  flakes that pass their isolated rerun. The laptop QA lead lands nothing, so
+  the hub manager lands the pointer (one line, the full swept SHA) after each
+  passing sweep.
+- Keep the post-push canary runner stopped until #1025 is fixed: it
+  forward-reverted a clean landing on its own setup error.
+
+## Deploys: build, then restart at a quiet point
+
+Preferred since 2026-09-30 (#1045, #1017 slice 2): `AgentRequestDeploy`
+restarts the hub through the supervisor's exit-75 path at a quiet point and wakes
+you once; `peer_id` deploys a paired satellite over the link. It needs the
+operator's Deploy grant (and, for the laptop, the hub on its inbound allowlist
+with a scope root). Confirm with `AgentGetDaemonInfo`. Until those grants exist,
+use the manual steps below or the scripts `~/.rsi/mgr/deploy-hub-c7b1-v2.sh`
+(hub: waits for the build and a quiet point, backs up the DB, restarts with the
+TUI environment) and `~/rsi-satellite/sat-deploy.sh <sha> <bins> <rsid_sha256>`
+(laptop). Never SIGSTOP an rsid supervisor: a stopped parent cannot reap the
+exited rsid, which then shows as a `<defunct>` zombie that `pgrep` still
+finds. Stop it with SIGTERM to the supervisor (its trap forwards TERM).
+
+1. Build from a detached worktree at the deploy SHA:
    `~/.rsi/bin/cargo-slot env CARGO_TARGET_DIR=$HOME/.cargo/shared-target ./scripts/install-release.sh --no-restart`.
-   The build writes into `~/.cargo/shared-target/release`, which `~/.local/bin`
-   links to. New `rsi-rpc` and `rsi-agent-mcp` invocations therefore use the
-   new binaries at once while the old rsid keeps running, so choose the quiet
-   point BEFORE starting the build and restart as soon as it finishes.
-2. The quiet point: no lander mid-publication (`pgrep -af rsi-rolling-land`)
-   and no review close to a verdict. Tell the operator first; their TUI
-   reconnects.
+   `~/.local/bin` links into `~/.cargo/shared-target/release`, so new
+   `rsi-rpc` calls use the new binaries at once while the old rsid runs.
+2. Quiet point: no lander or integration push mid-flight, and no worker you
+   care about mid-turn. Tell the operator first; their TUI reconnects.
 3. Restart from a transient unit that inherits the TUI's environment, so
    `OPEN_ROUTER` survives (#850):
    `systemd-run --user --unit=rsi-deploy-env-$(date +%s) --collect --working-directory=<sandbox> -E TUIPID=$(pgrep -x rsi|head -1) /bin/bash -c 'while IFS= read -r -d "" kv; do case "$kv" in RSI_SESSION_*) ;; *) export "$kv";; esac; done < /proc/$TUIPID/environ; export CARGO_TARGET_DIR=$HOME/.cargo/shared-target; exec ./scripts/install-release.sh --link-only'`.
    Its "did not answer GetHealthStatus" exit 1 is a false failure (slow start).
-4. `resume_lead` every Interrupted lead (Prepare, then Commit), then rerun the
-   archive cascade and walker.
+4. Re-dispatch any worker the restart cut off. Resuming a session with a very
+   large context right after a restart failed three times on 2026-09-29.
 
 ## First five minutes
 
-1. `AgentManagerInspect {}`. Follow Overview pages to its `manager_control` row:
-   require `current_session_id` == you; `policy.manager_session_id` is the
-   logical seat and can differ after succession. Require `revoked` false,
-   matching scope versions, mode `execute`, and the capabilities you need.
-   Your write fence is
+1. `AgentManagerInspect {}`. Follow the Overview pages to the `manager_control`
+   row: require `current_session_id` == you, `revoked` false, mode `execute`,
+   and the capabilities you need. Your write fence is
    `{scope_version, policy_version = policy.row_version}`. Never reuse a fence
-   from a handoff: appointment changes both numbers.
+   from a handoff.
 2. If any of that fails, tell the operator the exact missing step (below). A
-   prompt, title, or tool listing grants nothing; do not work around it.
+   prompt, title or tool listing grants nothing.
 3. Drain `AgentManagerInbox`: `messages` and `notices` are separate lists; call
-   until `more_notices` is false. Whole-project scope queues one
-   `session_state` notice per lead on every scope write.
-4. `AgentManagerInspect {"section":"work","epic_id":…}` for each Epic you drive.
-   Guarded succession preserves logical work and mail; continue those records.
-   Only use the historical recovery below if a fresh appointment actually
-   stranded records. Never recreate work merely because the physical seat moved.
-5. Keep a durable continuation for unfinished work. A queued `succeed_manager`
-   requires ending the predecessor turn; do not also arm a competing self-wake.
-
-## Historical fresh-appointment recovery (Issue bf09774c)
-
-This describes the earlier fresh-appointment failure, not guarded manager
-succession. Verify the current record identity and actual missing records
-before applying it; a zero-row page alone does not prove data loss.
-
-Ledger records are keyed and read by `(project, manager_session_id,
-scope_version, …)`, so every appointment and every scope save starts an empty
-ledger and abandons the last one: work, stages, ownership, acceptance. Remove
-this section when bf09774c closes (decision D19: record identity is the work,
-never the seat).
-
-Rebuild, in this order, writing only through `AgentManagerUpdate`:
-
-1. Read the predecessor's payloads read-only, never from a handoff's prose:
-   `SELECT kind, payload_json FROM harness_manager_v2_records WHERE
-   manager_session_id='<predecessor>' AND scope_version=<its scope> AND kind IN
-   ('work','ownership')`. SQLite here rejects double-quoted strings: put the
-   SQL in a file and build requests with `jq` from the payloads.
-2. Re-create each LIVE `work` (`expected_row_version: 0`), then its `ownership`
-   records. Skip work that has landed: it cannot be re-admitted once its lead's
-   HEAD has moved, and it does not need to be.
-3. For a sealed, still-frozen source, verify the lead's branch and worktree HEAD
-   == the seal with a clean tree yourself, then re-record `stage:
-   implementation` with the same evidence.
-4. Re-read Inspect `work`. `evidence_policy_digest` binds epic, key, revision,
-   gates, source commit, source session and head, NOT the seat
-   (`store/manager_ledger.rs` `policy_digest_projection`), so it must reproduce
-   byte for byte. If it does, nothing issued to a lead or a running reviewer
-   changed. If it does not, stop: something moved.
-
-What does not survive: an `accept`. Hold the seat steady between `accept` and
-landing, and never ask the operator for a scope change, including a narrowing,
-while any handshake is live.
+   until `more_notices` is false. The helpers in `~/.rsi/mgr4` (`seat.sh`,
+   `inbox_since.sh`, `lap.sh`) work; add your own session-id prefix to
+   `inbox_since.sh`'s sender filter.
+4. Check the satellite and the disk (reclaim stale sandbox build caches through
+   the supported reclaim path when under 80 GB free).
 
 ## Operator setup, and its traps
 
-Correct order: `:manager appoint` once, then `:manager policy`, set the preset
-row to Execute or Full project control, confirm the capability rows, `s`. Then
-never touch appoint again.
+The order: `:manager appoint` once, then `:manager policy`, set the preset row to
+Execute or Full project control, confirm the capability rows, and save with `s`.
 
-- One manager seat per project (`docs/harness-manager.md`, Bounds). Appointing
-  you displaces the previous manager and revokes its grants and mail.
-- ANY appoint or scope save, even identical, bumps the scope version and revokes
-  the saved policy and all in-flight manager mail (Issue eac83cfd,
-  `crates/rsid/src/store/harness_manager.rs` `configure_harness_manager`).
-- A policy save does not say what it granted. Enter/Space cycles the preset row,
-  so a save can land as Observe: mode `monitor`, zero capabilities. Verify with
-  step 1 rather than trusting "I saved it".
-- `allowed_launches` empty means the daemon restricts nothing. An operator model
-  restriction then holds only because agents honor it: carry it in every lead
-  contract.
+- One manager seat per project. Appointing a manager displaces the previous one
+  and revokes its grants and mail.
+- Any appoint or scope save, even an identical one, bumps the scope version and
+  revokes the saved policy and in-flight manager mail.
+- A policy save does not say what it granted, and Enter/Space cycles the preset
+  row, so a save can land as Observe (mode `monitor`, no capabilities). Verify
+  with step 1 of the first five minutes.
 
-2026-09-23 facts:
+## Baton pass
 
-- **Authority survives manager rotation** (2026-09-23;
-  `manager_config_for_caller` follows `config.current_session_id` and tests
-  rotation transfer in `crates/rsid/src/store/harness_manager.rs`): the rotated
-  session with `continued_from` equal to the seat passes Inspect and writes;
-  `policy.manager_session_id` stays the logical seat ID. Key review-assignment
-  queries on that logical ID (`crates/rsid/src/store/manager_reviews.rs`), not
-  `$RSI_SESSION_ID`.
-- **Record limits are per bookkeeping class** (2026-09-23 #614;
-  `harness_manager_v2.rs` `bookkeeping_class`): retrieval, resource
-  (`resource_spend`/`resource_launch_origin`), and lifecycle each have their own
-  1024-record limit and typed refusal. Do not treat them as one shared total.
-- A standing request permits at most **32 replies**; send one tagged reply per
-  event.
-- A source session archived before its DB-native review verdict is refused as
-  review evidence. Rotation is allowed; register the rotation tip that holds
-  the same sandbox.
-- A commit in a sealed source sandbox after `SEALED`—including a rotation
-  handoff commit—voids the seal.
-- Integration records fail on stale local `rolling` (#562) and archived source
-  sessions (#601); verify the landed remote target and a live source instead.
-- An old Epic with uncertain actions or an unknown program owner is untakeable
-  until ownership is reconciled (#380/#390).
-- Reviewers choose `z-ai/glm-5.3-flashx` before
-  `deepseek/deepseek-v4.1-flash` when using OpenRouter. Reuse exact valid QA
-  evidence; build only when needed. Reclaim eligible disposable caches through
-  the supported cleanup path, preserving the retained central QA cache.
-- A fresh appointment or scope/policy mutation can invalidate active DB-native
-  review assignments
-  (`manager_review_allocation_invalidated`); reviewers can keep running until
-  their Epic lead halts them (#614). Guarded succession retains the logical
-  manager and scope/policy; continue its preserved assignments.
-- **DB-native acceptance is automatic** (2026-09-23;
-  `manager_v2_accepted_source` derives `Acceptance` from an eligible accepted
-  receipt, and Inspect projects `source_accepted`): an accepted receipt marks
-  the work accepted; a later manual accept then fails
-  `manager_v2_record_changed`.
-- **Detect a silently dead lead after daemon restart** (#648; 2026-09-23,
-  `crates/rsid/src/session/mod.rs`): the watch delivery is abandoned as "was
-  never consumed: no provider output", the lead stays `Completed` and assigned,
-  and manager mail does not wake it. Replace it with `create_session` →
-  `assign_lead` after the candidate's first turn ends → `resume_lead`.
-  Since 2026-09-23 (K10d) the abandonment also reaches you as a
-  `delivery_abandoned` `session_state` notice and Health `lead_delivery_abandoned`.
-  A `Failed` or `Interrupted` lead, or a `Completed` one that `resume_lead`
-  refuses `manager_v2_resume_unavailable`, can instead be retried in place with
-  `retry_lead` (K13). An authorized lead change readdresses your open requests to
-  the new lead (K10c); answer and read the new request IDs.
-- A lead that ends "paused" with a handoff but no wake is never resumed; manager
-  mail reaches it only because the manager sender's delivery watch fires. Every
-  lead contract requires a same-session resume wake of at most 600 s.
-- **Idempotency conflict** (2026-09-23; `manager_idempotency_conflict` in
-  `crates/rsid/src/store/harness_manager.rs`): reuse with different content
-  fails, including keys used by a previous seat.
-- **Local-only integration targets**: repositories without `origin` need the
-  repository-level `rsi.managerIntegrationTarget` opt-in; see
-  [Local-only integration targets](../../docs/harness-manager.md#local-only-integration-targets-rsimanagerintegrationtarget)
-  (#644).
-- **Machine is disk/I/O bound** (2026-09-23 #647): cap concurrent code reviews;
-  tell design reviewers not to build; reclaim non-live `target/` dirs while the
-  filesystem has below 80 GB free (reclaim threshold evidence:
-  `docs/sandbox-storage.md`, sandbox build-cache pressure).
+- `succeed_manager` (via `AgentManagerControl`, with your fence) needs:
+  - the `manager_control` row's `expected.authority_epoch` and
+    `expected.custody_generation`, from the LAST Overview page;
+  - a `launch` (provider, model, effort);
+  - a handoff committed at your sandbox HEAD (`source_commit`,
+    `relative_path`, `blob_oid`).
 
-## Standing up work
-
-Containers: `AgentManagerControl` `create_container` (Group at root, Epic under
-a Group). Sessions and leads: prefer `AgentManagerPrepareControl` then
-`AgentManagerCommitPreparedControl`; the daemon resolves fences for you.
-
-Before launching an IMPLEMENTATION child, check the owning project's Issues for
-existing work and reuse it; if none fits, create an Issue with the intended
-outcome and acceptance criteria first. Admit Work and exact file ownership, then
-launch the child, and keep the Issue lifecycle aligned with real progress.
-Read-only audits and urgent recovery of already-issued work are exempt.
-
-Creating a lead is two non-atomic steps (Issue 89a39100). The verified sequence:
-
-1. Prepare + commit `create_session` (parent = the Epic).
-2. Read `AgentManagerGetAction` until the receipt is `succeeded` /
-   `session_established`. Assigning earlier fails
-   `manager_v2_candidate_unavailable`.
-3. Prepare + commit `assign_lead` immediately; expect `lead_committed`.
-4. If the session ended its first turn waiting, prepare + commit `resume_lead`;
-   expect `lead_resumed`.
-
-The lead's prompt must open with an authority check and must not enter program
-mode, register a guard, or arm a wake until it passes
-(`rsi-rpc AgentListIssues --params '{"archive":"Active","limit":1}'` succeeds
-only for a committed lead). A session that enters program mode before assignment
-becomes unassignable: running it blocks `manager_v2_program_evidence_unknown`,
-idle with its own wake it blocks `manager_v2_human_or_recovery_owner`. The cure
-is a replacement lead, which can `AgentHalt` the orphan as a child of its Epic;
-with `SessionControl` you can halt the orphan leaf yourself (2026-09-23 K1).
-
-### Lead contract checklist
-
-Authority check first · intent by reference (`git show <ref>:<path>`, never a
-paraphrase; a new sandbox is cut from `rolling` and cannot see other branches'
-working trees) · obligations in order · operator constraints verbatim, including
-permitted child launches · one mutating owner for hot shared files (`rpc.rs`,
-verb catalogs, `harness_manager_v2.rs`, `store/mod.rs`, `AGENTS.md`) · migration
-numbers AND decision numbers are proposed to you, not self-reserved (a lead
-once labelled its proposal with the number you had just issued); allocate a
-migration number only when its source seals, in landing order, because the
-store runner skips a lower `if version < N` block that lands after a higher
-one · Tier-2 needs a reviewer of a
-different model family than the author · typed short reports with an exact reply
-format · working notes under 150 lines · file an Issue labeled
-`human-touch-cause` before needing a human.
-
-## Ledger admission handshake (current ledger)
-
-Applies only to the review classes kept by the 2026-09-27 directive above
-(migrations and authority changes). Ordinary work lands without it.
-
-Source: `crates/rsid/src/session/manager_ledger.rs` (`observe_manager_update`,
-`observe_independent_evidence`, `validate_work_bundle`) and
-`crates/rsid/src/store/manager_ledger.rs` (`policy_digest`, `scope_label`). This
-ceremony is scheduled for replacement; until then, follow it exactly, and read
-the consumer contract BEFORE launching a reviewer.
-
-- You must never be a ledger source. Admission requires the source session's
-  custody HEAD == the sealed commit with a clean tree, and a manager keeps
-  committing. Leads hold custody and FREEZE from seal to admission; any commit,
-  even a handoff, voids it.
-- `work` of kind `product` must gate implementation + review + verification
-  (`manager_v2_product_gates_required`).
-- Sequence: lead seals and replies `sealed_source_sha`, `source_session_id` →
-  you record `stage: implementation` with evidence source=S, session=lead,
-  artifact=S:`<a regular tracked file UNDER thoughts/ present in S>` (anything
-  else is refused `manager_v2_invalid_artifact_path`,
-  `session/manager_ledger/git.rs` `artifact_path`; if the lead named a source
-  file, pick a pre-existing `thoughts/` file yourself rather than unfreeze it; a
-  non-closure artifact leaves evidence `unknown` but binds the source) →
-  Inspect `work` now projects
-  `evidence_policy_digest`, `review_scope`, `required_evidence_linkage` → send
-  those to the lead → the lead launches the Closure reviewer at S.
-- Reviewer: a Completed child of the work's Epic, not the lead, not you, custody
-  allocated at S, one two-file evidence commit (review JSON + manifest v2) whose
-  sole parent is S, strict `PIPELINE HANDOFF — REVIEW:` final message, manifest
-  covering every `required_evidence_linkage` key, verdict Accepted with zero
-  unresolved findings.
-- A failing bundle cannot be attached (`manager_v2_evidence_not_passed`): record
-  `stage: review, state: failed` with the evidence commit in the note. A fix
-  unfreezes the source, so the handshake repeats for the new seal.
-- Never soften a verdict to fit admission. Findings go to one mutating owner,
-  then one finding-focused delta review.
-- Verify the bundle YOURSELF before admitting, including the one gate that is
-  not in git: the daemon parses the reviewer's LAST non-empty assistant message
-  and its first non-blank line must be the marker
-  (`rsi-common/src/agent_contract.rs` `parse_closure_review_handoff_v1`). One
-  courtesy sentence before it voided a genuine accepted review
-  (`manager_v2_review_handoff_invalid`); the only remedy is a fresh reviewer.
-  Put this in every reviewer prompt: "The FIRST characters of your final
-  message are PIPELINE HANDOFF — REVIEW: with nothing before them. No code
-  fences anywhere in it. Write the exact final message to a scratch file
-  outside the evidence worktree, run rsi-contract-validate on it, and emit that
-  text unchanged."
-- Admit in this order, taking each `expected_row_version` from the previous
-  reply: `stage review` → `stage implementation` → `stage verification` (all
-  `passed`, all with the evidence commit as artifact) → `accept`. Stop at the
-  first refusal. An inadmissible-but-genuine review is recorded `stage: review,
-  state: blocked` with NO evidence, never `failed`.
-- After `accept` the LEAD builds the landing candidate (merges `origin/rolling`
-  into its branch) and runs the guard; a lander only verifies and pushes. An
-  ownership `key` is the work key; its record key is derived.
-- Before landing a changed registered hot file, the accepted Work needs an
-  active exclusive ownership claim with `domain` equal to that exact
-  repository-relative path and `files` containing the same path. Claim each
-  hot file separately; a category domain such as `rpc-catalog` does not pass
-  `rsi-rolling-land` for `crates/rsid/src/rpc.rs`.
+  Receive the queued receipt, then end your turn.
+- It is refused `manager_v2_human_or_recovery_owner` while you own any enabled
+  `resume` wake. Before a baton pass, retire each with
+  `AgentCancelWake {"name":"<name>"}` (or `{"job_id":"<id>"}`), or let it fire
+  first. Calling `AgentScheduleWake` again with the same explicit name replaces
+  the first job rather than adding a second.
+- The handoff carries the operator directives above, the current state, exact
+  SHAs, open Issues and the next actions, and names this skill's path.
 
 ## Control-surface facts
 
 - `AgentManagerCommitPreparedControl` returns `result.receipt.*`;
   `AgentManagerControl` and `AgentManagerGetAction` return the receipt at
-  `result.*`. `queued` is not done: read the receipt. `AgentManagerGetAction`
-  takes `{"operation_id": …}`. Error envelopes carry `code`, not `message`: a
-  poll loop that prints `.error.message` hides every failure as `null`.
-- Since 2026-09-23 (K10a) a retained notice wakes an idle recipient
-  (`Completed`/`Interrupted`, no active or queued turn, no pending question)
-  without waiting for the sender's turn: your mail wakes an idle lead, and a
-  lead's reply wakes you once you are idle. Busy recipients are never
-  interrupted; notices coalesce until `AgentManagerInbox` retrieval settles them.
-  Failed, archived, question-gated and running recipients are not woken.
-- Lost wake (Issue f94f23ab): a lead's child watch can fire, retire as
-  "confirmed consumed", and resume nobody when `rsid::reconciliation` races the
-  end of its turn. Symptom: lead `Completed`, child terminal, no event after the
-  lead's last message, its only enabled job the year-9999 program sentinel.
-  `resume_lead` is then blocked `human_or_recovery_owner`; mail it and end your
-  turn. Require every lead to arm a resume wake of at most 600 s IN ADDITION to
-  a child watch. Check for this on every wake.
-- `scripts/sync-agent-commands.sh --check` exits 1 on a clean `rolling`
-  checkout (19 `missing: .gemini/...` lines) until Factory Hygiene obligation 3
-  lands. Tell landers the exact expectation, never "expect pass".
-- Replaying an identical request with the same idempotency key returns the
-  original receipt, including a terminal `blocked`. Retry after conditions
-  change with a NEW key; never change the key on an uncertain result.
-- `resume_lead` on a program-mode lead is blocked `program_evidence`. Correct:
-  that lead owns its continuation and wakes itself. Send mail; it will read it.
-- `AgentGetStatus`, named-ID `AgentGetProgress` and terminal watches on a
-  scoped lead or worker need only the live scope. `AgentHalt`,
-  `AgentContinueChild` and `AgentSendMessage` on a scoped leaf also need
-  `SessionControl` in Execute mode, no pause, and no human gate on the target
-  (2026-09-23 K1; refusals `manager_v2_capability_denied`, `manager_v2_paused`,
-  `manager_v2_human_or_recovery_owner`). Inspect `workers`, `resources` and
-  `health` stay the fleet view; read-only SQLite against `~/.rsi/rsi.db` is
-  legitimate for diagnostics only.
-- `AgentManagerSend` to an Epic without a committed lead fails
-  `manager_lead_missing`. A send receipt means queued, never accepted.
-- Topology automation (#633) needs the V2 `Automation` capability (the
-  `Topology` capability only creates containers; a land step will also need
-  `GitEffect`). Ask the operator to tick "Grant Automation" in `:manager policy`
-  and to list the exact provider/model/effort triples in `allowed_launches`:
-  an empty list refuses every agent session node. Then `AgentTopologyUpsert`
-  (scope `manager` for reusable procedures, `epic` for one Epic),
-  `AgentTopologyExecute` on an in-scope Epic in Execute mode, and poll
-  `AgentTopologyGetExecution` or `AgentTopologyList{include_executions:true}`.
-  Each launch is charged to `max_created_sessions`; a launch refused by live
-  policy blocks the execution with `policy_refused` rather than retrying. Only
-  you or the operator may `discard` preserved work, with the exact
-  `confirm_preserved_commit` from `inspect`. Leads can run their own Epic's
-  topologies and operator-`shared` ones without you.
-- `succeed_manager` has no effect-free preflight and needs the Overview
-  `manager_control` observation. That is a ROW, not a top-level field, appended
-  after every `intent` and `lead_control` row, so it is on the LAST Overview
-  page (page 3 of 3 at whole-project scope): follow `next_cursor` to the end and
-  select `type == "manager_control"` for `expected.authority_epoch` and
-  `expected.custody_generation`. It exists only for a parentless Standard
-  manager (`store/manager_ledger/inspect.rs`). An earlier note here said the
-  baton pass "cannot be built" because the field was null; that was a page-1
-  read. Succession carries the same logical manager id and scope version
-  forward (`store/manager_successions.rs`), so it is the one handover that does
-  NOT strand the ledger. With the live SelfSuccession grant, use this supported
-  path for an authorized baton transfer (current contract:
-  `docs/harness-manager.md`, "Change the root manager model"). Commit the
-  handoff at the current custody HEAD, supply its exact path/blob and observed
-  fences, receive the queued operation ID, then finish the predecessor turn.
-  The daemon settles the predecessor and establishes distinct successor custody
-  before publishing authority. Preserve actual human gates and inspect an
-  uncertain operation before another attempt. Historical Issue status is not
-  a blanket reason to demand manual appointment, rebuild preserved ledgers, or
-  launch an unauthorized Fresh replacement.
-- Project-wide bulk archive/restore (K14, #672) needs `OperatorDelegation` in
-  Execute mode, not paused. Both directions loop `operator_call` `ListSessions`
-  — a project-bound keyset page over `(updated_at, id)`, ≤64 rows/≤12 KiB,
-  follow `next_after` until absent — but the page filter and the per-row skip
-  differ, because `archive_blocker` is an `ArchiveSession`-only signal:
-  - **Bulk archive**: page with `status_in: ["Completed","Failed","Interrupted"]`,
-    skip any row whose page `archive_blocker` is non-null, then `operator_call`
-    `ArchiveSession` on the rest with the row's observed `session_updated_at`
-    as the `OperatorCallFenceV1`.
-  - **Bulk restore**: page with `status_in: ["Archived"]`. Do NOT filter on
-    `archive_blocker` here — `delegated_archive_blocker`'s own first check
-    refuses every `Archived`/`Deleted` row `manager_v2_session_state_changed`
-    (`crates/rsid/src/store/manager_actions.rs:578-580`), so an
-    `archive_blocker`-based skip discards every restore candidate and never
-    calls `UnarchiveSession`. Skip only rows whose `sandbox_cleanup_state ==
-    "Purged"` (a cheap, always-true predictor of
-    `manager_v2_historical_restore_refused`; see
-    `historical_session_restore_blocked_on`,
-    `crates/rsid/src/store/sessions.rs:31-49`), then `operator_call`
-    `UnarchiveSession` on the rest with its `OperatorCallFenceV1`, tolerating
-    a `manager_v2_historical_restore_refused` refusal for a row whose
-    source-worktree settlement history blocks it — that half of the gate is
-    not visible on the page.
-  For both directions: `ArchiveSession`/`UnarchiveSession` rewrite the target's
-  `updated_at`, which can move it past an in-progress cursor, but once its
-  status changes it stops matching that direction's `status_in` filter and
-  cannot reappear on a later page of the SAME walk. Still treat a duplicate id
-  as a no-op: re-`ArchiveSession`-ing an already-Archived row is refused
-  `manager_v2_session_state_changed`, never a second effect. Reach is the
-  whole project, not Group/Epic scope.
-  `ArchiveSession` is logical-only (never a sandbox purge) and also refuses:
-  `manager_v2_retention_pinned`, `manager_v2_session_is_lead`,
-  `manager_v2_human_or_recovery_owner`, `manager_v2_retention_enabled_wake`,
-  `manager_v2_retention_live_review`, `manager_v2_retention_sealed_source`,
-  `manager_v2_retention_recent_activity` (any activity in the last 24h),
-  `manager_v2_retention_live_worktree`, `manager_v2_session_has_descendants`,
-  or `manager_v2_session_not_terminal`. `UnarchiveSession` has none of those
-  retention gates; it refuses only `manager_v2_session_state_changed` (row is
-  not `Archived` at effect time) or `manager_v2_historical_restore_refused`
-  (purged sandbox or unsettled worktree history) — see
-  `crates/rsid/src/store/manager_actions/operator_delegation.rs:97-107`.
-  A stale fence on either is `manager_v2_session_changed`; a target outside the
-  grant's project or a non-leaf is `manager_v2_target_out_of_project` /
-  `manager_v2_leaf_required`. A method outside
-  `ArchiveSession`/`GetArchiveCleanupStatus`/`ListSessions`/`UnarchiveSession`
-  is `manager_v2_operator_method_not_delegable` — this covers every other
-  operator RPC method, not only the `NEVER_DELEGABLE` ones (a plain
-  `GetSession` is refused the same way; it is in neither list). See
-  `docs/harness-manager.md` "Operator delegation" for the full retention
-  table and allowlist.
+  `result.*`. `queued` is not done: read the receipt. Error envelopes carry
+  `code`; `.error.message` can be null.
+- Replaying a request with the same idempotency key returns the original
+  receipt, including a terminal `blocked`. After conditions change, retry with
+  a new key; never change the key on an uncertain result.
+- A retained notice wakes an idle recipient without interrupting a busy one;
+  notices coalesce until `AgentManagerInbox` settles them.
+- `AgentHalt` cannot target an Epic lead from the manager
+  (`agent_verb_scope_denied`). `pause_lead` is not refused for the lead's own `resume` wakes: it suspends them (recorded, not deleted) and `resume_lead` restores exactly those; list any session's own wakes with `AgentListWakes`.
+  `retry_lead` starts a fresh, small session (budget: two per lead).
+- Read-only SQLite on `~/.rsi/rsi.db` is fine for diagnostics. Writes to
+  `scheduled_jobs` fail outside the daemon (a trigger calls a daemon-only
+  function).
+- Bulk archive and restore of sessions go through `operator_call`
+  (`OperatorDelegation` capability); see `docs/harness-manager.md`, "Operator
+  delegation".
+- Never `pkill -f` a pattern that also appears in your own command line: it
+  kills your own shell.
+- A `create_session` receipt `blocked` / `manager_v2_lifecycle_unconfirmed` is
+  the catch-all for an unmapped launch error (`safe_action_error` in
+  `session/manager_actions.rs`). Read the real one in `~/.rsi/daemon.log`
+  (`grep <operation_id>`). On 2026-09-29 it was `sandbox_capacity_refused`: the
+  operator Settings cycle "Maximum sandbox roots" (512 → 16384, then it wraps
+  back to 512) had wrapped to 512 while about 1,490 sandbox roots were live, so
+  every new worker sandbox was refused. The same cap refuses `succeed_manager`
+  (the successor gets its own sandbox custody), so a manager cannot hand off
+  either. Ask the operator to set it at or above the live count; agents cannot
+  change daemon settings.
+- An unsandboxed manager's `succeed_manager` handoff must be the HEAD of its
+  working_dir (the shared `~/rsi`): push the handoff, then fast-forward that
+  clean checkout to it (`git merge --ff-only`). No commit is made there.
+- The operator policy "Operator pause" blocks every `create_session` preflight
+  (`operator_pause` → `resume_manager_or_policy`); only the operator clears it.
 
 ## Wakes
 
-Match the delay to what you wait for: at most 600 s during a live handshake.
-Lead replies did not reliably wake an idle manager. A wake message is a note
-from a past self with less information: on wake, check the seat first (if it
-moved, do nothing), then re-derive state from the daemon, and only then act.
-Never follow a wake's script literally. Always `mode:"resume"`, never a fresh
-writer into your own sandbox.
+On every wake, before dispatching, take operator requests first: list the
+newest Issues (`AgentListIssues` with `order:"desc"`), pick the Open ones
+labelled `operator-request` (filed by the operator's `/intake` command), dedupe
+each against the other open Issues (comment on or merge into a duplicate rather
+than dispatching twice), then dispatch them ahead of the rest of the queue.
+
+Dispatch work and end the turn. Worker terminal watches, durable units and mail
+wake you by event; a batch of jobs wakes you once through a `mode:"when"`
+`jobs_terminal` wake. Never hold a turn open in sleep or wait loops. Keep at most
+one same-session `mode:"resume"` wake of at most 3600 s as a safety net. On
+wake: check the seat first (if it moved, do nothing), re-derive state from the
+daemon and git, then act. Never follow a wake note literally, and never use
+`fresh` on your own session.
 
 ## Instruction mirrors
 
 `.claude/commands` and `.claude/skills` are canonical;
-`scripts/sync-agent-commands.sh` renders `.codex/prompts`, `.agents/skills`,
-`.gemini/commands`. Before syncing, run `--check` and DIFF any drift: twice on
-2026-09-21 the mirror was the newer, correct copy, and a blind sync would have
-deleted live rules. Back-port into `.claude` first, then sync, then confirm the
-only deletions are re-renders.
+`scripts/sync-agent-commands.sh` renders `.codex/prompts`, `.agents/skills` and
+`.gemini/commands`. Before syncing, run `--check` and diff any drift (the mirror
+has sometimes been the newer copy). Back-port into `.claude` first, then sync.

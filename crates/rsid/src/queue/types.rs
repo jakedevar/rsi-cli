@@ -1,5 +1,6 @@
 //! Types for the background task queue.
 
+pub use crate::store_support::config_types::QueueConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -57,36 +58,6 @@ impl TaskType {
 impl fmt::Display for TaskType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// Configuration for the background queue.
-#[derive(Debug, Clone)]
-pub struct QueueConfig {
-    /// Polling interval in seconds. Default: 30.
-    pub poll_interval_secs: u64,
-    /// Default token threshold for batching. Default: 1024.
-    pub default_token_threshold: i64,
-    /// Stale claim timeout in seconds. Default: 300 (5 minutes).
-    pub stale_claim_timeout_secs: i64,
-    /// Max retry attempts per task. Default: 5.
-    pub max_attempts: i32,
-    /// Retention period for completed items in seconds. Default: 86400 (24 hours).
-    pub completed_retention_secs: i64,
-    /// Whether the queue is enabled. Default: true.
-    pub enabled: bool,
-}
-
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval_secs: 30,
-            default_token_threshold: 1024,
-            stale_claim_timeout_secs: 300,
-            max_attempts: 5,
-            completed_retention_secs: 86400,
-            enabled: true,
-        }
     }
 }
 

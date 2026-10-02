@@ -1,6 +1,5 @@
 ---
 source: crates/rsi-common/tests/rpc_snapshots.rs
-assertion_line: 524
 expression: response
 ---
 {
@@ -103,6 +102,7 @@ expression: response
     "total_cache_read_tokens": 0,
     "total_input_tokens": 2000,
     "total_output_tokens": 900,
+    "total_prompt_tokens": null,
     "turn_count": 3,
     "updated_at": "2026-01-01T00:00:00Z",
     "work_time_ms": 120000,

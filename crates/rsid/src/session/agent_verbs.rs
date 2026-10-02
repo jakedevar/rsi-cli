@@ -32,6 +32,7 @@ use super::spawn_coordinator::{SpawnRejectReason, SpawnState};
 use super::types::{CompletedSession, TrackedSession};
 use crate::error::{DaemonError, Result};
 use crate::store::agent_child_relaunch_intents::{RelaunchIntentRow, RelaunchState};
+use crate::store::agent_coordination::{AgentSpawnRequestRecord, WatchRepairPageBudget};
 use crate::store::daemon_settings::{C5AutofilePending, RecoveryDisposition};
 use crate::store::harness_manager::ManagerSessionScope;
 use crate::store::scheduled_jobs::ScheduledJobUpdate;
@@ -195,6 +196,8 @@ pub struct AgentControlHandle {
     pub(super) store: Arc<tokio::sync::Mutex<crate::store::Store>>,
     pub(super) event_bus: Arc<crate::bus::EventBus>,
     spawn_coordinator: Arc<super::spawn_coordinator::SpawnCoordinator>,
+    /// Deploy drain (#1073); `None` for handles built without a manager.
+    pub(super) deploy_drain: Option<Arc<crate::deploy_drain::DeployDrain>>,
 }
 
 impl AgentControlHandle {
@@ -217,7 +220,16 @@ impl AgentControlHandle {
             store,
             event_bus,
             spawn_coordinator,
+            deploy_drain: None,
         }
+    }
+
+    pub(super) fn with_deploy_drain(
+        mut self,
+        drain: Arc<crate::deploy_drain::DeployDrain>,
+    ) -> Self {
+        self.deploy_drain = Some(drain);
+        self
     }
 
     pub(super) fn with_custody_runtime(
@@ -392,7 +404,13 @@ impl AgentControlHandle {
             .await?;
         self.audit_manager_control(manager_scope.as_ref(), "AgentHalt")
             .await?;
-        if super::lifecycle::interrupt_active_in_maps(&self.active, target_session_id).await? {
+        if super::lifecycle::interrupt_active_in_maps_from(
+            &self.active,
+            target_session_id,
+            crate::terminal_cause::InterruptSource::ManagerHalt,
+        )
+        .await?
+        {
             return Ok(());
         }
         let Some(_max_retries) = super::lifecycle::suppress_pending_retry_in_maps(
@@ -415,7 +433,13 @@ impl AgentControlHandle {
                 .authorize_agent_mutation_target(caller_session_id, target_session_id)
                 .await?;
             let target = target.0;
-            if super::lifecycle::interrupt_active_in_maps(&self.active, target_session_id).await? {
+            if super::lifecycle::interrupt_active_in_maps_from(
+                &self.active,
+                target_session_id,
+                crate::terminal_cause::InterruptSource::ManagerHalt,
+            )
+            .await?
+            {
                 return Ok(());
             }
             if super::lifecycle::suppress_pending_retry_in_maps(
@@ -1702,7 +1726,19 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         candidate: ScheduledJob,
     ) -> Result<ArmWatchOutcome> {
-        self.arm_terminal_watch_inner(caller_session_id, candidate, false)
+        self.arm_terminal_watch_inner(caller_session_id, candidate, false, false)
+            .await
+    }
+
+    /// Like [`Self::arm_terminal_watch`], but an explicitly named candidate
+    /// replaces the caller's other enabled jobs of the same name in the same
+    /// transaction as the insert (one enabled job per name per session).
+    pub(crate) async fn arm_terminal_watch_replacing_name(
+        &self,
+        caller_session_id: Uuid,
+        candidate: ScheduledJob,
+    ) -> Result<ArmWatchOutcome> {
+        self.arm_terminal_watch_inner(caller_session_id, candidate, false, true)
             .await
     }
 
@@ -1711,6 +1747,7 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         candidate: ScheduledJob,
         reset_existing: bool,
+        replace_name: bool,
     ) -> Result<ArmWatchOutcome> {
         let WakeMode::OnTerminal(watched) = candidate.wake_mode else {
             return Err(DaemonError::InvalidParam(
@@ -1766,7 +1803,14 @@ impl AgentControlHandle {
             // Idempotent re-arm: same (caller, watched) natural key.
             return Ok(ArmWatchOutcome::Deduplicated((**existing).clone()));
         }
-        if mine.len() >= MAX_TERMINAL_WATCHES_PER_MASTER {
+        // A replaced same-name watch is disabled by the insert below, so it
+        // does not count against the cap.
+        let replaced = if replace_name {
+            mine.iter().filter(|j| j.name == candidate.name).count()
+        } else {
+            0
+        };
+        if mine.len() - replaced >= MAX_TERMINAL_WATCHES_PER_MASTER {
             tracing::warn!(
                 target: "agent_coordination",
                 owner_session_id = %caller_session_id,
@@ -1780,10 +1824,59 @@ impl AgentControlHandle {
                 mine.len()
             )));
         }
-        store
-            .insert_scheduled_job(&candidate)
-            .map_err(|e| DaemonError::Rpc(format!("failed to create scheduled job: {e}")))?;
+        if replace_name {
+            store
+                .insert_scheduled_job_replacing_name(caller_session_id, &candidate)
+                .map_err(|e| DaemonError::Rpc(format!("failed to create scheduled job: {e}")))?;
+        } else {
+            store
+                .insert_scheduled_job(&candidate)
+                .map_err(|e| DaemonError::Rpc(format!("failed to create scheduled job: {e}")))?;
+        }
         Ok(ArmWatchOutcome::Armed(candidate))
+    }
+
+    /// `AgentScheduleWake` mode `when` (#1006): arm one daemon-evaluated
+    /// predicate wake for `caller`. Both the RPC verb and the native tool
+    /// route here. Every job id must be one the caller owns (a foreign or
+    /// unknown id is refused as `wake_when_job_not_found`); the row and its
+    /// predicate state commit in one transaction. Returns the armed row and
+    /// the ids an explicit name replaced.
+    pub(crate) async fn arm_wake_when(
+        &self,
+        caller: Uuid,
+        message: String,
+        name: Option<String>,
+        predicate: rsi_common::wake_predicate::WakePredicate,
+        timeout_seconds: Option<i64>,
+    ) -> Result<(ScheduledJob, Vec<Uuid>)> {
+        use crate::session::harness::tools::schedule_wake::{WakeWhenRequest, build_wake_when_job};
+        let session = self
+            .get_session(caller)
+            .await
+            .ok_or(DaemonError::SessionNotFound(caller))?;
+        let replace_name = name.is_some();
+        let (job, state) = build_wake_when_job(WakeWhenRequest {
+            message,
+            name,
+            predicate,
+            timeout_seconds,
+            working_dir: session
+                .sandbox_root
+                .clone()
+                .unwrap_or_else(|| session.working_dir.clone()),
+            provider: Some(session.provider),
+            model: session.model.clone(),
+            project_id: session.project_id,
+            origin_session_id: caller,
+        })
+        .map_err(DaemonError::InvalidParam)?;
+        let replaced = self
+            .store
+            .lock()
+            .await
+            .insert_wake_when(&job, &state, replace_name)?;
+        Ok((job, replaced))
     }
 
     /// Arm the daemon-owned terminal watch for a durably launched child.
@@ -1827,7 +1920,7 @@ impl AgentControlHandle {
         })
         .map_err(DaemonError::InvalidParam)?;
         let outcome = self
-            .arm_terminal_watch_inner(owner_session_id, candidate, reset_existing)
+            .arm_terminal_watch_inner(owner_session_id, candidate, reset_existing, false)
             .await?;
         let disposition = match &outcome {
             ArmWatchOutcome::Armed(_) => "armed",
@@ -1845,11 +1938,27 @@ impl AgentControlHandle {
 
     /// Finite startup reconciliation over indexed launched spawn requests.
     pub async fn reconcile_automatic_child_watches(&self) -> Result<()> {
-        let requests = self
-            .store
-            .lock()
-            .await
-            .list_agent_spawn_requests_for_watch_repair()?;
+        let mut cursor = None;
+        loop {
+            // One bounded keyset page per store lock (C-P2-23), so the
+            // process-wide store mutex is released between pages.
+            let page = self
+                .store
+                .lock()
+                .await
+                .list_agent_spawn_requests_for_watch_repair_page(
+                    cursor.as_ref(),
+                    WatchRepairPageBudget::default(),
+                )?;
+            self.repair_automatic_child_watch_page(page.records).await;
+            cursor = page.next;
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn repair_automatic_child_watch_page(&self, requests: Vec<AgentSpawnRequestRecord>) {
         for request in requests {
             match self
                 .arm_automatic_child_watch(request.owner_session_id, request.child_session_id)
@@ -1869,7 +1978,6 @@ impl AgentControlHandle {
                 ),
             }
         }
-        Ok(())
     }
 
     pub async fn reconcile_incomplete_agent_spawns(&self) -> Result<usize> {
@@ -1882,7 +1990,7 @@ impl AgentControlHandle {
     /// caller's own session, a direct child of the caller, or a child of an
     /// Epic the caller leads. Returns the resolved target `Session` on
     /// success.
-    async fn authorize_agent_target(
+    pub(super) async fn authorize_agent_target(
         &self,
         caller_session_id: Uuid,
         target_session_id: Uuid,
@@ -2954,6 +3062,7 @@ impl SessionManager {
         )
         .with_custody_runtime(self.custody_execution_runtime())
         .with_topology_agent(Arc::clone(&self.topology_agent_self))
+        .with_deploy_drain(Arc::clone(&self.deploy_drain))
     }
 
     /// `AgentCreateIssue` RPC delegator — creator identity is passed only from
@@ -3067,6 +3176,40 @@ impl SessionManager {
         self.agent_control()
             .agent_get_progress(caller_session_id, requested_ids)
             .await
+    }
+
+    /// `ClaimBoundaryMail` (#1049): claim this session's pending mail at a tool
+    /// boundary. Only the session's own hook reaches it; the target is the
+    /// token-resolved caller.
+    pub async fn claim_boundary_mail(
+        &self,
+        caller_session_id: Uuid,
+    ) -> Result<super::boundary_mail::ClaimBoundaryMailResponse> {
+        super::boundary_mail::claim_boundary_mail(
+            &self.store,
+            &self.agent_message_arbiter,
+            &self.active,
+            caller_session_id,
+        )
+        .await
+    }
+
+    /// The `ClaimBoundaryMail` reply reached the hook (#1062): settle the
+    /// claimed operator messages `delivered` with their transcript event.
+    pub async fn finalize_operator_boundary_delivery(&self, message_ids: &[Uuid]) {
+        super::boundary_mail::finalize_operator_boundary_delivery(
+            &self.store,
+            &self.active,
+            &self.event_bus(),
+            message_ids,
+        )
+        .await;
+    }
+
+    /// The `ClaimBoundaryMail` reply could not be written (#1062): the claimed
+    /// operator messages become `uncertain`.
+    pub async fn abandon_operator_boundary_delivery(&self, message_ids: &[Uuid]) {
+        super::boundary_mail::abandon_operator_boundary_delivery(&self.store, message_ids).await;
     }
 
     /// `AgentSendMessage` RPC delegator — see
@@ -3215,6 +3358,13 @@ impl SessionManager {
         ))
         .await
         .map_err(|error| {
+            if crate::deploy_drain::is_draining_error(&error) {
+                return crate::error::agent_continue_error(
+                    AgentContinueErrorCodeV1::DeployDraining,
+                    None,
+                    None,
+                );
+            }
             if matches!(error, DaemonError::StructuredRpc { .. }) {
                 return error;
             }
@@ -3504,7 +3654,7 @@ fn master_program_guard_state(
     }
 }
 
-pub(super) fn exact_master_continuation_guard_present(
+pub(crate) fn exact_master_continuation_guard_present(
     store: &crate::store::Store,
     session_id: Uuid,
     program_guard_id: Uuid,
@@ -3620,6 +3770,7 @@ pub(crate) mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -3764,6 +3915,34 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some(),
             "a terminal halt without pending retry keeps the failure marker"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_halt_records_manager_halt_as_the_interrupt_source() {
+        let (control, store, _) = control_handle_with_store_and_bus();
+        let dir = TempDir::new().unwrap();
+        let session_id = Uuid::new_v4();
+        let mut session = test_session(session_id, dir.path().to_path_buf());
+        session.status = SessionStatus::Running;
+        store.lock().await.insert_session(&session).unwrap();
+        control.active.write().await.insert(
+            session_id,
+            super::super::TrackedSession::new_for_test(session),
+        );
+
+        control
+            .agent_halt(session_id, session_id)
+            .await
+            .expect("self halt reaches the active turn");
+
+        let active = control.active.read().await;
+        let tracked = active.get(&session_id).expect("tracked");
+        assert!(tracked.interrupt_requested);
+        assert_eq!(
+            tracked.interrupt_source,
+            Some(crate::terminal_cause::InterruptSource::ManagerHalt)
         );
     }
 
@@ -6537,7 +6716,10 @@ pub(crate) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[test]
     fn fresh_relaunch_system_prompt_carries_kind_preamble() {
-        let parts = crate::session::launch::fresh_launch_preamble_parts(SessionKind::Task);
+        let parts = crate::session::launch::fresh_launch_preamble_parts(
+            SessionKind::Task,
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        );
         assert!(
             parts
                 .iter()
@@ -7395,7 +7577,8 @@ pub(crate) mod tests {
             .agent_get_issue(
                 caller,
                 AgentGetIssueRequestV1 {
-                    issue_id: created.issue.id,
+                    issue_id: Some(created.issue.id),
+                    display_number: None,
                 },
             )
             .await
@@ -7408,7 +7591,8 @@ pub(crate) mod tests {
             .agent_update_issue(
                 caller,
                 AgentUpdateIssueRequestV1 {
-                    issue_id: created.issue.id,
+                    issue_id: Some(created.issue.id),
+                    display_number: None,
                     expected_row_version: created.issue.row_version,
                     idempotency_key: "agent-control-edit".into(),
                     title: None,
@@ -7426,7 +7610,8 @@ pub(crate) mod tests {
             .agent_update_issue_status(
                 caller,
                 AgentUpdateIssueStatusRequestV1 {
-                    issue_id: created.issue.id,
+                    issue_id: Some(created.issue.id),
+                    display_number: None,
                     status: rsi_common::types::IssueStatus::Closed,
                     expected_row_version: updated.issue.row_version,
                     idempotency_key: "agent-control-close".into(),

@@ -75,6 +75,9 @@ const STARTUP_ORPHAN_FIXED_POINT_MAX_PASSES: usize = 8;
 const STARTUP_ORPHAN_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const QUARANTINE_HOLDER_FIXED_POINT_PASSES: usize = 2;
 const QUARANTINE_HOLDER_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
+const QUARANTINE_HOLDER_INVENTORY_ATTEMPTS: usize = 6;
+const QUARANTINE_HOLDER_INVENTORY_BACKOFF: Duration = Duration::from_millis(50);
+const QUARANTINE_HOLDER_INVENTORY_INCOMPLETE: &str = "quarantine holder inventory is incomplete:";
 const QUARANTINE_HOLDER_PROC_ENTRY_MAX: usize = 131_072;
 const QUARANTINE_HOLDER_TASK_ENTRY_MAX: usize = 1_000_000;
 const QUARANTINE_HOLDER_STATUS_MAX_BYTES: usize = 64 * 1024;
@@ -156,6 +159,7 @@ enum TrustedPlatformProcessClass {
     SystemdUserManager,
     SystemdSdPam,
     PortalFuseMountHelper,
+    SshdSession,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +250,7 @@ struct TrustedPlatformExemptionCounts {
     systemd_user_manager: u32,
     systemd_sd_pam: u32,
     portal_fuse_mount_helper: u32,
+    sshd_session: u32,
     permission_denied_classes: [u32; QUARANTINE_INVENTORY_CLASS_COUNT],
 }
 
@@ -261,6 +266,7 @@ impl TrustedPlatformExemptionCounts {
             TrustedPlatformProcessClass::PortalFuseMountHelper => {
                 &mut self.portal_fuse_mount_helper
             }
+            TrustedPlatformProcessClass::SshdSession => &mut self.sshd_session,
         };
         *count = count.checked_add(1).ok_or_else(|| {
             crate::error::DaemonError::Process(
@@ -284,6 +290,7 @@ impl TrustedPlatformExemptionCounts {
         self.systemd_user_manager
             .checked_add(self.systemd_sd_pam)
             .and_then(|count| count.checked_add(self.portal_fuse_mount_helper))
+            .and_then(|count| count.checked_add(self.sshd_session))
             .ok_or_else(|| {
                 crate::error::DaemonError::Process(
                     "quarantine trusted-platform exemption total overflowed".into(),
@@ -301,6 +308,12 @@ impl TrustedPlatformExemptionCounts {
         digest.update(self.systemd_sd_pam.to_be_bytes());
         digest.update(b"portal-fusermount3\0");
         digest.update(self.portal_fuse_mount_helper.to_be_bytes());
+        // Appended only when present so digests recorded before the sshd
+        // class existed stay byte-identical.
+        if self.sshd_session != 0 {
+            digest.update(b"sshd-session\0");
+            digest.update(self.sshd_session.to_be_bytes());
+        }
         for (name, count) in QUARANTINE_INVENTORY_CLASS_NAMES
             .iter()
             .zip(self.permission_denied_classes)
@@ -1812,82 +1825,87 @@ fn reap_startup_owned_orphans_checked(
 fn reap_startup_owned_orphans_at(
     ownership: &StartupProcessOwnership,
     proc_root: &Path,
-    mut after_scan_hook: StartupAfterScanHook,
+    after_scan_hook: StartupAfterScanHook,
 ) -> crate::error::Result<usize> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = ownership;
+        let _ = (ownership, proc_root, after_scan_hook);
         return Ok(0);
     }
-    if ownership.session_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
-        || ownership.invocation_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
+    #[cfg(target_os = "linux")]
     {
-        return Err(crate::error::DaemonError::Process(format!(
-            "startup provider candidate bound exceeded ({})",
-            crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
-        )));
-    }
-    if ownership.is_empty() {
-        return Ok(0);
-    }
+        let mut after_scan_hook = after_scan_hook;
+        if ownership.session_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
+            || ownership.invocation_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
+        {
+            return Err(crate::error::DaemonError::Process(format!(
+                "startup provider candidate bound exceeded ({})",
+                crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
+            )));
+        }
+        if ownership.is_empty() {
+            return Ok(0);
+        }
 
-    let self_pid = std::process::id() as i32;
-    let self_uid = std::fs::metadata(proc_root.join("self"))
-        .map_err(|error| {
-            crate::error::DaemonError::Process(format!(
-                "startup provider inventory self identity failed: {error}"
-            ))
-        })?
-        .uid();
-    let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
-    let mut reaped = 0_usize;
-    let mut consecutive_empty_passes = 0_u8;
-    for _ in 0..STARTUP_ORPHAN_FIXED_POINT_MAX_PASSES {
-        if StdInstant::now() >= deadline {
-            return Err(crate::error::DaemonError::Process(
-                "startup provider inventory exceeded its deadline".into(),
-            ));
-        }
-        let inventory = scan_startup_process_inventory(proc_root, self_pid, self_uid, deadline)?;
-        let mut observed = Vec::new();
-        for process in inventory.processes {
-            if let Some(stamps) = process
-                .stamps
-                .authorized_exact_stamp(process.pid, ownership)?
-            {
-                observed.push(StartupOrphanIdentity {
-                    pid: process.pid,
-                    start_time: process.start_time,
-                    stamps,
-                });
+        let self_pid = std::process::id() as i32;
+        let self_uid = std::fs::metadata(proc_root.join("self"))
+            .map_err(|error| {
+                crate::error::DaemonError::Process(format!(
+                    "startup provider inventory self identity failed: {error}"
+                ))
+            })?
+            .uid();
+        let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
+        let mut reaped = 0_usize;
+        let mut consecutive_empty_passes = 0_u8;
+        for _ in 0..STARTUP_ORPHAN_FIXED_POINT_MAX_PASSES {
+            if StdInstant::now() >= deadline {
+                return Err(crate::error::DaemonError::Process(
+                    "startup provider inventory exceeded its deadline".into(),
+                ));
             }
-        }
-        let test_inventory_changed = run_startup_provider_after_scan_hook(&mut after_scan_hook);
-        if observed.is_empty() {
-            consecutive_empty_passes = if test_inventory_changed {
-                0
-            } else {
-                consecutive_empty_passes.saturating_add(1)
-            };
-            if consecutive_empty_passes >= 2 {
-                return Ok(reaped);
+            let inventory =
+                scan_startup_process_inventory(proc_root, self_pid, self_uid, deadline)?;
+            let mut observed = Vec::new();
+            for process in inventory.processes {
+                if let Some(stamps) = process
+                    .stamps
+                    .authorized_exact_stamp(process.pid, ownership)?
+                {
+                    observed.push(StartupOrphanIdentity {
+                        pid: process.pid,
+                        start_time: process.start_time,
+                        stamps,
+                    });
+                }
             }
-            continue;
+            let test_inventory_changed = run_startup_provider_after_scan_hook(&mut after_scan_hook);
+            if observed.is_empty() {
+                consecutive_empty_passes = if test_inventory_changed {
+                    0
+                } else {
+                    consecutive_empty_passes.saturating_add(1)
+                };
+                if consecutive_empty_passes >= 2 {
+                    return Ok(reaped);
+                }
+                continue;
+            }
+            consecutive_empty_passes = 0;
+            reaped = reaped
+                .checked_add(kill_startup_provider_orphans(
+                    proc_root, observed, ownership, deadline,
+                )?)
+                .ok_or_else(|| {
+                    crate::error::DaemonError::Process(
+                        "startup provider orphan reap count overflowed".into(),
+                    )
+                })?;
         }
-        consecutive_empty_passes = 0;
-        reaped = reaped
-            .checked_add(kill_startup_provider_orphans(
-                proc_root, observed, ownership, deadline,
-            )?)
-            .ok_or_else(|| {
-                crate::error::DaemonError::Process(
-                    "startup provider orphan reap count overflowed".into(),
-                )
-            })?;
+        Err(crate::error::DaemonError::Process(
+            "startup provider inventory did not reach a fixed point".into(),
+        ))
     }
-    Err(crate::error::DaemonError::Process(
-        "startup provider inventory did not reach a fixed point".into(),
-    ))
 }
 
 /// Prove that the same bounded process inventory needed by the destructive
@@ -1915,24 +1933,28 @@ pub(super) fn prove_startup_settlement_orphan_scan_readable(
         let _ = candidate_ids;
         return Ok(());
     }
-    let ownership = StartupProcessOwnership::for_sessions(candidate_ids.iter().copied().collect());
-    let proc_root = Path::new("/proc");
-    let self_pid = std::process::id() as i32;
-    let self_uid = std::fs::metadata(proc_root.join("self"))
-        .map_err(|error| {
-            crate::error::DaemonError::Process(format!(
-                "startup settlement self identity failed: {error}"
-            ))
-        })?
-        .uid();
-    let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
-    let inventory = scan_startup_process_inventory(proc_root, self_pid, self_uid, deadline)?;
-    for process in inventory.processes {
-        process
-            .stamps
-            .authorized_exact_stamp(process.pid, &ownership)?;
+    #[cfg(target_os = "linux")]
+    {
+        let ownership =
+            StartupProcessOwnership::for_sessions(candidate_ids.iter().copied().collect());
+        let proc_root = Path::new("/proc");
+        let self_pid = std::process::id() as i32;
+        let self_uid = std::fs::metadata(proc_root.join("self"))
+            .map_err(|error| {
+                crate::error::DaemonError::Process(format!(
+                    "startup settlement self identity failed: {error}"
+                ))
+            })?
+            .uid();
+        let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
+        let inventory = scan_startup_process_inventory(proc_root, self_pid, self_uid, deadline)?;
+        for process in inventory.processes {
+            process
+                .stamps
+                .authorized_exact_stamp(process.pid, &ownership)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Read the same bounded provider inventory as startup settlement, but require
@@ -1955,13 +1977,15 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
             StartupProcessOwnership::for_sessions(candidate_ids.iter().copied().collect());
         #[cfg(test)]
         let test_proc = archive_cleanup_test_proc_for_session(candidate_ids);
-        #[cfg(test)]
+        #[cfg(all(feature = "test-seam", not(test)))]
+        let test_proc: Option<std::path::PathBuf> = None;
+        #[cfg(any(test, feature = "test-seam"))]
         let test_context = if test_proc.is_none() {
             current_quarantine_holder_test_proc_context()
         } else {
             None
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let proc_root = test_proc
             .as_deref()
             .or_else(|| {
@@ -1970,10 +1994,10 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
                     .map(|context| context.proc_root.as_path())
             })
             .unwrap_or_else(|| Path::new("/proc"));
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-seam")))]
         let proc_root = Path::new("/proc");
         let current_pid = std::process::id() as i32;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let self_uid = if let Some(context) = test_context.as_ref() {
             context.uid
         } else {
@@ -1985,7 +2009,7 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
                 })?
                 .uid()
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-seam")))]
         let self_uid = std::fs::metadata(proc_root.join("self"))
             .map_err(|error| {
                 crate::error::DaemonError::Process(format!(
@@ -2032,7 +2056,7 @@ pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
             QuarantineHolderScanLimits::default(),
         );
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     if let Some(context) = current_quarantine_holder_test_proc_context() {
         return prove_quarantine_has_no_untrusted_same_uid_holders_at(
             &context.proc_root,
@@ -2049,38 +2073,73 @@ pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
             ))
         })?
         .uid();
-    prove_quarantine_has_no_untrusted_same_uid_holders_at(
-        proc_root,
-        self_uid,
-        tree,
-        QuarantineHolderScanLimits::default(),
+    retry_transient_holder_inventory(
+        QUARANTINE_HOLDER_INVENTORY_ATTEMPTS,
+        QUARANTINE_HOLDER_INVENTORY_BACKOFF,
+        || {
+            prove_quarantine_has_no_untrusted_same_uid_holders_at(
+                proc_root,
+                self_uid,
+                tree,
+                QuarantineHolderScanLimits::default(),
+            )
+        },
     )
 }
 
-#[cfg(test)]
+/// Run a holder proof again when it failed only because a same-UID task's
+/// inventory was unstable while being read (an fd closed or reused between
+/// reads, an exiting task, a half-written `fdinfo`). Such churn on a busy host
+/// says nothing about the quarantine, and each attempt is a complete
+/// fixed-point proof. A retained path or inode (a real holder), a deadline or
+/// work-bound failure, and every other error are returned at once and are never
+/// retried; only the final attempt's incomplete-inventory error is surfaced.
+fn retry_transient_holder_inventory<T>(
+    attempts: usize,
+    backoff: Duration,
+    mut prove: impl FnMut() -> crate::error::Result<T>,
+) -> crate::error::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match prove() {
+            Err(error)
+                if attempt < attempts
+                    && error
+                        .to_string()
+                        .contains(QUARANTINE_HOLDER_INVENTORY_INCOMPLETE) =>
+            {
+                attempt += 1;
+                std::thread::sleep(backoff);
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct QuarantineHolderTestProcContext {
     proc_root: std::path::PathBuf,
     uid: u32,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 thread_local! {
     static QUARANTINE_HOLDER_TEST_PROC_CONTEXTS: std::cell::RefCell<Vec<QuarantineHolderTestProcContext>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 fn current_quarantine_holder_test_proc_context() -> Option<QuarantineHolderTestProcContext> {
     QUARANTINE_HOLDER_TEST_PROC_CONTEXTS.with(|contexts| contexts.borrow().last().cloned())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 struct QuarantineHolderTestProcContextGuard {
     depth: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 impl Drop for QuarantineHolderTestProcContextGuard {
     fn drop(&mut self) {
         QUARANTINE_HOLDER_TEST_PROC_CONTEXTS.with(|contexts| {
@@ -2095,7 +2154,7 @@ impl Drop for QuarantineHolderTestProcContextGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 pub(super) fn with_quarantine_holder_test_proc<T>(
     proc_root: &Path,
     uid: u32,
@@ -2113,14 +2172,14 @@ pub(super) fn with_quarantine_holder_test_proc<T>(
     body()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 pub(super) struct SyntheticQuarantineHolderProc {
     temp_dir: tempfile::TempDir,
     uid: u32,
     namespace_root: std::path::PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 impl SyntheticQuarantineHolderProc {
     pub(super) fn new() -> Self {
         let temp_dir = tempfile::tempdir().expect("synthetic holder proc root");
@@ -2150,6 +2209,31 @@ impl SyntheticQuarantineHolderProc {
         );
         std::os::unix::fs::symlink(path, process.join("fd/3"))
             .expect("synthetic retained quarantine fd");
+    }
+
+    /// A same-UID process whose fd inventory cannot be read (`EACCES`, like a
+    /// non-dumpable host process). The proof must refuse it: an unreadable
+    /// process is an unknown holder, never a silent pass.
+    pub(super) fn add_unreadable_process(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let process = write_fake_holder_process(
+            self.proc_root(),
+            992,
+            &self.namespace_root,
+            &self.namespace_root,
+        );
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0))
+            .expect("synthetic unreadable fd inventory");
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl Drop for SyntheticQuarantineHolderProc {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        // Let the temp dir be removed even after `add_unreadable_process`.
+        let fd_dir = self.proc_root().join("992/task/992/fd");
+        let _ = std::fs::set_permissions(fd_dir, std::fs::Permissions::from_mode(0o755));
     }
 }
 
@@ -2553,7 +2637,7 @@ fn revalidate_quarantine_task(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 fn initialize_fake_holder_proc(proc_root: &Path) -> (u32, std::path::PathBuf) {
     let self_namespace = proc_root.join("self/ns");
     std::fs::create_dir_all(&self_namespace).expect("fake self mount namespace");
@@ -2567,7 +2651,7 @@ fn initialize_fake_holder_proc(proc_root: &Path) -> (u32, std::path::PathBuf) {
     (uid, namespace_root)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 fn write_fake_holder_process(
     proc_root: &Path,
     pid: i32,
@@ -2577,7 +2661,7 @@ fn write_fake_holder_process(
     write_fake_holder_task(proc_root, pid, pid, namespace_root, cwd, b'S', 424242)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 #[allow(clippy::too_many_arguments)]
 fn write_fake_holder_task(
     proc_root: &Path,
@@ -3012,6 +3096,38 @@ fn scan_quarantine_task_inventory(
                         None
                     }
                 };
+                // A descriptor that churns only between objects on devices
+                // that hold no quarantine entry (procfs handles of a
+                // concurrent daemon's own holder scan, dmabufs, pipes, sockets)
+                // cannot retain the tree, so its drift is not an incomplete
+                // inventory. Any observed identity on a tree device keeps the
+                // strict fail-closed handling below.
+                let drifted = descriptor_target != revalidated_target
+                    || descriptor_identity != revalidated_identity;
+                let observed_identities = [descriptor_identity, revalidated_identity];
+                // An io_uring can retain tree files as fixed files while its own
+                // inode lives on a foreign device, and its fdinfo is inspected
+                // only for the initially read target. Drift to or from an
+                // io_uring therefore never takes the foreign-device skip
+                // (Codex review of #393).
+                let observed_io_uring =
+                    [&descriptor_target, &revalidated_target]
+                        .iter()
+                        .any(|target| {
+                            target.as_ref().is_some_and(|target| {
+                                target.as_os_str().as_bytes() == b"anon_inode:[io_uring]"
+                            })
+                        });
+                if drifted
+                    && !observed_io_uring
+                    && observed_identities.iter().flatten().count() > 0
+                    && observed_identities
+                        .iter()
+                        .flatten()
+                        .all(|(device, _)| !tree.contains_device(*device))
+                {
+                    continue;
+                }
                 let revalidated_closed =
                     revalidated_target_not_found && revalidated_identity_not_found;
                 if revalidated_closed {
@@ -3275,7 +3391,7 @@ fn scan_quarantine_task_inventory(
             return Ok(());
         }
         return Err(crate::error::DaemonError::Process(format!(
-            "quarantine holder inventory is incomplete: {failure}"
+            "{QUARANTINE_HOLDER_INVENTORY_INCOMPLETE} {failure}"
         )));
     }
     Ok(())
@@ -4502,7 +4618,219 @@ fn authenticate_portal_fuse_mount_helper_at(
     }))
 }
 
-/// Authenticate the three narrow trusted platform classes admitted by the
+/// One readable link of the OpenSSH privilege-separation chain, bound to the
+/// root-owned listener through `/proc/<pid>/status` credentials (readable even
+/// when the process is not).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SshdChainLink {
+    pid: i32,
+    parent_pid: i32,
+    start_time: u64,
+    state: u8,
+    directory_device: u64,
+    directory_inode: u64,
+}
+
+fn observe_root_sshd_link(
+    proc_root: &Path,
+    pid: i32,
+    privileged_uid: u32,
+    expected_comm: &[&str],
+) -> crate::error::Result<Option<SshdChainLink>> {
+    if pid <= 1 {
+        return Ok(None);
+    }
+    let Some((comm, parent_pid)) = read_proc_comm_and_parent(proc_root, pid)? else {
+        return Ok(None);
+    };
+    if !expected_comm.contains(&comm.as_str()) {
+        return Ok(None);
+    }
+    let process_root = proc_root.join(pid.to_string());
+    let metadata = match std::fs::symlink_metadata(&process_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(crate::error::DaemonError::Process(format!(
+                "quarantine sshd chain identity failed for pid {pid}: {error}"
+            )));
+        }
+    };
+    let Some((start_time, state)) = read_proc_start_identity(proc_root, pid)? else {
+        return Ok(None);
+    };
+    if matches!(state, b'Z' | b'X' | b'x') {
+        return Ok(None);
+    }
+    let Some(status) =
+        read_quarantine_task_status(&process_root, pid, pid, QUARANTINE_HOLDER_STATUS_MAX_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let root_credentials = ProcTaskCredentials {
+        real: privileged_uid,
+        effective: privileged_uid,
+        saved: privileged_uid,
+        filesystem: privileged_uid,
+    };
+    if status.pid != pid || status.tgid != pid || status.credentials != root_credentials {
+        return Ok(None);
+    }
+    Ok(Some(SshdChainLink {
+        pid,
+        parent_pid,
+        start_time,
+        state,
+        directory_device: metadata.dev(),
+        directory_inode: metadata.ino(),
+    }))
+}
+
+/// Observe the strict sshd chain above a per-login `sshd-session` child: the
+/// parent is a fully root-credentialed `sshd` or `sshd-session` (the
+/// privileged monitor), and an `sshd-session` monitor is itself the child of a
+/// fully root-credentialed `sshd` listener. Returns the parent and, when
+/// present, the listener.
+fn observe_sshd_parent_chain(
+    proc_root: &Path,
+    parent_pid: i32,
+    privileged_uid: u32,
+) -> crate::error::Result<Option<(SshdChainLink, Option<SshdChainLink>)>> {
+    let Some(parent) = observe_root_sshd_link(
+        proc_root,
+        parent_pid,
+        privileged_uid,
+        &["sshd-session", "sshd"],
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some((parent_comm, _)) = read_proc_comm_and_parent(proc_root, parent_pid)? else {
+        return Ok(None);
+    };
+    if parent_comm == "sshd" {
+        return Ok(Some((parent, None)));
+    }
+    let Some(listener) =
+        observe_root_sshd_link(proc_root, parent.parent_pid, privileged_uid, &["sshd"])?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((parent, Some(listener))))
+}
+
+fn observe_sshd_session_process(
+    proc_root: &Path,
+    pid: i32,
+    uid: u32,
+    privileged_uid: u32,
+) -> crate::error::Result<Option<(SshdChainLink, (SshdChainLink, Option<SshdChainLink>))>> {
+    // The per-login child keeps the `sshd-session` comm; its argv title
+    // (`sshd-session: <user>@pts/N`) is rewritable by the process and is not
+    // trusted. Its readable status must show it is the unprivileged user (never
+    // an elevated or root task), and its parent chain must be root-credentialed
+    // `sshd`/`sshd-session`, which a same-UID process cannot forge.
+    if privileged_uid == uid {
+        return Ok(None);
+    }
+    let Some((comm, parent_pid)) = read_proc_comm_and_parent(proc_root, pid)? else {
+        return Ok(None);
+    };
+    if comm != "sshd-session" || parent_pid <= 1 {
+        return Ok(None);
+    }
+    let process_root = proc_root.join(pid.to_string());
+    let metadata = match std::fs::symlink_metadata(&process_root) {
+        Ok(metadata)
+            if metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid =>
+        {
+            metadata
+        }
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(crate::error::DaemonError::Process(format!(
+                "quarantine sshd-session identity failed for pid {pid}: {error}"
+            )));
+        }
+    };
+    let Some((start_time, state)) = read_proc_start_identity(proc_root, pid)? else {
+        return Ok(None);
+    };
+    if matches!(state, b'Z' | b'X' | b'x') {
+        return Ok(None);
+    }
+    let Some(status) =
+        read_quarantine_task_status(&process_root, pid, pid, QUARANTINE_HOLDER_STATUS_MAX_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let user_credentials = ProcTaskCredentials {
+        real: uid,
+        effective: uid,
+        saved: uid,
+        filesystem: uid,
+    };
+    if status.pid != pid || status.tgid != pid || status.credentials != user_credentials {
+        return Ok(None);
+    }
+    let Some(chain) = observe_sshd_parent_chain(proc_root, parent_pid, privileged_uid)? else {
+        return Ok(None);
+    };
+    let link = SshdChainLink {
+        pid,
+        parent_pid,
+        start_time,
+        state,
+        directory_device: metadata.dev(),
+        directory_inode: metadata.ino(),
+    };
+    Ok(Some((link, chain)))
+}
+
+/// Authenticate the per-login OpenSSH privilege-separated child
+/// (`sshd-session: <user>@pts/N`). It cannot hold a quarantine tree, but its
+/// `/proc` inventory is unreadable to the same-UID daemon, so without an
+/// exemption every ssh login would refuse every archive. Identity is the exact
+/// `sshd-session` comm, all-user credentials, and a fully root-credentialed
+/// sshd/sshd-session parent chain, observed twice for stability.
+fn authenticate_sshd_session_process(
+    proc_root: &Path,
+    pid: i32,
+    uid: u32,
+    privileged_uid: u32,
+) -> crate::error::Result<Option<TrustedPlatformProcessIdentity>> {
+    let Some(observed) = observe_sshd_session_process(proc_root, pid, uid, privileged_uid)? else {
+        return Ok(None);
+    };
+    if observe_sshd_session_process(proc_root, pid, uid, privileged_uid)? != Some(observed) {
+        return Ok(None);
+    }
+    let (link, (parent, listener)) = observed;
+    Ok(Some(TrustedPlatformProcessIdentity {
+        class: TrustedPlatformProcessClass::SshdSession,
+        start_time: link.start_time,
+        state: link.state,
+        uid,
+        parent_pid: link.parent_pid,
+        directory_device: link.directory_device,
+        directory_inode: link.directory_inode,
+        parent_start_time: Some(parent.start_time),
+        parent_state: Some(parent.state),
+        parent_directory_device: Some(parent.directory_device),
+        parent_directory_inode: Some(parent.directory_inode),
+        ancestor_pid: listener.map(|link| link.pid),
+        ancestor_start_time: listener.map(|link| link.start_time),
+        ancestor_state: listener.map(|link| link.state),
+        ancestor_directory_device: listener.map(|link| link.directory_device),
+        ancestor_directory_inode: listener.map(|link| link.directory_inode),
+        platform_binary_device: None,
+        platform_binary_inode: None,
+    }))
+}
+
+/// Authenticate the four narrow trusted platform classes admitted by the
 /// quarantine policy. This does not prove that they hold no references:
 /// manager FDSTORE/transient stdio/RootDirectory descriptors, sd-pam inherited
 /// descriptors, the exact portal fusermount helper's privileged descriptors,
@@ -4516,6 +4844,9 @@ fn authenticate_trusted_platform_process(
     uid: u32,
 ) -> crate::error::Result<Option<TrustedPlatformProcessIdentity>> {
     if let Some(identity) = authenticate_portal_fuse_mount_helper(proc_root, pid, uid)? {
+        return Ok(Some(identity));
+    }
+    if let Some(identity) = authenticate_sshd_session_process(proc_root, pid, uid, 0)? {
         return Ok(Some(identity));
     }
     let Some((comm, parent_pid)) = read_proc_comm_and_parent(proc_root, pid)? else {
@@ -5035,6 +5366,56 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
+    fn holder_inventory_retry_absorbs_transient_instability_but_never_a_holder() {
+        let incomplete = || {
+            crate::error::DaemonError::Process(format!(
+                "{QUARANTINE_HOLDER_INVENTORY_INCOMPLETE} fd target changed during proof for pid 1"
+            ))
+        };
+        let holder = || {
+            crate::error::DaemonError::Process(
+                "same-UID task tgid 1 tid 1 retains quarantine through fd".into(),
+            )
+        };
+
+        // Transient instability that clears is absorbed.
+        let mut calls = 0;
+        let result = retry_transient_holder_inventory(4, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                Err(incomplete())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.expect("transient instability retried"), 3);
+
+        // Persistent instability still fails closed after the bounded attempts.
+        let mut calls = 0;
+        let error = retry_transient_holder_inventory::<()>(4, Duration::ZERO, || {
+            calls += 1;
+            Err(incomplete())
+        })
+        .expect_err("persistent instability fails closed");
+        assert_eq!(calls, 4);
+        assert!(
+            error.to_string().contains("inventory is incomplete"),
+            "{error}"
+        );
+
+        // A real holder is refused on the first observation, never retried.
+        let mut calls = 0;
+        let error = retry_transient_holder_inventory::<()>(4, Duration::ZERO, || {
+            calls += 1;
+            Err(holder())
+        })
+        .expect_err("a holder is refused");
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("retains quarantine"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
     fn proc_map_device_identity_uses_platform_encoding() {
         let file = tempfile::NamedTempFile::new().expect("mapped file fixture");
         let metadata = file.as_file().metadata().expect("mapped file identity");
@@ -5245,6 +5626,107 @@ mod tests {
         )
         .expect_err("same-label fd reuse must fail the holder pass");
         assert!(error.to_string().contains("fd identity changed"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn quarantine_holder_tolerates_fd_churn_on_devices_outside_the_tree() {
+        let (_tree_temp, tree, retained) = holder_tree_fixture();
+        let tree_device = std::fs::metadata(&retained).expect("tree file").dev();
+        let null = Path::new("/dev/null");
+        let zero = Path::new("/dev/zero");
+        let foreign = std::fs::metadata(null).expect("/dev/null").dev();
+        assert_ne!(
+            foreign, tree_device,
+            "fixture needs a device outside the tree"
+        );
+        assert!(!tree.contains_device(foreign));
+        assert!(tree.contains_device(tree_device));
+
+        let proc_temp = tempfile::tempdir().expect("fake proc root");
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_temp.path());
+        let process =
+            write_fake_holder_process(proc_temp.path(), 173, &namespace_root, &namespace_root);
+        let descriptor = process.join("fd/4");
+        std::os::unix::fs::symlink(null, &descriptor).expect("initial foreign fd target");
+        let replacement = descriptor.clone();
+        QUARANTINE_HOLDER_FD_REVALIDATE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&replacement).expect("remove initial fd target");
+                std::os::unix::fs::symlink(zero, &replacement).expect("replace fd target");
+            }));
+        });
+        prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect("churn between objects outside the tree must not fail the pass");
+
+        // The same churn ending on the tree's device stays fail-closed.
+        std::fs::remove_file(&descriptor).expect("remove replacement fd target");
+        std::os::unix::fs::symlink(null, &descriptor).expect("restored foreign fd target");
+        let onto_tree_device = namespace_root.join("same-device");
+        std::fs::write(&onto_tree_device, "same device\n").expect("same-device target");
+        let replacement = descriptor.clone();
+        QUARANTINE_HOLDER_FD_REVALIDATE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&replacement).expect("remove initial fd target");
+                std::os::unix::fs::symlink(&onto_tree_device, &replacement)
+                    .expect("replace fd target with a same-device file");
+            }));
+        });
+        let error = prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect_err("churn onto the tree's device must fail the pass");
+        assert!(error.to_string().contains("fd target changed"), "{error}");
+
+        // A descriptor that holds a tree entry is still refused outright.
+        std::fs::remove_file(&descriptor).expect("remove same-device fd target");
+        std::os::unix::fs::symlink(&retained, &descriptor).expect("retained tree fd target");
+        let error = prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect_err("a real holder is still refused");
+        assert!(error.to_string().contains("through fd"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn quarantine_holder_refuses_fd_reuse_as_io_uring_during_the_pass() {
+        // A foreign-device fd reused as an io_uring between the reads could
+        // retain tree files as fixed files; the drift must fail the pass
+        // rather than take the foreign-device skip.
+        let (_tree_temp, tree, _retained) = holder_tree_fixture();
+        let proc_temp = tempfile::tempdir().expect("fake proc root");
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_temp.path());
+        let process =
+            write_fake_holder_process(proc_temp.path(), 174, &namespace_root, &namespace_root);
+        let descriptor = process.join("fd/4");
+        std::os::unix::fs::symlink("/dev/null", &descriptor).expect("initial foreign fd target");
+        let replacement = descriptor.clone();
+        QUARANTINE_HOLDER_FD_REVALIDATE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&replacement).expect("remove initial fd target");
+                std::os::unix::fs::symlink("anon_inode:[io_uring]", &replacement)
+                    .expect("reuse the fd as an io_uring");
+            }));
+        });
+        prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect_err("fd reuse as an io_uring during the pass must fail closed");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -5833,6 +6315,214 @@ mod tests {
             .expect("restore maps fixture");
     }
 
+    struct FakeSshdLogin {
+        session_pid: i32,
+        monitor_pid: i32,
+        listener_pid: i32,
+        task: PathBuf,
+        denied: PathBuf,
+    }
+
+    /// Synthetic listener -> privileged monitor -> per-login session chain.
+    /// The session's inventory is made unreadable the way the kernel hides a
+    /// non-dumpable same-UID task; the chain's status files carry the credentials.
+    fn write_fake_sshd_login(
+        proc_root: &Path,
+        namespace_root: &Path,
+        uid: u32,
+        session_comm: &str,
+    ) -> FakeSshdLogin {
+        let (listener_pid, monitor_pid, session_pid) = (4001, 4002, 4003);
+        for (pid, parent, comm, owner) in [
+            (listener_pid, 1, "sshd", 0),
+            (monitor_pid, listener_pid, "sshd-session", 0),
+            (session_pid, monitor_pid, session_comm, uid),
+        ] {
+            write_fake_holder_process(proc_root, pid, namespace_root, namespace_root);
+            let process = proc_root.join(pid.to_string());
+            write_fake_platform_stat(&process, pid, comm, parent, 5_000 + u64::from(pid as u32));
+            write_fake_platform_status(&process, pid, owner, owner);
+            // Root-credentialed chain members are skipped by the holder scan.
+            std::fs::write(
+                process.join("task").join(pid.to_string()).join("status"),
+                format!(
+                    "Name:\t{comm}\nTgid:\t{pid}\nPid:\t{pid}\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+                ),
+            )
+            .expect("fake sshd chain task status");
+        }
+        let task = proc_root
+            .join(session_pid.to_string())
+            .join("task")
+            .join(session_pid.to_string());
+        let denied = proc_root.join("denied");
+        std::fs::create_dir(&denied).expect("denied inventory parent");
+        std::fs::write(denied.join("target"), "denied\n").expect("denied inventory target");
+        std::fs::remove_file(task.join("cwd")).expect("replace cwd inventory");
+        std::fs::remove_file(task.join("root")).expect("replace root inventory");
+        std::fs::remove_file(task.join("ns/mnt")).expect("replace namespace inventory");
+        std::os::unix::fs::symlink(denied.join("target"), task.join("cwd"))
+            .expect("denied cwd inventory");
+        std::os::unix::fs::symlink(denied.join("target"), task.join("root"))
+            .expect("denied root inventory");
+        std::os::unix::fs::symlink(denied.join("target"), task.join("ns/mnt"))
+            .expect("denied namespace inventory");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("deny inventory traversal");
+        std::fs::set_permissions(task.join("fd"), std::fs::Permissions::from_mode(0o000))
+            .expect("deny fd inventory");
+        std::fs::set_permissions(task.join("maps"), std::fs::Permissions::from_mode(0o000))
+            .expect("deny maps inventory");
+        FakeSshdLogin {
+            session_pid,
+            monitor_pid,
+            listener_pid,
+            task,
+            denied,
+        }
+    }
+
+    fn restore_fake_sshd_login(login: &FakeSshdLogin) {
+        std::fs::set_permissions(&login.denied, std::fs::Permissions::from_mode(0o700))
+            .expect("restore denied fixture parent");
+        std::fs::set_permissions(
+            login.task.join("fd"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore fd fixture");
+        std::fs::set_permissions(
+            login.task.join("maps"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("restore maps fixture");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn sshd_session_login_does_not_block_holder_proof_but_lookalikes_still_refuse() {
+        let (_tree_temp, tree, _file) = holder_tree_fixture();
+        let proc_temp = tempfile::tempdir().expect("fake proc root");
+        let proc_root = proc_temp.path();
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_root);
+        let login = write_fake_sshd_login(proc_root, &namespace_root, uid, "sshd-session");
+        let prove = || {
+            prove_quarantine_has_no_untrusted_same_uid_holders_at(
+                proc_root,
+                uid,
+                &tree,
+                QuarantineHolderScanLimits::default(),
+            )
+        };
+        let session = proc_root.join(login.session_pid.to_string());
+        let monitor = proc_root.join(login.monitor_pid.to_string());
+        let listener = proc_root.join(login.listener_pid.to_string());
+
+        let proof = prove().expect("a genuine ssh login is a trusted platform process");
+        // One exempt process is recorded once per fixed-point pass.
+        assert_eq!(proof.trusted_platform_exemptions(), 2);
+        let identity = authenticate_sshd_session_process(proc_root, login.session_pid, uid, 0)
+            .expect("authenticate sshd-session")
+            .expect("genuine sshd-session is trusted");
+        assert_eq!(identity.class, TrustedPlatformProcessClass::SshdSession);
+        assert_eq!(identity.parent_pid, login.monitor_pid);
+        assert_eq!(identity.ancestor_pid, Some(login.listener_pid));
+
+        let refused = |label: &str| {
+            let error = prove().expect_err(label);
+            assert!(
+                error
+                    .to_string()
+                    .contains(QUARANTINE_HOLDER_INVENTORY_INCOMPLETE),
+                "{label}: {error}"
+            );
+        };
+
+        // Same-UID lookalike comm.
+        write_fake_platform_stat(
+            &session,
+            login.session_pid,
+            "sshd-session-fake",
+            login.monitor_pid,
+            5_003,
+        );
+        refused("a renamed comm is an unknown holder");
+        write_fake_platform_stat(
+            &session,
+            login.session_pid,
+            "sshd",
+            login.monitor_pid,
+            5_003,
+        );
+        refused("only the exact sshd-session comm is exempt");
+        write_fake_platform_stat(
+            &session,
+            login.session_pid,
+            "sshd-session",
+            login.monitor_pid,
+            5_003,
+        );
+        prove().expect("restored comm is trusted again");
+
+        // Parent that is not a root-credentialed sshd.
+        write_fake_platform_status(&monitor, login.monitor_pid, uid, uid);
+        refused("a same-UID parent fails the root parent check");
+        write_fake_platform_status(&monitor, login.monitor_pid, 0, 0);
+        write_fake_platform_status(&monitor, login.monitor_pid, 0, uid);
+        refused("a parent with any non-root credential fails");
+        write_fake_platform_status(&monitor, login.monitor_pid, 0, 0);
+        write_fake_platform_stat(
+            &monitor,
+            login.monitor_pid,
+            "bash",
+            login.listener_pid,
+            5_002,
+        );
+        refused("a root parent that is not sshd fails");
+        write_fake_platform_stat(
+            &monitor,
+            login.monitor_pid,
+            "sshd-session",
+            login.listener_pid,
+            5_002,
+        );
+
+        // Listener above an sshd-session monitor must be a root sshd.
+        write_fake_platform_stat(&listener, login.listener_pid, "sshd", 1, 5_001);
+        write_fake_platform_status(&listener, login.listener_pid, uid, uid);
+        refused("a same-UID listener fails the chain");
+        write_fake_platform_status(&listener, login.listener_pid, 0, 0);
+        write_fake_platform_stat(&listener, login.listener_pid, "not-sshd", 1, 5_001);
+        refused("a non-sshd listener fails the chain");
+        write_fake_platform_stat(&listener, login.listener_pid, "sshd", 1, 5_001);
+
+        // The session itself must be exactly the unprivileged user.
+        std::fs::write(
+            session.join("status"),
+            format!(
+                "Name:\tsshd-session\nTgid:\t{pid}\nPid:\t{pid}\nUid:\t{uid}\t0\t0\t0\n",
+                pid = login.session_pid
+            ),
+        )
+        .expect("elevated session status");
+        refused("a session with a privileged credential is unknown");
+        write_fake_platform_status(&session, login.session_pid, uid, uid);
+
+        // A readable holder still wins over the exemption.
+        std::fs::write(
+            login.task.join("mountinfo"),
+            format!(
+                "2 1 00:00 {} {} rw - none none rw\n",
+                tree.root().display(),
+                tree.root().display()
+            ),
+        )
+        .expect("lexical quarantine mount");
+        let error = prove().expect_err("an observed holder must win over the sshd exemption");
+        assert!(error.to_string().contains("mount"), "{error}");
+
+        restore_fake_sshd_login(&login);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn portal_fusermount_exemption_requires_exact_privilege_argv_cgroup_and_ancestry() {
@@ -6054,25 +6744,63 @@ mod tests {
             ) {
                 continue;
             }
-            if authenticate_portal_fuse_mount_helper(proc_root, pid, uid)
+            if let Some(identity) = authenticate_portal_fuse_mount_helper(proc_root, pid, uid)
                 .expect("authenticate live platform candidate")
-                .is_some()
             {
-                exact_helper = Some(pid);
+                exact_helper = Some((pid, identity));
                 break;
             }
         }
-        let Some(_pid) = exact_helper else {
+        let Some((helper_pid, helper_identity)) = exact_helper else {
             return;
         };
         let (_temp, tree, _file) = holder_tree_fixture();
-        let proof = prove_quarantine_has_no_untrusted_same_uid_holders_at(
+        let proof = match prove_quarantine_has_no_untrusted_same_uid_holders_at(
             proc_root,
             uid,
             &tree,
             QuarantineHolderScanLimits::default(),
-        )
-        .expect("the exact live portal helper receives a recorded permission-only exemption");
+        ) {
+            Ok(proof) => proof,
+            Err(crate::error::DaemonError::Process(message)) => {
+                // A live, unrelated same-UID process with an unreadable cwd makes
+                // the host-wide empty-tree proof unavailable. Production must
+                // still fail closed; only this live-platform test is unsupported.
+                let inaccessible_pid = message
+                    .strip_prefix(
+                        "quarantine holder inventory is incomplete: cwd identity read failed for pid ",
+                    )
+                    .and_then(|rest| rest.strip_suffix(": Permission denied (os error 13)"))
+                    .and_then(|value| value.parse::<i32>().ok());
+                if let Some(pid) = inaccessible_pid
+                    && pid != helper_pid
+                    && pid != helper_identity.parent_pid
+                    && Some(pid) != helper_identity.ancestor_pid
+                    && matches!(
+                        authenticate_trusted_platform_process(proc_root, pid, uid),
+                        Ok(None)
+                    )
+                {
+                    eprintln!(
+                        "unsupported live /proc proof: unrelated pid {pid} has an unreadable cwd"
+                    );
+                    return;
+                }
+                panic!(
+                    "the exact live portal helper must receive a recorded permission-only exemption: {message}"
+                );
+            }
+            Err(error) => panic!(
+                "the exact live portal helper must receive a recorded permission-only exemption: {error}"
+            ),
+        };
+        if authenticate_portal_fuse_mount_helper(proc_root, helper_pid, uid)
+            .expect("recheck live platform helper")
+            != Some(helper_identity)
+        {
+            eprintln!("unsupported live /proc proof: portal helper identity changed");
+            return;
+        }
         assert!(proof.trusted_platform_exemptions() >= 2);
     }
 
@@ -6151,6 +6879,32 @@ mod tests {
         // Sanity: the grace window must span multiple poll ticks so a wedged
         // provider is re-checked before escalation, not killed on tick zero.
         assert!(TEARDOWN_KILL_GRACE > TEARDOWN_KILL_POLL);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn non_linux_settlement_reapers_succeed_without_proc_inventory() {
+        let session_id = Uuid::new_v4();
+        let ownership = StartupProcessOwnership::for_sessions(HashSet::from([session_id]));
+        let root = tempfile::tempdir().unwrap();
+        let missing_proc = root.path().join("missing-proc");
+        assert_eq!(
+            reap_startup_owned_orphans_at(
+                &ownership,
+                &missing_proc,
+                Some(Box::new(|| panic!("non-Linux reaper must skip inventory"))),
+            )
+            .expect("non-Linux settlement reaper"),
+            0
+        );
+        prove_startup_settlement_orphan_scan_readable(&[session_id])
+            .expect("non-Linux settlement scan proof");
+        assert_eq!(
+            reap_startup_settlement_orphans_checked(&[session_id])
+                .expect("non-Linux settlement entry point"),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]

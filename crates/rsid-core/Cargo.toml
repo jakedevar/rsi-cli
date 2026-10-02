@@ -1,0 +1,17 @@
+[package]
+name = "rsid-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+
+[lints]
+workspace = true

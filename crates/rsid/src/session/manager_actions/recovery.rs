@@ -41,7 +41,9 @@ impl SessionManager {
         session: Uuid,
         require_row: bool,
     ) -> Result<Option<Value>> {
-        if self.active.read().await.contains_key(&session) {
+        if self.active.read().await.contains_key(&session)
+            || crate::reconciliation::terminal_settlement_in_progress(session)
+        {
             return Ok(None);
         }
         let status = self

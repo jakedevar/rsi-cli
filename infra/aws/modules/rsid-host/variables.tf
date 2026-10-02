@@ -64,6 +64,11 @@ variable "data_snapshot_id" {
   type    = string
   default = null
 }
+variable "data_volume_final_snapshot" {
+  type        = bool
+  default     = true
+  description = "Snapshot the data volume when it is destroyed. Keep true for a persistent host; set false where the volume only holds reproducible build state."
+}
 variable "budget_usd" {
   type = number
   validation {
@@ -128,7 +133,7 @@ variable "secret_names" {
   default = []
   validation {
     condition = alltrue([
-      for name in var.secret_names : contains(["codex_api_key", "openrouter_api_key", "github_deploy_key", "tailscale_auth_key"], name)
+      for name in var.secret_names : contains(["anthropic_api_key", "codex_api_key", "openrouter_api_key", "github_deploy_key", "tailscale_auth_key"], name)
     ])
     error_message = "secret_names contains an unsupported name."
   }
@@ -145,6 +150,17 @@ variable "secret_versions" {
   validation {
     condition     = alltrue([for version in values(var.secret_versions) : version >= 1 && floor(version) == version])
     error_message = "Secret versions must be positive integers."
+  }
+}
+variable "provider_cli_npm_packages" {
+  description = "Exact-version npm specs for provider CLIs installed system-wide at boot, e.g. @anthropic-ai/claude-code@2.1.283."
+  type        = list(string)
+  default     = []
+  validation {
+    condition = alltrue([
+      for spec in var.provider_cli_npm_packages : can(regex("^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@[0-9]+\\.[0-9]+\\.[0-9]+$", spec))
+    ])
+    error_message = "Each provider CLI must be an npm package pinned to an exact x.y.z version."
   }
 }
 variable "enable_tailscale" { type = bool }

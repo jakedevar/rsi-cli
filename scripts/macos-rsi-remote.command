@@ -17,9 +17,9 @@ Missing remote host.
 
 Create $config_file on this Mac, for example:
 
-  RSI_SSH_HOST=71.227.210.118
+  RSI_SSH_HOST=remote.example.net
   RSI_SSH_PORT=2222
-  RSI_SSH_USER=jakedevar
+  RSI_SSH_USER=your-remote-user   # optional; default is your ssh config
 
 Then run:
 
@@ -27,12 +27,14 @@ Then run:
 
 Or pass a host directly:
 
-  $0 71.227.210.118
+  $0 remote.example.net
 EOF
   exit 2
 fi
 
-export RSI_SSH_USER="${RSI_SSH_USER:-jakedevar}"
+if [[ -n "${RSI_SSH_USER:-}" ]]; then
+  export RSI_SSH_USER
+fi
 export RSI_SSH_PORT="${RSI_SSH_PORT:-2222}"
 
 exec "$script_dir/rsi-ssh-tui.sh" "$host"

@@ -2023,7 +2023,7 @@ mod tests {
              ## Phase 1 - linkage\n\
              \n\
              ### Automated\n\
-             - cross-stage coverage\n\
+             - [PASS] cross-stage coverage\n\
              \x20\x20satisfies: {satisfies}\n\
              \n\
              ### Daemon-level\n\
@@ -2079,6 +2079,28 @@ mod tests {
             ContractError::UncoveredLinkage { keys } => assert_eq!(keys, vec!["F-002"]),
             other => panic!("expected UncoveredLinkage, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn cross_stage_pass_ignores_failed_and_pending_items() {
+        let handoff = verify_handoff_declaring("F-001");
+        for status in ["[FAIL]", "[PENDING]", "[ ]", ""] {
+            let mut manifest = manifest_covering(&["F-001"]);
+            manifest.phases[0].items[0].status = match status {
+                "[FAIL]" => Some(crate::verification_manifest::ItemStatus::Fail),
+                "[PENDING]" => Some(crate::verification_manifest::ItemStatus::Pending),
+                "[ ]" => Some(crate::verification_manifest::ItemStatus::Unchecked),
+                _ => None,
+            };
+            match cross_stage_verify_coverage(&handoff, &manifest).unwrap_err() {
+                ContractError::UncoveredLinkage { keys } => assert_eq!(keys, vec!["F-001"]),
+                other => panic!("status `{status}`: expected UncoveredLinkage, got {other:?}"),
+            }
+        }
+        assert!(
+            cross_stage_verify_coverage(&handoff, &manifest_covering(&["F-001"])).is_ok(),
+            "a PASS item covers"
+        );
     }
 
     #[test]

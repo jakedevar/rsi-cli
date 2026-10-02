@@ -151,6 +151,7 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                 ManagerInspectSectionV2::Archive,
                 ManagerInspectSectionV2::Health,
                 ManagerInspectSectionV2::MigrationAllocations,
+                ManagerInspectSectionV2::Satellites,
             ];
             let current = match section {
                 Some(ManagerSection::Inspect(s)) => {

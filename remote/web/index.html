@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f3f1ec">
+    <title>RSI Remote</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#sessions" aria-label="RSI Remote sessions">
+          <span class="brand-mark" aria-hidden="true">R</span>
+          <span>RSI <span class="brand-light">Remote</span></span>
+        </a>
+        <div class="connection" id="connection" role="status" aria-live="polite" data-state="connecting">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-text">Connecting…</span>
+        </div>
+        <button class="icon-button refresh-button" id="refresh" type="button" aria-label="Refresh sessions" title="Refresh sessions">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.8 9a7 7 0 0 1 12-2L20 12M4 17v-5h5m10.2 3a7 7 0 0 1-12 2L4 12"/></svg>
+        </button>
+      </header>
+
+      <main id="main" class="workspace">
+        <section id="list-pane" class="list-pane" aria-labelledby="list-title">
+          <div class="list-heading">
+            <div>
+              <p class="eyebrow">YOUR WORKSPACE</p>
+              <h1 id="list-title">Sessions</h1>
+            </div>
+            <span id="session-count" class="count">—</span>
+          </div>
+          <label class="search-box">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/></svg>
+            <span class="sr-only">Search sessions</span>
+            <input id="search" type="search" placeholder="Find a session" autocomplete="off">
+            <kbd aria-hidden="true">⌘ K</kbd>
+          </label>
+          <div id="list-state" class="inline-state" role="status" hidden></div>
+          <div id="session-list" class="session-list" role="list" aria-label="Sessions"></div>
+        </section>
+
+        <section id="detail-pane" class="detail-pane" aria-label="Session detail" hidden>
+          <div id="detail-state" class="detail-state" role="status" hidden></div>
+          <div id="detail-content"></div>
+        </section>
+      </main>
+
+      <footer class="footnote"><span>Read only</span><span class="footnote-divider" aria-hidden="true">·</span><span>Session activity from your RSI host</span></footer>
+    </div>
+  </body>
+</html>

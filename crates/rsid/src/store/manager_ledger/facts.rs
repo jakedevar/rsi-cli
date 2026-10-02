@@ -297,6 +297,16 @@ impl Store {
     /// provenance (`None` only when the project never had a V2 grant; every
     /// agent path has already required one through `manager_v2_authorize`).
     fn manager_v2_fact_writer(&self, config: &HarnessManagerConfigV1) -> Result<Option<i64>> {
+        if let Some(caller) = config.current_session_id
+            && let Some(authority) = self.manager_area_authority_current(caller)?
+        {
+            if authority.config.manager_session_id != config.manager_session_id
+                || authority.config.row_version != config.row_version
+            {
+                return Err(refused("manager_v2_scope_changed"));
+            }
+            return Ok(Some(authority.grant.row_version));
+        }
         let current: Option<(String, i64)> = self
             .conn
             .query_row(

@@ -104,6 +104,9 @@ pub(crate) struct TokenUsage {
     pub confidence: ContextUsageConfidence,
     pub stop_reason: Option<String>,
     // === V99 richer usage capture (P1-C) ===
+    /// Raw full-prompt tokens from the provider, before cache subtraction.
+    /// Metric-only; does not affect context fill or confidence.
+    pub prompt_tokens_total: u64,
     /// `usage.output_tokens_details.thinking_tokens` for this turn.
     pub thinking: u64,
     /// `usage.cache_creation.ephemeral_1h_input_tokens` for this turn.
@@ -249,12 +252,18 @@ pub(crate) fn extract_token_usage(stream_event: &StreamEvent) -> Option<TokenUsa
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let prompt_tokens_total = usage
+        .and_then(|u| u.get("prompt_tokens_total"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
     Some(TokenUsage {
         input,
         cache_creation,
         cache_read,
         output,
         total_input: input + cache_creation + cache_read,
+        prompt_tokens_total,
         confidence,
         stop_reason,
         thinking,
@@ -712,6 +721,7 @@ mod tests {
             cache_read: 300,
             output: 500,
             total_input: 1500,
+            prompt_tokens_total: 0,
             confidence: ContextUsageConfidence::Full,
             stop_reason: Some("end_turn".to_string()),
             thinking: 120,
@@ -751,6 +761,7 @@ mod tests {
             cache_read: 0,
             output: 50,
             total_input: 100,
+            prompt_tokens_total: 0,
             confidence: ContextUsageConfidence::Partial,
             stop_reason: None,
             thinking: 0,

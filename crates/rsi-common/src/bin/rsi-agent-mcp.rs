@@ -1,6 +1,7 @@
 //! Ephemeral stdio MCP gateway for the closed, token-bound agent RPC catalog.
 //!
-//! This binary is launched only as a child of a Codex session. It has no
+//! This binary is launched only as a child of a Codex or Claude CLI session
+//! (the daemon passes it as a session-ephemeral MCP server). It has no
 //! configuration file and never accepts an authority token from tool input.
 
 use rsi_common::agent_control_schema::{NativeAgentControlToolV1, agent_control_catalog_v1};
@@ -152,6 +153,7 @@ mod tests {
                 .filter(|entry| entry.native_tool.is_some())
                 .count()
         );
+        assert_eq!(names, rsi_common::rpc_verb_registry::native_tool_names());
         assert!(!names.contains(&"AgentContinueChild"));
         assert!(!names.contains(&"AgentArchiveChild"));
         assert!(!names.contains(&"rsi_control_continue_child"));

@@ -342,6 +342,114 @@ pub(crate) fn validate_v119_catalog(connection: &Connection) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v119-target-reclaim-sweep-catalog
 
+// RSI-RELEASED-MIGRATION-BEGIN: target-reclaim-identity-events-migration
+/// Provisional schema version of the identity-keyed terminal evidence rebuild
+/// (#1035). The lander assigns the final number.
+pub(crate) const TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION: i32 = 141;
+
+const IDENTITY_EVENTS_TABLE: &str = "sandbox_target_reclaim_intent_events";
+
+/// The events table is rebuilt so that terminal evidence is unique per exact
+/// target identity, not per custody generation. A continued and rebuilt target
+/// keeps its custody generation but has a new device/inode, and its reclaim
+/// must be able to record its own terminal event beside the earlier one.
+/// `unique_identity` selects the identity-keyed shape; `false` restores the V119 shape
+/// (used by the migration-chain fixtures to rewind).
+pub(crate) fn rebuild_events_table_sql(unique_identity: bool) -> String {
+    let unique = if unique_identity {
+        "UNIQUE(custody_id,generation,expected_device,expected_inode)"
+    } else {
+        "UNIQUE(custody_id,generation)"
+    };
+    // The old table is set aside (its triggers and index dropped by name), the
+    // final table is created under its final name so the stored catalog text is
+    // the canonical statement, and the rows are copied across in event order.
+    format!(
+        "DROP TRIGGER sandbox_target_reclaim_intent_events_v119_exact_insert;
+        DROP TRIGGER sandbox_target_reclaim_intent_events_v119_no_update;
+        DROP TRIGGER sandbox_target_reclaim_intent_events_v119_no_delete;
+        DROP INDEX idx_sandbox_target_reclaim_intent_events_identity_v119;
+        ALTER TABLE {IDENTITY_EVENTS_TABLE} RENAME TO sandbox_target_reclaim_intent_events_old;
+        CREATE TABLE sandbox_target_reclaim_intent_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id INTEGER NOT NULL CHECK(schedule_id>0),
+            custody_id TEXT NOT NULL CHECK(rsi_uuid_is_canonical(custody_id)),
+            generation INTEGER NOT NULL CHECK(generation>0),
+            allocation_id TEXT NOT NULL CHECK(rsi_uuid_is_canonical(allocation_id)),
+            bucket INTEGER NOT NULL CHECK(bucket BETWEEN 0 AND 255),
+            slot_name TEXT NOT NULL
+                CHECK(slot_name='v3_' || custody_id || '_' || CAST(generation AS TEXT)),
+            payload_name TEXT NOT NULL CHECK(payload_name='payload'),
+            expected_device INTEGER NOT NULL CHECK(expected_device>=0),
+            expected_inode INTEGER NOT NULL CHECK(expected_inode>0),
+            terminal_state TEXT NOT NULL CHECK(terminal_state IN ('Completed','Abandoned')),
+            reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 96),
+            final_row_version INTEGER NOT NULL CHECK(final_row_version>0),
+            recorded_at TEXT NOT NULL CHECK(rsi_rfc3339_nanos_is_canonical(recorded_at)),
+            UNIQUE(schedule_id),
+            {unique}
+        );
+        INSERT INTO sandbox_target_reclaim_intent_events(
+            event_id,schedule_id,custody_id,generation,allocation_id,bucket,slot_name,
+            payload_name,expected_device,expected_inode,terminal_state,reason,
+            final_row_version,recorded_at)
+        SELECT event_id,schedule_id,custody_id,generation,allocation_id,bucket,slot_name,
+               payload_name,expected_device,expected_inode,terminal_state,reason,
+               final_row_version,recorded_at
+        FROM sandbox_target_reclaim_intent_events_old ORDER BY event_id;
+        DROP TABLE sandbox_target_reclaim_intent_events_old;
+        CREATE INDEX idx_sandbox_target_reclaim_intent_events_identity_v119
+            ON sandbox_target_reclaim_intent_events(custody_id,generation,event_id);
+        CREATE TRIGGER sandbox_target_reclaim_intent_events_v119_exact_insert
+        BEFORE INSERT ON sandbox_target_reclaim_intent_events
+        WHEN NOT EXISTS (
+            SELECT 1 FROM sandbox_target_reclaim_intents i
+            WHERE i.schedule_id=NEW.schedule_id AND i.custody_id=NEW.custody_id
+              AND i.generation=NEW.generation AND i.allocation_id=NEW.allocation_id
+              AND i.bucket=NEW.bucket AND i.slot_name=NEW.slot_name
+              AND i.payload_name=NEW.payload_name
+              AND i.expected_device=NEW.expected_device
+              AND i.expected_inode=NEW.expected_inode
+              AND i.row_version=NEW.final_row_version
+              AND ((i.state='Deleting' AND NEW.terminal_state='Completed')
+                   OR (i.state='Prepared' AND NEW.terminal_state='Abandoned'))
+        )
+        BEGIN SELECT RAISE(ABORT,'V119 target reclaim terminal evidence identity mismatch'); END;
+        CREATE TRIGGER sandbox_target_reclaim_intent_events_v119_no_update
+        BEFORE UPDATE ON sandbox_target_reclaim_intent_events
+        BEGIN SELECT RAISE(ABORT,'V119 target reclaim terminal evidence is immutable'); END;
+        CREATE TRIGGER sandbox_target_reclaim_intent_events_v119_no_delete
+        BEFORE DELETE ON sandbox_target_reclaim_intent_events
+        BEGIN SELECT RAISE(ABORT,'V119 target reclaim terminal evidence is retained'); END;"
+    )
+}
+
+pub(crate) fn apply_identity_events_migration(store: &Store, version: i32) -> Result<()> {
+    // The intents table's terminal-delete trigger names the events table, so
+    // RENAME must not rewrite or reject trigger references while the table is
+    // briefly absent.
+    store.conn.execute_batch("PRAGMA legacy_alter_table=ON;")?;
+    let outcome = (|| -> Result<()> {
+        let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)?;
+        let prior: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if prior != version - 1 {
+            return Err(DaemonError::Store(format!(
+                "target reclaim identity evidence requires V{}, found V{prior}",
+                version - 1
+            )));
+        }
+        tx.execute_batch(&rebuild_events_table_sql(true))?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = store.conn.execute_batch("PRAGMA legacy_alter_table=OFF;");
+    outcome?;
+    restored?;
+    Ok(())
+}
+// RSI-RELEASED-MIGRATION-END: target-reclaim-identity-events-migration
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TargetReclaimSweepV119MigrationFault {
     AfterPreflight,
@@ -465,6 +573,75 @@ pub(crate) struct TargetReclaimIntentEvent {
     pub expected_device: u64,
     pub expected_inode: u64,
     pub terminal_state: TargetReclaimIntentTerminalState,
+    /// When the terminal event was durably recorded. A target directory born
+    /// after this instant cannot be the target the event settled (#1040).
+    pub recorded_at: chrono::DateTime<Utc>,
+}
+
+/// Flag bit marking a store device value that carries a target epoch.
+const TARGET_EPOCH_FLAG: u64 = 1 << 62;
+const TARGET_EPOCH_SHIFT: u32 = 32;
+const TARGET_EPOCH_MASK: u64 = (1 << 30) - 1;
+/// The largest epoch a store device value can carry.
+pub(crate) const TARGET_EPOCH_MAX: u32 = TARGET_EPOCH_MASK as u32;
+
+/// The device value the store keys reclaim evidence by. Epoch 0 is the raw
+/// filesystem device. A later target that reuses the device and inode of a
+/// reclaimed one (ext4 recycles freed inodes) is keyed under a higher epoch, so
+/// its own intent and terminal evidence cannot collide with the earlier
+/// target's (#1040). Only devices below 2^32 (every Linux `st_dev`) can carry
+/// an epoch; `None` means the epoch is not representable.
+pub(crate) fn store_target_device(device: u64, epoch: u32) -> Option<u64> {
+    if epoch == 0 {
+        return Some(device);
+    }
+    if device >> TARGET_EPOCH_SHIFT != 0 || u64::from(epoch) > TARGET_EPOCH_MASK {
+        return None;
+    }
+    Some(TARGET_EPOCH_FLAG | (u64::from(epoch) << TARGET_EPOCH_SHIFT) | device)
+}
+
+/// Split a store device value into the raw filesystem device and its epoch.
+pub(crate) fn split_store_target_device(store_device: u64) -> (u64, u32) {
+    if store_device & TARGET_EPOCH_FLAG == 0 {
+        return (store_device, 0);
+    }
+    (
+        store_device & u64::from(u32::MAX),
+        ((store_device >> TARGET_EPOCH_SHIFT) & TARGET_EPOCH_MASK) as u32,
+    )
+}
+
+/// Whether retained terminal evidence for a (device, inode) belongs to an
+/// earlier target than the directory now open at that identity (#1040).
+///
+/// A recreated `target/` can reuse the reclaimed directory's device and inode
+/// but never its birth time. A completed reclaim removed its source, so a target
+/// that exists at a completed identity is a new one; without a birth time the
+/// answer fails toward reclaiming. Abandoned evidence left its target in place,
+/// so it is only superseded by a provably newer directory.
+pub(crate) fn terminal_evidence_is_for_earlier_target(
+    event: &TargetReclaimIntentEvent,
+    birth: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    match (event.terminal_state, birth) {
+        (_, Some(birth)) => birth > event.recorded_at,
+        (TargetReclaimIntentTerminalState::Completed, None) => true,
+        (TargetReclaimIntentTerminalState::Abandoned, None) => false,
+    }
+}
+
+/// The next identity epoch to probe. The first jump is derived from the birth
+/// time so a rebuilt target lands on a stable, distinct epoch; without one, or
+/// on a collision, epochs advance one at a time.
+pub(crate) fn next_target_epoch(epoch: u32, birth: Option<chrono::DateTime<Utc>>) -> u32 {
+    if epoch > 0 {
+        return epoch.saturating_add(1);
+    }
+    let span = u64::from(TARGET_EPOCH_MAX);
+    birth
+        .and_then(|birth| birth.timestamp_nanos_opt())
+        .map_or(1, |nanos| 1 + (nanos as u64 % span) as u32)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -590,7 +767,13 @@ impl Store {
         let expected_inode = i64::try_from(expected_inode)
             .map_err(|_| DaemonError::Store("target reclaim inode exceeds SQLite".into()))?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if let Some(event) = load_target_reclaim_intent_event(&tx, custody_id, generation)? {
+        if let Some(event) = load_target_reclaim_intent_event(
+            &tx,
+            custody_id,
+            generation,
+            expected_device,
+            expected_inode,
+        )? {
             tx.commit()?;
             return Ok(PrepareTargetReclaimIntentResult::Terminal(event));
         }
@@ -968,20 +1151,28 @@ fn settle_target_reclaim_intent(
     Ok(())
 }
 
+/// Terminal evidence is keyed by the exact target identity. A later target at
+/// the same custody generation (continue + rebuild) has a different device or
+/// inode and so has no evidence yet: it gets its own intent (#1035).
 fn load_target_reclaim_intent_event(
     connection: &Connection,
     custody_id: Uuid,
     generation: u64,
+    expected_device: i64,
+    expected_inode: i64,
 ) -> Result<Option<TargetReclaimIntentEvent>> {
     connection
         .query_row(
             "SELECT schedule_id,custody_id,generation,allocation_id,bucket,slot_name,
-                    expected_device,expected_inode,terminal_state
+                    expected_device,expected_inode,terminal_state,recorded_at
              FROM sandbox_target_reclaim_intent_events
-             WHERE custody_id=?1 AND generation=?2",
+             WHERE custody_id=?1 AND generation=?2
+               AND expected_device=?3 AND expected_inode=?4",
             params![
                 custody_id.to_string(),
-                sqlite_u64(generation, "target reclaim generation")?
+                sqlite_u64(generation, "target reclaim generation")?,
+                expected_device,
+                expected_inode,
             ],
             decode_target_reclaim_intent_event,
         )
@@ -1079,6 +1270,15 @@ fn decode_target_reclaim_intent_event(
         expected_device: active.expected_device,
         expected_inode: active.expected_inode,
         terminal_state,
+        recorded_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?
+            .with_timezone(&Utc),
     })
 }
 
@@ -1369,11 +1569,24 @@ impl Store {
         &self,
         limit: u32,
     ) -> Result<TerminalReclaimSweepPage> {
+        self.reserve_terminal_reclaim_page_with(limit, false)
+    }
+
+    /// Like [`Self::reserve_terminal_reclaim_page`]. With `recent_first` (a
+    /// pressure pass), the newest terminal rows outside the frozen cycle
+    /// window are placed ahead of the walk's candidates so a session that
+    /// went terminal after the cycle began is not starved until the cycle
+    /// wraps. The walk cursor, cycle and upper bound are unaffected.
+    pub(crate) fn reserve_terminal_reclaim_page_with(
+        &self,
+        limit: u32,
+        recent_first: bool,
+    ) -> Result<TerminalReclaimSweepPage> {
         validate_limit(limit)?;
         with_sweep_busy_timeout(&self.conn, || {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
             let state = load_state(&tx)?;
-            let selected = select_page(&tx, &state, limit, true)?;
+            let selected = select_page(&tx, &state, limit, true, recent_first)?;
             persist_selection(&tx, &selected)?;
             tx.commit()?;
             Ok(selected.page)
@@ -1387,11 +1600,19 @@ impl Store {
         &self,
         limit: u32,
     ) -> Result<TerminalReclaimSweepPage> {
+        self.preview_terminal_reclaim_page_with(limit, false)
+    }
+
+    pub(crate) fn preview_terminal_reclaim_page_with(
+        &self,
+        limit: u32,
+        recent_first: bool,
+    ) -> Result<TerminalReclaimSweepPage> {
         validate_limit(limit)?;
         with_sweep_busy_timeout(&self.conn, || {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
             let state = load_state(&tx)?;
-            let page = select_page(&tx, &state, limit, false)?.page;
+            let page = select_page(&tx, &state, limit, false, recent_first)?.page;
             tx.commit()?;
             Ok(page)
         })
@@ -1482,6 +1703,7 @@ fn select_page(
     state: &SweepState,
     limit: u32,
     reserved: bool,
+    recent_first: bool,
 ) -> Result<SelectedPage> {
     let (cycle_after, upper) = match &state.upper {
         Some(upper) => (state.cycle, Some(upper.clone())),
@@ -1494,12 +1716,23 @@ fn select_page(
         ),
     };
 
+    // Newest terminal rows above the cycle's frozen upper bound: the walk will
+    // not reach them until it wraps. They spend part of the page budget, so a
+    // pass never inspects more than `limit` rows.
+    let recent_keys = match (&state.upper, recent_first) {
+        (Some(upper), true) => {
+            select_recent_terminal_keys(connection, upper, (limit / 2).min(RECENT_FIRST_LIMIT))?
+        }
+        _ => Vec::new(),
+    };
+    let walk_limit = limit - recent_keys.len() as u32;
     let terminal_keys = match &upper {
-        Some(upper) => select_terminal_keys(connection, state.after.as_ref(), upper, limit)?,
+        Some(upper) => select_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?,
         None => Vec::new(),
     };
-    let candidates = terminal_keys
+    let candidates = recent_keys
         .iter()
+        .chain(terminal_keys.iter())
         .map(|key| select_candidate_for_key(connection, key))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
@@ -1537,9 +1770,15 @@ fn select_page(
                     state.after.clone()
                 },
                 upper_bound: upper,
-                page_key_digest: page_key_digest(&terminal_keys),
-                inspected_terminal_rows: terminal_keys.len() as u32,
-                custody_lookups: terminal_keys.len() as u32,
+                page_key_digest: page_key_digest(
+                    &terminal_keys
+                        .iter()
+                        .chain(recent_keys.iter())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                inspected_terminal_rows: (terminal_keys.len() + recent_keys.len()) as u32,
+                custody_lookups: (terminal_keys.len() + recent_keys.len()) as u32,
                 reserved,
                 wrapped: reserved && wrapped,
             },
@@ -1613,6 +1852,34 @@ fn select_terminal_keys(
         }
     };
     rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Newest-first rows above the frozen upper bound a pressure pass examines
+/// ahead of the fair walk.
+const RECENT_FIRST_LIMIT: u32 = 64;
+
+const SELECT_RECENT_TERMINAL_KEYS_ABOVE_SQL: &str = "SELECT updated_at,id FROM sessions
+     WHERE status IN ('Completed','Failed','Interrupted','Archived','Deleted')
+       AND (updated_at,id)>(?1,?2)
+     ORDER BY updated_at DESC,id DESC LIMIT ?3";
+
+fn select_recent_terminal_keys(
+    connection: &Connection,
+    above: &TerminalReclaimSweepKey,
+    limit: u32,
+) -> Result<Vec<TerminalReclaimSweepKey>> {
+    connection
+        .prepare(SELECT_RECENT_TERMINAL_KEYS_ABOVE_SQL)?
+        .query_map(
+            params![
+                above.updated_at,
+                above.session_id.to_string(),
+                i64::from(limit)
+            ],
+            |row| parse_key(Some(row.get(0)?), Some(row.get(1)?), 1).map(Option::unwrap),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
@@ -1820,6 +2087,72 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
+    fn target_epoch_keys_round_trip_and_keep_epoch_zero_raw() {
+        assert_eq!(store_target_device(0x1234, 0), Some(0x1234));
+        assert_eq!(split_store_target_device(0x1234), (0x1234, 0));
+        for epoch in [1, 2, 0xABCDE, TARGET_EPOCH_MAX] {
+            let key = store_target_device(0x1234, epoch).unwrap();
+            assert_ne!(key, 0x1234);
+            assert!(i64::try_from(key).is_ok(), "the key fits SQLite");
+            assert_eq!(split_store_target_device(key), (0x1234, epoch));
+        }
+        // A device that cannot carry an epoch is refused, never aliased.
+        assert_eq!(store_target_device(1 << 32, 1), None);
+        assert_eq!(store_target_device(0x1234, TARGET_EPOCH_MAX + 1), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn terminal_evidence_is_superseded_only_by_a_newer_or_unknown_age_target() {
+        let recorded_at = Utc::now();
+        let event = |terminal_state| TargetReclaimIntentEvent {
+            schedule_id: 1,
+            custody_id: Uuid::new_v4(),
+            generation: 1,
+            allocation_id: Uuid::new_v4(),
+            bucket: 0,
+            slot_name: String::new(),
+            expected_device: 1,
+            expected_inode: 1,
+            terminal_state,
+            recorded_at,
+        };
+        let completed = event(TargetReclaimIntentTerminalState::Completed);
+        let abandoned = event(TargetReclaimIntentTerminalState::Abandoned);
+        let later = recorded_at + chrono::Duration::seconds(1);
+        let earlier = recorded_at - chrono::Duration::seconds(1);
+        // Born after the evidence: a rebuilt target that reused the inode.
+        assert!(terminal_evidence_is_for_earlier_target(
+            &completed,
+            Some(later)
+        ));
+        assert!(terminal_evidence_is_for_earlier_target(
+            &abandoned,
+            Some(later)
+        ));
+        // Born before the evidence: an exact replay of the same target.
+        assert!(!terminal_evidence_is_for_earlier_target(
+            &completed,
+            Some(earlier)
+        ));
+        assert!(!terminal_evidence_is_for_earlier_target(
+            &abandoned,
+            Some(earlier)
+        ));
+        // No birth time: a completed reclaim removed its source, so fail toward
+        // reclaiming; abandoned evidence keeps its target and stays refused.
+        assert!(terminal_evidence_is_for_earlier_target(&completed, None));
+        assert!(!terminal_evidence_is_for_earlier_target(&abandoned, None));
+        // Epochs are stable per birth time, distinct from raw, and advance.
+        let first = next_target_epoch(0, Some(later));
+        assert!((1..=TARGET_EPOCH_MAX).contains(&first));
+        assert_eq!(first, next_target_epoch(0, Some(later)));
+        assert_eq!(next_target_epoch(0, None), 1);
+        assert_eq!(next_target_epoch(first, Some(later)), first + 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
     fn terminal_custody_reclaim_candidates_feed_durable_sweep_and_survive_reopen() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-reopen");
         let database = fixture.path().join("reclaim.db");
@@ -1873,6 +2206,45 @@ mod tests {
         assert_eq!(next_cycle.evidence.cycle_before, 1);
         assert_eq!(next_cycle.evidence.cycle_after, 2);
         assert_eq!(next_cycle.candidates[0].session_id, ids[0]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_takes_terminal_rows_newer_than_the_frozen_upper_bound_first() {
+        let fixture = FixtureDirectory::create("target-reclaim-sweep-recent-first");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..4)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        // A long cycle is in progress: upper bound frozen at ids[3].
+        let first = store.reserve_terminal_reclaim_page(1).unwrap();
+        assert_eq!(first.candidates[0].session_id, ids[0]);
+        // A session becomes terminal after the cycle started.
+        let late = seed_candidate(&mut store, fixture.path(), 5);
+
+        // Without pressure the fair walk defers it until the cycle wraps.
+        let preview = store.preview_terminal_reclaim_page(1).unwrap();
+        assert_eq!(preview.candidates[0].session_id, ids[1]);
+        assert!(preview.candidates.iter().all(|c| c.session_id != late));
+
+        // Under pressure the late session is examined first; the walk
+        // cursor, cycle and upper bound are untouched by the extra rows.
+        let pressure_preview = store.preview_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(pressure_preview.candidates[0].session_id, late);
+        assert_eq!(pressure_preview.candidates[1].session_id, ids[1]);
+        let pressure = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(pressure.candidates[0].session_id, late);
+        assert_eq!(pressure.candidates[1].session_id, ids[1]);
+        assert_eq!(pressure.evidence.upper_bound, first.evidence.upper_bound);
+        assert_eq!(pressure.evidence.cycle_after, first.evidence.cycle_after);
+        assert_eq!(
+            pressure
+                .evidence
+                .cursor_after
+                .as_ref()
+                .map(|k| k.session_id),
+            Some(ids[1])
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -2279,6 +2651,114 @@ mod tests {
                 .execute("DELETE FROM sandbox_target_reclaim_intent_events", [])
                 .is_err()
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn terminal_evidence_is_keyed_by_exact_target_identity() {
+        let fixture = FixtureDirectory::create("target-reclaim-identity-evidence");
+        let mut store = Store::open_in_memory().unwrap();
+        let first = seed_intent(&mut store, fixture.path(), 0);
+        let staged = store.mark_target_reclaim_staged(&first).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+
+        // An exact replay of the same identity is settled by the retained event.
+        let replay = store
+            .prepare_target_reclaim_intent(
+                first.custody_id,
+                first.generation,
+                first.expected_device,
+                first.expected_inode,
+            )
+            .unwrap();
+        let PrepareTargetReclaimIntentResult::Terminal(event) = replay else {
+            panic!("exact replay must be settled by retained terminal evidence");
+        };
+        assert_eq!(event.expected_inode, first.expected_inode);
+        assert_eq!(
+            event.terminal_state,
+            TargetReclaimIntentTerminalState::Completed
+        );
+
+        // A rebuilt target at the same generation has a new inode: it gets its
+        // own intent and its own terminal evidence.
+        let rebuilt_inode = first.expected_inode + 500;
+        let second = store
+            .prepare_target_reclaim_intent(
+                first.custody_id,
+                first.generation,
+                first.expected_device,
+                rebuilt_inode,
+            )
+            .unwrap()
+            .active();
+        assert_eq!(second.expected_inode, rebuilt_inode);
+        assert_ne!(second.schedule_id, first.schedule_id);
+        let staged = store.mark_target_reclaim_staged(&second).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 2);
+
+        for inode in [first.expected_inode, rebuilt_inode] {
+            let PrepareTargetReclaimIntentResult::Terminal(event) = store
+                .prepare_target_reclaim_intent(
+                    first.custody_id,
+                    first.generation,
+                    first.expected_device,
+                    inode,
+                )
+                .unwrap()
+            else {
+                panic!("each identity keeps its own terminal evidence");
+            };
+            assert_eq!(event.expected_inode, inode);
+        }
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn identity_evidence_migration_preserves_events_and_relaxes_uniqueness() {
+        let fixture = FixtureDirectory::create("target-reclaim-identity-migration");
+        let mut store = Store::open_in_memory().unwrap();
+        let first = seed_intent(&mut store, fixture.path(), 0);
+        let staged = store.mark_target_reclaim_staged(&first).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+
+        crate::store::tests::rewind_post_v121_tail_to(
+            &store.conn,
+            TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION - 1,
+        );
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 1);
+        apply_identity_events_migration(&store, TARGET_RECLAIM_IDENTITY_SCHEMA_VERSION).unwrap();
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 1);
+        let PrepareTargetReclaimIntentResult::Terminal(event) = store
+            .prepare_target_reclaim_intent(
+                first.custody_id,
+                first.generation,
+                first.expected_device,
+                first.expected_inode,
+            )
+            .unwrap()
+        else {
+            panic!("the migrated event still settles its exact identity");
+        };
+        assert_eq!(event.schedule_id, first.schedule_id);
+        let second = store
+            .prepare_target_reclaim_intent(
+                first.custody_id,
+                first.generation,
+                first.expected_device,
+                first.expected_inode + 1,
+            )
+            .unwrap()
+            .active();
+        let staged = store.mark_target_reclaim_staged(&second).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

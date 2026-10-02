@@ -422,6 +422,26 @@ pub(crate) struct CodexCatalogSnapshot {
 }
 
 impl CodexCatalogSnapshot {
+    pub(crate) fn effort_capabilities(
+        &self,
+    ) -> Vec<rsi_common::model_utils::ModelEffortCapabilities> {
+        self.models
+            .iter()
+            // Missing metadata must retain the static fallback; an explicit
+            // empty list means this model does not support effort selection.
+            .filter(|model| model.raw_keys.contains("supported_reasoning_levels"))
+            .map(|model| rsi_common::model_utils::ModelEffortCapabilities {
+                model: model.slug.clone(),
+                supported_efforts: model
+                    .supported_reasoning_levels
+                    .iter()
+                    .map(|level| level.effort.clone())
+                    .collect(),
+                default_effort: model.default_reasoning_level.clone(),
+            })
+            .collect()
+    }
+
     pub(crate) fn legacy_model_tuples(&self) -> Vec<(String, String)> {
         let mut entries = self
             .models
@@ -1046,6 +1066,42 @@ pub(crate) fn resolved_context_budget_for_session(session: &Session) -> Resolved
     provider_capabilities().resolve_context_budget(request)
 }
 
+/// Resolve whether a Harness route's model advertises image input.
+///
+/// An allowlisted installed Codex catalog is authoritative when its model is
+/// present. Other routes use the small set of known vision-capable model
+/// families; unknown models are intentionally conservative.
+pub(crate) fn supports_image_input(model: &str) -> bool {
+    if let Some(snapshot) = provider_capabilities()
+        .codex_catalog
+        .cached_snapshot()
+        .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Allowlisted)
+        && let Some(catalog_model) = snapshot.model(model)
+    {
+        return catalog_model
+            .tools
+            .input_modalities
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case("image"));
+    }
+
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    model.starts_with("claude-3")
+        || model.starts_with("claude-sonnet")
+        || model.starts_with("claude-opus")
+        || model.starts_with("claude-haiku")
+        || model.starts_with("gpt-4o")
+        || model.starts_with("gpt-4.1")
+        || model.starts_with("gpt-5")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("gemini-")
+}
+
 /// Reattach currently validated descriptive capacity without altering the
 /// persisted active denominator or its provenance.
 pub(crate) fn rehydrate_resolved_context_budget(
@@ -1121,6 +1177,9 @@ fn repository_context_window_for_provider(provider: SessionProvider, model: &str
     } else {
         model
     };
+    // A Bedrock Claude ID names a catalogued Claude model on any runtime.
+    let bedrock_claude = crate::bedrock::anthropic_model_name(normalized_model);
+    let normalized_model = bedrock_claude.unwrap_or(normalized_model);
     let normalized = normalized_model.to_ascii_lowercase();
     if uses_codex_transport_fallback(provider)
         && let Some((_, tokens)) = CODEX_TRANSPORT_FALLBACKS
@@ -1129,7 +1188,7 @@ fn repository_context_window_for_provider(provider: SessionProvider, model: &str
     {
         return Some(*tokens);
     }
-    if provider == SessionProvider::Claude {
+    if provider == SessionProvider::Claude || bedrock_claude.is_some() {
         if let Some(tokens) =
             rsi_common::claude_catalog::claude_catalog_context_window(normalized_model)
         {
@@ -1464,6 +1523,51 @@ mod tests {
                 .with_timezone(&Utc),
         )
         .unwrap()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn discovery_effort_capabilities_preserve_new_models_defaults_and_empty_ladders() {
+        let raw = serde_json::json!({"models": [
+            {
+                "slug": "gpt-6.1-sol", "visibility": "list",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                    {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}
+                ]
+            },
+            {"slug": "custom-no-reasoning", "supported_reasoning_levels": []},
+            {"slug": "legacy-without-metadata"}
+        ]});
+        let snapshot = parse_codex_catalog_snapshot(
+            "future-cli",
+            &serde_json::to_vec(&raw).unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.trust, CodexCatalogTrust::DiscoveryOnly);
+        let capabilities = snapshot.effort_capabilities();
+        assert_eq!(capabilities.len(), 2);
+        assert_eq!(capabilities[0].model, "gpt-6.1-sol");
+        assert_eq!(capabilities[0].default_effort.as_deref(), Some("low"));
+        assert_eq!(
+            capabilities[0].supported_efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(capabilities[1].model, "custom-no-reasoning");
+        assert_eq!(capabilities[1].supported_efforts, Vec::<String>::new());
+        let response = rsi_common::model_utils::DiscoveredModels {
+            models: snapshot.legacy_model_tuples(),
+            effort_capabilities: capabilities,
+        };
+        let decoded: rsi_common::model_utils::DiscoveredModels =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(
+            decoded.models,
+            vec![("gpt-6.1-sol".into(), "GPT-6.1 Sol".into())]
+        );
+        assert_eq!(decoded.effort_capabilities, response.effort_capabilities);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1874,6 +1978,10 @@ mod tests {
             // Retired from the catalog; answered by RETIRED_CLAUDE_MODEL_WINDOWS.
             ("claude-fable-5", 1_000_000),
             ("claude-opus-5[1m]", 1_000_000),
+            // #1038: the CLI does not recognize this bare id (200K); rsi
+            // launches it as `[1m]`, so the recorded window is 1M either way.
+            ("claude-sonnet-5-5", 1_000_000),
+            ("claude-sonnet-5-5[1m]", 1_000_000),
             ("claude-haiku-4-5-20251001[200k]", 200_000),
             ("claude-opus-4-7-200k[1m]", 200_000),
         ] {

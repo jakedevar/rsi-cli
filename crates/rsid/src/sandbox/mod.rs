@@ -37,11 +37,16 @@ pub(crate) mod target_reclaim;
 #[cfg(not(target_os = "linux"))]
 #[path = "target_reclaim_unsupported.rs"]
 pub(crate) mod target_reclaim;
+mod worktree_content_digest;
 
 use crate::error::{DaemonError, Result};
 use rsi_common::types::SandboxKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
+pub(crate) use worktree_content_digest::{WorktreeDigest, worktree_content_digest};
 
 /// Handle returned by [`SandboxAllocator::allocate`] describing the on-disk
 /// sandbox root. Callers plumb `root` into `Session.sandbox_root` and
@@ -70,6 +75,98 @@ pub struct SandboxAllocation {
 /// sandbox-module-private and exercised only by isolated unit tests under D00.
 pub struct SandboxAllocator {
     base_dir: PathBuf,
+}
+
+/// Serializes capacity observation through the filesystem allocation effect.
+/// There is one lock for the daemon process, including replacement allocators.
+/// The owned guard makes the permit movable into a blocking Git operation but
+/// deliberately not cloneable.
+pub(crate) struct AllocationPermit {
+    base: PathBuf,
+    base_identity: (u64, u64),
+    _guard: OwnedMutexGuard<()>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SandboxCapacity {
+    pub source_roots: u64,
+    pub available_bytes: u64,
+}
+
+static ALLOCATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+
+#[cfg(test)]
+mod allocation_tests;
+
+impl AllocationPermit {
+    pub(crate) async fn acquire(base: &Path) -> Result<Self> {
+        let guard = ALLOCATION_LOCK
+            .get_or_init(|| Arc::new(Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
+        let canonical = std::fs::canonicalize(base).map_err(|error| {
+            DaemonError::Process(format!("canonicalize sandbox base for allocation: {error}"))
+        })?;
+        if canonical != base {
+            return Err(DaemonError::Process(
+                "sandbox base must be an exact canonical directory for allocation".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&canonical)?;
+        if !metadata.is_dir() {
+            return Err(DaemonError::Process(
+                "sandbox base is not a directory for allocation".into(),
+            ));
+        }
+        Ok(Self {
+            base: canonical,
+            base_identity: (metadata.dev(), metadata.ino()),
+            _guard: guard,
+        })
+    }
+
+    pub(crate) fn measure(&self) -> Result<SandboxCapacity> {
+        self.check_base(&self.base)?;
+        let mut source_roots = 0_u64;
+        for entry in std::fs::read_dir(&self.base).map_err(|error| {
+            DaemonError::Process(format!("read sandbox roots for allocation: {error}"))
+        })? {
+            let entry = entry.map_err(|error| {
+                DaemonError::Process(format!("read sandbox root for allocation: {error}"))
+            })?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| Uuid::parse_str(name).is_ok())
+            {
+                source_roots = source_roots.saturating_add(1);
+            }
+        }
+        let stats = nix::sys::statvfs::statvfs(&self.base).map_err(|error| {
+            DaemonError::Process(format!("sandbox allocation statvfs failed: {error}"))
+        })?;
+        self.check_base(&self.base)?;
+        Ok(SandboxCapacity {
+            source_roots,
+            available_bytes: (stats.blocks_available() as u64)
+                .saturating_mul(stats.fragment_size() as u64),
+        })
+    }
+
+    fn check_base(&self, base: &Path) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(base)?;
+        if base == self.base
+            && metadata.is_dir()
+            && (metadata.dev(), metadata.ino()) == self.base_identity
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::Process(
+                "allocation permit belongs to a different sandbox base".into(),
+            ))
+        }
+    }
 }
 
 impl SandboxAllocator {
@@ -120,7 +217,38 @@ impl SandboxAllocator {
     /// - On success, the returned allocation describes a fresh sandbox root.
     /// - On failure, callers MUST surface the error and abort the launch.
     ///   Never silently degrade to the canonical working_dir.
+    ///
+    /// This entry point is unadmitted: it takes no allocation permit and
+    /// applies no capacity budget. It stays public for allocator tests,
+    /// including the `sandbox_e2e` integration target. Daemon launch paths
+    /// must call `SessionManager::admit_sandbox_allocation` and then
+    /// [`Self::allocate_with_permit`].
     pub fn allocate(
+        &self,
+        session_id: Uuid,
+        origin: &Path,
+        kind: SandboxKind,
+        source_commit: &str,
+        requested_branch: Option<&str>,
+    ) -> Result<SandboxAllocation> {
+        self.allocate_unchecked(session_id, origin, kind, source_commit, requested_branch)
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Own the permit through the allocation.
+    pub(crate) fn allocate_with_permit(
+        &self,
+        permit: AllocationPermit,
+        session_id: Uuid,
+        origin: &Path,
+        kind: SandboxKind,
+        source_commit: &str,
+        requested_branch: Option<&str>,
+    ) -> Result<SandboxAllocation> {
+        permit.check_base(&self.base_dir)?;
+        self.allocate_unchecked(session_id, origin, kind, source_commit, requested_branch)
+    }
+
+    fn allocate_unchecked(
         &self,
         session_id: Uuid,
         origin: &Path,
@@ -151,7 +279,45 @@ impl SandboxAllocator {
     /// Allocate a distinct sandbox root for a session that had a prior,
     /// terminal sandbox. This is used to restore an archived session without
     /// reusing a historical custody identity.
+    #[cfg(test)]
     pub(crate) fn allocate_replacement(
+        &self,
+        session_id: Uuid,
+        origin: &Path,
+        kind: SandboxKind,
+        source_commit: &str,
+        requested_branch: Option<&str>,
+    ) -> Result<SandboxAllocation> {
+        self.allocate_replacement_unchecked(
+            session_id,
+            origin,
+            kind,
+            source_commit,
+            requested_branch,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Own the permit through the allocation.
+    pub(crate) fn allocate_replacement_with_permit(
+        &self,
+        permit: AllocationPermit,
+        session_id: Uuid,
+        origin: &Path,
+        kind: SandboxKind,
+        source_commit: &str,
+        requested_branch: Option<&str>,
+    ) -> Result<SandboxAllocation> {
+        permit.check_base(&self.base_dir)?;
+        self.allocate_replacement_unchecked(
+            session_id,
+            origin,
+            kind,
+            source_commit,
+            requested_branch,
+        )
+    }
+
+    fn allocate_replacement_unchecked(
         &self,
         session_id: Uuid,
         origin: &Path,
@@ -177,14 +343,17 @@ impl SandboxAllocator {
 
     /// Recover the one deterministic Closure allocation reserved before the
     /// launch effect, or allocate it when no prior effect exists.
+    #[allow(clippy::needless_pass_by_value)] // Own the permit through the allocation.
     pub(crate) fn allocate_or_adopt_reserved_closure(
         &self,
+        permit: AllocationPermit,
         session_id: Uuid,
         origin: &Path,
         kind: SandboxKind,
         source_commit: &str,
         requested_branch: Option<&str>,
     ) -> Result<SandboxAllocation> {
+        permit.check_base(&self.base_dir)?;
         self.ensure_base()?;
         match kind {
             SandboxKind::GitWorktree => git_worktree::adopt_reserved(

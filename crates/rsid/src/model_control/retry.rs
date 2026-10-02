@@ -1,4 +1,4 @@
-use crate::session::types::MonitorBreakReason;
+use crate::store_support::event_types::MonitorBreakReason;
 use rsi_common::types::{ConversationEvent, EventType};
 use serde::{Deserialize, Serialize};
 

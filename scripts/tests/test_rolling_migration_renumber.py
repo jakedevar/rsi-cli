@@ -311,5 +311,121 @@ class ProvisionalMigrationTest(unittest.TestCase):
             RENUMBER.inspect(self.repo, self.base, malformed, self.base)
 
 
+MIGRATIONS = "crates/rsid/src/store/migrations"
+
+
+class PerFileProvisionalMigrationTest(unittest.TestCase):
+    """The per-version layout: a provisional migration is one new ``vNNN.rs``."""
+
+    git = staticmethod(ProvisionalMigrationTest.git)
+    write = staticmethod(ProvisionalMigrationTest.write)
+    candidate = ProvisionalMigrationTest.candidate
+
+    V0 = ("impl Store {\n    fn migrate_v000(&self, version: i32) -> Result<()> {\n"
+          "        // V0: Original schema\n        // original\n        Ok(())\n    }\n}\n")
+    V129 = ("impl Store {\n    fn migrate_v129(&self, version: i32) -> Result<()> {\n"
+            "        if version < 129 {\n            settled();\n        }\n"
+            "        Ok(())\n    }\n}\n")
+    TESTS = ("// RSI-RELEASED-MIGRATION-BEGIN: test-catalog\n// fixed\n"
+             "// RSI-RELEASED-MIGRATION-END: test-catalog\nconst REWIND: i32 = 129;\n")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="rsi-renumber-dir-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "rolling")
+        self.git(self.repo, "config", "user.name", "Migration Test")
+        self.git(self.repo, "config", "user.email", "migration@example.invalid")
+        files = {
+            RENUMBER.STORE: "// runner only\n",
+            "crates/rsid/Cargo.toml": '[package]\nname = "rsid"\nversion = "0.1.0"\n',
+            "crates/rsid/src/store/cohort_settlement.rs": "",
+            "crates/rsid/src/store/tests.rs": self.TESTS,
+            f"{MIGRATIONS}/v000.rs": self.V0,
+            f"{MIGRATIONS}/v129.rs": self.V129,
+        }
+        for name, value in files.items():
+            self.write(self.repo, name, value)
+        inventory = RENUMBER.guard.inventory(files)
+        self.write(self.repo, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
+        self.git(self.repo, "add", ".")
+        self.git(self.repo, "commit", "-q", "-m", "base V129")
+        self.base = self.git(self.repo, "rev-parse", "HEAD")
+        self.completed = {}
+
+    def source(self, label):
+        worktree = Path(self.temp.name) / f"source-{label}"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.base)
+        unit = (f"impl Store {{\n    fn migrate_v130(&self, version: i32) -> Result<()> {{\n"
+                f"        if version < 130 {{\n            {label}_apply();\n        }}\n"
+                f"        Ok(())\n    }}\n}}\n")
+        tests = self.TESTS.replace("REWIND: i32 = 129", "REWIND: i32 = 130")
+        self.write(worktree, f"{MIGRATIONS}/v130.rs", unit)
+        self.write(worktree, "crates/rsid/src/store/tests.rs", tests)
+        files = {name: (worktree / name).read_text() for name in (
+            RENUMBER.STORE, "crates/rsid/src/store/cohort_settlement.rs",
+            "crates/rsid/src/store/tests.rs", f"{MIGRATIONS}/v000.rs",
+            f"{MIGRATIONS}/v129.rs", f"{MIGRATIONS}/v130.rs")}
+        inventory = RENUMBER.guard.inventory(files)
+        self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
+        declared = [
+            (f"{MIGRATIONS}/v130.rs", unit, f"{MIGRATIONS}/v${{VERSION}}.rs", [
+                ("fn migrate_v130(", "fn migrate_v${VERSION}(", "unit"),
+                ("if version < 130 {", "if version < ${VERSION} {", "unit"),
+            ]),
+            ("crates/rsid/src/store/tests.rs", tests, "crates/rsid/src/store/tests.rs", [
+                ("const REWIND: i32 = 130;", "const REWIND: i32 = ${VERSION};", "head"),
+            ]),
+        ]
+        declaration = {"schema_version": 1, "version": 130, "files": [
+            {"path": name, "path_template": template,
+             "source_blob": RENUMBER.sha(content.encode()),
+             "sites": [{"anchor": before, "replacement": after, "scope": scope}
+                       for before, after, scope in sites]}
+            for name, content, template, sites in declared]}
+        self.write(worktree, f"tools/provisional-migrations/{label}.json",
+                   json.dumps(declaration, indent=2) + "\n")
+        self.git(worktree, "add", ".")
+        self.git(worktree, "commit", "-q", "-m", f"provisional V130 {label}")
+        return self.git(worktree, "rev-parse", "HEAD")
+
+    def test_two_v130_files_land_as_v130_v131_without_touching_a_shared_file(self):
+        first_source = self.source("alpha")
+        second_source = self.source("beta")
+        _first, first_candidate = self.candidate(first_source, self.base)
+        _second, final = self.candidate(second_source, first_candidate)
+        manifest = RENUMBER.revision_inventory(self.repo, final)
+        self.assertEqual(manifest["latest_schema_version"], 131)
+        self.assertEqual(manifest["migration_dir"], MIGRATIONS)
+        listing = self.git(self.repo, "ls-tree", "-r", "--name-only", final, "--", MIGRATIONS)
+        self.assertEqual(listing.splitlines(),
+                         [f"{MIGRATIONS}/v000.rs", f"{MIGRATIONS}/v129.rs",
+                          f"{MIGRATIONS}/v130.rs", f"{MIGRATIONS}/v131.rs"])
+        second_text = self.git(self.repo, "show", f"{final}:{MIGRATIONS}/v131.rs")
+        self.assertIn("if version < 131 {", second_text)
+        self.assertIn("beta_apply();", second_text)
+        self.assertIn("fn migrate_v131(", second_text)
+        self.assertEqual(self.git(self.repo, "show", f"{final}:{RENUMBER.STORE}"),
+                         "// runner only")
+        released = subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"),
+             self.base, final], cwd=self.repo, capture_output=True, text=True, check=False)
+        self.assertEqual(released.returncode, 0, released.stderr + released.stdout)
+
+    def test_undeclared_gate_site_refuses(self):
+        source = self.source("alpha")
+        worktree = Path(self.temp.name) / "source-alpha"
+        declaration = worktree / "tools/provisional-migrations/alpha.json"
+        data = json.loads(declaration.read_text())
+        data["files"][0]["sites"] = data["files"][0]["sites"][:1]
+        declaration.write_text(json.dumps(data))
+        self.git(worktree, "commit", "-qam", "drop gate site")
+        with self.assertRaises(RENUMBER.Refusal):
+            RENUMBER.inspect(self.repo, self.base,
+                             self.git(worktree, "rev-parse", "HEAD"), self.base)
+        self.assertTrue(source)
+
+
 if __name__ == "__main__":
     unittest.main()

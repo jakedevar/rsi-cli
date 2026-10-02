@@ -16,7 +16,11 @@ use rsi_common::{
     rpc::{GetIndexStatusParams, UpdateIndexStatusParams},
     types::{IndexStatusSidecar, IndexStatusValue, IndexTicketStatus},
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 use tempfile::NamedTempFile;
 
 use super::SessionManager;
@@ -50,6 +54,91 @@ fn sidecar_path(workspace_root: &std::path::Path, project: &str) -> PathBuf {
         .join("INDEX.status.json")
 }
 
+/// One lock per sidecar path: the update is a read-modify-write of the whole
+/// file, and an atomic rename only protects publication. Without it two
+/// concurrent updates both read the old map and the later rename drops the
+/// other's ticket (#388).
+fn sidecar_lock(path: &std::path::Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(locks.entry(path.to_path_buf()).or_default())
+}
+
+/// Test hook: pause between the read and the write so a concurrent update
+/// would interleave there if the update were not serialized.
+#[cfg(test)]
+static AFTER_READ_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Update (or create) one ticket in a project's sidecar, serialized per path.
+pub(crate) fn update_sidecar_at(
+    root: &std::path::Path,
+    params: UpdateIndexStatusParams,
+) -> Result<(), DaemonError> {
+    validate_project_name(&params.project)?;
+    let path = sidecar_path(root, &params.project);
+    let lock = sidecar_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+
+    let mut sidecar = if path.exists() {
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            DaemonError::Rpc(format!("failed to read sidecar {}: {}", path.display(), e))
+        })?;
+        serde_json::from_str::<IndexStatusSidecar>(&raw).map_err(|e| {
+            DaemonError::Rpc(format!("failed to parse sidecar {}: {}", path.display(), e))
+        })?
+    } else {
+        IndexStatusSidecar {
+            schema_version: 1,
+            project: params.project.clone(),
+            last_updated: Utc::now(),
+            tickets: BTreeMap::new(),
+        }
+    };
+
+    #[cfg(test)]
+    std::thread::sleep(std::time::Duration::from_millis(
+        AFTER_READ_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst),
+    ));
+
+    // Only preserve shipped-tracking fields when the new status is Shipped.
+    let (last_shipped_commit, last_shipped_at, last_shipped_branch) =
+        if params.status == IndexStatusValue::Shipped {
+            (
+                params.last_shipped_commit,
+                Some(Utc::now()),
+                params.last_shipped_branch,
+            )
+        } else {
+            (None, None, None)
+        };
+
+    sidecar.tickets.insert(
+        params.ticket_id,
+        IndexTicketStatus {
+            status: params.status,
+            last_shipped_commit,
+            last_shipped_at,
+            last_shipped_branch,
+        },
+    );
+    sidecar.last_updated = Utc::now();
+
+    // Atomic write: temp file in the same dir, then rename.
+    std::fs::create_dir_all(path.parent().expect("sidecar path always has parent"))
+        .map_err(|e| DaemonError::Rpc(format!("create_dir_all failed: {}", e)))?;
+    let mut tmp = NamedTempFile::new_in(path.parent().expect("parent always exists"))
+        .map_err(|e| DaemonError::Rpc(format!("tempfile creation failed: {}", e)))?;
+    serde_json::to_writer_pretty(&mut tmp, &sidecar)
+        .map_err(|e| DaemonError::Rpc(format!("serde write failed: {}", e)))?;
+    tmp.persist(&path)
+        .map_err(|e| DaemonError::Rpc(format!("atomic rename failed: {}", e)))?;
+
+    Ok(())
+}
+
 impl SessionManager {
     /// Update (or create) the INDEX.status.json sidecar for a single ticket.
     pub(crate) fn update_index_status(
@@ -68,59 +157,7 @@ impl SessionManager {
         root: &std::path::Path,
         params: UpdateIndexStatusParams,
     ) -> Result<(), DaemonError> {
-        validate_project_name(&params.project)?;
-        let path = sidecar_path(root, &params.project);
-
-        let mut sidecar = if path.exists() {
-            let raw = std::fs::read_to_string(&path).map_err(|e| {
-                DaemonError::Rpc(format!("failed to read sidecar {}: {}", path.display(), e))
-            })?;
-            serde_json::from_str::<IndexStatusSidecar>(&raw).map_err(|e| {
-                DaemonError::Rpc(format!("failed to parse sidecar {}: {}", path.display(), e))
-            })?
-        } else {
-            IndexStatusSidecar {
-                schema_version: 1,
-                project: params.project.clone(),
-                last_updated: Utc::now(),
-                tickets: BTreeMap::new(),
-            }
-        };
-
-        // Only preserve shipped-tracking fields when the new status is Shipped.
-        let (last_shipped_commit, last_shipped_at, last_shipped_branch) =
-            if params.status == IndexStatusValue::Shipped {
-                (
-                    params.last_shipped_commit,
-                    Some(Utc::now()),
-                    params.last_shipped_branch,
-                )
-            } else {
-                (None, None, None)
-            };
-
-        sidecar.tickets.insert(
-            params.ticket_id,
-            IndexTicketStatus {
-                status: params.status,
-                last_shipped_commit,
-                last_shipped_at,
-                last_shipped_branch,
-            },
-        );
-        sidecar.last_updated = Utc::now();
-
-        // Atomic write: temp file in the same dir, then rename.
-        std::fs::create_dir_all(path.parent().expect("sidecar path always has parent"))
-            .map_err(|e| DaemonError::Rpc(format!("create_dir_all failed: {}", e)))?;
-        let mut tmp = NamedTempFile::new_in(path.parent().expect("parent always exists"))
-            .map_err(|e| DaemonError::Rpc(format!("tempfile creation failed: {}", e)))?;
-        serde_json::to_writer_pretty(&mut tmp, &sidecar)
-            .map_err(|e| DaemonError::Rpc(format!("serde write failed: {}", e)))?;
-        tmp.persist(&path)
-            .map_err(|e| DaemonError::Rpc(format!("atomic rename failed: {}", e)))?;
-
-        Ok(())
+        update_sidecar_at(root, params)
     }
 
     /// Fetch the INDEX.status.json sidecar for a project. Returns an error if
@@ -209,56 +246,7 @@ mod tests {
             root: &std::path::Path,
             params: UpdateIndexStatusParams,
         ) -> Result<(), DaemonError> {
-            // Replicate the logic inline — we can't call `self::SessionManager`
-            // methods from the stub, so delegate to module-level helpers.
-            validate_project_name(&params.project)?;
-            let path = sidecar_path(root, &params.project);
-
-            let mut sidecar = if path.exists() {
-                let raw = std::fs::read_to_string(&path)
-                    .map_err(|e| DaemonError::Rpc(format!("read: {}", e)))?;
-                serde_json::from_str::<IndexStatusSidecar>(&raw)
-                    .map_err(|e| DaemonError::Rpc(format!("parse: {}", e)))?
-            } else {
-                IndexStatusSidecar {
-                    schema_version: 1,
-                    project: params.project.clone(),
-                    last_updated: Utc::now(),
-                    tickets: BTreeMap::new(),
-                }
-            };
-
-            let (last_shipped_commit, last_shipped_at, last_shipped_branch) =
-                if params.status == IndexStatusValue::Shipped {
-                    (
-                        params.last_shipped_commit,
-                        Some(Utc::now()),
-                        params.last_shipped_branch,
-                    )
-                } else {
-                    (None, None, None)
-                };
-
-            sidecar.tickets.insert(
-                params.ticket_id,
-                IndexTicketStatus {
-                    status: params.status,
-                    last_shipped_commit,
-                    last_shipped_at,
-                    last_shipped_branch,
-                },
-            );
-            sidecar.last_updated = Utc::now();
-
-            std::fs::create_dir_all(path.parent().unwrap())
-                .map_err(|e| DaemonError::Rpc(format!("create_dir_all: {}", e)))?;
-            let mut tmp = NamedTempFile::new_in(path.parent().unwrap())
-                .map_err(|e| DaemonError::Rpc(format!("tempfile: {}", e)))?;
-            serde_json::to_writer_pretty(&mut tmp, &sidecar)
-                .map_err(|e| DaemonError::Rpc(format!("serialize: {}", e)))?;
-            tmp.persist(&path)
-                .map_err(|e| DaemonError::Rpc(format!("persist: {}", e)))?;
-            Ok(())
+            update_sidecar_at(root, params)
         }
 
         fn get_index_status_at(
@@ -278,6 +266,57 @@ mod tests {
                 .map_err(|e| DaemonError::Rpc(format!("read: {}", e)))?;
             serde_json::from_str::<IndexStatusSidecar>(&raw)
                 .map_err(|e| DaemonError::Rpc(format!("parse: {}", e)))
+        }
+    }
+
+    /// #388: two concurrent updates of distinct tickets both survive. The
+    /// delay between the read and the write forces the interleaving that an
+    /// unserialized read-modify-write loses.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn concurrent_updates_of_distinct_tickets_both_survive() {
+        use std::sync::atomic::Ordering;
+        let ctx = Ctx::new();
+        let root = ctx.root().to_path_buf();
+        update_sidecar_at(
+            &root,
+            make_update_params("race", "P0.0", IndexStatusValue::Ready, None, None),
+        )
+        .unwrap();
+        AFTER_READ_DELAY_MS.store(150, Ordering::SeqCst);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = ["P1.1", "P1.2", "P1.3", "P1.4"]
+            .into_iter()
+            .map(|ticket| {
+                let (root, barrier) = (root.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update_sidecar_at(
+                        &root,
+                        make_update_params(
+                            "race",
+                            ticket,
+                            IndexStatusValue::InProgress,
+                            None,
+                            None,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        AFTER_READ_DELAY_MS.store(0, Ordering::SeqCst);
+        let sidecar = ctx
+            .mgr()
+            .get_index_status_at(&root, make_get_params("race"))
+            .unwrap();
+        let tickets: Vec<&str> = sidecar.tickets.keys().map(String::as_str).collect();
+        assert_eq!(tickets, ["P0.0", "P1.1", "P1.2", "P1.3", "P1.4"]);
+        assert_eq!(sidecar.tickets["P0.0"].status, IndexStatusValue::Ready);
+        for ticket in ["P1.1", "P1.2", "P1.3", "P1.4"] {
+            assert_eq!(sidecar.tickets[ticket].status, IndexStatusValue::InProgress);
         }
     }
 

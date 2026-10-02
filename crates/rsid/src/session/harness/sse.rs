@@ -22,6 +22,19 @@ pub struct AccumulatedToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    pub hosted: bool,
+    pub hosted_result: Option<serde_json::Value>,
+    pub is_result: bool,
+}
+
+/// A provider-reported USD cost from a chat-completions `usage` object
+/// (OpenRouter returns `usage.cost`). Only a finite, non-negative number
+/// counts; anything else is "not reported", never an estimate.
+pub(crate) fn reported_cost_usd(usage: &serde_json::Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 /// Read an OpenAI-format SSE stream, emitting chunks and accumulating the response.
@@ -95,6 +108,7 @@ pub async fn read_openai_sse_stream(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                usage.cost_usd = reported_cost_usd(u).or(usage.cost_usd);
             }
 
             let Some(choice) = json
@@ -180,37 +194,204 @@ pub async fn read_openai_sse_stream(
     Ok((content, tool_calls, usage, finish_reason))
 }
 
-/// Read an Anthropic-format SSE stream.
-///
-/// Anthropic uses stateful `event: TYPE` + `data: {json}` pairs:
+/// Anthropic Messages streaming state shared by the SSE reader (direct API)
+/// and the Bedrock event-stream reader. Events arrive in order:
 /// - `message_start`: contains model, usage.input_tokens
-/// - `content_block_start`: block type (text, tool_use)
+/// - `content_block_start`: block type (text, tool_use, hosted server tools)
 /// - `content_block_delta`: incremental text or tool input JSON
 /// - `content_block_stop`: end of block
 /// - `message_delta`: stop_reason, usage.output_tokens
 /// - `message_stop`: end of message
+#[derive(Default)]
+pub(crate) struct AnthropicStreamState {
+    content: String,
+    tool_calls: Vec<AccumulatedToolCall>,
+    finish_reason: Option<String>,
+    usage: TokenUsage,
+    complete: bool,
+    // Which tool call index a delta extends.
+    current_tool_idx: Option<usize>,
+}
+
+pub(crate) type AnthropicStreamResult =
+    (String, Vec<AccumulatedToolCall>, TokenUsage, Option<String>);
+
+impl AnthropicStreamState {
+    /// Apply one decoded stream event.
+    pub(crate) async fn apply(
+        &mut self,
+        event_type: &str,
+        json: &serde_json::Value,
+        chunk_tx: &mpsc::Sender<StreamChunk>,
+    ) {
+        match event_type {
+            "message_start" => {
+                // Extract input token usage
+                if let Some(u) = json.get("message").and_then(|m| m.get("usage")) {
+                    self.usage.prompt_tokens =
+                        u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    self.usage.cache_creation_tokens = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    self.usage.cache_read_tokens = u
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+            }
+            "content_block_start" => {
+                let block = json.get("content_block");
+                let block_type = block
+                    .and_then(|b| b.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if matches!(block_type, "tool_use" | "server_tool_use") {
+                    let field = |name: &str| {
+                        block
+                            .and_then(|b| b.get(name))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let arguments = block
+                        .and_then(|b| b.get("input"))
+                        .map(serde_json::Value::to_string)
+                        .unwrap_or_default();
+                    self.tool_calls.push(AccumulatedToolCall {
+                        id: field("id"),
+                        name: field("name"),
+                        arguments,
+                        hosted: block_type == "server_tool_use",
+                        hosted_result: None,
+                        is_result: false,
+                    });
+                    self.current_tool_idx = Some(self.tool_calls.len() - 1);
+                } else if matches!(
+                    block_type,
+                    "web_search_tool_result" | "web_fetch_tool_result"
+                ) {
+                    let block = block.cloned().unwrap_or_default();
+                    let id = block
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.tool_calls.push(AccumulatedToolCall {
+                        id,
+                        name: String::new(),
+                        arguments: String::new(),
+                        hosted: true,
+                        hosted_result: Some(block),
+                        is_result: true,
+                    });
+                    self.current_tool_idx = None;
+                } else {
+                    self.current_tool_idx = None;
+                }
+            }
+            "content_block_delta" => {
+                let delta = json.get("delta");
+                let delta_type = delta
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                match delta_type {
+                    "text_delta" => {
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
+                        {
+                            self.content.push_str(text);
+                            let _ = chunk_tx
+                                .send(StreamChunk {
+                                    delta_text: text.to_string(),
+                                    tool_call_deltas: Vec::new(),
+                                    is_final: false,
+                                    usage: None,
+                                    stop_reason: None,
+                                })
+                                .await;
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(idx) = self.current_tool_idx
+                            && let Some(partial) = delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(|p| p.as_str())
+                            && let Some(tc) = self.tool_calls.get_mut(idx)
+                        {
+                            tc.arguments.push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                self.current_tool_idx = None;
+            }
+            "message_delta" => {
+                if let Some(sr) = json
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    self.finish_reason = Some(sr.to_string());
+                }
+                if let Some(u) = json.get("usage") {
+                    self.usage.completion_tokens =
+                        u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+            "message_stop" => {
+                self.complete = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// The partial result returned when the caller cancels mid-stream.
+    pub(crate) fn cancelled(self) -> AnthropicStreamResult {
+        (
+            self.content,
+            self.tool_calls,
+            self.usage,
+            Some("cancelled".into()),
+        )
+    }
+
+    /// Final result once the transport ends; a stream that ended before
+    /// `message_stop` or a stop reason is a transient disconnect.
+    pub(crate) fn finish(mut self) -> Result<AnthropicStreamResult, DaemonError> {
+        self.usage.total_tokens = self.usage.prompt_tokens
+            + self.usage.completion_tokens
+            + self.usage.cache_creation_tokens
+            + self.usage.cache_read_tokens;
+        if !self.complete && self.finish_reason.is_none() {
+            return Err(stream_disconnect());
+        }
+        Ok((
+            self.content,
+            self.tool_calls,
+            self.usage,
+            self.finish_reason,
+        ))
+    }
+}
+
+/// Read an Anthropic-format SSE stream (`event: TYPE` + `data: {json}` pairs).
 pub async fn read_anthropic_sse_stream(
     resp: reqwest::Response,
     chunk_tx: &mpsc::Sender<StreamChunk>,
     cancel: &CancellationToken,
-) -> Result<(String, Vec<AccumulatedToolCall>, TokenUsage, Option<String>), DaemonError> {
-    let mut content = String::new();
-    let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
-    let mut finish_reason: Option<String> = None;
-    let mut usage = TokenUsage::default();
+) -> Result<AnthropicStreamResult, DaemonError> {
+    let mut state = AnthropicStreamState::default();
     let mut line_buf = String::new();
-    let mut complete = false;
     let mut current_event_type = String::new();
-    // Track which tool call index we're building
-    let mut current_tool_idx: Option<usize> = None;
-
     let mut byte_stream = resp.bytes_stream();
 
     loop {
         let chunk = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Ok((content, tool_calls, usage, Some("cancelled".into())));
-            }
+            _ = cancel.cancelled() => return Ok(state.cancelled()),
             chunk = byte_stream.next() => chunk,
         };
 
@@ -247,129 +428,14 @@ pub async fn read_anthropic_sse_stream(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-
-            match current_event_type.as_str() {
-                "message_start" => {
-                    // Extract input token usage
-                    if let Some(u) = json.get("message").and_then(|m| m.get("usage")) {
-                        usage.prompt_tokens =
-                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        usage.cache_creation_tokens = u
-                            .get("cache_creation_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage.cache_read_tokens = u
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                    }
-                }
-                "content_block_start" => {
-                    let block_type = json
-                        .get("content_block")
-                        .and_then(|b| b.get("type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    if block_type == "tool_use" {
-                        let id = json
-                            .get("content_block")
-                            .and_then(|b| b.get("id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = json
-                            .get("content_block")
-                            .and_then(|b| b.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        tool_calls.push(AccumulatedToolCall {
-                            id,
-                            name,
-                            arguments: String::new(),
-                        });
-                        current_tool_idx = Some(tool_calls.len() - 1);
-                    } else {
-                        current_tool_idx = None;
-                    }
-                }
-                "content_block_delta" => {
-                    let delta_type = json
-                        .get("delta")
-                        .and_then(|d| d.get("type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-
-                    match delta_type {
-                        "text_delta" => {
-                            if let Some(text) = json
-                                .get("delta")
-                                .and_then(|d| d.get("text"))
-                                .and_then(|t| t.as_str())
-                            {
-                                content.push_str(text);
-                                let _ = chunk_tx
-                                    .send(StreamChunk {
-                                        delta_text: text.to_string(),
-                                        tool_call_deltas: Vec::new(),
-                                        is_final: false,
-                                        usage: None,
-                                        stop_reason: None,
-                                    })
-                                    .await;
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(idx) = current_tool_idx
-                                && let Some(partial) = json
-                                    .get("delta")
-                                    .and_then(|d| d.get("partial_json"))
-                                    .and_then(|p| p.as_str())
-                                && let Some(tc) = tool_calls.get_mut(idx)
-                            {
-                                tc.arguments.push_str(partial);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                "content_block_stop" => {
-                    current_tool_idx = None;
-                }
-                "message_delta" => {
-                    if let Some(sr) = json
-                        .get("delta")
-                        .and_then(|d| d.get("stop_reason"))
-                        .and_then(|s| s.as_str())
-                    {
-                        finish_reason = Some(sr.to_string());
-                    }
-                    if let Some(u) = json.get("usage") {
-                        usage.completion_tokens =
-                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    }
-                }
-                "message_stop" => {
-                    // Stream complete
-                    complete = true;
-                }
-                _ => {}
-            }
+            state.apply(&current_event_type, &json, chunk_tx).await;
         }
     }
 
-    usage.total_tokens = usage.prompt_tokens
-        + usage.completion_tokens
-        + usage.cache_creation_tokens
-        + usage.cache_read_tokens;
-
-    if !complete && finish_reason.is_none() {
-        return Err(stream_disconnect());
-    }
-    Ok((content, tool_calls, usage, finish_reason))
+    state.finish()
 }
 
-fn stream_disconnect() -> DaemonError {
+pub(crate) fn stream_disconnect() -> DaemonError {
     ProviderError {
         class: ProviderErrorClass::Transient,
         http_status: None,
@@ -432,6 +498,20 @@ impl Default for ThinkStripFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn openrouter_usage_cost_is_read_verbatim_and_absent_stays_none() {
+        let usage =
+            serde_json::json!({"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.00042});
+        assert_eq!(reported_cost_usd(&usage), Some(0.00042));
+        let no_cost = serde_json::json!({"prompt_tokens": 10, "completion_tokens": 5});
+        assert_eq!(reported_cost_usd(&no_cost), None);
+        let bad = serde_json::json!({"cost": -1.0});
+        assert_eq!(reported_cost_usd(&bad), None);
+        let null = serde_json::json!({"cost": null});
+        assert_eq!(reported_cost_usd(&null), None);
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]

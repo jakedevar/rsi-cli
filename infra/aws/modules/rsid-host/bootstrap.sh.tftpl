@@ -13,6 +13,7 @@ ARCHITECTURE='${architecture}'
 ARTIFACT_URL="$(printf '%s' '${base64encode(artifact_url)}' | base64 -d)"
 ARTIFACT_SHA256='${artifact_sha256}'
 SECRET_NAMES='${join(" ", secret_names)}'
+PROVIDER_CLI_PACKAGES='${join(" ", provider_cli_packages)}'
 IDLE_MINUTES='${stop_when_idle_minutes}'
 DEADLINE_UTC='${shutdown_at_utc}'
 
@@ -43,6 +44,16 @@ dnf install -y git sqlite awscli-2 xfsprogs amazon-cloudwatch-agent tar python3.
 if [ "$INSTALL_MODE" = 'build' ] || [ "$INSTALL_MODE" = 'deferred' ]; then
   dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config openssl-devel fontconfig-devel
 fi
+if [ -n "$PROVIDER_CLI_PACKAGES" ]; then
+  # Provider CLIs live in /usr/local so rsid finds them on the default service
+  # PATH; ProtectSystem keeps them read-only, so pinned versions stay pinned.
+  dnf install -y nodejs22 nodejs22-npm || dnf install -y nodejs npm
+  NODE_BIN="$(command -v node || command -v node-22)"
+  NPM_BIN="$(command -v npm || command -v npm-22)"
+  [ -x /usr/local/bin/node ] || [ "$NODE_BIN" = /usr/bin/node ] || ln -sf "$NODE_BIN" /usr/local/bin/node
+  # shellcheck disable=SC2086
+  "$NPM_BIN" install --global --prefix /usr/local --no-fund --no-audit $PROVIDER_CLI_PACKAGES
+fi
 id rsi >/dev/null 2>&1 || useradd --home-dir /srv/rsi --shell /bin/bash rsi
 mkdir -p /srv/rsi /var/log/rsi /usr/local/libexec
 chown rsi:rsi /var/log/rsi
@@ -70,11 +81,13 @@ cat > /usr/local/libexec/rsi-run <<'RUN'
 set -euo pipefail
 export HOME=/srv/rsi
 export AWS_DEFAULT_REGION='${region}'
+export DISABLE_AUTOUPDATER=1
 mkdir -p /run/rsi/ssh
 chmod 700 /run/rsi /run/rsi/ssh
 for name in ${join(" ", secret_names)}; do
   value="$(aws ssm get-parameter --name '/${prefix}/rsid/'"$name" --with-decryption --query 'Parameter.Value' --output text)"
   case "$name" in
+    anthropic_api_key) export ANTHROPIC_API_KEY="$value" ;;
     codex_api_key) export OPENAI_API_KEY="$value" ;;
     openrouter_api_key) export OPENROUTER_API_KEY="$value" OPEN_ROUTER="$value" ;;
     github_deploy_key)

@@ -32,6 +32,7 @@ pub use slots::Slot;
 pub use store::VaultStoreError;
 
 use chrono::{DateTime, Utc};
+use rsi_common::mcp::{McpCredentialMetadata, McpCredentialState};
 use rsi_common::provider_credentials::{
     CliExposureConsumer, CliExposureReason, CredentialCheckClass, CredentialCheckMetadata,
     CredentialState, DEFAULT_CHECK_TTL_SECS, ImportProviderCredentialsResult, ImportSkipReason,
@@ -138,6 +139,10 @@ pub enum VaultError {
     InvalidSecret(&'static str),
     #[error("slot {0} has no vault entry to rotate; use SetProviderCredential")]
     NothingToRotate(Slot),
+    #[error("mcp server credential is invalid")]
+    InvalidMcpId,
+    #[error("mcp server has no vault entry to rotate; use SetMcpServerSecret")]
+    NothingToRotateMcp,
 }
 
 /// Launch-time admission refusal from an authoritative, unexpired check.
@@ -486,7 +491,7 @@ impl VaultHandle {
         )
     }
 
-    fn persist(&self, file: &VaultFile, checks_only: bool) -> Result<(), VaultStoreError> {
+    fn persist(&self, file: &mut VaultFile, checks_only: bool) -> Result<(), VaultStoreError> {
         let Some(dir) = &self.inner.dir else {
             return Ok(());
         };
@@ -506,7 +511,7 @@ impl VaultHandle {
         let mut guard = self.inner.file.lock();
         let mut next = guard.clone();
         let value = apply(&mut next)?;
-        self.persist(&next, false)?;
+        self.persist(&mut next, false)?;
         *guard = next;
         drop(guard);
         Ok(value)
@@ -600,6 +605,131 @@ impl VaultHandle {
             file.bump(slot);
             Ok(())
         })
+    }
+
+    /// Store (or replace) the credential for one MCP server. Unlike provider
+    /// slots, there is no environment or generator fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for an invalid id/secret or persistence failure.
+    pub fn set_mcp(&self, id: &str, secret: &str) -> Result<McpCredentialMetadata, VaultError> {
+        rsi_common::mcp::validate_mcp_server_id(id).map_err(|_| VaultError::InvalidMcpId)?;
+        let value = validate_secret(secret)?;
+        let now = self.now();
+        self.mutate(|file| {
+            let secret = SecretString::new(value);
+            let fingerprint = secret.fingerprint();
+            file.mcp_entries.insert(
+                id.to_owned(),
+                StoredEntry {
+                    secret,
+                    fingerprint: fingerprint.clone(),
+                    set_at: now,
+                    rotated_from_fingerprint: None,
+                    source_env_var: None,
+                },
+            );
+            file.mcp_cleared.remove(id);
+            file.bump_mcp(id);
+            Ok(())
+        })?;
+        Ok(self.mcp_metadata(id))
+    }
+
+    /// Replace an existing MCP server credential, recording the previous
+    /// fingerprint and bumping its generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] when no entry exists or the input is invalid.
+    pub fn rotate_mcp(&self, id: &str, secret: &str) -> Result<McpCredentialMetadata, VaultError> {
+        rsi_common::mcp::validate_mcp_server_id(id).map_err(|_| VaultError::InvalidMcpId)?;
+        let value = validate_secret(secret)?;
+        let now = self.now();
+        self.mutate(|file| {
+            let previous = file
+                .mcp_entries
+                .get(id)
+                .map(|entry| entry.fingerprint.clone())
+                .ok_or(VaultError::NothingToRotateMcp)?;
+            let secret = SecretString::new(value);
+            let fingerprint = secret.fingerprint();
+            file.mcp_entries.insert(
+                id.to_owned(),
+                StoredEntry {
+                    secret,
+                    fingerprint: fingerprint.clone(),
+                    set_at: now,
+                    rotated_from_fingerprint: Some(previous),
+                    source_env_var: None,
+                },
+            );
+            file.mcp_cleared.remove(id);
+            file.bump_mcp(id);
+            Ok(())
+        })?;
+        Ok(self.mcp_metadata(id))
+    }
+
+    /// Remove an MCP server credential and persist a tombstone. The server id
+    /// remains usable by nonsecret configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for an invalid id or persistence failure.
+    pub fn clear_mcp(&self, id: &str) -> Result<McpCredentialMetadata, VaultError> {
+        rsi_common::mcp::validate_mcp_server_id(id).map_err(|_| VaultError::InvalidMcpId)?;
+        let now = self.now();
+        self.mutate(|file| {
+            let fingerprint = file.mcp_entries.remove(id).map(|entry| entry.fingerprint);
+            file.mcp_cleared.insert(
+                id.to_owned(),
+                Tombstone {
+                    at: now,
+                    fingerprint,
+                },
+            );
+            file.bump_mcp(id);
+            Ok(())
+        })?;
+        Ok(self.mcp_metadata(id))
+    }
+
+    /// Secret-free credential metadata for one MCP server.
+    #[must_use]
+    pub fn mcp_metadata(&self, id: &str) -> McpCredentialMetadata {
+        let file = self.inner.file.lock();
+        let entry = file.mcp_entries.get(id);
+        let tombstone = file.mcp_cleared.get(id);
+        let state = if entry.is_some() {
+            McpCredentialState::Vault
+        } else if tombstone.is_some() {
+            McpCredentialState::Cleared
+        } else {
+            McpCredentialState::Absent
+        };
+        McpCredentialMetadata {
+            id: id.to_owned(),
+            state,
+            fingerprint: entry.map(|entry| entry.fingerprint.clone()),
+            set_at: entry.map(|entry| entry.set_at),
+            rotated_from_fingerprint: entry
+                .and_then(|entry| entry.rotated_from_fingerprint.clone()),
+            cleared_at: tombstone.map(|entry| entry.at),
+            generation: file.mcp_generation_of(id),
+        }
+    }
+
+    /// Clone the vault-held MCP secret for the confined child launch path.
+    ///
+    /// The returned `SecretString` has no clear `Debug`, `Display`, or serde
+    /// representation. It is exposed only to the MCP bridge, which moves the
+    /// value directly into the child environment pair list.
+    #[must_use]
+    pub fn mcp_secret(&self, id: &str) -> Option<secret::SecretString> {
+        let file = self.inner.file.lock();
+        file.mcp_entries.get(id).map(|entry| entry.secret.clone())
     }
 
     /// `ImportProviderCredentialsFromEnv`: explicit copy of static env keys.
@@ -720,6 +850,38 @@ impl VaultHandle {
         }
     }
 
+    /// Secret-free provider-credential state for health telemetry.
+    #[must_use]
+    pub fn health_summary(&self) -> rsi_common::rpc::ProviderCredentialHealthSummary {
+        let credentials = self
+            .list()
+            .credentials
+            .into_iter()
+            .map(|credential| rsi_common::rpc::ProviderCredentialHealth {
+                slot: credential.slot,
+                state: credential.state,
+                env_var_names: slots::env_vars(credential.slot)
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let missing = credentials
+            .iter()
+            .filter(|credential| {
+                matches!(
+                    credential.state,
+                    CredentialState::Absent | CredentialState::Cleared
+                )
+            })
+            .map(|credential| credential.slot)
+            .collect();
+        rsi_common::rpc::ProviderCredentialHealthSummary {
+            credentials,
+            missing,
+        }
+    }
+
     fn check_fresh(
         &self,
         check: &CredentialCheckMetadata,
@@ -759,12 +921,34 @@ impl VaultHandle {
         }
         let mut next = guard.clone();
         next.checks.insert(slot, check.clone());
-        if let Err(error) = self.persist(&next, true) {
+        if let Err(error) = self.persist(&mut next, true) {
             tracing::warn!(slot = %slot, error = %error, "vault check result not persisted");
         }
         *guard = next;
         drop(guard);
         true
+    }
+
+    /// A live request proved this exact key has no available credit. A
+    /// concurrent rotation or clear makes the observation stale.
+    #[must_use]
+    pub fn mark_exhausted(&self, slot: Slot, fingerprint: &str, http_status: u16) -> bool {
+        let Some((generation, resolved)) = self.check_target(slot) else {
+            return false;
+        };
+        if resolved.secret.fingerprint() != fingerprint {
+            return false;
+        }
+        let check = CredentialCheckMetadata {
+            generation,
+            at: self.now(),
+            class: CredentialCheckClass::Exhausted,
+            http_status: Some(http_status),
+            credit_remaining: None,
+            detail_code: "live_credit_exhausted".into(),
+            fingerprint: Some(fingerprint.to_owned()),
+        };
+        self.record_check(slot, &check)
     }
 
     /// Capture `(generation, statically resolved credential)`. The
@@ -905,7 +1089,8 @@ impl VaultHandle {
         consumer: CliExposureConsumer,
         reason: CliExposureReason,
     ) {
-        env_scrub::inject_route_credential(cmd, env_var, secret, true);
+        let codex_child = consumer != CliExposureConsumer::SessionClaudeCli;
+        env_scrub::inject_route_credential(cmd, env_var, secret, codex_child);
         let at = self.now();
         self.inner.cli_exposures.lock().insert(slot, at);
         tracing::info!(
@@ -949,26 +1134,59 @@ impl VaultHandle {
     }
 }
 
+/// Emit one warning per missing credential slot and one state summary.
+pub fn log_provider_credential_health(vault: &VaultHandle) {
+    let summary = vault.health_summary();
+    for slot in &summary.missing {
+        tracing::warn!(
+            slot = %slot,
+            env_var_names = ?slots::env_vars(*slot),
+            "provider credential missing; store it in the vault or ~/.rsi/.env"
+        );
+    }
+    tracing::info!(summary = ?summary, "provider credential state");
+}
+
+/// The launch fields credential admission reads. `claude::LaunchConfig`
+/// implements it (in `claude`), so the vault does not depend on the launch
+/// type.
+pub trait LaunchCredentialInputs {
+    /// The provider the launch is for, when the config names one.
+    fn provider(&self) -> Option<SessionProvider>;
+    /// The requested model, if any.
+    fn model(&self) -> Option<&str>;
+    /// Whether the launch supplies an explicit OpenAI-compatible base URL.
+    fn has_openai_base_url(&self) -> bool;
+    /// The explicit API key the launch supplies, if any.
+    fn openai_api_key(&self) -> Option<&str>;
+}
+
 /// The vault slot a launch authenticates with, if any.
 ///
 /// Codex-launched API providers use their slot; the Harness uses the model's
 /// slot unless the launch supplies an explicit base URL or explicit key.
 #[must_use]
-pub fn launch_slot(
+pub fn launch_slot<C: LaunchCredentialInputs + ?Sized>(
     provider: SessionProvider,
-    config: &crate::claude::LaunchConfig,
+    config: &C,
 ) -> Option<Slot> {
     match provider {
         SessionProvider::Harness => {
-            if config.openai_base_url.is_some()
-                || config
-                    .openai_api_key
-                    .as_deref()
-                    .is_some_and(|key| !key.is_empty())
+            if config.has_openai_base_url()
+                || config.openai_api_key().is_some_and(|key| !key.is_empty())
             {
                 return None;
             }
-            slots::slot_for_harness_model(config.model.as_deref().unwrap_or("claude-sonnet-5"))
+            slots::slot_for_harness_model(config.model().unwrap_or("claude-sonnet-5"))
+        }
+        // Claude Code on Bedrock authenticates with the Bedrock key.
+        SessionProvider::Claude
+            if config
+                .model()
+                .and_then(crate::bedrock::bedrock_vendor)
+                .is_some() =>
+        {
+            Some(Slot::Bedrock)
         }
         provider => slots::slot_for_provider(provider),
     }
@@ -982,9 +1200,9 @@ pub fn launch_slot(
 /// # Errors
 ///
 /// Returns the typed `provider_credential_refused` refusal.
-pub fn admit_provider_spawn(
+pub fn admit_provider_spawn<C: LaunchCredentialInputs + ?Sized>(
     provider: SessionProvider,
-    config: &crate::claude::LaunchConfig,
+    config: &C,
 ) -> crate::error::Result<()> {
     launch_slot(provider, config).map_or(Ok(()), |slot| {
         global()
@@ -995,9 +1213,9 @@ pub fn admit_provider_spawn(
 
 /// Async launch warm-up: run the lazy single-flight check (5 s timeout) so
 /// the synchronous chokepoint decides on a current result. Never refuses.
-pub async fn warm_launch_check(config: &crate::claude::LaunchConfig) {
+pub async fn warm_launch_check<C: LaunchCredentialInputs + ?Sized>(config: &C) {
     if let Some(slot) = config
-        .provider
+        .provider()
         .and_then(|provider| launch_slot(provider, config))
     {
         global().ensure_fresh_check(slot).await;

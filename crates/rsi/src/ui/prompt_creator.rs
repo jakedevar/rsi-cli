@@ -224,13 +224,13 @@ fn build_title(app: &App) -> Line<'static> {
     // Model badge
     if let Some(ref model) = app.prompt_creator_state.selected_model {
         spans.push(Span::styled(
-            format!(" [{model}] "),
+            format!("  {model} "),
             Style::default().fg(theme::blue()),
         ));
     } else if let Some(ref dropdown) = app.prompt_creator_state.model_dropdown {
         if let Some((id, _)) = dropdown.models.get(dropdown.selected_index) {
             spans.push(Span::styled(
-                format!(" [{id}] "),
+                format!("  {id} "),
                 Style::default().fg(theme::blue()),
             ));
         }

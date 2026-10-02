@@ -217,6 +217,8 @@ The Issues workspace tracks project issues; the scheduled-jobs browser runs recu
 | Scheduled jobs: `d` |  | Begin delete chord | First `d` of `dd`: arms deletion of the selected scheduled job. |
 | Scheduled jobs: `dd` |  | Delete selected job | Deletes the selected scheduled job (`dd`). |
 | Scheduled jobs: `r` |  | Refresh scheduled jobs | Re-reads the scheduled jobs from the daemon. |
+| Scheduled jobs: `H` |  | Toggle scheduled job history | Switches between active jobs and every job including old disabled history. |
+| Scheduled jobs: `m` |  | Load more scheduled jobs | Loads the next page of scheduled jobs from the daemon. |
 | `<Space>K` |  | Scheduled jobs | Opens the scheduled jobs browser. |
 
 ## 8. Lifecycle and housekeeping
@@ -229,7 +231,7 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | --- | --- | --- | --- |
 | `yy` |  | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
 | `x` | `:kill` `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
-| `X` |  | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `X` |  | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | `:pause soft` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | `:pause clear` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
 | `<Space>c` | `:continue [arg]` `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
@@ -338,6 +340,8 @@ Every settings row by group and section: what it does, what kind of value it is,
 | Settings: `a` |  | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | Settings: `d` |  | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | Settings: `e` |  | Enable or disable skill | Enables or disables the selected Claude skill. |
+| Settings: `K` |  | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
+| Settings: `J` |  | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
 | Settings: `R` |  | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | Settings: `s` |  | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | Settings: `r` |  | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -373,7 +377,7 @@ Text-area background, animation styles and detail column placement.
 | Background color | Sets the hex color used when the text area background is on. | edit | TUI (state.json) | immediately |
 | Formulation animation | Reveals each new live message with a top-to-bottom wipe. Off by default. | toggle | TUI (state.json) | immediately |
 | Formulation speed | Sets how long the formulation reveal runs when the animation is on. | choice | TUI (state.json) | immediately |
-| Activity indicator | Chooses the working-indicator style: Semantic, Rainbow Classic or Rainbow Compact. | choice | TUI (state.json) | immediately |
+| Activity indicator | Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight. | choice | TUI (state.json) | immediately |
 | Detail column | Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned. | choice | TUI (state.json) | immediately |
 
 ### WORKSPACE — What do I see in the list and a new transcript?
@@ -385,7 +389,7 @@ What the session navigator and cards show.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Navigator preset | Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it. | choice | TUI (state.json) | immediately |
-| Navigator optional columns | Turns individual optional navigator columns on or off. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. Required columns cannot be hidden. | list | TUI (state.json) | immediately |
+| Navigator optional columns | Turns optional navigator columns on or off; J/K move the selected column, saved per preset. Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden. | list | TUI (state.json) | immediately |
 | Card fields | Chooses which facts render on session-list cards. Card fields: Context bar, Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date. | list | TUI (state.json) | immediately |
 | Automatic session archive | Archives delivered or issue-filed terminal sessions after an idle window. | toggle | daemon field `session_retention_enabled` | immediately |
 | Archive idle hours | Idle hours before an eligible terminal session is archived. | choice | daemon field `session_retention_window_hours` | immediately |
@@ -491,7 +495,7 @@ What the daemon does when a session fails.
 | Retry max backoff | Upper bound, in milliseconds, on the delay between automatic retries. | choice | daemon field `retry_max_backoff_ms` | immediately |
 | Retry on stall | Runs the stall-retry handler that relaunches stalled sessions. | toggle | daemon field `retry_on_stall` | after daemon restart |
 | Reconciliation loop | Runs the background loop that reconciles session liveness and consistency. | toggle | daemon field `reconciliation_enabled` | after daemon restart |
-| Context rotation | Rotates a session into a fresh context near its limit, carrying a handoff forward. | toggle | daemon field `context_rotation_enabled` | new launches now · resumed sessions after restart |
+| Context rotation | Near its limit, asks a manager or Epic lead to pass its seat at the next idle boundary; workers keep going on native compaction. Manual rotation still works for any session. | toggle | daemon field `context_rotation_enabled` | new launches now · resumed sessions after restart |
 | Context rotation threshold (global) | Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%. | choice | daemon field `context_rotation_global_pct` | immediately |
 | Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | immediately |
 | Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | immediately |
@@ -516,7 +520,7 @@ Memory extraction and consolidation.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Memory system | OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync. | toggle | daemon field `memory_enabled` | after daemon restart |
+| Memory system | OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync. | toggle | daemon field `memory_enabled` | off now · on after restart |
 | Dream consolidation | Enables periodic memory consolidation (dreaming). | toggle | daemon field `dream_enabled` | immediately |
 | Observation threshold | Number of new observations that triggers a consolidation cycle. | edit | daemon field `dream_observation_threshold` | after daemon restart |
 | Dream cooldown | Minimum seconds between consolidation cycles. | edit | daemon field `dream_cooldown_secs` | after daemon restart |
@@ -550,6 +554,30 @@ Background queue and recursive DAG controls.
 | Worker slice MemoryMax (MiB) | Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_max_mib` | after daemon restart |
 | Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
 | Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
+| Rolling merge queue | Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish. | toggle | daemon field `rolling_queue_enabled` | immediately |
+| Hold new work while a deploy waits | While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs. Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything. | toggle | daemon field `deploy_drain_enabled` | immediately |
+| Merge queue batch size | Maximum ready sources merged into one candidate and gated once (1-8); the current runner gates one source at a time. | choice | daemon field `rolling_queue_batch_size` | immediately |
+| Merge queue speculation depth | How many candidates are prepared on top of the batch being gated (0-2). | choice | daemon field `rolling_queue_speculation_depth` | immediately |
+| Hold program wakes while children run | Program-mode masters' due resume wakes wait while their spawned children run, then deliver once per keep-alive window; the wake stays armed meanwhile. The held wake stays enabled and exact, so the no-idle invariant is unchanged. It delivers when the last child settles (the child watch wakes the master) or once when the window elapses; an operator trigger-now bypasses the hold. Non-program wakes are never held. | toggle | daemon field `program_hold_while_children_run` | immediately |
+| Child keep-alive valve | Off by default. When on, an idle parent whose children keep running gets one same-session resume per window so it can unblock hung children. The valve inserts at most one daemon-owned one-shot Resume row per window, only for a Completed parent with no other enabled resume wake, pending question, approval, pause or capacity incident, and retires it undelivered if every child settled first. It never launches a Fresh session. | toggle | daemon field `child_keepalive_enabled` | immediately |
+| Child keep-alive window (s) | Length of the keep-alive and hold window (300-21600 seconds, default 1500). | choice | daemon field `child_keepalive_window_secs` | immediately |
+| Build slots | Concurrent cargo build/test runs the resource governor admits (1-16); default 4. | choice | daemon field `governor_build_slots` | immediately |
+| Lander slots | Concurrent rsi-rolling-land runs the resource governor admits (1-16); default 5. | choice | daemon field `governor_lander_slots` | immediately |
+| Governor max load (0 auto) | 1-minute load at or above which no new build or lander starts; 0 means 1.25 x cores. | choice | daemon field `governor_max_load` | immediately |
+| Governor min free disk (GB) | Free space on / below which no new build or lander starts; default 30. | choice | daemon field `governor_min_free_disk_gb` | immediately |
+| Governor min available memory (GB) | MemAvailable below which no new build or lander starts; default 16. | choice | daemon field `governor_min_avail_mem_gb` | immediately |
+| Governor max workers-slice memory (GB) | Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30. | choice | daemon field `governor_max_workers_slice_gb` | immediately |
+| Harness web access | Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it. | choice | daemon field `harness_web_access` | next spawn |
+| Harness network egress | Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it. | choice | daemon field `harness_egress_mode` | next spawn |
+| Harness search call cap | Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues. | choice | daemon field `harness_max_search_calls` | next spawn |
+| Harness fetch call cap | Default cap on hosted web fetches per Harness session; 0 is unlimited. | choice | daemon field `harness_max_fetch_calls` | next spawn |
+| Harness completion gates | Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794). | toggle | daemon field `completion_gates_enabled` | next spawn |
+| Harness tool output cap (bytes) | Default cap on total tool output bytes per Harness session; 0 is unlimited. Once used up, further tool calls return a typed error. | choice | daemon field `harness_max_result_bytes` | next spawn |
+| Harness web cost cap (micro-USD) | Default cap on estimated hosted web cost per Harness session (1000000 = 1 USD, searches estimated at 0.01 USD); 0 is unlimited. | choice | daemon field `harness_max_web_cost_usd_micros` | next spawn |
+| MCP deferred tool threshold | Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable. Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap. | choice | daemon field `mcp.deferred_tool_threshold` | next spawn |
+| Cloud spend | Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC. | read-only | daemon (cloud spend) | immediately |
+| Cloud spend stop line (USD) | Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes. | choice | daemon field `cloud_spend_stop_line_usd` | immediately |
+| Cloud spend daily cap (USD) | Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop. | choice | daemon field `cloud_spend_daily_cap_usd` | immediately |
 
 #### Code Intelligence
 
@@ -572,7 +600,10 @@ How provider processes are sandboxed and isolated.
 | Vault: legacy env fallback | Allow provider keys from legacy environment variables when no vault credential exists. | toggle | daemon field `vault.env_compat` | immediately |
 | Vault: check TTL | Cache provider key check results for this many seconds. | choice | daemon field `vault.check_ttl_secs` | immediately |
 | OpenRouter engine | Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route <model> [codex_cli\|harness\|default]. | choice | daemon field `api_route.openrouter` | next spawn |
+| Bedrock engine | Choose the engine for new Bedrock sessions: codex_cli runs GPT in Codex and Claude in Claude Code; harness runs both in RSI's Harness. | choice | daemon field `api_route.bedrock` | next spawn |
 | API route fallback | Allow a failed Harness preflight to launch OpenRouter through Codex CLI. | toggle | daemon field `api_route.fallback` | next spawn |
+| OpenRouter context budget (0 off) | Live-context tokens at which an OpenRouter session compacts; 0 keeps the model's own limit. | choice | daemon field `openrouter_context_budget_tokens` | next spawn |
+| Harness iterations per turn | Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000). | choice | daemon field `harness_max_iterations_per_turn` | next spawn |
 
 #### Sandbox Storage
 
@@ -595,6 +626,9 @@ Sandbox disk use, cache reclamation and settlement.
 | Preview cache reclaim | Runs a dry-run reclaim pass and reports what it would free. | action | daemon (sandbox storage) | immediately |
 | Reclaim sandbox caches now | Runs a real reclaim pass now and reports the result. **Destructive.** | action | daemon (sandbox storage) | immediately |
 | Source-worktree settlement | Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. **Destructive.** | action | daemon (source-worktree settlement) | immediately |
+| Maximum sandbox roots | Maximum direct source roots under the sandbox base before a new allocation is refused. | choice | daemon field `sandbox_max_source_roots` | immediately |
+| Minimum free space (GiB) | Free filesystem space required before a new sandbox is allocated. | choice | daemon field `sandbox_min_free_gib` | immediately |
+| Purge archived sandboxes | Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. **Destructive.** | toggle | daemon field `archived_sandbox_purge_enabled` | immediately |
 
 #### Claude Hooks
 
@@ -622,6 +656,23 @@ Reach agents from Signal or iMessage.
 | --- | --- | --- | --- | --- |
 | Signal bridge | Signal bridge connection, account and sender allowlist. | edit | file `signal.toml` | immediately |
 | iMessage bridge | iMessage bridge connection, account and sender allowlist. | edit | file `imessage.toml` | immediately |
+
+#### Satellites
+
+Registered peers, local links and cached remote sessions.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Satellite registry | Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads. | action | daemon (satellite_registry) | immediately |
+| Satellite polling | Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on. | toggle | daemon field `satellite_polling_enabled` | immediately |
+
+#### MCP Servers
+
+MCP server definitions and credential metadata.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| MCP servers | Daemon-configured MCP server definitions and credential metadata; a adds, Enter edits, t enables or disables. Server definitions remain disabled until enabled. Credentials are entered through a masked form and stored only in the operator vault. | list | daemon (mcp servers) | immediately |
 
 ### Persisted daemon settings without a TUI editor
 
@@ -724,7 +775,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>gd` | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
 | `yy` | Copy Session UUID | Copies the selected session's UUID; in a transcript `yy` copies the selected event's content instead. |
 | `x` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
-| `X` | Hard interrupt running session | Immediately interrupts the selected session and marks it HARD; only the operator may clear it. |
+| `X` | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
 | `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
@@ -870,6 +921,8 @@ Keys of the settings pane (category rail and items).
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
+| `K` | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
+| `J` | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -946,6 +999,8 @@ Keys of the scheduled jobs browser.
 | `d` | Begin delete chord | First `d` of `dd`: arms deletion of the selected scheduled job. |
 | `dd` | Delete selected job | Deletes the selected scheduled job (`dd`). |
 | `r` | Refresh scheduled jobs | Re-reads the scheduled jobs from the daemon. |
+| `H` | Toggle scheduled job history | Switches between active jobs and every job including old disabled history. |
+| `m` | Load more scheduled jobs | Loads the next page of scheduled jobs from the daemon. |
 | `q` | Close or cancel | Closes the current view or cancels the pending action. |
 | `Esc` | Close or cancel | Closes the current view or cancels the pending action. |
 
@@ -996,15 +1051,15 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-H` | other pane focused (normal mode, no overlay) | focus the pane to the left |
 | `Ctrl-L` | session list focused (normal mode, no overlay) | next session-list zone (Main → TaskRabbit → Jobs → Archive, wrapping) |
 | `Ctrl-L` | other pane focused (normal mode, no overlay; not a stale Issues editor) | focus the pane to the right |
-| `Ctrl-Shift-Up` | launch prompt or input modal open | make the overlay shorter |
-| `Ctrl-Shift-Down` | launch prompt or input modal open | make the overlay taller |
-| `Ctrl-Shift-Left` | launch prompt or input modal open | make the overlay narrower |
-| `Ctrl-Shift-Right` | launch prompt or input modal open | make the overlay wider |
-| `Ctrl-Up` | launch prompt or input modal open | move the overlay up |
-| `Ctrl-Down` | launch prompt or input modal open | move the overlay down |
-| `Ctrl-Left` | launch prompt or input modal open | move the overlay left |
-| `Ctrl-Right` | launch prompt or input modal open | move the overlay right |
-| `Ctrl-0` | launch prompt or input modal open | reset the overlay's size and position |
+| `Ctrl-Shift-Up` | movable overlay open | make the overlay shorter |
+| `Ctrl-Shift-Down` | movable overlay open | make the overlay taller |
+| `Ctrl-Shift-Left` | movable overlay open | make the overlay narrower |
+| `Ctrl-Shift-Right` | movable overlay open | make the overlay wider |
+| `Ctrl-Up` | movable overlay open | move the overlay up |
+| `Ctrl-Down` | movable overlay open | move the overlay down |
+| `Ctrl-Left` | movable overlay open | move the overlay left |
+| `Ctrl-Right` | movable overlay open | move the overlay right |
+| `Ctrl-0` | movable overlay open | reset the overlay's size and position |
 | `Ctrl-Shift-Right` | normal mode, no overlay | widen the session-list sidebar |
 | `Ctrl-Shift-Left` | normal mode, no overlay | narrow the session-list sidebar |
 | `Ctrl-Left` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column left (snaps to Left Aligned at the edge) |
@@ -1093,10 +1148,13 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | --- | --- |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
-| `x` | Dismiss selected notification |
+| `x` | Dismiss selected active notification |
 | `N` | Dismiss all active notifications |
-| `Enter` | Open source session |
+| `Enter` | Open linked session |
 | `Esc / q` | Close |
+| `Ctrl+Arrows` | Move modal |
+| `Ctrl+Shift+Arrows` | Resize modal |
+| `Ctrl+0` | Reset modal geometry |
 | `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
@@ -1560,6 +1618,62 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Ctrl-C` | Send interrupt to the shell |
 | `Ctrl-\` | Close terminal |
 
+#### New Session Prompt
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl-Enter` | Launch the session |
+| `Ctrl-T / Ctrl-S` | Launch into a new tab / split |
+| `Ctrl-O, Tab (normal)` | Flip to launch settings: model, effort, sandbox, manager |
+| `Ctrl-M` | Open model picker |
+| `Ctrl-E` | Cycle effort level |
+| `Ctrl-B` | Toggle sandbox (isolated git worktree) |
+| `? (normal)` | Show this help |
+| `Ctrl-J / Ctrl-K` | Focus next / previous stacked prompt |
+| `Space o / Space N (normal)` | Stack a TaskRabbit / blank prompt |
+| `Ctrl-Q` | Close and keep the draft |
+| `Ctrl-Y` | Compile prompt |
+| `a / d` | Accept / discard the compiled preview |
+| `Ctrl-Shift-G` | Grammar and spelling correction |
+| `Ctrl-A` | AI command on text |
+| `Ctrl-Shift-A` | Ask AI about text |
+| `Ctrl-V` | Paste from clipboard (images become @path references) |
+| `i / a / o` | Enter insert mode (normal mode) |
+| `Esc` | Return to normal mode (insert mode) |
+| `h j k l, w b` | Move cursor (normal mode) |
+
+#### New Session Settings
+
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move between settings |
+| `h / l, Left / Right` | Change the selected setting |
+| `Space / Enter` | Toggle or open the selected setting |
+| `Ctrl-E / Ctrl-B` | Cycle effort / toggle sandbox |
+| `Ctrl-M` | Open model picker |
+| `Ctrl-Enter` | Launch the session |
+| `Ctrl-T / Ctrl-S` | Launch into a new tab / split |
+| `?` | Show this help |
+| `Ctrl-O / Tab / Esc` | Flip back to the prompt |
+| `Ctrl-Q` | Close and keep the draft |
+
+#### Continue Prompt
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl-Enter` | Send the follow-up |
+| `? (normal)` | Show this help |
+| `Ctrl-Q` | Close without sending |
+| `Ctrl-Y` | Compile prompt |
+| `a / d` | Accept / discard the compiled preview |
+| `Ctrl-Shift-G` | Grammar and spelling correction |
+| `Ctrl-A` | AI command on text |
+| `Ctrl-Shift-A` | Ask AI about text |
+| `Ctrl-V` | Paste from clipboard (images become @path references) |
+| `i / a / o` | Enter insert mode (normal mode) |
+| `Esc` | Return to normal mode (insert mode) |
+| `h j k l, w b` | Move cursor (normal mode) |
+
 ### Overlays: Diagnostics and tools
 
 #### Graph Review
@@ -1812,12 +1926,12 @@ Screens without an overlay key catalog, and where their keys are documented.
 | no overlay open | The focused pane's keys apply; see the Normal-mode table. | generated table `normal` |
 | Scheduled Jobs browser | Its keys are registry routes, rendered as their own generated table. | generated table `schedule-browser` |
 | Theme role editor | Its keys are registry routes, rendered as their own generated table. | generated table `theme-role-editor` |
-| Launch / continue prompt | A text editor surface; its keys are documented by hand. | keybindings.md § Prompt Overlay (New Session / Continue Session) |
 | Keybindings help | Help documents its own scroll, search and close keys. | keybindings.md § Keybindings Help Overlay |
 | ESP Square game | A game with its own single-screen key legend. | keybindings.md § ESP Square Overlay (`<Space>gc`) |
 | Manager policy: launch-choice catalog picker | A picker sub-mode of the manager policy editor with its own key handling. | keybindings.md § Harness Manager Policy (`:manager policy`) |
 | Source-worktree settlement: authorization | A confirmation sub-mode of the settlement browser with its own key handling. | keybindings.md § Source-Worktree Settlement Authorization |
 | Graph review: info dashboard focused | The dashboard panel owns keys while focused, separate from graph editing. | keybindings.md § Graph Review Overlay (`<Space>v` or `:graph`) |
+| Satellite registry browser | The browser owns its peer, link and cached session keys. | keybindings.md § Satellite Registry Browser |
 
 ### Surfaces documented by hand
 

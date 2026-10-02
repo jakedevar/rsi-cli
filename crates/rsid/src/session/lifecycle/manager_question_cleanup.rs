@@ -72,7 +72,11 @@ impl SessionManager {
                         let current = store.get_session(session_id)?
                             .ok_or_else(|| DaemonError::Store("question cleanup session is missing".into()))?;
                         if !matches!(current.status, SessionStatus::Archived | SessionStatus::Deleted) {
-                            store.update_session_status(session_id, SessionStatus::Interrupted)?;
+                            store.set_session_terminal_status(
+                                session_id,
+                                SessionStatus::Interrupted,
+                                crate::terminal_cause::InterruptSource::QuestionCleanup.cause(),
+                            )?;
                         }
                         cached.session = store.get_session(session_id)?.expect("session checked under Store lock");
                         cached.events = store.load_events(session_id)?;

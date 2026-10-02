@@ -17,8 +17,22 @@ expression: response
     "provider_antigravity_available": false,
     "provider_bedrock_available": true,
     "provider_claude_available": true,
+    "provider_clis_missing": [],
     "provider_codex_app_server_available": true,
     "provider_codex_available": true,
+    "provider_credentials": {
+      "credentials": [
+        {
+          "env_var_names": [
+            "OPEN_ROUTER",
+            "OPENROUTER_API_KEY"
+          ],
+          "slot": "openrouter",
+          "state": "env_compat"
+        }
+      ],
+      "missing": []
+    },
     "provider_harness_available": true,
     "provider_local_available": false,
     "provider_openrouter_available": true,

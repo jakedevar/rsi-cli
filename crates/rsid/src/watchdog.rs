@@ -5,7 +5,6 @@
 //! from process exit and persistence, which also makes failure cases testable.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +14,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::store::Store;
+pub use crate::store_support::restart_record::RestartRecord;
 
 pub const WATCHDOG_EXIT_CODE: i32 = 75;
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -132,16 +132,6 @@ pub struct WatchdogDecision {
     policy: WatchdogPolicy,
     consecutive_unhealthy: u8,
     last_healthy_at: DateTime<Utc>,
-}
-
-/// A small crash record written without using the possibly wedged Store.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RestartRecord {
-    pub version: u8,
-    pub id: Uuid,
-    pub observed_at: DateTime<Utc>,
-    pub last_healthy_at: DateTime<Utc>,
-    pub failed_probes: Vec<String>,
 }
 
 impl RestartRecord {

@@ -26,7 +26,7 @@ use crate::sandbox::custody::{
     RetryCustodyDisposition,
 };
 use crate::sandbox::target_reclaim::TargetReclaimOutcome;
-use crate::sandbox::{SandboxAllocation, SandboxAllocator};
+use crate::sandbox::{AllocationPermit, SandboxAllocation, SandboxAllocator, SandboxCapacity};
 use crate::store::Store;
 use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
 use rsi_common::model_control::{InvocationOwner, ModelUsageConfidence};
@@ -58,12 +58,19 @@ mod successor_recovery;
 
 const RECURSIVE_DAG_LIVE_SESSION_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(super) fn fresh_launch_preamble_parts(kind: SessionKind) -> Vec<String> {
+/// Startup text parts for a fresh launch or relaunch: the session project's
+/// router and preamble (read from `project_dir`, the session's sandbox root or
+/// working dir) followed by the RSI-generic part. A project without
+/// `.claude/commands` files contributes none of its own.
+pub(super) fn fresh_launch_preamble_parts(
+    kind: SessionKind,
+    project_dir: &std::path::Path,
+) -> Vec<String> {
     let mut parts = Vec::new();
-    if let Some(router) = super::preamble::load_orchestration_router() {
+    if let Some(router) = super::preamble::load_orchestration_router(project_dir) {
         parts.push(router);
     }
-    if let Some(preamble) = super::preamble::load(kind) {
+    if let Some(preamble) = super::preamble::load(kind, project_dir) {
         parts.push(preamble);
     }
     parts
@@ -245,12 +252,19 @@ const PRESSURE_BURST_BYTES: u64 = 1024 * 1024 * 1024;
 const PRESSURE_BURST_TIME: Duration = Duration::from_secs(2);
 const PRESSURE_PAGE_DELAY: Duration = Duration::from_millis(25);
 const PRESSURE_BURST_DELAY: Duration = Duration::from_secs(1);
+// Idle backoff when a full candidate cycle completes having freed nothing.
+// A refused set must not keep re-paging the same absent targets at page rate.
+const IDLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const IDLE_BACKOFF_CAP: Duration = Duration::from_secs(30 * 60);
+// Bounded memo of candidates last refused because their target is absent.
+const ABSENT_TARGET_CACHE_CAPACITY: usize = 4096;
 
 struct PressureReclaimPacing {
     started: Instant,
     passes: u32,
     rows: u32,
     bytes: u64,
+    idle_cycles: u32,
 }
 
 impl Default for PressureReclaimPacing {
@@ -260,6 +274,7 @@ impl Default for PressureReclaimPacing {
             passes: 0,
             rows: 0,
             bytes: 0,
+            idle_cycles: 0,
         }
     }
 }
@@ -267,11 +282,55 @@ impl Default for PressureReclaimPacing {
 impl PressureReclaimPacing {
     // None returns scheduling to the persisted operator interval. Merely
     // seeing pressure, eligibility, or a free-space fluctuation is insufficient.
+    #[cfg(test)]
     fn next_delay(&mut self, run: Option<&SandboxReclaimRun>) -> Option<Duration> {
-        let Some(run) = run.filter(|run| pressure_reclaim_progress(run)) else {
+        self.next_delay_with_interval(run, Duration::ZERO)
+    }
+
+    /// `interval` is the operator reclaim interval: idle backoff never runs
+    /// more often than it.
+    fn next_delay_with_interval(
+        &mut self,
+        run: Option<&SandboxReclaimRun>,
+        interval: Duration,
+    ) -> Option<Duration> {
+        let Some(run) = run.filter(|run| pressure_reclaim_eligible(run)) else {
             *self = Self::default();
             return None;
         };
+        let wrapped = pressure_reclaim_wrapped(run);
+        if pressure_reclaim_useful(run) {
+            self.idle_cycles = 0;
+            if wrapped {
+                // A productive cycle still ends at its wrap; the operator
+                // interval starts the next one.
+                *self = Self::default();
+                return None;
+            }
+        } else if wrapped {
+            // A cycle that ended without useful work backs off exponentially
+            // instead of immediately re-paging the same refused set. Only real
+            // work, pressure clearing, or a missing/error pass resets it.
+            self.idle_cycles = self.idle_cycles.saturating_add(1);
+            let delay = idle_backoff_delay(self.idle_cycles, interval);
+            *self = Self {
+                idle_cycles: self.idle_cycles,
+                ..Self::default()
+            };
+            return Some(delay);
+        } else if !pressure_reclaim_advanced(run) {
+            *self = Self::default();
+            return None;
+        } else if self.idle_cycles > 0 {
+            // After an idle cycle, an advancing but unproductive page waits
+            // out the same window: at most one pass per backoff window.
+            let delay = idle_backoff_delay(self.idle_cycles, interval);
+            *self = Self {
+                idle_cycles: self.idle_cycles,
+                ..Self::default()
+            };
+            return Some(delay);
+        }
         self.passes = self.passes.saturating_add(1);
         self.rows = self
             .rows
@@ -293,7 +352,38 @@ impl PressureReclaimPacing {
     }
 }
 
-fn pressure_reclaim_progress(run: &SandboxReclaimRun) -> bool {
+fn idle_backoff_delay(idle_cycles: u32, interval: Duration) -> Duration {
+    let exponent = idle_cycles.saturating_sub(1).min(16);
+    interval
+        .max(IDLE_BACKOFF_BASE)
+        .saturating_mul(1u32 << exponent)
+        .min(IDLE_BACKOFF_CAP.max(interval))
+}
+
+fn pressure_reclaim_useful(run: &SandboxReclaimRun) -> bool {
+    let report = &run.report;
+    report.fully_removed_count > 0
+        || report.newly_staged_count > 0
+        || run.evidence.recovery_sweep.entries_deleted > 0
+}
+
+fn pressure_reclaim_advanced(run: &SandboxReclaimRun) -> bool {
+    let Some(sweep) = &run.evidence.candidate_sweep else {
+        return false;
+    };
+    run.evidence.inspected_terminal_rows > 0
+        && sweep.cursor_after.is_some()
+        && sweep.cursor_after != sweep.cursor_before
+}
+
+fn pressure_reclaim_wrapped(run: &SandboxReclaimRun) -> bool {
+    run.evidence
+        .candidate_sweep
+        .as_ref()
+        .is_some_and(|sweep| sweep.wrapped)
+}
+
+fn pressure_reclaim_eligible(run: &SandboxReclaimRun) -> bool {
     let report = &run.report;
     if report.dry_run
         || !report.enabled
@@ -306,19 +396,7 @@ fn pressure_reclaim_progress(run: &SandboxReclaimRun) -> bool {
     let Some(sweep) = &run.evidence.candidate_sweep else {
         return false;
     };
-    if !sweep.reserved || sweep.wrapped {
-        return false;
-    }
-    let advanced = run.evidence.inspected_terminal_rows > 0
-        && sweep.cursor_after.is_some()
-        && sweep.cursor_after != sweep.cursor_before;
-    let useful = report.fully_removed_count > 0
-        || report.newly_staged_count > 0
-        || run.evidence.recovery_sweep.entries_deleted > 0;
-    // Traversing the finite frozen keyset is progress even when every candidate
-    // is refused. Custody refusals still apply to each candidate; pacing only
-    // admits the next bounded page, with burst limits and a stop at cycle wrap.
-    useful || advanced
+    sweep.reserved
 }
 
 struct SandboxReclaimCoordinator {
@@ -332,6 +410,40 @@ struct SandboxReclaimWorkerState {
     active: AtomicUsize,
     consecutive_store_busy_pressure_passes: AtomicUsize,
     prepared_cursors: std::sync::Mutex<HashMap<usize, u64>>,
+    // Candidates last refused because their target was absent, keyed by custody
+    // id and generation. Skipping them avoids a filesystem probe and a log line
+    // per absent target each pass. A different generation evicts the entry.
+    absent_targets: std::sync::Mutex<HashMap<Uuid, u64>>,
+}
+
+impl SandboxReclaimWorkerState {
+    /// True when `(custody_id, generation)` is memoized as absent-this-pass.
+    /// A different generation evicts the stale entry and returns false.
+    fn absent_target_cached(&self, custody_id: Uuid, generation: u64) -> bool {
+        let mut cache = self
+            .absent_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cache.get(&custody_id).copied() {
+            Some(cached) if cached == generation => true,
+            Some(_) => {
+                cache.remove(&custody_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remember_absent_target(&self, custody_id: Uuid, generation: u64) {
+        let mut cache = self
+            .absent_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= ABSENT_TARGET_CACHE_CAPACITY && !cache.contains_key(&custody_id) {
+            cache.clear();
+        }
+        cache.insert(custody_id, generation);
+    }
 }
 
 struct SandboxReclaimJob {
@@ -632,7 +744,20 @@ fn run_sandbox_reclaim_job(
         && result
             .as_ref()
             .is_ok_and(|run| !run.report.enabled || !run.report.pressure_active_after);
+    // #1063: under disk pressure, also prune stale incremental state from the
+    // shared cargo target, which the sandbox reclaim above does not cover.
+    let prune_shared_target = !dry_run
+        && !prepared_only
+        && result.as_ref().is_ok_and(|run| {
+            run.report.enabled
+                && (run.report.pressure_active_before || run.report.pressure_active_after)
+        });
     let _ = result_tx.send(result);
+    if prune_shared_target {
+        tracing::dispatcher::with_default(&dispatch, || {
+            crate::shared_target_prune::run_and_log(trigger);
+        });
+    }
     if let Some(context) = immediate_recovery_context.filter(|_| !stopped_continuation) {
         let prepared_pending = context.store.try_lock().is_ok_and(|store| {
             store
@@ -694,6 +819,18 @@ fn log_reclaim_pressure_health(
 
 fn bounded_elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Step timing inside the stale-effect restore phase, so a slow phase names
+/// its cause (#961). It uses its own milestone and field names, so
+/// phase-level consumers (which match `phase=...`) are unaffected.
+fn log_authority_restore_step(restore_step: &'static str, step_started_at: Instant) {
+    tracing::info!(
+        startup_milestone = "authority_restore_step_complete",
+        restore_step,
+        step_duration_ms = bounded_elapsed_ms(step_started_at),
+        "Daemon authority restore step completed"
+    );
 }
 
 fn log_authority_restore_phase(
@@ -1008,7 +1145,10 @@ fn registered_filesystem_intent(
         allocation_id: intent.allocation_id,
         bucket: intent.bucket,
         slot_name: intent.slot_name.clone(),
-        expected_device: intent.expected_device,
+        expected_device: crate::store::target_reclaim_sweep::split_store_target_device(
+            intent.expected_device,
+        )
+        .0,
         expected_inode: intent.expected_inode,
     }
 }
@@ -1605,6 +1745,9 @@ struct DirectLaunchCustodyTestControl {
     fail_cli_final_scratch_revalidation: bool,
     fail_app_server_final_scratch_revalidation: bool,
     force_provider_unavailable: bool,
+    /// Remaining injected `settle_failed_manager_launch_target` failures.
+    fail_manager_launch_cleanup: u32,
+    fail_pre_provider_settlement: bool,
 }
 
 #[cfg(test)]
@@ -1642,7 +1785,7 @@ pub(super) fn install_direct_launch_custody_test_pause(
 }
 
 #[cfg(test)]
-fn fail_next_direct_launch_context_authorization_for_test(control_key: &str) {
+pub(super) fn fail_next_direct_launch_context_authorization_for_test(control_key: &str) {
     direct_launch_custody_test_controls()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1652,7 +1795,7 @@ fn fail_next_direct_launch_context_authorization_for_test(control_key: &str) {
 }
 
 #[cfg(test)]
-fn fail_next_direct_launch_execution_scratch_for_test(control_key: &str) {
+pub(super) fn fail_next_direct_launch_execution_scratch_for_test(control_key: &str) {
     direct_launch_custody_test_controls()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1662,7 +1805,7 @@ fn fail_next_direct_launch_execution_scratch_for_test(control_key: &str) {
 }
 
 #[cfg(test)]
-fn fail_next_cli_final_scratch_revalidation_for_test(control_key: &str) {
+pub(super) fn fail_next_cli_final_scratch_revalidation_for_test(control_key: &str) {
     direct_launch_custody_test_controls()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1689,6 +1832,51 @@ fn force_direct_launch_provider_unavailable_for_test(control_key: &str) {
         .entry(control_key.to_owned())
         .or_default()
         .force_provider_unavailable = true;
+}
+
+#[cfg(test)]
+pub(super) fn fail_manager_launch_cleanup_for_test(target: Uuid, times: u32) {
+    direct_launch_custody_test_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(format!("manager-launch-cleanup:{target}"))
+        .or_default()
+        .fail_manager_launch_cleanup = times;
+}
+
+#[cfg(test)]
+fn take_manager_launch_cleanup_failure_for_test(target: Uuid) -> bool {
+    let mut controls = direct_launch_custody_test_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(control) = controls.get_mut(&format!("manager-launch-cleanup:{target}")) else {
+        return false;
+    };
+    if control.fail_manager_launch_cleanup == 0 {
+        return false;
+    }
+    control.fail_manager_launch_cleanup -= 1;
+    true
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_pre_provider_settlement_for_test(session_id: Uuid) {
+    direct_launch_custody_test_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(format!("pre-provider-settlement:{session_id}"))
+        .or_default()
+        .fail_pre_provider_settlement = true;
+}
+
+#[cfg(test)]
+fn take_pre_provider_settlement_failure_for_test(session_id: Uuid) -> bool {
+    let mut controls = direct_launch_custody_test_controls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    controls
+        .get_mut(&format!("pre-provider-settlement:{session_id}"))
+        .is_some_and(|control| std::mem::take(&mut control.fail_pre_provider_settlement))
 }
 
 #[cfg(test)]
@@ -2296,6 +2484,17 @@ pub(super) fn launch_provider_label(provider: SessionProvider) -> String {
     format!("{provider:?}")
 }
 
+/// Issue #692: the model a provider will actually run for a stored or requested
+/// `model`, i.e. with the provider's own default applied when none is named.
+pub(super) fn provider_effective_model(
+    provider: SessionProvider,
+    model: Option<&str>,
+) -> Option<String> {
+    let mut effective = model.map(str::to_string);
+    apply_provider_model_default(provider, &mut effective);
+    effective
+}
+
 fn apply_provider_model_default(provider: SessionProvider, model: &mut Option<String>) {
     if provider == SessionProvider::Pioneer {
         *model = Some(crate::pioneer::pioneer_launch_model(model.as_deref()).to_string());
@@ -2396,6 +2595,7 @@ fn build_starting_session(
         context_window: Some(resolved_context_budget.active_tokens),
         resolved_context_budget: Some(resolved_context_budget),
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         session_kind,
         total_cache_creation_tokens: None,
@@ -3243,6 +3443,12 @@ async fn settle_failed_bound_fresh_pre_provider(
     reason: &str,
     safe_error_class: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    if take_pre_provider_settlement_failure_for_test(session_id) {
+        return Err(DaemonError::Store(
+            "injected pre-provider settlement failure".into(),
+        ));
+    }
     match launch_purpose {
         LaunchPurpose::AgentSuccessor(context) => {
             return settle_failed_pre_provider_agent_successor(
@@ -3288,6 +3494,60 @@ async fn settle_failed_bound_fresh_pre_provider(
     )
     .await?;
     Ok(())
+}
+
+fn provider_credential_error_class(
+    provider: rsi_common::types::SessionProvider,
+    error: &DaemonError,
+) -> Option<&'static str> {
+    let error_text = error.to_string();
+    match provider {
+        rsi_common::types::SessionProvider::OpenRouter
+            if error_text.contains("OpenRouter credential")
+                || error_text.contains("missing_credential") =>
+        {
+            Some("provider_credential_missing:openrouter")
+        }
+        rsi_common::types::SessionProvider::Bedrock if error_text.contains("Bedrock API key") => {
+            Some("provider_credential_missing:bedrock")
+        }
+        rsi_common::types::SessionProvider::Pioneer
+            if error_text.contains("Pioneer credential") =>
+        {
+            Some("provider_credential_missing:pioneer")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[test]
+fn provider_spawn_failure_classifies_missing_route_credential() {
+    assert_eq!(
+        provider_credential_error_class(
+            rsi_common::types::SessionProvider::OpenRouter,
+            &DaemonError::OpenRouterRoutePreflight {
+                cause: "missing_credential"
+            },
+        ),
+        Some("provider_credential_missing:openrouter")
+    );
+    assert_eq!(
+        provider_credential_error_class(
+            rsi_common::types::SessionProvider::Pioneer,
+            &DaemonError::Process(
+                "Pioneer credential is not configured; set it in the RSI key vault".to_string(),
+            ),
+        ),
+        Some("provider_credential_missing:pioneer")
+    );
+    assert_eq!(
+        provider_credential_error_class(
+            rsi_common::types::SessionProvider::Codex,
+            &DaemonError::Process("provider died".to_string()),
+        ),
+        None
+    );
 }
 
 /// Settle a final scratch revalidation failure after an AppServer launch has
@@ -3412,6 +3672,64 @@ const fn controller_launch_error_reason(error: &DaemonError) -> ControllerReleas
     }
 }
 
+/// #913: a manager-created session may fork from an unsandboxed container
+/// (e.g. an Epic) whose frozen source is the operator's shared checkout. That
+/// checkout's local `rolling` can lag the verified origin tip by hundreds of
+/// commits, so such a source is eligible to be rebased onto the origin tip.
+/// Sandboxed sources (lead forks, `replace_lead`) and historical review
+/// sources keep their exact frozen commit.
+fn manager_action_fresh_base_eligible(
+    source: Option<&crate::store::manager_actions::ManagerActionSourceV2>,
+) -> bool {
+    source.is_some_and(|source| source.sandbox_root.is_none() && !source.historical_commit)
+}
+
+/// Sandbox source (origin, commit) of a manager-action launch. An eligible
+/// source (see [`manager_action_fresh_base_eligible`]) observes the verified
+/// origin `rolling` tip through `fresh_rolling_base(FastForwardOnly)`. It
+/// stores the selection in `rolling_selection`, so allocation cleans up the
+/// private ref. Other sources keep their exact frozen commit.
+///
+/// This runs synchronously and is `#[inline(never)]`, like the sandbox
+/// allocation it feeds. Any new suspension point or large temporaries in the
+/// launch future overflow the 2 MiB debug test stack that
+/// `manager_intent_live_decision_pause_and_dependency_races_refuse_at_custody_provider_boundary`
+/// deliberately runs on (#985).
+#[inline(never)]
+fn manager_action_sandbox_source(
+    context: &super::types::ManagerActionLaunchContext,
+    session_id: Uuid,
+    rolling_selection: &mut Option<crate::sandbox::git_worktree::RollingBaseSelection>,
+) -> (std::path::PathBuf, String) {
+    let origin = context.fork.fork_origin().to_path_buf();
+    let fork_commit = context.fork.fork_commit().to_owned();
+    if !manager_action_fresh_base_eligible(context.claim.operation.context.source.as_ref()) {
+        return (origin, fork_commit);
+    }
+    match crate::sandbox::git_worktree::fresh_rolling_base(
+        &origin,
+        session_id,
+        fork_commit.clone(),
+        crate::sandbox::git_worktree::RollingBasePolicy::FastForwardOnly,
+    ) {
+        Ok(selection) => {
+            let commit = selection.commit.clone();
+            *rolling_selection = Some(selection);
+            (origin, commit)
+        }
+        // Observing the remote is best effort: the frozen commit stays the
+        // source, as `fresh_rolling_base` itself does when the fetch fails.
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "manager action rolling base observation failed; using the frozen source"
+            );
+            (origin, fork_commit)
+        }
+    }
+}
+
 impl SessionManager {
     #[cfg(test)]
     pub(crate) fn fail_next_agent_successor_projection_for_test(&self, reservation_id: Uuid) {
@@ -3473,7 +3791,7 @@ impl SessionManager {
                 confirmation_tx: Some(confirmation_tx),
             }));
         if let Err(error) = self
-            .launch_session_with_retry_admission(
+            .boxed_launch_session_with_retry_admission(
                 config,
                 retry_admission,
                 false,
@@ -3603,7 +3921,10 @@ impl SessionManager {
             .flatten();
         let mut terminal_events = retry_bound.map(|_| self.event_bus.subscribe());
         let _ = self
-            .interrupt_session(reservation.candidate_session_id)
+            .interrupt_session_from(
+                reservation.candidate_session_id,
+                crate::terminal_cause::InterruptSource::LaunchCleanup,
+            )
             .await;
         #[cfg(test)]
         if retry_bound.is_some() {
@@ -3788,7 +4109,7 @@ impl SessionManager {
     /// and session monitoring run in a background task to avoid blocking the
     /// RPC response (and thus the TUI's event loop).
     pub async fn launch_session(&self, config: LaunchConfig) -> Result<Uuid> {
-        self.launch_session_with_retry_admission(
+        self.boxed_launch_session_with_retry_admission(
             config,
             None,
             false,
@@ -3804,7 +4125,7 @@ impl SessionManager {
         session_id: Uuid,
         custody_id: Uuid,
     ) -> Result<Uuid> {
-        self.launch_session_with_retry_admission(
+        self.boxed_launch_session_with_retry_admission(
             config,
             None,
             false,
@@ -3838,6 +4159,16 @@ impl SessionManager {
                 return Ok(request.child_session_id);
             }
         }
+        // #1073: a child spawn waits, in place and before any side effect or
+        // guard, while a deploy waits for its quiet point. The spawn request is
+        // already durable, so a restart re-launches it.
+        self.deploy_drain
+            .wait_released(
+                crate::deploy_drain::HeldKind::ChildSpawn,
+                Some(request.child_session_id),
+                true,
+            )
+            .await;
         let cwd_admission_guard =
             super::spawn_single_flight::acquire_provider_cwd_admission().await;
         if self
@@ -3919,7 +4250,7 @@ impl SessionManager {
             .mark_agent_spawn_launching(request.spawn_request_id)?;
         let config_for_settlement = request.config.clone();
         let result = self
-            .launch_session_with_retry_admission(
+            .boxed_launch_session_with_retry_admission(
                 request.config,
                 None,
                 false,
@@ -4043,6 +4374,7 @@ impl SessionManager {
             branch: None,
         });
         Ok(LaunchConfig {
+            completion_gates: None,
             query: reservation.request.query.clone(),
             title: None,
             agent_role: frozen.agent_role.clone(),
@@ -4082,6 +4414,7 @@ impl SessionManager {
             // The reservation freezes the effective provider/model witness.
             // A later project-default edit must not rewrite an exact replay.
             skip_project_model_default: true,
+            tool_policy: None,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::AgentReserveSuccessor,
             sandbox,
@@ -4109,7 +4442,7 @@ impl SessionManager {
             prospective_a6,
             confirmation_tx: Some(confirmation_tx),
         }));
-        self.launch_session_with_retry_admission(config, None, false, purpose, None)
+        self.boxed_launch_session_with_retry_admission(config, None, false, purpose, None)
             .await?;
         tokio::time::timeout(Duration::from_secs(60), confirmation_rx)
             .await
@@ -4301,7 +4634,12 @@ impl SessionManager {
 
     async fn cleanup_failed_agent_successor(&self, candidate_session_id: Uuid) {
         let mut events = self.event_bus.subscribe();
-        let _ = self.interrupt_session(candidate_session_id).await;
+        let _ = self
+            .interrupt_session_from(
+                candidate_session_id,
+                crate::terminal_cause::InterruptSource::LaunchCleanup,
+            )
+            .await;
         if self.active.read().await.contains_key(&candidate_session_id) {
             let _ = tokio::time::timeout(Self::CONTINUE_INTERRUPT_WAIT, async {
                 loop {
@@ -4657,7 +4995,7 @@ impl SessionManager {
         config: LaunchConfig,
         initial_rotation_disabled: bool,
     ) -> Result<Uuid> {
-        self.launch_session_with_retry_admission(
+        self.boxed_launch_session_with_retry_admission(
             config,
             None,
             initial_rotation_disabled,
@@ -4676,7 +5014,7 @@ impl SessionManager {
         config: LaunchConfig,
         admission: super::types::RetryAdmission,
     ) -> Result<Uuid> {
-        self.launch_session_with_retry_admission(
+        self.boxed_launch_session_with_retry_admission(
             config,
             Some(admission),
             false,
@@ -4684,6 +5022,30 @@ impl SessionManager {
             None,
         )
         .await
+    }
+
+    /// #1073: the deploy-drain admission for a new launch. An ordinary launch
+    /// is refused with the typed retryable `deploy_draining`; a topology node
+    /// is durable and waits in place. A parentless launch is never held.
+    async fn deploy_drain_launch_gate(
+        &self,
+        purpose: &LaunchPurpose,
+        has_parent: bool,
+    ) -> Result<()> {
+        match purpose {
+            LaunchPurpose::Interactive => self.deploy_drain.refuse_if_draining(None, has_parent)?,
+            LaunchPurpose::TopologyNode(context) => {
+                self.deploy_drain
+                    .wait_released(
+                        crate::deploy_drain::HeldKind::TopologyNode,
+                        Some(context.session_id),
+                        has_parent,
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub(super) async fn launch_manager_action_candidate(
@@ -4697,8 +5059,11 @@ impl SessionManager {
             .context
             .target_session_id
             .expect("reserved manager candidate");
+        // #1073: a manager-created session never starts behind a draining
+        // deploy. The action stays durable and is requeued, not claimed-running.
+        self.deploy_drain.refuse_if_draining(Some(target), true)?;
         let result = self
-            .launch_session_with_retry_admission(
+            .boxed_launch_session_with_retry_admission(
                 config,
                 None,
                 false,
@@ -4707,29 +5072,282 @@ impl SessionManager {
             )
             .await;
         if result.is_err() && !self.active.read().await.contains_key(&target) {
-            let invocation = {
-                let mut store = self.store.lock().await;
-                if store.get_session(target)?.is_some() {
-                    store.fail_bound_direct_launch(target, "manager_action_launch_unconfirmed")?;
-                }
-                store.session_model_invocation_id(target)?
-            };
-            if let Some(invocation) = invocation {
-                complete_invocation_by_id(
-                    &self.store,
-                    invocation,
-                    InvocationCompletion {
-                        error_class: Some("manager_action_launch_unconfirmed".into()),
-                        confidence: Some(ModelUsageConfidence::Unavailable),
-                        ..InvocationCompletion::default()
-                    },
-                    self.event_bus(),
-                )
-                .await?;
+            // #981/#1084: cleanup never replaces the launch error. A failed
+            // cleanup leaves durable evidence (a Starting row or an open
+            // invocation behind a terminal action) that
+            // `reconcile_failed_manager_launch_cleanup` retries under the
+            // same fences.
+            if let Err(error) = self.settle_failed_manager_launch_target(target).await {
+                tracing::warn!(
+                    session_id = %target,
+                    %error,
+                    "manager action launch cleanup incomplete; the sweep will retry"
+                );
             }
-            self.revoke_agent_token_for_session(target).await;
         }
         result
+    }
+
+    /// Fenced, idempotent cleanup for a manager-action launch that did not
+    /// establish: revoke the token, fail a still-Starting row (an already
+    /// settled row is left alone) and complete the open invocation.
+    pub(super) async fn settle_failed_manager_launch_target(&self, target: Uuid) -> Result<()> {
+        self.revoke_agent_token_for_session(target).await;
+        #[cfg(test)]
+        if take_manager_launch_cleanup_failure_for_test(target) {
+            return Err(DaemonError::Store(
+                "injected manager launch cleanup failure".into(),
+            ));
+        }
+        let invocation = {
+            let mut store = self.store.lock().await;
+            if store
+                .get_session(target)?
+                .is_some_and(|session| session.status == SessionStatus::Starting)
+            {
+                store.fail_bound_direct_launch(target, "manager_action_launch_unconfirmed")?;
+            }
+            store.session_model_invocation_id(target)?
+        };
+        if let Some(invocation) = invocation {
+            complete_invocation_by_id(
+                &self.store,
+                invocation,
+                InvocationCompletion {
+                    error_class: Some("manager_action_launch_unconfirmed".into()),
+                    confidence: Some(ModelUsageConfidence::Unavailable),
+                    ..InvocationCompletion::default()
+                },
+                self.event_bus(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Settle one provider spawn failure and return the error the launch
+    /// propagates. `launch_session_with_retry_admission` awaits this through
+    /// `Box::pin`: its settlement awaits and error-class strings would
+    /// otherwise grow that already very large future past a test thread's
+    /// stack (#850).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn settle_provider_spawn_failure(
+        &self,
+        session_id: Uuid,
+        provider: SessionProvider,
+        error: DaemonError,
+        launch_purpose: &mut LaunchPurpose,
+        direct_interactive: bool,
+        retry_bound: Option<&BoundRetryCustody>,
+        admission_permit: &crate::model_control::AdmissionPermit,
+    ) -> DaemonError {
+        tracing::warn!(
+            session_id = %session_id,
+            provider = ?provider,
+            error = %error,
+            "provider process spawn failed"
+        );
+        let execution_scratch_failure =
+            matches!(&error, DaemonError::ExecutionScratchUnavailable(_));
+        let codex_tool_history_failure = matches!(&error, DaemonError::CodexResumeToolHistory(_));
+        let codex_torn_tail = matches!(&error, DaemonError::CodexResumeTornTail);
+        let credential_error_class = provider_credential_error_class(provider, &error);
+        let safe_error_class: String = credential_error_class.map_or_else(
+            || {
+                if execution_scratch_failure {
+                    "execution_scratch_unavailable".to_string()
+                } else if codex_torn_tail {
+                    "codex_resume_rollout_torn_tail".to_string()
+                } else if codex_tool_history_failure {
+                    "codex_resume_tool_history_invalid".to_string()
+                } else {
+                    "provider_spawn_failed".to_string()
+                }
+            },
+            ToString::to_string,
+        );
+        if launch_purpose.manager_successor().is_some() {
+            // Even a failed establishment may have spawned an OS
+            // cohort. The root owner proves drain before releasing
+            // this invocation/capacity, outside the launch guards.
+            return error;
+        }
+        if direct_interactive {
+            let spawn_failure_reason: String = if credential_error_class.is_some() {
+                error.to_string()
+            } else if codex_torn_tail {
+                "Codex rollout torn tail before provider dispatch".to_string()
+            } else if codex_tool_history_failure {
+                "Codex persisted tool history invalid before provider dispatch".to_string()
+            } else if execution_scratch_failure {
+                "execution scratch revalidation failed before provider dispatch".to_string()
+            } else {
+                "provider spawn failed before establishment".to_string()
+            };
+            if let Err(settlement_error) = settle_failed_bound_fresh_pre_provider(
+                launch_purpose,
+                &self.store,
+                self.event_bus(),
+                &self.agent_tokens,
+                session_id,
+                admission_permit,
+                &spawn_failure_reason,
+                safe_error_class.as_str(),
+            )
+            .await
+            {
+                // #1084: the launch refusal is what the caller and the manager
+                // receipt must see; the unsettled row is retried by the
+                // fenced cleanup sweep and restart reconciliation.
+                tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle pre-provider launch failure; original refusal preserved");
+            }
+            self.revoke_agent_token_for_session(session_id).await;
+            return error;
+        }
+        if let Some(bound) = retry_bound
+            && let Err(settlement_error) = self
+                .custody_execution_runtime()
+                .settle_bound_retry_failure(
+                    session_id,
+                    bound,
+                    SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
+                )
+                .await
+        {
+            tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle bound retry provider-spawn failure");
+        }
+        let invocation_error_class: String = credential_error_class.map_or_else(
+            || {
+                if codex_torn_tail {
+                    "codex_resume_rollout_torn_tail".to_string()
+                } else if codex_tool_history_failure {
+                    "codex_resume_tool_history_invalid".to_string()
+                } else if execution_scratch_failure {
+                    "execution_scratch_unavailable".to_string()
+                } else {
+                    "spawn_failed".to_string()
+                }
+            },
+            ToString::to_string,
+        );
+        if let Err(settle_error) = complete_invocation(
+            &self.store,
+            admission_permit,
+            InvocationCompletion {
+                error_class: Some(invocation_error_class),
+                confidence: Some(ModelUsageConfidence::Unavailable),
+                ..InvocationCompletion::default()
+            },
+            self.event_bus(),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %settle_error,
+                session_id = %session_id,
+                "Failed to settle fresh launch admission after spawn error"
+            );
+        }
+        self.revoke_agent_token_for_session(session_id).await;
+        error
+    }
+
+    /// #985: the retry-admission state machine is ~40 KiB in debug builds.
+    /// Heap-pin it at every dispatch boundary so the future (and its huge
+    /// nested launch frames) never lives on a caller's stack.
+    #[inline(never)]
+    pub(super) fn boxed_launch_session_with_retry_admission<'a>(
+        &'a self,
+        config: LaunchConfig,
+        retry_admission: Option<super::types::RetryAdmission>,
+        initial_rotation_disabled: bool,
+        launch_purpose: LaunchPurpose,
+        preheld_cwd_admission: Option<super::spawn_single_flight::ProviderCwdAdmissionGuard>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + 'a>> {
+        Box::pin(self.launch_session_with_retry_admission(
+            config,
+            retry_admission,
+            initial_rotation_disabled,
+            launch_purpose,
+            preheld_cwd_admission,
+        ))
+    }
+
+    /// #985: heap future for [`Self::launch_manager_action_candidate`], which
+    /// otherwise inlines the retry-admission state machine into
+    /// `execute_manager_action`'s frame.
+    #[inline(never)]
+    pub(super) fn boxed_launch_manager_action_candidate<'a>(
+        &'a self,
+        config: LaunchConfig,
+        context: super::types::ManagerActionLaunchContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + 'a>> {
+        Box::pin(self.launch_manager_action_candidate(config, context))
+    }
+
+    /// Issue #692: the provider and model a launch will run, resolved the way
+    /// the launch resolves them: the explicit request, else the project's
+    /// `FLYWHEEL.md` default (never for a launch that skips it or replays a
+    /// frozen retry identity), then the provider's own default. `None` means
+    /// no effective model can be determined.
+    async fn effective_launch_identity(
+        &self,
+        config: &LaunchConfig,
+        authenticated_retry: bool,
+    ) -> (SessionProvider, Option<String>) {
+        let mut provider = config.provider;
+        let mut model = config.model.clone();
+        if !authenticated_retry {
+            let project_id = match config.project_id {
+                Some(id) => Some(id),
+                None => {
+                    let raw = config.working_dir.clone().unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                    });
+                    let dir = raw.canonicalize().unwrap_or(raw);
+                    self.project_index.read().await.find_project_for_path(&dir)
+                }
+            };
+            if let Some(pid) = project_id {
+                let cache = self.workflow_config_cache.read().await;
+                if let Some(wf) = cache.get(&pid) {
+                    if provider.is_none() {
+                        provider = wf.settings.provider;
+                    }
+                    if model.is_none() && !config.skip_project_model_default {
+                        model = wf.settings.model.clone();
+                    }
+                }
+            }
+        }
+        let provider = provider.unwrap_or(SessionProvider::Claude);
+        apply_provider_model_default(provider, &mut model);
+        (provider, model)
+    }
+
+    /// Issue #692: refuse a launch whose EFFECTIVE model is off the operator
+    /// allowlist. `model` is the model after the project default and the
+    /// provider default have been applied; it is canonicalised (context-variant
+    /// tag and provider routing prefix dropped) and compared exactly. `None`
+    /// (no effective model can be determined) is refused while a list is set.
+    /// Read live, so an `UpdateDaemonConfig` change applies to the next launch;
+    /// an empty list is unrestricted. Called at the one launch chokepoint
+    /// before any side effect, so every path (interactive, `AgentSpawnChild`,
+    /// topology nodes, manager actions, retries, successors, reviewers) is
+    /// covered; continuations and rotations are preflighted at their own entry.
+    fn enforce_launch_model_allowlist(
+        &self,
+        provider: SessionProvider,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let Some(reason) = self.runtime_config.launch_model_refusal(provider, model) else {
+            return Ok(());
+        };
+        tracing::warn!(
+            model = model.unwrap_or("-"),
+            "launch refused: model is not on the operator launch-model allowlist"
+        );
+        Err(DaemonError::PolicyDenied(reason))
     }
 
     pub(super) async fn launch_session_with_retry_admission(
@@ -4748,6 +5366,13 @@ impl SessionManager {
                 "daemon restart drain is in progress".into(),
             ));
         }
+        // #1073: hold new worker launches while a deploy waits for its quiet
+        // point. Retries and successors continue running work and pass; an
+        // AgentChild launch already waited (and holds the cwd guard).
+        if preheld_cwd_admission.is_none() && retry_admission.is_none() {
+            self.deploy_drain_launch_gate(&launch_purpose, config.parent_id.is_some())
+                .await?;
+        }
         let authenticated_retry = retry_admission.is_some();
         if authenticated_retry && (config.sandbox.is_some() || config.cargo_target_dir.is_some()) {
             return Err(DaemonError::InvalidParam(
@@ -4764,6 +5389,14 @@ impl SessionManager {
                 "Cannot spawn a container-kind session".into(),
             ));
         }
+        // #692: refuse a model off the operator allowlist before any side
+        // effect (sandbox allocation, custody, session row, admission). The
+        // check runs on the EFFECTIVE model: project and provider defaults are
+        // resolved first, exactly as the launch does below.
+        let (effective_provider, effective_model) = self
+            .effective_launch_identity(&config, authenticated_retry)
+            .await;
+        self.enforce_launch_model_allowlist(effective_provider, effective_model.as_deref())?;
         // #694 K1: refresh a missing/expired credential check (single-flight,
         // 5 s timeout) before any lock is taken, so the spawn chokepoint's
         // admission decides on a current result.
@@ -4946,6 +5579,12 @@ impl SessionManager {
         let allocation: Option<SandboxAllocation> = match config.sandbox.as_ref() {
             Some(spec) => {
                 let kind = spec.kind.unwrap_or(SandboxKind::GitWorktree);
+                if kind != SandboxKind::GitWorktree {
+                    return Err(DaemonError::InvalidParam(format!(
+                        "unsupported sandbox kind: {kind:?}"
+                    )));
+                }
+                let allocation_permit = self.admit_sandbox_allocation().await?;
                 // H1-04 (F-011): an agent child forks exclusively from the
                 // authenticated emitter HEAD captured by `launch_agent_child`.
                 // The canonical selector resolution below is structurally
@@ -4981,10 +5620,10 @@ impl SessionManager {
                             claim.reservation.frozen.handoff.source_commit.clone(),
                         )
                     } else if let Some(context) = launch_purpose.manager_action() {
-                        (
-                            context.fork.fork_origin().to_path_buf(),
-                            context.fork.fork_commit().to_owned(),
-                        )
+                        // #913: see manager_action_sandbox_source. It is
+                        // synchronous, so this branch adds no suspension point
+                        // to the launch future.
+                        manager_action_sandbox_source(context, session_id, &mut rolling_selection)
                     } else if let Some(context) = launch_purpose.topology_node() {
                         (
                             context.fork.origin().to_path_buf(),
@@ -5075,6 +5714,7 @@ impl SessionManager {
                 let allocate = |commit: &str| {
                     if launch_purpose.closure_source().is_some() {
                         self.sandbox_allocator.allocate_or_adopt_reserved_closure(
+                            allocation_permit,
                             session_id,
                             &working_dir,
                             kind,
@@ -5082,7 +5722,8 @@ impl SessionManager {
                             spec.branch.as_deref(),
                         )
                     } else {
-                        self.sandbox_allocator.allocate(
+                        self.sandbox_allocator.allocate_with_permit(
+                            allocation_permit,
                             session_id,
                             &source_origin,
                             kind,
@@ -5225,6 +5866,9 @@ impl SessionManager {
         // Re-resolve provider after settings override
         let provider = config.provider.unwrap_or(SessionProvider::Claude);
         apply_provider_model_default(provider, &mut config.model);
+        // #692: authoritative check on the effective model (project default and
+        // provider default applied).
+        self.enforce_launch_model_allowlist(provider, config.model.as_deref())?;
         if let Some(context) = launch_purpose.manager_action() {
             let frozen = context
                 .claim
@@ -5242,6 +5886,27 @@ impl SessionManager {
                 ));
             }
         }
+        // Bedrock Claude models resolve to Claude Code or the Harness per the
+        // operator's `api_route.bedrock` setting, and the session records that
+        // runtime so resume stays on the same engine.
+        // Launches replaying a frozen identity keep their recorded provider.
+        let provider = if matches!(
+            launch_purpose,
+            LaunchPurpose::Interactive | LaunchPurpose::AgentChild(_)
+        ) {
+            let route = self.runtime_config.bedrock_route_for(
+                config
+                    .model
+                    .as_deref()
+                    .unwrap_or(crate::bedrock::BEDROCK_DEFAULT_MODEL),
+            );
+            let resolved =
+                crate::bedrock::resolve_launch_provider(provider, config.model.as_deref(), route);
+            config.provider = Some(resolved);
+            resolved
+        } else {
+            provider
+        };
 
         if config.configured_context_window.is_none() {
             config.configured_context_window = retry_admission.as_ref().and_then(|admission| {
@@ -5887,7 +6552,7 @@ impl SessionManager {
                     )
                     .await
                     {
-                        return Err(settlement_error);
+                        tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle custody authorization failure; original refusal preserved");
                     }
                     return Err(error);
                 }
@@ -5960,7 +6625,7 @@ impl SessionManager {
                         )
                         .await
                     {
-                        return Err(settlement_error);
+                        tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle ContextRead authorization failure; original refusal preserved");
                     }
                     return Err(error);
                 }
@@ -6019,7 +6684,7 @@ impl SessionManager {
                     )
                     .await
                 {
-                    return Err(settlement_error);
+                    tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle execution scratch failure; original refusal preserved");
                 }
                 return Err(error);
             }
@@ -6308,7 +6973,10 @@ impl SessionManager {
                 launch_context_budget.active_tokens,
             );
 
-            let mut parts = fresh_launch_preamble_parts(config.session_kind.unwrap_or_default());
+            let mut parts = fresh_launch_preamble_parts(
+                config.session_kind.unwrap_or_default(),
+                &custody_context_cwd,
+            );
             // Orchestration router — "the very mouth of the pipeline" for every
             // leaf-kind session (Standard / TaskRabbit / Bug / Story / Task /
             // Feature / Refactor / Research). Frames the worker BEFORE the
@@ -6632,6 +7300,8 @@ impl SessionManager {
         {
             context.claim_effect().await?;
         }
+        let spawn_generation = self.next_spawn_generation();
+        let explicit_completion_gates = config.completion_gates.clone();
         let sync_launch = if provider == SessionProvider::CodexAppServer {
             // Entire launch deferred to background task (async handshake required).
             SyncLaunchResult::AppServerDeferred
@@ -6643,14 +7313,61 @@ impl SessionManager {
             // `config.working_dir` already holds the effective (sandbox) cwd, and
             // history is None on a fresh launch.
             let harness_project_id = resolved_project.as_ref().map(|p| p.id);
+            // #792: resolve (read-only) the operator-set or inherited policy before
+            // any provider effect; a retry relaunch resolves the stored row. The
+            // row is written after the session row exists (foreign key), below.
+            // A launch that carries a policy must persist its session row before
+            // going active, or a later continue could not find the policy.
+            if config.tool_policy.is_some()
+                && !(direct_interactive
+                    || config.continued_from.is_some()
+                    || initial_rotation_disabled
+                    || launch_purpose.is_controller_candidate()
+                    || launch_purpose.is_agent_successor()
+                    || launch_purpose.agent_child().is_some())
+            {
+                return Err(DaemonError::InvalidParam(
+                    "tool_policy_requires_durable_launch".into(),
+                ));
+            }
+            if config.completion_gates.is_some()
+                && !(direct_interactive
+                    || config.continued_from.is_some()
+                    || initial_rotation_disabled
+                    || launch_purpose.is_controller_candidate()
+                    || launch_purpose.is_agent_successor()
+                    || launch_purpose.agent_child().is_some())
+            {
+                return Err(DaemonError::InvalidParam(
+                    "completion_gates_requires_durable_launch".into(),
+                ));
+            }
+            let launch_completion_gates =
+                super::completion_gates_launch::resolve_launch_completion_gates(
+                    &self.store,
+                    session_id,
+                    config.continued_from,
+                    explicit_completion_gates.as_ref(),
+                )
+                .await?;
+            config.completion_gates = launch_completion_gates;
+            let launch_tool_policy = super::tool_policy_launch::resolve_launch_tool_policy(
+                &self.store,
+                session_id,
+                config.continued_from,
+                config.tool_policy.as_ref(),
+            )
+            .await;
             let launcher = super::provider_spawn::CachedLauncher {
                 mgr: self,
                 harness: super::provider_spawn::HarnessLaunchCtx {
+                    monitor_generation: spawn_generation,
                     conversation_history: None,
                     project_id: harness_project_id,
                     initial_admission_permit: admission_permit.clone(),
                     model_call_settlements: model_call_settlements.clone(),
                     resolved_context_budget: launch_context_budget.clone(),
+                    tool_policy: launch_tool_policy,
                 },
             };
             tracing::info!(session_id = %session_id, ?provider, "Launch: spawning provider process");
@@ -6715,92 +7432,16 @@ impl SessionManager {
             let (process, event_rx) = match launch_result {
                 Ok(pair) => pair,
                 Err(error) => {
-                    let execution_scratch_failure =
-                        matches!(&error, DaemonError::ExecutionScratchUnavailable(_));
-                    let codex_tool_history_failure =
-                        matches!(&error, DaemonError::CodexResumeToolHistory(_));
-                    let codex_torn_tail = matches!(&error, DaemonError::CodexResumeTornTail);
-                    let safe_error_class = if execution_scratch_failure {
-                        "execution_scratch_unavailable"
-                    } else if codex_torn_tail {
-                        "codex_resume_rollout_torn_tail"
-                    } else if codex_tool_history_failure {
-                        "codex_resume_tool_history_invalid"
-                    } else {
-                        "provider_spawn_failed"
-                    };
-                    if launch_purpose.manager_successor().is_some() {
-                        // Even a failed establishment may have spawned an OS
-                        // cohort. The root owner proves drain before releasing
-                        // this invocation/capacity, outside the launch guards.
-                        return Err(error);
-                    }
-                    if direct_interactive {
-                        settle_failed_bound_fresh_pre_provider(
-                            &mut launch_purpose,
-                            &self.store,
-                            self.event_bus(),
-                            &self.agent_tokens,
-                            session_id,
-                            &admission_permit,
-                            if codex_torn_tail {
-                                "Codex rollout torn tail before provider dispatch"
-                            } else if codex_tool_history_failure {
-                                "Codex persisted tool history invalid before provider dispatch"
-                            } else if execution_scratch_failure {
-                                "execution scratch revalidation failed before provider dispatch"
-                            } else {
-                                "provider spawn failed before establishment"
-                            },
-                            safe_error_class,
-                        )
-                        .await?;
-                        self.revoke_agent_token_for_session(session_id).await;
-                        return Err(error);
-                    }
-                    if let Some(bound) = retry_bound.as_ref()
-                        && let Err(settlement_error) = self
-                            .custody_execution_runtime()
-                            .settle_bound_retry_failure(
-                                session_id,
-                                bound,
-                                SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
-                            )
-                            .await
-                    {
-                        tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle bound retry provider-spawn failure");
-                    }
-                    if let Err(settle_error) = complete_invocation(
-                        &self.store,
+                    return Err(Box::pin(self.settle_provider_spawn_failure(
+                        session_id,
+                        provider,
+                        error,
+                        &mut launch_purpose,
+                        direct_interactive,
+                        retry_bound.as_ref(),
                         &admission_permit,
-                        InvocationCompletion {
-                            error_class: Some(
-                                if codex_torn_tail {
-                                    "codex_resume_rollout_torn_tail"
-                                } else if codex_tool_history_failure {
-                                    "codex_resume_tool_history_invalid"
-                                } else if execution_scratch_failure {
-                                    "execution_scratch_unavailable"
-                                } else {
-                                    "spawn_failed"
-                                }
-                                .to_string(),
-                            ),
-                            confidence: Some(ModelUsageConfidence::Unavailable),
-                            ..InvocationCompletion::default()
-                        },
-                        self.event_bus(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %settle_error,
-                            session_id = %session_id,
-                            "Failed to settle fresh launch admission after spawn error"
-                        );
-                    }
-                    self.revoke_agent_token_for_session(session_id).await;
-                    return Err(error);
+                    ))
+                    .await);
                 }
             };
             tracing::info!(session_id = %session_id, "Launch: provider process spawned");
@@ -6968,6 +7609,32 @@ impl SessionManager {
                     self.store.lock().await.insert_session(&session)
                 }
             };
+            // #792: record an explicit or spawn-inherited tool policy now that the
+            // session row exists. A failure stops the launch like any other
+            // admission failure; the stored first row wins on a retry.
+            let admission_result = match (
+                admission_result,
+                config.tool_policy.as_ref(),
+                explicit_completion_gates.as_ref(),
+            ) {
+                (Ok(()), _, Some(gates)) => {
+                    super::completion_gates_launch::persist_launch_completion_gates(
+                        &self.store,
+                        session_id,
+                        gates,
+                    )
+                    .await
+                }
+                (Ok(()), Some(policy), _) => {
+                    super::tool_policy_launch::persist_launch_tool_policy(
+                        &self.store,
+                        session_id,
+                        policy,
+                    )
+                    .await
+                }
+                (other, _, _) => other,
+            };
             if let Err(error) = admission_result {
                 if initial_rotation_disabled {
                     return Err(cleanup_failed_scheduled_fresh_before_active(
@@ -7020,7 +7687,6 @@ impl SessionManager {
             .await;
         }
 
-        let spawn_generation = self.next_spawn_generation();
         if let Some(context) = launch_purpose.manager_successor() {
             context
                 .generation
@@ -7043,11 +7709,14 @@ impl SessionManager {
                     || launch_purpose.manager_action().is_some()))
             .then(|| Arc::new(tokio::sync::Mutex::new(()))),
             stop_tx,
+            operator_inbox: Default::default(),
             interrupt_requested: false,
+            interrupt_source: None,
             pending_archive: false,
             rotation,
             live_input_tokens: 0,
             live_output_tokens: 0,
+            live_prompt_tokens: 0,
             live_usage_confidence: rsi_common::types::ContextUsageConfidence::Missing,
             daemon_input_tokens: 0,
             daemon_output_tokens: 0,
@@ -7686,6 +8355,39 @@ impl SessionManager {
                                     )
                                     .await;
                                 }
+                                // #1033: a manager-action candidate that was
+                                // interrupted (scope revoked, stop requested)
+                                // before the deferred provider start must be
+                                // settled here too. Returning without settling
+                                // left it Starting in `active` with
+                                // `interrupt_requested` set, so the stopper
+                                // waited out its deadline and blocked the action.
+                                if let Some(context) = manager_action_context.as_ref() {
+                                    // Report the real refusal when the action
+                                    // gate now fails (revoked scope/policy),
+                                    // so the receipt settles as Revoked.
+                                    let gate = store
+                                        .lock()
+                                        .await
+                                        .manager_action_runtime_gate(&context.claim, true);
+                                    let code = match &gate {
+                                        Err(error) => {
+                                            super::manager_actions::safe_action_error(error)
+                                        }
+                                        Ok(()) => "manager_v2_deferred_provider_start_cancelled",
+                                    };
+                                    settle_failed_deferred_manager_action(
+                                        context,
+                                        &active,
+                                        &store,
+                                        &event_bus,
+                                        &agent_tokens,
+                                        &admission_permit_for_task,
+                                        spawn_generation,
+                                        code,
+                                    )
+                                    .await;
+                                }
                                 tracing::info!(
                                     session_id = %session_id,
                                     ?rejection,
@@ -8074,6 +8776,7 @@ impl SessionManager {
                                     persistence.clone(),
                                     memory_handle.clone(),
                                     runtime_config.clone(),
+                                    Some(spawn_coordinator.process_registry_manager()),
                                 )
                                 .await;
                                 if finalized.is_none() {
@@ -8185,6 +8888,8 @@ impl SessionManager {
         })
         .await
         .map_err(|e| DaemonError::Store(e.to_string()))??;
+        log_authority_restore_step("stale_effect_boot_fence", phase_started_at);
+        let mut subphase_started_at = Instant::now();
         let sandbox_base = self.sandbox_allocator.base_dir().to_path_buf();
         let orphan_candidates = tokio::task::spawn_blocking({
             let store = self.store.clone();
@@ -8243,13 +8948,19 @@ impl SessionManager {
                 false
             }
         };
+        log_authority_restore_step("settlement_orphan_proof", subphase_started_at);
+        subphase_started_at = Instant::now();
         if settlement_recovery_safe {
             self.recover_source_worktree_settlements().await?;
         }
+        log_authority_restore_step("source_worktree_settlements", subphase_started_at);
+        subphase_started_at = Instant::now();
         // Ordinary archive cleanup owns its authenticated quarantine until
         // its journal reaches a terminal phase. Resume it before generic
         // custody reconciliation can classify the original path as missing.
         self.recover_archive_cleanups().await?;
+        log_authority_restore_step("archive_cleanups", subphase_started_at);
+        subphase_started_at = Instant::now();
         let adoption_store = Arc::clone(&self.store);
         let adoption_base = self.sandbox_allocator.base_dir().to_path_buf();
         match tokio::task::spawn_blocking(move || {
@@ -8275,6 +8986,7 @@ impl SessionManager {
                 "Sandbox absent-root startup adoption task failed; continuing restore"
             ),
         }
+        log_authority_restore_step("absent_root_adoption", subphase_started_at);
         log_authority_restore_phase(
             "stale_effect_and_settlement_recovery",
             phase_started_at,
@@ -8731,16 +9443,11 @@ impl SessionManager {
         );
         phase_started_at = Instant::now();
 
-        // Retry setup holds no completed-map guard here. Keep the orphan sweep
-        // outside map locks: it queries the store
-        // and may contend on the persistence worker, and it does NOT need
-        // the completed-map lock held.
-        // Sandbox orphan sweep: reconcile DB cleanup_state=Live rows whose
-        // owning session is terminal, and any on-disk sandbox subdirs that
-        // have no owning Live row. Non-fatal on error.
-        if let Err(e) = self.sandbox_orphan_sweep().await {
-            tracing::warn!(error = %e, "Sandbox orphan sweep failed during restore (non-fatal)");
-        }
+        // The sandbox orphan sweep only classifies retained candidates for
+        // diagnostics (D00 grants no cleanup authority, so it never mutates).
+        // It walks every Live row and sandbox directory, ~6 ms each, so it
+        // no longer blocks readiness: the daemon runs it after request_ready
+        // through `run_startup_sandbox_diagnostics` (#961).
         log_authority_restore_phase(
             "orphan_classification",
             phase_started_at,
@@ -8790,6 +9497,11 @@ impl SessionManager {
             })
             .collect();
 
+        let sweep_started_at = Instant::now();
+        let mut retained_by_reason: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        let mut path_only_by_reason: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
         // 2. Classify non-resumable typed owners without mutating them.
         for (session_id, status, sandbox_root) in live_owners.iter() {
             if !should_purge_sandbox_on_restore(*status) {
@@ -8831,7 +9543,8 @@ impl SessionManager {
             );
             match self.classify_cleanup_candidate(candidate).await {
                 CleanupDecision::Blocked(reason) => {
-                    tracing::warn!(
+                    *retained_by_reason.entry(reason.as_str()).or_default() += 1;
+                    tracing::debug!(
                         session_id = %session_id,
                         sandbox_root = %sandbox_root.display(),
                         cleanup_reason = reason.as_str(),
@@ -8866,7 +9579,8 @@ impl SessionManager {
             if let CleanupDecision::Blocked(reason) =
                 self.classify_cleanup_candidate(candidate).await
             {
-                tracing::warn!(
+                *path_only_by_reason.entry(reason.as_str()).or_default() += 1;
+                tracing::debug!(
                     session_id = %uuid,
                     sandbox_root = %stray_path.display(),
                     cleanup_reason = reason.as_str(),
@@ -8875,7 +9589,28 @@ impl SessionManager {
             }
         }
 
+        // One summary line instead of one WARN per retained sandbox (#961).
+        let retained: usize = retained_by_reason.values().sum();
+        let path_only: usize = path_only_by_reason.values().sum();
+        if retained + path_only > 0 {
+            tracing::warn!(
+                retained,
+                path_only,
+                retained_by_reason = ?retained_by_reason,
+                path_only_by_reason = ?path_only_by_reason,
+                duration_ms = bounded_elapsed_ms(sweep_started_at),
+                "Retaining startup sandbox candidates; per-candidate detail is at debug level"
+            );
+        }
         Ok(())
+    }
+
+    /// Post-readiness startup diagnostics (#961): classify retained sandbox
+    /// candidates once after the daemon accepts requests. Non-fatal.
+    pub async fn run_startup_sandbox_diagnostics(&self) {
+        if let Err(error) = self.sandbox_orphan_sweep().await {
+            tracing::warn!(%error, "Startup sandbox diagnostics failed (non-fatal)");
+        }
     }
 
     /// Reclaim cargo build caches inside terminal sessions' Live sandboxes
@@ -8946,6 +9681,92 @@ impl SessionManager {
             .run_sandbox_build_cache_reclaim_with_evidence_for_trigger(dry_run, trigger)
             .await?
             .into_wire())
+    }
+
+    /// Admit one new worktree while holding the process-wide allocation lock.
+    /// This runs before rolling-base Git observation, reservation or root
+    /// creation. The returned noncloneable permit stays alive through Git's
+    /// allocation effect, so simultaneous launches cannot oversubscribe count.
+    pub(super) async fn admit_sandbox_allocation(&self) -> Result<AllocationPermit> {
+        let permit = AllocationPermit::acquire(self.sandbox_allocator.base_dir()).await?;
+        let max_roots = u64::from(
+            self.runtime_config
+                .sandbox_max_source_roots
+                .load(Ordering::Relaxed),
+        );
+        let min_free_bytes = self
+            .runtime_config
+            .sandbox_min_free_gib
+            .load(Ordering::Relaxed)
+            .saturating_mul(1024 * 1024 * 1024);
+        let allowed = |capacity: SandboxCapacity| {
+            capacity.source_roots < max_roots && capacity.available_bytes >= min_free_bytes
+        };
+        #[cfg(test)]
+        let pop_test_capacity = {
+            // Fixtures live under TMPDIR, which the lander places on a shared
+            // tmpfs smaller than the default floor; free-space admission is
+            // asserted only through injected capacities.
+            let measured = permit.measure()?;
+            move || -> SandboxCapacity {
+                self.sandbox_allocation_test_capacities
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front()
+                    .unwrap_or(SandboxCapacity {
+                        available_bytes: u64::MAX,
+                        ..measured
+                    })
+            }
+        };
+        #[cfg(test)]
+        let mut capacity = pop_test_capacity();
+        #[cfg(not(test))]
+        let mut capacity = permit.measure()?;
+        if !allowed(capacity) {
+            // One Issue #69 page is the entire pressure response. The reclaim
+            // worker retains its existing custody and dirty-work refusals.
+            #[cfg(test)]
+            self.sandbox_allocation_test_pressure_pages
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(not(test))]
+            if let Err(error) = self
+                .run_sandbox_build_cache_reclaim_with_evidence_for_trigger(
+                    false,
+                    "allocation_pressure",
+                )
+                .await
+            {
+                tracing::warn!(%error, "Allocation pressure reclaim page failed");
+            }
+            #[cfg(test)]
+            {
+                capacity = pop_test_capacity();
+            }
+            #[cfg(not(test))]
+            {
+                capacity = permit.measure()?;
+            }
+        }
+        if !allowed(capacity) {
+            return Err(DaemonError::StructuredRpc {
+                rpc_code: -32029,
+                message: "sandbox_capacity_refused".into(),
+                data: serde_json::json!({
+                    "kind": "sandbox_capacity",
+                    "code": if capacity.source_roots >= max_roots {
+                        "source_root_limit"
+                    } else {
+                        "free_space_limit"
+                    },
+                    "source_roots": capacity.source_roots,
+                    "max_source_roots": max_roots,
+                    "available_bytes": capacity.available_bytes,
+                    "min_free_bytes": min_free_bytes,
+                }),
+            });
+        }
+        Ok(permit)
     }
 
     pub(crate) async fn run_sandbox_worktree_reclaim(
@@ -9071,10 +9892,13 @@ impl SessionManager {
                     }),
                     Err(error) => Err(error),
                 };
-                let delay = pacing.next_delay(result.as_ref().ok());
                 let config = manager
                     .runtime_config
                     .sandbox_build_cache_reclaim_snapshot();
+                let delay = pacing.next_delay_with_interval(
+                    result.as_ref().ok(),
+                    Duration::from_secs(config.interval_secs),
+                );
                 let pressure_continuation = delay.is_some() && config.enabled;
                 let delay = if pressure_continuation {
                     delay.unwrap()
@@ -9188,6 +10012,10 @@ impl SessionManager {
             candidate_budget_exhausted: false,
             stop_reason: ReclaimStopReason::Completed,
         };
+        // Bytes actually freed by targets this pass fully removed. Ambient
+        // free-space movement elsewhere on the host is never attributed to
+        // reclaim.
+        let mut removed_bytes: u64 = 0;
 
         // Recheck live policy and actual filesystem pressure on the serialized
         // worker, after any queue wait. Ordinary periodic recovery remains
@@ -9302,6 +10130,7 @@ impl SessionManager {
                             report.recovered_bytes =
                                 report.recovered_bytes.saturating_add(outcome.bytes);
                             report.fully_removed_count += 1;
+                            removed_bytes = removed_bytes.saturating_add(outcome.bytes);
                         }
                         TargetReclaimKind::RecoveredPending | TargetReclaimKind::Refused => {
                             if intent_remains_pending {
@@ -9382,6 +10211,7 @@ impl SessionManager {
                     report.recovered_count += 1;
                     report.recovered_bytes = report.recovered_bytes.saturating_add(outcome.bytes);
                     report.fully_removed_count += 1;
+                    removed_bytes = removed_bytes.saturating_add(outcome.bytes);
                 }
                 TargetReclaimKind::RecoveredPending => {
                     report.staged_count += 1;
@@ -9427,10 +10257,7 @@ impl SessionManager {
             }
             if !dry_run {
                 report.filesystem_after = sandbox_filesystem_stats(&base)?;
-                report.reclaimed_bytes = report
-                    .filesystem_after
-                    .available_bytes
-                    .saturating_sub(report.filesystem_before.available_bytes);
+                report.reclaimed_bytes = removed_bytes;
                 report.pressure_active_after = pressure_state(
                     pressure_active_after,
                     report.filesystem_after.used_percent,
@@ -9455,9 +10282,15 @@ impl SessionManager {
                 |_| Err(reclaim_store_busy_error()),
                 |store| {
                     if dry_run {
-                        store.preview_terminal_reclaim_page(config.max_candidates)
+                        store.preview_terminal_reclaim_page_with(
+                            config.max_candidates,
+                            pressure_active_after,
+                        )
                     } else {
-                        store.reserve_terminal_reclaim_page(config.max_candidates)
+                        store.reserve_terminal_reclaim_page_with(
+                            config.max_candidates,
+                            pressure_active_after,
+                        )
                     }
                 },
             );
@@ -9473,10 +10306,7 @@ impl SessionManager {
                 report.stop_reason = ReclaimStopReason::AllRefused;
                 if !dry_run {
                     report.filesystem_after = sandbox_filesystem_stats(&base)?;
-                    report.reclaimed_bytes = report
-                        .filesystem_after
-                        .available_bytes
-                        .saturating_sub(report.filesystem_before.available_bytes);
+                    report.reclaimed_bytes = removed_bytes;
                     report.pressure_active_after = pressure_state(
                         pressure_active_after,
                         report.filesystem_after.used_percent,
@@ -9519,10 +10349,7 @@ impl SessionManager {
                     .runtime_config
                     .sandbox_build_cache_pressure_active
                     .store(report.pressure_active_after, Ordering::Relaxed);
-                report.reclaimed_bytes = report
-                    .filesystem_after
-                    .available_bytes
-                    .saturating_sub(report.filesystem_before.available_bytes);
+                report.reclaimed_bytes = removed_bytes;
             }
             return Ok(SandboxReclaimRun {
                 report,
@@ -9543,10 +10370,7 @@ impl SessionManager {
             }
             if !dry_run {
                 report.filesystem_after = sandbox_filesystem_stats(&base)?;
-                report.reclaimed_bytes = report
-                    .filesystem_after
-                    .available_bytes
-                    .saturating_sub(report.filesystem_before.available_bytes);
+                report.reclaimed_bytes = removed_bytes;
                 report.pressure_active_after = pressure_state(
                     pressure_active_after,
                     report.filesystem_after.used_percent,
@@ -9573,6 +10397,13 @@ impl SessionManager {
                 break;
             }
             report.candidates_considered += 1;
+            // Absent-target memo: a candidate refused as TargetAbsent on a
+            // prior pass is counted without touching the filesystem or logging
+            // again. The cache only skips; custody fences still gate any effect.
+            if worker_state.absent_target_cached(candidate.custody_id, candidate.generation) {
+                increment_reclaim_skip(&mut report, ReclaimSkipReason::TargetAbsent);
+                continue;
+            }
             // Age gate: only reclaim after the owning row has been idle past
             // the TTL unless pressure hysteresis is active. An unparseable
             // timestamp fails closed (skip) even under pressure.
@@ -9650,6 +10481,7 @@ impl SessionManager {
                     report.newly_staged_bytes =
                         report.newly_staged_bytes.saturating_add(outcome.bytes);
                     report.fully_removed_count += 1;
+                    removed_bytes = removed_bytes.saturating_add(outcome.bytes);
                 }
                 Ok(outcome) if outcome.kind == TargetReclaimKind::StagedPending => {
                     report.eligible_candidates += 1;
@@ -9685,7 +10517,11 @@ impl SessionManager {
                     } else if let Some(stop) = reclaim_budget_stop_reason(reason) {
                         report.stop_reason = stop;
                     }
-                    tracing::info!(
+                    if reason == ReclaimSkipReason::TargetAbsent && !dry_run {
+                        worker_state
+                            .remember_absent_target(candidate.custody_id, candidate.generation);
+                    }
+                    tracing::debug!(
                         session_id = %candidate.session_id,
                         custody_id = %candidate.custody_id,
                         reason = ?reason,
@@ -9759,10 +10595,7 @@ impl SessionManager {
             );
         }
         if !dry_run {
-            report.reclaimed_bytes = report
-                .filesystem_after
-                .available_bytes
-                .saturating_sub(report.filesystem_before.available_bytes);
+            report.reclaimed_bytes = removed_bytes;
         }
         checkpoint_reclaim_report(&mut report, &pass_state);
         report.pressure_active_after = pressure_active_after;
@@ -9910,6 +10743,578 @@ mod tests {
         manager_with_smoke_suppress_retry_restore(false)
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_count_limit_refuses_before_creating_session_or_root() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_max_source_roots
+            .store(1, Ordering::Relaxed);
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
+        let allowed_at_count_boundary = manager
+            .admit_sandbox_allocation()
+            .await
+            .expect("zero roots is below the configured maximum of one");
+        drop(allowed_at_count_boundary);
+        let occupied = sandbox_base.path().join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&occupied).unwrap();
+
+        let error = manager
+            .admit_sandbox_allocation()
+            .await
+            .err()
+            .expect("the configured direct-root limit must refuse admission");
+        assert!(matches!(
+            error,
+            crate::error::DaemonError::StructuredRpc {
+                rpc_code: -32029,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("sandbox_capacity_refused"));
+        assert_eq!(
+            std::fs::read_dir(sandbox_base.path()).unwrap().count(),
+            1,
+            "refused admission must not create a sandbox root"
+        );
+        let store = manager.store.lock().await;
+        let session_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            session_count, 0,
+            "refused admission must not persist a Session"
+        );
+    }
+
+    /// Issue #692: the single launch chokepoint refuses a model that is off the
+    /// operator allowlist (explicit, or unnamed so it cannot be vetted) with a
+    /// typed error naming the allowed choices, before any durable effect.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn launch_refuses_model_off_the_operator_allowlist_before_any_effect() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["gpt-6-sol", "claude-opus-5-5"]),
+            )
+            .unwrap();
+        let work = tempfile::tempdir().expect("work dir");
+
+        let mut named = direct_interactive_test_config(work.path().to_path_buf());
+        named.model = Some("claude-sonnet-5".to_string());
+        let mut unnamed = direct_interactive_test_config(work.path().to_path_buf());
+        unnamed.model = None;
+        for config in [named, unnamed] {
+            let error = manager
+                .launch_session(config)
+                .await
+                .expect_err("a model off the allowlist must be refused");
+            assert!(
+                matches!(error, crate::error::DaemonError::PolicyDenied(_)),
+                "{error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("launch_model_not_allowed"), "{text}");
+            assert!(text.contains("gpt-6-sol, claude-opus-5-5"), "{text}");
+        }
+        // A sandbox-requesting launch (named or unnamed model) is refused before
+        // any sandbox is allocated.
+        let source = tempfile::tempdir().expect("source repository");
+        init_d00_git_repo(source.path());
+        for model in [None, Some("claude-sonnet-5".to_string())] {
+            let mut config = direct_interactive_test_config(source.path().to_path_buf());
+            config.model = model;
+            config.sandbox = Some(rsi_common::types::SandboxSpec {
+                kind: Some(SandboxKind::GitWorktree),
+                branch: None,
+            });
+            let error = manager
+                .launch_session(config)
+                .await
+                .expect_err("a model off the allowlist must be refused");
+            assert!(
+                error.to_string().contains("launch_model_not_allowed"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(sandbox_base.path()).unwrap().count(),
+            0,
+            "a refused launch must not allocate a sandbox root"
+        );
+        assert!(manager.active.read().await.is_empty());
+        let store = manager.store.lock().await;
+        for table in ["sessions", "model_invocations", "sandbox_custody_roots"] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "a refused launch must leave {table} unchanged");
+        }
+    }
+
+    /// Issue #692: the allowlist is checked on the EFFECTIVE model. A launch
+    /// that names no model is vetted on the project default, else on the
+    /// provider's own default (Pioneer, Bedrock, OpenRouter), allowed and not;
+    /// with no determinable model it is refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn launch_allowlist_checks_the_effective_model_after_project_and_provider_defaults() {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        let work = tempfile::tempdir().expect("work dir");
+        let set = |entries: &[&str]| {
+            manager
+                .runtime_config
+                .update_field("launch_model_allowlist", &serde_json::json!(entries))
+                .unwrap();
+        };
+
+        // Provider defaults: allowed only when the list names the default.
+        for (provider, default) in [
+            (
+                SessionProvider::Pioneer,
+                crate::pioneer::pioneer_launch_model(None).to_string(),
+            ),
+            (
+                SessionProvider::Bedrock,
+                crate::bedrock::BEDROCK_DEFAULT_MODEL.to_string(),
+            ),
+            (
+                SessionProvider::OpenRouter,
+                crate::openrouter::OPENROUTER_DEFAULT_MODEL.to_string(),
+            ),
+        ] {
+            let mut config = direct_interactive_test_config(work.path().to_path_buf());
+            config.provider = Some(provider);
+            config.model = None;
+            let (effective_provider, effective) =
+                manager.effective_launch_identity(&config, false).await;
+            assert_eq!(effective_provider, provider);
+            assert_eq!(effective.as_deref(), Some(default.as_str()), "{provider:?}");
+            set(&[default.as_str()]);
+            assert!(
+                manager
+                    .enforce_launch_model_allowlist(effective_provider, effective.as_deref())
+                    .is_ok(),
+                "{provider:?} default is on the list"
+            );
+            set(&["some-other-model"]);
+            let error = manager
+                .enforce_launch_model_allowlist(effective_provider, effective.as_deref())
+                .expect_err("a default off the list is refused");
+            assert!(error.to_string().contains(&default), "{error}");
+        }
+
+        // A provider with no default and no project default has no effective model.
+        let mut unnamed = direct_interactive_test_config(work.path().to_path_buf());
+        unnamed.provider = Some(SessionProvider::Claude);
+        unnamed.model = None;
+        let (provider, effective) = manager.effective_launch_identity(&unnamed, false).await;
+        assert_eq!(effective, None);
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(provider, effective.as_deref())
+                .is_err()
+        );
+
+        // Project default: allowed and not allowed.
+        let project_id = Uuid::new_v4();
+        manager.workflow_config_cache.write().await.insert(
+            project_id,
+            crate::project_workflow::ProjectWorkflow {
+                settings: crate::project_workflow::ProjectSettings {
+                    model: Some("project-default-model".to_string()),
+                    ..Default::default()
+                },
+                template_body: String::new(),
+                fingerprint: crate::project_workflow::FileFingerprint {
+                    mtime_secs: 0,
+                    size: 0,
+                    content_hash: 0,
+                },
+                loaded_at: chrono::Utc::now(),
+                last_error: None,
+            },
+        );
+        let mut project_launch = direct_interactive_test_config(work.path().to_path_buf());
+        project_launch.provider = Some(SessionProvider::Claude);
+        project_launch.model = None;
+        project_launch.project_id = Some(project_id);
+        let (provider, effective) = manager
+            .effective_launch_identity(&project_launch, false)
+            .await;
+        assert_eq!(effective.as_deref(), Some("project-default-model"));
+        set(&["Project-Default-Model"]);
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(provider, effective.as_deref())
+                .is_ok()
+        );
+        set(&["some-other-model"]);
+        let error = manager
+            .launch_session(project_launch.clone())
+            .await
+            .expect_err("a project default off the list is refused at launch");
+        assert!(
+            error.to_string().contains("project-default-model")
+                || error.to_string().contains("launch_model_not_allowed"),
+            "{error}"
+        );
+        assert_eq!(
+            manager
+                .store
+                .lock()
+                .await
+                .conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the refused launch created no session row"
+        );
+        // A launch that skips the project default does not inherit it.
+        project_launch.skip_project_model_default = true;
+        let (_, effective) = manager
+            .effective_launch_identity(&project_launch, false)
+            .await;
+        assert_eq!(effective, None);
+    }
+
+    /// Issue #692: a launch and its continuation name the same model with and
+    /// without the `[1m]` context-variant tag (the daemon adds it at launch and
+    /// stores the bare id), so the allowlist matches both spellings whichever
+    /// spelling the operator entered.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn launch_model_allowlist_matches_the_context_variant_spelling() {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        for entry in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
+            manager
+                .runtime_config
+                .update_field("launch_model_allowlist", &serde_json::json!([entry]))
+                .unwrap();
+            for launched in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
+                assert!(
+                    manager
+                        .enforce_launch_model_allowlist(SessionProvider::Claude, Some(launched))
+                        .is_ok(),
+                    "{entry} allows {launched}"
+                );
+            }
+            assert!(
+                manager
+                    .enforce_launch_model_allowlist(
+                        SessionProvider::Claude,
+                        Some("claude-sonnet-5")
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    /// Issue #692: an allowed model (any case) and an empty list both pass the
+    /// check; clearing the list restores unrestricted launches.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn launch_model_allowlist_passes_allowed_models_and_clears() {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Claude, Some("anything"))
+                .is_ok()
+        );
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Claude, None)
+                .is_ok()
+        );
+        manager
+            .runtime_config
+            .update_field("launch_model_allowlist", &serde_json::json!("gpt-6-sol"))
+            .unwrap();
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Codex, Some("GPT-6-Sol"))
+                .is_ok()
+        );
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Claude, Some("claude-sonnet-5"))
+                .is_err()
+        );
+        manager
+            .runtime_config
+            .update_field("launch_model_allowlist", &serde_json::json!("clear"))
+            .unwrap();
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Claude, Some("claude-sonnet-5"))
+                .is_ok()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_default_root_budget_accepts_more_than_32_roots() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
+        let default_root_limit = manager
+            .runtime_config
+            .sandbox_max_source_roots
+            .load(Ordering::Relaxed);
+        assert!(default_root_limit > 32);
+
+        for _ in 0..33 {
+            std::fs::create_dir(sandbox_base.path().join(Uuid::new_v4().to_string())).unwrap();
+        }
+
+        let permit = manager
+            .admit_sandbox_allocation()
+            .await
+            .expect("default root budget admits more than the archive batch size");
+        assert_eq!(permit.measure().unwrap().source_roots, 33);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_fixture_admission_ignores_host_free_space_without_injected_capacity()
+     {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(1024, Ordering::Relaxed);
+        manager
+            .admit_sandbox_allocation()
+            .await
+            .expect("fixture admission ignores host free space");
+        assert_eq!(
+            manager
+                .sandbox_allocation_test_pressure_pages
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_capacity_refusal_stops_full_launch_before_git_or_durable_effects() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_max_source_roots
+            .store(1, Ordering::Relaxed);
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
+        manager
+            .sandbox_allocation_test_capacities
+            .lock()
+            .unwrap()
+            .extend([
+                SandboxCapacity {
+                    source_roots: 1,
+                    available_bytes: 0,
+                },
+                SandboxCapacity {
+                    source_roots: 1,
+                    available_bytes: 0,
+                },
+            ]);
+
+        let source = tempfile::tempdir().expect("source repository");
+        init_d00_git_repo(source.path());
+        let refs_before = Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ])
+            .current_dir(source.path())
+            .output()
+            .expect("read source refs");
+        assert!(refs_before.status.success());
+
+        let mut config = direct_interactive_test_config(source.path().to_path_buf());
+        config.sandbox = Some(rsi_common::types::SandboxSpec {
+            kind: Some(SandboxKind::GitWorktree),
+            branch: None,
+        });
+        let error = manager
+            .launch_session(config)
+            .await
+            .expect_err("capacity refusal must stop sandboxed launch");
+        assert!(matches!(
+            error,
+            crate::error::DaemonError::StructuredRpc {
+                rpc_code: -32029,
+                ..
+            }
+        ));
+
+        let refs_after = Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ])
+            .current_dir(source.path())
+            .output()
+            .expect("re-read source refs");
+        assert!(refs_after.status.success());
+        assert_eq!(refs_after.stdout, refs_before.stdout);
+        assert_eq!(std::fs::read_dir(sandbox_base.path()).unwrap().count(), 0);
+        assert!(manager.active.read().await.is_empty());
+
+        let store = manager.store.lock().await;
+        for table in [
+            "sessions",
+            "model_invocations",
+            "sandbox_custody_roots",
+            "sandbox_custody_events",
+            "closure_source_launch_reservations",
+            "agent_successor_reservations",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "refused allocation must leave {table} unchanged");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_default_low_space_reclaims_once_remeasures_and_refuses() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_max_source_roots
+            .store(4096, Ordering::Relaxed);
+        let min_free_gib = RuntimeConfig::from_config(&Config::from_env())
+            .sandbox_min_free_gib
+            .load(Ordering::Relaxed);
+        assert_eq!(min_free_gib, 30, "the default free-space floor is 30 GiB");
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(min_free_gib, Ordering::Relaxed);
+        let floor = min_free_gib * 1024 * 1024 * 1024;
+        manager
+            .sandbox_allocation_test_capacities
+            .lock()
+            .unwrap()
+            .extend([
+                SandboxCapacity {
+                    source_roots: 0,
+                    available_bytes: floor - 1,
+                },
+                SandboxCapacity {
+                    source_roots: 0,
+                    available_bytes: floor - 1,
+                },
+            ]);
+
+        let error = manager
+            .admit_sandbox_allocation()
+            .await
+            .err()
+            .expect("still-low free space must refuse after pressure reclaim");
+        let crate::error::DaemonError::StructuredRpc { rpc_code, data, .. } = error else {
+            panic!("capacity refusal must be typed: {error:?}");
+        };
+        assert_eq!(rpc_code, -32029);
+        assert_eq!(data["kind"], "sandbox_capacity");
+        assert_eq!(data["code"], "free_space_limit");
+        assert_eq!(data["available_bytes"], floor - 1);
+        assert_eq!(data["min_free_bytes"], floor);
+        assert_eq!(
+            manager
+                .sandbox_allocation_test_pressure_pages
+                .load(Ordering::Relaxed),
+            1,
+            "one admission makes at most one bounded pressure-page call"
+        );
+        assert!(
+            manager
+                .sandbox_allocation_test_capacities
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(sandbox_base.path()).unwrap().count(), 0);
+        let store = manager.store.lock().await;
+        let session_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_accepts_exact_free_space_floor_after_reclaim() {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        manager
+            .runtime_config
+            .sandbox_max_source_roots
+            .store(1, Ordering::Relaxed);
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(30, Ordering::Relaxed);
+        let floor = 30_u64 * 1024 * 1024 * 1024;
+        manager
+            .sandbox_allocation_test_capacities
+            .lock()
+            .unwrap()
+            .extend([
+                SandboxCapacity {
+                    source_roots: 0,
+                    available_bytes: floor - 1,
+                },
+                SandboxCapacity {
+                    source_roots: 0,
+                    available_bytes: floor,
+                },
+            ]);
+
+        let permit = manager
+            .admit_sandbox_allocation()
+            .await
+            .expect("capacity equal to the free-space floor is admissible");
+        assert_eq!(permit.measure().unwrap().source_roots, 0);
+        assert_eq!(
+            manager
+                .sandbox_allocation_test_pressure_pages
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            manager
+                .sandbox_allocation_test_capacities
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // Reclaim tests share the process-wide bounded coordinator and test hooks.
     // Hold this only in tests that exercise that shared lifecycle so parallel
     // unit-test execution cannot replace a hook or fill another test's queue.
@@ -9929,9 +11334,38 @@ mod tests {
             .expect("create disk-backed test fixture")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn disk_backed_tempdir_is_not_on_tmpfs_or_ramfs() {
+        const TMPFS_MAGIC: i64 = 0x0102_1994;
+        const RAMFS_MAGIC: i64 = 0x8584_58f6;
+
+        let dir = disk_backed_tempdir("probe");
+        let path = dir.path().to_path_buf();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("probe path is NUL-free");
+        let mut stat: nix::libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `cpath` is a live NUL-terminated path and `stat` is writable.
+        let rc = unsafe { nix::libc::statfs(cpath.as_ptr(), &mut stat) };
+        assert_eq!(rc, 0, "statfs fixture root");
+        let filesystem_type = stat.f_type as i64;
+        assert!(
+            filesystem_type != TMPFS_MAGIC && filesystem_type != RAMFS_MAGIC,
+            "disk_backed_tempdir must not live on tmpfs/ramfs (f_type={filesystem_type:#x})"
+        );
+    }
+
     fn manager_for_disk_fixture(
         db_dir: &std::path::Path,
         sandbox_base: &std::path::Path,
+    ) -> SessionManager {
+        manager_for_disk_fixture_with_store_reopen(db_dir, sandbox_base, true)
+    }
+
+    fn manager_for_disk_fixture_with_store_reopen(
+        db_dir: &std::path::Path,
+        sandbox_base: &std::path::Path,
+        reopen_store: bool,
     ) -> SessionManager {
         let database = db_dir.join("rsi.db");
         let store = Store::open(&database).expect("open fixture Store");
@@ -9953,9 +11387,11 @@ mod tests {
         // original Store Arc. Give reclaim an independently reopened Store so
         // restart tests model daemon reconstruction without test-only watcher
         // reads creating nondeterministic effect-time contention.
-        manager.store = Arc::new(tokio::sync::Mutex::new(
-            Store::open(&database).expect("reopen fixture reclaim Store"),
-        ));
+        if reopen_store {
+            manager.store = Arc::new(tokio::sync::Mutex::new(
+                Store::open(&database).expect("reopen fixture reclaim Store"),
+            ));
+        }
         manager
     }
 
@@ -10187,6 +11623,7 @@ mod tests {
         intent: &str,
     ) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query: format!("D03 controller candidate {intent}"),
             title: None,
             agent_role: None,
@@ -10212,6 +11649,7 @@ mod tests {
             max_retries: None,
             group_id: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: ModelInvocationPurpose::SessionLaunchFresh,
             parent_id: None,
             effort: None,
@@ -10777,6 +12215,7 @@ done
             .restore_sessions()
             .await
             .expect("restore must classify injected row re-read failure");
+        manager.run_startup_sandbox_diagnostics().await;
 
         assert!(
             D00_STARTUP_ROW_REREAD_FAILURE
@@ -10926,6 +12365,7 @@ done
             manager.persistence.clone(),
             None,
             Arc::clone(&manager.runtime_config),
+            None,
         )
         .await;
         drain_d00_persistence(&manager).await;
@@ -10969,14 +12409,19 @@ done
     fn manager_with_smoke_suppress_retry_restore(
         smoke_suppress_retry_restore: bool,
     ) -> (SessionManager, TempDir, TempDir) {
-        let dir = TempDir::new().expect("temp db dir");
-        let sandbox_base = TempDir::new().expect("temp sandbox dir");
+        let dir = disk_backed_tempdir("smoke-db-");
+        let sandbox_base = disk_backed_tempdir("smoke-sandbox-");
         let db_path = dir.path().join("rsi.db");
         let store = Store::open(&db_path).expect("open store");
         let mut config = Config::from_env();
         config.retry_max_backoff_ms = 1;
         config.smoke_suppress_retry_restore = smoke_suppress_retry_restore;
         let runtime_config = RuntimeConfig::from_config(&config);
+        // Launch tests use a temporary sandbox directory. Keep the host's
+        // available space from deciding unrelated successor outcomes.
+        runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
         let manager = SessionManager::new(
             Arc::new(EventBus::new(16)),
             store,
@@ -11025,6 +12470,7 @@ done
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -11782,7 +13228,11 @@ done
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
         let external = sandbox_base.path().join("external-hard-link");
         std::fs::hard_link(&file, &external).unwrap();
-        let allocated = std::fs::metadata(&file).unwrap().blocks() * 512;
+        // st_blocks is transient on XFS (speculative preallocation): bracket
+        // the reads and compare against the lower bound only.
+        let external_meta = std::fs::metadata(&external).unwrap();
+        let (external_ino, external_len) = (external_meta.ino(), external_meta.len());
+        let allocated = external_meta.blocks() * 512;
         let pinned = crate::sandbox::target_reclaim::PinnedSandboxRoot::open(
             sandbox_base.path(),
             cache.parent().unwrap(),
@@ -11790,6 +13240,7 @@ done
         )
         .unwrap();
         let footprint = pinned.inspect_target().bytes;
+        let allocated = allocated.min(std::fs::metadata(&external).unwrap().blocks() * 512);
         manager.persistence.barrier().await.unwrap();
 
         let preview = run_build_cache_reclaim_fixture(&manager, true).await;
@@ -11802,19 +13253,15 @@ done
             simulated_filesystem_after(preview.filesystem_before, preview.would_reclaim_bytes)
         );
 
-        let before = sandbox_filesystem_stats(sandbox_base.path()).unwrap();
         let actual = run_build_cache_reclaim_fixture(&manager, false).await;
-        let after = sandbox_filesystem_stats(sandbox_base.path()).unwrap();
         assert_eq!(actual.fully_removed_count, 1);
-        assert!(external.exists());
-        assert_eq!(
-            std::fs::metadata(&external).unwrap().blocks() * 512,
-            allocated
-        );
-        assert!(
-            after.available_bytes.saturating_sub(before.available_bytes) < allocated,
-            "actual statvfs must not free externally retained data blocks"
-        );
+        // Inode-level, not a machine-wide statvfs reading: the external link
+        // still owns the one inode, unchanged.
+        let retained = std::fs::metadata(&external).unwrap();
+        assert_eq!(retained.ino(), external_ino);
+        assert_eq!(retained.len(), external_len);
+        assert_eq!(retained.nlink(), 1);
+        assert!(!file.exists());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -11838,7 +13285,10 @@ done
         let file = cache.join("post-sizing-race");
         std::fs::write(&file, vec![7_u8; 8 * 1024 * 1024]).unwrap();
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
-        let allocated = std::fs::metadata(&file).unwrap().blocks() * 512;
+        let (file_ino, file_len) = {
+            let meta = std::fs::metadata(&file).unwrap();
+            (meta.ino(), meta.len())
+        };
         let external = sandbox_base.path().join("post-sizing-retaining-link");
         manager.persistence.barrier().await.unwrap();
         let custody_id = manager
@@ -11888,10 +13338,10 @@ done
         assert_eq!(report.would_reclaim_count, 0);
         assert!(!report.stopped_at_low_watermark);
         assert!(external.exists(), "external retaining link must survive");
-        assert_eq!(
-            std::fs::metadata(&external).unwrap().blocks() * 512,
-            allocated
-        );
+        let retained = std::fs::metadata(&external).unwrap();
+        assert_eq!(retained.ino(), file_ino);
+        assert_eq!(retained.len(), file_len);
+        assert_eq!(retained.nlink(), 1);
         assert!(!cache.exists());
     }
 
@@ -11929,6 +13379,7 @@ done
             .sync_all()
             .unwrap();
         std::fs::hard_link(&first_file, &second_file).unwrap();
+        // st_blocks is transient on XFS: take the lower bound over the window.
         let allocated = std::fs::metadata(&first_file).unwrap().blocks() * 512;
         let first = crate::sandbox::target_reclaim::PinnedSandboxRoot::open(
             sandbox_base.path(),
@@ -11944,6 +13395,7 @@ done
         .unwrap();
         let first_footprint = first.inspect_target().bytes;
         let second_footprint = second.inspect_target().bytes;
+        let allocated = allocated.min(std::fs::metadata(&first_file).unwrap().blocks() * 512);
         manager.persistence.barrier().await.unwrap();
 
         let mut preview = None;
@@ -11970,7 +13422,6 @@ done
         assert_eq!(preview.would_reclaim_bytes, 0);
         assert_eq!(preview.would_reclaim_count, 0);
         assert!(!preview.stopped_at_low_watermark);
-        let before = sandbox_filesystem_stats(sandbox_base.path()).unwrap();
         let mut fully_removed = 0;
         for _ in 0..5 {
             manager.persistence.barrier().await.unwrap();
@@ -11983,10 +13434,10 @@ done
                 break;
             }
         }
-        let after = sandbox_filesystem_stats(sandbox_base.path()).unwrap();
+        // Ledger-level end state, not a machine-wide statvfs reading that
+        // races with every other test writing to the same filesystem.
         assert_eq!(fully_removed, 2);
         assert!(!first_file.exists() && !second_file.exists());
-        assert!(after.available_bytes >= before.available_bytes);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -12022,6 +13473,447 @@ done
         assert_eq!(report.candidates_considered, 0);
         assert_eq!(report.reclaimed_bytes, 0);
         assert!(cache.exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn build_cache_reclaim_reports_only_removed_bytes_when_ambient_space_rises() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-ambient-db-");
+        let sandbox_base = disk_backed_tempdir("reclaim-ambient-sandboxes-");
+        let repo = disk_backed_tempdir("reclaim-ambient-repo-");
+        init_d00_git_repo(repo.path());
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let stale = chrono::Utc::now() - chrono::Duration::hours(8);
+        let (_session, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+
+        // Model unrelated processes freeing space on the sandbox filesystem
+        // during the pass: the "before" snapshot is low and available bytes
+        // rise while the pass is paused after reserving its candidate page.
+        let base = sandbox_base.path().to_path_buf();
+        let _stats = install_sandbox_filesystem_stats_override_for_test(
+            &base,
+            SandboxFilesystemStats {
+                total_bytes: 1_000_000_000_000,
+                available_bytes: 999_000_000_000,
+                used_bytes: 1_000_000_000,
+                used_percent: 0,
+            },
+        );
+        let page_reached = Arc::new(Barrier::new(2));
+        let page_release = Arc::new(Barrier::new(2));
+        *reclaim_contention_hook()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReclaimContentionHook {
+            base: base.clone(),
+            page_reached: Arc::clone(&page_reached),
+            page_release: Arc::clone(&page_release),
+            attempt_reached: Arc::new(Barrier::new(1)),
+            attempt_release: Arc::new(Barrier::new(1)),
+        });
+        let ambient_base = base.clone();
+        let controller = std::thread::spawn(move || {
+            page_reached.wait();
+            *sandbox_filesystem_stats_overrides_for_test()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&ambient_base)
+                .expect("ambient filesystem override installed") = SandboxFilesystemStats {
+                total_bytes: 1_000_000_000_000,
+                available_bytes: 1_000_000_000_000,
+                used_bytes: 0,
+                used_percent: 0,
+            };
+            page_release.wait();
+        });
+
+        let report = manager
+            .run_sandbox_build_cache_reclaim_with_evidence_for_trigger(
+                false,
+                "ambient_free_space_test",
+            )
+            .await
+            .expect("reclaim pass under ambient free-space rise")
+            .report;
+        controller.join().unwrap();
+        *reclaim_contention_hook()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        assert_eq!(report.fully_removed_count, 1, "{report:?}");
+        assert!(
+            !cache.exists(),
+            "the authenticated target must be reclaimed"
+        );
+        assert!(
+            report.reclaimed_bytes > 0,
+            "a pass that removed a target reports the removed bytes: {report:?}"
+        );
+        assert_eq!(
+            report.reclaimed_bytes, report.newly_staged_bytes,
+            "reclaim reports the bytes it removed, not the ambient free-space delta: {report:?}"
+        );
+        let ambient_delta = report
+            .filesystem_after
+            .available_bytes
+            .saturating_sub(report.filesystem_before.available_bytes);
+        assert!(
+            ambient_delta > report.reclaimed_bytes,
+            "ambient free space rose by {ambient_delta} bytes while only {} were removed: {report:?}",
+            report.reclaimed_bytes
+        );
+    }
+
+    /// #1035: retained evidence of a completed reclaim must not block reclaiming
+    /// a later target with a different identity (continue + rebuild + terminal).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn rebuilt_target_after_completed_reclaim_is_reclaimed_again() {
+        use std::os::unix::fs::MetadataExt;
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-rebuilt-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-rebuilt-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let repo = TempDir::new().expect("repo dir");
+        init_d00_git_repo(repo.path());
+        let (session, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            chrono::Utc::now() - chrono::Duration::hours(8),
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        let custody_id = {
+            let store = manager.store.lock().await;
+            let custody_id: String = store
+                .conn
+                .query_row(
+                    "SELECT sandbox_custody_id FROM sessions WHERE id=?1",
+                    [session.id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("linked custody id");
+            Uuid::parse_str(&custody_id).expect("valid custody UUID")
+        };
+        let first_inode = std::fs::metadata(&cache).expect("first target").ino();
+
+        let first = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert_eq!(first.fully_removed_count, 1, "{first:?}");
+        assert!(!cache.exists(), "the first target is reclaimed");
+
+        // Continue + rebuild: a new target directory. Keep decoys alive so the
+        // filesystem cannot hand back the reclaimed inode number.
+        let root = cache.parent().expect("sandbox root").to_path_buf();
+        let mut decoys = Vec::new();
+        let rebuilt_inode = loop {
+            std::fs::create_dir(&cache).expect("recreate target");
+            let inode = std::fs::metadata(&cache).expect("rebuilt target").ino();
+            if inode != first_inode {
+                break inode;
+            }
+            let decoy = root.join(format!("decoy-{}", decoys.len()));
+            std::fs::rename(&cache, &decoy).expect("park recycled inode");
+            decoys.push(decoy);
+            assert!(decoys.len() < 64, "could not obtain a fresh inode");
+        };
+        assert_ne!(rebuilt_inode, first_inode);
+        std::fs::create_dir_all(cache.join("debug")).expect("rebuild debug dir");
+        std::fs::write(cache.join("debug/artifact.bin"), vec![0u8; 4096])
+            .expect("rebuild artifact");
+
+        // The candidate sweep is a finite cycle; a pass that only wraps the
+        // cursor finds nothing, the next one starts the new cycle.
+        let mut second = run_build_cache_reclaim_with_evidence_fixture(&manager, false)
+            .await
+            .report;
+        for _ in 0..3 {
+            if second.candidates_considered > 0 {
+                break;
+            }
+            second = run_build_cache_reclaim_with_evidence_fixture(&manager, false)
+                .await
+                .report;
+        }
+        assert_eq!(second.fully_removed_count, 1, "{second:?}");
+        assert!(
+            !cache.exists(),
+            "the rebuilt target is reclaimed: {second:?}"
+        );
+        let store = manager.store.lock().await;
+        let completed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sandbox_target_reclaim_intent_events
+                 WHERE custody_id=?1 AND generation=1 AND terminal_state='Completed'",
+                [custody_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            completed, 2,
+            "each identity keeps its own terminal evidence"
+        );
+        assert!(
+            store
+                .target_reclaim_intent(custody_id, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Reclaim a fixture's target once, rebuild it, and forge retained
+    /// `Completed` evidence for the rebuilt directory's exact (device, inode) as
+    /// if the earlier reclaim of a recycled inode had recorded it at
+    /// `recorded_at`. Returns the custody id and the rebuilt target's identity.
+    async fn rebuilt_target_with_forged_completed_evidence(
+        manager: &SessionManager,
+        cache: &std::path::Path,
+        custody_id: Uuid,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+    ) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::create_dir(cache).expect("recreate target");
+        std::fs::create_dir_all(cache.join("debug")).expect("rebuild debug dir");
+        std::fs::write(cache.join("debug/artifact.bin"), vec![0u8; 4096])
+            .expect("rebuild artifact");
+        let metadata = std::fs::metadata(cache).expect("rebuilt target");
+        let (device, inode) = (metadata.dev(), metadata.ino());
+        let store = manager.store.lock().await;
+        let allocation_id: String = store
+            .conn
+            .query_row(
+                "SELECT allocation_id FROM sandbox_custody_roots WHERE custody_id=?1",
+                [custody_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("custody allocation");
+        // The filesystem may already have handed the rebuilt directory the
+        // reclaimed inode, in which case the earlier reclaim's event is the
+        // evidence; otherwise a forged event stands in for it. Either way its
+        // recorded time is pinned. Terminal evidence is immutable and the
+        // exact-insert trigger only admits evidence for an intent in flight,
+        // so both fences are lifted for this fixture edit.
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER sandbox_target_reclaim_intent_events_v119_exact_insert;
+                 DROP TRIGGER sandbox_target_reclaim_intent_events_v119_no_update;",
+            )
+            .expect("lift terminal evidence fences");
+        let recorded_at = recorded_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let updated = store
+            .conn
+            .execute(
+                "UPDATE sandbox_target_reclaim_intent_events SET recorded_at=?1
+                 WHERE custody_id=?2 AND generation=1 AND expected_device=?3
+                   AND expected_inode=?4",
+                rusqlite::params![
+                    recorded_at,
+                    custody_id.to_string(),
+                    device as i64,
+                    inode as i64
+                ],
+            )
+            .expect("pin recycled-inode evidence");
+        if updated == 0 {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sandbox_target_reclaim_intent_events(
+                        schedule_id,custody_id,generation,allocation_id,bucket,slot_name,
+                        payload_name,expected_device,expected_inode,terminal_state,reason,
+                        final_row_version,recorded_at)
+                     VALUES(1000000,?1,1,?2,?3,?4,'payload',?5,?6,'Completed','forged',3,?7)",
+                    rusqlite::params![
+                        custody_id.to_string(),
+                        allocation_id,
+                        i64::from(crate::store::target_reclaim_sweep::target_reclaim_bucket(
+                            custody_id, 1
+                        )),
+                        crate::store::target_reclaim_sweep::target_reclaim_slot_name(custody_id, 1),
+                        device as i64,
+                        inode as i64,
+                        recorded_at,
+                    ],
+                )
+                .expect("forge terminal evidence");
+        }
+        (device, inode)
+    }
+
+    /// #1040: a rebuilt target that reuses the reclaimed directory's device and
+    /// inode is a new target and is reclaimed under its own identity epoch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn rebuilt_target_reusing_reclaimed_inode_is_reclaimed_again() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-reused-inode-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-reused-inode-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let repo = TempDir::new().expect("repo dir");
+        init_d00_git_repo(repo.path());
+        let (session, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            chrono::Utc::now() - chrono::Duration::hours(8),
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        let custody_id = {
+            let store = manager.store.lock().await;
+            let custody_id: String = store
+                .conn
+                .query_row(
+                    "SELECT sandbox_custody_id FROM sessions WHERE id=?1",
+                    [session.id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("linked custody id");
+            Uuid::parse_str(&custody_id).expect("valid custody UUID")
+        };
+        let first = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert_eq!(first.fully_removed_count, 1, "{first:?}");
+
+        // Retained evidence for the rebuilt directory's exact (device, inode),
+        // recorded before the rebuilt directory existed.
+        let (device, inode) = rebuilt_target_with_forged_completed_evidence(
+            &manager,
+            &cache,
+            custody_id,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        let mut second = run_build_cache_reclaim_with_evidence_fixture(&manager, false)
+            .await
+            .report;
+        for _ in 0..3 {
+            if second.candidates_considered > 0 {
+                break;
+            }
+            second = run_build_cache_reclaim_with_evidence_fixture(&manager, false)
+                .await
+                .report;
+        }
+        assert_eq!(second.fully_removed_count, 1, "{second:?}");
+        assert!(
+            !cache.exists(),
+            "the rebuilt target is reclaimed: {second:?}"
+        );
+        let store = manager.store.lock().await;
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT expected_device,expected_inode FROM sandbox_target_reclaim_intent_events
+                 WHERE custody_id=?1 AND generation=1 AND terminal_state='Completed'
+                 ORDER BY event_id",
+            )
+            .unwrap();
+        let identities: Vec<(u64, u64)> = statement
+            .query_map([custody_id.to_string()], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            identities.contains(&(device, inode)),
+            "the retained evidence for the recycled identity stays: {identities:?}"
+        );
+        assert!(
+            identities.iter().any(|&(store_device, store_inode)| {
+                let (raw_device, epoch) =
+                    crate::store::target_reclaim_sweep::split_store_target_device(store_device);
+                store_inode == inode && raw_device == device && epoch > 0
+            }),
+            "the rebuilt target is keyed under its own epoch: {identities:?}"
+        );
+    }
+
+    /// #1040: an exact replay (evidence recorded after the directory was born)
+    /// still settles from retained evidence and never re-reclaims.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn exact_replay_of_a_completed_reclaim_settles_once() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-replay-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-replay-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let repo = TempDir::new().expect("repo dir");
+        init_d00_git_repo(repo.path());
+        let (session, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            chrono::Utc::now() - chrono::Duration::hours(8),
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        let custody_id = {
+            let store = manager.store.lock().await;
+            let custody_id: String = store
+                .conn
+                .query_row(
+                    "SELECT sandbox_custody_id FROM sessions WHERE id=?1",
+                    [session.id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("linked custody id");
+            Uuid::parse_str(&custody_id).expect("valid custody UUID")
+        };
+        let first = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert_eq!(first.fully_removed_count, 1, "{first:?}");
+
+        rebuilt_target_with_forged_completed_evidence(
+            &manager,
+            &cache,
+            custody_id,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+        let target = std::fs::File::open(&cache).expect("open rebuilt target");
+        if crate::sandbox::target_reclaim::directory_birth_time_for_test(&target).is_none() {
+            // Without a birth time the pass fails toward reclaiming, so the
+            // replay/new-target distinction is not observable on this filesystem.
+            return;
+        }
+        drop(target);
+
+        let count_events = |store: &crate::store::Store| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sandbox_target_reclaim_intent_events
+                     WHERE custody_id=?1 AND generation=1 AND terminal_state='Completed'",
+                    [custody_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let before = count_events(&*manager.store.lock().await);
+        for _ in 0..4 {
+            run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        }
+        assert!(
+            cache.exists(),
+            "evidence recorded after the directory was born settles it as a replay"
+        );
+        let after = count_events(&*manager.store.lock().await);
+        assert_eq!(after, before, "the replay records no second event");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -12857,7 +14749,11 @@ done
         assert_eq!(pacing.next_delay(Some(&run)), None);
         run.report.pressure_active_after = true;
         run.evidence.candidate_sweep.as_mut().unwrap().wrapped = true;
-        assert_eq!(pacing.next_delay(Some(&run)), None);
+        assert_eq!(
+            pacing.next_delay(Some(&run)),
+            None,
+            "a productive cycle still ends at its wrap"
+        );
         run.evidence.candidate_sweep.as_mut().unwrap().wrapped = false;
         run.evidence.pass_contention = Some(ReclaimPassContention::StoreBusy);
         assert_eq!(pacing.next_delay(Some(&run)), None);
@@ -12900,7 +14796,11 @@ done
         assert_eq!(pacing.passes, 0, "refused pages consume the burst budget");
         let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
         sweep.wrapped = true;
-        assert_eq!(pacing.next_delay(Some(&run)), None, "wrap ends the cycle");
+        assert_eq!(
+            pacing.next_delay(Some(&run)),
+            Some(IDLE_BACKOFF_BASE),
+            "a wrapped cycle with no work backs off instead of re-paging"
+        );
         let sweep = run.evidence.candidate_sweep.as_mut().unwrap();
         sweep.wrapped = false;
         sweep.cursor_before = sweep.cursor_after.clone();
@@ -12948,6 +14848,54 @@ done
             assert_eq!(pacing.rows, 0);
             assert_eq!(pacing.bytes, 0);
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn pressure_reclaim_pacing_backs_off_idle_wrapped_cycles() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, _base) = manager();
+        let report = manager.run_sandbox_build_cache_reclaim(true).await.unwrap();
+        let mut run = pressure_pacing_fixture(report);
+        run.report.fully_removed_count = 0;
+        run.report.newly_staged_count = 0;
+        run.evidence.recovery_sweep.entries_deleted = 0;
+        let interval = Duration::from_secs(300);
+        let mut pacing = PressureReclaimPacing::default();
+        assert_eq!(
+            pacing.next_delay_with_interval(Some(&run), interval),
+            Some(PRESSURE_PAGE_DELAY),
+            "the first cycle still pages through refused candidates"
+        );
+        for expected_secs in [300u64, 600, 1200, 1800, 1800] {
+            run.evidence.candidate_sweep.as_mut().unwrap().wrapped = true;
+            assert_eq!(
+                pacing.next_delay_with_interval(Some(&run), interval),
+                Some(Duration::from_secs(expected_secs)),
+                "idle wrapped cycles double from the operator interval up to the cap"
+            );
+            run.evidence.candidate_sweep.as_mut().unwrap().wrapped = false;
+            assert_eq!(
+                pacing.next_delay_with_interval(Some(&run), interval),
+                Some(Duration::from_secs(expected_secs)),
+                "an unproductive page after an idle cycle waits out the same window"
+            );
+        }
+        let hourly = Duration::from_secs(3600);
+        run.evidence.candidate_sweep.as_mut().unwrap().wrapped = true;
+        assert_eq!(
+            PressureReclaimPacing::default().next_delay_with_interval(Some(&run), hourly),
+            Some(hourly),
+            "idle backoff never runs more often than the operator interval"
+        );
+        run.evidence.candidate_sweep.as_mut().unwrap().wrapped = false;
+        run.report.fully_removed_count = 1;
+        assert_eq!(
+            pacing.next_delay_with_interval(Some(&run), interval),
+            Some(PRESSURE_PAGE_DELAY),
+            "useful work resets idle backoff to page pacing"
+        );
+        assert_eq!(pacing.idle_cycles, 0);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -14568,7 +16516,10 @@ done
             .run_sandbox_build_cache_reclaim(false)
             .await
             .expect("bounded recovery pass");
-        assert_eq!(stopped.recovered_count, 1);
+        // The quantum charges raw readdir entries (`.`, `..` and the two stage
+        // entries), so how many stage entries fit before it is exhausted
+        // depends on the filesystem's listing order: one or two, never zero.
+        assert!((1..=2).contains(&stopped.recovered_count), "{stopped:?}");
         assert_eq!(stopped.candidates_considered, 1, "{stopped:?}");
         assert_eq!(stopped.newly_staged_count, 1, "{stopped:?}");
         assert!(
@@ -15545,6 +17496,7 @@ done
         scheduled_job_id: Uuid,
     ) -> LaunchConfig {
         LaunchConfig {
+            completion_gates: None,
             query: "scheduled Fresh production-path regression".to_string(),
             title: None,
             agent_role: None,
@@ -15583,6 +17535,7 @@ done
                 "scheduled-fresh-production-path:{purpose}:{scheduled_job_id}"
             )),
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: purpose,
             sandbox: None,
             cargo_target_dir: None,
@@ -19371,6 +21324,7 @@ done
         let (manager, _dir, _sandbox) = manager();
         let session_id = Uuid::new_v4();
         let config = LaunchConfig {
+            completion_gates: None,
             query: "global rotation disabled default test".to_string(),
             title: None,
             agent_role: None,
@@ -19405,6 +21359,7 @@ done
             model_invocation_dedup_key: None,
             model_invocation_request_fingerprint: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: ModelInvocationPurpose::SessionLaunchFresh,
             sandbox: None,
             cargo_target_dir: None,
@@ -19469,6 +21424,7 @@ done
     #[tokio::test]
     async fn global_rotation_enabled_default_leaves_timestamp_null() {
         let config = LaunchConfig {
+            completion_gates: None,
             query: "global rotation enabled default test".to_string(),
             title: None,
             agent_role: None,
@@ -19503,6 +21459,7 @@ done
             model_invocation_dedup_key: None,
             model_invocation_request_fingerprint: None,
             skip_project_model_default: false,
+            tool_policy: None,
             model_invocation_purpose: ModelInvocationPurpose::SessionLaunchFresh,
             sandbox: None,
             cargo_target_dir: None,
@@ -22381,6 +24338,172 @@ done
         cleanup_active_test_session(manager, child_id, invocation_id).await;
     }
 
+    /// #1073: the real spawn funnel waits, in place, while a deploy waits for
+    /// its quiet point, and launches (durable, exactly once) when it settles.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_draining_deploy_holds_the_agent_child_launch_until_it_settles() {
+        let (manager, _dir, _sandbox) = manager();
+        let manager = Arc::new(manager);
+        let repo = tempfile::tempdir().expect("canonical repo");
+        init_d00_git_repo(repo.path());
+        let canonical = std::fs::canonicalize(repo.path()).expect("canonical path");
+        let emitter = h1_7g_ordinary_emitter(&canonical);
+        manager
+            .store
+            .lock()
+            .await
+            .insert_session(&emitter)
+            .expect("insert ordinary emitter");
+        let (child_server, child_base_url, child_dispatches) =
+            spawn_blocking_local_test_provider().await;
+        let request =
+            h1_7g_reserve_spawn_request(&manager, emitter.id, canonical.clone(), child_base_url)
+                .await;
+        let reserved_child_id = request.child_session_id;
+        let spawn_request_id = request.spawn_request_id;
+        let live = crate::store::agent_deploys::DeployRow {
+            id: Uuid::new_v4(),
+            owner_session_id: Uuid::new_v4(),
+            sha: "0".repeat(40),
+            manifest: Vec::new(),
+            state: rsi_common::agent_deploy::DeployState::Staged,
+            reason: None,
+            deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        };
+        manager
+            .deploy_drain()
+            .sync(Some(&live), true, chrono::Utc::now());
+
+        let launch = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.launch_agent_child(request).await }
+        });
+        // Held: parked in the drain, no session row, nothing dispatched.
+        let held = async {
+            loop {
+                if !manager.deploy_drain().status().held.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), held)
+            .await
+            .expect("the launch parks behind the drain");
+        let status = manager.deploy_drain().status();
+        assert_eq!(status.held[0].kind, "child_spawn");
+        assert_eq!(status.held[0].session_id, Some(reserved_child_id));
+        assert!(!launch.is_finished());
+        assert!(
+            manager
+                .store
+                .lock()
+                .await
+                .get_session(reserved_child_id)
+                .expect("load child")
+                .is_none(),
+            "no side effect while held"
+        );
+        assert_eq!(
+            child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        manager.deploy_drain().sync(None, true, chrono::Utc::now());
+        let child_id = launch
+            .await
+            .expect("launch task")
+            .expect("the held spawn launches once released");
+        assert_eq!(child_id, reserved_child_id);
+        wait_for_backend_dispatch(&child_dispatches).await;
+        {
+            let store = manager.store.lock().await;
+            let (state, _) = h1_7g_spawn_row(&store, spawn_request_id);
+            assert_eq!(state, "launched");
+        }
+        assert!(manager.deploy_drain().status().held.is_empty());
+        h1_7g_cleanup_child(&manager, child_id).await;
+        child_server.abort();
+    }
+
+    /// #1073: the launch gate's scope: a parentless launch (interactive or a
+    /// parentless workflow node) is never held; a parented topology node waits
+    /// in place and runs when the hold releases; a parented ordinary launch is
+    /// refused with the typed retryable code.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn the_deploy_drain_launch_gate_exempts_parentless_topology_and_waits_for_parented() {
+        let (manager, _dir, _sandbox) = manager();
+        let manager = Arc::new(manager);
+        let node = || {
+            LaunchPurpose::TopologyNode(crate::session::types::TopologyNodeLaunchContext {
+                session_id: Uuid::new_v4(),
+                fork: crate::topology::custody::TopologyForkSource::for_test(
+                    std::path::PathBuf::from("/nonexistent"),
+                    "0",
+                ),
+            })
+        };
+        let live = crate::store::agent_deploys::DeployRow {
+            id: Uuid::new_v4(),
+            owner_session_id: Uuid::new_v4(),
+            sha: "0".repeat(40),
+            manifest: Vec::new(),
+            state: rsi_common::agent_deploy::DeployState::Staged,
+            reason: None,
+            deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        };
+        manager
+            .deploy_drain()
+            .sync(Some(&live), true, chrono::Utc::now());
+
+        // Parentless: passes at once, nothing parked.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.deploy_drain_launch_gate(&node(), false),
+        )
+        .await
+        .expect("a parentless workflow launch is never held")
+        .unwrap();
+        manager
+            .deploy_drain_launch_gate(&LaunchPurpose::Interactive, false)
+            .await
+            .expect("a parentless operator launch is never held");
+        assert!(manager.deploy_drain().status().held.is_empty());
+
+        // Parented ordinary launch: typed, retryable refusal.
+        let refused = manager
+            .deploy_drain_launch_gate(&LaunchPurpose::Interactive, true)
+            .await
+            .unwrap_err();
+        assert!(
+            crate::deploy_drain::is_draining_error(&refused),
+            "{refused}"
+        );
+
+        // Parented topology node: parked, then released.
+        let waiting = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.deploy_drain_launch_gate(&node(), true).await }
+        });
+        let parked = async {
+            while manager.deploy_drain().status().held.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), parked)
+            .await
+            .expect("a parented node parks behind the drain");
+        assert_eq!(
+            manager.deploy_drain().status().held[0].kind,
+            "topology_node"
+        );
+        assert!(!waiting.is_finished());
+        manager.deploy_drain().sync(None, true, chrono::Utc::now());
+        waiting.await.unwrap().unwrap();
+    }
+
     fn h1_7g_spawn_row(manager_store: &Store, spawn_request_id: Uuid) -> (String, Option<String>) {
         manager_store
             .conn
@@ -22573,6 +24696,10 @@ done
     #[tokio::test]
     async fn agent_child_execution_scratch_failure_uses_post_bind_settlement_and_retains_root() {
         let (manager, _dir, _sandbox) = manager();
+        manager
+            .runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
         let repo = tempfile::tempdir().expect("canonical repo");
         init_d00_git_repo(repo.path());
         let canonical = std::fs::canonicalize(repo.path()).expect("canonical path");
@@ -24295,7 +26422,7 @@ done
         );
         drop(manager);
 
-        let restart_sandbox = TempDir::new().expect("restart sandbox");
+        let restart_sandbox = disk_backed_tempdir("restart-sandbox-");
         let restarted = SessionManager::new(
             Arc::new(EventBus::new(16)),
             Store::open(&dir.path().join("rsi.db")).expect("reopen restart Store"),
@@ -24375,7 +26502,10 @@ done
     async fn agent_successor_inherits_rotation_override_before_provider_effect() {
         let dir = disk_backed_tempdir("successor-rotation-repo-");
         let sandbox = disk_backed_tempdir("successor-rotation-sandbox-");
-        let manager = manager_for_disk_fixture(dir.path(), sandbox.path());
+        // This test has no restart boundary. Keep the manager and its background
+        // services on one Store so fixture-only SQLite writers cannot race the
+        // override's reservation and pre-effect assertions.
+        let manager = manager_for_disk_fixture_with_store_reopen(dir.path(), sandbox.path(), false);
         manager
             .runtime_config
             .context_rotation_enabled
@@ -25724,6 +27854,35 @@ done
         assert!(!scripted.alive.load(Ordering::SeqCst));
         drop_controller_candidate_test_stream(receipt.candidate_session_id);
     }
+    /// #913: only an unsandboxed, non-historical manager source may be
+    /// rebased onto the verified origin tip. Sandboxed (lead fork,
+    /// `replace_lead`) and historical review sources keep their frozen commit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn manager_action_fresh_base_eligible_only_for_unsandboxed_live_sources() {
+        let source = |sandbox_root: Option<PathBuf>, historical_commit: bool| {
+            crate::store::manager_actions::ManagerActionSourceV2 {
+                session_id: Uuid::new_v4(),
+                working_dir: PathBuf::from("/tmp/fixture"),
+                sandbox_root,
+                commit: "a".repeat(40),
+                custody_generation: None,
+                historical_commit,
+            }
+        };
+        assert!(manager_action_fresh_base_eligible(Some(&source(
+            None, false
+        ))));
+        assert!(!manager_action_fresh_base_eligible(Some(&source(
+            Some(PathBuf::from("/tmp/fixture-sandbox")),
+            false
+        ))));
+        assert!(!manager_action_fresh_base_eligible(Some(&source(
+            None, true
+        ))));
+        assert!(!manager_action_fresh_base_eligible(None));
+    }
+
     mod manager_admission_tests;
     #[cfg(target_os = "linux")]
     mod successor_recovery_tests;

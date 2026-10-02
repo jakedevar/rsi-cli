@@ -214,7 +214,12 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::ModelPicker
         | C::AiCommand
         | C::AiChat => "inside-a-session",
-        C::Terminal | C::CommandPalette | C::SettlementBrowser => "lifecycle",
+        C::Terminal
+        | C::CommandPalette
+        | C::SettlementBrowser
+        | C::LaunchPrompt
+        | C::LaunchSettings
+        | C::ContinuePrompt => "lifecycle",
         C::GraphNavigate
         | C::GraphEmpty
         | C::GraphDetail

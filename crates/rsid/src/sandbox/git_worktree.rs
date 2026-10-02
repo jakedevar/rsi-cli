@@ -175,6 +175,15 @@ impl QuarantineTreeProof {
             .contains(&FilesystemIdentity { device, inode })
     }
 
+    /// Whether any entry of the quarantined tree lives on `device`. A
+    /// descriptor whose every observed identity is on another device (procfs,
+    /// an anonymous inode, a dmabuf, a pipe) cannot reference a tree entry.
+    pub(crate) fn contains_device(&self, device: u64) -> bool {
+        self.identities
+            .iter()
+            .any(|identity| identity.device == device)
+    }
+
     #[cfg(test)]
     fn entry_count(&self) -> usize {
         self.identities.len()
@@ -236,6 +245,9 @@ pub(crate) fn with_repository_mutation<T>(
     let _guard = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Marks this thread as holding the repository mutex so Store and stripe
+    // waits beneath it are bounded (global lock order, Issue #606).
+    let _held = crate::store::custody_lock_order::HeldScope::repository();
     operation()
 }
 
@@ -269,7 +281,58 @@ pub(crate) fn observe_repository_target_locked(
     })
 }
 
+pub(crate) fn observe_configured_upstream_ref_locked(origin: &Path) -> Result<Option<String>> {
+    let output = run_git_raw(
+        origin,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        "observe configured upstream",
+    )?;
+    match output.status.code() {
+        Some(0) => {
+            let reference = decode_git_text(&output.stdout, "observe configured upstream")?;
+            if reference.starts_with("refs/remotes/") {
+                Ok(Some(reference))
+            } else {
+                Err(DaemonError::Process(
+                    "configured upstream is not a remote-tracking ref".into(),
+                ))
+            }
+        }
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
+        _ => Err(DaemonError::Process(
+            "Git configured upstream observation failed".into(),
+        )),
+    }
+}
+
+pub(crate) fn prove_worktree_unregistered_locked(origin: &Path, root: &Path) -> Result<bool> {
+    Ok(!list_worktrees_locked(origin)?
+        .into_iter()
+        .any(|entry| entry.root == root))
+}
+
 pub(crate) fn observe_worktree_locked(origin: &Path, root: &Path) -> Result<WorktreeObservation> {
+    observe_worktree_inner_locked(origin, root, true)
+}
+
+pub(crate) fn observe_worktree_ignoring_ignored_locked(
+    origin: &Path,
+    root: &Path,
+) -> Result<WorktreeObservation> {
+    observe_worktree_inner_locked(origin, root, false)
+}
+
+fn observe_worktree_inner_locked(
+    origin: &Path,
+    root: &Path,
+    include_ignored: bool,
+) -> Result<WorktreeObservation> {
     let metadata = std::fs::symlink_metadata(root).ok();
     let root_exists = metadata.is_some();
     let root_is_symlink = metadata.is_some_and(|value| value.file_type().is_symlink());
@@ -289,18 +352,22 @@ pub(crate) fn observe_worktree_locked(origin: &Path, root: &Path) -> Result<Work
             "resolve worktree branch",
         )
         .ok();
+        let mut status_args: Vec<String> = [
+            "-c".to_string(),
+            "core.fsmonitor=false".to_string(),
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "-z".to_string(),
+            "--untracked-files=all".to_string(),
+        ]
+        .to_vec();
+        if include_ignored {
+            status_args.push("--ignored=matching".to_string());
+        }
+        status_args.push("--ignore-submodules=none".to_string());
         let status = run_git_bytes(
             root,
-            &[
-                "-c",
-                "core.fsmonitor=false",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignored=matching",
-                "--ignore-submodules=none",
-            ],
+            &status_args.iter().map(String::as_str).collect::<Vec<_>>(),
             "inspect worktree cleanliness",
         )?;
         let (visibility_safe, visibility_digest) = inspect_index_visibility_locked(root)?;
@@ -332,6 +399,33 @@ pub(crate) fn observe_worktree_locked(origin: &Path, root: &Path) -> Result<Work
         clean,
         clean_state_digest,
     })
+}
+
+pub(crate) fn prove_registered_worktree_exact_ignoring_ignored_locked(
+    origin: &Path,
+    root: &Path,
+    expected_branch: &str,
+    expected_oid: &str,
+) -> Result<WorktreeAdminIdentity> {
+    validate_expected_worktree_identity(expected_branch, expected_oid)?;
+    let observation = observe_worktree_ignoring_ignored_locked(origin, root)?;
+    if observation.root_is_symlink
+        || !observation.root_exists
+        || !observation.registered
+        || !observation.clean
+        || observation.registered_branch.as_deref() != Some(expected_branch)
+        || observation.head_ref.as_deref() != Some(expected_branch)
+        || observation.registered_head.as_deref() != Some(expected_oid)
+        || observation.head_oid.as_deref() != Some(expected_oid)
+        || resolve_ref_locked(origin, expected_branch)?.as_deref() != Some(expected_oid)
+        || !source_ref_is_registered_only_at_locked(origin, expected_branch, root, expected_oid)?
+        || source_ref_has_symref_dependents_locked(origin, expected_branch)?
+    {
+        return Err(DaemonError::Process(
+            "registered worktree identity or disposable cleanliness did not match".into(),
+        ));
+    }
+    prove_admin_identity(origin, root, &[root])
 }
 
 /// Authenticate one exact clean registered worktree without mutating Git.
@@ -1156,6 +1250,57 @@ fn require_path_absent(path: &Path, label: &str) -> Result<()> {
     }
 }
 
+/// Extended attributes a settlement quarantine may carry. `SELinux` hosts
+/// (Fedora, RHEL, Amazon Linux 2023) label every file with the policy-managed
+/// `security.selinux` MAC attribute, so refusing it made settlement
+/// impossible there (#934). Every other name still refuses the quarantine,
+/// including POSIX ACLs (`system.posix_acl_*`), file capabilities
+/// (`security.capability`) and `user.*` or `trusted.*` attributes.
+const PERMITTED_QUARANTINE_XATTRS: &[&[u8]] = &[b"security.selinux"];
+
+fn check_quarantine_xattr_names(names: &[u8]) -> Result<()> {
+    let permitted = names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .all(|name| PERMITTED_QUARANTINE_XATTRS.contains(&name));
+    if permitted {
+        Ok(())
+    } else {
+        Err(DaemonError::Process(
+            "settlement quarantine contains extended attributes or ACLs".into(),
+        ))
+    }
+}
+
+/// Reads the xattr name list in two calls (length, then names) and requires
+/// both to agree. Any change between them refuses the quarantine: a list that
+/// grew fails the read (ERANGE), and a list that shrank, for example a racer
+/// removing `user.test` so only `security.selinux` remains, must not pass as
+/// the shorter list (#934 review).
+fn quarantine_xattr_inventory(
+    length: isize,
+    read_names: impl FnOnce(&mut [u8]) -> isize,
+) -> Result<Vec<u8>> {
+    let inventory_failed = || {
+        DaemonError::Process(format!(
+            "settlement quarantine xattr inventory failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    };
+    let length = usize::try_from(length).map_err(|_| inventory_failed())?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let mut names = vec![0_u8; length];
+    let read = usize::try_from(read_names(&mut names)).map_err(|_| inventory_failed())?;
+    if read != length {
+        return Err(DaemonError::Process(
+            "settlement quarantine xattr inventory changed during the proof".into(),
+        ));
+    }
+    Ok(names)
+}
+
 #[cfg(target_os = "linux")]
 fn reject_extended_attributes(path: &Path) -> Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())
@@ -1163,18 +1308,12 @@ fn reject_extended_attributes(path: &Path) -> Result<()> {
     // SAFETY: `path` is NUL terminated and a null/zero buffer asks the kernel
     // only for the no-follow xattr-list length; no caller memory is written.
     let length = unsafe { nix::libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
-    if length < 0 {
-        return Err(DaemonError::Process(format!(
-            "settlement quarantine xattr inventory failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    if length != 0 {
-        return Err(DaemonError::Process(
-            "settlement quarantine contains extended attributes or ACLs".into(),
-        ));
-    }
-    Ok(())
+    let names = quarantine_xattr_inventory(length, |names| {
+        // SAFETY: `names` is a writable buffer of exactly `names.len()` bytes
+        // and `path` is NUL terminated.
+        unsafe { nix::libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) }
+    })?;
+    check_quarantine_xattr_names(&names)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1975,6 +2114,54 @@ pub(crate) fn remove_worktree_non_force_locked(
     {
         return Err(DaemonError::Process(
             "worktree removal left original, quarantine, or source-ref registration residue".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_live_worktree_non_force_locked(
+    origin: &Path,
+    root: &Path,
+    source_ref: &str,
+    expected_oid: &str,
+) -> Result<()> {
+    prove_registered_worktree_exact_ignoring_ignored_locked(
+        origin,
+        root,
+        source_ref,
+        expected_oid,
+    )?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("sandbox root is not UTF-8".into()))?;
+    let output = run_git_raw(
+        origin,
+        &["worktree", "remove", root_text],
+        "remove archived sandbox worktree",
+    )?;
+    if !output.status.success() {
+        return Err(DaemonError::Process(
+            "non-force Git archived worktree removal refused".into(),
+        ));
+    }
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(DaemonError::Process(
+                "archived worktree removal left filesystem residue".into(),
+            ));
+        }
+        Err(error) => {
+            return Err(DaemonError::Process(format!(
+                "archived worktree removal residue check failed: {error}"
+            )));
+        }
+    }
+    if registration_for_path(origin, root)?.is_some()
+        || resolve_ref_locked(origin, source_ref)?.as_deref() != Some(expected_oid)
+    {
+        return Err(DaemonError::Process(
+            "archived worktree removal left Git residue".into(),
         ));
     }
     Ok(())
@@ -3166,7 +3353,7 @@ fn capture_bounded_with_limits(
     })
 }
 
-fn run_bounded_records(
+pub(super) fn run_bounded_records(
     mut command: Command,
     input: Option<&[u8]>,
     delimiter: u8,
@@ -3640,7 +3827,7 @@ fn wait_child(child: &mut std::process::Child) -> std::io::Result<std::process::
     }
 }
 
-fn git_command() -> Command {
+pub(super) fn git_command() -> Command {
     let mut command = Command::new("git");
     command
         .env("GIT_NO_REPLACE_OBJECTS", "1")
@@ -5674,6 +5861,88 @@ mod tests {
             )
         })
         .expect("repair exact partial move");
+    }
+
+    /// #934: `SELinux` hosts label every file with `security.selinux`; that
+    /// policy-managed MAC label alone passes, while ACLs, capabilities and
+    /// caller-set attributes still refuse the quarantine.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn quarantine_xattr_names_admit_only_the_selinux_label() {
+        check_quarantine_xattr_names(b"").expect("no attributes");
+        check_quarantine_xattr_names(b"security.selinux\0").expect("SELinux label only");
+        for names in [
+            &b"security.selinux\0system.posix_acl_access\0"[..],
+            b"system.posix_acl_default\0",
+            b"security.capability\0",
+            b"user.rsi-quarantine-test\0",
+            b"trusted.overlay.opaque\0security.selinux\0",
+            b"security.selinuxx\0",
+            b"security.ima\0",
+        ] {
+            let error = check_quarantine_xattr_names(names)
+                .expect_err("any other attribute refuses the quarantine");
+            assert!(
+                error
+                    .to_string()
+                    .contains("settlement quarantine contains extended attributes or ACLs"),
+                "{error}"
+            );
+        }
+    }
+
+    /// #934 review: the name list must not change between the length query
+    /// and the read. A same-UID racer removing `user.test` before the second
+    /// read must not leave an accepted `security.selinux`-only list.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn quarantine_xattr_inventory_refuses_a_list_that_changes_between_reads() {
+        let full: &[u8] = b"user.test\0security.selinux\0";
+        let shrunk: &[u8] = b"security.selinux\0";
+        let length = isize::try_from(full.len()).unwrap();
+
+        let error = quarantine_xattr_inventory(length, |names| {
+            names[..shrunk.len()].copy_from_slice(shrunk);
+            isize::try_from(shrunk.len()).unwrap()
+        })
+        .expect_err("a shrunk list refuses the quarantine");
+        assert!(
+            error
+                .to_string()
+                .contains("settlement quarantine xattr inventory changed during the proof"),
+            "{error}"
+        );
+
+        // A list that grew makes the kernel read fail (ERANGE).
+        let error = quarantine_xattr_inventory(length, |_| -1)
+            .expect_err("a grown list refuses the quarantine");
+        assert!(
+            error
+                .to_string()
+                .contains("settlement quarantine xattr inventory failed"),
+            "{error}"
+        );
+
+        // An unchanged list is returned whole and then judged by name.
+        let names = quarantine_xattr_inventory(length, |names| {
+            names.copy_from_slice(full);
+            length
+        })
+        .expect("an unchanged list is read");
+        assert_eq!(names, full);
+        assert!(check_quarantine_xattr_names(&names).is_err());
+
+        let selinux = isize::try_from(shrunk.len()).unwrap();
+        let names = quarantine_xattr_inventory(selinux, |names| {
+            names.copy_from_slice(shrunk);
+            selinux
+        })
+        .expect("an unchanged SELinux-only list is read");
+        check_quarantine_xattr_names(&names).expect("the SELinux label alone passes");
+
+        let empty = quarantine_xattr_inventory(0, |_| panic!("no second read for an empty list"))
+            .expect("no attributes");
+        assert!(empty.is_empty());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

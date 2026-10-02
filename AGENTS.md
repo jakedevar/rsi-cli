@@ -34,8 +34,10 @@ stranded on a branch.
    never in the shared `~/rsi` worktree (`working_dir`). Do not checkout, switch
    or reset your sandbox branch: child launches pin to its commits.
 3. **Database.** Never hard-delete rows without operator consent. Schema changes
-   only through a new versioned migration (an `if version < N` block in
-   `crates/rsid/src/store/mod.rs` plus the `user_version` bump); released
+   only through a new versioned migration: one new file
+   `crates/rsid/src/store/migrations/vNNN.rs` holding the `if version < N`
+   block and the `user_version` bump (`build.rs` collects the files; the head is
+   the highest number, so no shared file is edited); released
    migrations are immutable. Timestamps are RFC3339 with nanoseconds, UUIDs are
    lowercase, enum strings match serde exactly. Sandbox tombstones flip cleanup
    state and null the path/branch atomically.
@@ -62,6 +64,11 @@ stranded on a branch.
 11. **Long cargo runs.** Scope them (`cargo test -p rsid --lib <filter>`), run in
     the foreground, and `tee` long runs to a log. Never report a run you did not
     see finish as green.
+12. **Detach with systemd.** Any process that must outlive this turn (a lander,
+    a long test run, anything you check on a later wake) MUST be launched via
+    `systemd-run --user --collect`; `setsid`, `nohup`, `disown` and bare `&`
+    backgrounding do not survive the daemon reaping this session's process tree
+    on resume.
 
 ## Project map
 
@@ -104,23 +111,32 @@ Rust is pinned by `rust-toolchain.toml`. Keybinding changes also update
 
 Publish with `rsi-rolling-land --repo <sandbox> --remote origin --accepted <SHA>`.
 Until it is installed on PATH, use `~/.cargo/shared-target/debug/rsi-rolling-land`.
-Add `--test-filter PACKAGE=FILTER` to keep the gate on the modules you touched.
-Tier-0/1 sources may publish without a bound manager Work; the lander reports
-each accepted source as `source_binding=<SHA>:unbound` when the ledger confirms
-no accepted Work binding. Its test gates and fast-forward-only publication
-remain required. The pre-push hook permits the lander's marked `rolling` push;
-unmarked agent pushes to `rolling` and every agent push to `main` remain refused.
+Add `--test-filter PACKAGE=FILTER` for the modules you touched: a filtered
+package's gate is a compile check plus the named tests (no new failures against
+the base); the QA sweep runs the rest. The lander's policy is mechanical and
+runs before any test: no Work binding, seal or hot-file claim is required, and a
+new migration must be the rolling tip's schema head + 1 (the highest
+`store/migrations/vNNN.rs`) as its own file with its `if version < N` block; one
+landing may carry several migrations only as a contiguous run from that number,
+each in its own file (the refusal names the number). It reports each
+source's `source_binding=<SHA>:bound|unbound|unknown` for information only.
+Fast-forward-only publication and the canary remain. The pre-push hook permits
+the lander's marked `rolling` push; unmarked agent pushes to `rolling` and every
+agent push to `main` remain refused.
 The hook is a cooperative guard rail, not a security boundary: agents can spoof
 the lander's `RSI_ROLLING_LANDER=1` marker or bypass hooks. Only the lander
 enforces test gates and fast-forward publication.
 Work is landed when `git merge-base --is-ancestor <SHA> origin/rolling` holds.
-`rolling` is agent-dev intake: land after your tests pass, with no pre-merge
-review except for schema migrations and authority/credential/custody changes.
+`rolling` is agent-dev intake: land after your tests pass. Pre-merge review
+only for new schema migrations and credential/IAM/network-exposure changes (one
+plain reviewer pass); other authority or custody changes land first and get one
+post-land review.
 The QA lane sweeps `rolling`, records each passing SHA in the pointer file
 `thoughts/shared/qa/qa-green.sha` (landed on `rolling`; `qa-green` is not a
-branch), and files regressions back as Issues (lead contract §5).
+branch), and files regressions back as Issues.
 `rolling` is agent-managed (merge and push fast-forwards freely); `main` is
-operator-only. Lead and manager landing rules: `thoughts/shared/manager/lead-contract.md`.
+operator-only. The manager integrates worker commits (`.claude/skills/rsi-project-manager/SKILL.md`);
+workers follow `thoughts/shared/manager/worker-contract.md`.
 
 ## Agent control
 

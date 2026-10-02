@@ -120,6 +120,58 @@ async fn quick_input_transport_drop_preserves_exact_draft_until_retry_accepts() 
     server.await.expect("quick-launch server");
 }
 
+#[tokio::test]
+async fn composing_to_busy_session_queues_without_changing_running_status() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let directory = tempfile::tempdir().expect("socket directory");
+    let socket_path = directory.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+    let mut app = crate::app::app_test_helpers::with_session_list(1);
+    let session_id = app.selected_session_id().expect("selected session");
+    app.sessions
+        .get_mut(&session_id)
+        .expect("session")
+        .session
+        .status = rsi_common::types::SessionStatus::Running;
+    app.client = DaemonClient::new(socket_path);
+    app.client.connect().await.expect("connect client");
+    app.poll.connected = true;
+    let message_id = Uuid::new_v4();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.expect("request").expect("line");
+        let request: serde_json::Value = serde_json::from_str(&line).expect("request JSON");
+        assert_eq!(request["method"], "QueueOperatorMessage");
+        assert_eq!(request["params"]["content"], "Please inspect the result");
+        assert_eq!(request["params"]["session_id"], session_id.to_string());
+        let response = serde_json::json!({
+            "jsonrpc":"2.0","id":request["id"],
+            "result": {
+                "id":message_id,"session_id":session_id,"content":"Please inspect the result",
+                "state":"queued","created_at":"2026-09-27T00:00:00.000000000Z",
+                "updated_at":"2026-09-27T00:00:00.000000000Z","delivered_at":null
+            }
+        });
+        writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("reply");
+    });
+    assert!(
+        app.continue_session(session_id, "Please inspect the result")
+            .await
+    );
+    server.await.expect("server");
+    assert_eq!(
+        app.sessions[&session_id].session.status,
+        rsi_common::types::SessionStatus::Running
+    );
+    assert_eq!(app.operator_messages[&session_id][0].id, message_id);
+}
+
 #[test]
 fn test_app_initial_state() {
     let app = test_app();
@@ -301,6 +353,7 @@ fn test_update_sessions() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -397,6 +450,7 @@ fn test_update_sessions_sorted_by_staleness() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -483,6 +537,7 @@ fn test_update_sessions_sorted_by_staleness() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -688,6 +743,7 @@ fn test_update_sessions_fixup_selected_index() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -793,6 +849,7 @@ fn test_update_sessions_fixup_selected_index() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -911,6 +968,7 @@ fn test_nav_down_session_list() {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -1010,6 +1068,7 @@ async fn test_auto_launch_resume_handoff_completed_session() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -1122,6 +1181,7 @@ async fn test_auto_launch_resume_handoff_running_session_not_launched() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -1275,6 +1335,7 @@ fn stale_response_generations_preserve_newer_launch_docreg_auto_resume_and_class
             generation: 1,
             accepted: Ok(uuid::Uuid::new_v4()),
             model_warning: None,
+            manager: None,
         })
     );
     assert_eq!(
@@ -1838,6 +1899,7 @@ async fn test_auto_launch_resume_handoff_no_tag() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -1940,6 +2002,7 @@ fn make_session_with_status(status: rsi_common::types::SessionStatus) -> Session
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,

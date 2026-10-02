@@ -354,7 +354,7 @@ impl Store {
         policies: &[ModelBudgetPolicy],
         replace: bool,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         update_model_budget_policies_tx(&tx, policies, replace)?;
         tx.commit()?;
         Ok(())
@@ -380,7 +380,7 @@ impl Store {
             return Ok(Vec::new());
         };
         let alerts = self.list_budget_alerts_for_record(&record)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let emitted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let mut inserted = Vec::new();
         for alert in alerts {
@@ -542,7 +542,7 @@ impl Store {
         policies: &[ModelBudgetPolicy],
         circuit_updates: &[rsi_common::rpc::ModelCircuitUpdate],
     ) -> Result<ModelControlPolicyTransition> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if replace_policies || !policies.is_empty() {
             update_model_budget_policies_tx(&tx, policies, replace_policies)?;
         }
@@ -632,7 +632,7 @@ impl Store {
         reason: &str,
         mechanism: &str,
     ) -> Result<StoreCancellationOutcome> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let record = tx
             .query_row(
                 MODEL_INVOCATION_SELECT_BY_ID,
@@ -840,6 +840,8 @@ impl Store {
         channel: StoreAdmissionChannel,
         origin: Option<&super::manager_resources::ManagerResourceLaunchOrigin>,
     ) -> Result<InternalStoreAdmissionOutcome> {
+        let canonical_request = request.with_canonical_provider();
+        let request = canonical_request.as_ref().unwrap_or(request);
         // Reserve the writer before reading scoped usage. A deferred read-to-
         // write upgrade can fail BUSY instead of observing the other admission.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -1020,7 +1022,7 @@ impl Store {
         let launch_provider = request
             .provider
             .as_deref()
-            .and_then(|provider| super::row_mappers::str_to_session_provider(provider).ok());
+            .and_then(super::row_mappers::admission_gate_provider);
         let mut launch_scope = None;
         let resource_gate = match (origin, launch_provider) {
             (Some(origin), Some(provider)) => self
@@ -1364,7 +1366,9 @@ impl Store {
         policy_snapshot: &serde_json::Value,
         error_class: &str,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let canonical_request = request.with_canonical_provider();
+        let request = canonical_request.as_ref().unwrap_or(request);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         insert_model_invocation_denied_tx(
             &tx,
@@ -1396,11 +1400,11 @@ impl Store {
         completion: &InvocationCompletion,
         disable_capacity_wake_id: Option<&str>,
     ) -> Result<StoreCompletionOutcome> {
-        let tx = if disable_capacity_wake_id.is_some() {
-            Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?
-        } else {
-            self.conn.unchecked_transaction()?
-        };
+        // IMMEDIATE, never DEFERRED: completion reads the row before it
+        // writes, and SQLite refuses a DEFERRED read -> write upgrade with an
+        // instant SQLITE_BUSY (no busy_timeout wait) while another connection
+        // holds the write lock (#919).
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let outcome = self.complete_model_invocation_in_tx(
             &tx,
             invocation_id,
@@ -1434,7 +1438,7 @@ impl Store {
                         usage_confidence, baseline_input_tokens, baseline_output_tokens,
                 baseline_cache_creation_tokens, baseline_cache_read_tokens,
                 baseline_reasoning_tokens, baseline_embedding_input_count, baseline_wall_time_ms,
-                        topology_node_id, policy_snapshot_json
+                        topology_node_id, policy_snapshot_json, model
                  FROM model_invocations WHERE id = ?1",
                 params![invocation_id.to_string()],
                 |row| {
@@ -1482,6 +1486,7 @@ impl Store {
                         baseline_wall_time_ms: row.get(40)?,
                         topology_node_id: row.get(41)?,
                         policy_snapshot_json: row.get(42)?,
+                        model: row.get(43)?,
                     })
                 },
             )
@@ -1611,10 +1616,23 @@ impl Store {
         } else {
             row.current_status.as_str()
         };
-        let next_confidence = completion
-            .confidence
-            .map(to_confidence)
-            .unwrap_or(row.current_confidence.as_str());
+        // A row with no input or output token figure at all cannot claim a
+        // measured, estimated or partial usage: the typed `unavailable`
+        // confidence is the explicit reason the token columns stay NULL.
+        let tokens_unavailable = next_input_tokens.is_none() && next_output_tokens.is_none();
+        let next_confidence = if tokens_unavailable {
+            to_confidence(ModelUsageConfidence::Unavailable)
+        } else {
+            completion
+                .confidence
+                .map(to_confidence)
+                .unwrap_or(row.current_confidence.as_str())
+        };
+        let next_effort = effective_invocation_effort(
+            row.effort.as_deref(),
+            completion.effort.as_deref(),
+            row.model.as_deref(),
+        );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         tx.execute(
             "UPDATE model_invocations
@@ -1629,7 +1647,8 @@ impl Store {
                  wall_time_ms = ?9,
                  estimated_cost_usd = ?10,
                 error_class = COALESCE(?11, error_class),
-                 usage_confidence = ?12
+                 usage_confidence = ?12,
+                 effort = COALESCE(effort, ?14)
              WHERE id = ?13",
             params![
                 next_status,
@@ -1647,6 +1666,7 @@ impl Store {
                 effective_error_class,
                 next_confidence,
                 invocation_id.to_string(),
+                next_effort,
             ],
         )?;
 
@@ -1818,6 +1838,20 @@ impl Store {
         .transpose()
     }
 
+    /// The session's total cost: the sum of every settled invocation cost the
+    /// session owns (#584). `None` when no invocation recorded a cost (an
+    /// unpriced model), so an unknown total is NULL, never a fabricated 0.
+    pub fn session_model_invocation_cost_total(&self, session_id: Uuid) -> Result<Option<f64>> {
+        let total = self.conn.query_row(
+            "SELECT SUM(estimated_cost_usd) FROM model_invocations
+             WHERE session_id = ?1 AND admission_status = 'admitted'
+               AND estimated_cost_usd IS NOT NULL",
+            params![session_id.to_string()],
+            |row| row.get::<_, Option<f64>>(0),
+        )?;
+        Ok(total)
+    }
+
     pub(crate) fn mark_manager_question_cleanup_required(&self, invocation: Uuid) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let session: Option<String> = tx.query_row(
@@ -1921,9 +1955,15 @@ impl Store {
                         Some("Archived") | Some("Deleted")
                     )
                 {
-                    self.update_session_status(
+                    self.set_session_terminal_status(
                         session,
                         rsi_common::types::SessionStatus::Interrupted,
+                        if question_cleanup {
+                            crate::terminal_cause::InterruptSource::QuestionCleanup
+                        } else {
+                            crate::terminal_cause::InterruptSource::DaemonRestart
+                        }
+                        .cause(),
                     )?;
                 }
                 self.complete_model_invocation(
@@ -1991,6 +2031,31 @@ impl Store {
             reconciled += 1;
         }
         Ok(reconciled)
+    }
+
+    /// Ids of background-helper invocations whose ledger row is still live
+    /// (`running`/`cancellation_requested`), oldest first (#940, #1080).
+    ///
+    /// Deliberately no wall-clock age filter: whether one of them is stale is
+    /// decided by the settlement worker from the monotonic live-call registry,
+    /// so a forward clock jump cannot make a live helper look old.
+    pub fn running_background_helper_invocation_ids(&self) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM model_invocations
+             WHERE admission_status='admitted' AND status IN ('running','cancellation_requested')
+               AND purpose IN (SELECT value FROM json_each(?1))
+             ORDER BY created_at LIMIT 256",
+        )?;
+        let ids = stmt
+            .query_map(
+                params![ModelInvocationPurpose::background_helper_json_array()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .collect())
     }
 
     fn build_invocation_view(&self, record: ModelInvocationRecord) -> Result<ModelInvocationView> {
@@ -2269,6 +2334,37 @@ struct InvocationSettlementRow {
     baseline_embedding_input_count: i64,
     baseline_wall_time_ms: i64,
     policy_snapshot_json: String,
+    model: Option<String>,
+}
+
+/// Recorded effort when neither the admission nor the settlement names one and
+/// the model has no authoritative default ladder: the provider's own default.
+pub(crate) const EFFORT_PROVIDER_DEFAULT: &str = "default";
+
+/// The effort an invocation ran at, for rows admitted without one. The
+/// admission value is never rewritten at admit time (replay comparisons and the
+/// orchestration guardrail treat `None` as unspecified); settlement records the
+/// effective value instead: completion-supplied effort, then the model's
+/// default effort, then [`EFFORT_PROVIDER_DEFAULT`].
+pub(crate) fn effective_invocation_effort(
+    admitted: Option<&str>,
+    completion: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    let named = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    named(admitted)
+        .or_else(|| named(completion))
+        .or_else(|| {
+            model
+                .and_then(rsi_common::model_utils::default_effort_level)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| EFFORT_PROVIDER_DEFAULT.to_string())
 }
 
 const MODEL_INVOCATION_SELECT_BY_ID: &str = "SELECT
@@ -2576,6 +2672,21 @@ fn enforce_mode(
     Ok(())
 }
 
+/// A denial raised at admission never started a provider invocation. When the
+/// refusal is a property of *current* capacity/pause state it can clear without
+/// any change to the caller's request, so an identical retry must be able to
+/// re-evaluate. Such a denial must not keep the request's model-invocation
+/// dedup key reserved: `dedup_row_is_retryable` deliberately treats `denied`
+/// as non-retryable, so a persisted key would suppress the retry forever (the
+/// observed `session.continue.resume:<session>:<event_seq>` dedup conflict).
+/// Non-transient denials keep the key so an exact replay still short-circuits.
+fn denial_class_is_transient_pre_provider(error_class: &str) -> bool {
+    matches!(
+        error_class,
+        "manager_resource_denied" | "policy_denied" | "circuit_open" | "budget_denied"
+    )
+}
+
 fn insert_model_invocation_denied_tx(
     tx: &rusqlite::Transaction<'_>,
     invocation_id: Uuid,
@@ -2629,7 +2740,11 @@ fn insert_model_invocation_denied_tx(
             request.owner.operator.as_deref(),
             request.parent_invocation_id.map(|id| id.to_string()),
             request.retry_of_invocation_id.map(|id| id.to_string()),
-            request.dedup_key.as_deref(),
+            if denial_class_is_transient_pre_provider(error_class) {
+                None
+            } else {
+                request.dedup_key.as_deref()
+            },
             request.request_fingerprint.as_deref(),
             policy_snapshot.to_string(),
             error_class,
@@ -6050,6 +6165,237 @@ mod tests {
         assert_eq!(active_count, 1);
     }
 
+    fn settle_for_usage_coverage(
+        store: &Store,
+        dedup_key: &str,
+        admitted_effort: Option<&str>,
+        model: &str,
+        completion: InvocationCompletion,
+    ) -> (Option<String>, Option<i64>, Option<i64>, String) {
+        let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
+            .copied()
+            .expect("registry");
+        let invocation_id = Uuid::new_v4();
+        let mut admission = request(
+            ModelInvocationPurpose::SessionContinueResume,
+            dedup_key,
+            Uuid::new_v4(),
+        );
+        admission.effort = admitted_effort.map(str::to_string);
+        admission.model = Some(model.to_string());
+        admission.baseline_input_tokens = 0;
+        admission.baseline_output_tokens = 0;
+        store
+            .admit_model_invocation(invocation_id, registry, ModelTier::Premium, &admission)
+            .expect("admission");
+        store
+            .complete_model_invocation(invocation_id, &completion)
+            .expect("completion");
+        store
+            .conn
+            .query_row(
+                "SELECT effort, input_tokens, output_tokens, usage_confidence
+                 FROM model_invocations WHERE id = ?1",
+                params![invocation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("settled row")
+    }
+
+    fn stored_provider(store: &Store, invocation_id: Uuid) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT provider FROM model_invocations WHERE id = ?1",
+                params![invocation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("stored provider")
+    }
+
+    /// Hard rule 3: enum strings match serde exactly. Whatever spelling a
+    /// writer passes, the stored provider is the exact variant string, on the
+    /// admitted and the denied path alike; unknown labels pass through.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn admission_stores_the_exact_serde_provider_string_for_every_spelling() {
+        let store = Store::open_in_memory().expect("store");
+        let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
+            .copied()
+            .expect("registry");
+        for (index, (written, stored)) in [
+            ("codex", "Codex"),
+            ("openrouter", "OpenRouter"),
+            ("CODEXAPPSERVER", "CodexAppServer"),
+            ("Claude", "Claude"),
+            ("none", "none"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invocation_id = Uuid::new_v4();
+            let mut admission = request(
+                ModelInvocationPurpose::SessionContinueResume,
+                &format!("provider-spelling-{index}"),
+                Uuid::new_v4(),
+            );
+            admission.provider = Some(written.to_string());
+            store
+                .admit_model_invocation(invocation_id, registry, ModelTier::Premium, &admission)
+                .expect("admission");
+            assert_eq!(
+                stored_provider(&store, invocation_id).as_deref(),
+                Some(stored)
+            );
+
+            let denied_id = Uuid::new_v4();
+            store
+                .insert_model_invocation_denied(
+                    denied_id,
+                    registry.kind,
+                    registry.foreground,
+                    registry.paid_risk,
+                    ModelTier::Premium,
+                    &admission,
+                    &serde_json::json!({"reason": "test"}),
+                    "policy_denied",
+                )
+                .expect("denied row");
+            assert_eq!(stored_provider(&store, denied_id).as_deref(), Some(stored));
+        }
+    }
+
+    /// The canonical label list is the `SessionProvider` serde spelling, so a
+    /// label written from a variant never needs rewriting.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn canonical_provider_labels_are_the_exact_session_provider_strings() {
+        use rsi_common::types::SessionProvider;
+        for provider in [
+            SessionProvider::Claude,
+            SessionProvider::Codex,
+            SessionProvider::Pioneer,
+            SessionProvider::OpenRouter,
+            SessionProvider::Bedrock,
+            SessionProvider::Local,
+            SessionProvider::Antigravity,
+            SessionProvider::CodexAppServer,
+            SessionProvider::Harness,
+        ] {
+            let serde_name = serde_json::to_value(provider)
+                .expect("serialize provider")
+                .as_str()
+                .expect("provider serializes as a string")
+                .to_string();
+            assert_eq!(serde_name, format!("{provider:?}"));
+            assert!(
+                crate::store::row_mappers::CANONICAL_INVOCATION_PROVIDER_LABELS
+                    .contains(&serde_name.as_str()),
+                "{serde_name}"
+            );
+            assert_eq!(
+                crate::store::row_mappers::canonical_invocation_provider(&serde_name),
+                None,
+                "an exact label is never rewritten"
+            );
+            assert_eq!(
+                crate::store::row_mappers::canonical_invocation_provider(
+                    &serde_name.to_ascii_lowercase()
+                ),
+                Some(serde_name.as_str())
+            );
+        }
+    }
+
+    /// #587: every settled invocation records the effort it ran at. Admission
+    /// is never rewritten (replay and the orchestration guardrail read `None`
+    /// as unspecified); settlement fills it from the completion, then the
+    /// model's default effort, then the explicit provider-default label.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn settlement_records_the_effective_effort_when_admission_named_none() {
+        let store = Store::open_in_memory().expect("store");
+        let done = |tokens: Option<u64>| InvocationCompletion {
+            input_tokens: tokens,
+            output_tokens: tokens,
+            confidence: Some(ModelUsageConfidence::Measured),
+            ..InvocationCompletion::default()
+        };
+        let default_for_model = settle_for_usage_coverage(
+            &store,
+            "effort-model",
+            None,
+            "claude-opus-4-7",
+            done(Some(3)),
+        );
+        assert_eq!(default_for_model.0.as_deref(), Some("xhigh"));
+
+        let provider_default =
+            settle_for_usage_coverage(&store, "effort-local", None, "qwen3:14b", done(Some(3)));
+        assert_eq!(provider_default.0.as_deref(), Some(EFFORT_PROVIDER_DEFAULT));
+
+        let completion_named = settle_for_usage_coverage(
+            &store,
+            "effort-completion",
+            None,
+            "qwen3:14b",
+            InvocationCompletion {
+                effort: Some("high".to_string()),
+                ..done(Some(3))
+            },
+        );
+        assert_eq!(completion_named.0.as_deref(), Some("high"));
+
+        let admitted_wins = settle_for_usage_coverage(
+            &store,
+            "effort-admitted",
+            Some("low"),
+            "claude-opus-4-7",
+            InvocationCompletion {
+                effort: Some("max".to_string()),
+                ..done(Some(3))
+            },
+        );
+        assert_eq!(admitted_wins.0.as_deref(), Some("low"));
+    }
+
+    /// #586: a settlement with no input or output figure never claims measured
+    /// usage; the typed `unavailable` confidence is the explicit reason the
+    /// token columns stay NULL. A settlement with figures keeps its confidence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn settlement_without_token_figures_records_unavailable_confidence() {
+        let store = Store::open_in_memory().expect("store");
+        let unreported = settle_for_usage_coverage(
+            &store,
+            "tokens-none",
+            None,
+            "qwen3:14b",
+            InvocationCompletion {
+                wall_time_ms: Some(10),
+                confidence: Some(ModelUsageConfidence::Partial),
+                ..InvocationCompletion::default()
+            },
+        );
+        assert_eq!((unreported.1, unreported.2), (None, None));
+        assert_eq!(unreported.3, "unavailable");
+
+        let reported = settle_for_usage_coverage(
+            &store,
+            "tokens-some",
+            None,
+            "qwen3:14b",
+            InvocationCompletion {
+                input_tokens: Some(12),
+                output_tokens: Some(4),
+                confidence: Some(ModelUsageConfidence::Estimated),
+                ..InvocationCompletion::default()
+            },
+        );
+        assert_eq!((reported.1, reported.2), (Some(12), Some(4)));
+        assert_eq!(reported.3, "estimated");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn completion_is_idempotent_and_uses_baseline_deltas() {
@@ -6140,6 +6486,65 @@ mod tests {
         assert_eq!(counters.1, 60);
         assert_eq!(counters.2, 35);
         assert_eq!(counters.3, 75);
+    }
+
+    /// #919: completion reads the invocation row before it writes. A DEFERRED
+    /// transaction then upgrades read -> write, and SQLite answers
+    /// `SQLITE_BUSY` at once, bypassing `busy_timeout`, whenever another
+    /// connection holds the write lock. Completion must wait for that writer
+    /// and settle.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn completion_waits_for_a_concurrent_writer_instead_of_failing_busy() {
+        let dir = TempDir::new().expect("completion fixture dir");
+        let database = dir.path().join("rsi.db");
+        let store = Store::open(&database).expect("completion store");
+        let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
+            .copied()
+            .expect("registry");
+        let invocation_id = Uuid::new_v4();
+        let outcome = store
+            .admit_model_invocation(
+                invocation_id,
+                registry,
+                ModelTier::Premium,
+                &request(
+                    ModelInvocationPurpose::SessionContinueResume,
+                    "concurrent-writer-key",
+                    Uuid::new_v4(),
+                ),
+            )
+            .expect("admission");
+        assert_eq!(outcome, StoreAdmissionOutcome::Admitted(invocation_id));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let writer_database = database.clone();
+        let writer = std::thread::spawn(move || {
+            let writer = rusqlite::Connection::open(&writer_database).expect("writer connection");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("writer holds the write lock");
+            locked_tx.send(()).expect("announce the held write lock");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            writer
+                .execute_batch("COMMIT")
+                .expect("writer releases the write lock");
+        });
+        locked_rx.recv().expect("writer took the write lock");
+        store
+            .complete_model_invocation(invocation_id, &InvocationCompletion::default())
+            .expect("completion waits for the concurrent writer instead of failing busy");
+        writer.join().expect("writer thread");
+
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM model_invocations WHERE id = ?1",
+                params![invocation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("settled invocation");
+        assert_eq!(status, "completed");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -7074,6 +7479,67 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
+    fn session_invocation_cost_total_sums_settled_costs_and_is_null_when_none_priced() {
+        let store = Store::open_in_memory().expect("store");
+        let session_id = Uuid::new_v4();
+        let registry = registry::lookup(ModelInvocationPurpose::SessionLaunchFresh)
+            .copied()
+            .expect("registry");
+        let settle = |key: &str, cost: Option<f64>| {
+            let invocation_id = match store
+                .admit_model_invocation(
+                    Uuid::new_v4(),
+                    registry,
+                    ModelTier::Premium,
+                    &request(ModelInvocationPurpose::SessionLaunchFresh, key, session_id),
+                )
+                .expect("admission")
+            {
+                StoreAdmissionOutcome::Admitted(id) => id,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            store
+                .complete_model_invocation(
+                    invocation_id,
+                    &InvocationCompletion {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        estimated_cost_usd: cost,
+                        confidence: Some(ModelUsageConfidence::Measured),
+                        ..InvocationCompletion::default()
+                    },
+                )
+                .expect("completion");
+        };
+
+        settle("cost-total-unpriced", None);
+        assert_eq!(
+            store
+                .session_model_invocation_cost_total(session_id)
+                .expect("total"),
+            None,
+            "no priced invocation leaves the session total NULL"
+        );
+
+        settle("cost-total-a", Some(0.25));
+        settle("cost-total-b", Some(0.5));
+        settle("cost-total-unpriced-2", None);
+        assert_eq!(
+            store
+                .session_model_invocation_cost_total(session_id)
+                .expect("total"),
+            Some(0.75)
+        );
+        assert_eq!(
+            store
+                .session_model_invocation_cost_total(Uuid::new_v4())
+                .expect("other session"),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
     fn over_reservation_without_explicit_usage_budget_stays_completed_and_admits_follow_up() {
         let store = Store::open_in_memory().expect("store");
         let session_id = Uuid::new_v4();
@@ -7365,6 +7831,112 @@ mod tests {
             .expect("failed row retained");
         assert_eq!(dedup_key, None, "dead key must be released");
         assert!(fingerprint.is_some(), "audit trail must survive");
+    }
+
+    /// #996: a continue refused before any provider invocation for a transient
+    /// capacity/pause reason must not keep its dedup key reserved, so the
+    /// identical manual continue at the SAME event sequence is admitted once the
+    /// condition clears. The denial row is retained for audit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn transient_denial_does_not_reserve_continue_dedup_key() {
+        let store = Store::open_in_memory().expect("store");
+        let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
+            .copied()
+            .expect("registry");
+        let session_id = Uuid::new_v4();
+        let event_sequence = 7;
+        let req = request(
+            ModelInvocationPurpose::SessionContinueResume,
+            &format!("session.continue.resume:{session_id}:{event_sequence}"),
+            session_id,
+        );
+        let denied_id = Uuid::new_v4();
+        store
+            .insert_model_invocation_denied(
+                denied_id,
+                registry.kind,
+                registry.foreground,
+                registry.paid_risk,
+                ModelTier::Premium,
+                &req,
+                &serde_json::json!({"reason": "capacity"}),
+                "manager_resource_denied",
+            )
+            .expect("record the capacity denial");
+
+        let denied_key: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT dedup_key FROM model_invocations WHERE id = ?1",
+                params![denied_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("denied row retained");
+        assert_eq!(
+            denied_key, None,
+            "a pre-provider transient denial must not reserve the dedup key"
+        );
+
+        match store
+            .admit_model_invocation(Uuid::new_v4(), registry, ModelTier::Premium, &req)
+            .expect("manual continue at the same event sequence")
+        {
+            StoreAdmissionOutcome::Admitted(_) => {}
+            other => panic!("manual continue must be admitted, got: {other:?}"),
+        }
+    }
+
+    /// #996 counter-case: a non-transient denial keeps today's behaviour — the
+    /// key stays reserved so an exact replay still short-circuits.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn non_transient_denial_still_reserves_continue_dedup_key() {
+        let store = Store::open_in_memory().expect("store");
+        let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
+            .copied()
+            .expect("registry");
+        let session_id = Uuid::new_v4();
+        let req = request(
+            ModelInvocationPurpose::SessionContinueResume,
+            &format!("session.continue.resume:{session_id}:11"),
+            session_id,
+        );
+        let denied_id = Uuid::new_v4();
+        store
+            .insert_model_invocation_denied(
+                denied_id,
+                registry.kind,
+                registry.foreground,
+                registry.paid_risk,
+                ModelTier::Premium,
+                &req,
+                &serde_json::json!({"reason": "escalation"}),
+                "orchestration_escalation_denied",
+            )
+            .expect("record the non-transient denial");
+
+        let denied_key: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT dedup_key FROM model_invocations WHERE id = ?1",
+                params![denied_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("denied row retained");
+        assert_eq!(
+            denied_key.as_deref(),
+            Some(req.dedup_key.as_deref().unwrap()),
+            "a non-transient denial keeps the key reserved"
+        );
+
+        let replay = store
+            .admit_model_invocation(Uuid::new_v4(), registry, ModelTier::Premium, &req)
+            .expect("exact replay is reported, not admitted");
+        assert!(
+            matches!(replay, StoreAdmissionOutcome::Denied { .. }),
+            "non-transient replay must stay denied, got: {replay:?}"
+        );
     }
 
     /// The retry itself claims the key, so a *second* concurrent attempt while

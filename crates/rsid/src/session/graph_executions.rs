@@ -595,7 +595,7 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
 
     async fn launch(&self, request: crate::topology::executor::LaunchRequest) -> Result<Uuid> {
         self.manager
-            .launch_session_with_retry_admission(
+            .boxed_launch_session_with_retry_admission(
                 request.config,
                 None,
                 false,
@@ -628,7 +628,14 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
     }
 
     async fn interrupt(&self, session_id: Uuid) {
-        if let Err(error) = self.manager.interrupt_session(session_id).await {
+        if let Err(error) = self
+            .manager
+            .interrupt_session_from(
+                session_id,
+                crate::terminal_cause::InterruptSource::GraphCancel,
+            )
+            .await
+        {
             tracing::debug!(%session_id, %error, "topology node interrupt not delivered");
         }
     }
@@ -677,8 +684,11 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         fork: crate::topology::custody::TopologyForkSource,
     ) -> Result<std::path::PathBuf> {
         let allocator = Arc::clone(&self.manager.sandbox_allocator);
+        let permit = self.manager.admit_sandbox_allocation().await?;
         tokio::task::spawn_blocking(move || {
-            crate::topology::catalog::allocate_or_adopt(&allocator, session_id, &fork)
+            crate::topology::catalog::allocate_or_adopt_with_permit(
+                &allocator, permit, session_id, &fork,
+            )
         })
         .await
         .map_err(|error| DaemonError::Process(error.to_string()))?

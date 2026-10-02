@@ -53,6 +53,58 @@ fn valid_cost(value: Option<f64>) -> Option<f64> {
 }
 
 impl Store {
+    /// #976: whether automatic context rotation of a lead-dismissible child
+    /// must stop here. A child is a session whose parent is an Epic it does
+    /// not lead, or a leaf session. `successor` asks about spawning a rotation
+    /// successor (always held for a child: the lead decides, told by its
+    /// terminal watch); otherwise about the one handoff-writing turn, which
+    /// is held only when the manager policy freezes the child's spend: the
+    /// policy or the Epic is paused, or a non-empty launch allowlist leaves
+    /// out the child's provider. Leads, managers and parentless sessions keep
+    /// rotating.
+    pub(crate) fn child_automatic_rotation_hold(
+        &self,
+        session_id: Uuid,
+        successor: bool,
+    ) -> Result<Option<&'static str>> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let Some(parent_id) = session.parent_id else {
+            return Ok(None);
+        };
+        let Some(parent) = self.get_session(parent_id)? else {
+            return Ok(None);
+        };
+        let child_of_lead = if parent.session_kind == SessionKind::Epic {
+            parent.lead_session_id != Some(session_id)
+        } else {
+            rsi_common::is_leaf_kind(parent.session_kind)
+        };
+        if !child_of_lead {
+            return Ok(None);
+        }
+        let epic_id = (parent.session_kind == SessionKind::Epic).then_some(parent_id);
+        if let Some(project_id) = session.project_id.or(parent.project_id)
+            && let Some(grant) = self.get_harness_manager_policy(project_id)?
+            && !grant.revoked
+        {
+            let policy = &grant.policy;
+            let provider_frozen = !policy.allowed_launches.is_empty()
+                && !policy
+                    .allowed_launches
+                    .iter()
+                    .any(|choice| choice.provider == session.provider);
+            if policy.paused
+                || epic_id.is_some_and(|epic| policy.paused_epic_ids.contains(&epic))
+                || provider_frozen
+            {
+                return Ok(Some("child_rotation_spend_frozen"));
+            }
+        }
+        Ok(successor.then_some("child_rotation_held_for_lead"))
+    }
+
     fn manager_v2_root_origins(
         &self,
         project: Uuid,
@@ -1039,9 +1091,17 @@ impl Store {
         let Some(session) = request.owner.session_id else {
             return Ok(());
         };
+        // #940: a background helper call (title, memory extraction, ...) is not
+        // a lead launch: it is neither counted against nor refused by the lead
+        // concurrency cap, but the spend capture and the pause/spend gates
+        // still apply to it.
         if request.purpose != ModelInvocationPurpose::SessionRotateChild {
             self.manager_v2_capture_resource_spend(session)?;
-            return self.manager_v2_resource_gate_for_session(session, provider);
+            return self.manager_v2_resource_gate_for_session_scoped(
+                session,
+                provider,
+                !request.purpose.is_background_helper(),
+            );
         }
         let Some(project) = request.owner.project_id else {
             return Ok(());
@@ -1113,11 +1173,18 @@ impl Store {
         )?;
         let mut active = HashSet::new();
         let mut by_provider = BTreeMap::<String, usize>::new();
+        let helper_purposes =
+            rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array();
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT session_id FROM model_invocations WHERE admission_status='admitted'
-             AND status IN ('running','cancellation_requested') AND session_id IN (SELECT value FROM json_each(?1))",
+             AND status IN ('running','cancellation_requested') AND session_id IN (SELECT value FROM json_each(?1))
+             AND purpose NOT IN (SELECT value FROM json_each(?2))
+             AND id NOT IN (SELECT value FROM json_each(?3))",
         )?;
-        for id in stmt.query_map([&ids], |r| r.get::<_, String>(0))? {
+        let released = crate::model_control::call_control::capacity_released_ids_json();
+        for id in stmt.query_map(params![&ids, &helper_purposes, &released], |r| {
+            r.get::<_, String>(0)
+        })? {
             active.insert(id?);
         }
         for member in &leaves {
@@ -1181,6 +1248,21 @@ impl Store {
         provider: SessionProvider,
         existing_session: Option<Uuid>,
     ) -> Result<()> {
+        self.manager_v2_resource_gate_scoped(config, epic_id, provider, existing_session, true)
+    }
+
+    /// `enforce_concurrency=false` is for background helper calls (#940): they
+    /// neither occupy nor are refused by the lead concurrency/provider-count
+    /// caps, but the operator pause, spend and provider usage-limit checks
+    /// still apply so a pause or spend cap stops helper spend too.
+    pub(crate) fn manager_v2_resource_gate_scoped(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic_id: Option<Uuid>,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        enforce_concurrency: bool,
+    ) -> Result<()> {
         let Some(grant) = self.get_harness_manager_policy(config.project_id)? else {
             return Ok(());
         };
@@ -1215,8 +1297,14 @@ impl Store {
         if let Some(id) = existing_session.filter(|_| existing_provider.is_some()) {
             let counted: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status IN ('Starting','Running','WaitingApproval'))
-                    OR EXISTS(SELECT 1 FROM model_invocations WHERE session_id=?1 AND admission_status='admitted' AND status IN ('running','cancellation_requested'))",
-                [id.to_string()], |r| r.get(0))?;
+                    OR EXISTS(SELECT 1 FROM model_invocations WHERE session_id=?1 AND admission_status='admitted' AND status IN ('running','cancellation_requested') AND purpose NOT IN (SELECT value FROM json_each(?2))
+                        AND id NOT IN (SELECT value FROM json_each(?3)))",
+                params![
+                    id.to_string(),
+                    rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array(),
+                    crate::model_control::call_control::capacity_released_ids_json()
+                ],
+                |r| r.get(0))?;
             if counted {
                 active = active.saturating_sub(1);
                 if existing_provider == Some(provider) {
@@ -1224,14 +1312,15 @@ impl Store {
                 }
             }
         }
-        if active >= u64::from(grant.policy.max_active_sessions) {
+        if enforce_concurrency && active >= u64::from(grant.policy.max_active_sessions) {
             return Err(refused("manager_v2_concurrency_capacity"));
         }
-        if grant
-            .policy
-            .provider_limits
-            .iter()
-            .any(|p| p.provider == provider && provider_active >= u64::from(p.max_active))
+        if enforce_concurrency
+            && grant
+                .policy
+                .provider_limits
+                .iter()
+                .any(|p| p.provider == provider && provider_active >= u64::from(p.max_active))
         {
             return Err(refused("manager_v2_provider_capacity"));
         }
@@ -1266,6 +1355,15 @@ impl Store {
         session_id: Uuid,
         provider: SessionProvider,
     ) -> Result<()> {
+        self.manager_v2_resource_gate_for_session_scoped(session_id, provider, true)
+    }
+
+    pub(crate) fn manager_v2_resource_gate_for_session_scoped(
+        &self,
+        session_id: Uuid,
+        provider: SessionProvider,
+        enforce_concurrency: bool,
+    ) -> Result<()> {
         let Some(session) = self.get_session(session_id)? else {
             return Ok(());
         };
@@ -1283,12 +1381,24 @@ impl Store {
         }
         let cohort = self.manager_v2_cohort(&config)?;
         if let Some(member) = cohort.iter().find(|m| m.session.id == session_id) {
-            self.manager_v2_resource_gate(&config, member.epic_id, provider, Some(session_id))?;
+            self.manager_v2_resource_gate_scoped(
+                &config,
+                member.epic_id,
+                provider,
+                Some(session_id),
+                enforce_concurrency,
+            )?;
         } else if let Some((_, epic)) = self
             .manager_v2_resource_reservations(&config, &cohort)?
             .get(&session_id)
         {
-            self.manager_v2_resource_gate(&config, *epic, provider, Some(session_id))?;
+            self.manager_v2_resource_gate_scoped(
+                &config,
+                *epic,
+                provider,
+                Some(session_id),
+                enforce_concurrency,
+            )?;
         } else if let Some(parent) = session.parent_id
             && let Some((_, epic)) = self.manager_v2_launch_parent_scope(
                 parent,
@@ -1296,7 +1406,13 @@ impl Store {
                 session.session_kind,
             )?
         {
-            self.manager_v2_resource_gate(&config, epic, provider, Some(session_id))?;
+            self.manager_v2_resource_gate_scoped(
+                &config,
+                epic,
+                provider,
+                Some(session_id),
+                enforce_concurrency,
+            )?;
         }
         Ok(())
     }

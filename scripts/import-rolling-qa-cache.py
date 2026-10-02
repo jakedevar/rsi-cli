@@ -23,6 +23,8 @@ LANES = {"integrations", "bins", "rsid-doc", "rsi", "rsi-common"}
 OID = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 TEST_NAME = re.compile(r"[A-Za-z0-9_:.-]+\Z")
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+TMPDIR_CLASSES = {"tmpfs", "disk"}
 
 
 class CacheConflict(ValueError):
@@ -52,6 +54,36 @@ def load_report(path):
     if provenance.get("kind") != "qa_sweep" or not provenance.get("runner") or not provenance.get("report_ref"):
         raise ValueError("QA report needs sweep provenance")
     return report
+
+
+def shard_env_class(spec_env, tmpdir_class):
+    """Mirror of rsi-rolling-land `shard_env_class` (#988): every spec env
+    entry except TMPDIR in key order, then the TMPDIR filesystem class."""
+    canonical = "".join(f"{key}={value}\n" for key, value in sorted(spec_env.items()) if key != "TMPDIR")
+    canonical += f"TMPDIR={tmpdir_class}\n"
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def shard_cache_key(fingerprint, env_class):
+    """Mirror of rsi-rolling-land `shard_cache_key`: the shard fingerprint
+    folded with the environment class, as the lander looks base entries up."""
+    return "sha256:" + hashlib.sha256(f"{fingerprint}\n{env_class}".encode()).hexdigest()
+
+
+def recorded_env_class(row, shard):
+    """The environment class a shard ran under, or None when the report
+    predates environment recording (#994) and cannot match any lander key."""
+    environment = row.get("environment")
+    if environment is None:
+        return None
+    spec_env = environment.get("spec_env") if isinstance(environment, dict) else None
+    tmpdir_class = environment.get("tmpdir_class") if isinstance(environment, dict) else None
+    if (not isinstance(spec_env, dict) or tmpdir_class not in TMPDIR_CLASSES
+            or any(not isinstance(key, str) or not ENV_KEY.fullmatch(key)
+                   or not isinstance(value, str) or "\n" in value
+                   for key, value in spec_env.items())):
+        raise ValueError(f"invalid QA environment for {shard}")
+    return shard_env_class(spec_env, tmpdir_class)
 
 
 def local_fingerprint(sha, shard, jobs):
@@ -111,14 +143,18 @@ def import_report(path, root=None):
             raise ValueError(f"QA host class does not match this host for {shard}")
         if local != fingerprint:
             raise ValueError(f"QA runner/toolchain fingerprint does not match this host for {shard}")
-        prepared.append((shard, digest, sorted(names)))
-    for shard, digest, failures in prepared:
-        directory = root / tip / digest
+        env_class = recorded_env_class(row, shard)
+        if env_class is None:
+            results.append((shard, "environment_unrecorded"))
+            continue
+        prepared.append((shard, shard_cache_key("sha256:" + digest, env_class), sorted(names)))
+    for shard, key, failures in prepared:
+        directory = root / tip / key.removeprefix("sha256:")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = directory / f"{shard}.json"
         entry = {
             "schema_version": 1, "rolling_sha": tip, "shard": shard,
-            "fingerprint": "sha256:" + digest, "failures": failures, "provenance": source,
+            "fingerprint": key, "failures": failures, "provenance": source,
         }
         with (directory / f"{shard}.lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

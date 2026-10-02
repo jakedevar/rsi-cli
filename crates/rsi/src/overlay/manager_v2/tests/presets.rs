@@ -139,6 +139,33 @@ async fn active_session_limit_is_top_level_and_keyboard_save_uses_edited_value()
 }
 
 #[tokio::test]
+async fn tier2_reviewer_minimum_is_visible_and_saved_in_policy_request() {
+    let (mut app, config) = fixture();
+    let (_dir, task) = connect(
+        &mut app,
+        vec![("GetHarnessManagerPolicy", json!({"result":null}))],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    let state = policy_mut(&mut app);
+    assert!(
+        state
+            .rows()
+            .iter()
+            .any(|row| { row.field == policy::Field::Tier2Reviewer && row.value == "Standard" })
+    );
+    state.activate(policy::Field::Tier2Reviewer);
+    assert_eq!(
+        state.request().policy.minimum_tier2_reviewer_tier,
+        rsi_common::model_control::ModelTier::Premium
+    );
+    let requests = finish(task).await;
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
 async fn presets_only_change_draft_and_one_save_adopts_the_actual_reply() {
     let (mut app, config) = fixture();
     app.selected_model = Some("retained-global-selection".into());
@@ -1108,4 +1135,182 @@ async fn toggling_operator_delegation_on_custom_draft_saves_it() {
         "{}",
         state.notice
     );
+}
+
+/// #1043: `StorageControl` is an operator-toggled row, off by default, and one
+/// save stores it under its snake_case wire name.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn toggling_storage_control_on_custom_draft_saves_it() {
+    let (mut app, config) = fixture();
+    let mut saved = policy_config(&config);
+    saved.policy.mode = ManagerOperatingModeV2::Execute;
+    saved.policy.capabilities = vec![ManagerCapabilityV2::WorkPlan];
+    let mut reply = saved.clone();
+    reply.row_version += 1;
+    reply
+        .policy
+        .capabilities
+        .push(ManagerCapabilityV2::StorageControl);
+    let (_dir, task) = connect(
+        &mut app,
+        vec![
+            ("GetHarnessManagerPolicy", json!({"result":saved})),
+            ("ConfigureHarnessManagerPolicy", json!({"result":reply})),
+        ],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    let field = policy::Field::Capability(12);
+    let row = policy_mut(&mut app)
+        .rows()
+        .into_iter()
+        .find(|r| r.field == field)
+        .unwrap();
+    assert_eq!(row.value, "false");
+    activate(&mut app, field).await;
+    let text = screen(&mut app);
+    assert!(
+        text.contains("Grant Storage control: true (saved false)"),
+        "{text}"
+    );
+    key(&mut app, KeyCode::Char('s')).await;
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[1]["params"]["policy"]["capabilities"],
+        json!(["work_plan", "storage_control"])
+    );
+    assert_eq!(policy_mut(&mut app).draft, reply.policy);
+}
+
+/// #1046: `DaemonSettings` is an operator-toggled row, off by default, and the
+/// per-key bounds save with the policy under their wire names.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn daemon_settings_grant_and_bounds_save_with_the_policy() {
+    let (mut app, config) = fixture();
+    let mut saved = policy_config(&config);
+    saved.policy.mode = ManagerOperatingModeV2::Execute;
+    saved.policy.capabilities = vec![ManagerCapabilityV2::WorkPlan];
+    let mut reply = saved.clone();
+    reply.row_version += 1;
+    reply
+        .policy
+        .capabilities
+        .push(ManagerCapabilityV2::DaemonSettings);
+    reply.policy.daemon_setting_bounds = vec![
+        rsi_common::manager_daemon_settings::ManagerDaemonSettingBoundV2 {
+            key: "sandbox_max_source_roots".into(),
+            min: 4096,
+            max: 32768,
+        },
+    ];
+    let (_dir, task) = connect(
+        &mut app,
+        vec![
+            ("GetHarnessManagerPolicy", json!({"result":saved})),
+            ("ConfigureHarnessManagerPolicy", json!({"result":reply})),
+        ],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    let field = policy::Field::Capability(13);
+    let row = policy_mut(&mut app)
+        .rows()
+        .into_iter()
+        .find(|r| r.field == field)
+        .unwrap();
+    assert_eq!(row.label, "Grant Daemon settings");
+    assert_eq!(row.value, "false");
+    // Default: no allowlisted key is adjustable.
+    let bound = policy::Field::SettingBound(0);
+    let row = policy_mut(&mut app)
+        .rows()
+        .into_iter()
+        .find(|r| r.field == bound)
+        .unwrap();
+    assert_eq!(row.label, "Manager may set Maximum sandbox roots");
+    assert_eq!(row.value, "not adjustable");
+    activate(&mut app, field).await;
+    // Bounds outside the daemon's hard range are refused with the range.
+    let error = policy_mut(&mut app)
+        .apply_text(bound, "0-70000")
+        .unwrap_err();
+    assert!(error.contains("1-65536"), "{error}");
+    policy_mut(&mut app)
+        .apply_text(bound, "4096-32768")
+        .unwrap();
+    let row = policy_mut(&mut app)
+        .rows()
+        .into_iter()
+        .find(|r| r.field == bound)
+        .unwrap();
+    assert_eq!(row.value, "4096-32768");
+    assert!(row.modified);
+    assert_eq!(row.saved.as_deref(), Some("not adjustable"));
+    key(&mut app, KeyCode::Char('s')).await;
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[1]["params"]["policy"]["capabilities"],
+        json!(["work_plan", "daemon_settings"])
+    );
+    assert_eq!(
+        requests[1]["params"]["policy"]["daemon_setting_bounds"],
+        json!([{"key":"sandbox_max_source_roots","min":4096,"max":32768}])
+    );
+    // Blank returns a key to not adjustable.
+    policy_mut(&mut app).apply_text(bound, "").unwrap();
+    assert!(policy_mut(&mut app).draft.daemon_setting_bounds.is_empty());
+}
+
+/// #1045: `Deploy` is an operator-toggled row, off by default, and one
+/// save stores it under its snake_case wire name.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn toggling_deploy_on_custom_draft_saves_it() {
+    let (mut app, config) = fixture();
+    let mut saved = policy_config(&config);
+    saved.policy.mode = ManagerOperatingModeV2::Execute;
+    saved.policy.capabilities = vec![ManagerCapabilityV2::WorkPlan];
+    let mut reply = saved.clone();
+    reply.row_version += 1;
+    reply
+        .policy
+        .capabilities
+        .push(ManagerCapabilityV2::Deploy);
+    let (_dir, task) = connect(
+        &mut app,
+        vec![
+            ("GetHarnessManagerPolicy", json!({"result":saved})),
+            ("ConfigureHarnessManagerPolicy", json!({"result":reply})),
+        ],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    let field = policy::Field::Capability(14);
+    let row = policy_mut(&mut app)
+        .rows()
+        .into_iter()
+        .find(|r| r.field == field)
+        .unwrap();
+    assert_eq!(row.value, "false");
+    activate(&mut app, field).await;
+    let text = screen(&mut app);
+    assert!(
+        text.contains("Grant Deploy: true (saved false)"),
+        "{text}"
+    );
+    key(&mut app, KeyCode::Char('s')).await;
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[1]["params"]["policy"]["capabilities"],
+        json!(["work_plan", "deploy"])
+    );
+    assert_eq!(policy_mut(&mut app).draft, reply.policy);
 }

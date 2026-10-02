@@ -55,6 +55,32 @@ class SourceInventoryTests(unittest.TestCase):
             ["git", *args], cwd=self.root, check=True, capture_output=True, text=True
         )
 
+    def test_tests_gated_to_another_os_are_runtime_conditional_on_this_host(self) -> None:
+        gate = '#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]'
+        (self.source / "lib.rs").write_text(
+            '#[cfg(target_os = "linux")]\nmod gated_file;\n'
+            + f'#[cfg(target_os = "linux")]\n{gate}\n#[test]\nfn item_linux() {{}}\n'
+            + f'#[cfg(target_os = "macos")]\n{gate}\n#[test]\nfn item_macos() {{}}\n'
+            + f'#[cfg(not(target_os = "macos"))]\n{gate}\n#[test]\nfn item_not_macos() {{}}\n'
+            + f'#[cfg(all(test, target_os = "linux"))]\nmod tests {{\n    {gate}\n    #[test]\n    fn inline_linux() {{}}\n}}\n'
+            + source_test("everywhere")
+        )
+        (self.source / "gated_file.rs").write_text(source_test("module_linux"))
+        (self.source / "inner.rs").write_text(
+            '#![cfg(target_os = "linux")]\n' + source_test("inner_linux")
+        )
+        with mock.patch.object(checker, "HOST_TARGET_OS", "macos"), mock.patch.object(
+            checker, "PLATFORM_CONDITIONAL_NAMES", {}
+        ):
+            manifest, _ = checker.source_inventory(checker.read_shards(), True)
+            conditional = set(checker.PLATFORM_CONDITIONAL_NAMES["store-01"])
+        self.assertEqual(
+            conditional,
+            {"item_linux", "item_not_macos", "inline_linux", "module_linux", "inner_linux"},
+        )
+        self.assertIn(("crates/rsid/src/lib.rs", "item_macos"), manifest)
+        self.assertIn(("crates/rsid/src/lib.rs", "everywhere"), manifest)
+
     def test_two_branches_add_tests_to_same_shard_and_merge_cleanly(self) -> None:
         self.git("init", "-q")
         self.git("config", "user.name", "Shard fixture")

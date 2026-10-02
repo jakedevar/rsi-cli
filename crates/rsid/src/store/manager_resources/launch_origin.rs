@@ -226,11 +226,14 @@ pub(super) fn validate_root_choice(
             | SessionProvider::Pioneer
             | SessionProvider::OpenRouter
             | SessionProvider::Bedrock => {
-                crate::codex::codex_reasoning_effort(Some(effort)).is_some()
+                crate::store_support::provider_defaults::codex_reasoning_effort(Some(effort))
+                    .is_some()
                     && rsi_common::model_utils::known_codex_effort_ladder(&choice.model)
                         .is_none_or(|ladder| ladder.contains(&effort))
             }
-            SessionProvider::Claude => crate::claude::claude_effort_level(Some(effort)).is_some(),
+            SessionProvider::Claude => {
+                crate::store_support::provider_defaults::claude_effort_level(Some(effort)).is_some()
+            }
             // These engines do not send LaunchConfig.effort to their backend.
             // Refuse an explicit value instead of recording a silently ignored choice.
             SessionProvider::Local | SessionProvider::Antigravity => false,
@@ -244,7 +247,8 @@ pub(super) fn validate_root_choice(
                     && if crate::session::harness::providers::anthropic::uses_adaptive_thinking(
                         &choice.model,
                     ) {
-                        crate::claude::claude_effort_level(Some(effort)).is_some()
+                        crate::store_support::provider_defaults::claude_effort_level(Some(effort))
+                            .is_some()
                     } else {
                         matches!(effort, "low" | "medium" | "high")
                     }

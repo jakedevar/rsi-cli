@@ -77,6 +77,32 @@ pub fn claude_catalog_context_window(model_id: &str) -> Option<u64> {
     claude_model_spec(model_id).map(|spec| spec.context_window)
 }
 
+/// Models the Claude CLI does not recognize under their bare id (it logs
+/// `unrecognized_model` and sizes the session at 200K without compacting) but
+/// accepts with the `[1m]` variant tag, reporting `contextWindow: 1000000`
+/// (`[observed]` against `claude 2.1.283`, #1038: `claude-sonnet-5-5` reports
+/// 200000, `claude-sonnet-5-5[1m]` reports 1000000). RSI launches these with the
+/// tag so the window it records (1M) is the window the session really has.
+///
+/// Remove an entry once a CLI that recognizes the bare id is the minimum.
+pub const CLAUDE_ONE_MILLION_VARIANT_LAUNCH_MODELS: &[&str] = &["claude-sonnet-5-5"];
+
+/// The id to pass to `claude --model` for the operator-chosen `model_id`.
+///
+/// Identity for everything except the bare ids in
+/// [`CLAUDE_ONE_MILLION_VARIANT_LAUNCH_MODELS`], which gain the `[1m]` tag.
+/// Ids that already carry a variant tag are left alone.
+pub fn claude_launch_model(model_id: &str) -> std::borrow::Cow<'_, str> {
+    if CLAUDE_ONE_MILLION_VARIANT_LAUNCH_MODELS
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(model_id))
+    {
+        std::borrow::Cow::Owned(format!("{model_id}[1m]"))
+    } else {
+        std::borrow::Cow::Borrowed(model_id)
+    }
+}
+
 /// Strips a single trailing bracketed context-variant tag from a model id.
 ///
 /// The Claude CLI reports the *variant-suffixed* form of the model back to the
@@ -94,10 +120,10 @@ pub fn claude_catalog_context_window(model_id: &str) -> Option<u64> {
 /// so a future `[200k]` or any other variant tag normalizes the same way
 /// without another edit here.
 ///
-/// This deliberately answers only the *window* question. The variant tag is
-/// still what the CLI calls the model, so the stored `session.model` keeps it;
-/// normalizing the persisted identity is entangled with effort-ladder and
-/// abbreviation logic and is tracked separately as P2-MODELID.
+/// The window lookup strips it, and so does the persisted identity (#273):
+/// `authoritative_model_update` stores the stripped id, so `session.model`
+/// always names a catalog entry. The 1M variant is recorded by the reported
+/// `contextWindow`, not by the id (the window is environment-dependent).
 pub fn strip_context_variant_suffix(model_id: &str) -> &str {
     let Some(stripped) = model_id.strip_suffix(']') else {
         return model_id;
@@ -117,6 +143,29 @@ pub fn strip_context_variant_suffix(model_id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrecognized_one_million_model_launches_with_variant_tag() {
+        assert_eq!(
+            claude_launch_model("claude-sonnet-5-5"),
+            "claude-sonnet-5-5[1m]"
+        );
+        // Already tagged, recognized, and unrelated ids pass through untouched.
+        assert_eq!(
+            claude_launch_model("claude-sonnet-5-5[1m]"),
+            "claude-sonnet-5-5[1m]"
+        );
+        assert_eq!(claude_launch_model("claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(
+            claude_launch_model("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
+        // The tagged id resolves to the same window as the bare one.
+        assert_eq!(
+            strip_context_variant_suffix(&claude_launch_model("claude-sonnet-5-5")),
+            "claude-sonnet-5-5"
+        );
+    }
 
     #[test]
     fn catalog_and_menu_are_the_same_list() {

@@ -108,6 +108,10 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("session_retention_window_hours", LIVE),
     // S-038, verify-settings-page.md.
     page("retry_enabled", LIVE),
+    // #925: the hub poller reads the runtime atomic on every registry tick
+    // (rsid satellite/hub.rs `run_hub_poller`), so a flip takes effect without
+    // a daemon restart.
+    page("satellite_polling_enabled", LIVE),
     // Not applied: rsid session/retry_policy.rs:14-18 `kind_default_max_retries`
     // returns 0 for every SessionKind, and `effective_default` (:28-34) reads
     // this field and discards it. Default launches get zero automatic retries
@@ -128,8 +132,10 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("context_rotation_claude_pct", LIVE),
     page("context_rotation_codex_pct", LIVE),
     page("completed_transcript_cache_max_bytes", LIVE),
-    // S-044.
-    page("memory_enabled", DaemonRestart),
+    // S-044: OFF is read per memory operation (rsid memory/worker.rs
+    // `MemoryWorkContext::check`, `ObservationSubmission::submit`); the worker
+    // is only started at boot when enabled, so ON needs a restart.
+    page("memory_enabled", LiveOffRestartOn),
     // Epic L CG-S3: the indexer shares the runtime `Arc<AtomicBool>` (rsid
     // codegraph/runtime.rs:482) and reads it per indexing pass.
     page("codegraph_indexing_enabled", LIVE),
@@ -207,6 +213,19 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("topology_bulk_fanout_min_openrouter", LIVE),
     // rsid store/model_control.rs:4678 reads the ceiling per admission.
     page("orchestration_max_child_effort", LIVE),
+    // Issue #692: read per launch by rsid session/launch.rs (the single launch
+    // chokepoint; the effective model, defaults applied, is checked before any
+    // side effect), the continuation/rotation preflights and the AgentSpawnChild
+    // pre-check. Edited by the TUI command `:launch-allow`, which writes it
+    // through `update_daemon_config`.
+    DaemonFieldSpec {
+        field: crate::launch_allowlist::LAUNCH_MODEL_ALLOWLIST_FIELD,
+        apply: LIVE,
+        operator_surface: OperatorSurface::Elsewhere {
+            surface: ":launch-allow command",
+            writer: "action_handler/daemon_config.rs",
+        },
+    },
     // S-052, S-054 .. S-058.
     page("sandbox_build_cache_reclaim_enabled", LIVE),
     page("sandbox_build_cache_reclaim_ttl_secs", LIVE),
@@ -214,6 +233,43 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("sandbox_build_cache_reclaim_high_watermark_pct", LIVE),
     page("sandbox_build_cache_reclaim_low_watermark_pct", LIVE),
     page("sandbox_build_cache_reclaim_max_candidates", LIVE),
+    page("sandbox_max_source_roots", LIVE),
+    page("sandbox_min_free_gib", LIVE),
+    // Issue #955: the purge worker reads the toggle at every 10-minute tick.
+    page("archived_sandbox_purge_enabled", LIVE),
+    // Issue #1007: the queue runner reads the toggle at every tick; batch size
+    // and speculation depth are read when a batch is formed.
+    page("rolling_queue_enabled", LIVE),
+    page("rolling_queue_batch_size", LIVE),
+    page("rolling_queue_speculation_depth", LIVE),
+    // Issue #1073: the deploy loop reads the toggle at every 5 s poll.
+    page("deploy_drain_enabled", LIVE),
+    // Issue #794 S3: the scheduler reads these settings on every tick.
+    page("program_hold_while_children_run", LIVE),
+    page("child_keepalive_enabled", LIVE),
+    page("child_keepalive_window_secs", LIVE),
+    // #1014: rsid governor.rs reads the policy per admission.
+    page("governor_build_slots", LIVE),
+    page("governor_lander_slots", LIVE),
+    page("governor_max_load", LIVE),
+    page("governor_min_free_disk_gb", LIVE),
+    page("governor_min_avail_mem_gb", LIVE),
+    page("governor_max_workers_slice_gb", LIVE),
+    // Issue #792: read when a Harness session launches (its policy is fixed
+    // at launch), so a change reaches the next Harness launch.
+    page("harness_web_access", NextSpawn),
+    page("harness_egress_mode", NextSpawn),
+    page("harness_max_search_calls", NextSpawn),
+    page("harness_max_fetch_calls", NextSpawn),
+    page("harness_max_result_bytes", NextSpawn),
+    page("harness_max_web_cost_usd_micros", NextSpawn),
+    page("completion_gates_enabled", NextSpawn),
+    // #788 slice 4: fixed for the session when its MCP bridge is built.
+    page("mcp.deferred_tool_threshold", NextSpawn),
+    // #1036: scripts/cloud-spend.py reads the mirrored caps file at every
+    // remote run start, so a change reaches the next run.
+    page("cloud_spend_stop_line_usd", LIVE),
+    page("cloud_spend_daily_cap_usd", LIVE),
     page("agent_build_jobs", NextSpawn),
     page("agent_build_line_tables_only", NextSpawn),
     page("agent_build_sccache_enabled", NextSpawn),
@@ -232,9 +288,14 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("worker_scope_cpu_weight", DaemonRestart),
     page("vault.env_compat", LIVE),
     page("vault.check_ttl_secs", LIVE),
-    // #694: dispatch reads these when an OpenRouter session starts.
+    // #694: dispatch reads these when a provider session starts.
     page("api_route.openrouter", NextSpawn),
+    page("api_route.bedrock", NextSpawn),
     page("api_route.fallback", NextSpawn),
+    // #966: the Codex CLI launch and the Harness launch read it per turn.
+    page("openrouter_context_budget_tokens", NextSpawn),
+    // #1050: the Harness turn reads the iteration cap when it starts.
+    page("harness_max_iterations_per_turn", NextSpawn),
 ];
 
 /// The catalog entry for `field`, if any.
@@ -271,6 +332,17 @@ mod tests {
         assert_eq!(
             daemon_field_spec("dream_idle_secs").map(|spec| spec.apply),
             Some(ApplyClass::Live)
+        );
+    }
+
+    #[test]
+    fn memory_enabled_applies_off_live_and_on_after_restart() {
+        // Turning Memory off gates the worker and drops queued observations
+        // while the daemon runs; turning it on needs a restart when no
+        // memory worker was started at boot.
+        assert_eq!(
+            daemon_field_spec("memory_enabled").map(|spec| spec.apply),
+            Some(ApplyClass::LiveOffRestartOn)
         );
     }
 }

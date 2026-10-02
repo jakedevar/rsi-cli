@@ -49,9 +49,10 @@ fn parse_empty(method: &str, params: &serde_json::Value) -> Result<()> {
 fn vault_error(error: VaultError) -> DaemonError {
     match error {
         VaultError::Store(error) => DaemonError::Store(format!("key vault: {error}")),
-        error @ (VaultError::InvalidSecret(_) | VaultError::NothingToRotate(_)) => {
-            DaemonError::InvalidParam(error.to_string())
-        }
+        error @ (VaultError::InvalidSecret(_)
+        | VaultError::InvalidMcpId
+        | VaultError::NothingToRotateMcp
+        | VaultError::NothingToRotate(_)) => DaemonError::InvalidParam(error.to_string()),
     }
 }
 

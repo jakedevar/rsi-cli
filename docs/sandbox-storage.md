@@ -110,6 +110,16 @@ The Sandbox storage row has five process-local states:
 - `Error: <message>` reports failure and, when known, only the time of the last
   success; it does not present old counts as current.
 
+Under disk pressure the appointed manager can use the same status and reclaim
+instead of removing caches by hand, when the operator grants it `StorageControl`
+in the manager policy (`:manager policy`, "Grant Storage control"; off by
+default). The manager calls `GetSandboxStorageStatus` or
+`RunSandboxBuildCacheReclaim` (`{"dry_run": true|false}`) through
+`AgentManagerControl` `operator_call`; both need Execute mode and an unpaused
+policy, run under the configured watermarks and limits, and are journaled like
+other delegated manager actions. Daemon storage settings remain operator-only.
+See `docs/harness-manager.md`, Operator delegation.
+
 Generations fence completions, so an older automatic preview cannot overwrite a
 newer operator action or its post-action result. These states and observation
 times are not persisted and introduce no daemon cache or wire contract. Every

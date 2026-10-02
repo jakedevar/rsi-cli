@@ -29,6 +29,8 @@ pub enum ActionId {
     SettingsAdd,
     SettingsDelete,
     SettingsEnable,
+    SettingsMoveColumnUp,
+    SettingsMoveColumnDown,
     SettingsRefresh,
     ProviderKeySet,
     ProviderKeyRotate,
@@ -91,6 +93,8 @@ pub enum ActionId {
     ScheduleArmDelete,
     ScheduleDelete,
     ScheduleRefresh,
+    ScheduleToggleHistory,
+    ScheduleLoadMore,
     ThemeRoleCommit,
     ThemeRoleReset,
     InterruptSession,
@@ -274,6 +278,7 @@ pub enum AvailabilitySelector {
     SettingsAdd,
     SettingsDelete,
     SettingsEnable,
+    SettingsMoveColumn,
     SettingsRefresh,
     ProviderKeys,
     Navigation,
@@ -338,7 +343,6 @@ pub enum HelpOrigin {
     SessionList,
     SessionDetail,
     PromptCreator,
-    PromptEntry,
     InputOverlay,
     /// An overlay state with no discovery catalog route; the exemption names
     /// why and where its keys are documented.
@@ -363,7 +367,6 @@ impl HelpOrigin {
             Self::SessionList => "Session List",
             Self::SessionDetail => "Session Detail",
             Self::PromptCreator => "Prompt Creator",
-            Self::PromptEntry => "Session Prompt",
             Self::InputOverlay => "Input Overlay",
             Self::OverlayExempt(_) => "Active Overlay",
             Self::SettingsCategories => "Settings / Categories",
@@ -454,6 +457,8 @@ pub struct ActionContext {
     pub active_tab_index: usize,
     pub project_id: Option<Uuid>,
     pub session_list_zone: Option<SessionListZone>,
+    /// Focused detail has empty normal-mode input and a selected list row.
+    pub session_detail_actions_available: bool,
     pub hierarchy_descended: bool,
     pub help_search_active: bool,
     pub role_editor_text_entry: bool,
@@ -510,6 +515,7 @@ impl Default for ActionContext {
             active_tab_index: 0,
             project_id: None,
             session_list_zone: None,
+            session_detail_actions_available: false,
             hierarchy_descended: false,
             help_search_active: false,
             role_editor_text_entry: false,
@@ -647,6 +653,10 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.exists = index < 2;
             facts.editable = facts.exists;
         }
+        SettingsSection::Satellites => {
+            facts.exists = index < 2;
+            facts.editable = facts.exists;
+        }
         SettingsSection::SystemPrompt => {
             facts.exists = index == 0;
             facts.editable = facts.exists && app.authoritative_config_ready();
@@ -670,6 +680,15 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.exists = index < count;
             facts.editable = facts.exists || (index == 0 && count == 0);
             facts.deletable = facts.exists;
+        }
+        SettingsSection::McpServers => {
+            let count = app
+                .cached_mcp_servers
+                .as_ref()
+                .map_or(0, |list| list.servers.len());
+            facts.exists = index < count;
+            facts.editable = facts.exists || (index == 0 && count == 0);
+            facts.enableable = facts.exists;
         }
         SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
@@ -792,12 +811,28 @@ impl ActionContext {
             Some(Pane::SessionDetail { session_id }) => {
                 context.origin = HelpOrigin::SessionDetail;
                 context.focus = ActionFocus::SessionDetail;
-                if app.sessions.get(session_id).is_some_and(|state| {
-                    state.input_bar.surface.mode == crate::types::PopupMode::Insert
-                }) {
+                let input_is_empty_normal = app.sessions.get(session_id).is_some_and(|state| {
+                    state.input_bar.surface.mode == crate::types::PopupMode::Normal
+                        && !state.input_bar.surface.has_content()
+                });
+                let selected_list_id = app.selected_session_id_from_list();
+                context.session_detail_actions_available = input_is_empty_normal
+                    && context.mode == ActionMode::Normal
+                    && selected_list_id.is_some();
+                if !input_is_empty_normal
+                    && app.sessions.get(session_id).is_some_and(|state| {
+                        state.input_bar.surface.mode == crate::types::PopupMode::Insert
+                    })
+                {
                     context.mode = ActionMode::Text;
                 }
-                populate_session_selection(&mut context, app, *session_id);
+                if let Some(selected_id) =
+                    selected_list_id.filter(|_| context.session_detail_actions_available)
+                {
+                    populate_session_selection(&mut context, app, selected_id);
+                } else {
+                    populate_session_selection(&mut context, app, *session_id);
+                }
             }
             Some(Pane::Settings) => {
                 let facts = settings_row_facts(app);
@@ -985,8 +1020,13 @@ impl ActionContext {
                 context.mode = ActionMode::Text;
                 context.overlay_blocks_normal_actions = true;
             }
-            Some(OverlayState::Prompt { surface, .. }) => {
-                context.origin = HelpOrigin::PromptEntry;
+            Some(OverlayState::Prompt {
+                surface,
+                purpose,
+                launch,
+                ..
+            }) => {
+                context.origin = HelpOrigin::OverlayClass(prompt_help_class(purpose, launch.open));
                 context.overlay_blocks_normal_actions = true;
                 if surface.mode == crate::types::PopupMode::Insert {
                     context.mode = ActionMode::Text;
@@ -1101,6 +1141,8 @@ const SETTINGS_TOGGLE: &[ActionBinding] = &[binding("Space", ActionRoute::Settin
 const SETTINGS_ADD: &[ActionBinding] = &[binding("a", ActionRoute::Settings)];
 const SETTINGS_DELETE_ITEM: &[ActionBinding] = &[binding("d", ActionRoute::Settings)];
 const SETTINGS_ENABLE: &[ActionBinding] = &[binding("e", ActionRoute::Settings)];
+const SETTINGS_MOVE_COLUMN_UP: &[ActionBinding] = &[binding("K", ActionRoute::Settings)];
+const SETTINGS_MOVE_COLUMN_DOWN: &[ActionBinding] = &[binding("J", ActionRoute::Settings)];
 const SETTINGS_REFRESH: &[ActionBinding] = &[binding("R", ActionRoute::Settings)];
 const PROVIDER_KEY_SET: &[ActionBinding] = &[binding("s", ActionRoute::Settings)];
 const PROVIDER_KEY_ROTATE: &[ActionBinding] = &[binding("r", ActionRoute::Settings)];
@@ -1286,6 +1328,8 @@ const SCHEDULE_TRIGGER: &[ActionBinding] = &[binding("t", ActionRoute::ScheduleB
 const SCHEDULE_ARM_DELETE: &[ActionBinding] = &[binding("d", ActionRoute::ScheduleBrowser)];
 const SCHEDULE_DELETE: &[ActionBinding] = &[binding("dd", ActionRoute::ScheduleBrowser)];
 const SCHEDULE_REFRESH: &[ActionBinding] = &[binding("r", ActionRoute::ScheduleBrowser)];
+const SCHEDULE_TOGGLE_HISTORY: &[ActionBinding] = &[binding("H", ActionRoute::ScheduleBrowser)];
+const SCHEDULE_LOAD_MORE: &[ActionBinding] = &[binding("m", ActionRoute::ScheduleBrowser)];
 const EDITOR_COMMIT: &[ActionBinding] = &[binding("Enter", ActionRoute::ThemeRoleEditor)];
 const EDITOR_RESET: &[ActionBinding] = &[binding("Delete", ActionRoute::ThemeRoleEditor)];
 const CLOSE: &[ActionBinding] = &[
@@ -1625,8 +1669,8 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     },
     ActionDescriptor {
         id: ActionId::HardInterruptSession,
-        label: "Hard interrupt running session",
-        summary: "Immediately interrupts the selected session and marks it HARD; only the operator may clear it.",
+        label: "INTERRUPT NOW",
+        summary: "Press twice within five seconds to cancel the active turn and mark it HARD.",
         category: "SESSION",
         bindings: NORMAL_HARD_INTERRUPT,
         command_aliases: &[],
@@ -1797,6 +1841,28 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::SettingsEnable,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::SettingsMoveColumnUp,
+        label: "Move navigator column earlier",
+        summary: "Moves the selected optional navigator column one place left; the order is saved per navigator preset.",
+        category: "SETTINGS",
+        bindings: SETTINGS_MOVE_COLUMN_UP,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::SettingsMoveColumn,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::SettingsMoveColumnDown,
+        label: "Move navigator column later",
+        summary: "Moves the selected optional navigator column one place right; the order is saved per navigator preset.",
+        category: "SETTINGS",
+        bindings: SETTINGS_MOVE_COLUMN_DOWN,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::SettingsMoveColumn,
         show_in_help: true,
     },
     ActionDescriptor {
@@ -2335,6 +2401,28 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         summary: "Re-reads the scheduled jobs from the daemon.",
         category: "SCHEDULED JOBS",
         bindings: SCHEDULE_REFRESH,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Connected,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ScheduleToggleHistory,
+        label: "Toggle scheduled job history",
+        summary: "Switches between active jobs and every job including old disabled history.",
+        category: "SCHEDULED JOBS",
+        bindings: SCHEDULE_TOGGLE_HISTORY,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Connected,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ScheduleLoadMore,
+        label: "Load more scheduled jobs",
+        summary: "Loads the next page of scheduled jobs from the daemon.",
+        category: "SCHEDULED JOBS",
+        bindings: SCHEDULE_LOAD_MORE,
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Connected,
@@ -3450,6 +3538,11 @@ fn materialize(context: &ActionContext, id: ActionId) -> ActionRequest {
     ActionRequest { id, payload }
 }
 
+fn session_list_action_surface(context: &ActionContext) -> bool {
+    context.surface == ActionSurface::SessionList
+        || (context.origin == HelpOrigin::SessionDetail && context.session_detail_actions_available)
+}
+
 pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> ActionAvailability {
     use AvailabilitySelector::*;
     let available = match descriptor.availability {
@@ -3481,7 +3574,7 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
             _ => false,
         },
         ContinueSessionMutation => {
-            context.surface == ActionSurface::SessionList
+            session_list_action_surface(context)
                 && context.mode == ActionMode::Normal
                 && context.operator
                 && context.connected
@@ -3499,7 +3592,7 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 )
         }
         RunningLeafSessionMutation => {
-            context.surface == ActionSurface::SessionList
+            session_list_action_surface(context)
                 && context.mode == ActionMode::Normal
                 && context.operator
                 && context.connected
@@ -3731,6 +3824,10 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 || (context.surface == ActionSurface::SessionList
                     && context.mode == ActionMode::Normal
                     && context.has_selection)
+                || (context.origin == HelpOrigin::SessionDetail
+                    && context.session_detail_actions_available
+                    && context.mode == ActionMode::Normal
+                    && context.has_selection)
         }
         SettingsCategories => {
             context.surface == ActionSurface::Settings
@@ -3773,6 +3870,13 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 && context.settings_focus == SettingsFocus::Items
                 && context.settings_row_enableable
                 && context.settings_category == SettingsSection::ClaudeSkills
+        }
+        SettingsMoveColumn => {
+            context.surface == ActionSurface::Settings
+                && context.settings_focus == SettingsFocus::Items
+                && context.settings_category == SettingsSection::SessionList
+                && (1..=crate::types::NavigatorOptionalColumn::ALL.len())
+                    .contains(&context.settings_selected_index)
         }
         ProviderKeys => {
             context.surface == ActionSurface::Settings
@@ -4312,6 +4416,9 @@ pub enum OverlayHelpClass {
     Dialectic,
     InputModal,
     ProviderCredentialForm,
+    LaunchPrompt,
+    LaunchSettings,
+    ContinuePrompt,
 }
 
 impl OverlayHelpClass {
@@ -4374,6 +4481,9 @@ impl OverlayHelpClass {
         Self::Dialectic,
         Self::InputModal,
         Self::ProviderCredentialForm,
+        Self::LaunchPrompt,
+        Self::LaunchSettings,
+        Self::ContinuePrompt,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -4437,6 +4547,9 @@ impl OverlayHelpClass {
             Self::Dialectic => 54,
             Self::InputModal => 55,
             Self::ProviderCredentialForm => 56,
+            Self::LaunchPrompt => 57,
+            Self::LaunchSettings => 58,
+            Self::ContinuePrompt => 59,
         }
     }
 }
@@ -4482,6 +4595,19 @@ const FORM_FIELDS: &[OverlayHelpEntry] = &[
     edit("Type, Backspace", "Edit focused field"),
 ];
 const DIALOG_TEXT: &[OverlayHelpEntry] = &[edit("Type, Backspace", "Edit text")];
+/// `overlay::handle_overlay_prompt_keys` / `handle_focused_input_prompt_keys`
+/// text tools shared by launch and continue prompts.
+const PROMPT_TEXT_TOOLS: &[OverlayHelpEntry] = &[
+    act("Ctrl-Y", "Compile prompt"),
+    act("a / d", "Accept / discard the compiled preview"),
+    act("Ctrl-Shift-G", "Grammar and spelling correction"),
+    act("Ctrl-A", "AI command on text"),
+    act("Ctrl-Shift-A", "Ask AI about text"),
+    act(
+        "Ctrl-V",
+        "Paste from clipboard (images become @path references)",
+    ),
+];
 const GRAPH_PAN: &[OverlayHelpEntry] = &[
     nav("H / J / K / L", "Pan graph view"),
     nav("c", "Camera follows selection"),
@@ -4799,10 +4925,15 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             LIST_NAV,
             &[
-                act("x", "Dismiss selected notification"),
+                act("x", "Dismiss selected active notification"),
                 act("N", "Dismiss all active notifications"),
-                act("Enter", "Open source session"),
+                act("Enter", "Open linked session"),
                 close("Esc / q", "Close"),
+            ],
+            &[
+                nav("Ctrl+Arrows", "Move modal"),
+                nav("Ctrl+Shift+Arrows", "Resize modal"),
+                act("Ctrl+0", "Reset modal geometry"),
             ],
             OVERLAY_LEADER,
         ],
@@ -5254,7 +5385,82 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             TEXT_SURFACE,
         ],
     },
+    // `overlay::launch_settings::handle_prompt_launch_keys` plus the prompt
+    // handlers in `overlay/mod.rs`; the front side of a new-session prompt.
+    OverlayHelpRoute {
+        class: OverlayHelpClass::LaunchPrompt,
+        title: "New Session Prompt",
+        groups: &[
+            &[
+                act("Ctrl-Enter", "Launch the session"),
+                act("Ctrl-T / Ctrl-S", "Launch into a new tab / split"),
+                nav(
+                    "Ctrl-O, Tab (normal)",
+                    "Flip to launch settings: model, effort, sandbox, manager",
+                ),
+                act("Ctrl-M", "Open model picker"),
+                edit("Ctrl-E", "Cycle effort level"),
+                edit("Ctrl-B", "Toggle sandbox (isolated git worktree)"),
+                act("? (normal)", "Show this help"),
+                nav("Ctrl-J / Ctrl-K", "Focus next / previous stacked prompt"),
+                act(
+                    "Space o / Space N (normal)",
+                    "Stack a TaskRabbit / blank prompt",
+                ),
+                close("Ctrl-Q", "Close and keep the draft"),
+            ],
+            PROMPT_TEXT_TOOLS,
+            TEXT_SURFACE,
+        ],
+    },
+    // The settings side ("back") of a new-session prompt.
+    OverlayHelpRoute {
+        class: OverlayHelpClass::LaunchSettings,
+        title: "New Session Settings",
+        groups: &[&[
+            nav("j / k, Down / Up", "Move between settings"),
+            edit("h / l, Left / Right", "Change the selected setting"),
+            edit("Space / Enter", "Toggle or open the selected setting"),
+            edit("Ctrl-E / Ctrl-B", "Cycle effort / toggle sandbox"),
+            act("Ctrl-M", "Open model picker"),
+            act("Ctrl-Enter", "Launch the session"),
+            act("Ctrl-T / Ctrl-S", "Launch into a new tab / split"),
+            act("?", "Show this help"),
+            nav("Ctrl-O / Tab / Esc", "Flip back to the prompt"),
+            close("Ctrl-Q", "Close and keep the draft"),
+        ]],
+    },
+    // A ContinueSession prompt held in `app.overlay`.
+    OverlayHelpRoute {
+        class: OverlayHelpClass::ContinuePrompt,
+        title: "Continue Prompt",
+        groups: &[
+            &[
+                act("Ctrl-Enter", "Send the follow-up"),
+                act("? (normal)", "Show this help"),
+                close("Ctrl-Q", "Close without sending"),
+            ],
+            PROMPT_TEXT_TOOLS,
+            TEXT_SURFACE,
+        ],
+    },
 ];
+
+/// Help class of a prompt overlay: its settings side, a new-session prompt,
+/// or a continue prompt. Mirrors `overlay::launch_settings` key routing.
+#[must_use]
+pub fn prompt_help_class(
+    purpose: &crate::types::PromptPurpose,
+    settings_open: bool,
+) -> OverlayHelpClass {
+    if matches!(purpose, crate::types::PromptPurpose::ContinueSession(_)) {
+        OverlayHelpClass::ContinuePrompt
+    } else if settings_open && crate::overlay::launch_settings::has_settings_side(purpose) {
+        OverlayHelpClass::LaunchSettings
+    } else {
+        OverlayHelpClass::LaunchPrompt
+    }
+}
 
 /// The single catalog route for an overlay help class.
 #[must_use]
@@ -5318,8 +5524,6 @@ pub enum OverlayHelpExemption {
     NoOverlay,
     /// The overlay's keys are an `ActionRoute` of the registry.
     RegistryRoute(RegistryOverlayRoute),
-    /// The launch / continue prompt editor.
-    PromptEntry,
     /// The help overlay itself.
     HelpItself,
     /// The ESP Square game.
@@ -5330,6 +5534,8 @@ pub enum OverlayHelpExemption {
     SettlementAuthorization,
     /// The graph review info dashboard while it holds focus.
     GraphDashboardFocus,
+    /// Operator satellite browser owns its own read-only and edit keys.
+    SatelliteBrowser,
 }
 
 impl OverlayHelpExemption {
@@ -5338,12 +5544,12 @@ impl OverlayHelpExemption {
         Self::NoOverlay,
         Self::RegistryRoute(RegistryOverlayRoute::ScheduleBrowser),
         Self::RegistryRoute(RegistryOverlayRoute::ThemeRoleEditor),
-        Self::PromptEntry,
         Self::HelpItself,
         Self::Game,
         Self::ManagerCatalogPicker,
         Self::SettlementAuthorization,
         Self::GraphDashboardFocus,
+        Self::SatelliteBrowser,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -5353,12 +5559,12 @@ impl OverlayHelpExemption {
             Self::NoOverlay => 0,
             Self::RegistryRoute(RegistryOverlayRoute::ScheduleBrowser) => 1,
             Self::RegistryRoute(RegistryOverlayRoute::ThemeRoleEditor) => 2,
-            Self::PromptEntry => 3,
-            Self::HelpItself => 4,
-            Self::Game => 5,
-            Self::ManagerCatalogPicker => 6,
-            Self::SettlementAuthorization => 7,
-            Self::GraphDashboardFocus => 8,
+            Self::HelpItself => 3,
+            Self::Game => 4,
+            Self::ManagerCatalogPicker => 5,
+            Self::SettlementAuthorization => 6,
+            Self::GraphDashboardFocus => 7,
+            Self::SatelliteBrowser => 8,
         }
     }
 
@@ -5369,12 +5575,12 @@ impl OverlayHelpExemption {
             Self::NoOverlay => "no overlay open",
             Self::RegistryRoute(RegistryOverlayRoute::ScheduleBrowser) => "Scheduled Jobs browser",
             Self::RegistryRoute(RegistryOverlayRoute::ThemeRoleEditor) => "Theme role editor",
-            Self::PromptEntry => "Launch / continue prompt",
             Self::HelpItself => "Keybindings help",
             Self::Game => "ESP Square game",
             Self::ManagerCatalogPicker => "Manager policy: launch-choice catalog picker",
             Self::SettlementAuthorization => "Source-worktree settlement: authorization",
             Self::GraphDashboardFocus => "Graph review: info dashboard focused",
+            Self::SatelliteBrowser => "Satellite registry browser",
         }
     }
 
@@ -5385,7 +5591,6 @@ impl OverlayHelpExemption {
             Self::RegistryRoute(_) => {
                 "Its keys are registry routes, rendered as their own generated table."
             }
-            Self::PromptEntry => "A text editor surface; its keys are documented by hand.",
             Self::HelpItself => "Help documents its own scroll, search and close keys.",
             Self::Game => "A game with its own single-screen key legend.",
             Self::ManagerCatalogPicker => {
@@ -5397,6 +5602,7 @@ impl OverlayHelpExemption {
             Self::GraphDashboardFocus => {
                 "The dashboard panel owns keys while focused, separate from graph editing."
             }
+            Self::SatelliteBrowser => "The browser owns its peer, link and cached session keys.",
         }
     }
 
@@ -5410,9 +5616,6 @@ impl OverlayHelpExemption {
             Self::RegistryRoute(RegistryOverlayRoute::ThemeRoleEditor) => {
                 DocAnchor::GeneratedRegion("theme-role-editor")
             }
-            Self::PromptEntry => {
-                DocAnchor::Narrative("Prompt Overlay (New Session / Continue Session)")
-            }
             Self::HelpItself => DocAnchor::Narrative("Keybindings Help Overlay"),
             Self::Game => DocAnchor::Narrative("ESP Square Overlay (`<Space>gc`)"),
             Self::ManagerCatalogPicker => {
@@ -5424,6 +5627,7 @@ impl OverlayHelpExemption {
             Self::GraphDashboardFocus => {
                 DocAnchor::Narrative("Graph Review Overlay (`<Space>v` or `:graph`)")
             }
+            Self::SatelliteBrowser => DocAnchor::Narrative("Satellite Registry Browser"),
         }
     }
 }
@@ -5554,6 +5758,7 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
                 Routed(C::SettlementBrowser)
             }
         }
+        OverlayState::SatelliteRegistry(..) => Exempt(X::SatelliteBrowser),
         OverlayState::GraphReview {
             dashboard_focused: true,
             ..
@@ -5588,11 +5793,16 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::CardEditor { .. } => Routed(C::CardEditor),
         OverlayState::Dialectic { .. } => Routed(C::Dialectic),
         OverlayState::InputModal { .. } => Routed(C::InputModal),
+        OverlayState::McpServerForm { .. } | OverlayState::McpServerSecretForm { .. } => {
+            Routed(C::InputModal)
+        }
         // A prompt's own model dropdown intercepts keys before prompt editing.
         OverlayState::Prompt { model_dropdown, .. } if model_dropdown.open => {
             Routed(C::ModelPicker)
         }
-        OverlayState::Prompt { .. } => Exempt(X::PromptEntry),
+        OverlayState::Prompt {
+            purpose, launch, ..
+        } => Routed(prompt_help_class(purpose, launch.open)),
         OverlayState::ScheduleBrowser { .. } => {
             Exempt(X::RegistryRoute(RegistryOverlayRoute::ScheduleBrowser))
         }
@@ -6426,6 +6636,71 @@ mod tests {
     }
 
     #[test]
+    fn session_detail_lifecycle_actions_require_empty_input_and_use_list_selection() {
+        use crate::app::app_test_helpers::with_session_list;
+        use crate::types::PopupMode;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use rsi_common::types::SessionStatus;
+
+        let mut app = with_session_list(2);
+        app.poll.connected = true;
+        let displayed_id = app.filtered_session_order[0];
+        let selected_id = app.filtered_session_order[1];
+        app.sessions.get_mut(&displayed_id).unwrap().session.status = SessionStatus::Completed;
+        app.sessions.get_mut(&selected_id).unwrap().session.status = SessionStatus::Running;
+        app.enter_session();
+        if let crate::types::Pane::SessionList {
+            selected_index,
+            selected_session,
+            ..
+        } = app.session_list_pane_mut()
+        {
+            *selected_index = 1;
+            *selected_session = Some(selected_id);
+        }
+
+        let context = ActionContext::from_app(&app);
+        assert_eq!(context.origin, HelpOrigin::SessionDetail);
+        assert!(context.session_detail_actions_available);
+        assert_eq!(context.selected_id, Some(selected_id));
+        assert_eq!(
+            context.selected_session_status,
+            Some(SessionStatus::Running)
+        );
+        for (key, expected) in [
+            (KeyCode::Enter, ActionId::Open),
+            (KeyCode::Char('x'), ActionId::InterruptSession),
+            (KeyCode::Char('X'), ActionId::HardInterruptSession),
+        ] {
+            assert!(matches!(
+                request_for_key(&context, KeyEvent::new(key, KeyModifiers::NONE)),
+                ActionAvailability::Available(request) if request.id == expected
+            ));
+        }
+        let continue_descriptor = ACTION_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.id == ActionId::ContinueSession)
+            .expect("continue descriptor");
+        assert!(matches!(
+            availability(continue_descriptor, &context),
+            ActionAvailability::Available(request) if request.id == ActionId::ContinueSession
+        ));
+
+        let detail_state = app.sessions.get_mut(&displayed_id).unwrap();
+        detail_state.input_bar.surface =
+            crate::input_surface::InputSurface::new_insert_with_content(vec!["draft".into()]);
+        detail_state.input_bar.surface.mode = PopupMode::Normal;
+        let draft_context = ActionContext::from_app(&app);
+        assert!(!draft_context.session_detail_actions_available);
+        for key in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char('X')] {
+            assert!(matches!(
+                request_for_key(&draft_context, KeyEvent::new(key, KeyModifiers::NONE)),
+                ActionAvailability::Unavailable { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn t31_list_and_detail_proxy_help_expose_copy_uuid_with_yy_and_recheck() {
         use crate::app::app_test_helpers::with_session_list;
 
@@ -6611,6 +6886,7 @@ mod tests {
             selected_index: 0,
             loading: false,
             pending_delete: true,
+            paging: Default::default(),
         };
         let schedule = ActionContext::from_app(&app);
         assert_eq!(schedule.focus, ActionFocus::ScheduleList);
@@ -7166,6 +7442,7 @@ mod tests {
             OverlayState::SortPicker { .. } => "SortPicker",
             OverlayState::PromptPreview { .. } => "PromptPreview",
             OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
+            OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
             OverlayState::NotificationBrowser { .. } => "NotificationBrowser",
             OverlayState::RecentCompletions { .. } => "RecentCompletions",
@@ -7173,6 +7450,8 @@ mod tests {
             OverlayState::FileExplorer { .. } => "FileExplorer",
             OverlayState::ProviderForm { .. } => "ProviderForm",
             OverlayState::ProviderCredentialForm { .. } => "ProviderCredentialForm",
+            OverlayState::McpServerForm { .. } => "McpServerForm",
+            OverlayState::McpServerSecretForm { .. } => "McpServerSecretForm",
             OverlayState::MessageBridgeForm { .. } => "MessageBridgeForm",
             OverlayState::HookForm { .. } => "HookForm",
             OverlayState::BudgetPolicyForm { .. } => "BudgetPolicyForm",
@@ -7332,19 +7611,60 @@ mod tests {
         dropdown
     }
 
+    #[inline(never)]
+    fn mcp_server_overlay_fixture(secret: bool) -> OverlayState {
+        let mut app = fixture_app();
+        if secret {
+            crate::overlay::mcp_server_form::open_mcp_server_secret_form(
+                &mut app,
+                "fixture".to_string(),
+                false,
+            );
+        } else {
+            crate::overlay::mcp_server_form::open_mcp_server_form(&mut app, None);
+        }
+        std::mem::replace(&mut app.overlay, OverlayState::None)
+    }
+
     /// One fixture per `OverlayState` variant and per routing-relevant
     /// sub-mode, including every former `None` path (N1-N5).
     #[allow(clippy::too_many_lines)] // One auditable row per state.
     async fn overlay_state_fixtures() -> Vec<OverlayFixture> {
+        let app = fixture_app();
+        let session_id = app.selected_session_id().expect("fixture session");
+        let mut fixtures = Vec::new();
+        overlay_fixture_part_01(&app, session_id, &mut fixtures);
+        overlay_fixture_part_02(&app, session_id, &mut fixtures);
+        overlay_fixture_part_03(&app, session_id, &mut fixtures);
+        overlay_fixture_part_04(&app, session_id, &mut fixtures);
+        overlay_fixture_part_05(&app, session_id, &mut fixtures);
+        Box::pin(overlay_fixture_part_06(&app, session_id, &mut fixtures)).await;
+        Box::pin(overlay_fixture_part_07(&app, session_id, &mut fixtures)).await;
+        overlay_fixture_part_08(&app, session_id, &mut fixtures);
+        overlay_fixture_part_09(&app, session_id, &mut fixtures);
+        overlay_fixture_part_10(&app, session_id, &mut fixtures);
+        overlay_fixture_part_11(&app, session_id, &mut fixtures);
+        overlay_fixture_part_12(&app, session_id, &mut fixtures);
+        overlay_fixture_part_13(&app, session_id, &mut fixtures);
+        overlay_fixture_part_14(&app, session_id, &mut fixtures);
+        overlay_fixture_part_15(&app, session_id, &mut fixtures);
+        overlay_fixture_part_16(&app, session_id, &mut fixtures);
+        overlay_fixture_part_17(&app, session_id, &mut fixtures);
+        overlay_fixture_part_18(&app, session_id, &mut fixtures);
+        overlay_fixture_part_19(&app, session_id, &mut fixtures);
+        overlay_fixture_part_20(&app, session_id, &mut fixtures);
+        fixtures
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_01(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
         use crate::overlay::manager_v2::ManagerSection;
         use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
         use HelpRouting::{Exempt, Routed};
         use OverlayHelpClass as C;
         use OverlayHelpExemption as X;
 
-        let app = fixture_app();
-        let session_id = app.selected_session_id().expect("fixture session");
-        let mut fixtures = Vec::new();
         let mut push = |label, app: &App, overlay: OverlayState, expected| {
             fixtures.push(state_fixture(label, app, &overlay, expected));
         };
@@ -7359,6 +7679,7 @@ mod tests {
                 selected_index: 0,
                 loading: false,
                 pending_delete: false,
+                paging: Default::default(),
             },
             Exempt(X::RegistryRoute(RegistryOverlayRoute::ScheduleBrowser)),
         );
@@ -7373,11 +7694,41 @@ mod tests {
                 Exempt(X::RegistryRoute(RegistryOverlayRoute::ThemeRoleEditor)),
             );
         }
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_02(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         {
             let mut app = fixture_app();
             crate::overlay::prompt::open_blank_popup(&mut app);
             let overlay = app.input_overlays.pop().expect("blank prompt opens");
-            push("Prompt entry (N5)", &app, overlay, Exempt(X::PromptEntry));
+            push("Prompt entry", &app, overlay, Routed(C::LaunchPrompt));
+            crate::overlay::prompt::open_blank_popup(&mut app);
+            let mut overlay = app.input_overlays.pop().expect("blank prompt opens");
+            if let OverlayState::Prompt { launch, .. } = &mut overlay {
+                launch.open = true;
+            }
+            push(
+                "Prompt settings side",
+                &app,
+                overlay,
+                Routed(C::LaunchSettings),
+            );
+            let continued = app.selected_session_id().expect("fixture session");
+            crate::overlay::prompt::open_continue_popup(&mut app, continued);
+            let overlay = std::mem::replace(&mut app.overlay, OverlayState::None);
+            push("Continue prompt", &app, overlay, Routed(C::ContinuePrompt));
             crate::overlay::prompt::open_blank_popup(&mut app);
             let mut overlay = app.input_overlays.pop().expect("blank prompt opens");
             if let OverlayState::Prompt { model_dropdown, .. } = &mut overlay {
@@ -7421,6 +7772,20 @@ mod tests {
             },
             Exempt(X::Game),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_03(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
 
         // N2: manager sections, text entry and the catalog picker.
         push(
@@ -7441,6 +7806,21 @@ mod tests {
             manager_overlay(ManagerSection::Inbox),
             Routed(C::ManagerBoard),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_04(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "HarnessManagerV2 Inspect",
             &app,
@@ -7486,6 +7866,21 @@ mod tests {
                 expected,
             });
         }
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_05(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         let mut push = |label, app: &App, overlay: OverlayState, expected| {
             fixtures.push(state_fixture(label, app, &overlay, expected));
         };
@@ -7503,6 +7898,45 @@ mod tests {
             settlement(true),
             Exempt(X::SettlementAuthorization),
         );
+        push(
+            "SatelliteRegistry browser",
+            &app,
+            OverlayState::SatelliteRegistry(Box::new(
+                crate::types::SatelliteRegistryOverlayState {
+                    registry: rsi_common::satellite::SatelliteRegistryV1 {
+                        revision: 0,
+                        peers: Vec::new(),
+                    },
+                    selected_peer: 0,
+                    selected_link: 0,
+                    selected_session: 0,
+                    tab: crate::types::SatelliteRegistryTab::Peers,
+                    sessions: None,
+                    form: None,
+                    last_probe: None,
+                    last_error: None,
+                },
+            )),
+            Exempt(X::SatelliteBrowser),
+        );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    async fn overlay_fixture_part_06(
+        app: &App,
+        session_id: Uuid,
+        fixtures: &mut Vec<OverlayFixture>,
+    ) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
 
         // N4 and graph modes.
         {
@@ -7587,6 +8021,24 @@ mod tests {
                 });
             }
         }
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    async fn overlay_fixture_part_07(
+        app: &App,
+        session_id: Uuid,
+        fixtures: &mut Vec<OverlayFixture>,
+    ) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
         let mut push = |label, app: &App, overlay: OverlayState, expected| {
             fixtures.push(state_fixture(label, app, &overlay, expected));
         };
@@ -7703,6 +8155,21 @@ mod tests {
             file_explorer(true, true),
             Routed(C::FileExplorerFinder),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_08(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "FileExplorer explorer",
             &app,
@@ -7723,6 +8190,20 @@ mod tests {
             question(PopupMode::Normal),
             Routed(C::QuestionNormal),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_09(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
 
         // Every remaining variant.
         {
@@ -7763,6 +8244,21 @@ mod tests {
             },
             Routed(C::ThemePicker),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_10(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         {
             let mut app = fixture_app();
             crate::overlay::color_customizer::open_color_customizer(&mut app);
@@ -7794,6 +8290,21 @@ mod tests {
             OverlayState::SortPicker { selected_index: 0 },
             Routed(C::SortPicker),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_11(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "PromptPreview",
             &app,
@@ -7826,6 +8337,21 @@ mod tests {
             OverlayState::RecentCompletions { selected_index: 0 },
             Routed(C::RecentCompletions),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_12(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "ProjectForm",
             &app,
@@ -7859,6 +8385,35 @@ mod tests {
                 Routed(C::ProviderCredentialForm),
             );
         }
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_13(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
+        // Built in a plain helper so each fixture App lives in its own frame,
+        // not in this async function's (debug stack overflow).
+        push(
+            "McpServerForm",
+            &app,
+            mcp_server_overlay_fixture(false),
+            Routed(C::InputModal),
+        );
+        push(
+            "McpServerSecretForm",
+            &app,
+            mcp_server_overlay_fixture(true),
+            Routed(C::InputModal),
+        );
         push(
             "MessageBridgeForm",
             &app,
@@ -7872,6 +8427,21 @@ mod tests {
             },
             Routed(C::MessageBridgeForm),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_14(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "HookForm",
             &app,
@@ -7919,6 +8489,21 @@ mod tests {
             },
             Routed(C::SkillPreview),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_15(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "Diagnostics",
             &app,
@@ -7944,6 +8529,21 @@ mod tests {
             },
             Routed(C::MemorySearch),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_16(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "RenameSession",
             &app,
@@ -7974,6 +8574,21 @@ mod tests {
             },
             Routed(C::LabelForm),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_17(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "InputModal",
             &app,
@@ -8024,6 +8639,21 @@ mod tests {
             },
             Routed(C::CardEditor),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_18(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "Telescope",
             &app,
@@ -8051,6 +8681,21 @@ mod tests {
             },
             Routed(C::Dialectic),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_19(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         {
             let mut app = fixture_app();
             crate::overlay::schedule_form::open_schedule_form_new(&mut app);
@@ -8072,6 +8717,21 @@ mod tests {
             },
             Routed(C::Rating),
         );
+    }
+
+    #[inline(never)]
+    #[allow(unused_imports, unused_mut, unused_variables, clippy::too_many_lines)] // One auditable row per state.
+    fn overlay_fixture_part_20(app: &App, session_id: Uuid, fixtures: &mut Vec<OverlayFixture>) {
+        use crate::overlay::manager_v2::ManagerSection;
+        use crate::types::{CreateEntityField, GraphCamera, GraphMode, PopupMode};
+        use HelpRouting::{Exempt, Routed};
+        use OverlayHelpClass as C;
+        use OverlayHelpExemption as X;
+
+        let mut push = |label, app: &App, overlay: OverlayState, expected| {
+            fixtures.push(state_fixture(label, app, &overlay, expected));
+        };
+
         push(
             "SessionInfoPanel",
             &app,
@@ -8089,7 +8749,6 @@ mod tests {
             },
             Routed(C::ParentPicker),
         );
-        fixtures
     }
 
     /// T11a: every overlay fixture routes to its pinned value; routed

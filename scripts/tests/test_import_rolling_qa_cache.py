@@ -15,6 +15,17 @@ SPEC = importlib.util.spec_from_file_location("rolling_qa_cache", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 SHA = "a" * 40
+# The gate's default spec env (rsi-rolling-land GuardSpec env at its default
+# CARGO_BUILD_JOBS); cargo-slot forces the same values for QA sweep shards.
+LANDER_ENV = {"CARGO_BUILD_JOBS": "4", "CARGO_PROFILE_DEV_DEBUG": "line-tables-only"}
+# Pinned against rsi-rolling-land `shard_cache_key_matches_the_qa_importer_vectors`:
+# (tmpdir class, env class, cache key for fingerprint sha256:a*64).
+LANDER_VECTORS = [
+    ("tmpfs", "sha256:d5da322b638d61ee4a9b2061389d35f57037e881a38e64fb305942e8e63636b9",
+     "sha256:5c13edf5b414383bf368da17364ebf409c1d775cce03f5fb9aabc1ce4f25a6ea"),
+    ("disk", "sha256:a68fc171a80ec57da8f351dcf6d5c0edbcdb4f1e682d5508514a59ebdfc645d5",
+     "sha256:e5c3dd61019cd7a754751ebca2e9a3f6473c53d1a3aa8a77ee0f9bd90b4c84cc"),
+]
 
 
 class RollingQaCacheImportTests(unittest.TestCase):
@@ -31,9 +42,17 @@ class RollingQaCacheImportTests(unittest.TestCase):
         canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
         return {"digest": hashlib.sha256(canonical).hexdigest(), "inputs": inputs}
 
-    def report(self, red=False):
+    def lander_key(self, shard, spec_env=None, tmpdir_class="tmpfs"):
+        """Cache directory digest a landing in this environment looks up."""
+        env_class = MODULE.shard_env_class(spec_env or LANDER_ENV, tmpdir_class)
+        key = MODULE.shard_cache_key("sha256:" + self.fingerprint(shard)["digest"], env_class)
+        return key.removeprefix("sha256:")
+
+    def report(self, red=False, environment=None):
+        environment = environment or {"spec_env": dict(LANDER_ENV), "tmpdir_class": "tmpfs"}
         rows = [{"name": shard, "run": 1, "passed": 1, "failed": 0, "skipped": 0,
-                 "exit_code": 0, "failing_tests": [], "fingerprint": self.fingerprint(shard)}
+                 "exit_code": 0, "failing_tests": [], "fingerprint": self.fingerprint(shard),
+                 "environment": environment}
                 for shard in sorted(MODULE.SHARDS)]
         if red:
             rows[0].update({"passed": 0, "failed": 1, "exit_code": 100,
@@ -62,11 +81,10 @@ class RollingQaCacheImportTests(unittest.TestCase):
         self.assertEqual(tip, SHA)
         self.assertEqual({state for _, state in first}, {"imported"})
         self.assertEqual({state for _, state in second}, {"existing"})
-        fingerprint = self.fingerprint("store-01")
-        entry = json.loads((self.cache / SHA / fingerprint["digest"] / "store-01.json").read_text())
+        entry = json.loads((self.cache / SHA / self.lander_key("store-01") / "store-01.json").read_text())
         self.assertEqual(entry["failures"], [])
         self.assertEqual(entry["provenance"], "qa:laptop:QA.md")
-        red = json.loads((self.cache / SHA / self.fingerprint("memory-01")["digest"] / "memory-01.json").read_text())
+        red = json.loads((self.cache / SHA / self.lander_key("memory-01") / "memory-01.json").read_text())
         self.assertEqual(red["failures"], ["memory::tests::known_red"])
 
     def test_fingerprint_mismatch_refuses_entry(self):
@@ -100,8 +118,7 @@ class RollingQaCacheImportTests(unittest.TestCase):
             with self.assertRaises(MODULE.CacheConflict):
                 MODULE.import_report(path, self.cache)
         shard = payload["shards"][0]["name"]
-        digest = self.fingerprint(shard)["digest"]
-        cached = json.loads((self.cache / SHA / digest / f"{shard}.json").read_text())
+        cached = json.loads((self.cache / SHA / self.lander_key(shard) / f"{shard}.json").read_text())
         self.assertEqual(cached["failures"], [])
 
     def test_concurrent_writers_leave_complete_matching_entries(self):
@@ -111,11 +128,11 @@ class RollingQaCacheImportTests(unittest.TestCase):
                 results = list(pool.map(lambda _: MODULE.import_report(path, self.cache), range(4)))
         self.assertEqual(len(results), 4)
         for shard in MODULE.SHARDS:
-            fingerprint = self.fingerprint(shard)
-            entry = json.loads((self.cache / SHA / fingerprint["digest"] / f"{shard}.json").read_text())
+            key = self.lander_key(shard)
+            entry = json.loads((self.cache / SHA / key / f"{shard}.json").read_text())
             self.assertEqual(entry["rolling_sha"], SHA)
             self.assertEqual(entry["shard"], shard)
-            self.assertEqual(entry["fingerprint"], "sha256:" + fingerprint["digest"])
+            self.assertEqual(entry["fingerprint"], "sha256:" + key)
 
     def test_markdown_machine_block_can_seed_a_qa_entry(self):
         _, payload = self.report()
@@ -123,9 +140,58 @@ class RollingQaCacheImportTests(unittest.TestCase):
         path.write_text("# QA result\n\n```qa-sweep-v1\n" + json.dumps(payload) + "\n```\n")
         with self.matching_local(), patch.object(MODULE, "local_tree", return_value="b" * 40):
             MODULE.import_report(path, self.cache)
-        digest = self.fingerprint("store-01")["digest"]
-        entry = json.loads((self.cache / SHA / digest / "store-01.json").read_text())
+        entry = json.loads((self.cache / SHA / self.lander_key("store-01") / "store-01.json").read_text())
         self.assertEqual(entry["provenance"], "qa:laptop:QA.md")
+
+    def test_cache_key_mirrors_the_lander_vectors(self):
+        fingerprint = "sha256:" + "a" * 64
+        env = {**LANDER_ENV, "TMPDIR": "/dev/shm/rsi-landing-gate-x"}
+        for tmpdir_class, env_class, key in LANDER_VECTORS:
+            self.assertEqual(MODULE.shard_env_class(env, tmpdir_class), env_class)
+            self.assertEqual(MODULE.shard_cache_key(fingerprint, env_class), key)
+
+    def test_matching_environment_import_is_found_where_the_lander_looks(self):
+        path, _ = self.report(environment={"spec_env": dict(LANDER_ENV), "tmpdir_class": "disk"})
+        with self.matching_local(), patch.object(MODULE, "local_tree", return_value="b" * 40):
+            _, rows = MODULE.import_report(path, self.cache)
+        self.assertEqual({state for _, state in rows}, {"imported"})
+        for shard in MODULE.SHARDS:
+            key = self.lander_key(shard, tmpdir_class="disk")
+            entry = json.loads((self.cache / SHA / key / f"{shard}.json").read_text())
+            self.assertEqual(entry["fingerprint"], "sha256:" + key)
+            # A tmpfs-scratch landing looks elsewhere and measures its own base.
+            self.assertFalse((self.cache / SHA / self.lander_key(shard) / f"{shard}.json").exists())
+
+    def test_mismatched_environment_import_is_ignored_by_the_lander(self):
+        swept = {"spec_env": {**LANDER_ENV, "CARGO_BUILD_JOBS": "8"}, "tmpdir_class": "tmpfs"}
+        path, _ = self.report(environment=swept)
+        with self.matching_local(), patch.object(MODULE, "local_tree", return_value="b" * 40):
+            MODULE.import_report(path, self.cache)
+        for shard in MODULE.SHARDS:
+            self.assertTrue((self.cache / SHA / self.lander_key(shard, swept["spec_env"]) / f"{shard}.json").exists())
+            self.assertFalse((self.cache / SHA / self.lander_key(shard) / f"{shard}.json").exists())
+            self.assertFalse((self.cache / SHA / self.fingerprint(shard)["digest"]).exists())
+
+    def test_report_without_environment_imports_nothing(self):
+        path, payload = self.report()
+        for row in payload["shards"]:
+            del row["environment"]
+        path.write_text(json.dumps(payload))
+        with self.matching_local(), patch.object(MODULE, "local_tree", return_value="b" * 40):
+            _, rows = MODULE.import_report(path, self.cache)
+        self.assertEqual({state for _, state in rows}, {"environment_unrecorded"})
+        self.assertFalse(any(self.cache.rglob("*.json")))
+
+    def test_invalid_environment_is_refused(self):
+        for environment in ({"spec_env": {"A": "1\nTMPDIR=disk"}, "tmpdir_class": "tmpfs"},
+                            {"spec_env": {"A=B": "1"}, "tmpdir_class": "tmpfs"},
+                            {"spec_env": dict(LANDER_ENV), "tmpdir_class": "ramfs"},
+                            {"spec_env": {"CARGO_BUILD_JOBS": 4}, "tmpdir_class": "disk"}):
+            path, _ = self.report(environment=environment)
+            with self.matching_local(), patch.object(MODULE, "local_tree", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "invalid QA environment"):
+                    MODULE.import_report(path, self.cache)
+        self.assertFalse(any(self.cache.rglob("*.json")))
 
     def test_incomplete_report_is_refused(self):
         path, payload = self.report()

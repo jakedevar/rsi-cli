@@ -37,12 +37,14 @@ pub enum ManagerPolicyField {
     CreatedContainers,
     CreatedSessions,
     ActiveSessions,
+    Tier2Reviewer,
     ProviderLimits,
     AllowedLaunches,
     RecoveryAttempts,
     RetryDelaySeconds,
     RequestTimeoutSeconds,
     MaxSpendUsd,
+    DaemonSettingBounds,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManagerAllowanceField {
@@ -131,6 +133,15 @@ const FULL: &[ManagerCapabilityV2] = &[
     // this grant existed keeps its exact grants and classifies as Custom until
     // the operator re-applies Full and saves; it is never widened silently.
     ManagerCapabilityV2::OperatorDelegation,
+    // Operator directive 2026-09-30: Full project control grants every
+    // capability, including the ones that were operator-toggled only. Execute
+    // still grants none of these. A Full policy saved before this change keeps
+    // its exact grants (shown as Custom) until the operator re-applies Full.
+    ManagerCapabilityV2::GitEffect,
+    ManagerCapabilityV2::Automation,
+    ManagerCapabilityV2::StorageControl,
+    ManagerCapabilityV2::DaemonSettings,
+    ManagerCapabilityV2::Deploy,
 ];
 const EXECUTE: &[ManagerCapabilityV2] = &[
     ManagerCapabilityV2::WorkPlan,

@@ -10,10 +10,12 @@ use crate::sandbox::target_reclaim::{
     PinnedSandboxRoot, RegisteredTargetIntent, TargetReclaimKind, TargetReclaimOutcome,
 };
 use crate::store::Store;
+use crate::store::custody_lock_order::{lock_store_then_root, lock_store_then_session_root};
 use crate::store::sandbox_custody::{
-    ArchivedRotationRestoration, CustodyCause, EffectReservation, LegacyStartupRoot,
-    LegacyTerminalRoot, RetryAuthorityCapture, RetryAuthorityFence, RotationAuthorityCapture,
-    RotationAuthorityFence, SessionCustodyBinding, StartupCustodyGroup, lock_custody_root,
+    ArchivedRotationRestoration, CustodyCause, CustodyRootGuard, EffectReservation,
+    LegacyStartupRoot, LegacyTerminalRoot, RetryAuthorityCapture, RetryAuthorityFence,
+    RotationAuthorityCapture, RotationAuthorityFence, SessionCustodyBinding, StartupCustodyGroup,
+    lock_custody_root,
 };
 use crate::store::target_reclaim_sweep::{
     PrepareTargetReclaimIntentResult, TargetReclaimIntentTerminalState,
@@ -25,7 +27,7 @@ use rsi_common::types::{
     SessionStatus,
 };
 use rusqlite::OptionalExtension;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
@@ -151,8 +153,14 @@ impl CustodyExecutionRuntime {
                 CustodyService::authorize_ordinary_for_transition(session, transition)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                let mut store = self.store.lock().await;
-                CustodyService::authorize_live(session, &mut store, &self.sandbox_base, transition)
+                let (mut store, root) = lock_store_then_session_root(&self.store, session.id).await;
+                CustodyService::authorize_live_holding(
+                    session,
+                    &mut store,
+                    &self.sandbox_base,
+                    transition,
+                    root,
+                )
             }
             Err(error) => Err(error),
         }?;
@@ -200,7 +208,7 @@ impl CustodyExecutionRuntime {
         source: RotationPredecessorSource,
     ) -> Result<RotationCustodyCandidate> {
         let transition = SandboxCustodyTransitionV1::Rotation;
-        let mut store = self.store.lock().await;
+        let (mut store, mut root) = lock_store_then_session_root(&self.store, predecessor.id).await;
         let captured = match source {
             RotationPredecessorSource::Completed => {
                 store.capture_completed_rotation_authority(predecessor)
@@ -238,11 +246,12 @@ impl CustodyExecutionRuntime {
                 CustodyService::authorize_ordinary_for_transition(predecessor, transition)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                CustodyService::authorize_live(
+                CustodyService::authorize_live_holding(
                     predecessor,
                     &mut store,
                     &self.sandbox_base,
                     transition,
+                    root.take(),
                 )
             }
             Err(error) => Err(error),
@@ -490,12 +499,14 @@ impl CustodyExecutionRuntime {
                 generation,
                 ..
             } => {
-                let mut store = self.store.lock().await;
-                let custody = CustodyService::authorize_live(
+                let (mut store, root) =
+                    lock_store_then_session_root(&self.store, successor.id).await;
+                let custody = CustodyService::authorize_live_holding(
                     successor,
                     &mut store,
                     &self.sandbox_base,
                     transition,
+                    root,
                 )?;
                 match &custody {
                     CustodyHandle::Sandboxed(sandboxed)
@@ -634,7 +645,7 @@ impl CustodyExecutionRuntime {
         source: &Session,
     ) -> Result<RetryCustodyCandidate> {
         let transition = SandboxCustodyTransitionV1::Retry;
-        let mut store = self.store.lock().await;
+        let (mut store, mut root) = lock_store_then_session_root(&self.store, source.id).await;
         let durable_source = match store.capture_failed_retry_authority(source) {
             Ok(RetryAuthorityCapture::Captured(fence)) => fence,
             Ok(RetryAuthorityCapture::Missing) => {
@@ -664,11 +675,12 @@ impl CustodyExecutionRuntime {
                 CustodyService::authorize_ordinary_for_transition(source, transition)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                CustodyService::authorize_live_nonmutating(
+                CustodyService::authorize_live_nonmutating_holding(
                     source,
                     &mut store,
                     &self.sandbox_base,
                     transition,
+                    root.take(),
                 )
             }
             Err(error) => Err(error),
@@ -747,14 +759,21 @@ impl CustodyExecutionRuntime {
             _ => unreachable!("retry only binds ordinary or transfer custody"),
         };
         let bind_result = {
-            let mut store = self.store.lock().await;
             // Hold the same root stripe from persisted/filesystem/Git
             // reauthentication through the SQL Transfer CAS. Ordinary retry
-            // has no exclusive root and therefore needs no stripe.
-            let _root_guard = match &candidate.custody {
-                CustodyHandle::Ordinary(_) => None,
+            // has no exclusive root and therefore needs no stripe. The stripe
+            // is never waited for while holding the Store (Issue #606).
+            let (mut store, held) = match &candidate.custody {
+                CustodyHandle::Ordinary(_) => (self.store.lock().await, None),
                 CustodyHandle::Sandboxed(expected) => {
-                    let guard = lock_custody_root(expected.custody_id);
+                    let (store, guard) =
+                        lock_store_then_root(&self.store, expected.custody_id).await;
+                    (store, Some(guard))
+                }
+            };
+            let _root_guard = match (&candidate.custody, held) {
+                (CustodyHandle::Ordinary(_), _) | (CustodyHandle::Sandboxed(_), None) => None,
+                (CustodyHandle::Sandboxed(_), Some(guard)) => {
                     let current = CustodyService::authorize_live_locked_with_policy(
                         source,
                         &mut store,
@@ -845,12 +864,14 @@ impl CustodyExecutionRuntime {
                 generation,
                 ..
             } => {
-                let mut store = self.store.lock().await;
-                let custody = CustodyService::authorize_live_nonmutating(
+                let (mut store, root) =
+                    lock_store_then_session_root(&self.store, successor.id).await;
+                let custody = CustodyService::authorize_live_nonmutating_holding(
                     successor,
                     &mut store,
                     &self.sandbox_base,
                     transition,
+                    root,
                 )?;
                 match &custody {
                     CustodyHandle::Sandboxed(sandboxed)
@@ -976,18 +997,19 @@ impl CustodyExecutionRuntime {
         String,
     )> {
         let transition = SandboxCustodyTransitionV1::AgentSpawnChild;
-        let authenticate = |store: &mut Store| -> Result<_> {
+        let authenticate = |store: &mut Store, root: Option<CustodyRootGuard>| -> Result<_> {
             match CustodyService::classify_for_transition(predecessor, transition)? {
                 CustodyClassification::OrdinaryUnsandboxed => {
                     CustodyService::authorize_ordinary_for_transition(predecessor, transition)?;
                     Ok(None)
                 }
                 CustodyClassification::RequiresPersistedAuthentication => {
-                    CustodyService::authorize_live_nonmutating(
+                    CustodyService::authorize_live_nonmutating_holding(
                         predecessor,
                         store,
                         &self.sandbox_base,
                         transition,
+                        root,
                     )?;
                     Ok(Some(store.live_custody_for_session(predecessor.id)?))
                 }
@@ -997,7 +1019,11 @@ impl CustodyExecutionRuntime {
             tracing::warn!(session_id=%predecessor.id, %error, "manager handoff custody authentication refused");
             crate::store::harness_manager_v2::refused("manager_succession_source_custody_changed")
         };
-        let before = authenticate(&mut *self.store.lock().await).map_err(source_error)?;
+        let before = {
+            let (mut store, root) = lock_store_then_session_root(&self.store, predecessor.id).await;
+            authenticate(&mut store, root)
+        }
+        .map_err(source_error)?;
         let cwd = before.as_ref().map_or_else(
             || predecessor.working_dir.clone(),
             |c| PathBuf::from(&c.sandbox_root),
@@ -1011,7 +1037,11 @@ impl CustodyExecutionRuntime {
                         "manager_succession_handoff_unavailable",
                     )
                 })??;
-        let after = authenticate(&mut *self.store.lock().await).map_err(source_error)?;
+        let after = {
+            let (mut store, root) = lock_store_then_session_root(&self.store, predecessor.id).await;
+            authenticate(&mut store, root)
+        }
+        .map_err(source_error)?;
         if before
             .as_ref()
             .map(crate::store::manager_successions::ManagerRootCustody::from)
@@ -1040,12 +1070,13 @@ impl CustodyExecutionRuntime {
         candidate: &Session,
         expected: &crate::store::manager_successions::ManagerRootCustody,
     ) -> Result<()> {
-        let mut store = self.store.lock().await;
-        CustodyService::authorize_live_nonmutating(
+        let (mut store, root) = lock_store_then_session_root(&self.store, candidate.id).await;
+        CustodyService::authorize_live_nonmutating_holding(
             candidate,
             &mut store,
             &self.sandbox_base,
             SandboxCustodyTransitionV1::AgentSpawnChild,
+            root,
         )
         .map_err(|error| {
             tracing::warn!(session_id=%candidate.id, %error, "manager candidate custody authentication refused");
@@ -1094,12 +1125,13 @@ impl CustodyExecutionRuntime {
                 CustodyService::authorize_ordinary_for_transition(emitter, transition)?
             }
             CustodyClassification::RequiresPersistedAuthentication => {
-                let mut store = self.store.lock().await;
-                CustodyService::authorize_live_nonmutating(
+                let (mut store, root) = lock_store_then_session_root(&self.store, emitter.id).await;
+                CustodyService::authorize_live_nonmutating_holding(
                     emitter,
                     &mut store,
                     &self.sandbox_base,
                     transition,
+                    root,
                 )?
             }
         };
@@ -1331,6 +1363,95 @@ fn startup_settlement_failure_for_test() -> Option<DaemonError> {
 #[cfg(not(test))]
 fn startup_settlement_failure_for_test() -> Option<DaemonError> {
     None
+}
+
+/// Test seam: run once for one sandbox base between the concurrent prefetch
+/// and the serial pass, to change the filesystem inside that window.
+#[cfg(test)]
+type AfterStartupPrefetchHook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static AFTER_STARTUP_PREFETCH: std::sync::Mutex<Option<AfterStartupPrefetchHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn after_startup_prefetch_for_test(sandbox_base: &Path) {
+    let hook = {
+        let mut slot = AFTER_STARTUP_PREFETCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some((base, _)) if base == sandbox_base => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_startup_prefetch_for_test(
+    sandbox_base: &Path,
+    hook: Box<dyn FnOnce() + Send>,
+) {
+    *AFTER_STARTUP_PREFETCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((sandbox_base.to_path_buf(), hook));
+}
+
+#[cfg(not(test))]
+const fn after_startup_prefetch_for_test(_sandbox_base: &Path) {}
+
+/// Test seam: for one sandbox base, delay each prefetched probe so later jobs
+/// finish first, and record the completion order.
+#[cfg(test)]
+static STARTUP_PROBE_REVERSAL: std::sync::Mutex<Option<(PathBuf, Vec<Uuid>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn reverse_startup_probe_completion_for_test(sandbox_base: Option<&Path>) -> Vec<Uuid> {
+    let mut hook = STARTUP_PROBE_REVERSAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = hook.take().map(|(_, order)| order).unwrap_or_default();
+    *hook = sandbox_base.map(|base| (base.to_path_buf(), Vec::new()));
+    previous
+}
+
+#[cfg(test)]
+fn startup_probe_completed_for_test(
+    sandbox_base: &Path,
+    index: usize,
+    jobs: usize,
+    custody_id: Uuid,
+) {
+    let applies = STARTUP_PROBE_REVERSAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|(base, _)| base == sandbox_base);
+    if !applies {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40 * (jobs - index) as u64));
+    if let Some((_, order)) = STARTUP_PROBE_REVERSAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        order.push(custody_id);
+    }
+}
+
+#[cfg(not(test))]
+const fn startup_probe_completed_for_test(
+    _sandbox_base: &Path,
+    _index: usize,
+    _jobs: usize,
+    _custody_id: Uuid,
+) {
 }
 
 fn retained_unowned_diagnostic(sandbox_root: Option<&str>, reason: &'static str) {
@@ -1773,6 +1894,16 @@ impl CustodyService {
     /// performs no provider/context/tool effect and never invents a legacy
     /// owner from lineage or a canonical fallback from a malformed tuple.
     pub(crate) fn reconcile_startup(store: &mut Store, sandbox_base: &Path) -> Result<()> {
+        Self::reconcile_startup_with_pool(store, sandbox_base, startup_proof_pool_size())
+    }
+
+    /// `reconcile_startup` with an explicit proof pool; `pool <= 1` is the
+    /// fully serial pass.
+    pub(crate) fn reconcile_startup_with_pool(
+        store: &mut Store,
+        sandbox_base: &Path,
+        pool: usize,
+    ) -> Result<()> {
         const STARTUP_GROUP_BATCH: usize = 64;
         // Every aggregate reader below requires an allocation identity; a
         // legacy row without one used to abort the whole restore (and with it
@@ -1802,6 +1933,11 @@ impl CustodyService {
             }
             successor_after = page.last().copied();
         }
+        // One worktree listing per repository for the whole classification
+        // pass, and every live-root proof computed concurrently up front
+        // (#961); see `WorktreeListings`.
+        let mut listings = Self::prefetch_startup_live_proofs(store, sandbox_base, pool)?;
+        after_startup_prefetch_for_test(sandbox_base);
         let mut after = None;
         loop {
             let groups = store.startup_custody_group_page(after.as_deref(), STARTUP_GROUP_BATCH)?;
@@ -1810,13 +1946,22 @@ impl CustodyService {
             };
             for group in groups {
                 if group.custody_id.is_some() {
-                    Self::reconcile_startup_existing_aggregate(store, sandbox_base, &group)?;
+                    Self::reconcile_startup_existing_aggregate(
+                        store,
+                        sandbox_base,
+                        &group,
+                        &mut listings,
+                    )?;
                 } else {
                     let sessions = Self::bounded_legacy_group_sessions(store, &group)?;
                     match group.sandbox_root.as_deref() {
-                        Some(root) => {
-                            Self::reconcile_startup_root_group(store, sandbox_base, root, sessions)?
-                        }
+                        Some(root) => Self::reconcile_startup_root_group(
+                            store,
+                            sandbox_base,
+                            root,
+                            sessions,
+                            &mut listings,
+                        )?,
                         None => Self::reconcile_startup_rootless_session(
                             store,
                             sessions.into_iter().next().ok_or_else(|| {
@@ -1863,6 +2008,7 @@ impl CustodyService {
         store: &mut Store,
         sandbox_base: &Path,
         group: &StartupCustodyGroup,
+        listings: &mut WorktreeListings,
     ) -> Result<()> {
         const PARTICIPANT_PAGE: usize = 64;
         let custody_id = group.custody_id.expect("aggregate group checked");
@@ -2031,7 +2177,7 @@ impl CustodyService {
         }
 
         if root.state != "live" {
-            return Self::authenticate_startup_terminal_root(store, sandbox_base, &root);
+            return Self::authenticate_startup_terminal_root(store, sandbox_base, &root, listings);
         }
         let owner_id = root.owner_session_id.expect("checked live owner");
         let owner = store.get_session(owner_id)?.ok_or_else(|| {
@@ -2039,11 +2185,13 @@ impl CustodyService {
         })?;
         let authorization = match startup_settlement_failure_for_test() {
             Some(error) => Err(error),
-            None => Self::authorize_live(
+            None => Self::authorize_live_with_listings(
                 &owner,
                 store,
                 sandbox_base,
                 SandboxCustodyTransitionV1::StartupReconciliation,
+                listings,
+                None,
             ),
         };
         match authorization {
@@ -2103,10 +2251,16 @@ impl CustodyService {
         sandbox_base: &Path,
         sandbox_root: &str,
         sessions: Vec<Session>,
+        listings: &mut WorktreeListings,
     ) -> Result<()> {
         if let Some(root) = store.startup_custody_root_for_sandbox_root(sandbox_root)? {
             if root.state != "live" {
-                return Self::authenticate_startup_terminal_root(store, sandbox_base, &root);
+                return Self::authenticate_startup_terminal_root(
+                    store,
+                    sandbox_base,
+                    &root,
+                    listings,
+                );
             }
             let Some(owner_id) = root.owner_session_id else {
                 // A malformed live root with no owner has no capability to
@@ -2124,11 +2278,13 @@ impl CustodyService {
             })?;
             let authorization = match startup_settlement_failure_for_test() {
                 Some(error) => Err(error),
-                None => Self::authorize_live(
+                None => Self::authorize_live_with_listings(
                     &owner,
                     store,
                     sandbox_base,
                     SandboxCustodyTransitionV1::StartupReconciliation,
+                    listings,
+                    None,
                 ),
             };
             match authorization {
@@ -2184,6 +2340,7 @@ impl CustodyService {
         store: &mut Store,
         sandbox_base: &Path,
         root: &crate::store::sandbox_custody::StartupCustodyRoot,
+        listings: &mut WorktreeListings,
     ) -> Result<()> {
         let root_path = Path::new(&root.sandbox_root);
         // Static identity is authenticated before any root probe. An ENOENT
@@ -2264,65 +2421,85 @@ impl CustodyService {
                 && matches!(session.sandbox_kind, Some(SandboxKind::GitWorktree))
                 && session.sandbox_root.as_deref().map(Path::new) == Some(root_path)
                 && session.sandbox_branch.as_deref() == Some(root.sandbox_branch.as_str()));
+        let inputs = TerminalProofInputs {
+            root_path: root_path.to_path_buf(),
+            canonical_repo,
+            sandbox_branch: root.sandbox_branch.clone(),
+            repository_identity: root.repository_identity.clone(),
+            source_commit: root.source_commit.clone(),
+        };
+        let proof = match listings.take_prefetched_terminal_proof(root.custody_id, &inputs) {
+            Some(proof) => proof,
+            None => Self::probe_startup_terminal_root(&inputs),
+        };
+        match proof {
+            TerminalRootProof::Absent => store.publish_startup_terminal_root(root.custody_id),
+            TerminalRootProof::Refused(code) => {
+                store.quarantine_startup_terminal_root(root.custody_id, code)
+            }
+            // The evidence probe is side-effect free, so evaluating it
+            // regardless of `tuple_matches` yields the same decision.
+            TerminalRootProof::Evidence { valid } if tuple_matches && valid => {
+                store.publish_startup_terminal_root(root.custody_id)
+            }
+            TerminalRootProof::Evidence { .. } => store.quarantine_startup_terminal_root(
+                root.custody_id,
+                SandboxCustodyErrorCodeV1::WorktreeMismatch,
+            ),
+        }
+    }
+
+    /// The filesystem/Git half of terminal-root authentication: no Store
+    /// access and no writes, so startup can run it concurrently (#961).
+    fn probe_startup_terminal_root(inputs: &TerminalProofInputs) -> TerminalRootProof {
+        let root_path = inputs.root_path.as_path();
         match std::fs::symlink_metadata(root_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return store.publish_startup_terminal_root(root.custody_id);
+                return TerminalRootProof::Absent;
             }
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             _ => {
-                return store.quarantine_startup_terminal_root(
-                    root.custody_id,
-                    SandboxCustodyErrorCodeV1::RootIdentityMismatch,
-                );
+                return TerminalRootProof::Refused(SandboxCustodyErrorCodeV1::RootIdentityMismatch);
             }
         }
         let canonical_root = match std::fs::canonicalize(root_path) {
             Ok(path) if path == root_path => path,
             _ => {
-                return store.quarantine_startup_terminal_root(
-                    root.custody_id,
-                    SandboxCustodyErrorCodeV1::RootIdentityMismatch,
-                );
+                return TerminalRootProof::Refused(SandboxCustodyErrorCodeV1::RootIdentityMismatch);
             }
         };
-        let registered = git_output(&canonical_repo, ["worktree", "list", "--porcelain"]);
+        let canonical_repo = inputs.canonical_repo.as_path();
+        let registered = git_output(canonical_repo, ["worktree", "list", "--porcelain"]);
         let common = git_output(
             &canonical_root,
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )
         .and_then(|path| std::fs::canonicalize(path).ok());
         let root_head = git_output(&canonical_root, ["rev-parse", "HEAD"]);
-        let valid = tuple_matches
-            && git_output(&canonical_root, ["rev-parse", "--show-toplevel"])
-                .is_some_and(|top| PathBuf::from(top) == canonical_root)
+        let valid = git_output(&canonical_root, ["rev-parse", "--show-toplevel"])
+            .is_some_and(|top| PathBuf::from(top) == canonical_root)
             && git_output(&canonical_root, ["branch", "--show-current"]).as_deref()
-                == Some(root.sandbox_branch.as_str())
+                == Some(inputs.sandbox_branch.as_str())
             && registered.is_some_and(|listed| {
                 root_head.as_deref().is_some_and(|head| {
                     has_matching_worktree_stanza_with_head(
                         &listed,
                         &canonical_root,
-                        &root.sandbox_branch,
+                        &inputs.sandbox_branch,
                         head,
                     )
                 })
             })
             && common.is_some_and(|identity| {
-                identity.to_string_lossy() == root.repository_identity
+                identity.to_string_lossy() == inputs.repository_identity
                     && std::fs::canonicalize(canonical_repo.join(".git"))
                         .is_ok_and(|repo_identity| repo_identity == identity)
             })
             && git_success(
                 &canonical_root,
-                ["merge-base", "--is-ancestor", &root.source_commit, "HEAD"],
+                ["merge-base", "--is-ancestor", &inputs.source_commit, "HEAD"],
             );
-        if !valid {
-            return store.quarantine_startup_terminal_root(
-                root.custody_id,
-                SandboxCustodyErrorCodeV1::WorktreeMismatch,
-            );
-        }
-        store.publish_startup_terminal_root(root.custody_id)
+        TerminalRootProof::Evidence { valid }
     }
 
     fn try_reconstruct_legacy_live_root(
@@ -2720,6 +2897,39 @@ impl CustodyService {
         sandbox_base: &Path,
         transition: SandboxCustodyTransitionV1,
     ) -> Result<CustodyHandle> {
+        Self::authorize_live_holding(session, store, sandbox_base, transition, None)
+    }
+
+    /// [`authorize_live`] for a caller that already holds this session's
+    /// custody stripe from `lock_store_then_session_root` (Store first, stripe
+    /// acquired without waiting). `None` takes the stripe here, which may wait
+    /// for it while the caller holds the Store: only use it where no
+    /// maintenance proof can hold the same stripe (tests, startup).
+    pub(crate) fn authorize_live_holding(
+        session: &Session,
+        store: &mut Store,
+        sandbox_base: &Path,
+        transition: SandboxCustodyTransitionV1,
+        held: Option<CustodyRootGuard>,
+    ) -> Result<CustodyHandle> {
+        Self::authorize_live_with_listings(
+            session,
+            store,
+            sandbox_base,
+            transition,
+            &mut WorktreeListings::Fresh,
+            held,
+        )
+    }
+
+    fn authorize_live_with_listings(
+        session: &Session,
+        store: &mut Store,
+        sandbox_base: &Path,
+        transition: SandboxCustodyTransitionV1,
+        listings: &mut WorktreeListings,
+        held: Option<CustodyRootGuard>,
+    ) -> Result<CustodyHandle> {
         Self::classify_for_transition(session, transition)?;
         let custody_id = match store.live_custody_for_session(session.id) {
             Ok(custody) => custody.custody_id,
@@ -2739,8 +2949,15 @@ impl CustodyService {
                 return Err(Self::refusal(code, Some(session.id), transition));
             }
         };
-        let _root_guard = lock_custody_root(custody_id);
-        Self::authorize_live_locked(session, store, sandbox_base, transition)
+        let _root_guard = held.unwrap_or_else(|| lock_custody_root(custody_id));
+        Self::authorize_live_locked_with_listings(
+            session,
+            store,
+            sandbox_base,
+            transition,
+            true,
+            listings,
+        )
     }
 
     /// Retry preauthentication/bind validation must be observational: a
@@ -2751,6 +2968,18 @@ impl CustodyService {
         store: &mut Store,
         sandbox_base: &Path,
         transition: SandboxCustodyTransitionV1,
+    ) -> Result<CustodyHandle> {
+        Self::authorize_live_nonmutating_holding(session, store, sandbox_base, transition, None)
+    }
+
+    /// [`authorize_live_nonmutating`] with the stripe already held (see
+    /// [`authorize_live_holding`]).
+    fn authorize_live_nonmutating_holding(
+        session: &Session,
+        store: &mut Store,
+        sandbox_base: &Path,
+        transition: SandboxCustodyTransitionV1,
+        held: Option<CustodyRootGuard>,
     ) -> Result<CustodyHandle> {
         Self::classify_for_transition(session, transition)?;
         let custody_id = store
@@ -2763,17 +2992,8 @@ impl CustodyService {
                 )
             })?
             .custody_id;
-        let _root_guard = lock_custody_root(custody_id);
+        let _root_guard = held.unwrap_or_else(|| lock_custody_root(custody_id));
         Self::authorize_live_locked_with_policy(session, store, sandbox_base, transition, false)
-    }
-
-    fn authorize_live_locked(
-        session: &Session,
-        store: &mut Store,
-        sandbox_base: &Path,
-        transition: SandboxCustodyTransitionV1,
-    ) -> Result<CustodyHandle> {
-        Self::authorize_live_locked_with_policy(session, store, sandbox_base, transition, true)
     }
 
     fn authorize_live_locked_with_policy(
@@ -2782,6 +3002,24 @@ impl CustodyService {
         sandbox_base: &Path,
         transition: SandboxCustodyTransitionV1,
         record_failure: bool,
+    ) -> Result<CustodyHandle> {
+        Self::authorize_live_locked_with_listings(
+            session,
+            store,
+            sandbox_base,
+            transition,
+            record_failure,
+            &mut WorktreeListings::Fresh,
+        )
+    }
+
+    fn authorize_live_locked_with_listings(
+        session: &Session,
+        store: &mut Store,
+        sandbox_base: &Path,
+        transition: SandboxCustodyTransitionV1,
+        record_failure: bool,
+        listings: &mut WorktreeListings,
     ) -> Result<CustodyHandle> {
         Self::classify_for_transition(session, transition)?;
         let persisted = store.live_custody_for_session(session.id).map_err(|_| {
@@ -2811,32 +3049,233 @@ impl CustodyService {
                 Self::refusal(code, Some(session.id), transition)
             }
         };
-        Self::authenticate_live_filesystem(session, &persisted, sandbox_base, failure)
+        Self::authenticate_live_filesystem(session, &persisted, sandbox_base, listings, failure)
+    }
+
+    /// Compute every live root's filesystem/Git proof, and every retained
+    /// terminal root's evidence probe, concurrently before the serial startup
+    /// pass (#961). Each probe is a pure function of its inputs, the sandbox
+    /// base, the filesystem and the pass-scoped listing snapshot; it reads no
+    /// Store and writes nothing. Startup runs before any provider or sandbox
+    /// mutation is restored, so an early probe is the result the serial pass
+    /// would compute. The serial pass is unchanged: it applies each result
+    /// in its own order through the existing publication, revalidation
+    /// failure, quarantine and invalidation paths, and re-probes any root
+    /// whose inputs differ from the prefetched ones.
+    fn prefetch_startup_live_proofs(
+        store: &Store,
+        sandbox_base: &Path,
+        pool: usize,
+    ) -> Result<WorktreeListings> {
+        enum Job {
+            Terminal(Uuid, TerminalProofInputs),
+            Live(
+                Box<Session>,
+                crate::store::sandbox_custody::PersistedCustody,
+            ),
+        }
+        enum Proof {
+            Terminal(TerminalRootProof, Option<WorktreeFingerprint>),
+            Live(
+                std::result::Result<(), SandboxCustodyErrorCodeV1>,
+                Option<WorktreeFingerprint>,
+            ),
+        }
+        if pool <= 1 {
+            return Ok(WorktreeListings::startup_snapshot());
+        }
+        let started = std::time::Instant::now();
+        // Terminal probes are the longest (a fresh listing and five Git
+        // calls each), so they are claimed first.
+        let mut jobs: Vec<Job> = store
+            .startup_terminal_root_probe_inputs()?
+            .into_iter()
+            .filter(|(_, inputs)| {
+                std::fs::symlink_metadata(&inputs.root_path).is_ok_and(|metadata| metadata.is_dir())
+            })
+            .map(|(custody_id, inputs)| Job::Terminal(custody_id, inputs))
+            .collect();
+        for owner_id in store.startup_live_root_owner_ids()? {
+            let Some(owner) = store.get_session(owner_id)? else {
+                continue;
+            };
+            if Self::classify_for_transition(
+                &owner,
+                SandboxCustodyTransitionV1::StartupReconciliation,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Ok(persisted) = store.live_custody_for_session(owner_id) else {
+                continue;
+            };
+            jobs.push(Job::Live(Box::new(owner), persisted));
+        }
+        // One listing per repository, keyed exactly as the live probe keys it.
+        let repositories: Vec<PathBuf> = jobs
+            .iter()
+            .filter_map(|job| match job {
+                Job::Live(owner, _) => std::fs::canonicalize(&owner.working_dir).ok(),
+                Job::Terminal(..) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let listed = scoped_pool_map(
+            &repositories,
+            pool,
+            || (),
+            |(), _, repo| git_output(repo, ["worktree", "list", "--porcelain"]),
+        );
+        let listings: HashMap<PathBuf, Option<String>> =
+            repositories.into_iter().zip(listed).collect();
+        let results = scoped_pool_map(
+            &jobs,
+            pool,
+            || WorktreeListings::StartupSnapshot(listings.clone()),
+            |local, index, job| {
+                // The worktree fingerprint is read before and after the
+                // probe; a change during the probe discards the result.
+                let (custody_id, proof) = match job {
+                    Job::Terminal(custody_id, inputs) => {
+                        let before = WorktreeFingerprint::observe(
+                            &inputs.root_path,
+                            &inputs.canonical_repo,
+                            None,
+                        );
+                        let proof = Self::probe_startup_terminal_root(inputs);
+                        let after = WorktreeFingerprint::observe(
+                            &inputs.root_path,
+                            &inputs.canonical_repo,
+                            None,
+                        );
+                        (
+                            *custody_id,
+                            Proof::Terminal(proof, (before == after).then_some(after)),
+                        )
+                    }
+                    Job::Live(owner, persisted) => {
+                        let observe = || {
+                            owner.sandbox_root.as_deref().map(|root| {
+                                WorktreeFingerprint::observe(
+                                    root,
+                                    &owner.working_dir,
+                                    Some(sandbox_base),
+                                )
+                            })
+                        };
+                        let before = observe();
+                        let proof =
+                            Self::probe_live_filesystem(owner, persisted, sandbox_base, local);
+                        let after = observe();
+                        (
+                            persisted.custody_id,
+                            Proof::Live(proof, if before == after { after } else { None }),
+                        )
+                    }
+                };
+                startup_probe_completed_for_test(sandbox_base, index, jobs.len(), custody_id);
+                proof
+            },
+        );
+        // Only admissions are kept, and only with a stable, fully readable
+        // fingerprint: every refusal is re-probed by the serial pass itself.
+        let mut proofs = HashMap::new();
+        let mut terminal_proofs = HashMap::new();
+        for (job, result) in jobs.into_iter().zip(results) {
+            match (job, result) {
+                (Job::Live(owner, persisted), Proof::Live(Ok(()), Some(fingerprint)))
+                    if fingerprint.is_readable() =>
+                {
+                    proofs.insert(
+                        persisted.custody_id,
+                        PrefetchedLiveProof {
+                            inputs: LiveProofInputs::of(&owner, &persisted),
+                            fingerprint,
+                        },
+                    );
+                }
+                (Job::Terminal(custody_id, inputs), Proof::Terminal(proof, Some(fingerprint)))
+                    if proof.admits() && fingerprint.is_readable() =>
+                {
+                    terminal_proofs.insert(
+                        custody_id,
+                        PrefetchedTerminalProof {
+                            inputs,
+                            fingerprint,
+                            proof,
+                        },
+                    );
+                }
+                (Job::Live(..), Proof::Live(..)) | (Job::Terminal(..), Proof::Terminal(..)) => {}
+                _ => unreachable!("each job yields its own proof kind"),
+            }
+        }
+        tracing::info!(
+            live_roots = proofs.len(),
+            terminal_roots = terminal_proofs.len(),
+            pool,
+            duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "Prefetched startup custody proofs"
+        );
+        Ok(WorktreeListings::StartupPrefetched(Box::new(
+            StartupPrefetch {
+                listings,
+                proofs,
+                terminal_proofs,
+            },
+        )))
     }
 
     fn authenticate_live_filesystem(
         session: &Session,
         persisted: &crate::store::sandbox_custody::PersistedCustody,
         sandbox_base: &Path,
+        listings: &mut WorktreeListings,
         mut failure: impl FnMut(SandboxCustodyErrorCodeV1) -> DaemonError,
     ) -> Result<CustodyHandle> {
+        // A startup proof computed concurrently for exactly these inputs is
+        // the same deterministic result this probe would return (#961).
+        let proof = match listings.take_prefetched_proof(session, persisted, sandbox_base) {
+            Some(proof) => proof,
+            None => Self::probe_live_filesystem(session, persisted, sandbox_base, listings),
+        };
+        match proof {
+            Ok(()) => Ok(CustodyHandle::Sandboxed(SandboxedCustody {
+                session_id: session.id,
+                custody_id: persisted.custody_id,
+                owner_generation: persisted.generation,
+            })),
+            Err(code) => Err(failure(code)),
+        }
+    }
+
+    /// The filesystem/Git half of live authentication: no Store access and no
+    /// writes, so startup can run it concurrently. Returns the first refusal.
+    fn probe_live_filesystem(
+        session: &Session,
+        persisted: &crate::store::sandbox_custody::PersistedCustody,
+        sandbox_base: &Path,
+        listings: &mut WorktreeListings,
+    ) -> std::result::Result<(), SandboxCustodyErrorCodeV1> {
         let Some(session_root) = session.sandbox_root.as_ref() else {
-            return Err(failure(SandboxCustodyErrorCodeV1::TupleIncomplete));
+            return Err(SandboxCustodyErrorCodeV1::TupleIncomplete);
         };
         let Some(session_branch) = session.sandbox_branch.as_deref() else {
-            return Err(failure(SandboxCustodyErrorCodeV1::TupleIncomplete));
+            return Err(SandboxCustodyErrorCodeV1::TupleIncomplete);
         };
         if persisted.owner_session_id != session.id
             || persisted.canonical_repo_dir != session.working_dir.to_string_lossy()
             || persisted.sandbox_root != session_root.to_string_lossy()
             || persisted.sandbox_branch != session_branch
         {
-            return Err(failure(SandboxCustodyErrorCodeV1::RootIdentityMismatch));
+            return Err(SandboxCustodyErrorCodeV1::RootIdentityMismatch);
         }
         let base = std::fs::canonicalize(sandbox_base)
-            .map_err(|_| failure(SandboxCustodyErrorCodeV1::RootOutsideBase))?;
+            .map_err(|_| SandboxCustodyErrorCodeV1::RootOutsideBase)?;
         let root = std::fs::canonicalize(session_root)
-            .map_err(|_| failure(SandboxCustodyErrorCodeV1::RootMissing))?;
+            .map_err(|_| SandboxCustodyErrorCodeV1::RootMissing)?;
         let allocation_root_name = persisted.allocation_id.to_string();
         if !root.starts_with(&base)
             || root.file_name().and_then(|name| name.to_str())
@@ -2844,50 +3283,55 @@ impl CustodyService {
             || root != *session_root
             || persisted.sandbox_root != root.to_string_lossy()
         {
-            return Err(failure(SandboxCustodyErrorCodeV1::RootOutsideBase));
+            return Err(SandboxCustodyErrorCodeV1::RootOutsideBase);
         }
         let canonical = std::fs::canonicalize(&session.working_dir)
-            .map_err(|_| failure(SandboxCustodyErrorCodeV1::RootMissing))?;
+            .map_err(|_| SandboxCustodyErrorCodeV1::RootMissing)?;
         if canonical != session.working_dir
             || persisted.canonical_repo_dir != canonical.to_string_lossy()
         {
-            return Err(failure(SandboxCustodyErrorCodeV1::RootIdentityMismatch));
+            return Err(SandboxCustodyErrorCodeV1::RootIdentityMismatch);
         }
-        if !git_output(&root, ["rev-parse", "--show-toplevel"])
-            .is_some_and(|top| PathBuf::from(top) == root)
-            || git_output(&root, ["branch", "--show-current"]).as_deref() != Some(session_branch)
-        {
-            return Err(failure(SandboxCustodyErrorCodeV1::WorktreeMismatch));
-        }
-        let Some(common_dir) = git_output(
-            &root,
-            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ) else {
-            return Err(failure(SandboxCustodyErrorCodeV1::WorktreeMismatch));
+        // One combined rev-parse only ever admits: its values are the ones
+        // the three separate calls print, so a match here is a match there.
+        // Anything else re-runs the separate calls, which decide every
+        // refusal exactly as before (#961).
+        let common_dir = match git_worktree_identity(&root).filter(|identity| {
+            PathBuf::from(&identity.toplevel) == root
+                && identity.head.strip_prefix("refs/heads/") == Some(session_branch)
+        }) {
+            Some(identity) => identity.common_dir,
+            None => {
+                if !git_output(&root, ["rev-parse", "--show-toplevel"])
+                    .is_some_and(|top| PathBuf::from(top) == root)
+                    || git_output(&root, ["branch", "--show-current"]).as_deref()
+                        != Some(session_branch)
+                {
+                    return Err(SandboxCustodyErrorCodeV1::WorktreeMismatch);
+                }
+                let Some(common_dir) = git_output(
+                    &root,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                ) else {
+                    return Err(SandboxCustodyErrorCodeV1::WorktreeMismatch);
+                };
+                common_dir
+            }
         };
         if std::fs::canonicalize(common_dir)
             .ok()
             .map(|path| path.to_string_lossy().to_string())
             != Some(persisted.repository_identity.clone())
         {
-            return Err(failure(SandboxCustodyErrorCodeV1::WorktreeMismatch));
+            return Err(SandboxCustodyErrorCodeV1::WorktreeMismatch);
         }
         if !git_is_ancestor(&root, &persisted.source_commit) {
-            return Err(failure(
-                SandboxCustodyErrorCodeV1::SourceRevisionUnavailable,
-            ));
+            return Err(SandboxCustodyErrorCodeV1::SourceRevisionUnavailable);
         }
-        let Some(registered) = git_output(&canonical, ["worktree", "list", "--porcelain"]) else {
-            return Err(failure(SandboxCustodyErrorCodeV1::WorktreeMismatch));
-        };
-        if !has_matching_worktree_stanza(&registered, &root, session_branch) {
-            return Err(failure(SandboxCustodyErrorCodeV1::WorktreeMismatch));
+        if listings.registers(&canonical, &root, session_branch) != Some(true) {
+            return Err(SandboxCustodyErrorCodeV1::WorktreeMismatch);
         }
-        Ok(CustodyHandle::Sandboxed(SandboxedCustody {
-            session_id: session.id,
-            custody_id: persisted.custody_id,
-            owner_generation: persisted.generation,
-        }))
+        Ok(())
     }
 
     /// Reserve then activate a persisted permit immediately before one effect.
@@ -3006,11 +3450,16 @@ impl CustodyService {
                     observed
                 };
                 let mut failure_code = None;
-                let revalidated =
-                    Self::authenticate_live_filesystem(session, &observed, sandbox_base, |code| {
+                let revalidated = Self::authenticate_live_filesystem(
+                    session,
+                    &observed,
+                    sandbox_base,
+                    &mut WorktreeListings::Fresh,
+                    |code| {
                         failure_code = Some(code);
                         Self::refusal(code, Some(session.id), transition)
-                    });
+                    },
+                );
                 let revalidated = match revalidated {
                     Ok(revalidated) => revalidated,
                     Err(error) => {
@@ -3324,29 +3773,63 @@ impl CustodyService {
             Err(reason) => return Ok(TargetReclaimOutcome::refused(reason)),
         };
         let root_already_locked = access.root_already_locked();
-        let intent = match access.with_store(|store| {
-            let _root_guard = if root_already_locked {
-                None
-            } else {
-                Some(
-                    crate::store::sandbox_custody::try_lock_custody_root(custody_id)
-                        .ok_or(ReclaimSkipReason::RootBusy)?,
-                )
+        let mut epoch = 0u32;
+        let mut epoch_attempts = 0u32;
+        let mut store_device = identity.device;
+        let prepared = loop {
+            store_device = match crate::store::target_reclaim_sweep::store_target_device(
+                identity.device,
+                epoch,
+            ) {
+                Some(store_device) => store_device,
+                None => break Some(Err(ReclaimSkipReason::TargetIdentityChanged)),
             };
-            if let Some(active_owner) = active_owner {
-                if active_owner()? {
-                    return Err(ReclaimSkipReason::ActiveOwner);
+            let prepared = access.with_store(|store| {
+                let _root_guard = if root_already_locked {
+                    None
+                } else {
+                    Some(
+                        crate::store::sandbox_custody::try_lock_custody_root(custody_id)
+                            .ok_or(ReclaimSkipReason::RootBusy)?,
+                    )
+                };
+                if let Some(active_owner) = active_owner {
+                    if active_owner()? {
+                        return Err(ReclaimSkipReason::ActiveOwner);
+                    }
                 }
+                store
+                    .prepare_target_reclaim_intent(
+                        custody_id,
+                        expected_generation,
+                        store_device,
+                        identity.inode,
+                    )
+                    .map_err(|_| ReclaimSkipReason::CustodyOrGenerationDrift)
+            });
+            match prepared {
+                Some(Ok(PrepareTargetReclaimIntentResult::Terminal(event)))
+                    if crate::store::target_reclaim_sweep::terminal_evidence_is_for_earlier_target(
+                        &event,
+                        identity.birth,
+                    ) =>
+                {
+                    // The same device and inode now name a directory born after
+                    // the evidence was recorded: a rebuilt `target/` that reused
+                    // the reclaimed inode. It is a new target with its own
+                    // identity epoch (#1040).
+                    epoch = crate::store::target_reclaim_sweep::next_target_epoch(epoch, identity.birth);
+                    if epoch > crate::store::target_reclaim_sweep::TARGET_EPOCH_MAX
+                        || epoch_attempts >= MAX_TARGET_EPOCH_PROBES
+                    {
+                        break Some(Err(ReclaimSkipReason::TargetIdentityChanged));
+                    }
+                    epoch_attempts += 1;
+                }
+                other => break other,
             }
-            store
-                .prepare_target_reclaim_intent(
-                    custody_id,
-                    expected_generation,
-                    identity.device,
-                    identity.inode,
-                )
-                .map_err(|_| ReclaimSkipReason::CustodyOrGenerationDrift)
-        }) {
+        };
+        let intent = match prepared {
             Some(Ok(PrepareTargetReclaimIntentResult::Active(intent))) => intent,
             Some(Ok(PrepareTargetReclaimIntentResult::Terminal(event))) => {
                 tracing::debug!(
@@ -3364,7 +3847,7 @@ impl CustodyService {
                 if event.custody_id != custody_id
                     || event.generation != expected_generation
                     || event.allocation_id != target.allocation_id
-                    || event.expected_device != identity.device
+                    || event.expected_device != store_device
                     || event.expected_inode != identity.inode
                 {
                     return Ok(TargetReclaimOutcome::refused(
@@ -3409,7 +3892,10 @@ impl CustodyService {
             allocation_id: intent.allocation_id,
             bucket: intent.bucket,
             slot_name: intent.slot_name.clone(),
-            expected_device: intent.expected_device,
+            expected_device: crate::store::target_reclaim_sweep::split_store_target_device(
+                intent.expected_device,
+            )
+            .0,
             expected_inode: intent.expected_inode,
         };
         let staged_outcome = pinned.stage_registered_target(&filesystem_intent);
@@ -3636,6 +4122,427 @@ fn legacy_lineage(sessions: &[Session], allocation: Uuid) -> Option<Vec<(Uuid, C
     (result.len() == sessions.len()).then_some(result)
 }
 
+/// Source of `git worktree list --porcelain` for live-root authentication.
+///
+/// Runtime effects always read a fresh listing. Startup custody
+/// classification runs before any provider or sandbox mutation is restored,
+/// and the daemon is the only writer of sandbox worktrees, so it reads each
+/// repository's listing once and reuses it for every live root (#961): with
+/// ~1,400 registered worktrees one listing costs ~31 ms, and the per-root
+/// call made startup classification quadratic (32.8 s on the hub). Every
+/// other per-root check (paths, branch, common dir, source ancestry) still
+/// runs per root.
+///
+/// `StartupPrefetched` is the same snapshot plus live-root proofs computed
+/// concurrently before the serial pass (see
+/// [`CustodyService::prefetch_startup_live_proofs`]).
+enum WorktreeListings {
+    Fresh,
+    StartupSnapshot(HashMap<PathBuf, Option<String>>),
+    StartupPrefetched(Box<StartupPrefetch>),
+}
+
+/// The startup listing snapshot and the proofs computed from it.
+struct StartupPrefetch {
+    listings: HashMap<PathBuf, Option<String>>,
+    proofs: HashMap<Uuid, PrefetchedLiveProof>,
+    terminal_proofs: HashMap<Uuid, PrefetchedTerminalProof>,
+}
+
+/// Everything `probe_startup_terminal_root` reads besides the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalProofInputs {
+    pub(crate) root_path: PathBuf,
+    pub(crate) canonical_repo: PathBuf,
+    pub(crate) sandbox_branch: String,
+    pub(crate) repository_identity: String,
+    pub(crate) source_commit: String,
+}
+
+/// The filesystem/Git evidence for a terminal root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRootProof {
+    /// The root is genuinely absent (compatible with completed cleanup).
+    Absent,
+    /// Evidence substitution (symlink, non-directory, non-canonical path).
+    Refused(SandboxCustodyErrorCodeV1),
+    /// The retained worktree's Git evidence, before the tuple check.
+    Evidence { valid: bool },
+}
+
+impl TerminalRootProof {
+    /// Outcomes that publish history rather than quarantine.
+    const fn admits(self) -> bool {
+        matches!(self, Self::Absent | Self::Evidence { valid: true })
+    }
+}
+
+/// A concurrently computed terminal-root admission, its exact inputs and
+/// the worktree fingerprint it was computed against.
+struct PrefetchedTerminalProof {
+    inputs: TerminalProofInputs,
+    fingerprint: WorktreeFingerprint,
+    proof: TerminalRootProof,
+}
+
+/// A concurrently computed live-root admission (the probe passed), its
+/// exact inputs and the worktree fingerprint it was computed against. It is
+/// used only when the serial pass reaches the same root with identical
+/// inputs and an identical fingerprint; anything else re-probes serially.
+struct PrefetchedLiveProof {
+    inputs: LiveProofInputs,
+    fingerprint: WorktreeFingerprint,
+}
+
+/// One observed filesystem fact: present with a value, absent, or not
+/// readable (any other I/O error, which disqualifies a cached proof).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Observed<T> {
+    Missing,
+    Present(T),
+    Unreadable,
+}
+
+impl<T> Observed<T> {
+    fn from_io(result: std::io::Result<T>) -> Self {
+        match result {
+            Ok(value) => Self::Present(value),
+            // A path under a regular file cannot exist either (the reftable
+            // backend leaves `refs/heads` as a stub file).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Self::Missing
+            }
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    const fn is_readable(&self) -> bool {
+        !matches!(self, Self::Unreadable)
+    }
+
+    fn present(&self) -> Option<&T> {
+        match self {
+            Self::Present(value) => Some(value),
+            Self::Missing | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Everything a startup worktree probe's verdict depends on besides its
+/// Store inputs, read with plain file reads (no Git process) so the serial
+/// pass can cheaply confirm a prefetched proof is still current (#961):
+/// the path resolutions the probes perform, the root's inode, the linked
+/// worktree's `.git` pointer, its administrative files (`HEAD`,
+/// `commondir`, the `gitdir` back-link that `git worktree list` reports,
+/// `config.worktree`), the common directory's `config`, the storage of the
+/// branch `HEAD` names (loose ref and `packed-refs` line for the files
+/// backend; the common and per-worktree reftable table lists, which change
+/// on every ref update, for the reftable backend) and the files that can
+/// change ancestry (`shallow`, `info/grafts`, `objects/info/alternates`,
+/// replace refs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeFingerprint {
+    sandbox_base: Option<Observed<PathBuf>>,
+    root_inode: Observed<(u64, u64, bool, bool)>,
+    root: Observed<PathBuf>,
+    repository: Observed<PathBuf>,
+    repository_git: Observed<PathBuf>,
+    dot_git: Observed<Vec<u8>>,
+    head: Observed<Vec<u8>>,
+    commondir: Observed<Vec<u8>>,
+    backlink: Observed<Vec<u8>>,
+    worktree_config: Observed<Vec<u8>>,
+    common: Observed<PathBuf>,
+    config: Observed<Vec<u8>>,
+    branch_ref: Observed<Vec<u8>>,
+    packed_branch_ref: Observed<Vec<Vec<u8>>>,
+    reftable: Observed<Vec<u8>>,
+    worktree_reftable: Observed<Vec<u8>>,
+    shallow: Observed<Vec<u8>>,
+    grafts: Observed<Vec<u8>>,
+    alternates: Observed<Vec<u8>>,
+    replace_refs: Observed<Vec<(std::ffi::OsString, Vec<u8>)>>,
+}
+
+impl WorktreeFingerprint {
+    fn observe(root: &Path, repository: &Path, sandbox_base: Option<&Path>) -> Self {
+        let read = |path: &Path| Observed::from_io(std::fs::read(path));
+        let dot_git = read(&root.join(".git"));
+        // A linked worktree's `.git` file names its administrative dir.
+        let gitdir = dot_git.present().and_then(|contents| {
+            let text = std::str::from_utf8(contents).ok()?;
+            let target = text.trim_end().strip_prefix("gitdir: ")?;
+            Some(root.join(target))
+        });
+        let at_gitdir = |name: &str| match &gitdir {
+            Some(gitdir) => read(&gitdir.join(name)),
+            None => Observed::Missing,
+        };
+        let head = at_gitdir("HEAD");
+        let commondir = at_gitdir("commondir");
+        let common_path = gitdir.as_ref().and_then(|gitdir| {
+            let text = std::str::from_utf8(commondir.present()?).ok()?;
+            Some(gitdir.join(text.trim_end()))
+        });
+        let at_common = |name: &str| match &common_path {
+            Some(common) => read(&common.join(name)),
+            None => Observed::Missing,
+        };
+        let branch = head.present().and_then(|contents| {
+            let text = std::str::from_utf8(contents).ok()?;
+            Some(text.trim_end().strip_prefix("ref: ")?.to_owned())
+        });
+        let branch_ref = match &branch {
+            Some(branch) => at_common(branch),
+            None => Observed::Missing,
+        };
+        let packed_branch_ref = match (&branch, at_common("packed-refs")) {
+            (Some(branch), Observed::Present(packed)) => {
+                let suffix = format!(" {branch}");
+                Observed::Present(
+                    packed
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| line.ends_with(suffix.as_bytes()))
+                        .map(<[u8]>::to_vec)
+                        .collect(),
+                )
+            }
+            (_, Observed::Unreadable) => Observed::Unreadable,
+            _ => Observed::Missing,
+        };
+        let replace_refs = match &common_path {
+            Some(common) => match std::fs::read_dir(common.join("refs/replace")) {
+                Ok(entries) => {
+                    let mut refs = Vec::new();
+                    let mut readable = true;
+                    for entry in entries {
+                        match entry.and_then(|entry| {
+                            std::fs::read(entry.path())
+                                .map(|contents| (entry.file_name(), contents))
+                        }) {
+                            Ok(reference) => refs.push(reference),
+                            Err(_) => readable = false,
+                        }
+                    }
+                    refs.sort();
+                    if readable {
+                        Observed::Present(refs)
+                    } else {
+                        Observed::Unreadable
+                    }
+                }
+                Err(error) => Observed::from_io(Err(error)),
+            },
+            None => Observed::Missing,
+        };
+        Self {
+            sandbox_base: sandbox_base.map(|base| Observed::from_io(std::fs::canonicalize(base))),
+            root_inode: Observed::from_io(root_inode(root)),
+            root: Observed::from_io(std::fs::canonicalize(root)),
+            repository: Observed::from_io(std::fs::canonicalize(repository)),
+            repository_git: Observed::from_io(std::fs::canonicalize(repository.join(".git"))),
+            dot_git,
+            backlink: at_gitdir("gitdir"),
+            worktree_config: at_gitdir("config.worktree"),
+            head,
+            commondir,
+            common: match &common_path {
+                Some(common) => Observed::from_io(std::fs::canonicalize(common)),
+                None => Observed::Missing,
+            },
+            config: at_common("config"),
+            branch_ref,
+            packed_branch_ref,
+            reftable: at_common("reftable/tables.list"),
+            worktree_reftable: at_gitdir("reftable/tables.list"),
+            shallow: at_common("shallow"),
+            grafts: at_common("info/grafts"),
+            alternates: at_common("objects/info/alternates"),
+            replace_refs,
+        }
+    }
+
+    /// Whether every fact was read or proven absent.
+    fn is_readable(&self) -> bool {
+        self.sandbox_base.as_ref().is_none_or(Observed::is_readable)
+            && self.root_inode.is_readable()
+            && self.root.is_readable()
+            && self.repository.is_readable()
+            && self.repository_git.is_readable()
+            && self.dot_git.is_readable()
+            && self.head.is_readable()
+            && self.commondir.is_readable()
+            && self.backlink.is_readable()
+            && self.worktree_config.is_readable()
+            && self.common.is_readable()
+            && self.config.is_readable()
+            && self.branch_ref.is_readable()
+            && self.packed_branch_ref.is_readable()
+            && self.reftable.is_readable()
+            && self.worktree_reftable.is_readable()
+            && self.shallow.is_readable()
+            && self.grafts.is_readable()
+            && self.alternates.is_readable()
+            && self.replace_refs.is_readable()
+    }
+}
+
+#[cfg(unix)]
+fn root_inode(root: &Path) -> std::io::Result<(u64, u64, bool, bool)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(root)?;
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.is_dir(),
+        metadata.file_type().is_symlink(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn root_inode(_root: &Path) -> std::io::Result<(u64, u64, bool, bool)> {
+    Err(std::io::Error::other("root inode is unavailable"))
+}
+
+/// Everything `probe_live_filesystem` reads besides the (pass-constant)
+/// sandbox base, the filesystem and the listing snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveProofInputs {
+    session_id: Uuid,
+    working_dir: PathBuf,
+    sandbox_root: Option<PathBuf>,
+    sandbox_branch: Option<String>,
+    persisted: crate::store::sandbox_custody::PersistedCustody,
+}
+
+impl LiveProofInputs {
+    fn of(session: &Session, persisted: &crate::store::sandbox_custody::PersistedCustody) -> Self {
+        Self {
+            session_id: session.id,
+            working_dir: session.working_dir.clone(),
+            sandbox_root: session.sandbox_root.clone(),
+            sandbox_branch: session.sandbox_branch.clone(),
+            persisted: persisted.clone(),
+        }
+    }
+}
+
+impl WorktreeListings {
+    fn startup_snapshot() -> Self {
+        Self::StartupSnapshot(HashMap::new())
+    }
+
+    /// Whether `repo` registers `root` on `branch`; `None` when the listing
+    /// cannot be read.
+    fn registers(&mut self, repo: &Path, root: &Path, branch: &str) -> Option<bool> {
+        let cache = match self {
+            Self::Fresh => {
+                return git_output(repo, ["worktree", "list", "--porcelain"])
+                    .map(|listing| has_matching_worktree_stanza(&listing, root, branch));
+            }
+            Self::StartupSnapshot(cache) => cache,
+            Self::StartupPrefetched(prefetch) => &mut prefetch.listings,
+        };
+        cache
+            .entry(repo.to_path_buf())
+            .or_insert_with(|| git_output(repo, ["worktree", "list", "--porcelain"]))
+            .as_deref()
+            .map(|listing| has_matching_worktree_stanza(listing, root, branch))
+    }
+
+    /// The prefetched admission for this root, if it was computed from
+    /// exactly these inputs and the worktree fingerprint is unchanged now.
+    /// Each proof is used at most once; a second authorization of the same
+    /// root in one pass, any drift, and every refusal re-probe.
+    fn take_prefetched_proof(
+        &mut self,
+        session: &Session,
+        persisted: &crate::store::sandbox_custody::PersistedCustody,
+        sandbox_base: &Path,
+    ) -> Option<std::result::Result<(), SandboxCustodyErrorCodeV1>> {
+        let Self::StartupPrefetched(prefetch) = self else {
+            return None;
+        };
+        let prefetched = prefetch.proofs.remove(&persisted.custody_id)?;
+        if prefetched.inputs != LiveProofInputs::of(session, persisted) {
+            return None;
+        }
+        let root = session.sandbox_root.as_deref()?;
+        let now = WorktreeFingerprint::observe(root, &session.working_dir, Some(sandbox_base));
+        (now.is_readable() && now == prefetched.fingerprint).then_some(Ok(()))
+    }
+
+    /// The prefetched terminal-root admission, under the same once-only,
+    /// identical-inputs, unchanged-fingerprint rule.
+    fn take_prefetched_terminal_proof(
+        &mut self,
+        custody_id: Uuid,
+        inputs: &TerminalProofInputs,
+    ) -> Option<TerminalRootProof> {
+        let Self::StartupPrefetched(prefetch) = self else {
+            return None;
+        };
+        let prefetched = prefetch.terminal_proofs.remove(&custody_id)?;
+        if prefetched.inputs != *inputs {
+            return None;
+        }
+        let now = WorktreeFingerprint::observe(&inputs.root_path, &inputs.canonical_repo, None);
+        (now.is_readable() && now == prefetched.fingerprint).then_some(prefetched.proof)
+    }
+}
+
+/// Bounded pool for startup live-root proofs (#961).
+const STARTUP_PROOF_POOL_MAX: usize = 8;
+
+pub(crate) fn startup_proof_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(STARTUP_PROOF_POOL_MAX)
+}
+
+/// Run `work` for every item on up to `pool` scoped threads, each with its
+/// own `state`, and return the results in item order.
+fn scoped_pool_map<T: Sync, S, R: Send>(
+    items: &[T],
+    pool: usize,
+    state: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, usize, &T) -> R + Sync,
+) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<R>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..pool.clamp(1, items.len().max(1)) {
+            scope.spawn(|| {
+                let mut local = state();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let result = work(&mut local, index, item);
+                    *results[index]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("every item is claimed exactly once")
+        })
+        .collect()
+}
+
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -3646,6 +4553,42 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// A worktree's top level, absolute common directory and symbolic HEAD
+/// from one `git rev-parse`, each line trimmed exactly as `git_output`
+/// trims one call's output.
+#[derive(Debug, PartialEq, Eq)]
+struct GitWorktreeIdentity {
+    toplevel: String,
+    common_dir: String,
+    head: String,
+}
+
+fn git_worktree_identity(root: &Path) -> Option<GitWorktreeIdentity> {
+    let output = std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--symbolic-full-name",
+            "HEAD",
+        ])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let identity = GitWorktreeIdentity {
+        toplevel: lines.next()?.trim().to_owned(),
+        common_dir: lines.next()?.trim().to_owned(),
+        head: lines.next()?.trim().to_owned(),
+    };
+    lines.next().is_none().then_some(identity)
 }
 
 fn git_success<const N: usize>(cwd: &Path, args: [&str; N]) -> bool {
@@ -3663,6 +4606,10 @@ fn git_is_ancestor(root: &Path, source_commit: &str) -> bool {
         .status()
         .is_ok_and(|status| status.success())
 }
+
+/// Epoch probes one reclaim attempt makes before it refuses. Each probe is one
+/// retained terminal event for a target that reused the same device and inode.
+const MAX_TARGET_EPOCH_PROBES: u32 = 8;
 
 fn has_matching_worktree_stanza(porcelain: &str, root: &Path, branch: &str) -> bool {
     let expected_root = format!("worktree {}", root.display());
@@ -3688,4 +4635,450 @@ fn has_matching_worktree_stanza_with_head(
             && lines.contains(&expected_branch.as_str())
             && lines.contains(&expected_head.as_str())
     })
+}
+
+#[cfg(test)]
+mod worktree_listing_tests {
+    use super::WorktreeListings;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn startup_snapshot_reads_each_repository_listing_once_for_every_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let roots = (0..3)
+            .map(|index| {
+                let root = temp.path().join(format!("root-{index}"));
+                let branch = format!("rsi/root-{index}");
+                git(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &branch,
+                        root.to_str().unwrap(),
+                    ],
+                );
+                (std::fs::canonicalize(&root).unwrap(), branch)
+            })
+            .collect::<Vec<_>>();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let mut snapshot = WorktreeListings::startup_snapshot();
+        for (root, branch) in &roots {
+            assert_eq!(snapshot.registers(&repo, root, branch), Some(true));
+        }
+        // A root on the wrong branch is still refused from the snapshot.
+        assert_eq!(
+            snapshot.registers(&repo, &roots[0].0, "rsi/other"),
+            Some(false)
+        );
+        let WorktreeListings::StartupSnapshot(cache) = &snapshot else {
+            panic!("startup snapshot mode");
+        };
+        assert_eq!(cache.len(), 1, "one listing read for one repository");
+
+        // Runtime authentication reads a fresh listing and sees a removal.
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                roots[2].0.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            WorktreeListings::Fresh.registers(&repo, &roots[2].0, &roots[2].1),
+            Some(false)
+        );
+        assert_eq!(
+            WorktreeListings::Fresh.registers(&repo, &roots[1].0, &roots[1].1),
+            Some(true)
+        );
+    }
+    /// A prefetched startup admission is used once, only for the exact
+    /// inputs it was computed from, and only while the worktree fingerprint
+    /// is unchanged (#961).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn prefetched_proof_is_used_once_and_only_for_identical_inputs() {
+        use super::{
+            LiveProofInputs, PrefetchedLiveProof, PrefetchedTerminalProof, StartupPrefetch,
+            TerminalProofInputs, TerminalRootProof, WorktreeFingerprint,
+        };
+        use crate::store::sandbox_custody::PersistedCustody;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let root = base.join("root");
+        let repo = temp.path().join("repo");
+        let mut session = crate::store::tests::make_test_session();
+        session.working_dir = repo.clone();
+        session.sandbox_root = Some(root.clone());
+        session.sandbox_branch = Some("rsi/root".into());
+        let persisted = PersistedCustody {
+            custody_id: Uuid::new_v4(),
+            allocation_session_id: session.id,
+            allocation_id: session.id,
+            owner_session_id: session.id,
+            generation: 1,
+            canonical_repo_dir: repo.display().to_string(),
+            sandbox_root: root.display().to_string(),
+            sandbox_branch: "rsi/root".into(),
+            repository_identity: "/repo/.git".into(),
+            source_commit: "0".repeat(40),
+        };
+        let prefetched = || {
+            WorktreeListings::StartupPrefetched(Box::new(StartupPrefetch {
+                listings: HashMap::new(),
+                terminal_proofs: HashMap::new(),
+                proofs: HashMap::from([(
+                    persisted.custody_id,
+                    PrefetchedLiveProof {
+                        inputs: LiveProofInputs::of(&session, &persisted),
+                        fingerprint: WorktreeFingerprint::observe(&root, &repo, Some(&base)),
+                    },
+                )]),
+            }))
+        };
+
+        let mut listings = prefetched();
+        assert_eq!(
+            listings.take_prefetched_proof(&session, &persisted, &base),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            listings.take_prefetched_proof(&session, &persisted, &base),
+            None,
+            "a second authorization in the pass re-probes"
+        );
+
+        let mut listings = prefetched();
+        let mut drifted = session.clone();
+        drifted.sandbox_branch = Some("rsi/other".into());
+        assert_eq!(
+            listings.take_prefetched_proof(&drifted, &persisted, &base),
+            None
+        );
+
+        let mut listings = prefetched();
+        let mut advanced = persisted.clone();
+        advanced.generation = 2;
+        assert_eq!(
+            listings.take_prefetched_proof(&session, &advanced, &base),
+            None
+        );
+
+        // The worktree changed after the proof: re-probe.
+        let mut listings = prefetched();
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            listings.take_prefetched_proof(&session, &persisted, &base),
+            None
+        );
+
+        assert_eq!(
+            WorktreeListings::Fresh.take_prefetched_proof(&session, &persisted, &base),
+            None
+        );
+
+        // Terminal-root admissions follow the same rule.
+        let inputs = TerminalProofInputs {
+            root_path: root.clone(),
+            canonical_repo: repo.clone(),
+            sandbox_branch: "rsi/root".into(),
+            repository_identity: "/repo/.git".into(),
+            source_commit: "0".repeat(40),
+        };
+        let custody_id = persisted.custody_id;
+        let terminal = || {
+            WorktreeListings::StartupPrefetched(Box::new(StartupPrefetch {
+                listings: HashMap::new(),
+                proofs: HashMap::new(),
+                terminal_proofs: HashMap::from([(
+                    custody_id,
+                    PrefetchedTerminalProof {
+                        inputs: inputs.clone(),
+                        fingerprint: WorktreeFingerprint::observe(&root, &repo, None),
+                        proof: TerminalRootProof::Evidence { valid: true },
+                    },
+                )]),
+            }))
+        };
+        let mut listings = terminal();
+        assert_eq!(
+            listings.take_prefetched_terminal_proof(custody_id, &inputs),
+            Some(TerminalRootProof::Evidence { valid: true })
+        );
+        assert_eq!(
+            listings.take_prefetched_terminal_proof(custody_id, &inputs),
+            None
+        );
+        let mut listings = terminal();
+        let mut moved = inputs.clone();
+        moved.canonical_repo = temp.path().join("elsewhere");
+        assert_eq!(
+            listings.take_prefetched_terminal_proof(custody_id, &moved),
+            None
+        );
+        let mut listings = terminal();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            listings.take_prefetched_terminal_proof(custody_id, &inputs),
+            None
+        );
+    }
+
+    /// The fingerprint sees a branch switch, a moved branch tip and a removed
+    /// root without running Git.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn worktree_fingerprint_sees_head_branch_tip_and_root_changes() {
+        use super::WorktreeFingerprint;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let root = temp.path().join("root");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "rsi/root",
+                root.to_str().unwrap(),
+            ],
+        );
+        let root = std::fs::canonicalize(&root).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let observe = || WorktreeFingerprint::observe(&root, &repo, Some(temp.path()));
+        let original = observe();
+        assert!(original.is_readable());
+        assert_eq!(observe(), original, "stable while nothing changes");
+
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "moved tip"]);
+        let moved = observe();
+        assert_ne!(moved, original, "a new branch tip is seen");
+
+        git(&repo, &["pack-refs", "--all"]);
+        let packed = observe();
+        assert_ne!(packed, moved, "packing the branch ref is seen");
+        assert_eq!(observe(), packed);
+
+        git(&root, &["switch", "-q", "-c", "rsi/elsewhere"]);
+        assert_ne!(observe(), packed, "a switched HEAD is seen");
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_ne!(observe(), packed, "a removed root is seen");
+    }
+
+    /// With the reftable backend the per-worktree table list carries HEAD
+    /// and the common one carries branch tips; both are fingerprinted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn worktree_fingerprint_sees_reftable_head_and_branch_changes() {
+        use super::WorktreeFingerprint;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(
+            &repo,
+            &["init", "-q", "-b", "main", "--ref-format=reftable"],
+        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let root = temp.path().join("root");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "rsi/root",
+                root.to_str().unwrap(),
+            ],
+        );
+        let root = std::fs::canonicalize(&root).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let observe = || WorktreeFingerprint::observe(&root, &repo, Some(temp.path()));
+        let original = observe();
+        assert!(original.is_readable(), "{original:?}");
+        assert_eq!(observe(), original);
+
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "moved tip"]);
+        let moved = observe();
+        assert_ne!(moved, original, "a new reftable branch tip is seen");
+
+        git(&root, &["switch", "-q", "-c", "rsi/elsewhere"]);
+        assert_ne!(observe(), moved, "a switched reftable HEAD is seen");
+    }
+
+    /// The combined rev-parse prints exactly what the separate calls print,
+    /// and a detached HEAD is never taken for a branch (#961).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn combined_rev_parse_matches_the_separate_calls() {
+        use super::{GitWorktreeIdentity, git_output, git_worktree_identity};
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let root = temp.path().join("root");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "rsi/root",
+                root.to_str().unwrap(),
+            ],
+        );
+        let root = std::fs::canonicalize(&root).unwrap();
+        let separate = || GitWorktreeIdentity {
+            toplevel: git_output(&root, ["rev-parse", "--show-toplevel"]).unwrap(),
+            common_dir: git_output(
+                &root,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .unwrap(),
+            head: format!(
+                "refs/heads/{}",
+                git_output(&root, ["branch", "--show-current"]).unwrap()
+            ),
+        };
+        assert_eq!(git_worktree_identity(&root), Some(separate()));
+
+        git(&root, &["checkout", "-q", "--detach"]);
+        let identity = git_worktree_identity(&root).unwrap();
+        assert_eq!(identity.head, "HEAD");
+        assert_eq!(
+            git_output(&root, ["branch", "--show-current"]).as_deref(),
+            Some("")
+        );
+        assert!(git_worktree_identity(&temp.path().join("missing")).is_none());
+    }
+}
+
+/// Operator-run timing of startup custody classification against a copy of a
+/// real store (#961). The source database is copied before it is opened, and
+/// every Git probe is read-only, so the live store and sandboxes are never
+/// mutated:
+///
+/// ```text
+/// sqlite3 ~/.rsi/rsi.db ".backup /tmp/rsi-bench.db"
+/// RSI_CUSTODY_BENCH_DB=/tmp/rsi-bench.db \
+///   cargo test --release -p rsid --lib startup_custody_bench -- --ignored --nocapture
+/// ```
+///
+/// `RSI_CUSTODY_BENCH_POOL` overrides the proof pool (1 is fully serial);
+/// `RSI_CUSTODY_BENCH_DUMP=<file>` writes the final custody roots, event
+/// write order, projections and Session statuses (no timestamps).
+#[cfg(test)]
+mod startup_custody_bench {
+    use super::CustodyService;
+    use crate::store::Store;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn outcome_dump(store: &Store) -> String {
+        const QUERIES: [&str; 4] = [
+            "SELECT 'root|'||custody_id||'|'||state||'|'||COALESCE(owner_session_id,'')||'|'||
+                    generation||'|'||event_sequence||'|'||validation_state||'|'||
+                    COALESCE(validated_generation,'')||'|'||COALESCE(validation_error_code,'')
+               FROM sandbox_custody_roots ORDER BY custody_id",
+            "SELECT 'event|'||custody_id||'|'||sequence||'|'||event_kind||'|'||cause||'|'||
+                    COALESCE(error_code,'')
+               FROM sandbox_custody_events ORDER BY rowid",
+            "SELECT 'projection|'||session_id||'|'||execution_state||'|'||freshness||'|'||
+                    COALESCE(effective_cwd,'')||'|'||COALESCE(custody_id,'')||'|'||
+                    COALESCE(custody_generation,'')||'|'||COALESCE(error_code,'')
+               FROM session_execution_projections ORDER BY session_id",
+            "SELECT 'session|'||id||'|'||status||'|'||COALESCE(stop_reason,'')
+               FROM sessions ORDER BY id",
+        ];
+        let mut dump = String::new();
+        for sql in QUERIES {
+            let mut statement = store.conn.prepare(sql).expect("dump query");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("dump rows");
+            for row in rows {
+                dump.push_str(&row.expect("dump row"));
+                dump.push('\n');
+            }
+        }
+        dump
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    #[ignore = "needs RSI_CUSTODY_BENCH_DB and reads real sandboxes"]
+    fn reconcile_startup_against_store_copy() {
+        let Ok(source) = std::env::var("RSI_CUSTODY_BENCH_DB") else {
+            eprintln!("RSI_CUSTODY_BENCH_DB unset; skipping");
+            return;
+        };
+        // Print the prefetch summary line (roots, pool, duration_ms).
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        let sandbox_base = std::env::var("RSI_CUSTODY_BENCH_SANDBOX_BASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(std::env::var("HOME").expect("HOME")).join(".rsi/sandboxes")
+            });
+        let sandbox_base = std::fs::canonicalize(&sandbox_base).expect("sandbox base");
+        let pool = std::env::var("RSI_CUSTODY_BENCH_POOL")
+            .ok()
+            .and_then(|pool| pool.parse().ok())
+            .unwrap_or_else(super::startup_proof_pool_size);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let copy = temp.path().join("rsi.db");
+        std::fs::copy(&source, &copy).expect("copy bench store");
+        let mut store = Store::open(&copy).expect("open bench store copy");
+
+        let started = Instant::now();
+        CustodyService::reconcile_startup_with_pool(&mut store, &sandbox_base, pool)
+            .expect("reconcile");
+        eprintln!(
+            "startup_custody_bench pool={pool} reconcile_ms={}",
+            started.elapsed().as_millis()
+        );
+        if let Ok(path) = std::env::var("RSI_CUSTODY_BENCH_DUMP") {
+            std::fs::write(path, outcome_dump(&store)).expect("write dump");
+        }
+    }
 }

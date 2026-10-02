@@ -613,3 +613,162 @@ async fn forged_restart_intent_cannot_rebind_review() {
         assert_eq!(code, "manager_review_unproven_continuation");
     }
 }
+
+/// #967: (assignment state, failure code, reserved reviewer, launch action id,
+/// launch action state).
+fn review_launch_row(
+    store: &Store,
+    assignment: Uuid,
+) -> (String, Option<String>, Uuid, Uuid, String) {
+    let (state, code, reviewer, action, launch): (String, Option<String>, String, String, String) =
+        store
+            .conn
+            .query_row(
+                "SELECT a.state,a.failure_code,a.reviewer_session_id,a.action_operation_id,o.state
+                   FROM manager_review_assignments a
+                   JOIN harness_manager_v2_operations o ON o.id=a.action_operation_id
+                  WHERE a.assignment_id=?1",
+                [assignment.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    (
+        state,
+        code,
+        Uuid::parse_str(&reviewer).unwrap(),
+        Uuid::parse_str(&action).unwrap(),
+        launch,
+    )
+}
+
+/// #967: request a DB review and allocate it, leaving the reviewer launch
+/// action queued with no reviewer session row yet.
+async fn allocated_review_before_launch(f: &Fixture, key: &str) -> Uuid {
+    record_db_review_source(f, key).await;
+    let assignment = request_db_review(f, key).await;
+    let store = f.handle.store.lock().await;
+    let state: String = store
+        .conn
+        .query_row(
+            "SELECT state FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if state == "reserved" {
+        assert!(
+            store
+                .allocate_manager_review_assignment(assignment)
+                .unwrap()
+        );
+    }
+    assignment
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn review_launch_in_flight_is_pending_and_a_dead_assignment_refuses_its_launch() {
+    let f = fixture().await;
+    let assignment = allocated_review_before_launch(&f, "launch-in-flight").await;
+    let store = f.handle.store.lock().await;
+    let (state, _, reviewer, action, launch) = review_launch_row(&store, assignment);
+    assert_eq!(state, "allocating");
+    assert_eq!(launch, "queued");
+    assert!(store.get_session(reviewer).unwrap().is_none());
+
+    // Reconcile before the reviewer session row exists: still pending.
+    assert!(!store.refresh_manager_review_assignment(assignment).unwrap());
+    store.reconcile_manager_review_assignments_once().unwrap();
+    assert_eq!(review_launch_row(&store, assignment).0, "allocating");
+    let op = store.manager_action_operation(action).unwrap().unwrap();
+    store.require_manager_review_launch_live(&op).unwrap();
+
+    // The launch settled without creating the reviewer: fail, naming its state.
+    store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_operations SET state='succeeded' WHERE id=?1",
+            [action.to_string()],
+        )
+        .unwrap();
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    let (state, code, ..) = review_launch_row(&store, assignment);
+    assert_eq!(state, "failed");
+    assert_eq!(
+        code.as_deref(),
+        Some("manager_review_reviewer_unavailable_launch_succeeded")
+    );
+
+    // A terminal assignment refuses its launch before any provider turn.
+    let error = store
+        .require_manager_review_launch_live(&op)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("manager_review_assignment_terminal"),
+        "{error}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn review_launch_stuck_past_establishment_deadline_fails_typed() {
+    let f = fixture().await;
+    let assignment = allocated_review_before_launch(&f, "launch-stuck").await;
+    let store = f.handle.store.lock().await;
+    let (.., action, launch) = review_launch_row(&store, assignment);
+    assert_eq!(launch, "queued");
+    // The launch action has been queued past the establishment deadline.
+    let stale = (Utc::now() - chrono::Duration::minutes(31))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_operations SET created_at=?2 WHERE id=?1",
+            params![action.to_string(), stale],
+        )
+        .unwrap();
+    assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+    let (state, code, ..) = review_launch_row(&store, assignment);
+    assert_eq!(state, "failed");
+    assert_eq!(
+        code.as_deref(),
+        Some("manager_review_reviewer_unavailable_launch_queued_timeout")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn failed_review_assignment_marks_its_running_reviewer_for_halt() {
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "orphan-reviewer").await;
+    let store = f.handle.store.lock().await;
+    // While the review is live its reviewer is not an orphan.
+    assert_eq!(
+        store.manager_review_orphaned_reviewers().unwrap(),
+        Vec::<Uuid>::new()
+    );
+    let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "UPDATE manager_review_assignments
+                SET state='failed',failure_code='manager_review_receipt_missing_interrupted',
+                    terminal_at=?2,updated_at=?2,row_version=row_version+1
+              WHERE assignment_id=?1",
+            params![assignment.to_string(), stamp],
+        )
+        .unwrap();
+    assert_eq!(
+        store.manager_review_orphaned_reviewers().unwrap(),
+        vec![f.reviewer]
+    );
+}

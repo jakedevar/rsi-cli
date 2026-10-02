@@ -846,7 +846,7 @@ async fn launch_and_wait_session(
     iteration: u32,
 ) -> AnyhowResult<NodeData> {
     let session_id = session_manager
-        .launch_session_with_retry_admission(
+        .boxed_launch_session_with_retry_admission(
             config,
             None,
             false,
@@ -882,7 +882,12 @@ async fn launch_and_wait_session(
                 // Timeout — check cancellation.
                 if cancel_flag.load(Ordering::Relaxed) {
                     warn!(node_id, %session_id, "cancelling graph node session");
-                    let _ = session_manager.interrupt_session(session_id).await;
+                    let _ = session_manager
+                        .interrupt_session_from(
+                            session_id,
+                            crate::terminal_cause::InterruptSource::GraphCancel,
+                        )
+                        .await;
                     event_bus.unsubscribe();
                     anyhow::bail!("node '{}' cancelled", node_id);
                 }

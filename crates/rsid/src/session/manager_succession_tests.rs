@@ -351,8 +351,11 @@ async fn assert_drain_reserved_without_effect(
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establishes_once() {
+    // The deadline bounds the scenario, not fixture construction: building the
+    // Store is CPU-bound and contends on SQLite's process-wide allocator mutex
+    // when many tests start together (#1095).
+    let w = RootWorld::with_rotation_enabled(false).await;
     tokio::time::timeout(Duration::from_secs(30), async {
-        let w = RootWorld::with_rotation_enabled(false).await;
         let request = w
             .request(
                 w.owner,
@@ -450,11 +453,13 @@ async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establ
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_live_rotation_disable_after_admission_refuses_without_effect() {
+    // Fixtures are built before the scenario deadline starts (see the enable
+    // test above, #1095).
+    let worlds = [RootWorld::new().await, RootWorld::new().await];
     tokio::time::timeout(Duration::from_secs(30), async {
         // First isolate the live guard before write-through persistence catches
         // up; then cover the completed operator update with both values false.
-        for persist_disabled in [false, true] {
-            let w = RootWorld::new().await;
+        for (persist_disabled, w) in [false, true].into_iter().zip(worlds) {
             let request = w
                 .request(
                     w.owner,

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "version": 149,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v149.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:d36e637f1ba66618aa75147939c434e00f9b8bdc3ff1516da567a2945f997abc",
+      "sites": [
+        {
+          "anchor": "fn migrate_v149(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 149 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "pub(crate) const AGENT_JOBS_CLOUD_SWEEP_SCHEMA_VERSION: i32 = 149;",
+          "replacement": "pub(crate) const AGENT_JOBS_CLOUD_SWEEP_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:2817fecd59e1d6632a4e0362a2a956c6b2b35f301398bc6d602f5802ca3c29f6",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 149;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

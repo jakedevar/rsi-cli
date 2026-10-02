@@ -39,6 +39,68 @@ CONDITIONAL_RUNTIME_NAMES = {
     },  # enclosing dev-fixtures feature
     "other-03": {"refuses_reclaim_without_linux_openat2_containment"},
 }
+TARGET_OS_GATE = re.compile(r'#\[cfg\((?:all\(test, )?(not\()?target_os = "([a-z]+)"\)?\)?\)\]')
+HOST_TARGET_OS = {"darwin": "macos", "linux": "linux"}.get(sys.platform, sys.platform)
+# Tests whose `#[cfg(target_os = ...)]` excludes this host: present in the static
+# manifest, absent at runtime here. Filled by `source_inventory`.
+PLATFORM_CONDITIONAL_NAMES: dict[str, Counter] = {}
+MOD_DECL = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*;")
+
+
+def host_excluded(gate_line: str) -> bool:
+    """Whether a `#[cfg([not(]target_os = "...")[)]]` line excludes this host."""
+    stripped = gate_line.strip()
+    gate = TARGET_OS_GATE.fullmatch(stripped)
+    if not gate or stripped.count("(") != stripped.count(")"):
+        return False
+    return (gate.group(2) == HOST_TARGET_OS) == bool(gate.group(1))
+
+
+MOD_BLOCK = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z_0-9]*\s*\{\s*$")
+
+
+def host_excluded_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """1-based line ranges of inline `mod name { ... }` blocks gated to another OS."""
+    ranges = []
+    for index, line in enumerate(lines):
+        block = MOD_BLOCK.match(line)
+        if not block or index == 0 or not host_excluded(lines[index - 1]):
+            continue
+        closing = block.group(1) + "}"
+        end = next((j for j in range(index + 1, len(lines)) if lines[j].rstrip() == closing), None)
+        if end is None:
+            fail(f"cannot find the end of an OS-gated module at line {index + 1}")
+        ranges.append((index + 1, end + 1))
+    return ranges
+
+
+def host_excluded_module_files() -> set[str]:
+    """Source files whose `mod name;` declaration is gated to another OS."""
+    excluded: set[str] = set()
+    for path in sorted(SOURCE.rglob("*.rs")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("#![") and host_excluded(stripped.replace("#![", "#[", 1)):
+                excluded.add(path.relative_to(ROOT).as_posix())
+            elif stripped and not stripped.startswith(("//", "#![")):
+                break
+        for index, line in enumerate(lines):
+            declared = MOD_DECL.match(line)
+            if not declared or index == 0 or not host_excluded(lines[index - 1]):
+                continue
+            name = declared.group(1)
+            module_dir = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.with_suffix("")
+            matches = [
+                candidate
+                for candidate in (*module_dir.rglob(f"{name}.rs"), *module_dir.rglob(f"{name}/mod.rs"))
+            ]
+            if len(matches) != 1:
+                fail(f"{path.relative_to(ROOT).as_posix()}:{index + 1}: cannot resolve OS-gated module {name}")
+            excluded.add(matches[0].relative_to(ROOT).as_posix())
+    return excluded
+
+
 ATTR = re.compile(r"^[ \t]*#\[\s*(?:test|tokio::test(?:\([^]\n]*\))?)\s*\]", re.M)
 FUNCTION = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(")
 CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^\\'\n])'")
@@ -187,10 +249,12 @@ def source_inventory(shards: list[str], require_gates: bool) -> tuple[dict[tuple
     file_shards: dict[str, str] = {}
     ungated: list[tuple[str, str, int]] = []
     gated = 0
+    excluded_files = host_excluded_module_files()
     for path in sorted(SOURCE.rglob("*.rs")):
         relative = path.relative_to(ROOT).as_posix()
         is_bin = relative == "crates/rsid/src/main.rs" or relative.startswith("crates/rsid/src/bin/")
         raw_lines = path.read_text(encoding="utf-8").splitlines()
+        excluded_ranges = host_excluded_line_ranges(raw_lines)
         for name, line, has_gate in extract_tests(path):
             identity = (relative, name)
             previous = raw_lines[line - 2] if line > 1 else ""
@@ -209,6 +273,12 @@ def source_inventory(shards: list[str], require_gates: bool) -> tuple[dict[tuple
                 before_gate = raw_lines[line - 3] if line > 2 else ""
                 if before_gate.lstrip().startswith("#[cfg(") and "test-shard-" in before_gate:
                     fail(f"{relative}:{line}: duplicate shard gates")
+                if (
+                    host_excluded(before_gate)
+                    or relative in excluded_files
+                    or any(start < line < end for start, end in excluded_ranges)
+                ):
+                    PLATFORM_CONDITIONAL_NAMES.setdefault(shard, Counter())[name] += 1
                 if relative in file_shards and file_shards[relative] != shard:
                     fail(f"{relative}:{line}: one source file spans shards")
                 file_shards[relative] = shard
@@ -259,7 +329,9 @@ def check_runtime(directory: Path, manifest: dict[tuple[str, str], str], shards:
             names.append(runtime_name.rsplit("::", 1)[-1])
         expected = Counter(name for (source, name), assigned in manifest.items() if assigned == shard)
         actual = Counter(names)
-        optional = Counter(CONDITIONAL_RUNTIME_NAMES.get(shard, ()))
+        optional = Counter(CONDITIONAL_RUNTIME_NAMES.get(shard, ())) | PLATFORM_CONDITIONAL_NAMES.get(
+            shard, Counter()
+        )
         if optional - expected:
             fail(f"{path}: conditional runtime exception is absent from the static manifest")
         missing = expected - actual

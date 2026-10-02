@@ -373,3 +373,4 @@ User Input
 The compiler sits between raw user input and the session context injector.
 It is the first transformation in the pipeline. Everything downstream receives
 a structurally guaranteed prompt, never raw user text.
+See `/intake` for the operator-facing command that reuses these anchoring, acceptance and self-containment steps interactively to turn a request into an Issue.

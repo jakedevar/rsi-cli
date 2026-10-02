@@ -210,6 +210,21 @@ impl PersistenceHandle {
             .await
     }
 
+    /// Persist a terminal status with its cause atomically (#588).
+    pub(super) async fn update_terminal_status(
+        &self,
+        session_id: Uuid,
+        status: SessionStatus,
+        cause: String,
+    ) -> Result<()> {
+        self.send(StoreCommand::UpdateTerminalSessionStatus {
+            session_id,
+            status,
+            cause,
+        })
+        .await
+    }
+
     pub(super) async fn update_failed_and_stage_autofile(
         &self,
         session_id: Uuid,
@@ -849,6 +864,23 @@ fn spawn_persistence_worker(
                             error = %e,
                             session_id = %session_id,
                             "Failed to update session status"
+                        );
+                    }
+                }
+                StoreCommand::UpdateTerminalSessionStatus {
+                    session_id,
+                    status,
+                    cause,
+                } => {
+                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                        s.set_session_terminal_status(session_id, status, &cause)
+                    })
+                    .await
+                    {
+                        tracing::error!(
+                            error = %e,
+                            session_id = %session_id,
+                            "Failed to update terminal session status"
                         );
                     }
                 }
@@ -1499,6 +1531,7 @@ mod tests {
             context_window: Some(1),
             resolved_context_budget: Some(context_budget(1, CapabilitySource::Configured)),
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,

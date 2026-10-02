@@ -8,6 +8,10 @@ use rsi_common::harness_manager::{
     HarnessManagerConfigV1, HarnessManagerScopeCandidateV1, HarnessManagerScopeModeV1,
     ListHarnessManagerScopeRequestV1,
 };
+use rsi_common::manager_nodes::{
+    ConfigureManagerNodeRequestV1, GetManagerNodeRequestV1, ListManagerNodesRequestV1,
+    ManagerNodeSelectorV1, ManagerNodeViewV1, RevokeManagerNodeRequestV1,
+};
 use rsi_common::types::{Session, SessionKind, SessionStatus};
 use uuid::Uuid;
 
@@ -199,6 +203,137 @@ pub(crate) async fn dispatch(app: &mut App, action: LcAction) {
         app.notify_error(error);
     }
     app.mark_dirty();
+}
+
+/// Minimal operator command surface for Slice A. The richer tree editor is
+/// Slice C; all mutations here still use the versioned daemon RPC.
+pub(crate) async fn dispatch_node_command(app: &mut App, command: &str) {
+    match run_node_command(app, command).await {
+        Ok(message) => app.notify_success(message),
+        Err(error) => app.notify_error(error),
+    }
+    app.mark_dirty();
+}
+
+async fn run_node_command(app: &mut App, command: &str) -> Result<String, String> {
+    let command = command.trim();
+    let project_id = app
+        .selected_session_state()
+        .and_then(|state| state.session.project_id)
+        .or(app.current_project_id)
+        .ok_or(NO_PROJECT)?;
+    if command == "list" {
+        let page = app
+            .client
+            .list_manager_nodes(ListManagerNodesRequestV1 {
+                project_id,
+                after_node_id: None,
+                limit: 64,
+            })
+            .await
+            .map_err(|error| format!("Manager nodes: {error}"))?;
+        if page.rows.is_empty() {
+            return Ok("No manager nodes for this project.".into());
+        }
+        let mut lines: Vec<String> = page.rows.iter().map(node_summary).collect();
+        if page.next_after_node_id.is_some() {
+            lines.push("More nodes available through ListManagerNodes RPC.".into());
+        }
+        return Ok(lines.join(" | "));
+    }
+    if let Some(raw) = command.strip_prefix("get ") {
+        let node_id = Uuid::parse_str(raw.trim())
+            .map_err(|_| "Use :manager node get <node UUID>.".to_string())?;
+        let node = app
+            .client
+            .get_manager_node(GetManagerNodeRequestV1 {
+                project_id,
+                node_id,
+            })
+            .await
+            .map_err(|error| format!("Manager node: {error}"))?
+            .ok_or_else(|| "Manager node unavailable.".to_string())?;
+        return Ok(node_summary(&node));
+    }
+    if let Some(raw) = command.strip_prefix("configure ") {
+        let request: ConfigureManagerNodeRequestV1 = serde_json::from_str(raw)
+            .map_err(|error| format!("Manager node request JSON: {error}"))?;
+        request
+            .validate()
+            .map_err(|error| format!("Manager node: {error}"))?;
+        if request.project_id != project_id {
+            return Err("Manager node project differs from the selected project.".into());
+        }
+        let node = app
+            .client
+            .configure_manager_node(request)
+            .await
+            .map_err(|error| format!("Manager node: {error}"))?;
+        return Ok(format!("Manager node saved: {}", node_summary(&node)));
+    }
+    if let Some(raw) = command.strip_prefix("revoke ") {
+        let mut parts = raw.split_whitespace();
+        let node_id = parts
+            .next()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| "Use :manager node revoke <node UUID> <epoch>.".to_string())?;
+        let expected_authority_epoch = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| "Use :manager node revoke <node UUID> <epoch>.".to_string())?;
+        if parts.next().is_some() {
+            return Err("Use :manager node revoke <node UUID> <epoch>.".into());
+        }
+        let current = app
+            .client
+            .get_manager_node(GetManagerNodeRequestV1 {
+                project_id,
+                node_id,
+            })
+            .await
+            .map_err(|error| format!("Manager node: {error}"))?
+            .ok_or_else(|| "Manager node unavailable.".to_string())?;
+        if current.authority_epoch != expected_authority_epoch {
+            return Err(
+                "Manager node changed. Run :manager node get and review before revoking.".into(),
+            );
+        }
+        let node = app
+            .client
+            .revoke_manager_node(RevokeManagerNodeRequestV1 {
+                project_id: current.project_id,
+                node_id,
+                expected_grant_version: current.grant_version,
+                expected_authority_epoch,
+                idempotency_key: Uuid::new_v4().to_string(),
+            })
+            .await
+            .map_err(|error| format!("Manager node: {error}"))?;
+        return Ok(format!("Manager node revoked: {}", node_summary(&node)));
+    }
+    Err("Use :manager node [list|get <UUID>|configure <JSON>|revoke <UUID> <epoch>].".into())
+}
+
+fn node_summary(node: &ManagerNodeViewV1) -> String {
+    let scope = match &node.selector {
+        Some(ManagerNodeSelectorV1::Project) => "project".to_string(),
+        Some(ManagerNodeSelectorV1::Selected {
+            group_ids,
+            epic_ids,
+        }) => format!("{} Groups, {} Epics", group_ids.len(), epic_ids.len()),
+        None => "revoked".into(),
+    };
+    format!(
+        "{} seat={} {:?}/{:?} scope={} grant={} epoch={} reports={}",
+        node.node_id,
+        node.seat_root_session_id,
+        node.state,
+        node.grant_state,
+        scope,
+        node.grant_version,
+        node.authority_epoch,
+        node.direct_reports,
+    )
 }
 
 async fn run_command(app: &mut App, action: LcAction) -> Result<(), String> {

@@ -13,6 +13,11 @@ pub(crate) fn render_session_meta_segment_for(
     let session_state = app.sessions.get(&session_id)?;
     let session = &session_state.session;
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let time_style = Style::default().fg(if theme::uses_terminal_default_backgrounds() {
+        theme::time_text()
+    } else {
+        theme::metadata_text()
+    });
     let metadata_style = Style::default().fg(theme::metadata_text());
 
     // Provider label
@@ -28,7 +33,14 @@ pub(crate) fn render_session_meta_segment_for(
         rsi_common::types::SessionProvider::Harness => "Harness",
         _ => "?",
     };
-    spans.push(Span::styled(provider_label, metadata_style));
+    spans.push(Span::styled(
+        provider_label,
+        metadata_style.fg(if theme::uses_terminal_default_backgrounds() {
+            super::glyphs::provider_color(session.provider)
+        } else {
+            theme::metadata_text()
+        }),
+    ));
 
     // Show active segment model (if model was switched), else session-level model
     let current_model = session_state
@@ -42,7 +54,11 @@ pub(crate) fn render_session_meta_segment_for(
         spans.push(Span::styled("  \u{00B7}  ", metadata_style));
         spans.push(Span::styled(
             crate::ui::session::abbreviate_model_name(model),
-            metadata_style,
+            metadata_style.fg(if theme::uses_terminal_default_backgrounds() {
+                theme::model_text()
+            } else {
+                theme::metadata_text()
+            }),
         ));
         if let Some(effort) = session
             .effort
@@ -55,7 +71,7 @@ pub(crate) fn render_session_meta_segment_for(
             ));
             spans.push(Span::styled(
                 format!(" {effort}"),
-                Style::default().fg(theme::dim_metadata()),
+                Style::default().fg(theme::effort_text()),
             ));
         }
     }
@@ -72,7 +88,7 @@ pub(crate) fn render_session_meta_segment_for(
             .map(crate::ui::session::format_work_time_ms)
         {
             spans.push(Span::styled("  \u{00B7}  ", metadata_style));
-            spans.push(Span::styled(elapsed, metadata_style));
+            spans.push(Span::styled(elapsed, time_style));
         }
     } else if let Some(duration) = session.duration_ms {
         let secs = duration / 1000;
@@ -80,11 +96,11 @@ pub(crate) fn render_session_meta_segment_for(
             spans.push(Span::styled("  \u{00B7}  ", metadata_style));
             spans.push(Span::styled(
                 format!("{}m{}s", secs / 60, secs % 60),
-                metadata_style,
+                time_style,
             ));
         } else {
             spans.push(Span::styled("  \u{00B7}  ", metadata_style));
-            spans.push(Span::styled(format!("{}s", secs), metadata_style));
+            spans.push(Span::styled(format!("{}s", secs), time_style));
         }
     }
     Some(spans)
@@ -237,6 +253,7 @@ mod tests {
             context_window: Some(200_000),
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -323,6 +340,48 @@ mod tests {
     /// Collect a span vector into a plain string (concatenated span contents).
     fn spans_text(spans: &[Span<'static>]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+    }
+
+    #[test]
+    fn truly_transparent_meta_distinguishes_provider_model_effort_and_time() {
+        let _guard = theme::pin_theme_state();
+        let mut app = test_app();
+        theme::set_theme_by_name("truly-transparent");
+        theme::clear_theme_role_overrides();
+        for status in [SessionStatus::Running, SessionStatus::Completed] {
+            let mut session = make_test_session(rsi_common::types::ContextUsageConfidence::Full);
+            session.model = Some("claude-sonnet-5".into());
+            session.effort = Some("high".into());
+            session.work_time_ms = Some(3_720_000);
+            session.duration_ms = Some(120_000);
+            session.status = status;
+            let id = install_session(&mut app, crate::types::SessionState::new(session));
+            let spans = render_session_meta_segment_for(&app, id).unwrap();
+            for (label, expected) in [
+                (
+                    "Claude",
+                    super::super::glyphs::provider_color(
+                        rsi_common::types::SessionProvider::Claude,
+                    ),
+                ),
+                ("Sonnet 5", theme::lavender()),
+                (" high", theme::peach()),
+                (
+                    if status == SessionStatus::Running {
+                        "1h2m"
+                    } else {
+                        "2m0s"
+                    },
+                    theme::sky(),
+                ),
+            ] {
+                let span = spans
+                    .iter()
+                    .find(|span| span.content == label)
+                    .unwrap_or_else(|| panic!("missing {label}: {}", spans_text(&spans)));
+                assert_eq!(span.style.fg, Some(expected), "{label}");
+            }
+        }
     }
 
     #[test]

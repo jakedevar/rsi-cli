@@ -1210,7 +1210,11 @@ pub(crate) trait RecursiveDagLiveSessionInterrupter: Send + Sync {
 #[async_trait]
 impl RecursiveDagLiveSessionInterrupter for SessionManager {
     async fn interrupt_recursive_dag_session(&self, session_id: Uuid) -> Result<()> {
-        self.interrupt_session(session_id).await
+        self.interrupt_session_from(
+            session_id,
+            crate::terminal_cause::InterruptSource::RecursiveDag,
+        )
+        .await
     }
 }
 
@@ -1871,6 +1875,7 @@ fn launch_config_from_envelope(envelope: &RecursiveDagLiveLaunchEnvelope) -> Lau
             branch: envelope.requested_sandbox_branch.clone(),
         });
     LaunchConfig {
+        completion_gates: None,
         query: envelope.launch_query.clone(),
         title: None,
         agent_role: None,
@@ -1895,6 +1900,7 @@ fn launch_config_from_envelope(envelope: &RecursiveDagLiveLaunchEnvelope) -> Lau
         workflow_id_override: None,
         max_retries: None,
         skip_project_model_default: false,
+        tool_policy: None,
         model_invocation_purpose:
             rsi_common::model_control::ModelInvocationPurpose::RecursiveLiveTask,
         // `group_id` is a label FK ("organize related sessions"), NOT hierarchy; the
@@ -2376,6 +2382,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -4722,7 +4729,8 @@ mod tests {
             .expect("missing interrupter follows production impl");
         let impl_source = &source[start..end];
 
-        assert!(impl_source.contains("self.interrupt_session(session_id).await"));
+        assert!(impl_source.contains("self.interrupt_session_from("));
+        assert!(impl_source.contains("InterruptSource::RecursiveDag"));
         for forbidden in [
             "Command::new",
             "tokio::process",
@@ -4741,7 +4749,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn rpc_dispatch_does_not_expose_recursive_live_interrupt() {
-        let source = include_str!("../rpc.rs");
+        let source = crate::rpc::rpc_production_source();
         assert!(!source.contains("RecursiveDagLiveInterrupt"));
         assert!(!source.contains("request_interrupt("));
         assert!(!source.contains("request_recursive_live_interrupt"));

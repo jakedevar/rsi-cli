@@ -183,6 +183,7 @@ fn make_session(id: Uuid, working_dir: &Path, status: SessionStatus) -> Session 
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -495,6 +496,12 @@ async fn explicit_archive_routes_to_cleanup_once_and_preserves_source() {
         .restore_sessions()
         .await
         .expect("restore production-shaped completed cache");
+    // Hermetic process proof: the host's /proc (an ssh login, a portal fuse
+    // helper, a user manager) must not decide this test. Production keeps
+    // reading the live /proc; the seam is compiled only for tests.
+    let _hermetic_proc = fix
+        .manager
+        .install_archive_cleanup_test_holder_proc(session_id);
     let source_ref = format!("refs/heads/{branch}");
     let source_oid = run_git(fix.repo.path(), &["rev-parse", &source_ref]);
     let mut events = fix.event_bus.subscribe();
@@ -660,6 +667,82 @@ async fn explicit_purge_is_blocked_and_dependent_state_survives() {
         "this session owns a retained sandbox",
     );
 
+    assert_eq!(snapshot(&fix, session_id, &root, epic_id), before);
+    assert_no_success_events(&fix.event_bus, &mut events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hermetic_proof_still_refuses_a_real_holder_of_the_tree() {
+    let fix = fixture();
+    let (session_id, root, _, epic_id) = sandbox_session(
+        &fix,
+        SessionStatus::Completed,
+        SandboxCleanupState::Live,
+        true,
+    );
+    fix.manager
+        .restore_sessions()
+        .await
+        .expect("hydrate the production completed snapshot");
+    let proc = fix
+        .manager
+        .install_archive_cleanup_test_holder_proc(session_id);
+    proc.add_fd_holder(&root);
+    let before = snapshot(&fix, session_id, &root, epic_id);
+    let mut events = fix.event_bus.subscribe();
+
+    // The synthetic fd names the pre-quarantine path, so the reproof sees the
+    // holder either as a live holder or as an unresolvable target; both refuse.
+    let refusal = fix
+        .manager
+        .archive_session(session_id)
+        .await
+        .expect_err("a held tree must be refused");
+    let rsid::error::DaemonError::StructuredRpc { data, .. } = &refusal else {
+        panic!("expected a structured archive cleanup refusal: {refusal:?}");
+    };
+    let envelope: ArchiveCleanupErrorV1 =
+        serde_json::from_value(data.clone()).expect("typed archive cleanup refusal");
+    assert!(
+        ["process_holder_present", "proof_unavailable"].contains(&envelope.safe_code.as_str()),
+        "unexpected refusal code {}",
+        envelope.safe_code.as_str()
+    );
+
+    assert!(root.exists(), "a held tree is never removed");
+    assert_eq!(snapshot(&fix, session_id, &root, epic_id), before);
+    assert_no_success_events(&fix.event_bus, &mut events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hermetic_proof_still_refuses_an_unreadable_unknown_holder() {
+    let fix = fixture();
+    let (session_id, root, _, epic_id) = sandbox_session(
+        &fix,
+        SessionStatus::Completed,
+        SandboxCleanupState::Live,
+        true,
+    );
+    fix.manager
+        .restore_sessions()
+        .await
+        .expect("hydrate the production completed snapshot");
+    let proc = fix
+        .manager
+        .install_archive_cleanup_test_holder_proc(session_id);
+    proc.add_unreadable_process();
+    let before = snapshot(&fix, session_id, &root, epic_id);
+    let mut events = fix.event_bus.subscribe();
+
+    assert_blocked(
+        fix.manager.archive_session(session_id).await,
+        "process_holder_present",
+    );
+
+    assert!(
+        root.exists(),
+        "an unreadable holder is never assumed absent"
+    );
     assert_eq!(snapshot(&fix, session_id, &root, epic_id), before);
     assert_no_success_events(&fix.event_bus, &mut events);
 }

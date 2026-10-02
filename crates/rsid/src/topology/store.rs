@@ -199,14 +199,15 @@ impl AttemptStatus {
 
 /// Failure classes (plan §2.5). Only the executor writes them.
 pub(crate) mod failure {
+    pub(crate) use crate::store_support::topology_usage::{
+        LAUNCH_REFUSED, LOST_BEFORE_SESSION, POLICY_REFUSED,
+    };
     pub(crate) const SESSION_FAILED: &str = "session_failed";
     pub(crate) const TIMEOUT: &str = "timeout";
     pub(crate) const INTERRUPTED: &str = "interrupted";
-    pub(crate) const LOST_BEFORE_SESSION: &str = "lost_before_session";
     pub(crate) const LOST_AFTER_SESSION: &str = "lost_after_session";
     pub(crate) const PRESERVED_WORK: &str = "preserved_work";
     pub(crate) const CUSTODY_REFUSED: &str = "custody_refused";
-    pub(crate) const LAUNCH_REFUSED: &str = "launch_refused";
     pub(crate) const CANCELLED: &str = "cancelled";
     pub(crate) const DISCARDED: &str = "preserved_work_discarded";
     pub(crate) const HANDOFF_INVALID: &str = "handoff_invalid";
@@ -217,9 +218,6 @@ pub(crate) mod failure {
     pub(crate) const GATE_ERROR: &str = "gate_error";
     /// Every incoming edge of the node was untaken.
     pub(crate) const DEAD_PATH: &str = "dead_path";
-    /// An agent-requested launch refused by live manager policy (#633,
-    /// plan §5.3): no session was created; the execution blocks.
-    pub(crate) const POLICY_REFUSED: &str = "policy_refused";
 
     /// Losses that are not the node's fault: bounded per instance, never
     /// charged against the execution's attempt cap.

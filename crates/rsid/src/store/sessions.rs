@@ -671,7 +671,7 @@ pub(super) fn insert_session_on(connection: &Connection, session: &Session) -> R
              project_id, pinned_at, created_at, updated_at, cost_usd, duration_ms, num_turns, model,
              input_tokens, output_tokens, context_window,
              total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens,
-             stop_reason, session_kind, continued_from, handoff_filepath, rotation_depth,
+             total_prompt_tokens, stop_reason, session_kind, continued_from, handoff_filepath, rotation_depth,
              daemon_input_tokens, daemon_output_tokens, title, description, pipeline_artifact, workflow_id,
              git_branch, active_task, group_id, pending_archive, effort, retry_attempt, max_retries,
              issue_identifier, issue_url, issue_tracker_id, scheduled_job_id,
@@ -692,7 +692,7 @@ pub(super) fn insert_session_on(connection: &Connection, session: &Session) -> R
                      ?44, ?45, ?46, ?47, ?48, ?49,
                      ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64,
                      ?65, ?66, ?67, ?68, ?69, ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79,
-                     ?80, ?81)",
+                     ?80, ?81, ?82)",
             params![
                 session.id.to_string(),
                 session.claude_session_id,
@@ -715,6 +715,7 @@ pub(super) fn insert_session_on(connection: &Connection, session: &Session) -> R
                 session.total_output_tokens.map(|v| v as i64),
                 session.total_cache_creation_tokens.map(|v| v as i64),
                 session.total_cache_read_tokens.map(|v| v as i64),
+                session.total_prompt_tokens.map(|v| v as i64),
                 session.stop_reason.clone(),
                 session_kind_to_str(session.session_kind),
                 session.continued_from.map(|id| id.to_string()),
@@ -1157,11 +1158,69 @@ impl Store {
     }
 
     /// Update session status and updated_at timestamp.
+    ///
+    /// A terminal status (`Completed`, `Failed`, `Interrupted`) is never
+    /// written without a cause (Issue #588): this routes it through
+    /// [`Self::set_session_terminal_status_default`], which keeps any cause the
+    /// row already carries and otherwise records the status's default cause.
+    /// Writers that know why the session ended call
+    /// [`Self::set_session_terminal_status`] with that cause instead.
     pub fn update_session_status(&self, id: Uuid, status: SessionStatus) -> Result<()> {
+        if crate::terminal_cause::is_terminal_status(status) {
+            return self.set_session_terminal_status_default(id, status);
+        }
         self.conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![
                 session_status_to_str(status),
+                chrono::Utc::now().to_rfc3339(),
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Terminal status plus its normalized cause in one statement (#588).
+    /// `status` must be terminal and `cause` non-empty; both are refused
+    /// otherwise, so a new terminal writer cannot forget the cause.
+    pub fn set_session_terminal_status(
+        &self,
+        id: Uuid,
+        status: SessionStatus,
+        cause: &str,
+    ) -> Result<()> {
+        if !crate::terminal_cause::is_terminal_status(status) {
+            return Err(DaemonError::InvalidParam(format!(
+                "set_session_terminal_status requires a terminal status, got {status:?}"
+            )));
+        }
+        let cause = crate::terminal_cause::validate_cause(cause)
+            .map_err(|message| DaemonError::InvalidParam(message.into()))?;
+        self.conn.execute(
+            "UPDATE sessions SET status = ?1, stop_reason = ?2, updated_at = ?3 WHERE id = ?4",
+            params![
+                session_status_to_str(status),
+                cause,
+                chrono::Utc::now().to_rfc3339(),
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Terminal status for a writer with no richer evidence: an existing
+    /// non-empty `stop_reason` is kept, otherwise the status default is set.
+    fn set_session_terminal_status_default(&self, id: Uuid, status: SessionStatus) -> Result<()> {
+        let cause = crate::terminal_cause::default_cause(status).ok_or_else(|| {
+            DaemonError::InvalidParam(format!("status {status:?} has no terminal cause"))
+        })?;
+        self.conn.execute(
+            "UPDATE sessions SET status = ?1,
+             stop_reason = COALESCE(NULLIF(TRIM(stop_reason), ''), ?2),
+             updated_at = ?3 WHERE id = ?4",
+            params![
+                session_status_to_str(status),
+                cause,
                 chrono::Utc::now().to_rfc3339(),
                 id.to_string(),
             ],
@@ -1217,18 +1276,18 @@ impl Store {
             "UPDATE sessions SET cost_usd = ?1, duration_ms = ?2, num_turns = ?3,
              model = ?4, input_tokens = ?5, output_tokens = ?6, context_window = ?7,
              total_input_tokens = ?8, total_output_tokens = ?9, total_cache_creation_tokens = ?10,
-             total_cache_read_tokens = ?11, stop_reason = ?12, handoff_filepath = ?13,
-             daemon_input_tokens = ?14, daemon_output_tokens = ?15, git_branch = ?16, active_task = ?17,
-             harness_version_hash = ?18, test_passed = ?19, clippy_passed = ?20,
-             turn_count = ?21, retry_count = ?22, approval_wait_ms = ?23,
-             work_time_ms = ?24,
-             thinking_tokens = ?25, service_tier = ?26, cache_creation_1h_tokens = ?27,
-             cache_creation_5m_tokens = ?28, permission_denial_count = ?29,
-             subagent_stats_json = ?30, queued_turn_count = ?31, terminal_reason = ?32,
-             context_window_source = ?33, context_window_source_version = ?34,
-             context_window_source_digest = ?35, context_window_observed_at = ?36,
-             context_window_configured_tokens = ?37, pipeline_artifact = ?38,
-             session_kind = ?39, updated_at = ?40 WHERE id = ?41",
+             total_cache_read_tokens = ?11, total_prompt_tokens = ?12, stop_reason = ?13, handoff_filepath = ?14,
+             daemon_input_tokens = ?15, daemon_output_tokens = ?16, git_branch = ?17, active_task = ?18,
+             harness_version_hash = ?19, test_passed = ?20, clippy_passed = ?21,
+             turn_count = ?22, retry_count = ?23, approval_wait_ms = ?24,
+             work_time_ms = ?25,
+             thinking_tokens = ?26, service_tier = ?27, cache_creation_1h_tokens = ?28,
+             cache_creation_5m_tokens = ?29, permission_denial_count = ?30,
+             subagent_stats_json = ?31, queued_turn_count = ?32, terminal_reason = ?33,
+             context_window_source = ?34, context_window_source_version = ?35,
+             context_window_source_digest = ?36, context_window_observed_at = ?37,
+             context_window_configured_tokens = ?38, pipeline_artifact = ?39,
+             session_kind = ?40, updated_at = ?41 WHERE id = ?42",
             params![
                 session.cost_usd,
                 session.duration_ms.map(|v| v as i64),
@@ -1241,6 +1300,7 @@ impl Store {
                 session.total_output_tokens.map(|v| v as i64),
                 session.total_cache_creation_tokens.map(|v| v as i64),
                 session.total_cache_read_tokens.map(|v| v as i64),
+                session.total_prompt_tokens.map(|v| v as i64),
                 session.stop_reason,
                 session.handoff_filepath,
                 session.daemon_input_tokens.map(|v| v as i64),
@@ -1445,6 +1505,29 @@ impl Store {
         Ok(sessions)
     }
 
+    /// Load every session ID, including terminal and archived rows.
+    ///
+    /// Startup cleanup needs durable ownership even when normal session listing
+    /// intentionally filters terminal statuses.
+    pub(crate) fn load_all_session_ids(&self) -> Result<Vec<Uuid>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id FROM sessions ORDER BY created_at ASC, id ASC")?;
+        let ids = statement
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Get a single session by ID.
     /// Populates `short_summary` from the session_summaries table.
     pub fn get_session(&self, id: Uuid) -> Result<Option<Session>> {
@@ -1506,7 +1589,7 @@ impl Store {
     #[allow(dead_code)]
     pub fn purge_session(&self, id: Uuid) -> Result<()> {
         let id_str = id.to_string();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if !super::sandbox_custody::prepare_session_execution_projection_for_purge(&tx, id)? {
             return Ok(());
         }
@@ -1850,7 +1933,7 @@ impl Store {
         id: Uuid,
         expected_status: &str,
     ) -> Result<Option<Session>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let settlement_blocks = historical_session_restore_blocked_on(&tx, id)?;
         if settlement_blocks {
             return Err(crate::error::DaemonError::InvalidParam(
@@ -1858,7 +1941,8 @@ impl Store {
             ));
         }
         let changed = tx.execute(
-            "UPDATE sessions SET status='Completed',pending_archive=0,updated_at=?1
+            "UPDATE sessions SET status='Completed',pending_archive=0,
+             stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'completed:restored'),updated_at=?1
              WHERE id=?2 AND status=?3",
             params![
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
@@ -2031,7 +2115,7 @@ impl Store {
     /// `Store` for a missing successor row or lost lead witness.
     pub(crate) fn publish_rotation_successor(
         &self,
-        guards: &crate::session::RotationPublicationGuards,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
         rotation_id: &str,
         metadata: &str,
     ) -> Result<Vec<Uuid>> {
@@ -2648,7 +2732,7 @@ impl Store {
     /// Insert a new dispatch record for an issue-driven session.
     pub fn insert_issue_dispatch(
         &self,
-        record: &crate::issue_tracker::types::DispatchRecord,
+        record: &crate::store_support::issue_tracker::DispatchRecord,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO issue_tracker_dispatches (issue_id, issue_identifier, tracker, session_id,
@@ -2722,7 +2806,7 @@ impl Store {
     /// Load all active (non-terminal) dispatch records for state restoration.
     pub fn load_active_dispatches(
         &self,
-    ) -> Result<Vec<crate::issue_tracker::types::DispatchRecord>> {
+    ) -> Result<Vec<crate::store_support::issue_tracker::DispatchRecord>> {
         use super::row_mappers::parse_timestamp;
         let mut stmt = self.conn.prepare(
             "SELECT issue_id, issue_identifier, tracker, session_id, dispatched_at,
@@ -2760,7 +2844,7 @@ impl Store {
                         .map(parse_timestamp)
                         .transpose()
                         .ok()?;
-                    Some(crate::issue_tracker::types::DispatchRecord {
+                    Some(crate::store_support::issue_tracker::DispatchRecord {
                         issue_id,
                         issue_identifier: identifier,
                         tracker,
@@ -2783,7 +2867,7 @@ impl Store {
         &self,
         tracker: &str,
         project_id: Uuid,
-    ) -> Result<Vec<crate::issue_tracker::types::DispatchRecord>> {
+    ) -> Result<Vec<crate::store_support::issue_tracker::DispatchRecord>> {
         use super::row_mappers::parse_timestamp;
         let mut stmt = self.conn.prepare(
             "SELECT d.issue_id, d.issue_identifier, d.tracker, d.session_id,
@@ -2822,7 +2906,7 @@ impl Store {
                     last_reconciled_at,
                     terminal_state,
                 )| {
-                    Some(crate::issue_tracker::types::DispatchRecord {
+                    Some(crate::store_support::issue_tracker::DispatchRecord {
                         issue_id,
                         issue_identifier,
                         tracker,
@@ -2845,7 +2929,7 @@ impl Store {
     pub fn load_dispatch_by_issue_id(
         &self,
         issue_id: &str,
-    ) -> Result<Option<crate::issue_tracker::types::DispatchRecord>> {
+    ) -> Result<Option<crate::store_support::issue_tracker::DispatchRecord>> {
         use super::row_mappers::parse_timestamp;
         let mut stmt = self.conn.prepare(
             "SELECT issue_id, issue_identifier, tracker, session_id, dispatched_at,
@@ -2872,7 +2956,7 @@ impl Store {
                 .transpose()
                 .map_err(DaemonError::Store)?;
 
-            Ok(Some(crate::issue_tracker::types::DispatchRecord {
+            Ok(Some(crate::store_support::issue_tracker::DispatchRecord {
                 issue_id,
                 issue_identifier: identifier,
                 tracker,
@@ -3879,9 +3963,14 @@ mod rotation_publication_tests {
             .expect("event count")
     }
 
-    async fn guards(lineage: &Lineage) -> crate::session::RotationPublicationGuards {
-        crate::session::RotationPublicationGuards::acquire(lineage.predecessor, lineage.successor)
-            .await
+    async fn guards(
+        lineage: &Lineage,
+    ) -> crate::store_support::spawn_single_flight::RotationPublicationGuards {
+        crate::store_support::spawn_single_flight::RotationPublicationGuards::acquire(
+            lineage.predecessor,
+            lineage.successor,
+        )
+        .await
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]

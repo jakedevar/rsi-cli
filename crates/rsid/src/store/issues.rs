@@ -2732,8 +2732,8 @@ impl Store {
         let mut clauses = vec![format!("i.project_id={project}")];
 
         match request.archive {
-            IssueArchiveFilterV1::Active => clauses.push("i.archived_at IS NULL".into()),
-            IssueArchiveFilterV1::Archived => clauses.push("i.archived_at IS NOT NULL".into()),
+            IssueArchiveFilterV1::Active => clauses.push("i.archived_at IS NULL".to_string()),
+            IssueArchiveFilterV1::Archived => clauses.push("i.archived_at IS NOT NULL".to_string()),
             IssueArchiveFilterV1::All => {}
         }
         if !request.statuses.is_empty() {
@@ -2758,7 +2758,7 @@ impl Store {
             let bind = bind_value(&mut values, assignee.clone());
             clauses.push(format!("i.assignee={bind}"));
         } else if request.unassigned {
-            clauses.push("i.assignee IS NULL".into());
+            clauses.push("i.assignee IS NULL".to_string());
         }
         for label in &request.labels_all {
             let bind = bind_value(&mut values, label.clone());
@@ -2767,18 +2767,44 @@ impl Store {
             ));
         }
         if !request.provenance.is_empty() {
-            let provenance = request
-                .provenance
-                .iter()
-                .map(|kind| match kind {
-                    IssueWorkspaceProvenanceV1::Operator => "i.created_by_session_id IS NULL",
-                    IssueWorkspaceProvenanceV1::Session => "i.created_by_session_id IS NOT NULL",
-                    IssueWorkspaceProvenanceV1::Idea => "i.idea_id IS NOT NULL",
-                    IssueWorkspaceProvenanceV1::Finding => "i.source_finding_ref IS NOT NULL",
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            clauses.push(format!("({provenance})"));
+            let operator = bind_value(
+                &mut values,
+                i64::from(
+                    request
+                        .provenance
+                        .contains(&IssueWorkspaceProvenanceV1::Operator),
+                ),
+            );
+            let session = bind_value(
+                &mut values,
+                i64::from(
+                    request
+                        .provenance
+                        .contains(&IssueWorkspaceProvenanceV1::Session),
+                ),
+            );
+            let idea = bind_value(
+                &mut values,
+                i64::from(
+                    request
+                        .provenance
+                        .contains(&IssueWorkspaceProvenanceV1::Idea),
+                ),
+            );
+            let finding = bind_value(
+                &mut values,
+                i64::from(
+                    request
+                        .provenance
+                        .contains(&IssueWorkspaceProvenanceV1::Finding),
+                ),
+            );
+            clauses.push(format!(
+                "(({operator} AND i.created_by_session_id IS NULL) OR \
+                 ({session} AND i.created_by_session_id IS NOT NULL) OR \
+                 ({idea} AND i.idea_id IS NOT NULL) OR \
+                 ({finding} AND i.source_finding_ref IS NOT NULL))"
+            ));
         }
         if let Some(query) = &request.query {
             let bind = bind_value(&mut values, format!("%{query}%"));
@@ -4369,6 +4395,41 @@ impl Store {
         Ok(())
     }
 
+    /// Resolve an Issue target given as `issue_id` or `display_number` to a
+    /// concrete id inside the caller's project scope. Unknown numbers report
+    /// `NotFoundInScope`, exactly like an unknown id.
+    fn resolve_agent_issue_target_tx(
+        tx: &Transaction<'_>,
+        project_id: Uuid,
+        issue_id: Option<Uuid>,
+        display_number: Option<i64>,
+    ) -> Result<Uuid> {
+        match (issue_id, display_number) {
+            (Some(id), None) => Ok(id),
+            (None, Some(number)) => {
+                let found: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM issues WHERE project_id=?1 AND display_number=?2",
+                        params![project_id.to_string(), number],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let found = found.ok_or_else(|| {
+                    agent_issue_error(
+                        rsi_common::rpc::AgentIssueErrorCodeV1::NotFoundInScope,
+                        None,
+                        None,
+                    )
+                })?;
+                Uuid::parse_str(&found)
+                    .map_err(|error| DaemonError::Store(format!("Invalid Issue id: {error}")))
+            }
+            _ => {
+                Self::agent_issue_invalid("exactly one of issue_id and display_number is required")
+            }
+        }
+    }
+
     /// Bounded, project-scoped Issue list for the authenticated owning-Epic
     /// lead or approved manager coordinator. The transaction covers persisted
     /// topology/policy resolution and the page snapshot so a caller cannot
@@ -4408,15 +4469,42 @@ impl Store {
         } else {
             ""
         };
+        let desc = request.order == rsi_common::rpc::IssueListOrderV1::Desc;
+        let (cursor_filter, order_by) = if desc {
+            (
+                "(?4 IS NULL OR i.display_number<?4 OR (i.display_number=?4 AND i.id<?5))",
+                "ORDER BY i.display_number DESC,i.id DESC",
+            )
+        } else {
+            (
+                "(?4 IS NULL OR i.display_number>?4 OR (i.display_number=?4 AND i.id>?5))",
+                "ORDER BY i.display_number ASC,i.id ASC",
+            )
+        };
+        // Case-insensitive substring: escape LIKE metacharacters and match
+        // against the lowercased title (SQLite `lower` folds ASCII only, so
+        // the needle is folded the same way to stay consistent).
+        let title_pattern = request.title_contains.as_ref().map(|needle| {
+            let mut pattern = String::from("%");
+            for ch in needle.to_ascii_lowercase().chars() {
+                if matches!(ch, '%' | '_' | '\\') {
+                    pattern.push('\\');
+                }
+                pattern.push(ch);
+            }
+            pattern.push('%');
+            pattern
+        });
         let rows = tx
             .prepare(&format!(
                 "SELECT {QUALIFIED_ISSUE_COLUMNS} FROM issues i
                  WHERE i.project_id=?1
                    AND (?2 IS NULL OR i.status=?2)
                    AND (?3=2 OR (?3=0 AND i.archived_at IS NULL) OR (?3=1 AND i.archived_at IS NOT NULL))
-                   AND (?4 IS NULL OR i.display_number>?4 OR (i.display_number=?4 AND i.id>?5))
+                   AND {cursor_filter}
+                   AND (?7 IS NULL OR lower(i.title) LIKE ?7 ESCAPE '\\')
                    {ready_filter}
-                 ORDER BY i.display_number ASC,i.id ASC LIMIT ?6"
+                 {order_by} LIMIT ?6"
             ))?
             .query_map(
                 params![
@@ -4426,6 +4514,7 @@ impl Store {
                     cursor_display_number,
                     cursor_issue_id,
                     i64::from(limit + 1),
+                    title_pattern,
                 ],
                 map_issue_row,
             )?
@@ -4466,7 +4555,13 @@ impl Store {
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
-        let issue = Self::get_issue_in_project_tx(&tx, authority.project_id, request.issue_id)?
+        let issue_id = Self::resolve_agent_issue_target_tx(
+            &tx,
+            authority.project_id,
+            request.issue_id,
+            request.display_number,
+        )?;
+        let issue = Self::get_issue_in_project_tx(&tx, authority.project_id, issue_id)?
             .ok_or_else(|| {
                 agent_issue_error(
                     rsi_common::rpc::AgentIssueErrorCodeV1::NotFoundInScope,
@@ -4484,7 +4579,7 @@ impl Store {
                 .query_map(
                     params![
                         authority.project_id.to_string(),
-                        request.issue_id.to_string(),
+                        issue_id.to_string(),
                         AGENT_ISSUE_DEPENDENCY_FETCH_LIMIT
                     ],
                     |row| {
@@ -4639,6 +4734,22 @@ impl Store {
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let mut resolved_request = request.clone();
+        resolved_request.issue_id = Some(Self::resolve_agent_issue_target_tx(
+            &tx,
+            authority.project_id,
+            request.issue_id,
+            request.display_number,
+        )?);
+        resolved_request.display_number = None;
+        let request = &resolved_request;
+        let request_issue_id = request.resolved_issue_id().map_err(|_| {
+            agent_issue_error(
+                rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
+                None,
+                None,
+            )
+        })?;
         let semantic_request = request.semantic_request().map_err(|_| {
             agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
@@ -4649,7 +4760,7 @@ impl Store {
         if let Some(replay) = Self::agent_replay_tx(
             &tx,
             authority,
-            request.issue_id,
+            request_issue_id,
             request.expected_row_version,
             &request.idempotency_key,
             IssueEventOperationV1::ContentUpdated,
@@ -4659,7 +4770,7 @@ impl Store {
             tx.commit()?;
             return Ok(replay);
         }
-        let prior = Self::get_issue_in_project_tx(&tx, authority.project_id, request.issue_id)?
+        let prior = Self::get_issue_in_project_tx(&tx, authority.project_id, request_issue_id)?
             .ok_or_else(|| {
                 agent_issue_error(
                     rsi_common::rpc::AgentIssueErrorCodeV1::NotFoundInScope,
@@ -4753,6 +4864,22 @@ impl Store {
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let mut resolved_request = request.clone();
+        resolved_request.issue_id = Some(Self::resolve_agent_issue_target_tx(
+            &tx,
+            authority.project_id,
+            request.issue_id,
+            request.display_number,
+        )?);
+        resolved_request.display_number = None;
+        let request = &resolved_request;
+        let request_issue_id = request.resolved_issue_id().map_err(|_| {
+            agent_issue_error(
+                rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
+                None,
+                None,
+            )
+        })?;
         let semantic_request = request.semantic_request().map_err(|_| {
             agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
@@ -4763,7 +4890,7 @@ impl Store {
         if let Some(replay) = Self::agent_replay_tx(
             &tx,
             authority,
-            request.issue_id,
+            request_issue_id,
             request.expected_row_version,
             &request.idempotency_key,
             IssueEventOperationV1::StatusUpdated,
@@ -4773,7 +4900,7 @@ impl Store {
             tx.commit()?;
             return Ok(replay);
         }
-        let prior = Self::get_issue_in_project_tx(&tx, authority.project_id, request.issue_id)?
+        let prior = Self::get_issue_in_project_tx(&tx, authority.project_id, request_issue_id)?
             .ok_or_else(|| {
                 agent_issue_error(
                     rsi_common::rpc::AgentIssueErrorCodeV1::NotFoundInScope,
@@ -5158,7 +5285,7 @@ impl Store {
             )));
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         let issue_project: Option<String> = tx
             .query_row(

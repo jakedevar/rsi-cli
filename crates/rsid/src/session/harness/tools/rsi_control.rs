@@ -284,7 +284,7 @@ impl RsiControlReserveSuccessorTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlReserveSuccessorTool {
     fn name(&self) -> &str {
-        "rsi_control_reserve_successor"
+        native_tool_name(AgentControlVerbV1::ReserveSuccessor)
     }
 
     fn description(&self) -> &str {
@@ -330,7 +330,7 @@ impl RsiControlSpawnTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlSpawnTool {
     fn name(&self) -> &str {
-        "rsi_control_spawn"
+        native_tool_name(AgentControlVerbV1::SpawnChild)
     }
 
     fn description(&self) -> &str {
@@ -387,7 +387,7 @@ impl RsiControlStatusTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlStatusTool {
     fn name(&self) -> &str {
-        "rsi_control_status"
+        native_tool_name(AgentControlVerbV1::GetStatus)
     }
 
     fn description(&self) -> &str {
@@ -446,7 +446,7 @@ impl RsiControlSendMessageTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlSendMessageTool {
     fn name(&self) -> &str {
-        "rsi_control_send_message"
+        native_tool_name(AgentControlVerbV1::SendMessage)
     }
 
     fn description(&self) -> &str {
@@ -507,7 +507,7 @@ impl RsiControlProgressTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlProgressTool {
     fn name(&self) -> &str {
-        "rsi_control_progress"
+        native_tool_name(AgentControlVerbV1::GetProgress)
     }
 
     fn description(&self) -> &str {
@@ -543,6 +543,122 @@ impl HarnessTool for RsiControlProgressTool {
     }
 }
 
+/// `rsi_control_read_session_events` — scoped, byte-bounded read of one
+/// session's conversation events (#1041). Same scope as `rsi_control_status`.
+pub struct RsiControlReadSessionEventsTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+}
+
+impl RsiControlReadSessionEventsTool {
+    pub fn new(control: AgentControlHandle, caller_session_id: Uuid) -> Self {
+        Self {
+            control,
+            caller_session_id,
+        }
+    }
+}
+
+/// `rsi_control_query_failure_signatures` (#1016): read-only, project-scoped
+/// lookup of known-failure signature records by test id and/or digest.
+pub struct RsiControlQueryFailureSignaturesTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+}
+
+impl RsiControlQueryFailureSignaturesTool {
+    pub fn new(control: AgentControlHandle, caller_session_id: Uuid) -> Self {
+        Self {
+            control,
+            caller_session_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlQueryFailureSignaturesTool {
+    fn name(&self) -> &str {
+        "rsi_control_query_failure_signatures"
+    }
+
+    fn description(&self) -> &str {
+        "Before debugging a red, ask whether it is already known: read the known-failure \
+         signature records of open Issues in your project by exact test_id and/or failure \
+         digest. Records of closed Issues are never returned."
+    }
+
+    fn parameters_json(&self) -> &str {
+        AgentControlVerbV1::QueryFailureSignatures
+            .descriptor()
+            .parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let request: rsi_common::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1 =
+            match serde_json::from_value(args) {
+                Ok(request) => request,
+                Err(e) => return err(format!("invalid query_failure_signatures arguments: {e}")),
+            };
+        match self
+            .control
+            .agent_query_failure_signatures(self.caller_session_id, request)
+            .await
+        {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(output) => ToolResult {
+                    success: true,
+                    output,
+                    error_msg: None,
+                },
+                Err(e) => err(format!("failed to serialize signatures: {e}")),
+            },
+            Err(e) => err(e.to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlReadSessionEventsTool {
+    fn name(&self) -> &str {
+        native_tool_name(AgentControlVerbV1::ReadSessionEvents)
+    }
+
+    fn description(&self) -> &str {
+        "Read a bounded page of a session's conversation events (tail, or forward from \
+         after_sequence) plus its final assistant message and terminal reason. Scope: \
+         your own child, a child of an Epic you lead, or a session in your manager scope."
+    }
+
+    fn parameters_json(&self) -> &str {
+        AgentControlVerbV1::ReadSessionEvents
+            .descriptor()
+            .parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let request: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
+            match serde_json::from_value(args) {
+                Ok(request) => request,
+                Err(e) => return err(format!("invalid read_session_events arguments: {e}")),
+            };
+        match self
+            .control
+            .agent_read_session_events(self.caller_session_id, request)
+            .await
+        {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(output) => ToolResult {
+                    success: true,
+                    output,
+                    error_msg: None,
+                },
+                Err(e) => err(format!("failed to serialize events: {e}")),
+            },
+            Err(e) => err(e.to_string()),
+        }
+    }
+}
+
 /// `rsi_control_halt` — session-attributed interrupt. Same scoping as
 /// `rsi_control_status`; delegates to the shared interrupt path.
 pub struct RsiControlHaltTool {
@@ -568,7 +684,7 @@ impl RsiControlCreateIssueTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlCreateIssueTool {
     fn name(&self) -> &str {
-        "rsi_control_create_issue"
+        native_tool_name(AgentControlVerbV1::CreateIssue)
     }
 
     fn description(&self) -> &str {
@@ -656,13 +772,17 @@ impl RsiControlIssueTool {
 impl HarnessTool for RsiControlIssueTool {
     fn name(&self) -> &str {
         match self.kind {
-            IssueControlToolKind::List => "rsi_control_list_issues",
-            IssueControlToolKind::Get => "rsi_control_get_issue",
-            IssueControlToolKind::Update => "rsi_control_update_issue",
-            IssueControlToolKind::UpdateStatus => "rsi_control_update_issue_status",
-            IssueControlToolKind::Archive => "rsi_control_archive_issue",
-            IssueControlToolKind::Restore => "rsi_control_restore_issue",
-            IssueControlToolKind::ListEvents => "rsi_control_list_issue_events",
+            IssueControlToolKind::List => native_tool_name(AgentControlVerbV1::ListIssues),
+            IssueControlToolKind::Get => native_tool_name(AgentControlVerbV1::GetIssue),
+            IssueControlToolKind::Update => native_tool_name(AgentControlVerbV1::UpdateIssue),
+            IssueControlToolKind::UpdateStatus => {
+                native_tool_name(AgentControlVerbV1::UpdateIssueStatus)
+            }
+            IssueControlToolKind::Archive => native_tool_name(AgentControlVerbV1::ArchiveIssue),
+            IssueControlToolKind::Restore => native_tool_name(AgentControlVerbV1::RestoreIssue),
+            IssueControlToolKind::ListEvents => {
+                native_tool_name(AgentControlVerbV1::ListIssueEvents)
+            }
         }
     }
 
@@ -784,9 +904,12 @@ impl HarnessTool for RsiControlIssueTool {
     }
 }
 
-/// Scoped manager and assigned-reviewer tools; appointment is never an agent capability.
+/// JSON-args agent-control tools sharing one guarded adapter: the universal
+/// authority catalog plus scoped manager and assigned-reviewer tools.
+/// Appointment is never an agent capability.
 #[derive(Clone, Copy, Debug)]
 pub enum ManagerControlToolKind {
+    AuthorityCatalog,
     Progress,
     Inbox,
     Send,
@@ -803,7 +926,8 @@ pub enum ManagerControlToolKind {
 }
 
 impl ManagerControlToolKind {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
+        Self::AuthorityCatalog,
         Self::Progress,
         Self::Inbox,
         Self::Send,
@@ -821,6 +945,7 @@ impl ManagerControlToolKind {
 
     pub(crate) const fn verb(self) -> AgentControlVerbV1 {
         match self {
+            Self::AuthorityCatalog => AgentControlVerbV1::GetAuthorityCatalog,
             Self::Progress => AgentControlVerbV1::ManagerProgress,
             Self::Inbox => AgentControlVerbV1::ManagerInbox,
             Self::Send => AgentControlVerbV1::ManagerSend,
@@ -837,22 +962,14 @@ impl ManagerControlToolKind {
         }
     }
 
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Progress => "rsi_control_manager_progress",
-            Self::Inbox => "rsi_control_manager_inbox",
-            Self::Send => "rsi_control_manager_send",
-            Self::Reply => "rsi_control_manager_reply",
-            Self::Notify => "rsi_control_manager_notify",
-            Self::Inspect => "rsi_control_manager_inspect",
-            Self::Update => "rsi_control_manager_update",
-            Self::SubmitReviewReceipt => "rsi_control_submit_review_receipt",
-            Self::Control => "rsi_control_manager_control",
-            Self::PrepareControl => "rsi_control_manager_prepare_control",
-            Self::CommitPreparedControl => "rsi_control_manager_commit_prepared_control",
-            Self::GetAction => "rsi_control_manager_get_action",
-            Self::WorkView => "rsi_control_manager_work_view",
-        }
+    /// Native tool name, read from the catalog descriptor (#1011): the
+    /// descriptor table is the single declaration of native tool names.
+    pub(crate) fn name(self) -> &'static str {
+        self.verb()
+            .descriptor()
+            .native_tool
+            .expect("manager control verbs are native tools")
+            .name()
     }
 }
 
@@ -873,6 +990,14 @@ pub(crate) async fn execute_manager_tool(
     args: serde_json::Value,
 ) -> crate::error::Result<serde_json::Value> {
     match kind {
+        ManagerControlToolKind::AuthorityCatalog => {
+            let request: rsi_common::agent_authority_catalog::AgentGetAuthorityCatalogRequestV1 =
+                parse_manager_args(args)?;
+            control
+                .agent_get_authority_catalog(caller, request)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json))
+        }
         ManagerControlToolKind::Inspect => {
             let request: rsi_common::harness_manager_v2::AgentManagerInspectRequestV2 =
                 parse_manager_args(args)?;
@@ -1004,6 +1129,15 @@ pub(crate) async fn execute_topology_tool(
         .await
 }
 
+/// Native tool name of a catalogued verb, read from its descriptor (#1011):
+/// the descriptor table is the single declaration of native tool names.
+pub(crate) fn native_tool_name(verb: AgentControlVerbV1) -> &'static str {
+    verb.descriptor()
+        .native_tool
+        .expect("catalogued verb has a native tool")
+        .name()
+}
+
 /// Native tool name of a catalogued topology verb.
 pub(crate) fn topology_tool_name(verb: AgentControlVerbV1) -> &'static str {
     verb.descriptor().native_tool.map_or(
@@ -1116,7 +1250,7 @@ impl RsiControlHaltTool {
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlHaltTool {
     fn name(&self) -> &str {
-        "rsi_control_halt"
+        native_tool_name(AgentControlVerbV1::Halt)
     }
 
     fn description(&self) -> &str {
@@ -1161,7 +1295,8 @@ mod tests {
         for kind in ManagerControlToolKind::ALL {
             let reference = Uuid::new_v4();
             let valid = match kind {
-                ManagerControlToolKind::Progress
+                ManagerControlToolKind::AuthorityCatalog
+                | ManagerControlToolKind::Progress
                 | ManagerControlToolKind::Inbox
                 | ManagerControlToolKind::Inspect
                 | ManagerControlToolKind::WorkView => {

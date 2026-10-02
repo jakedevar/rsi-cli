@@ -6,9 +6,10 @@
 #[cfg(test)]
 use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::rpc::{
-    AgentArchiveIssueRequestV1, AgentGetIssueRequestV1, AgentIssueValidationClassV1,
-    AgentIssueValidationFieldV1, AgentIssueValidationV1, AgentListIssuesRequestV1,
-    AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
+    AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES, AgentArchiveIssueRequestV1, AgentGetIssueRequestV1,
+    AgentIssueValidationClassV1, AgentIssueValidationFieldV1, AgentIssueValidationV1,
+    AgentListIssuesRequestV1, AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1,
+    AgentUpdateIssueStatusRequestV1,
 };
 use rsi_common::types::IssueEventPageRequestV1;
 use serde::de::DeserializeOwned;
@@ -41,10 +42,19 @@ impl AgentIssueRequestKind {
 
     const fn allowed(self) -> &'static [&'static str] {
         match self {
-            Self::List => &["status", "archive", "cursor", "limit", "ready"],
-            Self::Get => &["issue_id"],
+            Self::List => &[
+                "status",
+                "archive",
+                "cursor",
+                "limit",
+                "ready",
+                "order",
+                "title_contains",
+            ],
+            Self::Get => &["issue_id", "display_number"],
             Self::Update => &[
                 "issue_id",
+                "display_number",
                 "expected_row_version",
                 "idempotency_key",
                 "title",
@@ -57,6 +67,7 @@ impl AgentIssueRequestKind {
             ],
             Self::UpdateStatus => &[
                 "issue_id",
+                "display_number",
                 "status",
                 "expected_row_version",
                 "idempotency_key",
@@ -70,17 +81,13 @@ impl AgentIssueRequestKind {
 
     const fn required(self) -> &'static [&'static str] {
         match self {
-            Self::List => &[],
-            Self::Get | Self::ListEvents => &["issue_id"],
-            Self::Update | Self::Archive | Self::Restore => {
+            Self::List | Self::Get => &[],
+            Self::ListEvents => &["issue_id"],
+            Self::Archive | Self::Restore => {
                 &["issue_id", "expected_row_version", "idempotency_key"]
             }
-            Self::UpdateStatus => &[
-                "issue_id",
-                "status",
-                "expected_row_version",
-                "idempotency_key",
-            ],
+            Self::Update => &["expected_row_version", "idempotency_key"],
+            Self::UpdateStatus => &["status", "expected_row_version", "idempotency_key"],
         }
     }
 }
@@ -103,6 +110,9 @@ fn field(name: &str) -> Option<AgentIssueValidationFieldV1> {
         "assignee" => Some(AgentIssueValidationFieldV1::Assignee),
         "clear_assignee" => Some(AgentIssueValidationFieldV1::ClearAssignee),
         "after_sequence" => Some(AgentIssueValidationFieldV1::AfterSequence),
+        "display_number" => Some(AgentIssueValidationFieldV1::DisplayNumber),
+        "order" => Some(AgentIssueValidationFieldV1::Order),
+        "title_contains" => Some(AgentIssueValidationFieldV1::TitleContains),
         _ => None,
     }
 }
@@ -168,23 +178,58 @@ pub(crate) fn decode<T: DeserializeOwned>(
     }
 }
 
+/// Exactly one of `issue_id` and `display_number`. Both present is an
+/// invalid field; neither present is a missing field.
+fn require_one_issue_target(
+    issue_id: Option<uuid::Uuid>,
+    display_number: Option<i64>,
+) -> Result<(), AgentIssueValidationV1> {
+    match (issue_id, display_number) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (Some(_), Some(_)) => Err(hint(
+            AgentIssueValidationClassV1::InvalidField,
+            Some(AgentIssueValidationFieldV1::DisplayNumber),
+        )),
+        (None, None) => Err(hint(
+            AgentIssueValidationClassV1::MissingField,
+            Some(AgentIssueValidationFieldV1::IssueId),
+        )),
+    }
+}
+
 pub(crate) fn decode_list(
     value: &Value,
 ) -> Result<AgentListIssuesRequestV1, AgentIssueValidationV1> {
-    decode(AgentIssueRequestKind::List, value)
+    let request: AgentListIssuesRequestV1 = decode(AgentIssueRequestKind::List, value)?;
+    if request.title_contains.as_ref().is_some_and(|needle| {
+        needle.is_empty() || needle.len() > AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES
+    }) {
+        return Err(hint(
+            AgentIssueValidationClassV1::InvalidField,
+            Some(AgentIssueValidationFieldV1::TitleContains),
+        ));
+    }
+    Ok(request)
 }
 pub(crate) fn decode_get(value: &Value) -> Result<AgentGetIssueRequestV1, AgentIssueValidationV1> {
-    decode(AgentIssueRequestKind::Get, value)
+    let request: AgentGetIssueRequestV1 = decode(AgentIssueRequestKind::Get, value)?;
+    require_one_issue_target(request.issue_id, request.display_number)?;
+    Ok(request)
 }
 pub(crate) fn decode_update(
     value: &Value,
 ) -> Result<AgentUpdateIssueRequestV1, AgentIssueValidationV1> {
-    decode(AgentIssueRequestKind::Update, value)
+    let request: AgentUpdateIssueRequestV1 = decode(AgentIssueRequestKind::Update, value)?;
+    require_one_issue_target(request.issue_id, request.display_number)?;
+    Ok(request)
 }
 pub(crate) fn decode_update_status(
     value: &Value,
 ) -> Result<AgentUpdateIssueStatusRequestV1, AgentIssueValidationV1> {
-    decode(AgentIssueRequestKind::UpdateStatus, value)
+    let request: AgentUpdateIssueStatusRequestV1 =
+        decode(AgentIssueRequestKind::UpdateStatus, value)?;
+    require_one_issue_target(request.issue_id, request.display_number)?;
+    Ok(request)
 }
 pub(crate) fn decode_archive(
     value: &Value,
@@ -232,6 +277,86 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
+    #[allow(clippy::unwrap_used)]
+    fn issue_target_accepts_exactly_one_of_issue_id_and_display_number() {
+        let issue_id = uuid::Uuid::new_v4();
+        let by_number = decode_get(&serde_json::json!({"display_number": 1039})).unwrap();
+        assert_eq!(by_number.display_number, Some(1039));
+        assert_eq!(by_number.issue_id, None);
+        let by_id = decode_get(&serde_json::json!({"issue_id": issue_id})).unwrap();
+        assert_eq!(by_id.issue_id, Some(issue_id));
+
+        let both = decode_get(&serde_json::json!({"issue_id": issue_id, "display_number": 7}))
+            .unwrap_err();
+        assert_eq!(both.class, Class::InvalidField);
+        let neither = decode_get(&serde_json::json!({})).unwrap_err();
+        assert_eq!(neither.class, Class::MissingField);
+        assert_eq!(neither.field, Some(Field::IssueId));
+
+        let mutation = serde_json::json!({
+            "display_number": 12,
+            "expected_row_version": 1,
+            "idempotency_key": "k",
+            "status": "Closed",
+            "title": "t",
+        });
+        let mut status_request = mutation.clone();
+        status_request.as_object_mut().unwrap().remove("title");
+        assert_eq!(
+            decode_update_status(&status_request)
+                .unwrap()
+                .display_number,
+            Some(12)
+        );
+        let mut update_request = mutation;
+        update_request.as_object_mut().unwrap().remove("status");
+        assert_eq!(
+            decode_update(&update_request).unwrap().display_number,
+            Some(12)
+        );
+        update_request
+            .as_object_mut()
+            .unwrap()
+            .insert("issue_id".into(), serde_json::json!(issue_id));
+        assert_eq!(
+            decode_update(&update_request).unwrap_err().class,
+            Class::InvalidField
+        );
+        assert_eq!(
+            decode_update(&serde_json::json!({
+                "expected_row_version": 1,
+                "idempotency_key": "k"
+            }))
+            .unwrap_err()
+            .class,
+            Class::MissingField
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn list_decodes_order_and_bounds_title_contains() {
+        use rsi_common::rpc::IssueListOrderV1;
+        let request =
+            decode_list(&serde_json::json!({"order": "desc", "title_contains": "cat"})).unwrap();
+        assert_eq!(request.order, IssueListOrderV1::Desc);
+        assert_eq!(request.title_contains.as_deref(), Some("cat"));
+        assert_eq!(
+            decode_list(&Value::Null).unwrap().order,
+            IssueListOrderV1::Asc
+        );
+        let bad_order = decode_list(&serde_json::json!({"order": "sideways"})).unwrap_err();
+        assert_eq!(bad_order.field, Some(Field::Order));
+        for needle in [String::new(), "x".repeat(129)] {
+            let error = decode_list(&serde_json::json!({"title_contains": needle})).unwrap_err();
+            assert_eq!(error.class, Class::InvalidField);
+            assert_eq!(error.field, Some(Field::TitleContains));
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
     fn classifier_never_echoes_unknown_keys_and_uses_stable_precedence() {
         let error =
             decode_get(&serde_json::json!({"token/secret": "never", "issue_id": 7})).unwrap_err();
@@ -240,7 +365,12 @@ mod tests {
         let encoded = serde_json::to_string(&error).unwrap();
         assert!(!encoded.contains("token/secret"));
         assert!(!encoded.contains("never"));
-        let error = decode_update(&serde_json::json!({"title": "x"})).unwrap_err();
+        let error = decode_update(&serde_json::json!({
+            "title": "x",
+            "expected_row_version": 1,
+            "idempotency_key": "k"
+        }))
+        .unwrap_err();
         assert_eq!(error.class, Class::MissingField);
         assert_eq!(error.field, Some(Field::IssueId));
     }

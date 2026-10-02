@@ -12,6 +12,15 @@ use std::path::Path;
 use uuid::Uuid;
 pub(crate) mod git;
 
+/// Accepted-content refusals observed while integrating work. Recording one
+/// stops the persisted Execute intent from treating the work as ready.
+const INTEGRATION_REFUSAL_CODES: [&str; 4] = [
+    "manager_v2_accepted_content_lost",
+    "manager_v2_accepted_content_empty",
+    "manager_v2_accepted_content_ambiguous",
+    "manager_v2_accepted_content_path_limit",
+];
+
 #[cfg(test)]
 type ManagerUpdateTestPause = (
     tokio::sync::oneshot::Sender<()>,
@@ -291,12 +300,42 @@ impl AgentControlHandle {
             }
             context
         };
-        let observed = tokio::time::timeout(
+        // #984: the observation (Git and custody proofs) runs as a heap future
+        // so callers' futures stay within a 2 MiB debug test-thread stack.
+        let observed = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.observe_manager_update(&context, &request),
+            self.boxed_observe_manager_update(&context, &request),
         )
         .await
-        .map_err(|_| refused("manager_v2_observation_budget"))??;
+        {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(error)) => {
+                if let ManagerUpdateV2::Integration {
+                    key,
+                    source_commit,
+                    target_commit,
+                    ..
+                } = &request.change
+                    && let Some(code) = INTEGRATION_REFUSAL_CODES
+                        .into_iter()
+                        .find(|code| error.to_string().contains(code))
+                {
+                    let store = self.store.lock().await;
+                    if let Err(write_error) = store.manager_v2_record_integration_refusal(
+                        &context.authority.config,
+                        key,
+                        code,
+                        source_commit,
+                        target_commit,
+                        caller,
+                    ) {
+                        tracing::warn!(%write_error, %key, "manager integration refusal record deferred");
+                    }
+                }
+                return Err(error);
+            }
+            Err(_) => return Err(refused("manager_v2_observation_budget")),
+        };
         #[cfg(test)]
         if let Some((reached_tx, release_rx)) = {
             let pause = manager_update_test_pauses()
@@ -354,6 +393,71 @@ impl AgentControlHandle {
         }
         Ok(receipt)
     }
+
+    /// #984: heap future for [`Self::review_unrelated_descendants`].
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn boxed_review_unrelated_descendants<'a>(
+        &'a self,
+        project: Uuid,
+        epic: Uuid,
+        author: Uuid,
+        root: &'a Path,
+        base: &'a str,
+        sealed: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Uuid>>> + Send + 'a>> {
+        Box::pin(self.review_unrelated_descendants(project, epic, author, root, base, sealed))
+    }
+
+    /// #984: prove which spawned descendants of the author authored nothing in
+    /// the sealed review range. `own` is the candidate's branch diff from its
+    /// custody fork; any missing ref, missing fork, or git error fails closed,
+    /// so the descendant keeps contributing. Path-disjointness survives squash,
+    /// cherry-pick and rebase because landed content still touches its paths.
+    async fn review_unrelated_descendants(
+        &self,
+        project: Uuid,
+        epic: Uuid,
+        author: Uuid,
+        root: &Path,
+        base: &str,
+        sealed: &str,
+    ) -> Result<Vec<Uuid>> {
+        let range = git::changed_path_set(root, base, sealed).await?;
+        let candidates = {
+            let store = self.store.lock().await;
+            store.review_contributor_candidates(project, epic, author)?
+        };
+        let mut unrelated = Vec::new();
+        for (id, fork, branch) in candidates {
+            let Some(fork) = fork else {
+                continue;
+            };
+            let tip = match branch {
+                Some(branch) => format!("refs/heads/{branch}"),
+                None => format!("refs/heads/rsi/{id}"),
+            };
+            // Any missing ref or Git error keeps the descendant a contributor.
+            if let Ok(own) = git::changed_path_set(root, &fork, &tip).await
+                && own.is_disjoint(&range)
+            {
+                unrelated.push(id);
+            }
+        }
+        Ok(unrelated)
+    }
+
+    /// #984: heap future for [`Self::observe_manager_update`].
+    #[inline(never)]
+    fn boxed_observe_manager_update<'a>(
+        &'a self,
+        context: &'a LedgerObservationContext,
+        request: &'a AgentManagerUpdateRequestV2,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LedgerObservation>> + Send + 'a>>
+    {
+        Box::pin(self.observe_manager_update(context, request))
+    }
+
     async fn observe_manager_update(
         &self,
         context: &LedgerObservationContext,
@@ -390,9 +494,29 @@ impl AgentControlHandle {
             if git::ancestor(root, source_commit, &custody.source_commit).await? {
                 return Err(refused("manager_review_source_not_authored"));
             }
+            let work = context
+                .work
+                .as_ref()
+                .ok_or_else(|| refused("manager_v2_work_missing"))?;
+            let author = work
+                .source_session_id
+                .ok_or_else(|| refused("manager_review_author_missing"))?;
+            // #984: a heap future keeps this Git proof out of the manager
+            // update future (debug test threads have 2 MiB stacks).
+            let review_unrelated = self
+                .boxed_review_unrelated_descendants(
+                    context.authority.config.project_id,
+                    work.epic_id,
+                    author,
+                    root,
+                    &custody.source_commit,
+                    source_commit,
+                )
+                .await?;
             return Ok(LedgerObservation {
                 source_commit: Some(source_commit.clone()),
                 custody: vec![(source.id, custody.custody_id, custody.generation)],
+                review_unrelated,
                 ..Default::default()
             });
         }
@@ -411,7 +535,21 @@ impl AgentControlHandle {
             .source_session
             .as_ref()
             .ok_or_else(|| refused("manager_v2_source_custody_required"))?;
-        if source.status == rsi_common::types::SessionStatus::Archived
+        // A DB-reviewed Work whose accepted source is provably on the
+        // integration target is recordable as integrated from the canonical
+        // repository even when its source custodian can no longer hold live
+        // custody: either the source is sealed (`Archived`) or its custody
+        // root is no longer live (reclaimed sandbox, quarantined or
+        // tombstoned custody). Evidence-bearing (stage) updates never take
+        // this fallback, and the live-custody path below is unchanged.
+        let custody_live = source.status != rsi_common::types::SessionStatus::Archived
+            && self
+                .store
+                .lock()
+                .await
+                .live_custody_for_session(source.id)
+                .is_ok();
+        if (source.status == rsi_common::types::SessionStatus::Archived || !custody_live)
             && let Some((original, target)) = integration
             && evidence.is_none()
         {

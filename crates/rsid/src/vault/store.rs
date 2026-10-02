@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 pub const VAULT_DIR_NAME: &str = "vault";
 pub const VAULT_FILE_NAME: &str = "credentials.json";
-pub const VAULT_FILE_VERSION: u32 = 1;
+const LEGACY_VAULT_FILE_VERSION: u32 = 1;
+pub const VAULT_FILE_VERSION: u32 = 2;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
@@ -93,6 +94,15 @@ pub struct VaultFile {
     /// Per-slot generation, bumped on every Set, Rotate, Clear and import.
     #[serde(default)]
     pub generation: BTreeMap<Slot, u64>,
+    /// Namespaced MCP credentials (#788). Ids are validated before reaching
+    /// the store; no environment fallback applies to this namespace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_entries: BTreeMap<String, StoredEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_cleared: BTreeMap<String, Tombstone>,
+    /// Per-server generation, bumped on every Set, Rotate and Clear.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_generation: BTreeMap<String, u64>,
 }
 
 impl VaultFile {
@@ -108,6 +118,19 @@ impl VaultFile {
         self.generation.insert(slot, next);
         self.checks.remove(&slot);
     }
+
+    /// Current generation of an MCP server credential (0 before any mutation).
+    #[must_use]
+    pub fn mcp_generation_of(&self, id: &str) -> u64 {
+        self.mcp_generation.get(id).copied().unwrap_or(0)
+    }
+
+    /// Bump an MCP server's generation. MCP credentials have no provider check
+    /// cache to invalidate.
+    pub fn bump_mcp(&mut self, id: &str) {
+        let next = self.mcp_generation_of(id).saturating_add(1);
+        self.mcp_generation.insert(id.to_owned(), next);
+    }
 }
 
 impl Default for VaultFile {
@@ -118,12 +141,24 @@ impl Default for VaultFile {
             cleared: BTreeMap::new(),
             checks: BTreeMap::new(),
             generation: BTreeMap::new(),
+            mcp_entries: BTreeMap::new(),
+            mcp_cleared: BTreeMap::new(),
+            mcp_generation: BTreeMap::new(),
         }
     }
 }
 
 const fn default_version() -> u32 {
-    VAULT_FILE_VERSION
+    LEGACY_VAULT_FILE_VERSION
+}
+
+fn persisted_version(file: &VaultFile) -> u32 {
+    if file.mcp_entries.is_empty() && file.mcp_cleared.is_empty() && file.mcp_generation.is_empty()
+    {
+        LEGACY_VAULT_FILE_VERSION
+    } else {
+        VAULT_FILE_VERSION
+    }
 }
 
 /// The default vault directory under the RSI data dir.
@@ -199,7 +234,7 @@ pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
                 error.column()
             ),
         })?;
-    if file.version != VAULT_FILE_VERSION {
+    if file.version != 1 && file.version != VAULT_FILE_VERSION {
         return Err(VaultStoreError::Malformed {
             path,
             reason: format!("unsupported version {}", file.version),
@@ -214,8 +249,9 @@ pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
 /// # Errors
 ///
 /// Returns a typed [`VaultStoreError`] naming the path.
-pub fn save(dir: &Path, file: &VaultFile) -> Result<(), VaultStoreError> {
+pub fn save(dir: &Path, file: &mut VaultFile) -> Result<(), VaultStoreError> {
     ensure_dir(dir)?;
+    file.version = persisted_version(file);
     let path = dir.join(VAULT_FILE_NAME);
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(file).map_err(|_| {
         VaultStoreError::Malformed {
@@ -311,7 +347,7 @@ mod tests {
         let mut file = VaultFile::default();
         file.entries
             .insert(Slot::Openrouter, entry("sk-test-roundtrip"));
-        save(&dir, &file).unwrap();
+        save(&dir, &mut file).unwrap();
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         let file_mode = fs::metadata(dir.join(VAULT_FILE_NAME))
             .unwrap()
@@ -331,10 +367,120 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
+    fn provider_only_vault_stays_version_one_for_older_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("vault");
+        let mut file = VaultFile::default();
+        file.entries
+            .insert(Slot::Openrouter, entry("sk-test-provider"));
+        save(&dir, &mut file).unwrap();
+
+        let raw = fs::read_to_string(dir.join(VAULT_FILE_NAME)).unwrap();
+        assert!(raw.contains("\"version\": 1"), "{raw}");
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyVaultFile {
+            version: u32,
+            entries: BTreeMap<Slot, StoredEntry>,
+            cleared: BTreeMap<Slot, Tombstone>,
+            checks: BTreeMap<Slot, CredentialCheckMetadata>,
+            generation: BTreeMap<Slot, u64>,
+        }
+        let legacy: LegacyVaultFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert_eq!(legacy.entries.len(), 1);
+        assert!(legacy.cleared.is_empty());
+        assert!(legacy.checks.is_empty());
+        assert!(legacy.generation.is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn mcp_state_upgrades_vault_to_version_two_and_backloads() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("vault");
+        let mut file = VaultFile::default();
+        file.entries
+            .insert(Slot::Openrouter, entry("sk-test-provider"));
+        file.mcp_entries
+            .insert("docs".into(), entry("mcp-test-secret"));
+        file.bump_mcp("docs");
+        save(&dir, &mut file).unwrap();
+
+        let raw = fs::read_to_string(dir.join(VAULT_FILE_NAME)).unwrap();
+        assert!(raw.contains("\"version\": 2"), "{raw}");
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.mcp_generation.get("docs"), Some(&1));
+        assert_eq!(
+            loaded.mcp_entries["docs"].secret.expose(),
+            "mcp-test-secret"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn cleared_mcp_state_keeps_vault_version_two() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("vault");
+        let mut file = VaultFile::default();
+        file.mcp_entries
+            .insert("docs".into(), entry("mcp-test-secret"));
+        file.bump_mcp("docs");
+        save(&dir, &mut file).unwrap();
+
+        let fingerprint = file
+            .mcp_entries
+            .remove("docs")
+            .map(|entry| entry.fingerprint);
+        file.mcp_cleared.insert(
+            "docs".into(),
+            Tombstone {
+                at: Utc::now(),
+                fingerprint,
+            },
+        );
+        file.bump_mcp("docs");
+        save(&dir, &mut file).unwrap();
+
+        let raw = fs::read_to_string(dir.join(VAULT_FILE_NAME)).unwrap();
+        assert!(raw.contains("\"version\": 2"), "{raw}");
+        assert!(load(&dir).unwrap().mcp_cleared.contains_key("docs"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn legacy_version_one_provider_vault_survives_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("vault");
+        let mut file = VaultFile::default();
+        file.version = 1;
+        file.entries
+            .insert(Slot::Openrouter, entry("sk-test-legacy"));
+        save(&dir, &mut file).unwrap();
+
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(
+            loaded.entries[&Slot::Openrouter].secret.expose(),
+            "sk-test-legacy"
+        );
+        let mut loaded = loaded;
+        save(&dir, &mut loaded).unwrap();
+        let reloaded = load(&dir).unwrap();
+        assert_eq!(reloaded.version, 1);
+        assert_eq!(
+            reloaded.entries[&Slot::Openrouter].secret.expose(),
+            "sk-test-legacy"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
     fn looser_file_mode_is_refused_with_typed_error_naming_path() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("vault");
-        save(&dir, &VaultFile::default()).unwrap();
+        let mut file = VaultFile::default();
+        save(&dir, &mut file).unwrap();
         let path = dir.join(VAULT_FILE_NAME);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         match load(&dir) {
@@ -358,7 +504,8 @@ mod tests {
     fn looser_dir_mode_is_refused_for_load_and_save() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("vault");
-        save(&dir, &VaultFile::default()).unwrap();
+        let mut file = VaultFile::default();
+        save(&dir, &mut file).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
             load(&dir),
@@ -368,7 +515,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            save(&dir, &VaultFile::default()),
+            save(&dir, &mut VaultFile::default()),
             Err(VaultStoreError::LooseMode {
                 required: 0o700,
                 ..
@@ -381,7 +528,8 @@ mod tests {
     fn symlinked_vault_file_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("vault");
-        save(&dir, &VaultFile::default()).unwrap();
+        let mut file = VaultFile::default();
+        save(&dir, &mut file).unwrap();
         let path = dir.join(VAULT_FILE_NAME);
         let target = root.path().join("elsewhere.json");
         fs::rename(&path, &target).unwrap();
@@ -397,7 +545,8 @@ mod tests {
     fn malformed_file_error_does_not_echo_contents() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("vault");
-        save(&dir, &VaultFile::default()).unwrap();
+        let mut file = VaultFile::default();
+        save(&dir, &mut file).unwrap();
         let path = dir.join(VAULT_FILE_NAME);
         fs::write(&path, br#"{"entries": "sk-test-malformed-canary"}"#).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();

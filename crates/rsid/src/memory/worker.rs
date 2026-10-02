@@ -2060,6 +2060,9 @@ mod tests {
         let handle = MemoryHandle::new(tx);
 
         let rt_cfg = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        rt_cfg
+            .memory_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut worker = MemoryWorker::new(rx, sync_engine, main_store, None, bus, rt_cfg);
         let worker_task = tokio::spawn(async move { worker.run().await });
 

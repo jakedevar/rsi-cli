@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
-use crate::watchdog::RestartRecord;
+use crate::store_support::restart_record::RestartRecord;
 
 const COLUMNS: &str = "id, version, observed_at, last_healthy_at, failed_probes_json";
 // RSI-RELEASED-MIGRATION-BEGIN: v128-watchdog-restart-catalog

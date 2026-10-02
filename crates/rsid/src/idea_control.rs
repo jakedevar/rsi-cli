@@ -33,12 +33,6 @@ impl AgentTokenLookup for HashMap<String, Uuid> {
     }
 }
 
-impl AgentTokenLookup for crate::session::AgentTokenRegistry {
-    fn session_for_token(&self, token: &str) -> Option<Uuid> {
-        self.get(token).copied()
-    }
-}
-
 /// Redacted, stable `SQLite` integrity classes exposed only through the
 /// operator Issue-link error envelope.  The database message is deliberately
 /// not transport data: it can contain SQL or implementation details.

@@ -12,11 +12,11 @@ Commit 7c10f8d ("refactor(rpi): kill context-bloat across RPI command suite") fi
 4. Carry the "Commit and Push — MANDATORY" destructive block in bare prose, copy-pasted from four siblings that have since been refactored around it.
 5. Repeat the Original-Question-bookend rule three times per file, each pass with increasingly desperate ALL-CAPS enforcement — teaching the agent that rules can be safely ignored until the third restatement.
 
-The grading pass in `/home/jakedevar/rsi/docs/prompt-grading/` (`create_handoff.md`, D+ / 33-70; `resume_handoff.md`, D / 31-70) diagnosed each defect. This plan is the fix. After it lands, every RPI command in the project-local command set obeys the shared preamble; the pipeline has no terminal bloat leak; and the document format the next-session agent reads is a typed artifact instead of an LLM diary. This finishes the work 7c10f8d started.
+The grading pass in `~/rsi/docs/prompt-grading/` (`create_handoff.md`, D+ / 33-70; `resume_handoff.md`, D / 31-70) diagnosed each defect. This plan is the fix. After it lands, every RPI command in the project-local command set obeys the shared preamble; the pipeline has no terminal bloat leak; and the document format the next-session agent reads is a typed artifact instead of an LLM diary. This finishes the work 7c10f8d started.
 
 ## Success Criteria
-- Zero occurrences of `Read files FULLY`, `read the handoff document FULLY`, `WITHOUT limit/offset`, or equivalent full-file mandates in either file. Verified by `grep -rEi "read.*(FULLY|completely)|without limit/offset|never use (limit|offset)" /home/jakedevar/rsi/.claude/commands/create_handoff.md /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returning zero hits.
-- Both files contain the canonical Worker-Preamble reference paragraph, pointing at `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=handoff` (see "Preamble Reference Paragraph — Exact Text" below for the literal paragraph).
+- Zero occurrences of `Read files FULLY`, `read the handoff document FULLY`, `WITHOUT limit/offset`, or equivalent full-file mandates in either file. Verified by `grep -rEi "read.*(FULLY|completely)|without limit/offset|never use (limit|offset)" ~/rsi/.claude/commands/create_handoff.md ~/rsi/.claude/commands/resume_handoff.md` returning zero hits.
+- Both files contain the canonical Worker-Preamble reference paragraph, pointing at `~/rsi/.claude/commands/_shared/worker_preamble.md` with `role=handoff` (see "Preamble Reference Paragraph — Exact Text" below for the literal paragraph).
 - `create_handoff.md` contains exactly one `<handoff_contract>` XML block declaring the load-bearing fields the resuming agent pulls (`doc_path`, `status`, `immediate_next_action`, `ticket_id?`, `critical_refs[]`, `blocker?`).
 - `create_handoff.md` wraps its document template in a `<handoff_document>` XML block with `max_words` / `max_items` on every field (caps listed under Ambiguity Resolutions).
 - `create_handoff.md` lifts Commit-and-Push into a `<destructive_actions>` XML block with scoped `stage` paths, a `main-branch guard`, a `push on_failure` clause, and an explicit forbidden-paths list.
@@ -44,7 +44,7 @@ The grading pass in `/home/jakedevar/rsi/docs/prompt-grading/` (`create_handoff.
 Both files ship in one commit. The phases below are logical units inside that single commit, ordered so that a reviewer reading the diff can see the contract being defined before it is referenced. If Phase 2 grows beyond what a single-commit diff can safely carry (unlikely at the current scope), split per "Commit strategy" in Ambiguity Resolutions — otherwise keep atomic.
 
 ### Phase 1 — `create_handoff.md`: contract and template
-**File touched:** `/home/jakedevar/rsi/.claude/commands/create_handoff.md`
+**File touched:** `~/rsi/.claude/commands/create_handoff.md`
 
 **Changes (ordered top-down in the file after the edit):**
 
@@ -182,20 +182,20 @@ Both files ship in one commit. The phases below are logical units inside that si
 9. **Remove duplicate "Original Question Restatement — MANDATORY (ENFORCED)" section** (L98-116) entirely — subsumed by the `<terminal_contract>` block at the top.
 
 **Success check (Phase 1 scope):**
-- `grep -c "Original Question" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 1 (the `<terminal_contract>` block), not 3.
-- `grep -c "<handoff_contract>" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 1.
-- `grep -c "<handoff_document>" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 1.
-- `grep -c "<destructive_actions>" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 1.
-- `grep -c "more information, not less" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 0.
-- `grep -c "leanrned" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 0.
-- `grep -c "_shared/worker_preamble.md" /home/jakedevar/rsi/.claude/commands/create_handoff.md` returns 1.
+- `grep -c "Original Question" ~/rsi/.claude/commands/create_handoff.md` returns 1 (the `<terminal_contract>` block), not 3.
+- `grep -c "<handoff_contract>" ~/rsi/.claude/commands/create_handoff.md` returns 1.
+- `grep -c "<handoff_document>" ~/rsi/.claude/commands/create_handoff.md` returns 1.
+- `grep -c "<destructive_actions>" ~/rsi/.claude/commands/create_handoff.md` returns 1.
+- `grep -c "more information, not less" ~/rsi/.claude/commands/create_handoff.md` returns 0.
+- `grep -c "leanrned" ~/rsi/.claude/commands/create_handoff.md` returns 0.
+- `grep -c "_shared/worker_preamble.md" ~/rsi/.claude/commands/create_handoff.md` returns 1.
 
 **Risk:** Low-medium. Behavioral risk is confined to the written handoff's shape: a terser doc may cause some downstream `/resume_handoff` heuristics to miss a field. Mitigation: the XML-driven markdown headings match the current heading names the resuming agent scans for, and Phase 2 rewrites the resuming side to be contract-driven rather than heuristic-driven anyway.
 
 ---
 
 ### Phase 2 — `resume_handoff.md`: intake and discipline
-**File touched:** `/home/jakedevar/rsi/.claude/commands/resume_handoff.md`
+**File touched:** `~/rsi/.claude/commands/resume_handoff.md`
 
 **Changes (ordered top-down in the file after the edit):**
 
@@ -318,16 +318,16 @@ Both files ship in one commit. The phases below are logical units inside that si
 16. **Resolve the `<docregblock>?</docregblock>` folklore at L129**: document what it does (daemon detects the literal string and prompts Jake) in one inline sentence. Keep the mechanism — replacing it requires a harness-side change that is out of scope — but surface its semantics so the agent isn't acting on folklore.
 
 **Success check (Phase 2 scope):**
-- `grep -c "FULLY" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 0.
-- `grep -c "WITHOUT limit" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 0.
-- `grep -c "without limit" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 0.
-- `grep -c "<handoff_intake>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1.
-- `grep -c "<discard_after_extract>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1.
-- `grep -c "<forbidden_content>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1.
-- `grep -c "<destructive_actions>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1.
-- `grep -c "Original Question" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1 (inside `<terminal_contract>`).
-- `grep -c "_shared/worker_preamble.md" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns 1.
-- `grep -c "ToolSearch" /home/jakedevar/rsi/.claude/commands/resume_handoff.md` returns ≥1.
+- `grep -c "FULLY" ~/rsi/.claude/commands/resume_handoff.md` returns 0.
+- `grep -c "WITHOUT limit" ~/rsi/.claude/commands/resume_handoff.md` returns 0.
+- `grep -c "without limit" ~/rsi/.claude/commands/resume_handoff.md` returns 0.
+- `grep -c "<handoff_intake>" ~/rsi/.claude/commands/resume_handoff.md` returns 1.
+- `grep -c "<discard_after_extract>" ~/rsi/.claude/commands/resume_handoff.md` returns 1.
+- `grep -c "<forbidden_content>" ~/rsi/.claude/commands/resume_handoff.md` returns 1.
+- `grep -c "<destructive_actions>" ~/rsi/.claude/commands/resume_handoff.md` returns 1.
+- `grep -c "Original Question" ~/rsi/.claude/commands/resume_handoff.md` returns 1 (inside `<terminal_contract>`).
+- `grep -c "_shared/worker_preamble.md" ~/rsi/.claude/commands/resume_handoff.md` returns 1.
+- `grep -c "ToolSearch" ~/rsi/.claude/commands/resume_handoff.md` returns ≥1.
 
 **Risk:** Medium. This is the behaviorally significant half of the refactor. Pre-refactor, the resuming agent reads the entire handoff plus every referenced artifact before acting; post-refactor it extracts a working set and defers body reads. An existing handoff whose load-bearing content sits in `## Other Notes` instead of a proper field will lose that content. Mitigation: (a) the `<handoff_intake>` explicitly lists `critical_refs[]` as a fallback channel for "everything important that doesn't fit another slot"; (b) any handoff produced by the post-refactor `create_handoff.md` will have the fields in the right places; (c) if a pre-refactor handoff is encountered, the agent's first read (handoff is <400 lines in almost all cases) still loads the body — the discipline change is about what is retained, not what is initially read.
 
@@ -376,7 +376,7 @@ Both files ship in one commit. The phases below are logical units inside that si
 
 Copy the paragraph below verbatim into BOTH files, placed immediately after the new role statement. The same paragraph works for both files; the role token is `role=handoff` in both cases.
 
-> **Worker preamble (binding):** This command MUST load and obey `/home/jakedevar/rsi/.claude/commands/_shared/worker_preamble.md` with `role=handoff` before acting. That file defines the read budget (Grep-then-Read targeted ranges; full-file reads only for files <400 lines; ≤8k-token read budget before acting), the forbidden-content rules, and the failure-mode contract. The return-budget section of the preamble is INAPPLICABLE to this command — handoff commands write to disk or drive a live session rather than return a bounded blob to a master orchestrator. The rules below COMPOSE ON TOP of the preamble and may tighten (never loosen) any limit declared there.
+> **Worker preamble (binding):** This command MUST load and obey `~/rsi/.claude/commands/_shared/worker_preamble.md` with `role=handoff` before acting. That file defines the read budget (Grep-then-Read targeted ranges; full-file reads only for files <400 lines; ≤8k-token read budget before acting), the forbidden-content rules, and the failure-mode contract. The return-budget section of the preamble is INAPPLICABLE to this command — handoff commands write to disk or drive a live session rather than return a bounded blob to a master orchestrator. The rules below COMPOSE ON TOP of the preamble and may tighten (never loosen) any limit declared there.
 
 Both files get this exact paragraph. No per-file variation. If a future change requires distinct handoff-command budgets, extend the preamble's frontmatter `role_variants` list — do not fork the paragraph.
 
@@ -389,82 +389,82 @@ Run each check below after the commit lands. Expected-zero checks fail the refac
 1. **`FULLY` / limit-offset mandates purged:**
    ```
    grep -rEi "read.*(FULLY|completely)|without limit|never use (limit|offset)" \
-     /home/jakedevar/rsi/.claude/commands/create_handoff.md \
-     /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+     ~/rsi/.claude/commands/create_handoff.md \
+     ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: **0 hits.**
 
 2. **Preamble referenced in both files (exactly once each):**
    ```
-   grep -c "_shared/worker_preamble.md" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "_shared/worker_preamble.md" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+   grep -c "_shared/worker_preamble.md" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "_shared/worker_preamble.md" ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: **1 and 1.**
 
 3. **Role token correct:**
    ```
-   grep -c "role=handoff" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "role=handoff" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+   grep -c "role=handoff" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "role=handoff" ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: **1 and 1.**
 
 4. **Terminal contract collapsed (not triplicated):**
    ```
-   grep -c "<terminal_contract>" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "<terminal_contract>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
-   grep -c "Original Question" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "Original Question" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+   grep -c "<terminal_contract>" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "<terminal_contract>" ~/rsi/.claude/commands/resume_handoff.md
+   grep -c "Original Question" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "Original Question" ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: first two return **1 each**; second two return **1 each** (the `<terminal_contract>` block mentions it once; all other restatements deleted).
 
 5. **`create_handoff.md` structural blocks present (exactly once each):**
    ```
-   grep -c "<handoff_contract>" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "<handoff_document>" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "<destructive_actions>" /home/jakedevar/rsi/.claude/commands/create_handoff.md
+   grep -c "<handoff_contract>" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "<handoff_document>" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "<destructive_actions>" ~/rsi/.claude/commands/create_handoff.md
    ```
    Expected: **1, 1, 1.**
 
 6. **`resume_handoff.md` structural blocks present (exactly once each):**
    ```
-   grep -c "<handoff_intake>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
-   grep -c "<discard_after_extract>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
-   grep -c "<forbidden_content>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
-   grep -c "<destructive_actions>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
-   grep -c "<constraints>" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+   grep -c "<handoff_intake>" ~/rsi/.claude/commands/resume_handoff.md
+   grep -c "<discard_after_extract>" ~/rsi/.claude/commands/resume_handoff.md
+   grep -c "<forbidden_content>" ~/rsi/.claude/commands/resume_handoff.md
+   grep -c "<destructive_actions>" ~/rsi/.claude/commands/resume_handoff.md
+   grep -c "<constraints>" ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: **1, 1, 1, 1, 1.**
 
 7. **Caps present on every handoff_document field (spot-check):**
    ```
-   grep -E "max_words|max_items" /home/jakedevar/rsi/.claude/commands/create_handoff.md | wc -l
+   grep -E "max_words|max_items" ~/rsi/.claude/commands/create_handoff.md | wc -l
    ```
    Expected: **≥15** (the `<handoff_document>` schema has at least 10 capped fields plus `<handoff_contract>`'s optional-field caps and `<destructive_actions>`'s `max_subject_chars`).
 
 8. **Anti-contract prose deleted:**
    ```
-   grep -c "more information, not less" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "leanrned" /home/jakedevar/rsi/.claude/commands/create_handoff.md
-   grep -c "##\. " /home/jakedevar/rsi/.claude/commands/create_handoff.md
+   grep -c "more information, not less" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "leanrned" ~/rsi/.claude/commands/create_handoff.md
+   grep -c "##\. " ~/rsi/.claude/commands/create_handoff.md
    ```
    Expected: **0, 0, 0.**
 
 9. **Stop condition in `resume_handoff.md`:**
    ```
-   grep -c "3 consecutive" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+   grep -c "3 consecutive" ~/rsi/.claude/commands/resume_handoff.md
    ```
    Expected: **≥1.**
 
 10. **ToolSearch preflight in `resume_handoff.md`:**
     ```
-    grep -c "ToolSearch" /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+    grep -c "ToolSearch" ~/rsi/.claude/commands/resume_handoff.md
     ```
     Expected: **≥1.**
 
 11. **File-size delta sanity check:**
     ```
-    wc -l /home/jakedevar/rsi/.claude/commands/create_handoff.md
-    wc -l /home/jakedevar/rsi/.claude/commands/resume_handoff.md
+    wc -l ~/rsi/.claude/commands/create_handoff.md
+    wc -l ~/rsi/.claude/commands/resume_handoff.md
     ```
     Expected: `create_handoff.md` lands between **110-160 lines** (currently 130; XML caps add structure but template prose shrinks); `resume_handoff.md` lands between **150-200 lines** (currently 254; collapsed branches and deleted Common Scenarios section shrink it substantially).
 

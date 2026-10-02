@@ -5,25 +5,25 @@ expression: text
  ● 8
  All projects / Sessions                                                                                                                                                                    22 sessions
                                                                                                                    │
-               #   ∞  S  !  FUNCTION                                        ◔     ⇄ AGE    MODEL                ▮  │  01  ? waiting                                    All projects › Root
-               ! NEEDS YOU  2  ──────────────                                                                      │  ────────────────────────────────────────────────────────────────────
-             ▌        ?  !  Review harness snapshots                              3  now ⋈ opus-4-6             ▆──│  Review harness snapshots
-                      ×  !  Investigate render edge                              13  now ✻ opus-4-1                │  ! needs you
-                                                                                                                   │
-               ● IN FLIGHT  8  ──────────────                                                                      │  → Choose the bounded relay policy?
-                      ●     Implement event seam                                  8  now ✻ sonnet-5                │
-                      ●     Browser session 05                                    8   5d ✻ sonnet-5                │  ? reply required
+               #   ∞  S  !  FUNCTION                                        ◔     ⇄ AGE    MODEL                ▮  │  01  ? waiting  # 02020202                        All projects › Root
+               ! NEEDS YOU  2  ──────────────                                                                      │  ⋈ openrouter/anthropic/claude-opus-4-6  ▮▮▮▯ high
+             ▌        ?  !  Review harness snapshots                              3  now ⋈ opus-4-6             ▆──│  ────────────────────────────────────────────────────────────────────
+                      ×  !  Investigate render edge                              13  now ✻ opus-4-1                │  Review harness snapshots
+                                                                                                                   │  ! needs you
+               ● IN FLIGHT  8  ──────────────                                                                      │
+                      ●     Implement event seam                                  8  now ✻ sonnet-5                │  ⇄ 3   $0.01   ◷ <1m run   + 01-01 01:58   Δ just now
+                      ●     Browser session 05                                    8   5d ✻ sonnet-5                │  ⌂ /tmp
                       ●     Browser session 06                                    8   6d ✻ sonnet-5                │
-                      ●     Browser session 07                                    8   7d ✻ sonnet-5                │  Policy requires your response.
+                      ●     Browser session 07                                    8   7d ✻ sonnet-5                │  → Choose the bounded relay policy?
                       ●     Browser session 08                                    8   8d ✻ sonnet-5                │
-                      ●     Browser session 09                                    8   9d ✻ sonnet-5                │  ▎ Pin session list rendering with TestBackend
+                      ●     Browser session 09                                    8   9d ✻ sonnet-5                │  ? reply required
                       ●     Browser session 10                                    8  10d ✻ sonnet-5                │
-                      ◐     Browser session 11                                    8  11d ✻ sonnet-5                │  ⋈ openrouter/anthropic/claude-opus-4-6  ▮▮▮▯ high
-                                                                                                                   │  ⇄ 3   $0.01   ◷ <1m run
-               ✓ RECENT  1  ──────────────                                                                         │  + 01-01 01:58   Δ just now
+                      ◐     Browser session 11                                    8  11d ✻ sonnet-5                │  Policy requires your response.
+                                                                                                                   │
+               ✓ RECENT  1  ──────────────                                                                         │  ▎ Pin session list rendering with TestBackend
                       ✓     Clean fixture state                                   5  now ⌂ oss:20b                 │
-                                                                                                                   │  # 02020202-0202-0202-0202-020202020202
-               · QUIET  11  ──────────────                                                                         │  ⌂ /tmp
+                                                                                                                   │
+               · QUIET  11  ──────────────                                                                         │
                       ■     Browser session 12                                    8  12d ✻ sonnet-5                │
                       ✓     Browser session 13                                    8  13d ✻ sonnet-5                │
                       ✓     Browser session 14                                    8  14d ✻ sonnet-5                │
@@ -50,13 +50,13 @@ expression: text
                                                                                                                    │
                                                                                                                    │
                                                                                                                    │
-                                                                                                                   │
-                                                                                                                   │
-                                                                                                                   │
-                                                                                                                   │
-                                                                                                                   │
                ────────────────────────────────────────────────────────────────────────────────────────────────    │
                                                                                                                    │
                22/22                                                                                               │
+                                                                                                                   │
+               ● run  ✓ done  × fail  ■ stop  ◐ start  ? wait  · arch                                              │
+               ! you  • unread  ↺ retry  ⧗ stall  ◆ pin  ↻ rotated  ◌ ctx ?                                        │
+               ✻ claude  ◎ codex  ◉ codex as  ⋈ openrouter  ⌂ local  △ antigravity  ◇ pioneer  ⌘ harness           │
+               Mg lead  Pl plan  Im build  Db debug  Rv check                                                      │
                                                                                                                    │
                                                                                                                    │

@@ -253,7 +253,23 @@ pub(crate) async fn capture_bounded(
     limits: CaptureLimits,
     cancel: &CancellationToken,
 ) -> std::result::Result<CapturedOutput, CaptureError> {
-    capture_bounded_with_spawn(command, limits, cancel, |mut command| {
+    capture_bounded_with_stdin(command, limits, cancel, None).await
+}
+
+/// [`capture_bounded`] that optionally feeds `stdin` to the child.
+///
+/// With `Some(bytes)` the child's stdin is a pipe: the bytes are written and
+/// the pipe is then closed, so a reader sees EOF after the payload. With
+/// `None` stdin is `/dev/null`, exactly as [`capture_bounded`]. Catalog probes
+/// that speak a request/response protocol on stdin (the Claude CLI's
+/// stream-json `initialize` control request) use this form.
+pub(crate) async fn capture_bounded_with_stdin(
+    command: Command,
+    limits: CaptureLimits,
+    cancel: &CancellationToken,
+    stdin: Option<Vec<u8>>,
+) -> std::result::Result<CapturedOutput, CaptureError> {
+    capture_bounded_with_spawn_and_stdin(command, limits, cancel, stdin, |mut command| {
         command
             .spawn()
             .map_err(|error| CaptureError::Spawn(error.to_string()))
@@ -267,9 +283,24 @@ pub(crate) async fn capture_bounded(
 /// capability at the exact spawn boundary after this module has installed all
 /// pipes and containment settings.
 pub(crate) async fn capture_bounded_with_spawn<F>(
+    command: Command,
+    limits: CaptureLimits,
+    cancel: &CancellationToken,
+    spawn: F,
+) -> std::result::Result<CapturedOutput, CaptureError>
+where
+    F: FnOnce(Command) -> std::result::Result<Child, CaptureError>,
+{
+    capture_bounded_with_spawn_and_stdin(command, limits, cancel, None, spawn).await
+}
+
+/// Shared body of every bounded capture: optional stdin payload plus the
+/// caller-owned spawn seam.
+async fn capture_bounded_with_spawn_and_stdin<F>(
     mut command: Command,
     limits: CaptureLimits,
     cancel: &CancellationToken,
+    stdin: Option<Vec<u8>>,
     spawn: F,
 ) -> std::result::Result<CapturedOutput, CaptureError>
 where
@@ -281,7 +312,11 @@ where
     configure_tokio_process_group(&mut command, limits.containment)
         .map_err(|error| CaptureError::Spawn(error.to_string()))?;
     command
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -293,6 +328,23 @@ where
     let pgid = nix::unistd::Pid::from_raw(child.id().ok_or_else(|| {
         CaptureError::Spawn("spawned child did not expose a process id".to_string())
     })? as i32);
+    if let Some(payload) = stdin {
+        let Some(mut child_stdin) = child.stdin.take() else {
+            terminate_process_group(pgid);
+            let _ = tokio::time::timeout(limits.cleanup_timeout, child.wait()).await;
+            return Err(CaptureError::MissingPipe("stdin"));
+        };
+        // Written off the supervisor so a child that never reads cannot stall
+        // stdout/stderr draining. The writer ends when the payload is flushed
+        // or when the supervisor kills the group and the pipe closes; dropping
+        // the handle delivers EOF.
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if child_stdin.write_all(&payload).await.is_ok() {
+                let _ = child_stdin.shutdown().await;
+            }
+        });
+    }
     let Some(stdout) = child.stdout.take() else {
         terminate_process_group(pgid);
         let _ = tokio::time::timeout(limits.cleanup_timeout, child.wait()).await;
@@ -674,6 +726,32 @@ where
         let bytes = std::mem::take(&mut self.current);
         String::from_utf8(bytes).map_err(|_| BoundedLineError::InvalidUtf8)
     }
+
+    /// Drop the remainder of one oversized frame so the next call can read the
+    /// following event. Keep draining without retaining any more provider data.
+    pub(crate) async fn drain_oversized_line(
+        &mut self,
+    ) -> std::result::Result<(), BoundedLineError> {
+        self.current.clear();
+        self.pending_cr = false;
+        loop {
+            let available = self
+                .reader
+                .fill_buf()
+                .await
+                .map_err(|error| BoundedLineError::Io(error.to_string()))?;
+            if available.is_empty() {
+                break;
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |position| position + 1);
+            self.reader.consume(consumed);
+            if newline.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn configure_tokio_process_group(
@@ -709,12 +787,39 @@ pub(crate) fn signal_process_group(
     if pgid.as_raw() <= 0 {
         return Err(Errno::EINVAL);
     }
+    #[cfg(test)]
+    recorded_group_signals::record(pgid.as_raw(), signal);
     match killpg(pgid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(_) => match kill(pgid, signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(error),
         },
+    }
+}
+
+/// Test seam: every process-group signal the daemon attempts, so a test can
+/// prove a disarmed handle sends none without relying on real PID reuse.
+#[cfg(test)]
+pub(crate) mod recorded_group_signals {
+    use std::sync::Mutex;
+
+    static RECORDED: Mutex<Vec<(i32, nix::sys::signal::Signal)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(pgid: i32, signal: nix::sys::signal::Signal) {
+        RECORDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((pgid, signal));
+    }
+
+    pub(crate) fn sent_to(pgid: i32) -> usize {
+        RECORDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(recorded, _)| *recorded == pgid)
+            .count()
     }
 }
 
@@ -903,6 +1008,34 @@ mod tests {
         assert_eq!(output.stderr.len(), 64);
         assert!(!output.stdout_truncated);
         assert!(!output.stderr_truncated);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn bounded_capture_feeds_stdin_payload_then_eof() {
+        // `cat` exits only at EOF, so a clean exit proves the pipe was closed.
+        let output = capture_bounded_with_stdin(
+            shell("cat"),
+            short_limits(OverflowBehavior::Error),
+            &CancellationToken::new(),
+            Some(b"initialize\n".to_vec()),
+        )
+        .await
+        .expect("payload echoed");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"initialize\n");
+
+        // `None` keeps stdin on /dev/null: `cat` reads EOF immediately.
+        let output = capture_bounded_with_stdin(
+            shell("cat"),
+            short_limits(OverflowBehavior::Error),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("null stdin");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -1103,12 +1236,14 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn bounded_lines_rejects_before_extending_past_limit() {
-        let mut lines = BoundedLines::new(Cursor::new(b"123456789\n".to_vec()), 8);
+        let mut lines = BoundedLines::new(Cursor::new(b"123456789\nnext\n".to_vec()), 8);
         assert_eq!(
             lines.next_line().await,
             Err(BoundedLineError::Exceeded { limit: 8 })
         );
         assert!(lines.current.len() <= 8);
+        lines.drain_oversized_line().await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("next"));
     }
 
     #[cfg(target_os = "linux")]

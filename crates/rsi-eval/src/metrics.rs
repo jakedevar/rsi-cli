@@ -254,6 +254,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: Some(100),
+            total_prompt_tokens: None,
             session_kind: SessionKind::Bug,
             total_output_tokens: Some(50),
             total_cache_creation_tokens: Some(0),

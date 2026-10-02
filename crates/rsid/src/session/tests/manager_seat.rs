@@ -556,3 +556,76 @@ async fn seat_question_after_early_gate_is_refused_before_launch() {
 async fn seat_rotation_after_early_gate_is_refused_before_launch() {
     late_mutation_is_refused_before_launch(LateMutation::Rotate, "manager_seat_tip_changed").await;
 }
+
+/// #754: a seat continuation on an exhausted Codex account is refused with the
+/// typed usage-limit hold before any launch; the attempt records the typed
+/// code and no provider starts.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seat_continuation_during_usage_limit_hold_is_refused_typed() {
+    let p = pilot().await;
+    fail_manager(&p).await;
+    let claim = claim_only(&p).await;
+    let reset = chrono::Utc::now() + chrono::Duration::days(2);
+    let text = format!(
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at {} {}th, {} {}.",
+        reset.format("%b"),
+        reset.format("%-d"),
+        reset.format("%Y"),
+        reset.format("%-I:%M %p"),
+    );
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET provider='Codex', stop_reason=?2 WHERE id=?1",
+                rusqlite::params![
+                    p.owner.to_string(),
+                    crate::codex::CODEX_USAGE_LIMIT_STOP_REASON
+                ],
+            )
+            .unwrap();
+        store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: p.owner,
+                sequence: 9_000,
+                event_type: EventType::Message,
+                role: Some(Role::Assistant),
+                content: format!("**Process Error (codex_event)**\n```\n{text}\n```"),
+                tool_name: None,
+                tool_input: None,
+                created_at: chrono::Utc::now(),
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .unwrap();
+    }
+    let process = launch::install_controller_candidate_test_process(p.owner);
+    p.manager
+        .execute_manager_seat_claim(p.project, claim.clone())
+        .await
+        .unwrap();
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
+    let direct = p
+        .manager
+        .continue_manager_seat(claim, "resume".into())
+        .await
+        .expect_err("a seat continuation is held while the account is exhausted");
+    assert!(
+        crate::provider_exhaustion::hold_error_until(&direct).is_some(),
+        "typed hold refusal, got {direct}"
+    );
+    let row = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(p.owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, SessionStatus::Failed);
+    launch::take_controller_candidate_test_process(p.owner);
+}

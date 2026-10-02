@@ -9,6 +9,7 @@ use rsi_common::harness_manager_v2::*;
 use rsi_common::types::Project;
 
 mod fence;
+mod lead_wakes;
 mod recovery;
 
 const OBSERVED_INTERRUPTED_PROGRAM_TEXT: &str = "The fresh re-review is terminal. I’m re-registering the program guard first, then I’ll validate its one-file commit and stored strict handoff. Zero findings will open V13; any finding returns to the exact implementer.";
@@ -3403,6 +3404,180 @@ async fn manager_actions_fresh_provider_custody_and_explicit_assignment() {
     super::super::launch::drop_controller_candidate_test_stream(child);
 }
 
+/// Put the fixture repo on `refs/heads/rolling` with a bare `origin` remote
+/// whose `rolling` matches the checkout, mirroring the operator's shared
+/// checkout before it lags. Returns the bare origin path.
+#[allow(clippy::unwrap_used)]
+fn rolling_checkout_with_origin(p: &Pilot) -> std::path::PathBuf {
+    let parent = p.repo.parent().unwrap().to_path_buf();
+    let origin = parent.join("origin.git");
+    git(&parent, &["init", "-q", "--bare", "origin.git"]);
+    git(
+        &p.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&p.repo, &["branch", "-M", "rolling"]);
+    git(&p.repo, &["push", "-q", "origin", "rolling"]);
+    git(&p.repo, &["fetch", "-q", "origin"]);
+    origin
+}
+
+/// Advance the bare origin's `rolling` one commit past the checkout's local
+/// branch without moving any ref inside the checkout (#913 fixture).
+#[allow(clippy::unwrap_used)]
+fn advance_origin_rolling(p: &Pilot, origin: &std::path::Path) -> String {
+    let parent = p.repo.parent().unwrap().to_path_buf();
+    let scratch = parent.join("scratch");
+    git(
+        &parent,
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "rolling",
+            origin.to_str().unwrap(),
+            scratch.to_str().unwrap(),
+        ],
+    );
+    git(&scratch, &["config", "user.name", "Rolling origin"]);
+    git(
+        &scratch,
+        &["config", "user.email", "origin@example.invalid"],
+    );
+    std::fs::write(scratch.join("origin-fresh"), "fresh origin commit\n").unwrap();
+    git(&scratch, &["add", "origin-fresh"]);
+    git(&scratch, &["commit", "-qm", "origin fresh"]);
+    git(
+        &scratch,
+        &["push", "-q", "origin", "HEAD:refs/heads/rolling"],
+    );
+    git(&scratch, &["rev-parse", "HEAD"])
+}
+
+/// #913: a manager-created session whose source is an unsandboxed container
+/// (an Epic) forks from the verified origin `rolling` tip rather than the
+/// checkout's stale local `rolling`, and never moves a checkout ref.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::large_futures, clippy::significant_drop_tightening)]
+async fn manager_actions_unsandboxed_source_forks_from_origin_rolling_tip() {
+    let p = pilot().await;
+    let origin = rolling_checkout_with_origin(&p);
+    let stale = git(&p.repo, &["rev-parse", "HEAD"]);
+    let fresh = advance_origin_rolling(&p, &origin);
+    assert_ne!(stale, fresh);
+
+    let receipt = p
+        .admit(
+            "stale-rolling-epic-spawn",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "fork from the verified origin tip".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+            },
+        )
+        .await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    let child = receipt.target_session_id.unwrap();
+    let process = super::super::launch::install_controller_candidate_test_process(child);
+    p.execute().await.unwrap();
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+
+    let root = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(child)
+        .unwrap()
+        .unwrap()
+        .sandbox_root
+        .unwrap();
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), fresh);
+    assert_eq!(git(&p.repo, &["rev-parse", "refs/heads/rolling"]), stale);
+    assert_eq!(
+        git(&p.repo, &["rev-parse", "refs/remotes/origin/rolling"]),
+        stale
+    );
+    assert!(git(&p.repo, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
+    super::super::launch::drop_controller_candidate_test_stream(child);
+}
+
+/// #913: a sandboxed source (predecessor lead fork) keeps its exact frozen
+/// commit even when the origin `rolling` tip is newer.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::large_futures, clippy::significant_drop_tightening)]
+async fn manager_actions_sandboxed_source_keeps_frozen_commit_when_origin_is_newer() {
+    let p = pilot().await;
+    let origin = rolling_checkout_with_origin(&p);
+    let frozen = git(&p.repo, &["rev-parse", "HEAD"]);
+
+    let first = p
+        .admit(
+            "sandboxed-source-first-replace",
+            ManagerActionV2::ReplaceLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                query: "first replacement".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+            },
+        )
+        .await;
+    let sandboxed = first.target_session_id.unwrap();
+    let first_process = super::super::launch::install_controller_candidate_test_process(sandboxed);
+    p.execute().await.unwrap();
+    assert_eq!(
+        first_process.productive_start_count.load(Ordering::SeqCst),
+        1
+    );
+    // Let the first launch settle before reading the lead fence for the
+    // second replacement; under load its tail still moves the fence.
+    wait_launch_event(&p, sandboxed).await;
+
+    let fresh = advance_origin_rolling(&p, &origin);
+    assert_ne!(frozen, fresh);
+
+    let second = p
+        .admit(
+            "sandboxed-source-second-replace",
+            ManagerActionV2::ReplaceLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                query: "second replacement".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+            },
+        )
+        .await;
+    let successor = second.target_session_id.unwrap();
+    let second_process = super::super::launch::install_controller_candidate_test_process(successor);
+    p.execute().await.unwrap();
+    assert_eq!(
+        second_process.productive_start_count.load(Ordering::SeqCst),
+        1
+    );
+
+    let root = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(successor)
+        .unwrap()
+        .unwrap()
+        .sandbox_root
+        .unwrap();
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), frozen);
+    assert_ne!(git(&root, &["rev-parse", "HEAD"]), fresh);
+    assert_eq!(git(&p.repo, &["rev-parse", "refs/heads/rolling"]), frozen);
+    assert!(git(&p.repo, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
+    super::super::launch::drop_controller_candidate_test_stream(sandboxed);
+    super::super::launch::drop_controller_candidate_test_stream(successor);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_actions_replacement_preserves_committed_predecessor_and_blocks_dirty_source() {
@@ -3727,6 +3902,246 @@ async fn manager_actions_internal_intent_has_daemon_attribution_and_policy_gate(
         p.receipt(receipt.operation_id).await.state,
         ManagerActionStateV2::Succeeded
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn queued_last_slot_actions(
+    child_provider: SessionProvider,
+    max_active: u16,
+) -> (Pilot, ManagerActionReceiptV2, ManagerActionReceiptV2) {
+    let mut p = pilot().await;
+    p.policy.max_active_sessions = max_active;
+    let child_launch = if child_provider == SessionProvider::Claude {
+        p.policy.allowed_launches[0].clone()
+    } else {
+        let choice = ManagerLaunchChoiceV2 {
+            provider: child_provider,
+            model: "codex-test".into(),
+            effort: None,
+        };
+        p.policy.allowed_launches.push(choice.clone());
+        choice
+    };
+    if max_active > 1 {
+        p.policy.provider_limits = vec![rsi_common::harness_manager_v2::ManagerProviderLimitV2 {
+            provider: SessionProvider::Claude,
+            max_active: 1,
+        }];
+    }
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: "last-slot-policy".into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+    let mut recovery = p.request(
+        "older-intent-resume",
+        ManagerActionV2::ResumeLead {
+            epic_id: p.epic,
+            expected: p.fence().await,
+            message: "resume declared work".into(),
+        },
+    );
+    recovery.fence.policy_version = 2;
+    let recovery = p
+        .manager
+        .store
+        .lock()
+        .await
+        .enqueue_manager_action(
+            ManagerActionOriginV2::OperatingIntent {
+                project_id: p.project,
+                intent_id: Uuid::new_v4(),
+            },
+            recovery,
+        )
+        .unwrap();
+    intent::wait_due(&p, recovery.operation_id).await;
+    let mut child_request = p.request(
+        "younger-child",
+        ManagerActionV2::CreateSession {
+            parent_id: p.epic,
+            kind: SessionKind::Task,
+            query: "complete independent child work".into(),
+            launch: child_launch,
+        },
+    );
+    child_request.fence.policy_version = 2;
+    let child = p
+        .manager
+        .agent_control()
+        .agent_manager_control(p.owner, child_request)
+        .await
+        .unwrap();
+    (p, recovery, child)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn due_child_creation_claims_last_slot_before_older_intent_resume() {
+    let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), child.operation_id);
+    assert_eq!(
+        p.receipt(recovery.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn due_child_creation_keeps_priority_after_restart() {
+    let (mut p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    intent::restart(&mut p).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .recover_manager_actions_startup(p.manager.program_run_boot_id)
+        .unwrap();
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), child.operation_id);
+    assert_eq!(
+        p.receipt(recovery.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn stale_child_source_fails_closed_then_recovery_can_claim() {
+    let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    std::fs::write(p.repo.join("source"), "source changed after admission\n").unwrap();
+    git(&p.repo, &["add", "source"]);
+    git(
+        &p.repo,
+        &["commit", "-qm", "advance source after admission"],
+    );
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), child.operation_id);
+    let error = p
+        .manager
+        .check_manager_action_runtime(&claim, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_source_changed"));
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(
+            &claim,
+            ManagerActionStateV2::Blocked,
+            "manager_v2_source_changed",
+        )
+        .unwrap();
+    assert_eq!(p.claim().await.id(), recovery.operation_id);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn child_priority_does_not_refresh_stale_recovery_lead_fence() {
+    let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    let child_claim = p.claim().await;
+    assert_eq!(child_claim.id(), child.operation_id);
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .finish_manager_action(
+                &child_claim,
+                ManagerActionStateV2::Blocked,
+                "test_child_did_not_launch",
+            )
+            .unwrap();
+        let mut successor = store.get_session(p.lead).unwrap().unwrap();
+        successor.id = Uuid::new_v4();
+        successor.continued_from = None;
+        store.insert_session(&successor).unwrap();
+        store.set_lead_session(p.epic, Some(successor.id)).unwrap();
+    }
+    let recovery_claim = p.claim().await;
+    assert_eq!(recovery_claim.id(), recovery.operation_id);
+    let error = p
+        .manager
+        .store
+        .lock()
+        .await
+        .manager_action_runtime_gate(&recovery_claim, false)
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_lead_changed"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn due_codex_child_uses_free_provider_slot_ahead_of_claude_recovery() {
+    let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Codex, 2).await;
+    {
+        let store = p.manager.store.lock().await;
+        let mut active_claude = store.get_session(p.lead).unwrap().unwrap();
+        active_claude.id = Uuid::new_v4();
+        active_claude.status = SessionStatus::Running;
+        active_claude.continued_from = None;
+        store.insert_session(&active_claude).unwrap();
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        assert_eq!(
+            store.manager_v2_resource_snapshot(&config).unwrap()["active_by_provider"]["Claude"],
+            1
+        );
+    }
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), child.operation_id);
+    p.manager
+        .check_manager_action_runtime(&claim, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        p.receipt(recovery.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    let error = store
+        .manager_v2_resource_gate(&config, Some(p.epic), SessionProvider::Claude, None)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("manager_v2_provider_capacity"),
+        "{error}"
+    );
+    store
+        .manager_v2_resource_gate(&config, Some(p.epic), SessionProvider::Codex, None)
+        .unwrap();
+}
+
+/// Wait until `id` has left the active map, its terminal finalizer has
+/// released the settlement guard, and its row shows `status`. The bound is a
+/// failure backstop, not a pacing assumption.
+async fn wait_candidate_settled(p: &Pilot, id: Uuid, status: SessionStatus) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let in_active = p.manager.active.read().await.contains_key(&id);
+            let settling = crate::reconciliation::terminal_settlement_in_progress(id);
+            let current = p
+                .manager
+                .store
+                .lock()
+                .await
+                .get_session(id)
+                .unwrap()
+                .map(|s| s.status);
+            if !in_active && !settling && current == Some(status) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("candidate settles to the expected terminal status");
 }
 
 async fn wait_launch_event(p: &Pilot, id: Uuid) {
@@ -4585,6 +5000,10 @@ async fn manager_actions_deferred_revocation_settles_starting_candidate_without_
     };
     let (result, ()) = tokio::join!(p.manager.reconcile_manager_actions_once(), revoke);
     result.unwrap();
+    // The candidate's terminal finalizer runs on its own task after the
+    // reconcile pass returns. Wait for that condition (leaves `active`, settled
+    // durably Failed) instead of assuming it already ran (#1033).
+    wait_candidate_settled(&p, id, SessionStatus::Failed).await;
     assert!(!p.manager.active.read().await.contains_key(&id));
     let store = p.manager.store.lock().await;
     let row = store.get_session(id).unwrap().unwrap();
@@ -4600,6 +5019,222 @@ async fn manager_actions_deferred_revocation_settles_starting_candidate_without_
         .unwrap();
     assert_eq!(op.receipt.state, ManagerActionStateV2::Revoked);
     assert!(!op.effect_started);
+}
+
+/// #981: a pre-provider launch refusal reaches the typed receipt with its own
+/// class (not the "lost Starting session fence" settlement error), and the
+/// cleanup still fails the target row exactly once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_action_launch_refusal_keeps_its_class_in_the_receipt() {
+    let p = pilot().await;
+    let receipt = p
+        .admit(
+            "scratch-refusal",
+            ManagerActionV2::ReplaceLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                query: "manager candidate".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+            },
+        )
+        .await;
+    let id = receipt.target_session_id.unwrap();
+    super::super::launch::fail_next_direct_launch_execution_scratch_for_test(&format!(
+        "manager.action:{}",
+        receipt.operation_id
+    ));
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let after = p.receipt(receipt.operation_id).await;
+    assert_ne!(after.state, ManagerActionStateV2::Succeeded);
+    assert_eq!(
+        after.outcome.as_deref(),
+        Some("manager_v2_execution_scratch_unavailable")
+    );
+    let store = p.manager.store.lock().await;
+    assert_eq!(
+        store.get_session(id).unwrap().unwrap().status,
+        SessionStatus::Failed
+    );
+    assert!(!p.manager.active.read().await.contains_key(&id));
+}
+
+async fn admit_replace_lead(p: &Pilot, key: &str) -> ManagerActionReceiptV2 {
+    p.admit(
+        key,
+        ManagerActionV2::ReplaceLead {
+            epic_id: p.epic,
+            expected: p.fence().await,
+            query: "manager candidate".into(),
+            launch: p.policy.allowed_launches[0].clone(),
+        },
+    )
+    .await
+}
+
+async fn session_status_of(p: &Pilot, id: Uuid) -> SessionStatus {
+    p.manager
+        .store
+        .lock()
+        .await
+        .get_session(id)
+        .unwrap()
+        .unwrap()
+        .status
+}
+
+/// #1084 (1): a failing inner pre-provider settlement never replaces the
+/// original refusal; the outer cleanup then settles the row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_action_scratch_refusal_survives_a_failing_inner_settlement() {
+    let p = pilot().await;
+    let receipt = admit_replace_lead(&p, "inner-settlement-scratch").await;
+    let id = receipt.target_session_id.unwrap();
+    super::super::launch::fail_next_direct_launch_execution_scratch_for_test(&format!(
+        "manager.action:{}",
+        receipt.operation_id
+    ));
+    super::super::launch::fail_next_pre_provider_settlement_for_test(id);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.outcome.as_deref(),
+        Some("manager_v2_execution_scratch_unavailable")
+    );
+    assert_eq!(session_status_of(&p, id).await, SessionStatus::Failed);
+}
+
+/// #1084 (1): the ContextRead authorization path settles through the same
+/// helper; a failing settlement there is still cleaned up by the outer path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_action_context_refusal_survives_a_failing_inner_settlement() {
+    let p = pilot().await;
+    let receipt = admit_replace_lead(&p, "inner-settlement-context").await;
+    let id = receipt.target_session_id.unwrap();
+    super::super::launch::fail_next_direct_launch_context_authorization_for_test(&format!(
+        "manager.action:{}",
+        receipt.operation_id
+    ));
+    super::super::launch::fail_next_pre_provider_settlement_for_test(id);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let after = p.receipt(receipt.operation_id).await;
+    assert_ne!(after.state, ManagerActionStateV2::Succeeded);
+    assert_eq!(session_status_of(&p, id).await, SessionStatus::Failed);
+}
+
+/// #1084 (2): a transient cleanup failure keeps the action's original class
+/// and leaves durable pending state (row still Starting) that the next
+/// reconcile pass settles.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_action_launch_cleanup_is_retried_after_a_transient_store_failure() {
+    let p = pilot().await;
+    let receipt = admit_replace_lead(&p, "cleanup-retry").await;
+    let id = receipt.target_session_id.unwrap();
+    super::super::launch::fail_next_direct_launch_execution_scratch_for_test(&format!(
+        "manager.action:{}",
+        receipt.operation_id
+    ));
+    super::super::launch::fail_next_pre_provider_settlement_for_test(id);
+    // The outer cleanup and the same pass's sweep both fail transiently.
+    super::super::launch::fail_manager_launch_cleanup_for_test(id, 2);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let first = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        first.outcome.as_deref(),
+        Some("manager_v2_execution_scratch_unavailable")
+    );
+    assert_eq!(session_status_of(&p, id).await, SessionStatus::Starting);
+
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(session_status_of(&p, id).await, SessionStatus::Failed);
+    let second = p.receipt(receipt.operation_id).await;
+    assert_eq!(second.outcome, first.outcome);
+    assert_eq!(second.state, first.state);
+    let store = p.manager.store.lock().await;
+    let invocation = store.session_model_invocation_id(id).unwrap().unwrap();
+    let open: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM model_invocations WHERE id=?1 AND status IN ('running','cancellation_requested')",
+            [invocation.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(open, 0, "the failed launch's invocation is completed");
+    assert!(
+        store
+            .manager_launch_cleanup_candidates(8)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// #1084 (3): every typed launch refusal keeps its own static receipt class.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[test]
+fn launch_refusals_map_to_static_receipt_classes() {
+    use crate::session::manager_actions::safe_action_error as code;
+    let cases: Vec<(DaemonError, &str)> = vec![
+        (
+            DaemonError::ExecutionScratchUnavailable("/secret/path".into()),
+            "manager_v2_execution_scratch_unavailable",
+        ),
+        (
+            DaemonError::ClaudeBinaryNotFound,
+            "manager_v2_claude_binary_not_found",
+        ),
+        (
+            DaemonError::CodexBinaryNotFound,
+            "manager_v2_codex_binary_not_found",
+        ),
+        (
+            DaemonError::AgyBinaryNotFound,
+            "manager_v2_agy_binary_not_found",
+        ),
+        (
+            DaemonError::CodexResumeToolHistory("detail".into()),
+            "manager_v2_codex_resume_tool_history_invalid",
+        ),
+        (
+            DaemonError::CodexResumeTornTail,
+            "manager_v2_codex_resume_rollout_torn_tail",
+        ),
+        (
+            DaemonError::OpenRouterRoutePreflight {
+                cause: "missing_credential",
+            },
+            "manager_v2_provider_credential_missing_openrouter",
+        ),
+        (
+            DaemonError::OpenRouterRoutePreflight {
+                cause: "no_tool_support",
+            },
+            "manager_v2_openrouter_route_no_tool_support",
+        ),
+        (
+            DaemonError::OpenRouterRoutePreflight {
+                cause: "unsupported_model",
+            },
+            "manager_v2_openrouter_route_unsupported_model",
+        ),
+        (
+            DaemonError::Process("Bedrock API key is not configured".into()),
+            "manager_v2_provider_credential_missing_bedrock",
+        ),
+        (
+            DaemonError::Process("Pioneer credential is not configured".into()),
+            "manager_v2_provider_credential_missing_pioneer",
+        ),
+        (
+            DaemonError::Process("OpenRouter credential is not configured".into()),
+            "manager_v2_provider_credential_missing_openrouter",
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(code(&error), expected, "{error}");
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -4778,6 +5413,7 @@ fn integrate_work_record(epic: Uuid, key: &str, source_commit: &str) -> WorkReco
         priority: 1,
         weight: 1,
         required_gates: vec![],
+        risk_tier: Default::default(),
         spec_revision: 0,
         source_session_id: None,
         source_commit: Some(source_commit.into()),
@@ -5495,6 +6131,7 @@ async fn manager_created_worker_reads_its_work_and_ownership_view() {
                     ManagerWorkStageV2::Review,
                     ManagerWorkStageV2::Verification,
                 ],
+                risk_tier: Default::default(),
             },
         ),
         (
@@ -6074,4 +6711,350 @@ fn manager_resume_and_retry_predicates_agree_with_continuation_gate() {
         }
     }
     assert_eq!(rows, 8 * 6 * 2);
+}
+
+/// #973: the open request count the per-Epic send cap reads.
+fn open_requests_for(store: &crate::store::Store, project: Uuid, epic: Uuid) -> u32 {
+    let config = store.get_harness_manager(project).unwrap().unwrap();
+    let (_, per_epic) = store.manager_open_request_counts(&config).unwrap();
+    per_epic.get(&epic).copied().unwrap_or(0)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::significant_drop_tightening,
+    clippy::large_futures
+)]
+async fn manager_replace_lead_moves_only_newest_open_requests_and_keeps_mail_capacity() {
+    use crate::store::harness_manager::MAX_READDRESSED_REQUESTS;
+    let p = pilot().await;
+    let stale = MAX_READDRESSED_REQUESTS + 4;
+    let mut sent = Vec::new();
+    let store = p.manager.store.lock().await;
+    {
+        // A request the lead answered is settled by that reply.
+        let answered = store
+            .manager_send(
+                p.owner,
+                &AgentManagerSendRequestV1 {
+                    epic_id: p.epic,
+                    message: "Answered before replacement".into(),
+                    idempotency_key: "answered".into(),
+                    informational: false,
+                },
+            )
+            .unwrap();
+        store
+            .manager_reply(
+                p.lead,
+                &AgentManagerReplyRequestV1 {
+                    request_id: answered.message_id,
+                    message: "done".into(),
+                    idempotency_key: "answered-reply".into(),
+                    still_running: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(open_requests_for(&store, p.project, p.epic), 0);
+        for n in 0..stale {
+            sent.push(
+                store
+                    .manager_send(
+                        p.owner,
+                        &AgentManagerSendRequestV1 {
+                            epic_id: p.epic,
+                            message: format!("Unanswered request {n}"),
+                            idempotency_key: format!("unanswered-{n}"),
+                            informational: false,
+                        },
+                    )
+                    .unwrap()
+                    .message_id,
+            );
+        }
+        assert_eq!(open_requests_for(&store, p.project, p.epic) as usize, stale);
+    }
+    // Replace the lead at the store's lead-change boundary: the readdress
+    // path ReplaceLead commits, without provider launch timing.
+    let child = Uuid::new_v4();
+    let mut row = bare_session(child);
+    row.project_id = Some(p.project);
+    row.working_dir = p.repo.clone();
+    row.session_kind = SessionKind::Feature;
+    row.parent_id = Some(p.epic);
+    row.provider = SessionProvider::Claude;
+    row.model = Some("manager-scripted-provider".into());
+    store.insert_session(&row).unwrap();
+    store
+        .set_epic_lead_and_readdress(p.epic, Some(child))
+        .unwrap();
+    // Only the newest open requests move; the answered one never does.
+    let moved: Vec<Uuid> = sent
+        .iter()
+        .copied()
+        .filter(|id| {
+            store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM harness_manager_v2_records
+                      WHERE kind='request_readdress' AND record_key=?1)",
+                    [id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(moved, sent[stale - MAX_READDRESSED_REQUESTS..].to_vec());
+    let inbox = store
+        .manager_inbox(child, &AgentManagerInboxRequestV1::default())
+        .unwrap();
+    assert!(!inbox.messages.is_empty());
+    assert!(inbox.messages.iter().all(|message| {
+        message
+            .readdressed_from
+            .is_some_and(|origin| moved.contains(&origin))
+    }));
+    // The older ones are settled as superseded by an audited daemon disposition.
+    for id in &sent[..stale - MAX_READDRESSED_REQUESTS] {
+        let disposition: String = store
+            .conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.disposition') FROM harness_manager_v2_records
+                  WHERE kind='request_settle' AND record_key=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "superseded_on_replace");
+    }
+    // A replace cycle leaves the manager able to reach the new lead.
+    assert_eq!(
+        open_requests_for(&store, p.project, p.epic) as usize,
+        MAX_READDRESSED_REQUESTS
+    );
+    store
+        .manager_send(
+            p.owner,
+            &AgentManagerSendRequestV1 {
+                epic_id: p.epic,
+                message: "Reachable after replacement".into(),
+                idempotency_key: "after-replace".into(),
+                informational: false,
+            },
+        )
+        .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::significant_drop_tightening,
+    clippy::large_futures
+)]
+async fn manager_declines_its_own_stale_request_and_frees_capacity() {
+    let p = pilot().await;
+    let sent = p
+        .manager
+        .store
+        .lock()
+        .await
+        .manager_send(
+            p.owner,
+            &AgentManagerSendRequestV1 {
+                epic_id: p.epic,
+                message: "Stale instruction".into(),
+                idempotency_key: "stale-instruction".into(),
+                informational: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        open_requests_for(&*p.manager.store.lock().await, p.project, p.epic),
+        1
+    );
+    p.manager
+        .agent_control()
+        .agent_manager_update(
+            p.owner,
+            AgentManagerUpdateRequestV2 {
+                fence: ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version: 1,
+                },
+                idempotency_key: "decline-stale-instruction".into(),
+                change: ManagerUpdateV2::Request {
+                    request_id: sent.message_id,
+                    expected_row_version: 0,
+                    state: ManagerRequestStateV2::Declined,
+                    message: "Superseded by a newer instruction".into(),
+                    work_key: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        open_requests_for(&*p.manager.store.lock().await, p.project, p.epic),
+        0
+    );
+}
+
+/// #1073: engage the deploy drain for a deploy owned by someone else.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+fn engage_deploy_drain(p: &Pilot) {
+    let live = crate::store::agent_deploys::DeployRow {
+        id: Uuid::new_v4(),
+        owner_session_id: Uuid::new_v4(),
+        sha: "0".repeat(40),
+        manifest: Vec::new(),
+        state: rsi_common::agent_deploy::DeployState::Staged,
+        reason: None,
+        deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+    };
+    p.manager
+        .deploy_drain()
+        .sync(Some(&live), true, chrono::Utc::now());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_draining_deploy_keeps_manager_creates_queued_unclaimed_across_a_restart() {
+    let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    engage_deploy_drain(&p);
+    let boot = p.manager.program_run_boot_id;
+
+    // Nothing that starts a worker is claimed: no Running claim to lose.
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action_holding(boot, p.manager.deploy_drain().is_draining())
+            .unwrap()
+            .is_none()
+    );
+    // The reconcile pass also leaves both queued.
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    for id in [child.operation_id, recovery.operation_id] {
+        assert_eq!(p.receipt(id).await.state, ManagerActionStateV2::Queued);
+    }
+    // A restart finds no running claim to make uncertain.
+    p.manager
+        .store
+        .lock()
+        .await
+        .recover_manager_actions_startup(Uuid::new_v4())
+        .unwrap();
+    for id in [child.operation_id, recovery.operation_id] {
+        assert_eq!(
+            p.receipt(id).await.state,
+            ManagerActionStateV2::Queued,
+            "held work is deferred, never uncertain or dropped"
+        );
+    }
+    // After the deploy settles, the same actions are admitted in order.
+    p.manager
+        .deploy_drain()
+        .sync(None, true, chrono::Utc::now());
+    assert_eq!(p.claim().await.id(), child.operation_id);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_create_claimed_before_the_drain_engaged_is_requeued_before_any_effect() {
+    let (p, _recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), child.operation_id);
+    engage_deploy_drain(&p);
+
+    let error = p.manager.execute_manager_action(&claim).await.unwrap_err();
+    assert!(crate::deploy_drain::is_draining_error(&error), "{error}");
+    assert_eq!(
+        p.receipt(child.operation_id).await.state,
+        ManagerActionStateV2::Running,
+        "the claim is still ours until it is handed back"
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .requeue_held_manager_action(&claim)
+            .unwrap()
+    );
+    assert_eq!(
+        p.receipt(child.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+    // It is claimable again once the deploy settles.
+    p.manager
+        .deploy_drain()
+        .sync(None, true, chrono::Utc::now());
+    assert_eq!(p.claim().await.id(), child.operation_id);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_claim_whose_effect_started_is_never_requeued() {
+    let (p, _recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    let claim = p.claim().await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .manager_action_runtime_gate(&claim, true)
+        .unwrap();
+    assert!(
+        !p.manager
+            .store
+            .lock()
+            .await
+            .requeue_held_manager_action(&claim)
+            .unwrap()
+    );
+    assert_eq!(
+        p.receipt(child.operation_id).await.state,
+        ManagerActionStateV2::Running
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_draining_deploy_refuses_a_manager_resume_of_a_child_lead_and_the_action_requeues() {
+    let p = pilot().await;
+    let receipt = p
+        .admit(
+            "resume-under-drain",
+            ManagerActionV2::ResumeLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                message: "continue".into(),
+            },
+        )
+        .await;
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), receipt.operation_id);
+    engage_deploy_drain(&p);
+
+    let error = p.manager.execute_manager_action(&claim).await.unwrap_err();
+    assert!(
+        crate::deploy_drain::is_draining_error(&error),
+        "a ManagerAction continuation of a child lead is held: {error}"
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .requeue_held_manager_action(&claim)
+            .unwrap()
+    );
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued,
+        "the durable action is deferred, not blocked"
+    );
 }

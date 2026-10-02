@@ -77,14 +77,14 @@ pub fn render_model_dropdown(
         .border_style(Style::default().fg(theme::overlay_border()))
         .style(Style::default().bg(theme::overlay_bg()))
         .title(Line::from(vec![
-            Span::styled(" Model [", title_style),
+            Span::styled(" Model  ", title_style),
             Span::styled(
                 glyphs::provider_glyph(state.provider),
                 title_style.fg(glyphs::provider_color(state.provider)),
             ),
             Span::styled(
                 format!(
-                    " {}{}] ",
+                    " {}{} ",
                     provider_label,
                     if provider_available { "" } else { " (offline)" }
                 ),
@@ -221,7 +221,7 @@ mod tests {
                 let offline = if available { "" } else { " (offline)" };
                 assert!(
                     title.contains(&format!(
-                        "Model [{} {}{}]",
+                        "Model  {} {}{} ",
                         glyphs::provider_glyph(provider),
                         provider_label(provider),
                         offline

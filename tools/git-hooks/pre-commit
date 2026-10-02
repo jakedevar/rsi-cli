@@ -173,6 +173,18 @@ if [ -n "$staged_rs" ] && [ -f tools/check_identity_assertions.py ]; then
   fi
 fi
 
+# ── Personal-path guard ─────────────────────────────────────────────────────
+# Rejects staged files (outside thoughts/) that embed a personal home path or a
+# public IP literal (see scripts/check-personal-paths.sh, Issue #730).
+staged_all="$(git diff --cached --name-only --diff-filter=d)"
+if [ -n "$staged_all" ] && [ -f tools/check_personal_paths.py ]; then
+  # shellcheck disable=SC2086
+  if ! python3 tools/check_personal_paths.py $staged_all; then
+    echo "pre-commit: personal-path guard failed (see above)." >&2
+    exit 1
+  fi
+fi
+
 art_fail=0
 for f in $(git diff --cached --name-only --diff-filter=d); do
   [ -f "$f" ] || continue

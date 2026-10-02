@@ -256,6 +256,104 @@ pub(crate) fn provider_label(target: &MemoryLlmTarget) -> Result<String> {
     Ok(resolved_provider_label(&resolved))
 }
 
+/// Token figures a helper call reports back to its settlement (#586).
+///
+/// An API response's own `usage` is recorded as measured; CLI helpers print
+/// plain text and report nothing, so the daemon's BPE estimate of the prompt
+/// and the reply stands in as estimated. Nothing is guessed when neither exists.
+#[derive(Debug, Default, Clone)]
+struct HelperUsage(Arc<std::sync::Mutex<Option<HelperUsageFigures>>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelperUsageFigures {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    reasoning_tokens: u64,
+    measured: bool,
+}
+
+impl HelperUsage {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<HelperUsageFigures>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a provider-reported usage (an empty report is not a measurement).
+    fn record_reported(&self, usage: &crate::session::harness::types::TokenUsage) {
+        let total = usage
+            .prompt_tokens
+            .saturating_add(usage.completion_tokens)
+            .saturating_add(usage.total_tokens);
+        if total == 0 {
+            return;
+        }
+        let output_tokens = if usage.completion_tokens > 0 {
+            usage.completion_tokens
+        } else {
+            usage.total_tokens.saturating_sub(usage.prompt_tokens)
+        };
+        *self.slot() = Some(HelperUsageFigures {
+            input_tokens: usage.prompt_tokens,
+            output_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            measured: true,
+        });
+    }
+
+    /// Stand in for an unreported usage with the daemon's BPE estimate.
+    fn estimate_if_unreported(&self, prompt: &str, reply: &str) {
+        let mut slot = self.slot();
+        if slot.is_some() {
+            return;
+        }
+        static COUNTER: std::sync::OnceLock<crate::monitor::TokenCounter> =
+            std::sync::OnceLock::new();
+        let counter = COUNTER.get_or_init(crate::monitor::TokenCounter::new);
+        *slot = Some(HelperUsageFigures {
+            input_tokens: counter.count(prompt),
+            output_tokens: counter.count(reply),
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            reasoning_tokens: 0,
+            measured: false,
+        });
+    }
+
+    fn apply(&self, completion: &mut crate::model_control::InvocationCompletion) {
+        let Some(figures) = *self.slot() else {
+            return;
+        };
+        completion.input_tokens = Some(figures.input_tokens);
+        completion.output_tokens = Some(figures.output_tokens);
+        completion.cache_creation_tokens = Some(figures.cache_creation_tokens);
+        completion.cache_read_tokens = Some(figures.cache_read_tokens);
+        completion.reasoning_tokens = Some(figures.reasoning_tokens);
+        completion.confidence = Some(if figures.measured {
+            ModelUsageConfidence::Measured
+        } else {
+            ModelUsageConfidence::Estimated
+        });
+    }
+}
+
+/// Give a helper settlement that has no provider-reported usage the daemon's
+/// BPE estimate of its prompt and reply, marked `Estimated` (#586). A failed
+/// call has no reply to count and keeps the unavailable figures.
+pub(crate) fn apply_estimated_usage(
+    completion: &mut crate::model_control::InvocationCompletion,
+    prompt: &str,
+    reply: &str,
+) {
+    let usage = HelperUsage::default();
+    usage.estimate_if_unreported(prompt, reply);
+    usage.apply(completion);
+}
+
 pub async fn admit_and_generate_text(
     store: &Arc<Mutex<Store>>,
     event_bus: &Arc<EventBus>,
@@ -302,10 +400,21 @@ pub async fn admit_and_generate_text(
         }
     };
     let cancel = CancellationToken::new();
-    let execution = generate_text_cancellable_resolved(
-        &permit, &resolved, prompt, max_tokens, purpose, &cancel,
-    );
-    settle_memory_execution(store, event_bus, &permit, execution, &cancel, purpose).await
+    let usage = HelperUsage::default();
+    let execution = async {
+        let result = generate_text_cancellable_resolved(
+            &permit, &resolved, prompt, max_tokens, purpose, &cancel, &usage,
+        )
+        .await;
+        if let Ok(reply) = &result {
+            usage.estimate_if_unreported(prompt, reply);
+        }
+        result
+    };
+    settle_memory_execution_with_usage(
+        store, event_bus, &permit, execution, &cancel, purpose, &usage,
+    )
+    .await
 }
 
 async fn settle_memory_execution<T>(
@@ -316,9 +425,30 @@ async fn settle_memory_execution<T>(
     cancel: &CancellationToken,
     purpose: &str,
 ) -> Result<T> {
+    settle_memory_execution_with_usage(
+        store,
+        event_bus,
+        permit,
+        execution,
+        cancel,
+        purpose,
+        &HelperUsage::default(),
+    )
+    .await
+}
+
+async fn settle_memory_execution_with_usage<T>(
+    store: &Arc<Mutex<Store>>,
+    event_bus: &Arc<EventBus>,
+    permit: &AdmissionPermit,
+    execution: impl std::future::Future<Output = Result<T>>,
+    cancel: &CancellationToken,
+    purpose: &str,
+    usage: &HelperUsage,
+) -> Result<T> {
     let started_at = Instant::now();
     let result = finish_memory_execution(execution, cancel).await;
-    let completion = match &result {
+    let mut completion = match &result {
         Ok(_) => completion_with_wall_time(started_at, None, ModelUsageConfidence::Partial),
         Err(error) => completion_with_wall_time(
             started_at,
@@ -326,6 +456,7 @@ async fn settle_memory_execution<T>(
             ModelUsageConfidence::Partial,
         ),
     };
+    usage.apply(&mut completion);
     settle_result(store, permit, completion, result, purpose, event_bus).await
 }
 
@@ -383,8 +514,16 @@ pub async fn generate_text_cancellable(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let resolved = resolve_target(target)?;
-    generate_text_cancellable_resolved(_permit, &resolved, prompt, max_tokens, purpose, cancel)
-        .await
+    generate_text_cancellable_resolved(
+        _permit,
+        &resolved,
+        prompt,
+        max_tokens,
+        purpose,
+        cancel,
+        &HelperUsage::default(),
+    )
+    .await
 }
 
 async fn generate_text_cancellable_resolved(
@@ -394,6 +533,7 @@ async fn generate_text_cancellable_resolved(
     max_tokens: u32,
     purpose: &str,
     cancel: &CancellationToken,
+    usage: &HelperUsage,
 ) -> Result<String> {
     if cancel.is_cancelled() {
         return Err(DaemonError::ChannelClosed);
@@ -413,7 +553,7 @@ async fn generate_text_cancellable_resolved(
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(DaemonError::ChannelClosed),
-                result = generate_harness_api(_permit, target, prompt, max_tokens) => result,
+                result = generate_harness_api(_permit, target, prompt, max_tokens, usage) => result,
             }
         }
         LlmExecutionPath::OllamaLocal => {
@@ -422,7 +562,7 @@ async fn generate_text_cancellable_resolved(
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(DaemonError::ChannelClosed),
-                result = generate_local_or_custom_api(target, prompt, max_tokens, execution) => result,
+                result = generate_local_or_custom_api(target, prompt, max_tokens, execution, usage) => result,
             }
         }
     }
@@ -433,6 +573,7 @@ async fn generate_harness_api(
     target: &MemoryLlmTarget,
     prompt: &str,
     max_tokens: u32,
+    usage: &HelperUsage,
 ) -> Result<String> {
     let provider = resolve_provider(
         &target.model,
@@ -445,7 +586,15 @@ async fn generate_harness_api(
         RuntimeExecutionRoute::SessionHarnessOpenAiHttp
     };
     let execution = permit.claim_model_execution(execution_route)?;
-    generate_api(provider, &target.model, prompt, max_tokens, execution).await
+    generate_api(
+        provider,
+        &target.model,
+        prompt,
+        max_tokens,
+        execution,
+        usage,
+    )
+    .await
 }
 
 async fn generate_local_or_custom_api(
@@ -453,6 +602,7 @@ async fn generate_local_or_custom_api(
     prompt: &str,
     max_tokens: u32,
     execution: ModelExecutionCapability,
+    usage: &HelperUsage,
 ) -> Result<String> {
     let base_url = target
         .base_url
@@ -474,6 +624,7 @@ async fn generate_local_or_custom_api(
         prompt,
         max_tokens,
         execution,
+        usage,
     )
     .await
 }
@@ -484,6 +635,7 @@ async fn generate_api(
     prompt: &str,
     max_tokens: u32,
     execution: ModelExecutionCapability,
+    usage: &HelperUsage,
 ) -> Result<String> {
     let response = provider
         .chat(
@@ -499,6 +651,7 @@ async fn generate_api(
             execution,
         )
         .await?;
+    usage.record_reported(&response.usage);
     let text = response.content.trim().to_string();
     if text.is_empty() {
         return Err(DaemonError::Store(format!(
@@ -526,7 +679,9 @@ async fn generate_claude_cli(
 /// The memory LLM's bypass-permissions Claude child; the shared spawn
 /// boundary (`run_cancellable_cli_with_limits`) scrubs it before spawn.
 fn claude_memory_command(target: &MemoryLlmTarget, prompt: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("claude");
+    let mut command = tokio::process::Command::new(
+        crate::provider_cli::resolve("claude").unwrap_or_else(|| "claude".into()),
+    );
     command.args([
         "-p",
         prompt,
@@ -549,7 +704,9 @@ async fn generate_codex_cli(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let execution = permit.claim_cli_execution(RuntimeExecutionRoute::MemoryCli)?;
-    let mut command = tokio::process::Command::new("codex");
+    let mut command = tokio::process::Command::new(
+        crate::provider_cli::resolve("codex").unwrap_or_else(|| "codex".into()),
+    );
     command.args([
         "exec",
         "--skip-git-repo-check",
@@ -560,7 +717,7 @@ async fn generate_codex_cli(
         "never",
     ]);
 
-    let codex_binary = which::which("codex").unwrap_or_else(|_| "codex".into());
+    let codex_binary = crate::provider_cli::resolve("codex").unwrap_or_else(|| "codex".into());
     let model = append_codex_route_credential(
         &mut command,
         target,
@@ -645,10 +802,8 @@ async fn generate_agy_cli(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let execution = permit.claim_cli_execution(RuntimeExecutionRoute::MemoryCli)?;
-    let binary_path = which::which("agy")
-        .or_else(|_| which::which("antigravity"))
-        .or_else(|_| which::which("antigravity-cli"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("agy"));
+    let binary_path = crate::provider_cli::resolve_any(&["agy", "antigravity", "antigravity-cli"])
+        .unwrap_or_else(|| std::path::PathBuf::from("agy"));
 
     let mut cmd = tokio::process::Command::new(&binary_path);
     cmd.arg("-p").arg(prompt).args(["--model", &target.model]);
@@ -956,6 +1111,158 @@ mod tests {
 
         assert_eq!(response, "openai once");
         server.verify().await;
+    }
+
+    async fn settled_helper_row(
+        server: &MockServer,
+        dedup_key: &str,
+    ) -> (Option<i64>, Option<i64>, String, Option<String>) {
+        let target = MemoryLlmTarget {
+            provider: SessionProvider::Harness,
+            model: "gpt-test".to_string(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            api_key: None,
+        };
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let bus = Arc::new(EventBus::new(8));
+        let request = http_request(ModelInvocationPurpose::PromptCompile, &target, dedup_key);
+        let reply = admit_and_generate_text(
+            &store,
+            &bus,
+            request,
+            &target,
+            "summarize the repository state",
+            64,
+            "helper usage",
+        )
+        .await
+        .expect("admitted helper call");
+        assert!(!reply.is_empty());
+        let guard = store.lock().await;
+        guard
+            .conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, usage_confidence, effort
+                 FROM model_invocations WHERE trigger_source = 'memory_llm_http_test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("settled helper row")
+    }
+
+    /// #586: a helper API call settles with the provider-reported usage as
+    /// measured, and records the effort it ran at (the provider default here).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn helper_api_call_settles_the_reported_usage_as_measured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "state summary"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 41, "completion_tokens": 9, "total_tokens": 50}
+            })))
+            .mount(&server)
+            .await;
+        let row = settled_helper_row(&server, "helper-usage-measured").await;
+        assert_eq!((row.0, row.1), (Some(41), Some(9)));
+        assert_eq!(row.2, "measured");
+        assert_eq!(row.3.as_deref(), Some("default"));
+    }
+
+    /// #586: an API that reports no usage still gets token figures, marked
+    /// estimated from the daemon's BPE count of the prompt and the reply.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn helper_api_call_without_usage_settles_an_estimate() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "state summary"}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        let row = settled_helper_row(&server, "helper-usage-estimated").await;
+        assert!(row.0.is_some_and(|tokens| tokens > 0), "{row:?}");
+        assert!(row.1.is_some_and(|tokens| tokens > 0), "{row:?}");
+        assert_eq!(row.2, "estimated");
+    }
+
+    /// Every provider label a memory/helper target can resolve to is an exact
+    /// canonical `model_invocations.provider` spelling (hard rule 3), including
+    /// loopback and remote OpenAI-compatible endpoints.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn every_helper_provider_label_is_an_exact_canonical_spelling() {
+        let labels = crate::store::row_mappers::CANONICAL_INVOCATION_PROVIDER_LABELS;
+        let providers = [
+            SessionProvider::Claude,
+            SessionProvider::Codex,
+            SessionProvider::Pioneer,
+            SessionProvider::OpenRouter,
+            SessionProvider::Bedrock,
+            SessionProvider::Local,
+            SessionProvider::Antigravity,
+            SessionProvider::CodexAppServer,
+            SessionProvider::Harness,
+        ];
+        let models = [
+            "claude-sonnet-5",
+            "gpt-5.5",
+            "gemini-3.5-pro-high",
+            "qwen3:14b",
+        ];
+        let base_urls = [
+            None,
+            Some("http://127.0.0.1:11434/v1".to_string()),
+            Some("https://api.example.test/v1".to_string()),
+        ];
+        let mut checked = 0;
+        for provider in providers {
+            for model in models {
+                for base_url in &base_urls {
+                    let mut target = target(provider, model);
+                    target.base_url = base_url.clone();
+                    let Ok(label) = provider_label(&target) else {
+                        continue;
+                    };
+                    assert!(
+                        labels.contains(&label.as_str()),
+                        "{provider:?}/{model}/{base_url:?} resolved to non-canonical `{label}`"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 20,
+            "the table must exercise real targets: {checked}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn helper_usage_prefers_reported_figures_over_the_estimate() {
+        let usage = HelperUsage::default();
+        usage.record_reported(&crate::session::harness::types::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            total_tokens: 14,
+            ..Default::default()
+        });
+        usage.estimate_if_unreported("a much longer prompt than ten tokens would be", "reply");
+        let mut completion = crate::model_control::InvocationCompletion::default();
+        usage.apply(&mut completion);
+        assert_eq!(completion.input_tokens, Some(10));
+        assert_eq!(completion.output_tokens, Some(4), "total minus prompt");
+        assert_eq!(completion.confidence, Some(ModelUsageConfidence::Measured));
+
+        let empty = HelperUsage::default();
+        empty.record_reported(&crate::session::harness::types::TokenUsage::default());
+        let mut untouched = crate::model_control::InvocationCompletion::default();
+        empty.apply(&mut untouched);
+        assert_eq!(untouched.input_tokens, None, "an empty report is no figure");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]

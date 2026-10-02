@@ -9,8 +9,10 @@ pub fn render_schedule_browser(
     frame: &mut Frame,
     area: Rect,
     jobs: &[ScheduledJob],
+    holds: &std::collections::HashMap<uuid::Uuid, rsi_common::child_autonomy::ScheduledJobHoldV1>,
     selected_index: usize,
     loading: bool,
+    paging: &crate::types::SchedulePaging,
 ) {
     let width = 100.min(area.width.saturating_sub(4));
     let height = 30.min(area.height.saturating_sub(4));
@@ -18,7 +20,7 @@ pub fn render_schedule_browser(
 
     frame.render_widget(Clear, popup);
     let block = theme::overlay_block()
-        .title(" Scheduled Jobs ")
+        .title(title(paging))
         .title_alignment(Alignment::Center)
         .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
@@ -48,8 +50,9 @@ pub fn render_schedule_browser(
             let recurrence_str = format_recurrence(&job.schedule.recurrence);
             let next_str = job.next_fire_at.format("%Y-%m-%d %H:%M").to_string();
             let cursor = if i == selected_index { "> " } else { "  " };
+            let held = holds.get(&job.id).map_or_else(String::new, hold_badge);
             let line = format!(
-                "{cursor}[{enabled_icon}] {:<24} {:<16} next: {next_str}",
+                "{cursor}[{enabled_icon}] {:<24} {:<16} next: {next_str}{held}",
                 truncate(&job.name, 24),
                 recurrence_str,
             );
@@ -72,6 +75,33 @@ pub fn render_schedule_browser(
     let mut list_state = ListState::default();
     list_state.select(Some(selected_index));
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// Title naming the active filter so the operator knows whether history is
+/// hidden, and whether more pages remain (`m` loads them).
+fn title(paging: &crate::types::SchedulePaging) -> String {
+    let filter = if paging.include_history {
+        "all history"
+    } else {
+        "active"
+    };
+    let more = if paging.next_cursor.is_some() {
+        " · more: m"
+    } else {
+        ""
+    };
+    format!(" Scheduled Jobs · {filter} · H: history{more} ")
+}
+
+/// `  HELD xN until HH:MM`: why a due wake has not fired, N running children (#794 S3).
+fn hold_badge(hold: &rsi_common::child_autonomy::ScheduledJobHoldV1) -> String {
+    format!(
+        "  HELD x{} until {}",
+        hold.running_children.len(),
+        hold.release_at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+    )
 }
 
 fn format_recurrence(r: &rsi_common::types::Recurrence) -> String {
@@ -139,6 +169,48 @@ mod tests {
     }
 
     #[test]
+    fn a_held_wake_shows_its_children_and_release_time() {
+        let jobs: Vec<_> = (0..2).map(job).collect();
+        let held = rsi_common::child_autonomy::ScheduledJobHoldV1 {
+            job_id: jobs[1].id,
+            parent_session_id: Uuid::new_v4(),
+            running_children: vec![Uuid::new_v4(), Uuid::new_v4()],
+            held_since: Utc::now(),
+            release_at: Utc::now() + chrono::Duration::seconds(1500),
+        };
+        let holds = std::collections::HashMap::from([(held.job_id, held)]);
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| {
+                render_schedule_browser(
+                    frame,
+                    frame.area(),
+                    &jobs,
+                    &holds,
+                    0,
+                    false,
+                    &Default::default(),
+                )
+            })
+            .expect("schedule browser should render");
+        let lines = buffer_lines(terminal.backend().buffer());
+        let held_line = lines
+            .iter()
+            .find(|line| line.contains("job-1"))
+            .expect("held job row");
+        assert!(held_line.contains("HELD x2 until"), "{held_line}");
+        let plain = lines
+            .iter()
+            .find(|line| line.contains("job-0"))
+            .expect("plain job row");
+        assert!(
+            plain.contains("next:") && !plain.contains("HELD"),
+            "{plain}"
+        );
+    }
+
+    #[test]
     fn selected_job_scrolls_into_view() {
         let jobs: Vec<_> = (0..40).map(job).collect();
         let backend = TestBackend::new(120, 40);
@@ -146,7 +218,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_schedule_browser(frame, frame.area(), &jobs, 39, false);
+                render_schedule_browser(
+                    frame,
+                    frame.area(),
+                    &jobs,
+                    &std::collections::HashMap::new(),
+                    39,
+                    false,
+                    &Default::default(),
+                );
             })
             .expect("schedule browser should render");
 
@@ -154,5 +234,38 @@ mod tests {
         assert!(text.contains("job-39"));
         assert!(text.contains("> [+] job-39"));
         assert!(!text.contains("j/k: nav"));
+    }
+
+    #[test]
+    fn title_names_the_active_filter_and_pending_pages() {
+        let render = |paging: &crate::types::SchedulePaging| {
+            let jobs: Vec<_> = (0..2).map(job).collect();
+            let backend = TestBackend::new(120, 20);
+            let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+            terminal
+                .draw(|frame| {
+                    render_schedule_browser(
+                        frame,
+                        frame.area(),
+                        &jobs,
+                        &std::collections::HashMap::new(),
+                        0,
+                        false,
+                        paging,
+                    );
+                })
+                .expect("schedule browser should render");
+            buffer_lines(terminal.backend().buffer()).join("\n")
+        };
+
+        let active = render(&Default::default());
+        assert!(active.contains("Scheduled Jobs · active · H: history"));
+        assert!(!active.contains("more: m"));
+
+        let history = render(&crate::types::SchedulePaging {
+            include_history: true,
+            next_cursor: Some("next".to_string()),
+        });
+        assert!(history.contains("Scheduled Jobs · all history · H: history · more: m"));
     }
 }

@@ -144,7 +144,7 @@ resource "aws_vpc_security_group_egress_rule" "dns_tcp" {
 
 resource "aws_s3_bucket" "backups" {
   bucket_prefix = "${local.name}-backup-"
-  force_destroy = true # Explicit terraform destroy removes backups; final EBS snapshot remains.
+  force_destroy = true # Explicit terraform destroy removes backups; a final EBS snapshot remains only when data_volume_final_snapshot is true.
   tags          = local.common_tags
 }
 
@@ -266,7 +266,7 @@ resource "aws_ebs_volume" "data" {
   snapshot_id       = var.data_snapshot_id
   type              = "gp3"
   encrypted         = true
-  final_snapshot    = true
+  final_snapshot    = var.data_volume_final_snapshot
   tags              = merge(local.common_tags, { Name = "${local.name}-data" })
 }
 
@@ -292,6 +292,7 @@ resource "aws_instance" "host" {
     artifact_url           = var.artifact_url == null ? "" : var.artifact_url
     artifact_sha256        = var.artifact_sha256 == null ? "" : var.artifact_sha256
     secret_names           = sort(tolist(var.secret_names))
+    provider_cli_packages  = var.provider_cli_npm_packages
     enable_tailscale       = var.enable_tailscale
     stop_when_idle_minutes = var.stop_when_idle_minutes
     shutdown_at_utc        = var.shutdown_at_utc

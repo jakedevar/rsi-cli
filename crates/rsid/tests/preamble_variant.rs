@@ -27,7 +27,7 @@ fn variant_loader_composes_base_and_selected_kind() {
         assert!(variant.starts_with("---\nversion: "));
         assert!(variant.contains(&format!("\nkind: {name}\n")));
         assert!(variant.contains("\ninherits: worker_preamble.md\n"));
-        let loaded = preamble::load(kind).expect("loaded preamble");
+        let loaded = preamble::load(kind, &root()).expect("loaded preamble");
         assert!(loaded.starts_with(&base));
         assert!(loaded.contains(&variant));
     }
@@ -35,13 +35,16 @@ fn variant_loader_composes_base_and_selected_kind() {
 
 #[test]
 fn kinds_without_variants_load_the_same_base() {
-    let standard = preamble::load(SessionKind::Standard).expect("base preamble");
+    let standard = preamble::load(SessionKind::Standard, &root()).expect("base preamble");
     for kind in [
         SessionKind::Task,
         SessionKind::Story,
         SessionKind::TaskRabbit,
     ] {
-        assert_eq!(preamble::load(kind).expect("base preamble"), standard);
+        assert_eq!(
+            preamble::load(kind, &root()).expect("base preamble"),
+            standard
+        );
     }
     assert!(standard.starts_with("---\nversion: "));
     assert!(standard.contains("\nrole_variants: [research, planning, implementation]\n"));

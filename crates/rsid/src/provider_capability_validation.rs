@@ -920,7 +920,8 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
         path: "crates/rsid/src/session/harness/mod.rs",
         symbol: "HarnessClient::launch_with_binding",
         source: FlowSource::Parameter("resolved_context_budget"),
-        sinks: &[FlowSink::Call("run_harness_loop")],
+        // #966: the launch passes the budget through the budget-aware entry.
+        sinks: &[FlowSink::Call("run_harness_loop_with_compact_budget")],
     },
     ConsumerContract {
         role: ConsumerRole::Persistence,
@@ -972,7 +973,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
         path: "crates/rsi/src/ui/session.rs",
         symbol: "render_inspector_context",
         source: FlowSource::Call("detail_rows"),
-        sinks: &[FlowSink::Call("wrap_plain")],
+        sinks: &[FlowSink::Call("pack_chip_lines")],
     },
     ConsumerContract {
         role: ConsumerRole::DetailHeaderContext,

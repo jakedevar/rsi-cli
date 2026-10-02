@@ -8,6 +8,14 @@ status-level = "fail"
 final-status-level = "fail"
 slow-timeout = { period = "60s", terminate-after = 4 }
 
+# The store H1/D05 migration matrices rebuild a database per hostile seam and
+# take 60-190 s on a busy host (h1_trrev_v88 is ~120 s idle). A 240 s kill
+# refused whole landing gates on load alone, so they get a bounded 600 s.
+# Default-profile overrides also apply to every profile that inherits it.
+[[profile.default.overrides]]
+filter = 'package(rsid) & test(/^store::tests::(h1_|d05_)/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [profile.rsid-fast]
 inherits = "default"
 retries = 0

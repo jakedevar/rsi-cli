@@ -45,6 +45,8 @@ pub struct ScheduleWakeRequest {
     pub watch_session_id: Option<Uuid>,
 }
 
+use crate::store::scheduled_jobs::BACKGROUND_PROCESS_WAKE_PREFIX as DAEMON_PROCESS_WAKE_PREFIX;
+
 /// Construction-time provenance for shared scheduled-wake row building.
 ///
 /// Only token-resolved `AgentScheduleWake` and native tool construction with
@@ -102,6 +104,13 @@ fn build_scheduled_job_with_provenance(
     req: ScheduleWakeRequest,
     provenance: ScheduleWakeProvenance,
 ) -> Result<ScheduledJob, String> {
+    if req
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with(DAEMON_PROCESS_WAKE_PREFIX))
+    {
+        return Err("wake names beginning with 'background-process-' are reserved".to_string());
+    }
     let mode = req.mode.as_deref();
     if provenance == ScheduleWakeProvenance::AgentBound && mode.is_none() {
         return Err(
@@ -260,6 +269,65 @@ fn build_scheduled_job_with_provenance(
     })
 }
 
+/// Inputs of a `mode:"when"` predicate wake (#1006). Shared by the
+/// `AgentScheduleWake` RPC verb and the native tool.
+pub(crate) struct WakeWhenRequest {
+    pub message: String,
+    pub name: Option<String>,
+    pub predicate: rsi_common::wake_predicate::WakePredicate,
+    pub timeout_seconds: Option<i64>,
+    /// The caller's own repository directory, for `sha_on_rolling`.
+    pub working_dir: PathBuf,
+    pub provider: Option<rsi_common::types::SessionProvider>,
+    pub model: Option<String>,
+    pub project_id: Option<Uuid>,
+    pub origin_session_id: Uuid,
+}
+
+/// Build the one-shot Resume row and `$.wake_when` state of a predicate wake.
+/// The row is due immediately: the daemon evaluates the predicate then and on
+/// its fast lane, and only delivers once it settles.
+pub(crate) fn build_wake_when_job(
+    req: WakeWhenRequest,
+) -> Result<(ScheduledJob, rsi_common::wake_predicate::WakeWhenState), String> {
+    use rsi_common::wake_predicate as wp;
+    if req.message.trim().is_empty() || req.message.len() > 262_144 || req.message.contains('\0') {
+        return Err("message must be non-empty text without NUL (max 256 KiB)".to_string());
+    }
+    req.predicate.validate().map_err(str::to_string)?;
+    wp::validate_timeout(req.timeout_seconds).map_err(str::to_string)?;
+    let now = Utc::now();
+    let state = wp::WakeWhenState {
+        predicate: req.predicate,
+        armed_at: now,
+        deadline: req
+            .timeout_seconds
+            .map(|seconds| now + chrono::Duration::seconds(seconds)),
+        repo_dir: Some(req.working_dir.to_string_lossy().into_owned()),
+    };
+    let job = ScheduledJob {
+        id: Uuid::new_v4(),
+        name: req.name.unwrap_or_else(|| "wake-when".to_string()),
+        message: req.message,
+        schedule: ScheduleSpec {
+            recurrence: Recurrence::Once,
+            anchor: now,
+        },
+        last_fired_at: None,
+        next_fire_at: now,
+        enabled: true,
+        working_dir: Some(req.working_dir),
+        provider: req.provider,
+        model: req.model,
+        project_id: req.project_id,
+        created_at: now,
+        updated_at: now,
+        wake_mode: WakeMode::Resume,
+        wake_session_id: Some(req.origin_session_id),
+    };
+    Ok((job, state))
+}
+
 /// Captured at construction from `LaunchConfig`; never exposed through the
 /// JSON schema — the agent cannot widen its own session context.
 pub struct ScheduleWakeTool {
@@ -362,7 +430,13 @@ impl ScheduleWakeTool {
             Err(e) => return fail(e),
         };
 
-        match control.arm_terminal_watch(origin, job).await {
+        // One enabled job per explicit name per session (same rule as the RPC verb).
+        let armed = if args.get("name").and_then(|v| v.as_str()).is_some() {
+            control.arm_terminal_watch_replacing_name(origin, job).await
+        } else {
+            control.arm_terminal_watch(origin, job).await
+        };
+        match armed {
             Ok(ArmWatchOutcome::Armed(job)) => ToolResult {
                 success: true,
                 output: format!(
@@ -382,6 +456,49 @@ impl ScheduleWakeTool {
                 error_msg: None,
             },
             Err(e) => fail(e.to_string()),
+        }
+    }
+}
+
+impl ScheduleWakeTool {
+    /// `mode:"when"`: needs the guarded authority handle and a bound origin,
+    /// exactly like `on_terminal`.
+    async fn arm_wake_when(&self, args: &serde_json::Value, message: String) -> ToolResult {
+        use rsi_common::wake_predicate as wp;
+        let (Some(control), Some(origin)) = (self.agent_control.as_ref(), self.origin_session_id)
+        else {
+            return fail("mode 'when' requires an agent-control authority handle and bound origin");
+        };
+        if ["in_seconds", "at", "every_seconds", "watch_session_id"]
+            .iter()
+            .any(|key| args.get(key).is_some_and(|value| !value.is_null()))
+        {
+            return fail(wp::WAKE_WHEN_TIMING_UNSUPPORTED);
+        }
+        let predicate: wp::WakePredicate = match args
+            .get("when")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+        {
+            Some(Ok(predicate)) => predicate,
+            _ => return fail(wp::WAKE_WHEN_PREDICATE_INVALID),
+        };
+        let name = args.get("name").and_then(|v| v.as_str()).map(String::from);
+        let timeout = args.get("timeout_seconds").and_then(|v| v.as_i64());
+        match control
+            .arm_wake_when(origin, message, name, predicate, timeout)
+            .await
+        {
+            Ok((job, _replaced)) => ToolResult {
+                success: true,
+                output: format!(
+                    "predicate wake '{}' (id={}) armed; the daemon evaluates it and resumes \
+                     this session once when it settles",
+                    job.name, job.id
+                ),
+                error_msg: None,
+            },
+            Err(error) => fail(error.to_string()),
         }
     }
 }
@@ -422,7 +539,12 @@ impl HarnessTool for ScheduleWakeTool {
              terminal watch that resumes this session when the watched session (a direct \
              child, or a child of an Epic this session leads) finishes; the watch fires \
              within ~60 seconds of the terminal transition. In 'program_guard' mode it \
-             registers the deterministic master-orchestrate program sentinel. Jobs fire \
+             registers the deterministic master-orchestrate program sentinel. In 'when' \
+             mode the daemon evaluates the 'when' predicate (jobs_terminal: every listed \
+             AgentSubmitJob job you own is terminal; sha_on_rolling: that commit is on \
+             origin/rolling) and resumes this session ONCE when it is true, unsatisfiable \
+             or past 'timeout_seconds' (timed_out true), carrying each job's id, name, \
+             state, exit code and refusal; submit the batch with wake 'none' first. Jobs fire \
              within ~60 seconds of the requested time. One-shot or recurring."
         } else {
             "Schedule a future session wake-up. In 'fresh' mode (default) launches a \
@@ -471,6 +593,17 @@ impl HarnessTool for ScheduleWakeTool {
             return self
                 .arm_terminal_watch(&args, message, effective_working_dir)
                 .await;
+        }
+        // #1006: daemon-evaluated predicate wake, armed through the same
+        // guarded service as the `AgentScheduleWake` verb.
+        let has_when_args = ["when", "timeout_seconds"]
+            .iter()
+            .any(|key| args.get(key).is_some_and(|value| !value.is_null()));
+        if mode.as_deref() == Some("when") {
+            return self.arm_wake_when(&args, message).await;
+        }
+        if has_when_args {
+            return fail(rsi_common::wake_predicate::WAKE_WHEN_FIELD_MISPLACED);
         }
         if mode.as_deref() == Some("program_guard") {
             let (Some(control), Some(origin)) =
@@ -543,6 +676,13 @@ impl HarnessTool for ScheduleWakeTool {
             watch_session_id: None,
         };
 
+        let replace_owner = if args.get("name").and_then(|v| v.as_str()).is_some()
+            && self.agent_control.is_some()
+        {
+            self.origin_session_id
+        } else {
+            None
+        };
         let job = match if self.agent_control.is_some() && self.origin_session_id.is_some() {
             build_agent_scheduled_job(req)
         } else {
@@ -559,7 +699,13 @@ impl HarnessTool for ScheduleWakeTool {
         };
 
         let guard = self.store.lock().await;
-        match guard.insert_scheduled_job(&job) {
+        let inserted = match replace_owner {
+            Some(owner) => guard
+                .insert_scheduled_job_replacing_name(owner, &job)
+                .map(drop),
+            None => guard.insert_scheduled_job(&job),
+        };
+        match inserted {
             Ok(()) => ToolResult {
                 success: true,
                 output: format!(
@@ -1067,6 +1213,124 @@ mod tests {
         assert_eq!(jobs[0].wake_mode, WakeMode::OnTerminal(child));
         assert_eq!(jobs[0].wake_session_id, Some(caller));
         assert!(jobs[0].enabled);
+    }
+
+    fn wake_when_job_fixture(owner: Uuid) -> crate::store::agent_jobs::NewAgentJob {
+        use rsi_common::agent_jobs::{BuildCommand, BuildJobParams, JobParams, JobWake};
+        let id = Uuid::new_v4();
+        crate::store::agent_jobs::NewAgentJob {
+            id,
+            owner_session_id: owner,
+            project_id: None,
+            name: Some("check".into()),
+            params: JobParams::Build(BuildJobParams {
+                command: BuildCommand::Check,
+                package: None,
+                workspace: true,
+                all_targets: false,
+                release: false,
+            }),
+            cwd: "/tmp".into(),
+            unit_name: format!("rsi-job-{id}"),
+            log_path: format!("/tmp/jobs/{id}.log"),
+            status_path: format!("/tmp/jobs/{id}.status"),
+            idempotency_key: None,
+            wake: JobWake::None,
+        }
+    }
+
+    /// #1006: the native tool arms a caller-bound predicate wake through the
+    /// same guarded service as `AgentScheduleWake`, refuses a job the caller
+    /// does not own, and refuses timing fields and stray predicate fields.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::significant_drop_tightening
+    )]
+    async fn test_tool_arms_a_daemon_evaluated_predicate_wake() {
+        use rsi_common::wake_predicate::{
+            WAKE_WHEN_FIELD_MISPLACED, WAKE_WHEN_JOB_NOT_FOUND, WAKE_WHEN_TIMING_UNSUPPORTED,
+        };
+        let (tool, store, caller, _child, stranger) = make_watch_tool().await;
+        let (mine, theirs) = {
+            let guard = store.lock().await;
+            let mine = wake_when_job_fixture(caller);
+            let theirs = wake_when_job_fixture(stranger);
+            guard.insert_agent_job(&mine, Utc::now()).unwrap();
+            guard.insert_agent_job(&theirs, Utc::now()).unwrap();
+            (mine.id, theirs.id)
+        };
+        let schema: serde_json::Value = serde_json::from_str(tool.parameters_json()).unwrap();
+        assert!(schema["properties"]["when"].is_object());
+        assert!(tool.description().contains("'when'"));
+
+        let arm = |when: serde_json::Value, extra: serde_json::Value| {
+            let mut args = serde_json::json!({
+                "message": "batch done", "mode": "when", "when": when,
+                "timeout_seconds": 600,
+            });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        for (when, extra, code) in [
+            (
+                serde_json::json!({"jobs_terminal":[theirs]}),
+                serde_json::json!({}),
+                WAKE_WHEN_JOB_NOT_FOUND,
+            ),
+            (
+                serde_json::json!({"jobs_terminal":[Uuid::new_v4()]}),
+                serde_json::json!({}),
+                WAKE_WHEN_JOB_NOT_FOUND,
+            ),
+            (
+                serde_json::json!({"jobs_terminal":[mine]}),
+                serde_json::json!({"in_seconds":5}),
+                WAKE_WHEN_TIMING_UNSUPPORTED,
+            ),
+        ] {
+            let result = tool.execute(arm(when, extra), Path::new("/tmp")).await;
+            assert!(!result.success);
+            assert!(result.error_msg.unwrap().contains(code));
+        }
+        let misplaced = tool
+            .execute(
+                serde_json::json!({"message":"m","mode":"resume","in_seconds":5,
+                    "when":{"jobs_terminal":[mine]}}),
+                Path::new("/tmp"),
+            )
+            .await;
+        assert_eq!(
+            misplaced.error_msg.as_deref(),
+            Some(WAKE_WHEN_FIELD_MISPLACED)
+        );
+        assert!(store.lock().await.list_scheduled_jobs().unwrap().is_empty());
+
+        let ok = tool
+            .execute(
+                arm(
+                    serde_json::json!({"jobs_terminal":[mine]}),
+                    serde_json::json!({}),
+                ),
+                Path::new("/tmp"),
+            )
+            .await;
+        assert!(ok.success, "{:?}", ok.error_msg);
+        let guard = store.lock().await;
+        let jobs = guard.list_scheduled_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].wake_mode, WakeMode::Resume);
+        assert_eq!(jobs[0].wake_session_id, Some(caller));
+        let state = guard
+            .wake_when_state(jobs[0].id)
+            .unwrap()
+            .expect("predicate state");
+        assert_eq!(state.predicate.jobs_terminal, Some(vec![mine]));
+        assert!(state.deadline.is_some());
     }
 
     /// A8.1 Q3: an out-of-scope watched subject is denied by the SAME guarded

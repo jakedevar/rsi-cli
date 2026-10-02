@@ -117,6 +117,17 @@ pub enum SpawnRejectReason {
         effort: String,
         valid: &'static [&'static str],
     },
+    /// The emitter runs under a Harness tool policy (#792), which a spawned
+    /// child inherits unchanged. A child on a provider that cannot enforce it
+    /// would escape the policy, so the spawn is refused.
+    ToolPolicyProviderUnsupported {
+        provider: rsi_common::types::SessionProvider,
+    },
+    /// The child's model is not on the operator launch-model allowlist
+    /// (issue #692). Refused synchronously, before any spawn request, session
+    /// row or provider process exists; the launch chokepoint re-checks the
+    /// effective model (project default included) for every other path.
+    LaunchModelNotAllowed { model: String, allowed: Vec<String> },
 }
 
 impl std::fmt::Display for SpawnRejectReason {
@@ -192,6 +203,17 @@ impl std::fmt::Display for SpawnRejectReason {
                 f,
                 "unsupported effort '{effort}' for model '{model}' (valid: {})",
                 valid.join(", ")
+            ),
+            Self::LaunchModelNotAllowed { model, allowed } => write!(
+                f,
+                "{}",
+                rsi_common::launch_allowlist::launch_model_refusal(allowed, Some(model))
+            ),
+            Self::ToolPolicyProviderUnsupported { provider } => write!(
+                f,
+                "{}: the emitter runs under a Harness tool policy that a {provider:?} child \
+                 cannot enforce",
+                rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_PROVIDER
             ),
         }
     }
@@ -334,8 +356,15 @@ pub struct SpawnCoordinator {
     /// Installed once by `SessionManager`; carries only durable reservation
     /// IDs to the successor reconciler.
     successor_tx: OnceLock<mpsc::Sender<SuccessorDispatchRequest>>,
+    /// Installed once by `SessionManager`; supplies the daemon-wide Harness tool
+    /// policy defaults to the child-inheritance check (#792). Unset in bare
+    /// fixtures, where only a stored row can put an emitter under a policy.
+    runtime_config: OnceLock<Arc<crate::config::RuntimeConfig>>,
     /// Coalesces status, startup, and backstop hints for the same durable row.
     successor_pending: Mutex<HashSet<Uuid>>,
+    /// Daemon-wide Harness process registry shared by rotation and fresh launch.
+    process_registry_manager:
+        Arc<super::harness::tools::process_registry::HarnessProcessRegistryManager>,
     /// Optional clock override — non-None only in tests.
     #[cfg(test)]
     test_clock: Mutex<Option<Instant>>,
@@ -349,10 +378,25 @@ impl SpawnCoordinator {
             consumed: Mutex::new(HashMap::new()),
             spawn_tx,
             successor_tx: OnceLock::new(),
+            runtime_config: OnceLock::new(),
             successor_pending: Mutex::new(HashSet::new()),
+            process_registry_manager:
+                super::harness::tools::process_registry::HarnessProcessRegistryManager::new(),
             #[cfg(test)]
             test_clock: Mutex::new(None),
         }
+    }
+
+    /// Install the daemon runtime config once (the source of the Harness tool
+    /// policy defaults, #792). A second install is ignored.
+    pub(crate) fn install_runtime_config(&self, config: Arc<crate::config::RuntimeConfig>) {
+        let _ = self.runtime_config.set(config);
+    }
+
+    pub(crate) fn process_registry_manager(
+        &self,
+    ) -> Arc<super::harness::tools::process_registry::HarnessProcessRegistryManager> {
+        Arc::clone(&self.process_registry_manager)
     }
 
     pub(crate) fn install_successor_sender(
@@ -936,12 +980,71 @@ impl SpawnCoordinator {
         // retain the historical project-default behavior.
         let child_provider = directive.provider.unwrap_or(emitter.provider);
         let inherit_emitter_defaults = child_provider == emitter.provider;
+        // #792: the child inherits the emitter's tool policy unchanged. There
+        // is no spawn parameter that could widen it; a provider that cannot
+        // enforce it is refused. An unreadable policy refuses the spawn.
+        let inherited_tool_policy = {
+            let g = store.lock().await;
+            g.resolve_session_tool_policy(emitter_id)
+        };
+        let inherited_tool_policy = match inherited_tool_policy {
+            Ok(policy) => policy,
+            Err(error) => {
+                return SpawnState::Rejected {
+                    reason: SpawnRejectReason::StoreError(format!("tool policy lookup: {error}")),
+                };
+            }
+        };
+        // The daemon-wide defaults are layered at runtime and never stored, so
+        // "under a policy" is the shared predicate (stored row OR a Harness-loop
+        // emitter the defaults restrict), the same one the route guard uses.
+        let emitter_under_policy = self.runtime_config.get().map_or_else(
+            || inherited_tool_policy.is_some(),
+            |config| {
+                config
+                    .session_is_under_tool_policy(emitter.provider, inherited_tool_policy.as_ref())
+            },
+        );
+        if emitter_under_policy
+            && !rsi_common::harness_tool_policy::provider_runs_harness_loop(child_provider)
+        {
+            return SpawnState::Rejected {
+                reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
+                    provider: child_provider,
+                },
+            };
+        }
         let skip_project_model_default = !inherit_emitter_defaults && directive.model.is_none();
         let child_model = directive.model.clone().or_else(|| {
             inherit_emitter_defaults
                 .then(|| emitter.model.clone())
                 .flatten()
         });
+        // #692: operator launch-model allowlist. Only a model known here is
+        // checked; a child that names none (and whose emitter has none to
+        // inherit) is vetted at the launch chokepoint, where the project and
+        // provider defaults are resolved.
+        if let (Some(model), Some(config)) = (child_model.as_deref(), self.runtime_config.get()) {
+            let allowed = config.launch_model_allowlist.read().clone();
+            if !rsi_common::launch_allowlist::launch_model_allowed(
+                &allowed,
+                Some(child_provider),
+                Some(model),
+            ) {
+                tracing::warn!(
+                    emitter_id = %emitter_id,
+                    epic_id = %epic_id,
+                    model,
+                    "spawn_child rejected: model is not on the operator launch-model allowlist"
+                );
+                return SpawnState::Rejected {
+                    reason: SpawnRejectReason::LaunchModelNotAllowed {
+                        model: model.to_string(),
+                        allowed,
+                    },
+                };
+            }
+        }
         let child_effort = directive.effort.clone().or_else(|| {
             let mut inherited = inherit_emitter_defaults
                 .then(|| emitter.effort.clone())
@@ -1156,6 +1259,7 @@ impl SpawnCoordinator {
         // `hierarchy_ops::effective_topology` (P1.3 — kill the per-session
         // workflow_id copy).
         let config = LaunchConfig {
+            completion_gates: None,
             query: directive.query.clone(),
             title: None,
             agent_role: durable_request.request.agent_role.clone(),
@@ -1193,6 +1297,7 @@ impl SpawnCoordinator {
             )),
             model_invocation_request_fingerprint: Some(request_fingerprint.clone()),
             skip_project_model_default,
+            tool_policy: inherited_tool_policy,
             model_invocation_purpose:
                 rsi_common::model_control::ModelInvocationPurpose::AgentSpawnChild,
             sandbox: sandbox_spec_from_session(&emitter),
@@ -1397,6 +1502,7 @@ mod tests {
             context_window: None,
             resolved_context_budget: None,
             total_input_tokens: None,
+            total_prompt_tokens: None,
             total_output_tokens: None,
             total_cache_creation_tokens: None,
             total_cache_read_tokens: None,
@@ -1813,6 +1919,165 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
+    async fn a_spawned_child_inherits_the_emitters_tool_policy_and_cannot_leave_the_harness() {
+        use rsi_common::harness_tool_policy::{HarnessToolPolicy, WebAccessMode};
+        let (store, _td) = open_store();
+        let (tx, mut rx) = mpsc::channel(8);
+        let coord = SpawnCoordinator::new(tx);
+        let epic_id = Uuid::new_v4();
+        let emitter_id = Uuid::new_v4();
+        insert(
+            &store,
+            &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+        )
+        .await;
+        let mut emitter = mk_session(emitter_id, SessionKind::Task, Some(epic_id), None);
+        emitter.provider = SessionProvider::Harness;
+        insert(&store, &emitter).await;
+        seed_root_invocation(&store, emitter_id, "premium", "high").await;
+        let policy = HarnessToolPolicy {
+            web_access: Some(WebAccessMode::Disabled),
+            ..HarnessToolPolicy::default()
+        };
+        store
+            .lock()
+            .await
+            .insert_session_tool_policy(emitter_id, &policy, chrono::Utc::now())
+            .unwrap();
+
+        // The child stays on the Harness loop and carries the policy verbatim.
+        let state =
+            handle_for_test(&coord, emitter_id, 61, directive(SessionKind::Task), &store).await;
+        assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+        let sent = rx.try_recv().expect("spawn request is sent");
+        assert_eq!(sent.config.tool_policy, Some(policy));
+
+        // Selecting a provider that cannot enforce the policy is refused.
+        let mut escape = directive(SessionKind::Task);
+        escape.provider = Some(SessionProvider::Claude);
+        let state = handle_for_test(&coord, emitter_id, 62, escape, &store).await;
+        assert!(matches!(
+            state,
+            SpawnState::Rejected {
+                reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
+                    provider: SessionProvider::Claude
+                }
+            }
+        ));
+        assert!(rx.try_recv().is_err(), "no spawn request for the escape");
+    }
+
+    /// A Harness emitter with NO stored row but restricted by the daemon-wide
+    /// defaults (`harness_web_access=disabled`) is under a policy: its child
+    /// stays on a Harness-loop provider or is refused, exactly as for a stored
+    /// row. With all-default config the same spawns behave as before.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn a_default_only_restriction_binds_children_like_a_stored_row() {
+        for restricted in [true, false] {
+            let (store, _td) = open_store();
+            let (tx, mut rx) = mpsc::channel(8);
+            let coord = SpawnCoordinator::new(tx);
+            let config =
+                crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+            if restricted {
+                config
+                    .update_field("harness_web_access", &serde_json::json!("disabled"))
+                    .unwrap();
+            }
+            coord.install_runtime_config(config);
+            let epic_id = Uuid::new_v4();
+            let emitter_id = Uuid::new_v4();
+            insert(
+                &store,
+                &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+            )
+            .await;
+            let mut emitter = mk_session(emitter_id, SessionKind::Task, Some(epic_id), None);
+            emitter.provider = SessionProvider::Harness;
+            insert(&store, &emitter).await;
+            seed_root_invocation(&store, emitter_id, "premium", "high").await;
+            assert!(
+                store
+                    .lock()
+                    .await
+                    .get_session_tool_policy(emitter_id)
+                    .unwrap()
+                    .is_none(),
+                "no stored row: only the defaults can restrict this emitter"
+            );
+
+            let mut hash = 70;
+            let mut spawn = |provider: SessionProvider| {
+                hash += 1;
+                let mut d = directive(SessionKind::Task);
+                d.provider = Some(provider);
+                (hash, d)
+            };
+            // A CLI child would escape the defaults.
+            let (h, d) = spawn(SessionProvider::Claude);
+            let state = handle_for_test(&coord, emitter_id, h, d, &store).await;
+            if restricted {
+                assert!(matches!(
+                    state,
+                    SpawnState::Rejected {
+                        reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
+                            provider: SessionProvider::Claude
+                        }
+                    }
+                ));
+                assert!(rx.try_recv().is_err());
+            } else {
+                assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+                assert_eq!(
+                    rx.try_recv().unwrap().config.provider,
+                    Some(SessionProvider::Claude)
+                );
+            }
+            // Harness-loop providers are always allowed.
+            for provider in [
+                SessionProvider::Harness,
+                SessionProvider::OpenRouter,
+                SessionProvider::Bedrock,
+            ] {
+                let (h, d) = spawn(provider);
+                let state = handle_for_test(&coord, emitter_id, h, d, &store).await;
+                assert!(
+                    matches!(state, SpawnState::Spawning { .. }),
+                    "{provider:?} restricted={restricted}: {state:?}"
+                );
+                assert_eq!(rx.try_recv().unwrap().config.provider, Some(provider));
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn an_emitter_without_a_policy_spawns_unrestricted_children() {
+        let (store, _td) = open_store();
+        let (tx, mut rx) = mpsc::channel(8);
+        let coord = SpawnCoordinator::new(tx);
+        let epic_id = Uuid::new_v4();
+        let emitter_id = Uuid::new_v4();
+        insert(
+            &store,
+            &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+        )
+        .await;
+        insert(
+            &store,
+            &mk_session(emitter_id, SessionKind::Task, Some(epic_id), None),
+        )
+        .await;
+        seed_root_invocation(&store, emitter_id, "premium", "high").await;
+        let state =
+            handle_for_test(&coord, emitter_id, 63, directive(SessionKind::Task), &store).await;
+        assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+        assert_eq!(rx.try_recv().unwrap().config.tool_policy, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
     async fn non_escalating_effort_spawn_still_enqueues() {
         let (store, _td) = open_store();
         let (tx, mut rx) = mpsc::channel(8);
@@ -1996,6 +2261,93 @@ mod tests {
         assert_eq!(req.config.provider, Some(SessionProvider::CodexAppServer));
         assert_eq!(req.config.query, "Only the extracted QUERY body.");
         assert!(req.config.system_prompt.is_none());
+    }
+
+    /// Issue #692: `AgentSpawnChild` with a model off the operator allowlist is
+    /// refused typed, before any spawn request, session row or provider process;
+    /// an allowed model still spawns; an empty list is unrestricted.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn agent_spawn_child_refuses_model_off_the_operator_allowlist() {
+        let (store, _td) = open_store();
+        let (tx, mut rx) = mpsc::channel(8);
+        let coord = SpawnCoordinator::new(tx);
+        let config = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["gpt-6-sol", "claude-opus-5-5"]),
+            )
+            .unwrap();
+        coord.install_runtime_config(config);
+        let (active, completed) = empty_runtime();
+        let epic_id = Uuid::new_v4();
+        let emitter_id = Uuid::new_v4();
+        insert(
+            &store,
+            &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+        )
+        .await;
+        // The emitter's own model (claude-sonnet-5) is off the list too.
+        insert(
+            &store,
+            &mk_session(emitter_id, SessionKind::Task, Some(epic_id), None),
+        )
+        .await;
+        seed_root_invocation(&store, emitter_id, "premium", "high").await;
+
+        for (idx, model) in [Some("claude-sonnet-5"), None].into_iter().enumerate() {
+            let request = AgentSpawnChildRequestV1 {
+                model: model.map(str::to_string),
+                ..agent_request(&format!("disallowed-{idx}"), "do the thing")
+            };
+            let state = coord
+                .handle_agent(emitter_id, request, &active, &completed, &store)
+                .await;
+            match state {
+                SpawnState::Rejected {
+                    reason: SpawnRejectReason::LaunchModelNotAllowed { model, allowed },
+                } => {
+                    assert_eq!(model, "claude-sonnet-5");
+                    assert_eq!(allowed, vec!["gpt-6-sol", "claude-opus-5-5"]);
+                    let text =
+                        SpawnRejectReason::LaunchModelNotAllowed { model, allowed }.to_string();
+                    assert!(text.contains("launch_model_not_allowed"), "{text}");
+                    assert!(text.contains("gpt-6-sol, claude-opus-5-5"), "{text}");
+                }
+                other => panic!("expected LaunchModelNotAllowed, got {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err(), "no spawn request is enqueued");
+        assert!(
+            store
+                .lock()
+                .await
+                .list_children(Some(epic_id))
+                .unwrap()
+                .iter()
+                .all(|row| row.id == emitter_id),
+            "no child session row exists"
+        );
+        assert!(
+            store
+                .lock()
+                .await
+                .list_incomplete_agent_spawn_requests()
+                .unwrap()
+                .is_empty(),
+            "no durable spawn request exists"
+        );
+
+        let allowed = AgentSpawnChildRequestV1 {
+            model: Some("GPT-6-SOL".to_string()),
+            ..agent_request("allowed", "do the thing")
+        };
+        let state = coord
+            .handle_agent(emitter_id, allowed, &active, &completed, &store)
+            .await;
+        assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+        assert!(rx.try_recv().is_ok(), "the allowed child is enqueued");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

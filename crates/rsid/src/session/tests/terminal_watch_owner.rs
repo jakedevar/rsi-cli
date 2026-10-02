@@ -152,6 +152,7 @@ async fn owner_settling_watch_delivers_once_per_child_epoch_and_preserves_rearm(
         manager.persistence.clone(),
         None,
         Arc::clone(&manager.runtime_config),
+        None,
     ));
     tokio::time::timeout(std::time::Duration::from_secs(2), removed)
         .await

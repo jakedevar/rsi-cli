@@ -47,6 +47,69 @@ fn shift_key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
+#[tokio::test]
+async fn notification_browser_uses_persisted_geometry_keys() {
+    let mut app = test_app();
+    app.overlay = OverlayState::NotificationBrowser {
+        selected_index: 0,
+        scroll_offset: 0,
+    };
+    crate::event::step_once(&mut app, ctrl_key(KeyCode::Right)).await;
+    crate::event::step_once(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+    )
+    .await;
+    let geom = app.current_overlay_geometry();
+    assert_eq!(geom.dx, 2);
+    assert_eq!(geom.dh, 2);
+    assert_eq!(
+        app.current_overlay_geometry_key().as_deref(),
+        Some("NotificationBrowser")
+    );
+    crate::event::step_once(&mut app, ctrl_key(KeyCode::Char('0'))).await;
+    let reset = app.current_overlay_geometry();
+    assert_eq!((reset.dx, reset.dy, reset.dw, reset.dh), (0, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn centered_overlays_have_independent_geometry_keys() {
+    let mut app = test_app();
+    prompt::open_blank_popup(&mut app);
+    app.overlay = OverlayState::ThemePicker {
+        selected_index: 0,
+        original_index: 0,
+    };
+    crate::event::step_once(&mut app, ctrl_key(KeyCode::Right)).await;
+    assert_eq!(
+        app.current_overlay_geometry_key().as_deref(),
+        Some("ThemePicker")
+    );
+    assert_eq!(app.current_overlay_geometry().dx, 2);
+
+    app.overlay = OverlayState::Terminal;
+    crate::event::step_once(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+    )
+    .await;
+    assert_eq!(
+        app.current_overlay_geometry_key().as_deref(),
+        Some("Terminal")
+    );
+    assert_eq!(app.current_overlay_geometry().dh, 2);
+
+    app.overlay = OverlayState::ThemePicker {
+        selected_index: 0,
+        original_index: 0,
+    };
+    assert_eq!(app.current_overlay_geometry().dx, 2);
+    crate::event::step_once(&mut app, ctrl_key(KeyCode::Char('0'))).await;
+    assert_eq!(app.current_overlay_geometry().dx, 0);
+    app.overlay = OverlayState::Terminal;
+    assert_eq!(app.current_overlay_geometry().dh, 2);
+}
+
 fn scheduled_job(name: &str) -> ScheduledJob {
     let now = chrono::Utc::now();
     ScheduledJob {
@@ -110,6 +173,7 @@ async fn schedule_browser_requires_dd_before_deleting() {
         selected_index: 0,
         loading: false,
         pending_delete: false,
+        paging: Default::default(),
     };
 
     handle_overlay_key(&mut app, key(KeyCode::Char('d'))).await;
@@ -189,6 +253,7 @@ async fn schedule_browser_single_space_toggles_selected_job() {
         selected_index: 0,
         loading: false,
         pending_delete: false,
+        paging: Default::default(),
     };
 
     assert!(handle_overlay_key(&mut app, key(KeyCode::Char(' '))).await);
@@ -449,6 +514,119 @@ fn main_overlay_effort_cycle_follows_model_ladder_and_default() {
     app.selected_effort = Some("xhigh".to_string());
     cycle_effort(&mut app, None, None);
     assert_eq!(app.selected_effort.as_deref(), Some("max"));
+}
+
+#[tokio::test]
+async fn blank_picker_uses_discovered_effort_ladder_default_and_bars() {
+    use rsi_common::model_utils::ModelEffortCapabilities;
+    use rsi_common::types::SessionProvider;
+    for provider in [SessionProvider::Codex, SessionProvider::CodexAppServer] {
+        // Both a newly released model and a future ID must use metadata.
+        for model in ["gpt-6.1-sol", "gpt-future-custom"] {
+            let mut app = test_app();
+            app.selected_provider = SessionProvider::Claude;
+            app.selected_model = Some("claude-opus-5".into());
+            app.selected_effort = Some("ultra".into());
+            app.model_effort_capabilities.insert(
+                provider,
+                vec![ModelEffortCapabilities {
+                    model: model.into(),
+                    supported_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                        .map(str::to_string)
+                        .to_vec(),
+                    default_effort: Some("low".into()),
+                }],
+            );
+            prompt::open_blank_popup(&mut app);
+            if let Some(OverlayState::Prompt { model_dropdown, .. }) = app.input_overlays.last_mut()
+            {
+                *model_dropdown = crate::types::ModelDropdownState::new(
+                    provider,
+                    vec![(model.into(), model.into())],
+                    None,
+                );
+            }
+            handle_overlay_key(&mut app, key(KeyCode::Enter)).await;
+            assert_eq!(app.selected_effort.as_deref(), Some("ultra"));
+            assert_eq!(app.model_effort_bar_counts(Some(model), provider), (6, 6));
+
+            app.selected_effort = None;
+            assert_eq!(app.model_effort_bar_counts(Some(model), provider), (6, 1));
+            for (index, expected) in ["low", "medium", "high", "xhigh", "max", "ultra", "low"]
+                .into_iter()
+                .enumerate()
+            {
+                handle_overlay_key(&mut app, ctrl_key(KeyCode::Char('e'))).await;
+                assert_eq!(app.selected_effort.as_deref(), Some(expected));
+                assert_eq!(
+                    app.model_effort_bar_counts(Some(model), provider),
+                    (6, index % 6 + 1)
+                );
+            }
+            app.selected_effort = Some("ultra".into());
+            if let Some(OverlayState::Prompt { working_dir, .. }) = app.input_overlays.last_mut() {
+                *working_dir = PathBuf::from("/tmp");
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::overlay::render_overlay(frame, frame.area(), &mut app))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(model), "{rendered}");
+            assert!(rendered.contains("▮▮▮▮▮▮"), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn discovered_effort_ladders_override_known_models_and_stay_provider_scoped() {
+    use rsi_common::model_utils::ModelEffortCapabilities;
+    use rsi_common::types::SessionProvider;
+    let mut app = test_app();
+    app.model_effort_capabilities.insert(
+        SessionProvider::Codex,
+        vec![
+            ModelEffortCapabilities {
+                model: "gpt-6-astra".into(),
+                supported_efforts: vec!["medium".into(), "max".into()],
+                default_effort: Some("max".into()),
+            },
+            ModelEffortCapabilities {
+                model: "gpt-no-effort".into(),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+            },
+        ],
+    );
+    assert_eq!(
+        app.model_effort_ladder(SessionProvider::Codex, "gpt-6-astra"),
+        ["medium", "max"]
+    );
+    assert_eq!(
+        app.model_effort_ladder(SessionProvider::CodexAppServer, "gpt-6-astra"),
+        ["low", "medium", "high", "xhigh", "max", "ultra"]
+    );
+    app.selected_provider = SessionProvider::Codex;
+    app.selected_model = Some("gpt-6-astra".into());
+    app.selected_effort = None;
+    cycle_effort(&mut app, None, None);
+    assert_eq!(app.selected_effort.as_deref(), Some("max"));
+    app.selected_effort = Some("ultra".into());
+    app.reconcile_model_effort(SessionProvider::Codex, "gpt-6-astra");
+    assert_eq!(app.selected_effort, None);
+    cycle_effort(&mut app, Some("gpt-no-effort"), None);
+    assert_eq!(app.selected_effort, None);
+    assert_eq!(
+        app.model_effort_bar_counts(Some("gpt-no-effort"), SessionProvider::Codex),
+        (0, 0)
+    );
 }
 
 #[tokio::test]
@@ -1697,6 +1875,7 @@ async fn test_open_continue_popup_sets_purpose() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -1806,6 +1985,7 @@ async fn test_submit_prompt_routes_to_continue_session() {
         context_window: None,
         resolved_context_budget: None,
         total_input_tokens: None,
+        total_prompt_tokens: None,
         total_output_tokens: None,
         total_cache_creation_tokens: None,
         total_cache_read_tokens: None,
@@ -2372,4 +2552,176 @@ fn test_picker_renders_with_scroll_state() {
         text.contains("workflow-25"),
         "selected entry should be visible in the rendered buffer; got: {text}"
     );
+}
+
+/// Fake daemon for the Scheduled Jobs paging tests: answers `ListScheduledJobs`
+/// from the request's `include_history` and `cursor` (two pages per filter) and
+/// records every request.
+#[allow(clippy::expect_used)]
+fn spawn_paged_schedule_daemon(
+    listener: tokio::net::UnixListener,
+    default_pages: (Vec<ScheduledJob>, Vec<ScheduledJob>),
+    history_page: Vec<ScheduledJob>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("schedule client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await.expect("request read") {
+            let request: serde_json::Value = serde_json::from_str(&line).expect("request JSON");
+            log.lock().expect("log").push(request.clone());
+            let result = match request["method"].as_str() {
+                Some("ListScheduledJobHolds") => serde_json::json!([]),
+                Some("ListScheduledJobs") => {
+                    let history = request["params"]["include_history"] == true;
+                    let cursor = request["params"]["cursor"].as_str();
+                    let (jobs, next) = match (history, cursor) {
+                        (true, _) => (&history_page, None),
+                        (false, None) => (&default_pages.0, Some("page-2")),
+                        (false, Some(_)) => (&default_pages.1, None),
+                    };
+                    serde_json::json!({
+                        "jobs": jobs,
+                        "next_cursor": next,
+                        "include_history": history,
+                    })
+                }
+                other => panic!("unexpected request {other:?}"),
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": result,
+            });
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("response write");
+        }
+    })
+}
+
+fn listed_requests(log: &std::sync::Mutex<Vec<serde_json::Value>>) -> Vec<serde_json::Value> {
+    log.lock()
+        .expect("log")
+        .iter()
+        .filter(|request| request["method"] == "ListScheduledJobs")
+        .map(|request| request["params"].clone())
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn schedule_browser_pages_and_toggles_history() {
+    let temp_dir = tempfile::tempdir().expect("temporary schedule socket directory");
+    let socket_path = temp_dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("schedule listener");
+    let first = scheduled_job("active-1");
+    let second = scheduled_job("active-2");
+    let old = scheduled_job("old-disabled");
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _server = spawn_paged_schedule_daemon(
+        listener,
+        // The second page repeats `first`, as when a row crosses the filter
+        // between pages; the view must not show it twice.
+        (vec![first.clone()], vec![first.clone(), second.clone()]),
+        vec![first.clone(), second.clone(), old.clone()],
+        std::sync::Arc::clone(&log),
+    );
+    let mut app = test_app_at(socket_path);
+    app.client.connect().await.expect("connect schedule client");
+    app.poll.connected = true;
+
+    crate::overlay::schedule_browser::open_schedule_browser(&mut app).await;
+    let names = |app: &App| -> Vec<String> {
+        match &app.overlay {
+            OverlayState::ScheduleBrowser { jobs, .. } => {
+                jobs.iter().map(|job| job.name.clone()).collect()
+            }
+            _ => panic!("schedule browser must stay open"),
+        }
+    };
+    let paging = |app: &App| match &app.overlay {
+        OverlayState::ScheduleBrowser { paging, .. } => paging.clone(),
+        _ => panic!("schedule browser must stay open"),
+    };
+    assert_eq!(names(&app), ["active-1"]);
+    assert!(!paging(&app).include_history, "default filter first");
+    assert_eq!(paging(&app).next_cursor.as_deref(), Some("page-2"));
+
+    // `m` loads the next page and skips the row already shown.
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('m'))).await);
+    assert_eq!(names(&app), ["active-1", "active-2"]);
+    assert_eq!(paging(&app).next_cursor, None);
+
+    // Nothing left: `m` sends no further request.
+    let before = listed_requests(&log).len();
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('m'))).await);
+    assert_eq!(listed_requests(&log).len(), before);
+
+    // `H` reloads the first page with history included, and `r` keeps it.
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('H'))).await);
+    assert_eq!(names(&app), ["active-1", "active-2", "old-disabled"]);
+    assert!(paging(&app).include_history);
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('r'))).await);
+    assert!(paging(&app).include_history, "refresh keeps the filter");
+
+    // `H` again returns to the default filter.
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('H'))).await);
+    assert_eq!(names(&app), ["active-1"]);
+    assert!(!paging(&app).include_history);
+
+    let requests = listed_requests(&log);
+    assert_eq!(requests[0]["include_history"], false);
+    assert_eq!(requests[1]["cursor"], "page-2");
+    assert_eq!(requests[2]["include_history"], true);
+    assert_eq!(requests[3]["include_history"], true);
+    assert_eq!(requests[4]["include_history"], false);
+}
+
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn schedule_form_return_restores_the_history_filter() {
+    let temp_dir = tempfile::tempdir().expect("temporary schedule socket directory");
+    let socket_path = temp_dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("schedule listener");
+    let active = scheduled_job("active-1");
+    let old = scheduled_job("old-disabled");
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _server = spawn_paged_schedule_daemon(
+        listener,
+        (vec![active.clone()], Vec::new()),
+        vec![active.clone(), old.clone()],
+        std::sync::Arc::clone(&log),
+    );
+    let mut app = test_app_at(socket_path);
+    app.client.connect().await.expect("connect schedule client");
+    app.poll.connected = true;
+
+    crate::overlay::schedule_browser::open_schedule_browser(&mut app).await;
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('H'))).await);
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Char('n'))).await);
+    assert!(matches!(app.overlay, OverlayState::ScheduleForm { .. }));
+
+    // Leaving the form returns to the browser with history still included.
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Esc)).await);
+    match &app.overlay {
+        OverlayState::ScheduleBrowser { jobs, paging, .. } => {
+            assert!(paging.include_history);
+            assert_eq!(jobs.len(), 2, "history rows are back");
+        }
+        _ => panic!("expected the schedule browser"),
+    }
+    let requests = listed_requests(&log);
+    assert_eq!(requests.last().expect("reload")["include_history"], true);
+
+    // A fresh open (not a form return) starts on the default filter again.
+    crate::overlay::schedule_browser::open_schedule_browser(&mut app).await;
+    assert!(matches!(
+        &app.overlay,
+        OverlayState::ScheduleBrowser { paging, .. } if !paging.include_history
+    ));
 }

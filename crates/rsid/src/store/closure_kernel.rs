@@ -1575,7 +1575,7 @@ impl Store {
     pub(crate) fn closure_launch_selector_for_session(
         &self,
         session_id: Uuid,
-    ) -> Result<Option<crate::closure_kernel::ClosureLaunchSelectorV1>> {
+    ) -> Result<Option<crate::store_support::closure_selector::ClosureLaunchSelectorV1>> {
         self.conn
             .query_row(
                 "SELECT cs.program_id,cs.id,cs.source_base_sha,cs.destination_ref,
@@ -1604,39 +1604,41 @@ impl Store {
             )
             .optional()?
             .map(|row| {
-                Ok(crate::closure_kernel::ClosureLaunchSelectorV1 {
-                    program_id: ClosureProgramIdV1::new(
-                        Uuid::parse_str(&row.0)
-                            .map_err(|error| DaemonError::Store(error.to_string()))?,
-                    ),
-                    source_id: ClosureSourceIdV1::new(
-                        Uuid::parse_str(&row.1)
-                            .map_err(|error| DaemonError::Store(error.to_string()))?,
-                    ),
-                    base_sha: ClosureGitShaV1::parse(row.2).map_err(DaemonError::Store)?,
-                    destination_ref: ClosureLocalBranchRefV1::parse(row.3)
-                        .map_err(DaemonError::Store)?,
-                    destination_pre_head: ClosureGitShaV1::parse(row.4)
-                        .map_err(DaemonError::Store)?,
-                    staging_ref: ClosureLocalBranchRefV1::parse(row.5)
-                        .map_err(DaemonError::Store)?,
-                    lineage_root_session_id: Some(
-                        Uuid::parse_str(&row.6)
-                            .map_err(|error| DaemonError::Store(error.to_string()))?,
-                    ),
-                    custody_id: Some(
-                        Uuid::parse_str(&row.7)
-                            .map_err(|error| DaemonError::Store(error.to_string()))?,
-                    ),
-                    custody_generation: Some(row.8),
-                    model_invocation_id: row
-                        .9
-                        .map(|raw| {
-                            Uuid::parse_str(&raw)
-                                .map_err(|error| DaemonError::Store(error.to_string()))
-                        })
-                        .transpose()?,
-                })
+                Ok(
+                    crate::store_support::closure_selector::ClosureLaunchSelectorV1 {
+                        program_id: ClosureProgramIdV1::new(
+                            Uuid::parse_str(&row.0)
+                                .map_err(|error| DaemonError::Store(error.to_string()))?,
+                        ),
+                        source_id: ClosureSourceIdV1::new(
+                            Uuid::parse_str(&row.1)
+                                .map_err(|error| DaemonError::Store(error.to_string()))?,
+                        ),
+                        base_sha: ClosureGitShaV1::parse(row.2).map_err(DaemonError::Store)?,
+                        destination_ref: ClosureLocalBranchRefV1::parse(row.3)
+                            .map_err(DaemonError::Store)?,
+                        destination_pre_head: ClosureGitShaV1::parse(row.4)
+                            .map_err(DaemonError::Store)?,
+                        staging_ref: ClosureLocalBranchRefV1::parse(row.5)
+                            .map_err(DaemonError::Store)?,
+                        lineage_root_session_id: Some(
+                            Uuid::parse_str(&row.6)
+                                .map_err(|error| DaemonError::Store(error.to_string()))?,
+                        ),
+                        custody_id: Some(
+                            Uuid::parse_str(&row.7)
+                                .map_err(|error| DaemonError::Store(error.to_string()))?,
+                        ),
+                        custody_generation: Some(row.8),
+                        model_invocation_id: row
+                            .9
+                            .map(|raw| {
+                                Uuid::parse_str(&raw)
+                                    .map_err(|error| DaemonError::Store(error.to_string()))
+                            })
+                            .transpose()?,
+                    },
+                )
             })
             .transpose()
     }

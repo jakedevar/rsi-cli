@@ -82,8 +82,13 @@ async fn user_events_containing(manager: &SessionManager, session: Uuid, text: &
 }
 
 /// Events reach `SQLite` through the persistence queue; wait for the flush.
+///
+/// Both waits below return as soon as the state is observed; the 60 s bound
+/// only limits how long a real failure takes to report. The earlier 5 s and
+/// 10 s budgets were the only wall-clock assumptions in tests that flaked
+/// under loaded landing gates (#926).
 async fn delivered_events(manager: &SessionManager, session: Uuid, text: &str) -> usize {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let count = user_events_containing(manager, session, text).await;
         if count > 0 || tokio::time::Instant::now() >= deadline {
@@ -94,7 +99,7 @@ async fn delivered_events(manager: &SessionManager, session: Uuid, text: &str) -
 }
 
 async fn wait_inactive(manager: &SessionManager, session: Uuid) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while manager.active.read().await.contains_key(&session) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -677,6 +682,62 @@ fn continue_refusal(error: &crate::error::DaemonError) -> (String, String) {
     }
 }
 
+/// #1073: `AgentContinueChild` against a waiting deploy returns the typed,
+/// retryable `deploy_draining` envelope (stable code + retry action), starts
+/// nothing, and succeeds once the deploy settles.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_continue_child_during_a_draining_deploy_returns_the_typed_retry_refusal()
+-> anyhow::Result<()> {
+    let (manager, dir) = rotation_manager();
+    let manager = Arc::new(manager);
+    let (epic, children) = epic_with_children(
+        &manager,
+        dir.path(),
+        &[SessionKind::Story, SessionKind::Task],
+    )
+    .await?;
+    let (lead, worker) = (children[0], children[1]);
+    manager.set_epic_lead(epic, Some(lead)).await?;
+    let history = manager.store.lock().await.load_events(worker)?.len();
+    let request = continue_request(&manager, worker, "more work").await?;
+    let live = crate::store::agent_deploys::DeployRow {
+        id: Uuid::new_v4(),
+        owner_session_id: Uuid::new_v4(),
+        sha: "0".repeat(40),
+        manifest: Vec::new(),
+        state: rsi_common::agent_deploy::DeployState::Staged,
+        reason: None,
+        deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+    };
+    manager
+        .deploy_drain()
+        .sync(Some(&live), true, chrono::Utc::now());
+
+    let refused = manager
+        .agent_continue_child(lead, request)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a draining deploy must refuse the continuation"))?;
+    let (code, message) = continue_refusal(&refused);
+    assert_eq!(code, "deploy_draining", "{message}");
+    let crate::error::DaemonError::StructuredRpc { data, .. } = &refused else {
+        anyhow::bail!("the refusal is structured: {refused}");
+    };
+    assert!(
+        data["next_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("retry")),
+        "{data}"
+    );
+    assert_eq!(
+        manager.store.lock().await.load_events(worker)?.len(),
+        history,
+        "nothing was started"
+    );
+    Ok(())
+}
+
 /// Review round 2 `agent_continue_lead_authority_race`: lead L1 is
 /// authorized to continue Epic worker W, then `SetEpicLead` replaces L1 with
 /// L2 before the effect. The continuation is refused with the typed
@@ -932,13 +993,25 @@ async fn agent_continue_child_refuses_moved_tip_typed_then_continues_fresh_and_b
     );
 
     // Busy: the successor is still running; the verb interrupts and delivers.
+    // The interrupt relaunches the successor, so it needs its own scripted
+    // provider. Without one the relaunch fell back to the real `claude` binary:
+    // it passed where `claude` was on PATH and failed with
+    // `ClaudeBinaryNotFound` in PATH-minimal lander units (#926).
     assert!(manager.active.read().await.contains_key(&successor.id));
+    let relaunch = install_controller_candidate_test_process(successor.id);
     let busy = continue_request(&manager, worker, "busy continuation").await?;
     let receipt = manager.agent_continue_child(lead, busy).await?;
     assert_eq!(receipt.continued_session_id, successor.id);
     assert_eq!(
         delivered_events(&manager, successor.id, "busy continuation").await,
         1
+    );
+    assert_eq!(
+        relaunch
+            .productive_start_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the busy continuation relaunches through the scripted provider"
     );
     assert!(
         process

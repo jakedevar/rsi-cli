@@ -20,6 +20,7 @@ warmup: build shard, integration, binary, and selected workspace test artifacts 
 shard: list, check, and run one library shard for a bounded edit/verify loop.
 --dry-run checks the static inventory and prints commands without running Cargo.
 --keep-rsid-artifacts retains each shard's rsid test build for debugging.
+Cleanup skips while another runner uses the same Cargo target directory.
 EOF
     exit 2
 }
@@ -123,6 +124,7 @@ if (( dry_run )); then
             if [[ -n "$filterset" ]]; then run_args+=(--filterset "$filterset"); fi
             print_command "${run_args[@]}"
             if (( ! keep_rsid_artifacts )); then
+                echo '# clean only with an exclusive target-directory lock; otherwise skip'
                 print_command cargo clean -p rsid --profile test
             fi
         done
@@ -144,6 +146,12 @@ fi
 # Keep one target and the caller's compiler job limit across every shard. Callers may select
 # the shared target directory with CARGO_TARGET_DIR; this runner never copies it.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
+# Cargo resolves environment, workspace and global target-dir settings for us.
+# Keep this lock outside the package artifacts removed by `cargo clean -p`.
+target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+mkdir -p "$target_dir"
+exec {artifact_lock_fd}>"$target_dir/.rsid-test-shards.lock"
+flock --shared "$artifact_lock_fd"
 if [[ -z "$evidence_dir" ]]; then
     mkdir -p target/rsid-test-shards
     evidence_dir="$(mktemp -d "target/rsid-test-shards/${mode}.XXXXXX")"
@@ -179,6 +187,36 @@ run_logged() {
     (( status == 0 )) || return "$status"
 }
 
+clean_rsid_artifacts() {
+    local label="$1" final="${2:-0}" clean_status=0
+    # Explicitly release our shared lock before trying exclusively. A new run
+    # waits for any exclusive clean before it can build or execute artifacts.
+    flock --unlock "$artifact_lock_fd"
+    if flock --exclusive --nonblock "$artifact_lock_fd"; then
+        run_logged "$label" cargo clean -p rsid --profile test || clean_status=$?
+    else
+        echo "skipping $label: another rsid shard runner is using $target_dir" | tee "$evidence_dir/logs/$label.stdout"
+        printf '%s\t0\n' "$label" >>"$evidence_dir/status.tsv"
+    fi
+    if (( ! final )); then
+        flock --shared "$artifact_lock_fd"
+    fi
+    return "$clean_status"
+}
+
+finish_artifacts() {
+    local status=$? clean_status=0 label=clean-final
+    if [[ "$mode" == shard ]]; then label="clean-$requested_shard"; fi
+    # Do not reacquire shared here: the last exiting runner must be able to
+    # clean even when every intermediate cleanup skipped because of overlap.
+    clean_rsid_artifacts "$label" 1 || clean_status=$?
+    if (( status == 0 )); then status=$clean_status; fi
+    exit "$status"
+}
+if (( ! keep_rsid_artifacts )) && [[ "$mode" != list && "$mode" != warmup ]]; then
+    trap finish_artifacts EXIT
+fi
+
 for shard in "${shards[@]}"; do
     label="list-$shard"
     record_command "$label" cargo nextest list --profile "$profile" -p rsid --lib --no-default-features --features "test-shard-$shard" --message-format json
@@ -213,8 +251,8 @@ for shard in "${shards[@]}"; do
     else
         run_status=$?
     fi
-    if (( ! keep_rsid_artifacts )); then
-        run_logged "clean-$shard" cargo clean -p rsid --profile test
+    if (( ! keep_rsid_artifacts )) && [[ "$mode" != shard ]]; then
+        clean_rsid_artifacts "clean-$shard"
     fi
     (( run_status == 0 )) || exit "$run_status"
 done

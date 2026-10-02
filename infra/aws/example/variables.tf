@@ -71,6 +71,11 @@ variable "secret_names" {
   type    = set(string)
   default = []
 }
+variable "provider_cli_npm_packages" {
+  description = "Exact-version npm specs for provider CLIs the host installs at boot."
+  type        = list(string)
+  default     = ["@anthropic-ai/claude-code@2.1.283", "@openai/codex@0.157.1"]
+}
 variable "operator_secrets" {
   type      = map(string)
   ephemeral = true

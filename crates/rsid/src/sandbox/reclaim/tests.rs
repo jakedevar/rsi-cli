@@ -178,6 +178,152 @@ fn absent_live_terminal_owner_is_adopted_and_linked_session_is_purged() {
     assert_eq!(item.2, expected_branch_oid);
 }
 
+fn insert_invalid_historical_session(f: &Fixture, working_dir: &Path) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at)
+             VALUES(?1,'historical invalid dependency row',?2,'Archived',?3,?3)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                working_dir.to_string_lossy().into_owned(),
+                now
+            ],
+        )
+        .unwrap();
+}
+
+/// Issue #1086: a historical Invalid Session row that cannot reach the absent
+/// root must not block adoption; one that can reach it still does.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn unreachable_invalid_historical_session_does_not_block_absent_root_adoption() {
+    let mut f = fixture();
+    let elsewhere = f._tmp.path().join("historical-elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    insert_invalid_historical_session(&f, &elsewhere);
+    remove_external(&f);
+    run(&mut f, false);
+    assert_eq!(state(&f), "purged");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn reachable_invalid_historical_session_blocks_absent_root_adoption() {
+    let mut f = fixture();
+    // The alias dangles once the root is gone but could be restored into it.
+    let alias = f._tmp.path().join("alias-into-root");
+    remove_external(&f);
+    std::os::unix::fs::symlink(&f.root, &alias).unwrap();
+    insert_invalid_historical_session(&f, &alias.join("work"));
+    let run_id = run(&mut f, false);
+    assert_eq!(state(&f), "live");
+    let reason: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT reason_code FROM sandbox_reclaim_items WHERE run_id=?1",
+            [run_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "session_projection_unhealthy");
+}
+
+/// Archived Session with a verified ordinary projection whose directory was
+/// then removed (hub class 1|Archived|NULL with a stale projection), plus a
+/// Failed-cleanup Session whose sandbox was removed elsewhere (class
+/// 2|Archived|Failed). Neither can reach the candidate root.
+fn insert_stale_historical_bystanders(f: &Fixture) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let stale_dir = f._tmp.path().join("stale-elsewhere");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let canonical = std::fs::canonicalize(&stale_dir).unwrap();
+    let stale = Uuid::new_v4().to_string();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at)
+             VALUES(?1,'historical stale relevant row',?2,'Archived',?3,?3)",
+            rusqlite::params![stale, stale_dir.to_string_lossy().into_owned(), now],
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE session_execution_projections
+                SET execution_state='ordinary_unsandboxed',freshness='verified',
+                    canonical_repo_dir=?1,effective_cwd=?1,custody_id=NULL,
+                    custody_generation=NULL,validated_at=?2,error_code=NULL,updated_at=?2
+              WHERE session_id=?3",
+            rusqlite::params![canonical.to_string_lossy().into_owned(), now, stale],
+        )
+        .unwrap();
+    std::fs::remove_dir_all(&stale_dir).unwrap();
+    let failed = Uuid::new_v4().to_string();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO sessions(id,query,working_dir,status,sandbox_kind,sandbox_cleanup_state,
+                                  sandbox_root,sandbox_branch,created_at,updated_at)
+             VALUES(?1,'historical failed cleanup row',?2,'Archived','GitWorktree','Failed',?3,
+                    'rsi/removed-elsewhere',?4,?4)",
+            rusqlite::params![
+                failed,
+                f.repo.to_string_lossy().into_owned(),
+                f._tmp
+                    .path()
+                    .join("sandboxes")
+                    .join("removed")
+                    .to_string_lossy()
+                    .into_owned(),
+                now
+            ],
+        )
+        .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn stale_historical_bystanders_do_not_block_absent_root_adoption() {
+    let mut f = fixture();
+    insert_stale_historical_bystanders(&f);
+    remove_external(&f);
+    run(&mut f, false);
+    assert_eq!(state(&f), "purged");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn stale_historical_bystanders_do_not_block_quarantined_root_missing_adoption() {
+    // Issue #1086 acceptance 3: a quarantined root_missing root (Session
+    // cleanup Failed) moves to the terminal tombstone even though unrelated
+    // historical rows hold stale projections.
+    let mut f = fixture();
+    insert_stale_historical_bystanders(&f);
+    remove_external(&f);
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let tx = f.store.conn.transaction().unwrap();
+    tx.execute("INSERT INTO sandbox_custody_events(event_id,custody_id,sequence,event_kind,cause,from_generation,to_generation,from_owner_session_id,to_owner_session_id,prior_state,next_state,error_code,occurred_at) VALUES(?1,?2,2,'quarantined','startup_reconciliation',1,2,?3,NULL,'live','quarantined','root_missing',?4)",rusqlite::params![Uuid::new_v4().to_string(),f.custody_id.to_string(),f.session_id.to_string(),now]).unwrap();
+    tx.execute("UPDATE sandbox_custody_roots SET state='quarantined',owner_session_id=NULL,generation=2,event_sequence=2,validation_state='invalid',validated_generation=2,validated_at=?2,validation_error_code='root_missing',updated_at=?2 WHERE custody_id=?1",rusqlite::params![f.custody_id.to_string(),now]).unwrap();
+    tx.execute("UPDATE sessions SET status='Archived',sandbox_cleanup_state='Failed',stop_reason='sandbox_custody:root_missing',updated_at=?2 WHERE id=?1",rusqlite::params![f.session_id.to_string(),now]).unwrap();
+    tx.execute("UPDATE session_execution_projections SET execution_state='quarantined',freshness='invalid',effective_cwd=NULL,custody_generation=2,validated_at=?2,error_code='root_missing',updated_at=?2 WHERE session_id=?1",rusqlite::params![f.session_id.to_string(),now]).unwrap();
+    tx.commit().unwrap();
+    run(&mut f, false);
+    assert_eq!(state(&f), "purged");
+    let (clean, root, branch): (String, Option<String>, Option<String>) = f
+        .store
+        .conn
+        .query_row(
+            "SELECT sandbox_cleanup_state,sandbox_root,sandbox_branch FROM sessions WHERE id=?1",
+            [f.session_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((clean, root, branch), ("Purged".into(), None, None));
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn absent_quarantined_root_missing_is_adopted() {
@@ -395,4 +541,190 @@ fn dry_run_then_real_run_adopts_at_same_generation() {
         (1, "absent_adopted".into(), 1, "settled".into())
     );
     assert_eq!(item_effect(&f, dry_run).2, 0);
+}
+
+fn only_reason(f: &Fixture, run_id: Uuid) -> String {
+    f.store
+        .conn
+        .query_row(
+            "SELECT reason_code FROM sandbox_reclaim_items WHERE run_id=?1",
+            [run_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn delete_branch(f: &Fixture) {
+    git(&f.repo, &["branch", "-D", &f.branch]);
+}
+
+fn candidate(f: &Fixture) -> AbsentRootCandidate {
+    let mut candidates = f.store.absent_root_candidates(16).unwrap();
+    assert_eq!(candidates.len(), 1);
+    candidates.remove(0)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn missing_branch_is_retained_without_custody_change() {
+    let mut f = fixture();
+    remove_external(&f);
+    delete_branch(&f);
+    let run_id = run(&mut f, false);
+    assert_eq!(only_reason(&f, run_id), "branch_missing");
+    assert_eq!(state(&f), "live");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn registered_worktree_with_absent_directory_is_retained() {
+    let mut f = fixture();
+    std::fs::remove_dir_all(&f.root).unwrap();
+    let run_id = run(&mut f, false);
+    assert_eq!(only_reason(&f, run_id), "worktree_registered");
+    assert_eq!(state(&f), "live");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn run_reads_repository_evidence_once_and_reuses_it() {
+    let f = fixture();
+    remove_external(&f);
+    delete_branch(&f);
+    let base = std::fs::canonicalize(&f.base).unwrap();
+    let c = candidate(&f);
+    let mut evidence = RepoEvidenceCache::default();
+    assert_eq!(
+        prove_absent_root(&base, &c, &mut evidence),
+        Err("branch_missing")
+    );
+    // The branch reappears mid-run; the run keeps its one snapshot and still
+    // retains, which has no custody effect. A later run sees the branch.
+    git(&f.repo, &["branch", &f.branch, "main"]);
+    assert_eq!(
+        prove_absent_root(&base, &c, &mut evidence),
+        Err("branch_missing")
+    );
+    assert_eq!(
+        evidence.repos.len(),
+        1,
+        "one evidence read for one repository"
+    );
+    let mut next_run = RepoEvidenceCache::default();
+    let oid = prove_absent_root(&base, &c, &mut next_run).unwrap();
+    assert_eq!(oid, git(&f.repo, &["rev-parse", "main"]));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn stale_snapshot_never_proves_an_adoption() {
+    let f = fixture();
+    remove_external(&f);
+    let base = std::fs::canonicalize(&f.base).unwrap();
+    let c = candidate(&f);
+    let repo = PathBuf::from(&c.canonical_repo_dir);
+    let mut evidence = RepoEvidenceCache::default();
+    // Snapshot taken while the branch exists; the branch is then deleted.
+    let _ = evidence.repo(&repo);
+    delete_branch(&f);
+    assert_eq!(
+        prove_absent_root(&base, &c, &mut evidence),
+        Err("branch_missing")
+    );
+
+    // Snapshot taken before registration disappears still retains.
+    let g = fixture();
+    std::fs::remove_dir_all(&g.root).unwrap();
+    let c = candidate(&g);
+    let repo = PathBuf::from(&c.canonical_repo_dir);
+    let base = std::fs::canonicalize(&g.base).unwrap();
+    let mut evidence = RepoEvidenceCache::default();
+    let _ = evidence.repo(&repo);
+    git(&g.repo, &["worktree", "prune", "--expire", "now"]);
+    assert_eq!(
+        prove_absent_root(&base, &c, &mut evidence),
+        Err("worktree_registered")
+    );
+}
+
+/// Pre-#961 proof: every candidate re-read the listing and branch freshly.
+fn prove_absent_root_always_fresh(
+    base: &Path,
+    candidate: &AbsentRootCandidate,
+) -> std::result::Result<String, &'static str> {
+    let allocation = Uuid::parse_str(
+        candidate
+            .allocation_id
+            .as_deref()
+            .ok_or("allocation_id_missing")?,
+    )
+    .map_err(|_| "allocation_id_invalid")?;
+    let path = base.join(allocation.to_string());
+    if PathBuf::from(&candidate.sandbox_root) != path {
+        return Err("sandbox_path_mismatch");
+    }
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("directory_present"),
+        Err(_) => return Err("directory_probe_failed"),
+    }
+    prove_absent_root_fresh(
+        Path::new(&candidate.canonical_repo_dir),
+        &path,
+        &branch_ref(candidate),
+    )
+}
+
+/// Equivalence and timing against a copy of a real database (never the live
+/// file): `RSI_RECLAIM_BENCH_DB=/tmp/rsi-copy.db
+/// RSI_RECLAIM_BENCH_BASE=~/.rsi/sandboxes cargo test -p rsid --lib
+/// bench_absent_root_proof_against_db_copy -- --ignored --nocapture`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+#[ignore = "needs RSI_RECLAIM_BENCH_DB and RSI_RECLAIM_BENCH_BASE"]
+fn bench_absent_root_proof_against_db_copy() {
+    let db = std::env::var("RSI_RECLAIM_BENCH_DB").unwrap();
+    let base = std::env::var("RSI_RECLAIM_BENCH_BASE").unwrap();
+    let base = std::fs::canonicalize(base).unwrap();
+    let mut store = Store::open(Path::new(&db)).unwrap();
+    let candidates = store.absent_root_candidates(1024).unwrap();
+    let gated: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| store.absent_root_gate(c).unwrap().is_none())
+        .collect();
+
+    let started = std::time::Instant::now();
+    let fresh: Vec<_> = gated
+        .iter()
+        .map(|c| prove_absent_root_always_fresh(&base, c))
+        .collect();
+    let fresh_ms = started.elapsed().as_millis();
+
+    let started = std::time::Instant::now();
+    let mut evidence = RepoEvidenceCache::default();
+    let snapshot: Vec<_> = gated
+        .iter()
+        .map(|c| prove_absent_root(&base, c, &mut evidence))
+        .collect();
+    let snapshot_ms = started.elapsed().as_millis();
+
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for (old, new) in fresh.iter().zip(&snapshot) {
+        assert_eq!(old, new, "snapshot changed a proof outcome");
+        *reasons
+            .entry(match new {
+                Ok(_) => "adoptable".into(),
+                Err(code) => (*code).into(),
+            })
+            .or_default() += 1;
+    }
+
+    let started = std::time::Instant::now();
+    run_absent_root_adoption(&mut store, &base, "startup", true, 1024, None).unwrap();
+    let run_ms = started.elapsed().as_millis();
+    eprintln!(
+        "gated={} fresh_ms={fresh_ms} snapshot_ms={snapshot_ms} repos={} full_dry_run_ms={run_ms} reasons={reasons:?}",
+        gated.len(),
+        evidence.repos.len()
+    );
 }

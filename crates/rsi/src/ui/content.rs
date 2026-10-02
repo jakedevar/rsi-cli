@@ -377,62 +377,165 @@ pub fn render_markdown_line(
     Line::from(spans)
 }
 
+/// One whitespace-delimited word of a table cell. Every rendered character
+/// carries its own style, so wrapping happens on rendered text and can never
+/// split Markdown syntax such as `**bold phrase**`.
+type StyledWord = Vec<(char, Style)>;
+
+fn char_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn word_width(word: &StyledWord) -> usize {
+    word.iter().map(|(ch, _)| char_width(*ch)).sum()
+}
+
+/// Rendered width of words joined by single spaces.
+fn words_width(words: &[StyledWord]) -> usize {
+    words.iter().map(word_width).sum::<usize>() + words.len().saturating_sub(1)
+}
+
+/// Parse inline Markdown and split the rendered result into styled words.
+fn styled_words(text: &str) -> Vec<StyledWord> {
+    let mut words: Vec<StyledWord> = Vec::new();
+    let mut current: StyledWord = Vec::new();
+    for span in parse_inline_markdown(text) {
+        for ch in span.content.chars() {
+            if !ch.is_whitespace() {
+                current.push((ch, span.style));
+                continue;
+            }
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Split a single word wider than `width` into pieces. Plain alphanumeric
+/// words get a trailing hyphen on every piece but the last; paths, URLs and
+/// other punctuated tokens are broken bare so they stay copyable.
+fn split_overlong_word(word: &StyledWord, width: usize) -> Vec<StyledWord> {
+    if word_width(word) <= width {
+        return vec![word.clone()];
+    }
+    let hyphenate = width >= 3 && word.iter().all(|(ch, _)| ch.is_alphanumeric());
+    let limit = if hyphenate { width - 1 } else { width };
+    let mut pieces: Vec<StyledWord> = Vec::new();
+    let mut current: StyledWord = Vec::new();
+    let mut current_width = 0usize;
+    for &(ch, style) in word {
+        let ch_width = char_width(ch);
+        if !current.is_empty() && current_width + ch_width > limit {
+            let last_style = current[current.len() - 1].1;
+            if hyphenate {
+                current.push(('-', last_style));
+            }
+            pieces.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push((ch, style));
+        current_width += ch_width;
+    }
+    pieces.push(current);
+    pieces
+}
+
+fn styled_chars_to_spans(chars: &StyledWord) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut run_style: Option<Style> = None;
+    for &(ch, style) in chars {
+        if run_style.is_some_and(|run| run != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut text),
+                run_style.unwrap_or_default(),
+            ));
+        }
+        run_style = Some(style);
+        text.push(ch);
+    }
+    if let Some(style) = run_style {
+        spans.push(Span::styled(text, style));
+    }
+    spans
+}
+
+/// Wrap styled words to `width` columns. Lines break only at whitespace; a
+/// single word wider than the column is split (see `split_overlong_word`).
+/// Always returns at least one (possibly empty) line.
+fn wrap_styled_words(words: &[StyledWord], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut lines: Vec<StyledWord> = Vec::new();
+    let mut current: StyledWord = Vec::new();
+    let mut current_width = 0usize;
+
+    for word in words {
+        let pieces = split_overlong_word(word, width);
+        let split = pieces.len() > 1;
+        if split && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        let last_index = pieces.len() - 1;
+        for (index, piece) in pieces.into_iter().enumerate() {
+            let piece_width = word_width(&piece);
+            if index < last_index {
+                lines.push(piece);
+                continue;
+            }
+            let fits = current.is_empty() || current_width + 1 + piece_width <= width;
+            if !fits {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if let Some(&(_, previous)) = current.last() {
+                // A space between two identically styled words keeps that
+                // style so a bold or underlined phrase stays one span.
+                let same_style = piece.first().is_some_and(|(_, next)| *next == previous);
+                let space_style = if same_style {
+                    previous
+                } else {
+                    Style::default()
+                };
+                current.push((' ', space_style));
+                current_width += 1;
+            }
+            current_width += piece_width;
+            current.extend(piece);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines.iter().map(styled_chars_to_spans).collect()
+}
+
 /// Render a complete table block with aligned columns.
 ///
-/// Two-pass: first computes max column widths across all rows,
-/// then renders each row with cells padded to those widths.
-/// Separator rows render as horizontal box-drawing lines.
+/// Cells are parsed as inline Markdown once and wrapped on rendered words.
+/// Column widths start at each column's natural width; when the pane is too
+/// narrow the widest column shrinks first, never below its longest word
+/// (min-content) until every column is at min-content, and only then below it
+/// (down to `MIN_READABLE_TABLE_COLUMN_WIDTH`). Tables that still cannot fit
+/// render as stacked label/value records. Separator rows render as horizontal
+/// box-drawing lines.
 fn render_table_block(
     indent: &str,
     rows: &[(BlockElement, &str)],
     max_width: u16,
 ) -> Vec<Line<'static>> {
-    let TableLayout {
-        parsed_rows,
-        mut col_widths,
-    } = table_layout(rows);
+    let layout = table_layout(rows);
 
-    if table_needs_stacked_layout(indent, &col_widths, max_width) {
-        return render_stacked_table(indent, &parsed_rows, max_width);
+    if table_needs_stacked_layout(indent, &layout, max_width) {
+        return render_stacked_table(indent, &layout, max_width);
     }
 
-    // Constrain column widths to fit within max_width.
-    // Table structure: indent + │ + ( space + content + space + │ ) per column
-    // Overhead = indent_len + num_cols + 1 (borders) + num_cols * 2 (cell padding)
-    if !col_widths.is_empty() && max_width > 0 {
-        let num_cols = col_widths.len();
-        let overhead = indent.chars().count() + num_cols.saturating_mul(3) + 1;
-        let available = (max_width as usize).saturating_sub(overhead);
-        let total: usize = col_widths.iter().sum();
-
-        if total > available && available > 0 {
-            // The stacked-layout gate guarantees these readable minima fit.
-            // Spend remaining cells on the column with the largest unmet need;
-            // every increment stays within both the natural and total width.
-            let mut new_widths: Vec<usize> = col_widths
-                .iter()
-                .map(|width| (*width).min(MIN_READABLE_TABLE_COLUMN_WIDTH))
-                .collect();
-            let mut remaining = available.saturating_sub(new_widths.iter().sum());
-            while remaining > 0 {
-                let Some((index, _)) = col_widths
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, width)| new_widths[*index] < **width)
-                    .max_by_key(|(index, width)| **width - new_widths[*index])
-                else {
-                    break;
-                };
-                new_widths[index] += 1;
-                remaining -= 1;
-            }
-
-            col_widths = new_widths;
-        }
-    }
-
-    // Second pass: render rows. When cell content exceeds column width,
-    // word-wrap within the cell and emit multiple output lines for that row.
+    let col_widths = fit_column_widths(indent, &layout, max_width);
     let mut lines = Vec::new();
     let border_style = Style::default().fg(super::theme::md_table_border());
 
@@ -458,35 +561,19 @@ fn render_table_block(
             continue;
         }
 
-        let cells = &parsed_rows[row_idx];
+        let cells = &layout.cell_words[row_idx];
+        let wrapped_cells: Vec<Vec<Vec<Span<'static>>>> = col_widths
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                let words = cells.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                wrap_styled_words(words, w)
+            })
+            .collect();
+        let max_lines = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
 
-        // Word-wrap each cell's content to fit column width. Uses rendered width
-        // (excluding markdown delimiters like ** and `) for accurate wrapping.
-        let mut wrapped_cells: Vec<Vec<String>> = Vec::new();
-        let mut max_lines = 1usize;
-
-        for (i, &w) in col_widths.iter().enumerate() {
-            let cell_text = cells.get(i).copied().unwrap_or("");
-            let rendered_width: usize = parse_inline_markdown(cell_text)
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum();
-
-            if w == 0 || rendered_width <= w {
-                wrapped_cells.push(vec![cell_text.to_string()]);
-            } else {
-                // Wrap at word boundaries using rendered width.
-                // First flatten to plain text for wrapping decisions,
-                // then map break positions back to the raw markdown text.
-                let cell_lines = wrap_cell_text(cell_text, w);
-                if cell_lines.len() > max_lines {
-                    max_lines = cell_lines.len();
-                }
-                wrapped_cells.push(cell_lines);
-            }
-        }
-
-        // Emit one output Line per wrapped line, padding shorter cells with blanks.
+        // Emit one output Line per wrapped line, padding shorter cells with
+        // blanks so every line of a multi-line row keeps both borders.
         for line_idx in 0..max_lines {
             let mut spans: Vec<Span<'static>> = Vec::new();
             if !indent.is_empty() {
@@ -495,15 +582,12 @@ fn render_table_block(
             spans.push(Span::styled("│".to_string(), border_style));
 
             for (i, &w) in col_widths.iter().enumerate() {
-                let chunk = wrapped_cells
-                    .get(i)
-                    .and_then(|cell_lines| cell_lines.get(line_idx))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-
-                let cell_spans = parse_inline_markdown(chunk);
-                let actual_width: usize =
-                    cell_spans.iter().map(|s| s.content.chars().count()).sum();
+                let cell_spans = wrapped_cells[i].get(line_idx).cloned().unwrap_or_default();
+                let actual_width: usize = cell_spans
+                    .iter()
+                    .flat_map(|span| span.content.chars())
+                    .map(char_width)
+                    .sum();
                 let padding = w.saturating_sub(actual_width);
 
                 spans.push(Span::raw(" ".to_string()));
@@ -532,34 +616,74 @@ fn render_table_block(
 
 const MIN_READABLE_TABLE_COLUMN_WIDTH: usize = 8;
 
-fn table_needs_stacked_layout(indent: &str, col_widths: &[usize], max_width: u16) -> bool {
-    if col_widths.is_empty() || max_width == 0 {
+/// Per-column lower bound used when the pane is narrower than every
+/// min-content layout: long words may be split down to this width.
+fn readable_floor_widths(layout: &TableLayout) -> Vec<usize> {
+    layout
+        .min_widths
+        .iter()
+        .map(|width| (*width).min(MIN_READABLE_TABLE_COLUMN_WIDTH))
+        .collect()
+}
+
+fn table_needs_stacked_layout(indent: &str, layout: &TableLayout, max_width: u16) -> bool {
+    if layout.col_widths.is_empty() || max_width == 0 {
         return false;
     }
 
-    let natural_width = table_line_width(indent, col_widths);
-    let readable_content_width: usize = col_widths
-        .iter()
-        .map(|width| (*width).min(MIN_READABLE_TABLE_COLUMN_WIDTH))
-        .sum();
-    let readable_width =
-        indent.chars().count() + readable_content_width + col_widths.len().saturating_mul(3) + 1;
+    let natural_width = table_line_width(indent, &layout.col_widths);
+    let readable_width = table_line_width(indent, &readable_floor_widths(layout));
 
     natural_width > max_width as usize && readable_width > max_width as usize
+}
+
+/// Decrement the widest column that is still above its floor until the
+/// columns fit `available` cells (or every column is at its floor).
+fn shrink_widest_columns(widths: &mut [usize], floors: &[usize], available: usize) {
+    while widths.iter().sum::<usize>() > available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width > floors[*index])
+            .max_by_key(|(index, width)| (**width, *index))
+        else {
+            return;
+        };
+        widths[index] -= 1;
+    }
+}
+
+/// Choose column widths for the box layout.
+///
+/// Table structure: indent + │ + ( space + content + space + │ ) per column.
+fn fit_column_widths(indent: &str, layout: &TableLayout, max_width: u16) -> Vec<usize> {
+    let mut widths = layout.col_widths.clone();
+    if widths.is_empty() || max_width == 0 {
+        return widths;
+    }
+    let overhead = table_line_width(indent, &[]) + widths.len().saturating_mul(3);
+    let available = (max_width as usize).saturating_sub(overhead);
+    if widths.iter().sum::<usize>() <= available || available == 0 {
+        return widths;
+    }
+    shrink_widest_columns(&mut widths, &layout.min_widths, available);
+    shrink_widest_columns(&mut widths, &readable_floor_widths(layout), available);
+    widths
 }
 
 /// Render dense tables vertically when the pane cannot preserve readable
 /// columns. Header-only tables become a column list; data rows become labeled
 /// records. This avoids four-character columns and mid-word header fragments.
-fn render_stacked_table(
-    indent: &str,
-    parsed_rows: &[Vec<&str>],
-    max_width: u16,
-) -> Vec<Line<'static>> {
-    let Some(headers) = parsed_rows.first() else {
+fn render_stacked_table(indent: &str, layout: &TableLayout, max_width: u16) -> Vec<Line<'static>> {
+    let Some(headers) = layout.cell_words.first() else {
         return Vec::new();
     };
-    let body_rows: Vec<&Vec<&str>> = parsed_rows.iter().skip(2).collect();
+    let body_rows: Vec<&Vec<Vec<StyledWord>>> = layout
+        .cell_words
+        .iter()
+        .skip(2)
+        .filter(|row| !row.is_empty())
+        .collect();
     let content_width = (max_width as usize)
         .saturating_sub(indent.chars().count())
         .max(1);
@@ -571,11 +695,11 @@ fn render_stacked_table(
             Span::styled("Columns", Style::default().add_modifier(Modifier::BOLD)),
         ]));
         for header in headers {
-            let chunks = word_wrap(header, content_width.saturating_sub(2).max(1));
-            for (index, chunk) in chunks.iter().enumerate() {
+            let chunks = wrap_styled_words(header, content_width.saturating_sub(2).max(1));
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let prefix = if index == 0 { "• " } else { "  " };
                 let mut spans = vec![Span::raw(format!("{indent}{prefix}"))];
-                spans.extend(parse_inline_markdown(chunk));
+                spans.extend(chunk);
                 lines.push(Line::from(spans));
             }
         }
@@ -593,17 +717,20 @@ fn render_stacked_table(
             ]));
         }
         for column_index in 0..headers.len().max(row.len()) {
-            let fallback_header = format!("Column {}", column_index + 1);
-            let header = headers
+            let mut words: Vec<StyledWord> = headers
                 .get(column_index)
-                .copied()
                 .filter(|header| !header.is_empty())
-                .unwrap_or(&fallback_header);
-            let value = row.get(column_index).copied().unwrap_or("");
-            let text = format!("{header}: {value}");
-            for chunk in word_wrap(&text, content_width) {
+                .cloned()
+                .unwrap_or_else(|| styled_words(&format!("Column {}", column_index + 1)));
+            if let Some(last) = words.last_mut() {
+                last.push((':', Style::default()));
+            }
+            if let Some(value) = row.get(column_index) {
+                words.extend(value.iter().cloned());
+            }
+            for chunk in wrap_styled_words(&words, content_width) {
                 let mut spans = vec![Span::raw(indent.to_string())];
-                spans.extend(parse_inline_markdown(&chunk));
+                spans.extend(chunk);
                 lines.push(Line::from(spans));
             }
         }
@@ -615,43 +742,53 @@ fn render_stacked_table(
     lines
 }
 
-/// Parsed table rows and the natural width of each column.
-struct TableLayout<'a> {
-    parsed_rows: Vec<Vec<&'a str>>,
+/// Styled table cells and per-column widths.
+struct TableLayout {
+    /// Row → column → words of the rendered (inline-Markdown-parsed) cell.
+    /// Separator rows are empty placeholders.
+    cell_words: Vec<Vec<Vec<StyledWord>>>,
+    /// Natural (max-content) width of each column.
     col_widths: Vec<usize>,
+    /// Min-content width of each column: its longest single word.
+    min_widths: Vec<usize>,
 }
 
 /// Parse table cells and measure their rendered (not Markdown-source) widths.
 ///
 /// This is shared by rendering and layout selection so that a table never
 /// requests a width different from the one its renderer considers natural.
-fn table_layout<'a>(rows: &[(BlockElement, &'a str)]) -> TableLayout<'a> {
-    let mut parsed_rows: Vec<Vec<&str>> = Vec::new();
+fn table_layout(rows: &[(BlockElement, &str)]) -> TableLayout {
+    let mut cell_words: Vec<Vec<Vec<StyledWord>>> = Vec::new();
     let mut col_widths: Vec<usize> = Vec::new();
+    let mut min_widths: Vec<usize> = Vec::new();
 
     for (block, content) in rows {
         if *block == BlockElement::TableSeparator {
-            parsed_rows.push(Vec::new()); // placeholder
+            cell_words.push(Vec::new());
             continue;
         }
         let trimmed = pipe_cells(content);
+        let mut row_words: Vec<Vec<StyledWord>> = Vec::new();
         for (i, cell) in trimmed.iter().enumerate() {
-            let rendered_width: usize = parse_inline_markdown(cell)
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum();
+            let words = styled_words(cell);
+            let natural = words_width(&words);
+            let longest = words.iter().map(word_width).max().unwrap_or(0);
             if i >= col_widths.len() {
-                col_widths.push(rendered_width);
-            } else if rendered_width > col_widths[i] {
-                col_widths[i] = rendered_width;
+                col_widths.push(natural);
+                min_widths.push(longest);
+            } else {
+                col_widths[i] = col_widths[i].max(natural);
+                min_widths[i] = min_widths[i].max(longest);
             }
+            row_words.push(words);
         }
-        parsed_rows.push(trimmed);
+        cell_words.push(row_words);
     }
 
     TableLayout {
-        parsed_rows,
+        cell_words,
         col_widths,
+        min_widths,
     }
 }
 
@@ -762,86 +899,6 @@ fn table_border_line(
     }
     spans.push(Span::styled(right, border_style));
     Line::from(spans)
-}
-
-/// Word-wrap cell text for table rendering, breaking at word boundaries based
-/// on **rendered** width (excluding markdown delimiters like `**` and `` ` ``).
-///
-/// Standard `word_wrap` operates on raw text bytes, which overcounts width when
-/// markdown formatting is present. This function splits on spaces, measures each
-/// word's rendered width, and accumulates words per line until the column width
-/// is reached.
-fn wrap_cell_text(raw_text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![raw_text.to_string()];
-    }
-
-    let words: Vec<&str> = raw_text.split_whitespace().collect();
-    if words.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut result: Vec<String> = Vec::new();
-    let mut current_line = String::new();
-    let mut current_rendered_width = 0usize;
-
-    for word in &words {
-        let word_rendered_width: usize = parse_inline_markdown(word)
-            .iter()
-            .map(|s| s.content.chars().count())
-            .sum();
-
-        if current_line.is_empty() {
-            if word_rendered_width > max_width && max_width >= 1 {
-                // Word exceeds column width (e.g. a long file path with no spaces).
-                // Hard-break it at max_width chars so the table stays within bounds.
-                let mut remaining_word = *word;
-                while !remaining_word.is_empty() {
-                    let remaining_rendered: usize = parse_inline_markdown(remaining_word)
-                        .iter()
-                        .map(|s| s.content.chars().count())
-                        .sum();
-                    if remaining_rendered <= max_width {
-                        current_line.push_str(remaining_word);
-                        current_rendered_width = remaining_rendered;
-                        break;
-                    }
-                    // Slice at max_width chars (char_indices gives byte positions safely)
-                    let byte_end = remaining_word
-                        .char_indices()
-                        .nth(max_width)
-                        .map(|(i, _)| i)
-                        .unwrap_or(remaining_word.len());
-                    result.push(remaining_word[..byte_end].to_string());
-                    remaining_word = &remaining_word[byte_end..];
-                }
-            } else {
-                // First word fits — place it on the current line.
-                current_line.push_str(word);
-                current_rendered_width = word_rendered_width;
-            }
-        } else if current_rendered_width + 1 + word_rendered_width <= max_width {
-            // Fits with a space separator
-            current_line.push(' ');
-            current_line.push_str(word);
-            current_rendered_width += 1 + word_rendered_width;
-        } else {
-            // Doesn't fit — start a new line
-            result.push(current_line);
-            current_line = word.to_string();
-            current_rendered_width = word_rendered_width;
-        }
-    }
-
-    if !current_line.is_empty() {
-        result.push(current_line);
-    }
-
-    if result.is_empty() {
-        result.push(String::new());
-    }
-
-    result
 }
 
 /// Check if a docregblock content string is a question indicator (`?`).
@@ -1076,7 +1133,9 @@ pub fn parse_inline_markdown(line: &str) -> Vec<Span<'static>> {
         {
             flush_plain(&chars, plain_start, i, &mut spans);
             let content: String = chars[i + 1..end].iter().collect();
-            let style = if looks_like_filepath(&content) {
+            // A bare filename such as `launch.rs` has no directory part and is
+            // not a click target; only slash-bearing paths get link styling.
+            let style = if content.contains('/') && looks_like_filepath(&content) {
                 // File path inside backticks: sapphire + underline (clickable)
                 Style::default()
                     .fg(super::theme::file_path_fg())
@@ -1530,6 +1589,7 @@ pub(crate) fn build_event_lines_with_interaction_meta(
                 format!("\u{25B6} {tool}")
             }
             EventType::ToolResult => "\u{25B6} \u{2190} Result".to_string(),
+            EventType::CompletionGate => "✓ Completion gate".to_string(),
             _ => format!("#{}", event.sequence),
         };
         lines.push(Line::default()); // top padding row
@@ -1544,6 +1604,7 @@ pub(crate) fn build_event_lines_with_interaction_meta(
 
     let role_label = match event.role {
         Some(Role::Assistant) => ctx.model_name.as_deref().unwrap_or("Assistant"),
+        Some(Role::User) if event.is_operator_message() => "Operator",
         Some(Role::User) => "You",
         None => "",
         Some(_) => "",
@@ -1647,6 +1708,20 @@ pub(crate) fn build_event_lines_with_interaction_meta(
                 Style::default()
                     .fg(super::theme::fold_indicator())
                     .add_modifier(Modifier::ITALIC),
+            )));
+        }
+        EventType::Plan => {
+            lines.push(Line::from(Span::styled(
+                "\u{1F5D2} Plan",
+                Style::default()
+                    .fg(super::theme::fold_indicator())
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+        EventType::CompletionGate => {
+            lines.push(Line::from(Span::styled(
+                "✓ Completion gate",
+                Style::default().fg(super::theme::system_event()),
             )));
         }
         _ => {}
@@ -1776,7 +1851,9 @@ fn markdown_event_indent(event_type: EventType) -> &'static str {
         | EventType::ToolResult
         | EventType::System
         | EventType::Thinking
-        | EventType::Compressed => "  ",
+        | EventType::Compressed
+        | EventType::Plan
+        | EventType::CompletionGate => "  ",
         EventType::Message => "",
         _ => "",
     }
@@ -2297,6 +2374,43 @@ mod tests {
     }
 
     #[test]
+    fn completion_gate_events_render_gate_output() {
+        let event = ConversationEvent {
+            id: 0,
+            session_id: uuid::Uuid::new_v4(),
+            sequence: 1,
+            event_type: EventType::CompletionGate,
+            role: None,
+            content: "bench failed: exit 1".to_string(),
+            tool_name: Some("bench".to_string()),
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        };
+        let ctx = EventRenderContext {
+            is_collapsed: false,
+            is_expanded: false,
+            is_cursor: false,
+            is_last_event: false,
+            model_name: None,
+            pipeline_commands: Vec::new(),
+            max_width: 100,
+        };
+
+        let lines = build_event_lines(&event, &ctx);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("✓ Completion gate"));
+        assert!(rendered.contains("bench failed: exit 1"));
+    }
+
+    #[test]
     fn test_web_link_metadata_records_markdown_link_target() {
         let event = ConversationEvent {
             id: 0,
@@ -2363,6 +2477,48 @@ mod tests {
         assert_eq!(web_links.len(), 1);
         // Trailing comma must not be swallowed into the recorded target.
         assert_eq!(web_links[0].target, "https://example.com/docs/page.html");
+    }
+
+    #[test]
+    fn plan_events_render_in_session_detail() {
+        let event = ConversationEvent {
+            id: 0,
+            session_id: uuid::Uuid::new_v4(),
+            sequence: 1,
+            event_type: EventType::Plan,
+            role: None,
+            content: "Plan updated: Continue utility tools\n- [in_progress] Add compaction"
+                .to_string(),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        };
+        let ctx = EventRenderContext {
+            is_collapsed: false,
+            is_expanded: false,
+            is_cursor: false,
+            is_last_event: false,
+            model_name: None,
+            pipeline_commands: Vec::new(),
+            max_width: 100,
+        };
+
+        let (lines, _, file_links, web_links) =
+            build_event_lines_with_interaction_meta(&event, &ctx);
+
+        assert!(file_links.is_empty());
+        assert!(web_links.is_empty());
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| &*span.content)
+            .collect::<String>();
+        assert!(text.contains("Plan"));
+        assert!(text.contains("Plan updated: Continue utility tools"));
+        assert!(text.contains("Add compaction"));
     }
 
     #[test]
@@ -2716,7 +2872,7 @@ mod tests {
 
     #[test]
     fn test_word_wrap_preserves_markdown_links_with_spaced_labels() {
-        let input = "The [slice board](/home/jakedevar/rsi/thoughts/shared/orchestration/2026-07-02-pending-slices-board.md:267) and [ledger](/home/jakedevar/rsi/thoughts/shared/projects/local-issue-tracker/ledger.md:49)";
+        let input = "The [slice board](/home/user/rsi/thoughts/shared/orchestration/2026-07-02-pending-slices-board.md:267) and [ledger](/home/user/rsi/thoughts/shared/projects/local-issue-tracker/ledger.md:49)";
         let wrapped = word_wrap(input, 80);
 
         // The hidden file targets must not force each short label onto its
@@ -2982,6 +3138,219 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
+    }
+
+    /// Reconstruction of the 3-column table from the #1022 operator screenshot:
+    /// bold labels in the first column (blank on continuation rows), short
+    /// columns that used to be starved, a bare filename, a real URL and a
+    /// code span.
+    const ISSUE_1022_TABLE: &str = "\
+| Area | Status | Notes |
+|------|--------|-------|
+| **Active on the plan** | Reliability | Keep the lander gates green; launch.rs owns the spawn path and https://example.com/docs/lander stays clickable. |
+| | Hierarchy | Epics hold leads; `crates/rsid/src/store.rs` is the store. |
+| **Finishing, then stop** | Land-older | Older batches wait for the current landing to finish before the next one starts. |
+| | Satellites | Mirror the hub after every landing and report drift. |
+| | Recovery Hierarchy | Recovery restores the epic tree before any lead wakes. |
+| **Laptop** | Satellites | Second seat for the laptop satellite; nothing else runs here. |";
+
+    fn plain_table_lines(markdown: &str, indent: &str, max_width: u16) -> Vec<String> {
+        let rows: Vec<(BlockElement, &str)> = markdown.lines().map(detect_block_element).collect();
+        render_table_block(indent, &rows, max_width)
+            .into_iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    const ISSUE_1022_WIDE_200: &[&str] = &[
+        "┌──────────────────────┬────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐",
+        "│ Area                 │ Status             │ Notes                                                                                                           │",
+        "├──────────────────────┼────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤",
+        "│ Active on the plan   │ Reliability        │ Keep the lander gates green; launch.rs owns the spawn path and https://example.com/docs/lander stays clickable. │",
+        "│                      │ Hierarchy          │ Epics hold leads; crates/rsid/src/store.rs is the store.                                                        │",
+        "│ Finishing, then stop │ Land-older         │ Older batches wait for the current landing to finish before the next one starts.                                │",
+        "│                      │ Satellites         │ Mirror the hub after every landing and report drift.                                                            │",
+        "│                      │ Recovery Hierarchy │ Recovery restores the epic tree before any lead wakes.                                                          │",
+        "│ Laptop               │ Satellites         │ Second seat for the laptop satellite; nothing else runs here.                                                   │",
+        "└──────────────────────┴────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘",
+    ];
+
+    const ISSUE_1022_BOX_60: &[&str] = &[
+        "┌────────────┬─────────────┬───────────────────────────────┐",
+        "│ Area       │ Status      │ Notes                         │",
+        "├────────────┼─────────────┼───────────────────────────────┤",
+        "│ Active on  │ Reliability │ Keep the lander gates green;  │",
+        "│ the plan   │             │ launch.rs owns the spawn path │",
+        "│            │             │ and                           │",
+        "│            │             │ https://example.com/docs/land │",
+        "│            │             │ er stays clickable.           │",
+        "│            │ Hierarchy   │ Epics hold leads;             │",
+        "│            │             │ crates/rsid/src/store.rs is   │",
+        "│            │             │ the store.                    │",
+        "│ Finishing, │ Land-older  │ Older batches wait for the    │",
+        "│ then stop  │             │ current landing to finish     │",
+        "│            │             │ before the next one starts.   │",
+        "│            │ Satellites  │ Mirror the hub after every    │",
+        "│            │             │ landing and report drift.     │",
+        "│            │ Recovery    │ Recovery restores the epic    │",
+        "│            │ Hierarchy   │ tree before any lead wakes.   │",
+        "│ Laptop     │ Satellites  │ Second seat for the laptop    │",
+        "│            │             │ satellite; nothing else runs  │",
+        "│            │             │ here.                         │",
+        "└────────────┴─────────────┴───────────────────────────────┘",
+    ];
+
+    const ISSUE_1022_STACKED_30: &[&str] = &[
+        "Row 1",
+        "Area: Active on the plan",
+        "Status: Reliability",
+        "Notes: Keep the lander gates",
+        "green; launch.rs owns the",
+        "spawn path and",
+        "https://example.com/docs/lande",
+        "r stays clickable.",
+        "",
+        "Row 2",
+        "Area:",
+        "Status: Hierarchy",
+        "Notes: Epics hold leads;",
+        "crates/rsid/src/store.rs is",
+        "the store.",
+        "",
+        "Row 3",
+        "Area: Finishing, then stop",
+        "Status: Land-older",
+        "Notes: Older batches wait for",
+        "the current landing to finish",
+        "before the next one starts.",
+        "",
+        "Row 4",
+        "Area:",
+        "Status: Satellites",
+        "Notes: Mirror the hub after",
+        "every landing and report",
+        "drift.",
+        "",
+        "Row 5",
+        "Area:",
+        "Status: Recovery Hierarchy",
+        "Notes: Recovery restores the",
+        "epic tree before any lead",
+        "wakes.",
+        "",
+        "Row 6",
+        "Area: Laptop",
+        "Status: Satellites",
+        "Notes: Second seat for the",
+        "laptop satellite; nothing else",
+        "runs here.",
+    ];
+
+    #[test]
+    fn issue_1022_wide_pane_snapshot_renders_inline_markdown_and_keeps_words_whole() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let lines = plain_table_lines(ISSUE_1022_TABLE, "", 200);
+        assert_eq!(lines, ISSUE_1022_WIDE_200);
+        // (1) no literal Markdown delimiters survive in any cell.
+        assert!(lines.iter().all(|line| !line.contains("**")));
+        // (2) short columns are never starved into mid-word fragments.
+        for word in ["Reliability", "Hierarchy", "Land-older", "Satellites"] {
+            assert!(lines.iter().any(|line| line.contains(word)), "{word}");
+        }
+    }
+
+    #[test]
+    fn issue_1022_multiline_rows_keep_both_borders_and_one_box() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let lines = plain_table_lines(ISSUE_1022_TABLE, "", 60);
+        assert_eq!(lines, ISSUE_1022_BOX_60);
+        // (3) every line has identical display width and closes with a border.
+        let width = unicode_width::UnicodeWidthStr::width(lines[0].as_str());
+        for line in &lines {
+            assert_eq!(unicode_width::UnicodeWidthStr::width(line.as_str()), width);
+            assert!(
+                line.ends_with('│')
+                    || line.ends_with('┐')
+                    || line.ends_with('┤')
+                    || line.ends_with('┘')
+            );
+        }
+        // ... and the table is a single box: one top, one header rule, one bottom.
+        let count = |glyph: &str| lines.iter().filter(|line| line.starts_with(glyph)).count();
+        assert_eq!((count("┌"), count("├"), count("└")), (1, 1, 1));
+        // (1)/(2) bold labels wrap whole at whitespace, not as `**Active`.
+        assert!(lines.iter().all(|line| !line.contains('*')));
+        assert!(lines[3].starts_with("│ Active on  │"), "{:?}", lines[3]);
+    }
+
+    #[test]
+    fn issue_1022_narrow_pane_snapshot_uses_stacked_layout_with_inline_markdown() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let lines = plain_table_lines(ISSUE_1022_TABLE, "", 30);
+        assert_eq!(lines, ISSUE_1022_STACKED_30);
+        assert!(lines.iter().all(|line| !line.contains('*')));
+        assert!(lines.iter().all(|line| !line.contains('│')));
+    }
+
+    #[test]
+    fn issue_1022_cell_styles_bold_labels_and_only_scheme_urls_are_links() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let rows: Vec<(BlockElement, &str)> =
+            ISSUE_1022_TABLE.lines().map(detect_block_element).collect();
+        let path_fg = Some(crate::ui::theme::file_path_fg());
+        let span_for = |needle: &str| -> Vec<Span<'static>> {
+            render_table_block("", &rows, 200)
+                .into_iter()
+                .flat_map(|line| line.spans)
+                .filter(|span| span.content.contains(needle))
+                .collect()
+        };
+
+        // (1) `**Active on the plan**` renders as one bold, delimiter-free run.
+        let bold = span_for("Active on the plan");
+        assert_eq!(bold.len(), 1);
+        assert!(bold[0].style.add_modifier.contains(Modifier::BOLD));
+
+        // (4) a bare filename in a cell is plain text, not link-styled.
+        let filename = span_for("launch.rs");
+        assert!(!filename.is_empty());
+        for span in filename.iter() {
+            assert_ne!(span.style.fg, path_fg);
+            assert!(!span.style.add_modifier.contains(Modifier::UNDERLINED));
+        }
+
+        // A real https URL keeps link styling.
+        let url = span_for("https://example.com/docs/lander");
+        assert_eq!(url.len(), 1);
+        assert!(url[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn code_span_with_bare_filename_is_not_link_styled_but_slash_paths_are() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let spans = parse_inline_markdown("`launch.rs`");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(crate::ui::theme::md_inline_code_fg())
+        );
+        assert!(!spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let spans = parse_inline_markdown("`crates/rsi/src/launch.rs`");
+        assert_eq!(spans[0].style.fg, Some(crate::ui::theme::file_path_fg()));
+    }
+
+    #[test]
+    fn table_columns_get_min_content_before_the_widest_column_shrinks() {
+        let md = "| a | b | c |\n|---|---|---|\n| Reliability | Hierarchy | one two three four five six seven eight nine ten eleven twelve |";
+        let lines = plain_table_lines(md, "", 50);
+        let body: Vec<&String> = lines.iter().filter(|line| line.starts_with('│')).collect();
+        assert!(
+            body[1].starts_with("│ Reliability │ Hierarchy │"),
+            "{:?}",
+            body[1]
+        );
+        assert!(lines.iter().all(|line| !line.contains("Reliabil│")));
     }
 
     #[test]
@@ -3335,6 +3704,42 @@ mod tests {
         assert!(user_header.contains(&user_stamp));
         assert!(unlabeled_header.starts_with("#2"));
         assert!(unlabeled_header.contains(&unlabeled_stamp));
+    }
+
+    #[test]
+    fn a_boundary_delivered_operator_message_is_labelled_operator() {
+        let ctx = EventRenderContext {
+            is_collapsed: false,
+            is_expanded: false,
+            is_cursor: false,
+            is_last_event: false,
+            model_name: None,
+            pipeline_commands: Vec::new(),
+            max_width: 80,
+        };
+        let event = ConversationEvent {
+            id: 0,
+            session_id: uuid::Uuid::new_v4(),
+            sequence: 4,
+            event_type: EventType::Message,
+            role: Some(Role::User),
+            content: "check the schema".to_string(),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: Some(Box::new(serde_json::json!({
+                "source": rsi_common::types::OPERATOR_EVENT_SOURCE,
+            }))),
+        };
+        assert!(event.is_operator_message());
+        let header: String = build_event_lines(&event, &ctx)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(header.starts_with("#4  Operator"), "{header}");
     }
 
     #[test]

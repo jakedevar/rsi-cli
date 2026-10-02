@@ -15,6 +15,7 @@ use crate::store::cohort_settlement::{
     SourceWorktreeInventoryRow, SourceWorktreeSettlementJournalItem,
     quarantine_remove_authority_field_digest,
 };
+use crate::store::custody_lock_order::BlockingStoreLockExt;
 use rsi_common::cohort_settlement::{
     ApplySourceWorktreeCohortParams, SOURCE_WORKTREE_EMPTY_DEPENDENCY_DIGEST,
     SOURCE_WORKTREE_EMPTY_SESSION_PATH_DEPENDENCY_DIGEST, SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS,
@@ -218,7 +219,7 @@ impl SessionManager {
     pub async fn list_source_worktree_cohorts(&self) -> Result<Vec<SourceWorktreeCohortSummaryV1>> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
+            let store = store.blocking_lock_checked()?;
             let summaries = store.list_source_worktree_cohorts()?;
             summaries
                 .into_iter()
@@ -238,7 +239,7 @@ impl SessionManager {
         let identity = repository_identity.clone();
         let store = Arc::clone(&self.store);
         let start = tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
+            let store = store.blocking_lock_checked()?;
             let inventory = store.source_worktree_inventory(
                 &identity,
                 SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
@@ -274,7 +275,7 @@ impl SessionManager {
             let origin = PathBuf::from(&canonical_repo_dir);
             git_worktree::with_repository_mutation(&origin, || {
                 let (inventory, latest) = {
-                    let store = store.blocking_lock();
+                    let store = store.blocking_lock_checked()?;
                     let inventory = store.source_worktree_inventory(
                         &repository_identity,
                         SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
@@ -328,7 +329,7 @@ impl SessionManager {
     ) -> Result<Option<SourceWorktreeSettlementRunV1>> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
+            let store = store.blocking_lock_checked()?;
             store
                 .get_source_worktree_settlement_run(run_id)?
                 .map(|receipt| receipt.validate_wire().map_err(DaemonError::Store))
@@ -359,11 +360,9 @@ impl SessionManager {
             let key = params.idempotency_key.clone();
             let fingerprint = request_fingerprint.as_str().to_string();
             tokio::task::spawn_blocking(move || {
-                store.blocking_lock().replay_source_worktree_settlement_run(
-                    &identity,
-                    &key,
-                    &fingerprint,
-                )
+                store
+                    .blocking_lock_checked()?
+                    .replay_source_worktree_settlement_run(&identity, &key, &fingerprint)
             })
             .await
             .map_err(|error| DaemonError::Process(error.to_string()))??
@@ -490,7 +489,7 @@ impl SessionManager {
                 let store = Arc::clone(&self.store);
                 tokio::task::spawn_blocking(move || {
                     store
-                        .blocking_lock()
+                        .blocking_lock_checked()?
                         .list_nonterminal_source_worktree_settlement_run_ids(after_run_id, 64)
                 })
                 .await
@@ -504,7 +503,7 @@ impl SessionManager {
                 let (receipt, journal) = {
                     let store = Arc::clone(&self.store);
                     tokio::task::spawn_blocking(move || {
-                        let store = store.blocking_lock();
+                        let store = store.blocking_lock_checked()?;
                         let receipt = store
                             .get_source_worktree_settlement_run(run_id)?
                             .ok_or_else(|| {
@@ -580,7 +579,7 @@ impl SessionManager {
                             return Err(error);
                         }
                     }
-                    let store = store.blocking_lock();
+                    let store = store.blocking_lock_checked()?;
                     if store.source_worktree_settlement_run_has_nonterminal_items(run_id)? {
                         return Err(DaemonError::Store(format!(
                             "settlement recovery made no terminal progress for run {run_id}"
@@ -707,7 +706,7 @@ impl SessionManager {
         let identity = repository_identity.to_string();
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
+            let store = store.blocking_lock_checked()?;
             store.source_worktree_inventory(
                 &identity,
                 SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
@@ -770,7 +769,7 @@ fn apply_locked_with_orphan_proof(
             let active_ids = active_guard.keys().copied().collect::<HashSet<_>>();
             let active_cwds = collect_runtime_path_inputs(&active_guard);
             drop(active_guard);
-            let inventory = store.blocking_lock().source_worktree_inventory(
+            let inventory = store.blocking_lock_checked()?.source_worktree_inventory(
                 repository_identity,
                 SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
             )?;
@@ -854,7 +853,7 @@ fn apply_locked_with_orphan_proof(
                     .collect(),
             };
             let outcome = store
-                .blocking_lock()
+                .blocking_lock_checked()?
                 .insert_source_worktree_settlement_run(&new_run)?;
             match outcome {
                 InsertSettlementRunOutcome::Inserted => {
@@ -891,7 +890,7 @@ fn apply_locked_with_orphan_proof(
     };
 
     let journal = store
-        .blocking_lock()
+        .blocking_lock_checked()?
         .list_source_worktree_settlement_journal_items(run_id)?;
     if reap_orphans_after_intent {
         let candidate_ids = journal
@@ -939,6 +938,14 @@ fn apply_locked_with_orphan_proof(
             Ok(true) => settled_ids.push(item.session_id),
             Ok(false) => stopped = true,
             Err(error) => {
+                // A bounded Store/stripe surrender is a transient wait, not a
+                // saga outcome: propagate it before any stop handling so this
+                // item and every later one stay replayable (never marked
+                // unattempted or recovery-required) and the caller sees the
+                // typed retry.
+                if crate::store::custody_lock_order::is_lock_order_busy_error(&error) {
+                    return Err(error);
+                }
                 tracing::warn!(
                     run_id = %run_id,
                     session_id = %item.session_id,
@@ -952,7 +959,7 @@ fn apply_locked_with_orphan_proof(
     settled_ids.sort_unstable();
     settled_ids.dedup();
     let receipt = store
-        .blocking_lock()
+        .blocking_lock_checked()?
         .get_source_worktree_settlement_run(run_id)?
         .ok_or_else(|| DaemonError::Store("settlement receipt disappeared".into()))?;
     Ok(ApplyOutcome {
@@ -973,7 +980,10 @@ fn settle_one_item_locked(
     item: &SourceWorktreeSettlementJournalItem,
     replaying: bool,
 ) -> Result<bool> {
-    let _root_guard = crate::store::sandbox_custody::lock_custody_root(item.custody_id);
+    let _root_guard =
+        crate::store::custody_lock_order::lock_custody_root_under_repository(item.custody_id)?;
+    #[cfg(test)]
+    pause_settlement_proof_if_requested(item.session_id);
     let original_root = Path::new(&item.sandbox_root);
     let quarantine_root = match git_worktree::derive_settlement_quarantine_path(
         original_root,
@@ -2315,6 +2325,38 @@ thread_local! {
     };
 }
 
+/// Test seam: pause one session's settlement item while it holds the
+/// repository mutex and its custody stripe (Issue #606).
+#[cfg(test)]
+struct SettlementProofPause {
+    session_id: Uuid,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SETTLEMENT_PROOF_PAUSE: std::sync::Mutex<Option<SettlementProofPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_settlement_proof_if_requested(session_id: Uuid) {
+    let pause = {
+        let mut slot = SETTLEMENT_PROOF_PAUSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(pause) if pause.session_id == session_id => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause
+            .release
+            .recv_timeout(std::time::Duration::from_secs(60));
+    }
+}
+
 #[cfg(test)]
 fn set_before_dangling_remove_test_hook(hook: impl FnOnce() + 'static) {
     SETTLEMENT_BEFORE_DANGLING_REMOVE_TEST_HOOK.with(|slot| {
@@ -2751,7 +2793,7 @@ fn mark_item_stopped_blocking(
     observation: &str,
     replaying: bool,
 ) -> Result<()> {
-    let store = store.blocking_lock();
+    let store = store.blocking_lock_checked()?;
     if item.phase == SourceWorktreeSettlementPhaseV1::IntentCommitted && !replaying {
         store.mark_source_worktree_settlement_refused(
             run_id,
@@ -2778,7 +2820,7 @@ fn mark_source_restore_failure_blocking(
     observation: &'static str,
 ) -> Result<()> {
     store
-        .blocking_lock()
+        .blocking_lock_checked()?
         .mark_source_worktree_settlement_recovery_required(
             run_id,
             item.session_id,
@@ -2794,7 +2836,8 @@ fn mark_unattempted_under_root(
     item: &SourceWorktreeSettlementJournalItem,
     replaying: bool,
 ) -> Result<()> {
-    let _root_guard = crate::store::sandbox_custody::lock_custody_root(item.custody_id);
+    let _root_guard =
+        crate::store::custody_lock_order::lock_custody_root_under_repository(item.custody_id)?;
     let store = store.try_lock().map_err(|_| {
         DaemonError::Store("Store was contended while closing a later settlement intent".into())
     })?;
@@ -3810,6 +3853,89 @@ mod tests {
                     participant_count: eligible.inventory.participant_count,
                 }],
             }
+        }
+
+        /// A second Live custody-backed root of the same repository, integrated
+        /// like the first, so one settlement run carries two items.
+        fn add_second_root(&mut self, label: &str) {
+            let session_id = Uuid::new_v4();
+            let custody_id = Uuid::new_v4();
+            let branch = format!("rsi/{label}/{session_id}");
+            let allocation = git_worktree::allocate(
+                &self.sandbox_base,
+                session_id,
+                &self.repository,
+                &self.source_oid,
+                Some(&branch),
+            )
+            .expect("allocate second candidate worktree");
+            let mut session = crate::store::tests::make_test_session();
+            session.id = session_id;
+            session.status = SessionStatus::Completed;
+            session.working_dir = self.target.canonical_repo_dir.clone();
+            session.sandbox_kind = Some(SandboxKind::GitWorktree);
+            session.sandbox_root = Some(allocation.root.clone());
+            session.sandbox_branch = Some(branch.clone());
+            session.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+            self.store
+                .insert_session_with_custody(
+                    &session,
+                    SessionCustodyBinding::New(NewCustodyRoot {
+                        custody_id,
+                        canonical_repo_dir: self
+                            .target
+                            .canonical_repo_dir
+                            .to_string_lossy()
+                            .into_owned(),
+                        sandbox_root: allocation.root.to_string_lossy().into_owned(),
+                        sandbox_branch: branch,
+                        repository_identity: self.target.repository_identity.clone(),
+                        source_commit: self.source_oid.clone(),
+                        cause: CustodyCause::FreshLaunch,
+                    }),
+                )
+                .expect("seed second custody-backed terminal Session");
+        }
+
+        /// Commit one run whose items are every eligible root in the audit.
+        fn commit_intent_for_all_eligible(&mut self, key: &str) -> NewSettlementRun {
+            let audit = self.audit();
+            let mut run = self.run_from_audit(&audit, key);
+            run.items = audit
+                .eligible
+                .iter()
+                .map(|eligible| NewSettlementItem {
+                    session_id: eligible.inventory.session_id.expect("eligible session"),
+                    custody_id: eligible.inventory.custody_id,
+                    original_status: eligible.inventory.status.clone().expect("status"),
+                    original_updated_at: eligible
+                        .inventory
+                        .session_updated_at
+                        .clone()
+                        .expect("updated_at"),
+                    custody_generation: eligible.inventory.generation,
+                    canonical_repo_dir: eligible.inventory.canonical_repo_dir.clone(),
+                    sandbox_root: eligible.inventory.sandbox_root.clone(),
+                    sandbox_branch: eligible.inventory.sandbox_branch.clone(),
+                    repository_identity: eligible.inventory.repository_identity.clone(),
+                    source_ref: eligible.source_ref.clone(),
+                    source_oid: eligible.source_oid.clone(),
+                    target_oid: run.items[0].target_oid.clone(),
+                    evidence_digest: eligible.evidence_digest.clone(),
+                    clean_state_digest: eligible.clean_state_digest.clone(),
+                    reserved_effects: eligible.inventory.reserved_effects,
+                    active_effects: eligible.inventory.active_effects,
+                    participant_count: eligible.inventory.participant_count,
+                })
+                .collect();
+            assert!(run.items.len() >= 2, "fixture carries multiple items");
+            assert!(matches!(
+                self.store
+                    .insert_source_worktree_settlement_run(&run)
+                    .expect("commit multi-item settlement intent"),
+                InsertSettlementRunOutcome::Inserted
+            ));
+            run
         }
 
         fn commit_intent(&mut self, key: &str) -> NewSettlementRun {
@@ -7415,6 +7541,208 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// Issue #606 review: a bounded stripe timeout on the first of several
+    /// items propagates as the typed retry. No item is stopped, unattempted or
+    /// recovery-required; a replay after the stripe frees settles all of them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn stripe_timeout_on_first_item_leaves_every_item_replayable() {
+        let mut fixture = IntegratedFixture::new("stripe-timeout-first-item");
+        fixture.add_second_root("stripe-timeout-second-item");
+        let run = fixture.commit_intent_for_all_eligible("fixture:stripe-timeout-multi");
+        let item_count = run.items.len();
+        let receipt = fixture
+            .store
+            .get_source_worktree_settlement_run(run.run_id)
+            .expect("read fixture receipt")
+            .expect("fixture receipt");
+        let first_custody = fixture
+            .store
+            .list_source_worktree_settlement_journal_items(run.run_id)
+            .expect("journal")
+            .first()
+            .expect("first journal item")
+            .custody_id;
+        let idempotency_key = receipt.idempotency_key.clone();
+        let plan_digest = receipt.plan_digest.as_str().to_string();
+        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            &mut fixture.store,
+            crate::store::Store::open_in_memory().expect("replacement fixture Store"),
+        )));
+        let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let replay = |start: ApplyStart| {
+            fixture.with_quarantine_holder_test_proc(|| {
+                git_worktree::with_repository_mutation(&fixture.repository, || {
+                    apply_locked(
+                        start,
+                        &fixture.target.repository_identity,
+                        &idempotency_key,
+                        &plan_digest,
+                        "",
+                        "",
+                        &fixture.sandbox_base,
+                        &store,
+                        &active,
+                        &completed,
+                    )
+                })
+            })
+        };
+
+        crate::store::custody_lock_order::set_bounded_wait_for_test(Some(
+            std::time::Duration::from_millis(60),
+        ));
+        let contended = crate::store::sandbox_custody::lock_custody_root(first_custody);
+        // The first item's stripe is held elsewhere; `lock_custody_root` on this
+        // same thread is non-reentrant, so the bounded acquisition surrenders.
+        let error = replay(ApplyStart::Replay(receipt.clone()))
+            .err()
+            .expect("contended first stripe surrenders");
+        assert!(
+            crate::store::custody_lock_order::is_lock_order_busy_error(&error),
+            "{error}"
+        );
+        drop(contended);
+        crate::store::custody_lock_order::set_bounded_wait_for_test(None);
+
+        let pending = store
+            .blocking_lock()
+            .list_source_worktree_settlement_journal_items(run.run_id)
+            .expect("journal after timeout");
+        assert_eq!(pending.len(), item_count);
+        assert!(
+            pending
+                .iter()
+                .all(|item| item.phase == SourceWorktreeSettlementPhaseV1::IntentCommitted),
+            "every item stays replayable: {:?}",
+            pending
+                .iter()
+                .map(|item| item.phase.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let outcome = replay(ApplyStart::Replay(receipt)).expect("replay after the stripe frees");
+        assert_eq!(outcome.receipt.counts.settled, item_count as u32);
+        assert!(
+            outcome
+                .receipt
+                .items
+                .iter()
+                .all(|item| item.phase == SourceWorktreeSettlementPhaseV1::Settled)
+        );
+    }
+
+    /// Issue #606: a settlement item paused while holding the repository mutex
+    /// and its custody stripe must not pin the Store for a contended admission
+    /// on the same stripe, and must finish once released.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn paused_settlement_proof_neither_pins_store_nor_deadlocks_contended_admission() {
+        let mut fixture = IntegratedFixture::new("pause-settlement-proof");
+        let run = fixture.commit_intent("fixture:pause-settlement-proof");
+        let receipt = fixture
+            .store
+            .get_source_worktree_settlement_run(run.run_id)
+            .expect("read fixture receipt")
+            .expect("fixture receipt");
+        let idempotency_key = receipt.idempotency_key.clone();
+        let plan_digest = receipt.plan_digest.as_str().to_string();
+        let custody_id = fixture.custody_id;
+        let session_id = fixture.session_id;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            &mut fixture.store,
+            crate::store::Store::open_in_memory().expect("replacement fixture Store"),
+        )));
+        let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *SETTLEMENT_PROOF_PAUSE.lock().unwrap() = Some(SettlementProofPause {
+            session_id,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let repository = fixture.repository.clone();
+        let repository_identity = fixture.target.repository_identity.clone();
+        let sandbox_base = fixture.sandbox_base.clone();
+        let holder_root = fixture.quarantine_holder_proc.proc_root().to_path_buf();
+        let holder_uid = fixture.quarantine_holder_proc.uid();
+        std::thread::scope(|scope| {
+            let settle = scope.spawn(|| {
+                crate::session::reaper::with_quarantine_holder_test_proc(
+                    &holder_root,
+                    holder_uid,
+                    || {
+                        git_worktree::with_repository_mutation(&repository, || {
+                            apply_locked(
+                                ApplyStart::Replay(receipt),
+                                &repository_identity,
+                                &idempotency_key,
+                                &plan_digest,
+                                "",
+                                "",
+                                &sandbox_base,
+                                &store,
+                                &active,
+                                &completed,
+                            )
+                        })
+                    },
+                )
+            });
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("settlement paused holding the repository and stripe");
+
+            let contended =
+                crate::store::custody_lock_order::admission_contention_signal(custody_id);
+            let admission_store = Arc::clone(&store);
+            let mut admission = runtime.spawn(async move {
+                let (_store, _root) = crate::store::custody_lock_order::lock_store_then_root(
+                    &admission_store,
+                    custody_id,
+                )
+                .await;
+            });
+            contended
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("admission reached the busy stripe");
+            assert!(
+                !admission.is_finished(),
+                "admission waits for the stripe the paused settlement holds"
+            );
+            runtime.block_on(async {
+                for _ in 0..5 {
+                    let store = Arc::clone(&store);
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                        store.lock().await.get_session(Uuid::new_v4())
+                    })
+                    .await
+                    .expect("an unrelated Store RPC is not pinned by the queued admission")
+                    .expect("unrelated query");
+                }
+            });
+
+            release_tx.send(()).expect("release the proof");
+            settle
+                .join()
+                .expect("settlement thread")
+                .expect("settlement settles after the proof resumes");
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(60), admission).await
+                })
+                .expect("admission settles after the stripe frees")
+                .expect("admission task");
+        });
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]

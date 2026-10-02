@@ -1,13 +1,7 @@
 //! Integration test for the variant-missing-falls-back-to-base path.
 //!
-//! Because `preamble::harness_root()` uses `OnceLock`, the first call in
-//! this test binary's process locks in whichever path discovery resolves.
-//! We set `RSI_HARNESS_ROOT` BEFORE any test runs (via `ctor` is overkill;
-//! we just set it at the top of the test function and rely on the fact
-//! that no other test in this binary calls preamble::* first).
-//!
-//! Each integration test file in cargo is its own binary, so this binary's
-//! `OnceLock` is independent of `preamble_variant.rs`'s OnceLock.
+//! The project part is read from the session's own tree, so the test points
+//! the loader at a temp project that ships only the base file.
 
 use rsi_common::types::SessionKind;
 use rsid::session::preamble;
@@ -24,28 +18,19 @@ fn variant_missing_falls_back_to_base() {
     let base_content = "BASE PREAMBLE FOR FALLBACK TEST";
     std::fs::write(&base_path, base_content).expect("write base file");
 
-    // Point harness_root() at our tempdir BEFORE any preamble::* call.
-    // Safe: this is the only test in this binary that touches preamble,
-    // and it's the first call so the OnceLock initializer reads our env.
-    // SAFETY: tests in this binary run serially by virtue of being the
-    // only test that touches `preamble`; setting an env var in a single
-    // test is the conventional pattern even though `set_var` is unsafe.
-    unsafe {
-        std::env::set_var("RSI_HARNESS_ROOT", tmp.path());
-    }
-
     // `load()` appends the binary-embedded agent-discovery nudge to the
     // disk-resolved preamble, so the returned content starts with the selected
     // disk file and carries the nudge tail. The fallback assertion is therefore
     // "starts with base + contains nudge".
-    let nudge = preamble::AGENT_DISCOVERY_NUDGE;
+    let nudge = preamble::agent_discovery_nudge();
 
-    // Bug has a variant file in the real repo, but our tempdir does NOT
+    // Bug has a variant file in the rsi repo, but the temp project does NOT
     // — so loading should fall back to the base content we just wrote.
-    let content = preamble::load(SessionKind::Bug).expect("base fallback should yield content");
+    let content =
+        preamble::load(SessionKind::Bug, tmp.path()).expect("base fallback should yield content");
     assert!(
         content.starts_with(base_content),
-        "Bug variant missing should fall back to base content from RSI_HARNESS_ROOT"
+        "Bug variant missing should fall back to base content from the session project"
     );
     assert!(
         content.contains(nudge),
@@ -58,8 +43,8 @@ fn variant_missing_falls_back_to_base() {
         SessionKind::Refactor,
         SessionKind::Research,
     ] {
-        let content =
-            preamble::load(kind).expect("base fallback should yield content for all kinds");
+        let content = preamble::load(kind, tmp.path())
+            .expect("base fallback should yield content for all kinds");
         assert!(
             content.starts_with(base_content),
             "{:?} variant missing should fall back to base",
@@ -72,7 +57,8 @@ fn variant_missing_falls_back_to_base() {
     }
 
     // Standard has no variant file by design — also returns base (+ nudge).
-    let std_content = preamble::load(SessionKind::Standard).expect("base preamble for Standard");
+    let std_content =
+        preamble::load(SessionKind::Standard, tmp.path()).expect("base preamble for Standard");
     assert!(std_content.starts_with(base_content));
     assert!(std_content.contains(nudge));
 }

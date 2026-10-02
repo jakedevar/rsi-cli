@@ -161,6 +161,22 @@ impl JsonRpcId {
         }
     }
 
+    /// Classify a raw wire `id` for live routing and replies (not persistence).
+    ///
+    /// Unlike [`Self::from_json`] this keeps numeric `0` legal: JSON-RPC allows
+    /// it and a provider's own request counter may start there, so a live
+    /// frame must not be dropped or re-spelled because of its value. Only an
+    /// absent, null, float, boolean, container, out-of-range, or oversized id
+    /// yields `None`; nothing is ever aliased to a stand-in value.
+    #[must_use]
+    pub(crate) fn from_wire(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(number) => number.as_i64().map(Self::Number),
+            Value::String(text) => Self::string(text.clone()).ok(),
+            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+        }
+    }
+
     /// The exact reversible persistence form.
     ///
     /// This is the ONLY producer of values stored in a V81 `*_request_id`

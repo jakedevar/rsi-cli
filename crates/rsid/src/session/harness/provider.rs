@@ -14,6 +14,96 @@ use tokio_util::sync::CancellationToken;
 
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
+/// Explicit route facts for provider-hosted web tools.
+///
+/// Unknown routes have no capability by default. Model compatibility is still
+/// determined by the provider; this struct only records an explicit route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebCapabilities {
+    pub api_surface: &'static str,
+    pub endpoint: String,
+    pub model: String,
+    pub tools: Vec<HostedWebTool>,
+    pub filter_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedWebTool {
+    pub name: &'static str,
+    pub wire_type: String,
+}
+
+impl WebCapabilities {
+    pub fn none() -> Self {
+        Self {
+            api_surface: "none",
+            endpoint: String::new(),
+            model: String::new(),
+            tools: Vec::new(),
+            filter_supported: false,
+        }
+    }
+
+    pub fn anthropic_messages(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            api_surface: "anthropic_messages",
+            endpoint: endpoint.into(),
+            model: model.into(),
+            tools: vec![
+                HostedWebTool {
+                    name: "web_search",
+                    wire_type: "web_search_20250305".to_string(),
+                },
+                HostedWebTool {
+                    name: "web_fetch",
+                    wire_type: "web_fetch_20250910".to_string(),
+                },
+            ],
+            filter_supported: true,
+        }
+    }
+
+    pub fn openai_responses(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            api_surface: "openai_responses",
+            endpoint: endpoint.into(),
+            model: model.into(),
+            tools: vec![HostedWebTool {
+                name: "web_search",
+                wire_type: "web_search".to_string(),
+            }],
+            filter_supported: true,
+        }
+    }
+
+    pub fn specs(&self) -> Vec<HarnessToolSpec> {
+        self.tools
+            .iter()
+            .map(|tool| HarnessToolSpec {
+                name: tool.name.to_string(),
+                description: format!(
+                    "Provider-hosted {name} on {surface}",
+                    name = tool.name,
+                    surface = self.api_surface
+                ),
+                parameters_json: "{}".to_string(),
+                freeform: None,
+                kind: match (self.api_surface, tool.name) {
+                    ("anthropic_messages", "web_search") => {
+                        HarnessToolSpecKind::AnthropicWebSearch {
+                            wire_type: tool.wire_type.clone(),
+                        }
+                    }
+                    ("anthropic_messages", "web_fetch") => HarnessToolSpecKind::AnthropicWebFetch {
+                        wire_type: tool.wire_type.clone(),
+                    },
+                    _ => HarnessToolSpecKind::ResponsesWebSearch,
+                },
+            })
+            .collect()
+    }
+}
+
 /// Trait for making direct API calls to LLM providers.
 ///
 /// Separate from `ProviderSession` (which is the monitor-loop interface).
@@ -42,6 +132,16 @@ pub(crate) trait ApiProvider: Send + Sync {
 
     /// Whether this provider supports native tool calling (structured JSON tool_calls).
     fn supports_native_tools(&self) -> bool;
+
+    /// Whether the resolved model accepts image inputs on this provider route.
+    fn supports_image_input(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Explicit hosted-web route data. Defaults to no hosted tools.
+    fn web_capabilities(&self, _model: &str) -> WebCapabilities {
+        WebCapabilities::none()
+    }
 
     /// Provider name for logging and display.
     fn name(&self) -> &str;
@@ -96,6 +196,23 @@ pub(crate) fn resolve_provider(
         )?));
     }
 
+    match crate::bedrock::bedrock_vendor(model) {
+        Some(crate::bedrock::BedrockVendor::Anthropic) => {
+            let region = crate::bedrock::region().map_err(DaemonError::Process)?;
+            return Ok(Box::new(AnthropicProvider::bedrock(
+                region,
+                bedrock_credential()?,
+            )?));
+        }
+        // Same Responses backend the Bedrock provider's Harness route uses.
+        Some(crate::bedrock::BedrockVendor::OpenAi) => {
+            return Ok(Box::new(
+                super::providers::openai_responses::OpenAiResponsesProvider::bedrock()?,
+            ));
+        }
+        None => {}
+    }
+
     if model.starts_with("claude-") {
         return Ok(Box::new(AnthropicProvider::new(api_key)?));
     }
@@ -124,6 +241,22 @@ pub(crate) fn resolve_provider(
     Err(DaemonError::InvalidParam(format!(
         "unknown OpenAI-compatible route for model '{model}'; explicit base_url required"
     )))
+}
+
+/// The Harness Bedrock credential. A vault or env-compat key resolves per
+/// request so a rotation reaches the live session; a generator token is minted
+/// once per launch (the generator is a subprocess, too slow per request).
+fn bedrock_credential() -> Result<super::api_key::ApiCredential> {
+    use super::api_key::ApiCredential;
+    let resolved =
+        crate::bedrock::credential_from(&crate::vault::global()).map_err(DaemonError::Process)?;
+    Ok(
+        if resolved.source == crate::vault::CredentialSource::Generator {
+            ApiCredential::Fixed(resolved.secret)
+        } else {
+            ApiCredential::for_slot_only(crate::vault::Slot::Bedrock)
+        },
+    )
 }
 
 #[cfg(test)]

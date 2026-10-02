@@ -267,10 +267,12 @@ impl Store {
                 break;
             }
             for (id, session, invocation) in &page {
-                let tx = self.conn.unchecked_transaction()?;
+                let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
                 let at = now();
                 let changed = tx.execute(
-                    "UPDATE sessions SET status='Interrupted',updated_at=?1
+                    "UPDATE sessions SET status='Interrupted',
+                     stop_reason=COALESCE(NULLIF(TRIM(stop_reason),''),'interrupted:daemon_restart'),
+                     updated_at=?1
                      WHERE id=?2 AND model_invocation_id=?3
                        AND (status IN ('Starting','Running') OR (status='WaitingApproval' AND pending_question_json IS NULL))
                        AND EXISTS(SELECT 1 FROM model_invocations WHERE id=?3 AND session_id=?2
@@ -406,7 +408,7 @@ impl Store {
         boot_id: Uuid,
         review_owned: bool,
     ) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let at = now();
         let reason: Option<String> = tx.query_row(
             "SELECT CASE
@@ -582,9 +584,12 @@ mod tests {
                 .expect("prepare"),
             1
         );
+        let interrupted = store.get_session(session).unwrap().unwrap();
+        assert_eq!(interrupted.status, SessionStatus::Interrupted);
         assert_eq!(
-            store.get_session(session).unwrap().unwrap().status,
-            SessionStatus::Interrupted
+            interrupted.stop_reason.as_deref(),
+            Some("interrupted:daemon_restart"),
+            "#588: the restart reconciliation records why the turn was interrupted"
         );
         store.conn.execute(
             "UPDATE model_invocations SET status='failed',error_class='restart_reconciled_interrupted' WHERE id=?1",

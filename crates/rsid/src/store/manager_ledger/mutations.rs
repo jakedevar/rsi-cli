@@ -267,8 +267,11 @@ impl Store {
         a: &ManagerAuthorityV2,
         id: Uuid,
     ) -> Result<Uuid> {
-        let raw:Option<String>=self.conn.query_row(&format!("SELECT epic_id FROM harness_manager_messages WHERE id=?1 AND {} AND project_id=?2 AND manager_session_id=?3 AND scope_version=?4", super::super::harness_manager::MANAGER_REQUEST_ROW),
-            params![id.to_string(),a.config.project_id.to_string(),a.config.manager_session_id.to_string(),a.config.row_version],|r|r.get(0)).optional()?;
+        let (mail_config, node) = self.manager_mail_route_for_config(&a.config)?;
+        let raw:Option<String>=self.conn.query_row(&format!("SELECT epic_id FROM harness_manager_messages m WHERE id=?1 AND {} AND project_id=?2 AND manager_session_id=?3 AND scope_version=?4
+            AND ((?5 IS NULL AND NOT EXISTS (SELECT 1 FROM harness_manager_v2_events e WHERE e.project_id=m.project_id AND e.manager_session_id=m.manager_session_id AND e.scope_version=m.scope_version AND e.kind='node_mail_address' AND e.record_key=m.id))
+              OR (?5 IS NOT NULL AND EXISTS (SELECT 1 FROM harness_manager_v2_events e WHERE e.project_id=m.project_id AND e.manager_session_id=m.manager_session_id AND e.scope_version=m.scope_version AND e.kind='node_mail_address' AND e.record_key=m.id AND json_extract(e.payload_json,'$.node_id')=?5)))", super::super::harness_manager::MANAGER_REQUEST_ROW),
+            params![id.to_string(),mail_config.project_id.to_string(),mail_config.manager_session_id.to_string(),mail_config.row_version,node.map(|id|id.to_string())],|r|r.get(0)).optional()?;
         let epic = raw.ok_or_else(|| refused("manager_v2_request_out_of_scope"))?;
         let epic =
             Uuid::parse_str(&epic).map_err(|_| refused("manager_v2_invalid_stored_identity"))?;
@@ -282,7 +285,7 @@ impl Store {
         // The immutable recipient is an audit identity. Inheritance requires
         // exactly the live, receipt-backed sender AND recipient checks used by
         // the v1 inbox/reply consumers, never merely continued_from or a title.
-        if lead.id != a.caller || !self.manager_v2_operator_request_live(&a.config, epic, id)? {
+        if lead.id != a.caller || !self.manager_v2_operator_request_live(&mail_config, epic, id)? {
             return Err(refused("manager_v2_request_lead_changed"));
         }
         Ok(epic)
@@ -376,6 +379,7 @@ impl Store {
                 priority,
                 weight,
                 required_gates,
+                risk_tier,
             } => {
                 text(key, 128).map_err(refused)?;
                 text(title, 512).map_err(refused)?;
@@ -447,6 +451,16 @@ impl Store {
                     priority: *priority,
                     weight: *weight,
                     required_gates: required_gates.clone(),
+                    // A revised Work may not silently shed the stronger
+                    // review obligation already recorded for this key.
+                    risk_tier: if old_work
+                        .as_ref()
+                        .is_some_and(|old| old.risk_tier == ManagerWorkRiskTierV2::Tier2)
+                    {
+                        ManagerWorkRiskTierV2::Tier2
+                    } else {
+                        *risk_tier
+                    },
                     spec_revision: revision,
                     source_session_id: old_work.as_ref().and_then(|w| w.source_session_id),
                     source_commit: old_work.and_then(|w| w.source_commit),
@@ -808,10 +822,11 @@ impl Store {
             } => {
                 text(message, 2048).map_err(refused)?;
                 let epic = self.manager_v2_request_target(a, *request_id)?;
+                let (mail_config, _) = self.manager_mail_route_for_config(config)?;
                 // #664: a settled request accepts no further lead lifecycle;
                 // an exact replay was already answered above.
                 if self
-                    .manager_request_settlement(config, *request_id)?
+                    .manager_request_settlement(&mail_config, *request_id)?
                     .is_some()
                 {
                     return Err(refused("manager_v2_request_settled"));
@@ -822,7 +837,11 @@ impl Store {
                     .map(|r| decode::<RequestRecord>(&r))
                     .transpose()?;
                 let retrieved = self
-                    .manager_v2_record(config, "retrieval", &format!("{request_id}:{caller}"))?
+                    .manager_v2_record(
+                        &mail_config,
+                        "retrieval",
+                        &format!("{request_id}:{caller}"),
+                    )?
                     .is_some();
                 if !retrieved && !a.is_manager {
                     return Err(refused("manager_v2_request_retrieval_required"));
@@ -848,9 +867,15 @@ impl Store {
                 // marker yet, so it is released first; the open (= unanswered)
                 // count then grows only by sends and never exceeds the cap.
                 if is_terminal_request_state(*state) {
-                    self.manager_v2_release_request(config, caller, epic, *request_id, *state)?;
+                    self.manager_v2_release_request(
+                        &mail_config,
+                        caller,
+                        epic,
+                        *request_id,
+                        *state,
+                    )?;
                 } else if old == ManagerRequestStateV2::Failed {
-                    self.manager_v2_release_request(config, caller, epic, *request_id, old)?;
+                    self.manager_v2_release_request(&mail_config, caller, epic, *request_id, old)?;
                 }
                 let execution_evidence = if a.is_manager {
                     Some(json!({"kind":"manager_disposition","actor":caller,"message":message}))
@@ -864,7 +889,7 @@ impl Store {
                             json!({"kind":"committed_source","work_key":key,"work_row_version":record.row_version,"source_commit":source}),
                         )
                     } else {
-                        let reply:Option<String>=self.conn.query_row("SELECT id FROM harness_manager_messages WHERE request_id=?1 AND sender_session_id=?2 AND project_id=?3 AND manager_session_id=?4 AND scope_version=?5 ORDER BY sequence DESC LIMIT 1",params![request_id.to_string(),caller.to_string(),config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version],|r|r.get(0)).optional()?;
+                        let reply:Option<String>=self.conn.query_row("SELECT id FROM harness_manager_messages WHERE request_id=?1 AND sender_session_id=?2 AND project_id=?3 AND manager_session_id=?4 AND scope_version=?5 ORDER BY sequence DESC LIMIT 1",params![request_id.to_string(),caller.to_string(),mail_config.project_id.to_string(),mail_config.manager_session_id.to_string(),mail_config.row_version],|r|r.get(0)).optional()?;
                         Some(
                             json!({"kind":"attributed_reply","message_id":reply.ok_or_else(||refused("manager_v2_request_execution_evidence_required"))?}),
                         )
@@ -1502,5 +1527,41 @@ impl Store {
             row_version: row.row_version,
             deduplicated: false,
         })
+    }
+
+    /// Persist an accepted-content refusal observed while integrating a work.
+    /// The row is keyed by the work so a later re-bind to a new source hides a
+    /// stale refusal. This is deliberately a plain store write: the session
+    /// observation path can record it without re-running git.
+    pub(crate) fn manager_v2_record_integration_refusal(
+        &self,
+        config: &HarnessManagerConfigV1,
+        work_key: &str,
+        code: &str,
+        source_commit: &str,
+        target_commit: &str,
+        actor: Uuid,
+    ) -> Result<ManagerRecordV2> {
+        let epic = self
+            .manager_v2_record(config, "work", work_key)?
+            .and_then(|row| row.epic_id);
+        let expected = self
+            .manager_v2_record(config, INTEGRATION_REFUSAL_KIND, work_key)?
+            .map_or(0, |row| row.row_version);
+        let payload = json!({
+            "code": code,
+            "source_commit": source_commit,
+            "target_commit": target_commit,
+            "actor": actor,
+            "recorded_at": now(),
+        });
+        self.manager_v2_put_record(
+            config,
+            INTEGRATION_REFUSAL_KIND,
+            work_key,
+            epic,
+            expected,
+            &payload,
+        )
     }
 }

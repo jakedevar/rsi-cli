@@ -10,6 +10,12 @@
 //!
 //! Everyone else, including topology node sessions, is refused.
 
+#[allow(unused_imports)]
+pub(crate) use crate::store_support::config_types::{
+    BULK_FANOUT_MIN_OPENROUTER_MAX, DEFAULT_BULK_FANOUT_MIN_OPENROUTER,
+};
+#[allow(unused_imports)]
+pub(crate) use crate::store_support::topology_usage::topology_created_usage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -51,11 +57,6 @@ use crate::topology::store::{
 
 /// Plan §5.3: session nodes of one agent-requested execution in flight.
 pub(crate) const AGENT_MAX_PARALLEL_NODES: usize = 3;
-/// Default of the operator knob `topology_bulk_fanout_min_openrouter`: a
-/// layer with this many same-kind session nodes must run on `OpenRouter`.
-pub(crate) const DEFAULT_BULK_FANOUT_MIN_OPENROUTER: u32 = 4;
-/// Knob range; `0` disables the fan-out rule.
-pub(crate) const BULK_FANOUT_MIN_OPENROUTER_MAX: u32 = 64;
 const DIAGNOSTICS_MAX: usize = 32;
 const DIAGNOSTIC_CHARS: usize = 512;
 const EXECUTIONS_LIST_MAX: i64 = 32;
@@ -928,31 +929,6 @@ fn fanout_diagnostics(
 }
 
 // ─── launch-time gate (plan §5.3) ──────────────────────────────────────────
-
-/// Sessions charged to the manager's `max_created_sessions` by executions it
-/// requested within this appointment scope (#633). An attempt is charged
-/// once its launch began (`boot_id` stamped) unless it provably created no
-/// session.
-pub(crate) fn topology_created_usage(
-    conn: &Connection,
-    project_id: Uuid,
-    scope_version: i64,
-) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM topology_node_attempts a JOIN topology_executions e ON e.id=a.execution_id \
-         WHERE e.project_id=?1 AND e.requested_by_kind='manager' AND e.scope_version=?2 \
-           AND a.node_kind='session' AND a.boot_id IS NOT NULL \
-           AND (a.failure_class IS NULL OR a.failure_class NOT IN (?3,?4,?5))",
-        params![
-            project_id.to_string(),
-            scope_version,
-            rows::failure::LAUNCH_REFUSED,
-            rows::failure::LOST_BEFORE_SESSION,
-            rows::failure::POLICY_REFUSED,
-        ],
-        |row| row.get(0),
-    )?)
-}
 
 /// Re-check live policy before one agent-requested session launch. Returns
 /// the refusal code, or `None` to launch. Epic parenting applies the

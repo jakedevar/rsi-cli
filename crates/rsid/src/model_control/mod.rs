@@ -1,6 +1,9 @@
 pub mod call_control;
+pub(crate) mod cost;
+pub(crate) mod live_calls;
 pub mod registry;
 pub mod retry;
+pub mod transient_heal;
 pub mod validator;
 
 use crate::bus::{DaemonEvent, EventBus};
@@ -244,6 +247,32 @@ pub struct ExpectedUsage {
     pub wall_time_ms: u64,
 }
 
+impl ModelAdmissionRequest {
+    /// A copy whose provider label carries the exact stored spelling, or
+    /// `None` when the label is already exact or not a known provider label.
+    /// Enum strings in `model_invocations` match serde exactly, so a lowercase
+    /// `codex` from any writer is recorded, gated and replay-compared as
+    /// `Codex`.
+    pub(crate) fn with_canonical_provider(&self) -> Option<Self> {
+        let canonical =
+            crate::store::row_mappers::canonical_invocation_provider(self.provider.as_deref()?)?;
+        Some(Self {
+            provider: Some(canonical.to_string()),
+            ..self.clone()
+        })
+    }
+}
+
+/// Whether a stored provider label and a request's label name the same
+/// provider, ignoring only the case spelling the store canonicalizes.
+pub(crate) fn provider_labels_match(record: &Option<String>, request: &Option<String>) -> bool {
+    fn canonical(label: Option<&String>) -> Option<&str> {
+        let label = label?.as_str();
+        Some(crate::store::row_mappers::canonical_invocation_provider(label).unwrap_or(label))
+    }
+    canonical(record.as_ref()) == canonical(request.as_ref())
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelAdmissionRequest {
     pub purpose: ModelInvocationPurpose,
@@ -273,6 +302,8 @@ pub struct AdmissionPermit {
     pub purpose: ModelInvocationPurpose,
     pub model_tier: ModelTier,
     execution_claimed: Arc<AtomicBool>,
+    /// Monotonic liveness lease (#1080); dropped with the last permit clone.
+    lease: Arc<live_calls::CallLease>,
 }
 
 /// A purpose-bound, one-use authority to start a model-bearing CLI child.
@@ -373,15 +404,23 @@ enum StoreChannelAdmissionOutcome {
 impl AdmissionPermit {
     #[cfg(test)]
     pub(crate) fn for_route_dispatch_test() -> Self {
+        let invocation_id = Uuid::new_v4();
         Self {
-            invocation_id: Uuid::new_v4(),
+            invocation_id,
             purpose: ModelInvocationPurpose::SessionLaunchFresh,
             model_tier: ModelTier::Standard,
             execution_claimed: Arc::new(AtomicBool::new(false)),
+            lease: live_calls::CallLease::register(invocation_id),
         }
     }
     pub fn invocation_id(&self) -> Uuid {
         self.invocation_id
+    }
+
+    /// Record provider activity (a streamed chunk, a retry attempt) so the
+    /// stale-helper sweeper sees the call as live and active (#1080).
+    pub fn touch_activity(&self) {
+        self.lease.touch();
     }
 
     /// Claim the single model-bearing CLI execution authorized by this
@@ -655,6 +694,8 @@ pub struct InvocationCompletion {
     pub estimated_cost_usd: Option<f64>,
     pub error_class: Option<String>,
     pub confidence: Option<ModelUsageConfidence>,
+    /// Effort the call ran at, recorded only when admission named none.
+    pub effort: Option<String>,
 }
 
 pub fn completion_with_wall_time(
@@ -684,7 +725,9 @@ pub fn classify_error_class(error: &DaemonError) -> String {
         DaemonError::CodexResumeTornTail => "codex_resume_rollout_torn_tail".to_string(),
         DaemonError::StartupProviderInventory(_) => "startup_provider_inventory".to_string(),
         DaemonError::Rpc(_) | DaemonError::StructuredRpc { .. } => "rpc".to_string(),
-        DaemonError::Store(_) | DaemonError::Database(_) => "store".to_string(),
+        DaemonError::Store(_) | DaemonError::Database(_) | DaemonError::SchemaTooNew { .. } => {
+            "store".to_string()
+        }
         DaemonError::Io(_) => "io".to_string(),
         DaemonError::SessionNotFound(_) => "session_not_found".to_string(),
         DaemonError::SessionExists(_) => "session_exists".to_string(),
@@ -824,6 +867,7 @@ async fn admit_invocation_through_store_channel(
                 purpose: request.purpose,
                 model_tier,
                 execution_claimed: Arc::new(AtomicBool::new(false)),
+                lease: live_calls::CallLease::register(admission_id),
             })
         }
         StoreChannelAdmissionOutcome::Duplicate(invocation_id) => {
@@ -948,7 +992,7 @@ pub(crate) async fn resume_unexecuted_closure_launch_admission(
         || record.owner != request.owner
         || record.dedup_key != request.dedup_key
         || record.request_fingerprint != request.request_fingerprint
-        || record.provider != request.provider
+        || !provider_labels_match(&record.provider, &request.provider)
         || record.model != request.model
         || record.backend != request.backend
         || record.effort != request.effort
@@ -965,6 +1009,7 @@ pub(crate) async fn resume_unexecuted_closure_launch_admission(
         purpose: request.purpose,
         model_tier,
         execution_claimed: Arc::new(AtomicBool::new(false)),
+        lease: live_calls::CallLease::register(invocation_id),
     })
 }
 
@@ -1002,7 +1047,7 @@ pub(crate) async fn resume_unexecuted_agent_successor_admission(
         || record.owner != request.owner
         || record.dedup_key != request.dedup_key
         || record.request_fingerprint != request.request_fingerprint
-        || record.provider != request.provider
+        || !provider_labels_match(&record.provider, &request.provider)
         || record.model != request.model
         || record.backend != request.backend
         || record.effort != request.effort
@@ -1019,6 +1064,7 @@ pub(crate) async fn resume_unexecuted_agent_successor_admission(
         purpose: request.purpose,
         model_tier,
         execution_claimed: Arc::new(AtomicBool::new(false)),
+        lease: live_calls::CallLease::register(invocation_id),
     })
 }
 
@@ -1050,7 +1096,10 @@ pub(crate) async fn resume_unexecuted_capacity_delivery_admission(
             record.request_fingerprint != request.request_fingerprint,
             "request_fingerprint",
         ),
-        (record.provider != request.provider, "provider"),
+        (
+            !provider_labels_match(&record.provider, &request.provider),
+            "provider",
+        ),
         (record.model != request.model, "model"),
         (record.backend != request.backend, "backend"),
         (record.effort != request.effort, "effort"),
@@ -1072,6 +1121,7 @@ pub(crate) async fn resume_unexecuted_capacity_delivery_admission(
         purpose: request.purpose,
         model_tier,
         execution_claimed: Arc::new(AtomicBool::new(false)),
+        lease: live_calls::CallLease::register(invocation_id),
     })
 }
 
@@ -1364,6 +1414,7 @@ pub(crate) fn classify_model_tier(
         return ModelTier::Local;
     }
     if model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
         || model.starts_with("claude-opus")
         || model.starts_with("claude-sonnet")
         || model.starts_with("gemini-")

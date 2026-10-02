@@ -11,6 +11,9 @@ const VALID: &[&str] = &[
     // superset — they validate green exactly like a legacy manifest.
     "linkage_covered.md",
     "linkage_uncovered.md",
+    // Unfinished/failed items parse and validate; they just cover nothing.
+    "linkage_failed.md",
+    "linkage_pending.md",
 ];
 const INVALID: &[&str] = &[
     "invalid_missing_check.md",
