@@ -642,6 +642,11 @@ impl CodexAppServerProcess {
         crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
+    /// OS pid of the provider child, `None` once it was reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Non-blocking check if the process has exited.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)

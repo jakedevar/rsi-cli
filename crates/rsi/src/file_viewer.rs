@@ -192,7 +192,8 @@ fn save_file(app: &mut crate::app::App, session_id: Uuid, force: bool) -> bool {
     }
 }
 
-/// Close the file viewer, caching it for later restoration.
+/// Close the file viewer, caching it for later restoration. An open file
+/// explorer drawer takes keyboard focus back.
 fn close_viewer(app: &mut crate::app::App, session_id: Uuid) {
     if let Some(state) = app.sessions.get_mut(&session_id) {
         if let Some(viewer) = state.file_viewer.take() {
@@ -202,6 +203,85 @@ fn close_viewer(app: &mut crate::app::App, session_id: Uuid) {
         }
         state.clear_next_render = true;
     }
+    crate::overlay::file_explorer::on_viewer_closed(app);
+}
+
+/// Session whose file viewer receives keys and pastes: the focused detail
+/// pane's session, or the session selected in the focused list.
+fn active_viewer_session(app: &crate::app::App) -> Option<Uuid> {
+    let session_id = match app.focused_pane()? {
+        Pane::SessionDetail { session_id } => *session_id,
+        Pane::SessionList {
+            selected_session: Some(id),
+            ..
+        } => *id,
+        _ => return None,
+    };
+    app.sessions
+        .get(&session_id)?
+        .file_viewer
+        .as_ref()
+        .map(|_| session_id)
+}
+
+/// Paste text into the visible file viewer (entering insert mode), so a
+/// paste lands in the file being edited rather than a hidden input bar.
+/// Returns false when no viewer is showing. Read-only markdown preview
+/// swallows the paste.
+pub fn try_paste_text_file_viewer(app: &mut crate::app::App, text: &str) -> bool {
+    let Some(session_id) = active_viewer_session(app) else {
+        return false;
+    };
+    let Some(viewer) = app
+        .sessions
+        .get_mut(&session_id)
+        .and_then(|state| state.file_viewer.as_mut())
+    else {
+        return false;
+    };
+    if viewer.markdown_preview && viewer.is_markdown() {
+        return true;
+    }
+    if viewer.command.active || viewer.search.input_active {
+        // Single-line prompts take the first line only.
+        let line = text.lines().next().unwrap_or_default();
+        if viewer.command.active {
+            for c in line.chars() {
+                viewer.command.insert_char(c);
+            }
+        } else {
+            viewer.search.input_buffer.push_str(line);
+            recompute_search_matches(viewer);
+            let forward = viewer.search.forward;
+            jump_to_first_match_from_cursor(viewer, forward);
+        }
+        return true;
+    }
+    let before = viewer.surface.content();
+    viewer.surface.insert_pasted_text(text);
+    if viewer.surface.content() != before {
+        viewer.mark_dirty();
+        recompute_folds_from_content(viewer);
+    }
+    true
+}
+
+/// Paste the system clipboard into the visible file viewer (Ctrl+V path).
+pub fn try_paste_clipboard_file_viewer(app: &mut crate::app::App) -> bool {
+    if active_viewer_session(app).is_none() {
+        return false;
+    }
+    let paste_dir = app.paste_dir.clone();
+    match crate::clipboard::read_clipboard(&paste_dir) {
+        crate::clipboard::ClipboardContent::Text(text) => {
+            try_paste_text_file_viewer(app, &text);
+        }
+        crate::clipboard::ClipboardContent::Image { .. } => {
+            app.notify("Image paste isn't supported in the file viewer");
+        }
+        crate::clipboard::ClipboardContent::Empty => app.notify("Clipboard empty"),
+    }
+    true
 }
 
 /// Handle a key event when the file viewer is active.
@@ -269,6 +349,11 @@ pub fn handle_file_viewer_key(app: &mut crate::app::App, key: KeyEvent) -> bool 
             if key.code == KeyCode::Char(' ') {
                 // Space+Space → open telescope file picker
                 crate::overlay::telescope::open_telescope(app);
+                return true;
+            }
+            if key.code == KeyCode::Char('e') {
+                // Space+e → toggle the file explorer drawer beside the viewer
+                crate::overlay::file_explorer::toggle_from_viewer(app);
                 return true;
             }
             // Space was consumed but second key wasn't recognized — fall through to InputSurface

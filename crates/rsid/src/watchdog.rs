@@ -14,13 +14,15 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::store::Store;
-pub use crate::store_support::restart_record::RestartRecord;
+pub use crate::store_support::restart_record::{
+    FailedProbe, RestartRecord, import_pending_restart_records, pending_restart_record_paths,
+    read_restart_record, sidecar_path, write_restart_record,
+};
 
 pub const WATCHDOG_EXIT_CODE: i32 = 75;
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_KEY: &str = "internal_watchdog_probe_nonce";
-const SIDECAR_PREFIX: &str = "daemon-watchdog-restart-";
 
 /// A completion marker shared by a daemon loop and the watchdog thread.
 #[derive(Clone, Debug)]
@@ -60,14 +62,6 @@ impl LoopHeartbeat {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FailedProbe {
-    Rpc,
-    Store,
-    Scheduler,
-    Reconciliation,
-}
-
 /// A responsive Store can report an operational error without being wedged.
 /// Only a missed deadline is evidence for a watchdog restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,17 +69,6 @@ pub enum StoreProbeOutcome {
     Responsive,
     Error,
     TimedOut,
-}
-
-impl FailedProbe {
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::Rpc => "rpc_timeout",
-            Self::Store => "store_probe_timeout",
-            Self::Scheduler => "scheduler_tick_stale",
-            Self::Reconciliation => "reconciliation_tick_stale",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +94,10 @@ impl WatchdogPolicy {
     /// leaves room for a legitimate slow job without hiding an hour-long stall.
     pub fn from_intervals(scheduler_secs: u64, reconciliation_secs: u64) -> Self {
         Self {
-            startup_grace: Duration::from_secs(300),
+            // Counted from watchdog start, which is after `request_ready`: the
+            // third #1166 wedge began 20 s after a restart and a 5-minute grace
+            // delayed its trip past 6 minutes.
+            startup_grace: Duration::from_secs(90),
             scheduler_max_age: Duration::from_secs(scheduler_secs.saturating_mul(3).max(300)),
             reconciliation_max_age: Duration::from_secs(
                 reconciliation_secs.saturating_mul(3).max(360),
@@ -134,122 +120,18 @@ pub struct WatchdogDecision {
     last_healthy_at: DateTime<Utc>,
 }
 
-impl RestartRecord {
-    fn from_trip(trip: &WatchdogTrip) -> Self {
-        Self {
-            version: 1,
-            id: Uuid::new_v4(),
-            observed_at: trip.observed_at,
-            last_healthy_at: trip.last_healthy_at,
-            failed_probes: trip
-                .failed
-                .iter()
-                .map(|probe| probe.code().to_owned())
-                .collect(),
-        }
+fn restart_record_from_trip(trip: &WatchdogTrip) -> RestartRecord {
+    RestartRecord {
+        version: 1,
+        id: Uuid::new_v4(),
+        observed_at: trip.observed_at,
+        last_healthy_at: trip.last_healthy_at,
+        failed_probes: trip
+            .failed
+            .iter()
+            .map(|probe| probe.code().to_owned())
+            .collect(),
     }
-}
-
-pub fn sidecar_path(data_dir: &Path, id: Uuid) -> PathBuf {
-    data_dir.join(format!("{SIDECAR_PREFIX}{id}.json"))
-}
-
-pub fn pending_restart_record_paths(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name
-            .strip_prefix(SIDECAR_PREFIX)
-            .and_then(|suffix| suffix.strip_suffix(".json"))
-            .is_some_and(|id| Uuid::parse_str(id).is_ok())
-        {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-/// Rename and sync the containing directory so a Store deadlock cannot erase
-/// the reason for the next boot. The caller must hold the daemon instance lease.
-pub fn write_restart_record(path: &Path, record: &RestartRecord) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("sidecar has no parent"))?;
-    if path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "watchdog restart record already exists",
-        ));
-    }
-    let temporary = parent.join(format!(".{SIDECAR_PREFIX}{}.tmp", record.id));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-pub fn read_restart_record(path: &Path) -> std::io::Result<Option<RestartRecord>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let record: RestartRecord = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
-    if record.version != 1
-        || path.file_name() != sidecar_path(Path::new(""), record.id).file_name()
-        || record.failed_probes.is_empty()
-        || record.last_healthy_at > record.observed_at
-        || record.failed_probes.iter().any(|code| {
-            ![
-                FailedProbe::Rpc.code(),
-                FailedProbe::Store.code(),
-                FailedProbe::Scheduler.code(),
-                FailedProbe::Reconciliation.code(),
-            ]
-            .contains(&code.as_str())
-        })
-    {
-        return Err(std::io::Error::other("invalid watchdog restart record"));
-    }
-    Ok(Some(record))
-}
-
-/// Replay crash sidecars after the Store has opened. `persist` must return
-/// only after its insert transaction commits; its insert must be idempotent by
-/// restart ID because an unlink or directory sync can fail after that commit.
-/// Invalid records remain on disk so the operator can inspect the raw bytes.
-pub fn import_pending_restart_records(
-    data_dir: &Path,
-    mut persist: impl FnMut(&RestartRecord) -> std::io::Result<()>,
-) -> std::io::Result<Vec<RestartRecord>> {
-    let mut imported = Vec::new();
-    for path in pending_restart_record_paths(data_dir)? {
-        let record = match read_restart_record(&path) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "invalid watchdog restart sidecar retained");
-                continue;
-            }
-        };
-        persist(&record)?;
-        std::fs::remove_file(&path)?;
-        imported.push(record);
-    }
-    if !imported.is_empty() {
-        std::fs::File::open(data_dir)?.sync_all()?;
-    }
-    Ok(imported)
 }
 
 pub struct WatchdogHandle {
@@ -308,9 +190,10 @@ pub fn start_watchdog(
                     reconciliation_age: reconciliation.as_ref().map(LoopHeartbeat::age),
                 };
                 if let Some(trip) = decision.observe(&observation) {
-                    let record = RestartRecord::from_trip(&trip);
+                    let record = restart_record_from_trip(&trip);
                     let metrics = runtime.metrics();
-                    let thread_waits = thread_wait_snapshot();
+                    let thread_waits =
+                        bounded_thread_waits(Duration::from_secs(2), thread_wait_snapshot);
                     tracing::error!(
                         restart_id = %record.id,
                         failed_probes = ?record.failed_probes,
@@ -324,6 +207,7 @@ pub fn start_watchdog(
                         tokio_alive_tasks = metrics.num_alive_tasks(),
                         tokio_global_queue_depth = metrics.global_queue_depth(),
                         thread_waits = ?thread_waits,
+                        launch_phases = ?crate::launch_breadcrumbs::snapshot(),
                         "daemon watchdog tripped"
                     );
                     if let Err(error) =
@@ -331,6 +215,7 @@ pub fn start_watchdog(
                     {
                         tracing::error!(%error, "watchdog restart evidence could not be persisted");
                     }
+                    write_thread_stacks(&data_dir, record.id);
                     std::process::exit(WATCHDOG_EXIT_CODE);
                 }
             }
@@ -339,6 +224,38 @@ pub fn start_watchdog(
         stop,
         thread: Some(thread),
     })
+}
+
+/// Persist every thread's kernel wait state next to the restart record so a
+/// wedge tells a thread blocked on a lock from an idle park. The collection and
+/// the write run on a detached thread and the watchdog waits at most 2 s of wall
+/// clock: `/proc` reads of a wedged thread can block in the kernel, and this must
+/// never stop the restart that follows.
+fn write_thread_stacks(data_dir: &Path, restart_id: Uuid) {
+    let path = data_dir.join(format!("daemon-watchdog-stacks-{restart_id}.txt"));
+    let shown = path.display().to_string();
+    let deadline = Duration::from_secs(2);
+    let written = crate::thread_stacks::write_snapshot_bounded(path, deadline, move || {
+        format!(
+            "# launch phases (id phase age)\n{}\n{}",
+            crate::launch_breadcrumbs::snapshot().join("\n"),
+            crate::thread_stacks::thread_wait_report(deadline)
+        )
+    });
+    if written {
+        tracing::error!(restart_id = %restart_id, path = %shown, "watchdog thread wait snapshot written");
+    }
+}
+
+/// The legacy comm/wchan snapshot for the trip log, collected on a detached
+/// thread under a hard wall-clock deadline: a `/proc` read that blocks in the
+/// kernel must never delay the restart (#1173).
+fn bounded_thread_waits(
+    deadline: Duration,
+    collect: impl FnOnce() -> Vec<String> + Send + 'static,
+) -> Vec<String> {
+    crate::thread_stacks::bounded_call("watchdog-waits", deadline, collect)
+        .unwrap_or_else(|| vec!["<thread wait snapshot timed out>".to_owned()])
 }
 
 #[cfg(target_os = "linux")]
@@ -533,22 +450,43 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
+    fn a_stalled_legacy_wait_snapshot_cannot_delay_the_trip_log() {
+        let started = Instant::now();
+        let waits = bounded_thread_waits(Duration::from_millis(300), || {
+            loop {
+                std::thread::park();
+            }
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the trip path waited {:?} for a stalled collector",
+            started.elapsed()
+        );
+        assert_eq!(waits, vec!["<thread wait snapshot timed out>".to_owned()]);
+        assert_eq!(
+            bounded_thread_waits(Duration::from_secs(2), || vec!["tid:comm:futex".into()]),
+            vec!["tid:comm:futex".to_owned()]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
     fn persistent_store_timeout_trips_after_grace_and_records_last_health() {
         let started = Utc::now();
         let mut decision = WatchdogDecision::new(WatchdogPolicy::from_intervals(60, 120), started);
-        let mut before_grace = observation(started, 299);
+        let mut before_grace = observation(started, 89);
         before_grace.store_probe = StoreProbeOutcome::TimedOut;
         assert!(decision.observe(&before_grace).is_none());
 
-        let healthy_at = started + chrono::Duration::seconds(300);
-        assert!(decision.observe(&observation(healthy_at, 300)).is_none());
-        for seconds in [330_u64, 360] {
+        let healthy_at = started + chrono::Duration::seconds(90);
+        assert!(decision.observe(&observation(healthy_at, 90)).is_none());
+        for seconds in [120_u64, 150] {
             let mut failed =
                 observation(started + chrono::Duration::seconds(seconds as i64), seconds);
             failed.store_probe = StoreProbeOutcome::TimedOut;
             assert!(decision.observe(&failed).is_none());
         }
-        let mut failed = observation(started + chrono::Duration::seconds(390), 390);
+        let mut failed = observation(started + chrono::Duration::seconds(180), 180);
         failed.store_probe = StoreProbeOutcome::TimedOut;
         let trip = decision.observe(&failed).expect("third missed probe trips");
         assert_eq!(trip.failed, vec![FailedProbe::Store]);

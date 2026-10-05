@@ -78,9 +78,9 @@ pub(super) fn dispatch(app: &mut App, action: LcAction) {
                 if matches!(pane, Pane::Settings) {
                     crate::settings_keys::close_settings(app);
                 } else {
-                    app.settings_state = crate::types::SettingsState::default();
                     app.pre_settings_pane = Some(pane.clone());
                     *pane = Pane::Settings;
+                    crate::settings_keys::reopen_settings(app);
                 }
             }
         }
@@ -96,13 +96,8 @@ pub(super) fn dispatch(app: &mut App, action: LcAction) {
             }
             // Land in Items focus on the requested section so the user can
             // immediately use `a / Enter / d / e` chords.
-            app.settings_state = crate::types::SettingsState {
-                section,
-                selected_index: 0,
-                focus: crate::types::SettingsFocus::Items,
-                ..Default::default()
-            };
-            crate::settings_keys::ensure_claude_caches_for_category(app);
+            app.settings_state.clear_transient();
+            crate::settings_keys::enter_remembered_settings_section(app, section);
         }
 
         LcAction::OpenPromptCreator => {
@@ -209,5 +204,104 @@ pub(crate) fn maybe_auto_expand_session_list(app: &mut App) {
         let tab = &mut app.tabs[app.active_tab];
         tab.session_list_width_pct = (tab.session_list_width_pct + 10).min(50);
         app.pane_switch_clear = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings_keys::handle_settings_key;
+    use crate::types::{SettingsFocus, SettingsSection};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn settings_reopen_remembers_location_for_q_escape_and_toggle() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.select_section(SettingsSection::Screen);
+        app.settings_state.selected_index = 1;
+        app.settings_state.focus = SettingsFocus::Items;
+        dispatch(&mut app, LcAction::OpenSettings);
+        for close_key in [Some(KeyCode::Char('q')), Some(KeyCode::Esc), None] {
+            if let Some(code) = close_key {
+                assert!(handle_settings_key(
+                    &mut app,
+                    KeyEvent::new(code, KeyModifiers::NONE)
+                ));
+            } else {
+                dispatch(&mut app, LcAction::OpenSettings);
+            }
+            assert!(matches!(app.focused_pane(), Some(Pane::SessionList { .. })));
+            dispatch(&mut app, LcAction::OpenSettings);
+            assert!(matches!(app.focused_pane(), Some(Pane::Settings)));
+            assert_eq!(app.settings_state.section, SettingsSection::Screen);
+            assert_eq!(app.settings_state.selected_index, 1);
+            assert_eq!(app.settings_state.focus, SettingsFocus::Items);
+        }
+    }
+
+    #[test]
+    fn settings_direct_link_restores_target_row_and_refreshes_target_data() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state
+            .section_rows
+            .insert(SettingsSection::Budgets, 4);
+        app.settings_state
+            .section_rows
+            .insert(SettingsSection::Screen, 1);
+        dispatch(&mut app, LcAction::OpenSettingsAt(SettingsSection::Budgets));
+        assert_eq!(app.settings_state.section, SettingsSection::Budgets);
+        assert_eq!(app.settings_state.selected_index, 4);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Items);
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::RefreshUsageStats)
+        );
+        dispatch(&mut app, LcAction::OpenSettingsAt(SettingsSection::Screen));
+        assert_eq!(app.settings_state.selected_index, 1);
+    }
+
+    #[test]
+    fn settings_reopen_clears_transient_input_and_preserves_category_focus() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        app.settings_state.selected_index = 2;
+        app.settings_state.focus = SettingsFocus::Categories;
+        app.settings_state.query = "unfinished search".into();
+        app.settings_state.query_active = true;
+        app.settings_state.model_dropdown.open = true;
+        app.settings_state.active_dropdown_item = Some(2);
+        app.settings_state.provider_key_clear_confirmation =
+            Some(crate::types::ProviderKeyClearConfirmation {
+                slot: rsi_common::provider_credentials::ProviderCredentialSlot::ALL[2],
+                armed_at_ms: chrono::Utc::now().timestamp_millis(),
+            });
+        dispatch(&mut app, LcAction::OpenSettings);
+        assert_eq!(app.settings_state.section, SettingsSection::ProviderKeys);
+        assert_eq!(app.settings_state.selected_index, 2);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Categories);
+        assert!(app.settings_state.query.is_empty());
+        assert!(!app.settings_state.query_active);
+        assert!(!app.settings_state.model_dropdown.open);
+        assert_eq!(app.settings_state.active_dropdown_item, None);
+        assert!(app.settings_state.provider_key_clear_confirmation.is_none());
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::RefreshProviderCredentials)
+        );
+    }
+
+    #[test]
+    fn settings_location_survives_app_restart() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        dispatch(&mut app, LcAction::OpenSettingsAt(SettingsSection::Screen));
+        app.settings_state.selected_index = 1;
+        dispatch(&mut app, LcAction::OpenSettings);
+        let mut restarted = App::new(crate::client::DaemonClient::new(std::path::PathBuf::from(
+            "/tmp/settings-restart.sock",
+        )));
+        dispatch(&mut restarted, LcAction::OpenSettings);
+        assert_eq!(restarted.settings_state.section, SettingsSection::Screen);
+        assert_eq!(restarted.settings_state.selected_index, 1);
+        assert_eq!(restarted.settings_state.focus, SettingsFocus::Items);
     }
 }

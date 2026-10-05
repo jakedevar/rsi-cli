@@ -531,7 +531,24 @@ mod route_tests {
             tools: Vec::new(),
             stream: false,
             reasoning_effort: None,
+            context_editing: false,
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn context_editing_never_reaches_an_openai_style_body() {
+        let provider = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks::default(),
+        )
+        .unwrap();
+        let mut request = request(vec![ChatMessage::user("hi")]);
+        request.context_editing = true;
+        let body = provider.build_request_body(&request);
+        assert!(body.get("context_management").is_none());
+        assert!(!body.to_string().contains("clear_tool_uses"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

@@ -260,6 +260,7 @@ mod tests {
             tools: Vec::new(),
             stream: false,
             reasoning_effort: None,
+            context_editing: false,
         };
         let openai_route =
             || ModelExecutionCapability::for_test(RuntimeExecutionRoute::SessionHarnessOpenAiHttp);
@@ -386,6 +387,7 @@ mod tests {
             tools: vec![],
             stream: false,
             reasoning_effort: None,
+            context_editing: false,
         };
         let error = provider
             .chat(

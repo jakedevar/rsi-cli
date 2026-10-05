@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::harness_manager::{
     ConfigureHarnessManagerRequestV1, HARNESS_MANAGER_MAX_EPICS, HARNESS_MANAGER_MAX_GROUPS,
-    HarnessManagerConfigV1, HarnessManagerScopeCandidateV1, HarnessManagerScopeModeV1,
-    ListHarnessManagerScopeRequestV1,
+    HarnessManagerConfigV1, HarnessManagerPolicyOutcomeKindV1, HarnessManagerPolicyOutcomeV1,
+    HarnessManagerScopeCandidateV1, HarnessManagerScopeModeV1, ListHarnessManagerScopeRequestV1,
 };
 use rsi_common::manager_nodes::{
     ConfigureManagerNodeRequestV1, GetManagerNodeRequestV1, ListManagerNodesRequestV1,
@@ -208,6 +208,10 @@ pub(crate) async fn dispatch(app: &mut App, action: LcAction) {
 /// Minimal operator command surface for Slice A. The richer tree editor is
 /// Slice C; all mutations here still use the versioned daemon RPC.
 pub(crate) async fn dispatch_node_command(app: &mut App, command: &str) {
+    if command.trim() == "tree" {
+        super::manager_tree::open(app).await;
+        return;
+    }
     match run_node_command(app, command).await {
         Ok(message) => app.notify_success(message),
         Err(error) => app.notify_error(error),
@@ -397,8 +401,9 @@ async fn run_command(app: &mut App, action: LcAction) -> Result<(), String> {
         }
         LcAction::ClearHarnessManagerScope => {
             let config = config.ok_or(NO_MANAGER)?;
-            app.client
-                .configure_harness_manager(ConfigureHarnessManagerRequestV1 {
+            let saved = app
+                .client
+                .configure_harness_manager_outcome(ConfigureHarnessManagerRequestV1 {
                     group_ids: Vec::new(),
                     project_id: config.project_id,
                     session_id: config.manager_session_id,
@@ -408,7 +413,10 @@ async fn run_command(app: &mut App, action: LcAction) -> Result<(), String> {
                 .await
                 .map_err(|error| rpc_error(error, false))?;
             app.manager_roster.request_refresh();
-            app.notify_success("Manager scope cleared; supervision revoked.");
+            app.notify_success(format!(
+                "Manager scope cleared; supervision revoked. {}",
+                policy_outcome_note(&saved.policy)
+            ));
         }
         LcAction::OpenHarnessManager => open_manager(app, config.ok_or(NO_MANAGER)?).await?,
         _ => unreachable!("only manager actions are dispatched here"),
@@ -618,13 +626,15 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                 } else {
                     let appointing = state.appointing;
                     let expected_row_version = state.expected_row_version;
-                    match app.client.configure_harness_manager(request).await {
-                        Ok(config) => {
+                    match app.client.configure_harness_manager_outcome(request).await {
+                        Ok(saved) => {
+                            let (config, outcome) = (saved.config, saved.policy);
                             app.overlay = OverlayState::None;
                             if config.row_version == expected_row_version {
-                                app.notify_success(
-                                    "Manager scope unchanged; no policy or watches revoked.",
-                                );
+                                app.notify_success(format!(
+                                    "Manager scope unchanged. {}",
+                                    policy_outcome_note(&outcome)
+                                ));
                             } else {
                                 app.manager_roster.request_refresh();
                                 let selection =
@@ -637,7 +647,7 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                                             config.explicit_epic_ids().len()
                                         )
                                     };
-                                app.notify_success(format!("Manager scope saved: {selection} ({} Epics now). Use :manager to open the conversation.", config.epic_ids.len()));
+                                app.notify_success(format!("Manager scope saved: {selection} ({} Epics now). {} Use :manager to open the conversation.", config.epic_ids.len(), policy_outcome_note(&outcome)));
                             }
                         }
                         Err(error) => {
@@ -652,6 +662,25 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
     app.mark_dirty();
+}
+
+/// What a scope save did to the saved policy, for the operator (#1145).
+/// Authority never follows a changed scope: it is re-granted only by an
+/// explicit policy save.
+pub(crate) fn policy_outcome_note(outcome: &HarnessManagerPolicyOutcomeV1) -> String {
+    match outcome.kind {
+        HarnessManagerPolicyOutcomeKindV1::NoPolicy => "No policy saved; none granted.".to_string(),
+        HarnessManagerPolicyOutcomeKindV1::Unchanged => format!(
+            "Policy kept unchanged ({} capabilities, {} paused Epics).",
+            outcome.capability_count,
+            outcome.paused_epic_ids.len()
+        ),
+        HarnessManagerPolicyOutcomeKindV1::RevokedNeedsConfirmation => format!(
+            "Policy revoked, nothing carried to this scope: review and re-save it in :manager policy to grant its {} capabilities ({} paused Epics stay paused).",
+            outcome.capability_count,
+            outcome.paused_epic_ids.len()
+        ),
+    }
 }
 
 #[cfg(test)]

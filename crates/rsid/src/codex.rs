@@ -23,7 +23,7 @@ use crate::provider_capabilities::{
     ProviderCapabilityRegistry, provider_capabilities,
 };
 pub(crate) use crate::store_support::provider_defaults::{
-    CODEX_TOOL_HISTORY_ERROR_CLASS, codex_reasoning_effort,
+    CODEX_TOOL_HISTORY_ERROR_CLASS, CODEX_USAGE_LIMIT_STOP_REASON, codex_reasoning_effort,
 };
 pub use crate::store_support::provider_settings::CodexSandboxMode;
 use serde_json::Value;
@@ -51,7 +51,6 @@ pub(crate) const CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE: &str = "stderr.codex_st
 pub(crate) const CODEX_STORAGE_FULL_STOP_REASON: &str = "provider_error:codex_storage_full";
 const CODEX_USAGE_LIMIT_MESSAGE_PREFIX: &str = "You've hit your usage limit.";
 pub(crate) const CODEX_USAGE_LIMIT_ERROR_CLASS: &str = "codex_usage_limit";
-pub(crate) const CODEX_USAGE_LIMIT_STOP_REASON: &str = "provider_error:codex_usage_limit";
 
 /// Wraps a running Codex CLI process.
 pub struct CodexProcess {
@@ -83,9 +82,59 @@ impl CodexProcess {
         crate::process_scope::kill_worker_child(&mut self.child).await
     }
 
+    /// OS pid of the provider child, `None` once it was reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Non-blocking check if the process has exited.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)
+    }
+}
+
+/// Per-runtime Codex executable override for tests, keyed by the runtime
+/// config's identity so one test's fake CLI never leaks into another test or a
+/// concurrent resolver (the process `PATH` stays untouched).
+#[cfg(test)]
+static PINNED_BINARIES_FOR_TEST: std::sync::Mutex<Vec<(usize, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn pinned_binary_for_test(runtime_config: &Arc<RuntimeConfig>) -> Option<PathBuf> {
+    let key = Arc::as_ptr(runtime_config) as usize;
+    PINNED_BINARIES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(pinned, _)| *pinned == key)
+        .map(|(_, path)| path.clone())
+}
+
+/// Pins `path` as the Codex executable for `runtime_config` until dropped.
+#[cfg(test)]
+pub(crate) struct PinnedCodexBinary(usize);
+
+#[cfg(test)]
+pub(crate) fn pin_codex_binary_for_test(
+    runtime_config: &Arc<RuntimeConfig>,
+    path: PathBuf,
+) -> PinnedCodexBinary {
+    let key = Arc::as_ptr(runtime_config) as usize;
+    PINNED_BINARIES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((key, path));
+    PinnedCodexBinary(key)
+}
+
+#[cfg(test)]
+impl Drop for PinnedCodexBinary {
+    fn drop(&mut self) {
+        PINNED_BINARIES_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(key, _)| *key != self.0);
     }
 }
 
@@ -105,8 +154,13 @@ pub struct CodexClient {
 
 impl CodexClient {
     pub fn new(runtime_config: Arc<RuntimeConfig>) -> Result<Self> {
-        let binary_path =
-            crate::provider_cli::resolve("codex").ok_or(DaemonError::CodexBinaryNotFound)?;
+        #[cfg(test)]
+        let pinned = pinned_binary_for_test(&runtime_config);
+        #[cfg(not(test))]
+        let pinned: Option<PathBuf> = None;
+        let binary_path = pinned
+            .or_else(|| crate::provider_cli::resolve("codex"))
+            .ok_or(DaemonError::CodexBinaryNotFound)?;
         tracing::info!(
             path = %binary_path.display(),
             "Found Codex binary"
@@ -469,6 +523,17 @@ impl CodexClient {
                 .arg(format!("mcp_servers.rsi-agent.command={mcp_path:?}"))
                 .arg("-c")
                 .arg("mcp_servers.rsi-agent.args=[]");
+            // #1175: `codex exec` runs with approval policy "never", which
+            // rejects every MCP tool call that is not pre-approved ("MCP tool
+            // call requires approval"). Pre-approve this one trusted,
+            // daemon-installed server only; the daemon still authorizes each
+            // call against the session's roles. The MCP server is spawned by
+            // Codex outside the shell sandbox, so it reaches the daemon socket
+            // without any filesystem or network widening. (The in-sandbox
+            // `rsi-rpc` fallback cannot: see the issue for the sandbox
+            // network finding.)
+            cmd.arg("-c")
+                .arg("mcp_servers.rsi-agent.default_tools_approval_mode=\"approve\"");
             cmd.arg("-c").arg(format!(
                 "mcp_servers.rsi-agent.env_vars=[\"{}\",\"{}\"]",
                 rsi_common::identity::ENV_SESSION_TOKEN,
@@ -2582,6 +2647,19 @@ mod tests {
                 rsi_common::identity::ENV_SESSION_TOKEN,
                 rsi_common::identity::ENV_SOCKET
             )));
+        // #1175: only the rsi-agent server is pre-approved under approval
+        // policy "never", and no filesystem/network widening is added.
+        let approvals: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.contains("tools_approval_mode"))
+            .collect();
+        assert_eq!(
+            approvals,
+            vec!["mcp_servers.rsi-agent.default_tools_approval_mode=\"approve\""]
+        );
+        assert!(args.iter().all(|arg| !arg.contains("network_access")
+            && !arg.contains("writable_roots")
+            && !arg.contains("danger-full-access")));
         assert!(
             args.iter()
                 .all(|arg| !arg.contains("must-not-appear-in-argv"))

@@ -4,6 +4,11 @@
 Each library test's source gate declares its shard. A normal direct
 ``cargo test -p rsid --lib`` still sees every test because the gates are
 disabled unless a shard feature enables ``test-shard-mode``.
+
+The library tests live in two packages since the #1021 S4 crate split: ``rsid``
+and ``rsid-store``. A shard is one feature name declared by every package that
+has tests in it; the gate runs the shard across those packages
+(``--list-shard-packages``).
 """
 
 from __future__ import annotations
@@ -18,7 +23,10 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "crates/rsid/src"
+# Package name -> crate directory. Order is the order `-p` flags are emitted in.
+CRATES = {"rsid": ROOT / "crates/rsid", "rsid-store": ROOT / "crates/rsid-store"}
+SOURCES = [directory / "src" for directory in CRATES.values()]
+SHARD_KIND_ORDER = ("store", "session", "memory", "other")
 # These source tests are kept in the inventory but may be absent from the
 # default Linux, no-default-features runtime list because of enclosing cfgs.
 CONDITIONAL_RUNTIME_NAMES = {
@@ -77,7 +85,7 @@ def host_excluded_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
 def host_excluded_module_files() -> set[str]:
     """Source files whose `mod name;` declaration is gated to another OS."""
     excluded: set[str] = set()
-    for path in sorted(SOURCE.rglob("*.rs")):
+    for path in sorted(path for source in SOURCES for path in source.rglob("*.rs")):
         lines = path.read_text(encoding="utf-8").splitlines()
         for line in lines:
             stripped = line.strip()
@@ -223,11 +231,11 @@ def extract_tests(path: Path) -> list[tuple[str, int, bool]]:
     return identities
 
 
-def read_shards() -> list[str]:
-    cargo = tomllib.loads((ROOT / "crates/rsid/Cargo.toml").read_text(encoding="utf-8"))
+def read_crate_shards(package: str) -> list[str]:
+    cargo = tomllib.loads((CRATES[package] / "Cargo.toml").read_text(encoding="utf-8"))
     features = cargo["features"]
     if features.get("default") != [] or features.get("test-shard-mode") != []:
-        fail("rsid default/test-shard-mode features changed")
+        fail(f"{package} default/test-shard-mode features changed")
     shards = []
     for feature, dependencies in features.items():
         if not feature.startswith("test-shard-") or feature == "test-shard-mode":
@@ -239,19 +247,48 @@ def read_shards() -> list[str]:
             fail(f"{feature} must imply only test-shard-mode")
         shards.append(shard)
     if not shards:
-        fail("rsid declares no library shard features")
+        fail(f"{package} declares no library shard features")
     return shards
 
 
-def source_inventory(shards: list[str], require_gates: bool) -> tuple[dict[tuple[str, str], str], int]:
+def shard_sort_key(shard: str) -> tuple[int, int]:
+    kind, number = shard.rsplit("-", 1)
+    order = SHARD_KIND_ORDER.index(kind) if kind in SHARD_KIND_ORDER else len(SHARD_KIND_ORDER)
+    return order, int(number)
+
+
+def read_shard_packages() -> dict[str, list[str]]:
+    """Shard name -> packages (in `CRATES` order) that declare its feature."""
+    packages: dict[str, list[str]] = {}
+    for package in CRATES:
+        for shard in read_crate_shards(package):
+            packages.setdefault(shard, []).append(package)
+    return dict(sorted(packages.items(), key=lambda item: shard_sort_key(item[0])))
+
+
+def read_shards() -> list[str]:
+    return list(read_shard_packages())
+
+
+def package_of(relative: str) -> str:
+    for package, directory in CRATES.items():
+        if relative.startswith(directory.relative_to(ROOT).as_posix() + "/"):
+            return package
+    fail(f"{relative}: not under a sharded rsid package")
+
+
+def source_inventory(
+    shard_packages: dict[str, list[str]], require_gates: bool
+) -> tuple[dict[tuple[str, str], str], int]:
     """Assign tests from their source gates, with bin tests in a separate lane."""
     manifest: dict[tuple[str, str], str] = {}
     file_shards: dict[str, str] = {}
     ungated: list[tuple[str, str, int]] = []
     gated = 0
     excluded_files = host_excluded_module_files()
-    for path in sorted(SOURCE.rglob("*.rs")):
+    for path in sorted(path for source in SOURCES for path in source.rglob("*.rs")):
         relative = path.relative_to(ROOT).as_posix()
+        package = package_of(relative)
         is_bin = relative == "crates/rsid/src/main.rs" or relative.startswith("crates/rsid/src/bin/")
         raw_lines = path.read_text(encoding="utf-8").splitlines()
         excluded_ranges = host_excluded_line_ranges(raw_lines)
@@ -266,8 +303,10 @@ def source_inventory(shards: list[str], require_gates: bool) -> tuple[dict[tuple
             match = SHARD_GATE.fullmatch(previous.strip())
             if match:
                 shard = match.group(1)
-                if shard not in shards:
+                if shard not in shard_packages:
                     fail(f"{relative}:{line}: unknown shard {shard}")
+                if package not in shard_packages[shard]:
+                    fail(f"{relative}:{line}: shard {shard} is not a {package} feature")
                 if previous[: len(previous) - len(previous.lstrip())] != raw_lines[line - 1][: len(raw_lines[line - 1]) - len(raw_lines[line - 1].lstrip())]:
                     fail(f"{relative}:{line}: incorrect shard gate indentation")
                 before_gate = raw_lines[line - 3] if line > 2 else ""
@@ -298,75 +337,102 @@ def source_inventory(shards: list[str], require_gates: bool) -> tuple[dict[tuple
     return manifest, gated
 
 
-def check_runtime(directory: Path, manifest: dict[tuple[str, str], str], shards: list[str]) -> None:
+def check_runtime(
+    directory: Path, manifest: dict[tuple[str, str], str], shard_packages: dict[str, list[str]], selected: list[str]
+) -> None:
     seen: set[str] = set()
     total = 0
     conditional_absent = 0
     counts = Counter(manifest.values())
-    for shard in shards:
+    for shard in selected:
+        packages = shard_packages[shard]
         expected_count = counts[shard]
         path = directory / f"{shard}.json"
         data = json.loads(path.read_text(encoding="utf-8"))
         suites = data.get("rust-suites")
-        if not isinstance(suites, dict) or len(suites) != 1:
-            fail(f"{path}: expected one rsid library suite")
-        binary_id, suite = next(iter(suites.items()))
-        if suite.get("binary-id") != binary_id or not isinstance(suite.get("testcases"), dict):
-            fail(f"{path}: malformed Nextest library suite")
+        if not isinstance(suites, dict) or sorted(suites) != sorted(packages):
+            fail(f"{path}: expected one library suite for each of {packages}")
         names = []
-        for runtime_name, metadata in suite["testcases"].items():
-            match = metadata.get("filter-match", {})
-            ignored = metadata.get("ignored")
-            selected = match.get("status") == "matches" or (
-                ignored is True and match == {"status": "mismatch", "reason": "ignored"}
-            )
-            if not selected or not isinstance(ignored, bool):
-                fail(f"{path}: filtered or malformed test {runtime_name}")
-            identity = f"{binary_id}::{runtime_name}"
-            if identity in seen:
-                fail(f"runtime test appears in multiple shards: {identity}")
-            seen.add(identity)
-            names.append(runtime_name.rsplit("::", 1)[-1])
-        expected = Counter(name for (source, name), assigned in manifest.items() if assigned == shard)
-        actual = Counter(names)
         optional = Counter(CONDITIONAL_RUNTIME_NAMES.get(shard, ())) | PLATFORM_CONDITIONAL_NAMES.get(
             shard, Counter()
         )
-        if optional - expected:
+        shard_expected = Counter(name for (source, name), assigned in manifest.items() if assigned == shard)
+        if optional - shard_expected:
             fail(f"{path}: conditional runtime exception is absent from the static manifest")
-        missing = expected - actual
-        unexpected_missing = missing - optional
-        extra = actual - expected
-        if unexpected_missing or extra:
-            fail(f"{path}: runtime/static test identities differ: missing={list(unexpected_missing.elements())[:10]}, extra={list(extra.elements())[:10]}")
-        conditional_absent += sum(missing.values())
-        if len(names) != expected_count - sum(missing.values()):
-            fail(f"{path}: expected {expected_count - sum(missing.values())} runtime tests, observed {len(names)}")
+        shard_missing = 0
+        for binary_id, suite in suites.items():
+            if suite.get("binary-id") != binary_id or not isinstance(suite.get("testcases"), dict):
+                fail(f"{path}: malformed Nextest library suite")
+            suite_names = []
+            for runtime_name, metadata in suite["testcases"].items():
+                match = metadata.get("filter-match", {})
+                ignored = metadata.get("ignored")
+                selected_case = match.get("status") == "matches" or (
+                    ignored is True and match == {"status": "mismatch", "reason": "ignored"}
+                )
+                if not selected_case or not isinstance(ignored, bool):
+                    fail(f"{path}: filtered or malformed test {runtime_name}")
+                identity = f"{binary_id}::{runtime_name}"
+                if identity in seen:
+                    fail(f"runtime test appears in multiple shards: {identity}")
+                seen.add(identity)
+                suite_names.append(runtime_name.rsplit("::", 1)[-1])
+            expected = Counter(
+                name
+                for (source, name), assigned in manifest.items()
+                if assigned == shard and package_of(source) == binary_id
+            )
+            actual = Counter(suite_names)
+            missing = expected - actual
+            unexpected_missing = missing - optional
+            extra = actual - expected
+            if unexpected_missing or extra:
+                fail(f"{path}: runtime/static test identities differ in {binary_id}: missing={list(unexpected_missing.elements())[:10]}, extra={list(extra.elements())[:10]}")
+            shard_missing += sum(missing.values())
+            names.extend(suite_names)
+        conditional_absent += shard_missing
+        if len(names) != expected_count - shard_missing:
+            fail(f"{path}: expected {expected_count - shard_missing} runtime tests, observed {len(names)}")
         total += len(names)
-    if total != sum(counts[shard] for shard in shards) - conditional_absent:
+    if total != sum(counts[shard] for shard in selected) - conditional_absent:
         fail(f"runtime union count differs: {total}")
-    print(f"runtime union: {total} distinct rsid library tests in {len(shards)} shard(s); {conditional_absent} conditional source tests absent")
+    print(f"runtime union: {total} distinct rsid library tests in {len(selected)} shard(s); {conditional_absent} conditional source tests absent")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-gates", action="store_true", help="reject any ungated library test")
     parser.add_argument("--list-shards", action="store_true", help="print shard names for the runner")
+    parser.add_argument(
+        "--list-shard-packages",
+        action="store_true",
+        help="print `shard package...` lines: the packages whose tests a shard run must select",
+    )
     parser.add_argument("--runtime-dir", type=Path, help="check one Nextest JSON list per shard")
     parser.add_argument("--runtime-shard", help="check one selected shard")
     args = parser.parse_args()
     if args.runtime_shard and args.runtime_dir is None:
         parser.error("--runtime-shard requires --runtime-dir")
     try:
-        shards = read_shards()
+        shard_packages = read_shard_packages()
+        shards = list(shard_packages)
         if args.runtime_shard and args.runtime_shard not in shards:
             fail(f"unknown runtime shard {args.runtime_shard}")
-        manifest, gated = source_inventory(shards, args.require_gates or args.runtime_dir is not None)
+        manifest, gated = source_inventory(shard_packages, args.require_gates or args.runtime_dir is not None)
+        populated = {(package_of(source), assigned) for (source, _), assigned in manifest.items()}
+        for shard, packages in shard_packages.items():
+            for package in packages:
+                if (package, shard) not in populated:
+                    fail(f"{package} declares shard {shard} but has no test in it")
         bin_count = sum(shard == "bin" for shard in manifest.values())
         total = len(manifest)
         if args.runtime_dir is not None:
-            check_runtime(args.runtime_dir, manifest, [args.runtime_shard] if args.runtime_shard else shards)
-        if args.list_shards:
+            check_runtime(
+                args.runtime_dir, manifest, shard_packages, [args.runtime_shard] if args.runtime_shard else shards
+            )
+        if args.list_shard_packages:
+            print("\n".join(f"{shard} {' '.join(packages)}" for shard, packages in shard_packages.items()))
+        elif args.list_shards:
             print("\n".join(shards))
         else:
             print(f"static inventory: {total} test identities ({total - bin_count} library, {bin_count} binary); {gated}/{total - bin_count} library gates present")

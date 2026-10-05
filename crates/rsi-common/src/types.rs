@@ -557,7 +557,15 @@ pub struct Session {
     /// this when `Some`, falling back to `working_dir` otherwise.
     #[serde(default)]
     pub sandbox_root: Option<PathBuf>,
-    /// Git branch name for the sandbox (when `sandbox_kind == GitWorktree`).
+    /// Git branch the sandbox was **assigned** at allocation (when
+    /// `sandbox_kind == GitWorktree`), e.g. `rsi/<short>`. This is
+    /// branch-at-creation, not a live view: it is written at allocation and
+    /// on rotation/restore only and is never reconciled with the worktree's
+    /// checked-out branch. Sandboxed agents must not switch branches
+    /// (AGENTS.md hard rule 2), but a child that does would leave this field
+    /// pointing at a branch with none of its work. To find a child's work tip
+    /// read `git -C <sandbox_root> rev-parse HEAD` (or `git worktree list`,
+    /// keyed on the session-UUID directory); never resolve by branch name.
     #[serde(default)]
     pub sandbox_branch: Option<String>,
     /// Cleanup state of the on-disk sandbox. Drives orphan sweep logic on daemon restart.

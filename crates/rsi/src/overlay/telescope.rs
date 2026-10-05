@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::types::OverlayState;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Open the telescope file picker overlay.
 pub fn open_telescope(app: &mut App) {
@@ -27,7 +27,7 @@ pub fn open_telescope(app: &mut App) {
     };
 
     // Scan files immediately (same as file explorer finder activation)
-    let file_cache = crate::file_utils::walk_files_scoped(&root, false, Some(1));
+    let file_cache = crate::file_utils::walk_files_scoped(&root, false, None);
     let results: Vec<usize> = (0..file_cache.len().min(100)).collect();
 
     app.overlay = OverlayState::Telescope {
@@ -41,7 +41,11 @@ pub fn open_telescope(app: &mut App) {
 }
 
 /// Handle keys when the telescope overlay is active.
+///
+/// Every printable key (including `j` and `k`) types into the query; the
+/// arrows and Ctrl-J/K/N/P move the selection, Ctrl-U clears the query.
 pub fn handle_telescope_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
             app.overlay = OverlayState::None;
@@ -49,18 +53,15 @@ pub fn handle_telescope_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             handle_telescope_enter(app);
         }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let OverlayState::Telescope {
-                results, selected, ..
-            } = &mut app.overlay
-            {
-                move_finder_selection(selected, results.len(), 1);
+        KeyCode::Down => move_telescope_selection(app, 1),
+        KeyCode::Up => move_telescope_selection(app, -1),
+        KeyCode::Char('j' | 'n') if ctrl => move_telescope_selection(app, 1),
+        KeyCode::Char('k' | 'p') if ctrl => move_telescope_selection(app, -1),
+        KeyCode::Char('u') if ctrl => {
+            if let OverlayState::Telescope { query, .. } = &mut app.overlay {
+                query.clear();
             }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if let OverlayState::Telescope { selected, .. } = &mut app.overlay {
-                move_finder_selection(selected, usize::MAX, -1);
-            }
+            rescore_telescope(app);
         }
         KeyCode::Backspace => {
             if let OverlayState::Telescope { query, .. } = &mut app.overlay {
@@ -68,13 +69,22 @@ pub fn handle_telescope_key(app: &mut App, key: KeyEvent) {
             }
             rescore_telescope(app);
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
             if let OverlayState::Telescope { query, .. } = &mut app.overlay {
                 query.push(c);
             }
             rescore_telescope(app);
         }
         _ => {}
+    }
+}
+
+fn move_telescope_selection(app: &mut App, delta: i8) {
+    if let OverlayState::Telescope {
+        results, selected, ..
+    } = &mut app.overlay
+    {
+        move_finder_selection(selected, results.len(), delta);
     }
 }
 
@@ -200,6 +210,72 @@ fn handle_telescope_enter(app: &mut App) {
 #[cfg(test)]
 mod finder_tests {
     use super::*;
+
+    fn telescope_app() -> App {
+        let mut app = crate::app::app_test_helpers::with_session_list(1);
+        let session_id = app.filtered_session_order[0];
+        let file_cache = vec![
+            std::path::PathBuf::from("jk.rs"),
+            std::path::PathBuf::from("other.rs"),
+            std::path::PathBuf::from("zz.rs"),
+        ];
+        app.overlay = OverlayState::Telescope {
+            root: std::path::PathBuf::from("/tmp"),
+            session_id,
+            query: String::new(),
+            results: (0..file_cache.len()).collect(),
+            file_cache,
+            selected: 0,
+        };
+        app
+    }
+
+    fn query_and_selection(app: &App) -> (String, usize) {
+        match &app.overlay {
+            OverlayState::Telescope {
+                query, selected, ..
+            } => (query.clone(), *selected),
+            _ => panic!("telescope should stay open"),
+        }
+    }
+
+    #[test]
+    fn telescope_types_j_and_k_into_the_query() {
+        let mut app = telescope_app();
+        for c in ['j', 'k'] {
+            handle_telescope_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(query_and_selection(&app).0, "jk");
+    }
+
+    #[test]
+    fn telescope_moves_with_arrows_and_ctrl_keys_and_clears_with_ctrl_u() {
+        let mut app = telescope_app();
+        handle_telescope_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_telescope_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(query_and_selection(&app), (String::new(), 2));
+        handle_telescope_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(query_and_selection(&app).1, 1);
+
+        handle_telescope_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        );
+        handle_telescope_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(query_and_selection(&app), (String::new(), 0));
+    }
 
     #[test]
     fn finder_scores_command_catalog_source_with_stable_ties_and_cap() {

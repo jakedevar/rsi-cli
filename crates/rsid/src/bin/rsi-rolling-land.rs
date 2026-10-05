@@ -1,5 +1,5 @@
 // One shard inventory for the lander and the impact selector.
-use rsi_codegraph::impact::RSID_SHARDS;
+use rsi_codegraph::impact::{RSID_SHARDS, is_rsid_shard_package, rsid_shard_packages};
 use rsi_common::failure_signature::{Classification, Snapshot, classify, failure_text_for};
 use rsid::integration::{
     Candidate, CandidateKind, CommitIdentity, GuardCommand, GuardSpec, IntegrationConfig,
@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 
@@ -137,6 +137,8 @@ struct LandReport {
     /// `known_red=` annotations for `base_reds`, empty without a snapshot.
     known_red_lines: Vec<String>,
     flakes: BTreeSet<String>,
+    /// Candidate-only failures whose isolated retry could not run (#1167).
+    unverified: BTreeSet<String>,
     base_reused: BTreeSet<String>,
     local_base_confirmed: BTreeSet<String>,
     base_absent_packages: BTreeSet<String>,
@@ -219,6 +221,7 @@ struct TestGate {
     // Known-failure snapshot loaded once per landing (annotation only).
     known_failures: Option<Snapshot>,
     flakes: BTreeSet<String>,
+    unverified: BTreeSet<String>,
     base_reused: BTreeSet<String>,
     local_base_confirmed: BTreeSet<String>,
     // Workspace package names per base commit; `None` when unproven.
@@ -236,6 +239,12 @@ struct TestGate {
     remote_results: Mutex<RemoteShardResults>,
     scratch: Option<GateScratch>,
     disk_scratch_used: BTreeSet<String>,
+    /// Base guards actually executed (cache misses) in this gate (#1132).
+    base_runs: usize,
+    /// Seconds spent compiling shard binaries ahead of the gate loop (#1132).
+    prebuild_secs: u64,
+    /// Test hook: run the prebuild even under `cfg(test)`.
+    prebuild_forced: bool,
 }
 
 enum GateScratch {
@@ -646,6 +655,9 @@ fn main() {
             for name in &report.flakes {
                 println!("candidate_flake={name}");
             }
+            for name in &report.unverified {
+                println!("candidate_unverified={name}");
+            }
             for entry in &report.base_reused {
                 println!("base_reused={entry}");
             }
@@ -838,6 +850,11 @@ const fn usage() -> &'static str {
     "usage: rsi-rolling-land [--repo PATH] [--remote NAME] --accepted SOURCE|BASE:SOURCE [--accepted SOURCE|BASE:SOURCE ...] [--test-filter PACKAGE=FILTER ...] [--tmpfs-min-free-gb N] [--disk-scratch-shard SHARD ...] [--expected-tip SHA] [--remote-gate-host USER@HOST --remote-gate-dir PATH --remote-gate-identity PATH [--remote-gate-run-as USER]]\nFor a landing candidate, omitted BASE is merge-base(SOURCE, current landing target tip); an explicit BASE must equal it. Already-integrated sources require the explicit historical BASE.\nAn rsid shard filter is rsid=shard:SHARD[:FILTERSET], for example rsid=shard:session-02:test(manager_recovery_). The full shard inventory is checked before any focused run.\n--tmpfs-min-free-gb requires N GiB free on /dev/shm before private gate TMPDIR is used (default 12); otherwise gates use sandbox target scratch. --disk-scratch-shard gives a named shard disk scratch on both sides.\nRemote shard execution is opt-in and refuses publication on missing evidence or mismatched commit/fingerprint. The SSH host must already be in known_hosts. Only full rsid shards run remotely; local regression comparison and isolated retries are preserved.\n--expected-tip is used by the merge queue: an initial fetch that differs from SHA is an out-of-band advance charged against the re-gated retry budget.\nCARGO_BUILD_JOBS: positive integer from 1 to 6; defaults to 4 when unset."
 }
 
+/// #1140/#1150: the lander's startup sweep of dead owners' workspaces (on after
+/// the hardened scratch-reclaim core's final check). Registration of the owner and
+/// the private clone records each workspace.
+const LANDER_STARTUP_SWEEP_ENABLED: bool = true;
+
 #[allow(clippy::too_many_lines)] // Keeps fetch, preparation, and owned cleanup visibly ordered.
 async fn land(options: Options) -> Result<LandReport, LandFailure> {
     land_with_gate(options, TestGate::for_landing()?).await
@@ -859,12 +876,44 @@ async fn land_with_gate(
         .map_err(|error| format!("cannot resolve repository: {error}"))?;
     let remote_url = git_text(&repo, &["remote", "get-url", "--push", &options.remote])?;
     let workspace_parent = landing_workspace_parent(&repo, &cargo_target_dir)?;
+    // #932: a killed lander (every daemon restart, SIGKILL, reboot) leaves its
+    // private workspace behind. Sweep recorded, dead-owner leftovers before
+    // taking disk (#1140: bounded, off the async executor).
+    if LANDER_STARTUP_SWEEP_ENABLED {
+        let parent = workspace_parent.clone();
+        if let Ok(swept) = tokio::task::spawn_blocking(move || {
+            rsid::agent_scratch_reclaim::sweep_lander_workspace(&parent)
+        })
+        .await
+            && swept.reclaimed > 0
+        {
+            println!(
+                "lander_scratch_swept={} bytes={}",
+                swept.reclaimed, swept.reclaimed_bytes
+            );
+        }
+    }
     let temp = tempfile::Builder::new()
-        .prefix("rsi-rolling-land-")
+        .prefix(rsid::agent_scratch_reclaim::LANDER_SCRATCH_PREFIX)
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(workspace_parent)
+        .tempdir_in(&workspace_parent)
         .map_err(|error| format!("cannot create private landing workspace: {error}"))?;
-    let private_repo = temp.path().join("repo");
+    if let Err(error) = rsid::agent_scratch_reclaim::register_lander_owner(temp.path(), &repo) {
+        eprintln!("lander: cannot register scratch owner (workspace will not be swept): {error}");
+    }
+    // #1140: the private clone is the one repository a sweep may delete without
+    // proving its commits published, so the lander creates its (empty) directory
+    // first and registers that exact directory before cloning into it.
+    let private_repo = temp
+        .path()
+        .join(rsid::agent_scratch_reclaim::LANDER_CLONE_DIR);
+    std::fs::create_dir(&private_repo)
+        .map_err(|error| format!("cannot create private clone directory: {error}"))?;
+    if let Err(error) =
+        rsid::agent_scratch_reclaim::register_lander_clone(temp.path(), &private_repo)
+    {
+        eprintln!("lander: cannot register private clone (workspace will not be swept): {error}");
+    }
     git_ok(
         &repo,
         &[
@@ -1075,6 +1124,9 @@ async fn land_with_gate(
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                // A batch caller needs the culprit: this source conflicted with
+                // the target plus the sources merged before it (#1119).
+                let error = rsid::rolling_queue::mark_conflict_source(error, &pair.source);
                 if let Some(previous) = candidate.take() {
                     let cleanup = discard_candidate(&config, &private_repo, &previous.handle).await;
                     if let Err(cleanup) = cleanup {
@@ -1704,6 +1756,7 @@ async fn land_candidate(
             test_gate.known_failures.as_ref(),
         ),
         flakes: test_gate.flakes.clone(),
+        unverified: test_gate.unverified.clone(),
         base_reused: test_gate.base_reused.clone(),
         local_base_confirmed: test_gate.local_base_confirmed.clone(),
         base_absent_packages: test_gate.base_absent_packages.clone(),
@@ -1756,6 +1809,10 @@ fn touches_provisional_gate(
     // Keep the fixed entries aligned with check-released-migrations.py's
     // tracked_source_paths. Manifest sections supply its remaining paths.
     let mut surface = BTreeSet::from([
+        b"crates/rsid-store/src/store/mod.rs".to_vec(),
+        b"crates/rsid-store/src/store/cohort_settlement.rs".to_vec(),
+        b"crates/rsid-store/src/store/tests.rs".to_vec(),
+        // The layout before the #1021 S4 crate split: a stale source touches it.
         b"crates/rsid/src/store/mod.rs".to_vec(),
         b"crates/rsid/src/store/cohort_settlement.rs".to_vec(),
         b"crates/rsid/src/store/tests.rs".to_vec(),
@@ -2531,7 +2588,68 @@ fn observed_test_failures(
     }
 }
 
-fn isolated_retry_command(command: &GuardCommand, name: &str) -> Result<GuardCommand, String> {
+/// Where a shard command reads its package list from: the tree it will run in.
+/// The candidate binary's own static map names the packages of the *current*
+/// layout; a base cut before the #1021 S4 crate split declares every shard in
+/// `rsid` alone, so its direct and retry commands follow its own manifests.
+#[derive(Clone, Copy)]
+enum ShardTree<'a> {
+    Worktree(&'a Path),
+    Revision {
+        repo: &'a Path,
+        revision: &'a str,
+    },
+    /// The lander's own static map (unit tests with no tree to read).
+    #[cfg(test)]
+    Static,
+}
+
+impl ShardTree<'_> {
+    fn manifest(&self, package: &str) -> Option<String> {
+        match self {
+            Self::Worktree(root) => {
+                std::fs::read_to_string(root.join(format!("crates/{package}/Cargo.toml"))).ok()
+            }
+            Self::Revision { repo, revision } => git_text(
+                repo,
+                &["show", &format!("{revision}:crates/{package}/Cargo.toml")],
+            )
+            .ok(),
+            #[cfg(test)]
+            Self::Static => None,
+        }
+    }
+
+    /// The packages whose manifest declares `test-shard-<shard>`; the static
+    /// map when the tree has no readable manifest declaring it.
+    fn packages(&self, shard: &str) -> Vec<String> {
+        let needle = format!("test-shard-{shard} =");
+        let declared: Vec<String> = ["rsid", "rsid-store"]
+            .into_iter()
+            .filter(|package| {
+                self.manifest(package).is_some_and(|text| {
+                    text.lines()
+                        .any(|line| line.trim_start().starts_with(&needle))
+                })
+            })
+            .map(str::to_owned)
+            .collect();
+        if declared.is_empty() {
+            rsid_shard_packages(shard)
+                .iter()
+                .map(|package| (*package).to_owned())
+                .collect()
+        } else {
+            declared
+        }
+    }
+}
+
+fn isolated_retry_command(
+    command: &GuardCommand,
+    name: &str,
+    tree: ShardTree<'_>,
+) -> Result<GuardCommand, String> {
     if name.is_empty()
         || !name
             .bytes()
@@ -2543,10 +2661,15 @@ fn isolated_retry_command(command: &GuardCommand, name: &str) -> Result<GuardCom
     if retry.program == "scripts/run-rsid-test-shards.sh" {
         let shard = retry.args.get(1).ok_or("rsid shard command has no shard")?;
         retry.program = "cargo".into();
-        retry.args = vec![
-            "test".into(),
-            "-p".into(),
-            "rsid".into(),
+        let shard_packages = tree.packages(shard);
+        if shard_packages.is_empty() {
+            return Err(format!("unknown rsid shard for isolated retry: {shard}"));
+        }
+        let mut args = vec!["test".to_owned()];
+        for package in shard_packages {
+            args.extend(["-p".to_owned(), package]);
+        }
+        args.extend([
             "--lib".into(),
             "--no-default-features".into(),
             "--features".into(),
@@ -2555,7 +2678,8 @@ fn isolated_retry_command(command: &GuardCommand, name: &str) -> Result<GuardCom
             "--".into(),
             "--exact".into(),
             "--test-threads=4".into(),
-        ];
+        ]);
+        retry.args = args;
     } else if retry.program == "cargo" {
         let separator = retry
             .args
@@ -2578,13 +2702,76 @@ fn isolated_retry_command(command: &GuardCommand, name: &str) -> Result<GuardCom
     Ok(retry)
 }
 
+/// True when an isolated retry ran no test. A shard retry spans every package
+/// that declares the shard feature (`-p rsid -p rsid-store`), and the package
+/// without the test prints its own `running 0 tests`, so that line alone proves
+/// nothing: a retry ran the test when any package ran one (`running N tests`,
+/// N > 0) or printed the test's own result line (#1167).
+fn retry_ran_no_test(output: &str, name: &str) -> bool {
+    let mut saw_zero = false;
+    for line in output.lines().map(str::trim) {
+        if line
+            .strip_prefix("test ")
+            .is_some_and(|rest| rest.starts_with(&format!("{name} ... ")))
+        {
+            return false;
+        }
+        if let Some(count) = line
+            .strip_prefix("running ")
+            .and_then(|rest| rest.strip_suffix(" tests").or(rest.strip_suffix(" test")))
+        {
+            match count.parse::<u64>() {
+                Ok(0) => saw_zero = true,
+                Ok(_) => return false,
+                Err(_) => {}
+            }
+        }
+    }
+    saw_zero
+}
+
+/// Whether the source's diff can have changed the module a failing test lives
+/// in. The first segment of the test path names its module; a changed file
+/// under `src/` whose directory or file stem equals it touches it. Anything
+/// that cannot be read (no diff, a manifest or build-script change) counts as
+/// touched, so an unknown never lets a failure through (#1167).
+fn source_touches_test_module(changed: Option<&[String]>, name: &str) -> bool {
+    let Some(changed) = changed else {
+        return true;
+    };
+    let module = name.split("::").next().unwrap_or(name);
+    changed.iter().any(|path| {
+        let path = Path::new(path);
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default();
+        if matches!(file, "Cargo.toml" | "Cargo.lock" | "build.rs") {
+            return true;
+        }
+        let mut under_src = false;
+        for component in path.components() {
+            let component = component.as_os_str().to_str().unwrap_or_default();
+            if under_src
+                && (component == module
+                    || Path::new(component).file_stem().and_then(|s| s.to_str()) == Some(module))
+            {
+                return true;
+            }
+            under_src |= component == "src";
+        }
+        false
+    })
+}
+
 /// The isolated retry of one failure with its own bounded guard, so a hung
 /// retry fails the gate quickly instead of holding it for the shard timeout.
 fn bounded_isolated_retry_command(
     command: &GuardCommand,
     name: &str,
+    tree: ShardTree<'_>,
 ) -> Result<GuardCommand, String> {
-    let mut isolated = isolated_retry_command(command, name)?;
+    let mut isolated = isolated_retry_command(command, name, tree)?;
     isolated.timeout = retry_timeout(command.timeout);
     Ok(isolated)
 }
@@ -2605,7 +2792,7 @@ async fn run_isolated_retry(
     command: &GuardCommand,
     name: &str,
 ) -> Result<rsid::integration::GuardCommandReport, String> {
-    let isolated = bounded_isolated_retry_command(command, name)?;
+    let isolated = bounded_isolated_retry_command(command, name, ShardTree::Worktree(worktree))?;
     let report = run_one_guard(worktree, spec, &isolated).await?;
     if report.status == rsid::integration::GuardStatus::TimedOut {
         return Err(retry_hung_error(name, isolated.timeout));
@@ -2845,6 +3032,96 @@ fn shard_cache_key(fingerprint: &str, env_class: &str) -> Result<String, String>
     ))
 }
 
+/// Where a test guard's base result lives in the persistent base cache.
+struct BaseCacheIdentity {
+    /// Slot file stem (`[A-Za-z0-9-]+`).
+    slot_label: String,
+    /// `sha256:` digest naming the slot directory under the base SHA.
+    slot_key: String,
+    /// Human label printed in `base_reused=`.
+    display: String,
+}
+
+/// `(shard, jobs, filterset)` of a rsid shard command with or without
+/// `--filterset`; full shards have `None` for the filterset.
+fn shard_command_parts(command: &GuardCommand) -> Option<(&str, u32, Option<&str>)> {
+    if let Some((shard, jobs)) = full_shard(command) {
+        return Some((shard, jobs, None));
+    }
+    if command.program != "scripts/run-rsid-test-shards.sh" || command.args.len() != 6 {
+        return None;
+    }
+    let args = &command.args;
+    if args[0] != "shard"
+        || args[2] != "--jobs"
+        || args[4] != "--filterset"
+        || !RSID_SHARDS.contains(&args[1].as_str())
+    {
+        return None;
+    }
+    Some((&args[1], args[3].parse().ok()?, Some(&args[5])))
+}
+
+fn sha256_digest_of(text: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(text.as_bytes()))
+    )
+}
+
+/// The persistent base-cache identity of a test guard (#1132). The base only
+/// changes when a batch publishes, so the same base SHA, command and
+/// environment class always reproduces the same base failures: a second batch
+/// on that base reads the earlier result instead of recompiling and rerunning
+/// the base side. `Ok(None)` means the command shape is not cacheable.
+fn base_cache_identity(
+    candidate_worktree: &Path,
+    base: &str,
+    command: &GuardCommand,
+    env_class: &str,
+) -> Result<Option<BaseCacheIdentity>, String> {
+    if let Some((shard, jobs, filterset)) = shard_command_parts(command) {
+        let fingerprint = shard_fingerprint(candidate_worktree, base, shard, jobs)?;
+        let shard_key = shard_cache_key(&fingerprint, env_class)?;
+        return Ok(Some(match filterset {
+            None => BaseCacheIdentity {
+                slot_label: shard.to_owned(),
+                slot_key: shard_key,
+                display: shard.to_owned(),
+            },
+            Some(filterset) => BaseCacheIdentity {
+                slot_label: shard.to_owned(),
+                slot_key: sha256_digest_of(&format!("{shard_key}\nfilterset={filterset}")),
+                display: format!("{shard}[{filterset}]"),
+            },
+        }));
+    }
+    if command.program != "cargo" || cargo_test_package(command).is_none() {
+        return Ok(None);
+    }
+    let Ok(rustc) = Command::new("rustc")
+        .arg("-vV")
+        .current_dir(candidate_worktree)
+        .output()
+    else {
+        return Ok(None);
+    };
+    if !rustc.status.success() {
+        return Ok(None);
+    }
+    let canonical = format!(
+        "cargo-test\nrustc={}\nargs={:?}\nenv={env_class}",
+        String::from_utf8_lossy(&rustc.stdout),
+        command.args
+    );
+    Ok(Some(BaseCacheIdentity {
+        slot_label: "cargo-test".into(),
+        slot_key: sha256_digest_of(&canonical),
+        display: format!("cargo {}", command.args.join(" ")),
+    }))
+}
+
 async fn run_shard_or_local(
     worktree: &Path,
     fingerprint_source: &Path,
@@ -3073,7 +3350,7 @@ async fn run_base_guard(
     .await?;
     if let (Some(reason), Some(direct)) = (
         static_inventory_refusal(&report),
-        direct_base_shard_command(command),
+        direct_base_shard_command(command, ShardTree::Worktree(&base_worktree)),
     ) {
         // A base whose shard inventory is statically red (for example an
         // ungated test) refuses before any test runs. That must not make the
@@ -3122,7 +3399,7 @@ fn static_inventory_refusal(report: &rsid::integration::GuardCommandReport) -> O
 /// The bounded feature harness `scripts/run-rsid-test-shards.sh shard` runs
 /// after its static check, as a direct command for a base whose check
 /// refused. `None` for any other command shape.
-fn direct_base_shard_command(command: &GuardCommand) -> Option<GuardCommand> {
+fn direct_base_shard_command(command: &GuardCommand, tree: ShardTree<'_>) -> Option<GuardCommand> {
     if command.program != "scripts/run-rsid-test-shards.sh"
         || command.args.first().map(String::as_str) != Some("shard")
     {
@@ -3140,20 +3417,19 @@ fn direct_base_shard_command(command: &GuardCommand) -> Option<GuardCommand> {
             .and_then(|index| command.args.get(index + 1))
             .cloned()
     };
-    let mut args: Vec<String> = [
-        "nextest",
-        "run",
-        "--profile",
-        "rsid-fast",
-        "-p",
-        "rsid",
-        "--lib",
-        "--no-default-features",
-        "--features",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    // The shard's packages: the ones that declare its feature (rsid, rsid-store).
+    let mut args: Vec<String> = ["nextest", "run", "--profile", "rsid-fast"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    for package in tree.packages(shard) {
+        args.extend(["-p".into(), package]);
+    }
+    args.extend(
+        ["--lib", "--no-default-features", "--features"]
+            .into_iter()
+            .map(String::from),
+    );
     args.push(format!("test-shard-{shard}"));
     args.extend(["--status-level", "all", "--final-status-level", "all", "-j"].map(String::from));
     args.push(flag("--jobs").unwrap_or_else(|| "4".into()));
@@ -3193,14 +3469,18 @@ async fn confirm_local_base_failure(
     repo: &Path,
     base: &str,
     spec: &GuardSpec,
-    isolated: &GuardCommand,
+    command: &GuardCommand,
     name: &str,
     gate: &mut TestGate,
 ) -> Result<bool, String> {
     let base_worktree = ensure_base_worktree(repo, base, gate)?;
-    let report = run_one_guard(&base_worktree, spec, isolated).await?;
+    // The packages come from the base's own manifests: a base cut before the
+    // #1021 S4 crate split has no rsid-store package.
+    let isolated =
+        bounded_isolated_retry_command(command, name, ShardTree::Worktree(&base_worktree))?;
+    let report = run_one_guard(&base_worktree, spec, &isolated).await?;
     let output = format!("{}\n{}", report.stdout_tail, report.stderr_tail);
-    if output.contains("running 0 tests") {
+    if retry_ran_no_test(&output, name) {
         return Err(format!("local base isolated test did not run {name}"));
     }
     let failures = observed_test_failures(&report)?;
@@ -3249,7 +3529,175 @@ fn command_scratch_path(
     Ok(path)
 }
 
+/// Build commands for the shard guards of a gate: the harness's own nextest
+/// invocation with `--no-run`, so the later real run finds every binary built.
+fn shard_build_commands(spec: &GuardSpec, tree: ShardTree<'_>) -> Vec<GuardCommand> {
+    spec.commands
+        .iter()
+        .filter(|command| shard_command_parts(command).is_some())
+        .filter_map(|command| direct_base_shard_command(command, tree))
+        .map(|mut build| {
+            // `cargo nextest run --no-run`: compile only.
+            build.args.insert(2, "--no-run".into());
+            build
+        })
+        .collect()
+}
+
+/// Whether the gate may compile the candidate and base shard binaries
+/// concurrently (`RSI_LANDER_PREBUILD=0` turns it off). They build into
+/// separate target directories, and each build still goes through the
+/// build-slot wrapper, so the memory and load limits keep applying.
+fn prebuild_enabled(gate: &TestGate) -> bool {
+    // Unit tests with fake cargo shims count invocations, so they opt in.
+    gate.prebuild_forced
+        || (!cfg!(test) && std::env::var("RSI_LANDER_PREBUILD").map_or(true, |value| value != "0"))
+}
+
+async fn prebuild_stream(
+    worktree: PathBuf,
+    spec: GuardSpec,
+    builds: Vec<GuardCommand>,
+) -> Result<(), String> {
+    for build in &builds {
+        let report = run_one_guard(&worktree, &spec, build).await?;
+        if report.status != rsid::integration::GuardStatus::Passed {
+            // The gate loop reports the real failure; stop wasting compiles.
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Compile the candidate shard binaries and the not-yet-cached base shard
+/// binaries at the same time (#1132). Best effort: a failed prebuild only
+/// means the sequential gate loop compiles as before.
+async fn prebuild_shard_binaries(
+    repo: &Path,
+    candidate_worktree: &Path,
+    base: &str,
+    spec: &GuardSpec,
+    gate: &mut TestGate,
+    disk_scratch_shards: &BTreeSet<String>,
+) {
+    if !prebuild_enabled(gate) {
+        return;
+    }
+    let candidate_builds = shard_build_commands(spec, ShardTree::Worktree(candidate_worktree));
+    if candidate_builds.is_empty() {
+        return;
+    }
+    // Only the base shards whose result is not already cached need a base build.
+    let mut base_builds = Vec::new();
+    for command in &spec.commands {
+        let Some(build) = direct_base_shard_command(
+            command,
+            ShardTree::Revision {
+                repo,
+                revision: base,
+            },
+        ) else {
+            continue;
+        };
+        if shard_command_parts(command).is_none()
+            || gate
+                .base_cache
+                .contains_key(&(base.to_owned(), format!("{command:?}")))
+        {
+            continue;
+        }
+        let mut build = build;
+        build.args.insert(2, "--no-run".into());
+        if let Some(root) = gate.cache_root.as_deref() {
+            let env_class = shard_env_class(
+                &spec.env,
+                shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
+            );
+            if let Ok(Some(identity)) =
+                base_cache_identity(candidate_worktree, base, command, &env_class)
+            {
+                if base_cache::BaseShardSlot::peek(
+                    root,
+                    base,
+                    &identity.slot_label,
+                    &identity.slot_key,
+                ) {
+                    continue;
+                }
+            }
+        }
+        base_builds.push(build);
+    }
+    let base_worktree = if base_builds.is_empty() {
+        None
+    } else {
+        ensure_base_worktree(repo, base, gate).ok()
+    };
+    let mut scratch_spec = spec.clone();
+    if let Some(scratch) = &gate.scratch {
+        scratch_spec.env.insert(
+            "TMPDIR".into(),
+            scratch.path().to_string_lossy().into_owned(),
+        );
+    }
+    let started = Instant::now();
+    let candidate = prebuild_stream(
+        candidate_worktree.to_path_buf(),
+        scratch_spec.clone(),
+        candidate_builds,
+    );
+    let base_side = async {
+        match base_worktree {
+            Some(path) => prebuild_stream(path, scratch_spec.clone(), base_builds).await,
+            None => Ok(()),
+        }
+    };
+    let (candidate_result, base_result) = tokio::join!(candidate, base_side);
+    for result in [candidate_result, base_result] {
+        if let Err(error) = result {
+            eprintln!("prebuild skipped: {error}");
+        }
+    }
+    gate.prebuild_secs += started.elapsed().as_secs();
+}
+
+/// The gate with its #1132 timing evidence: shards, base cache hits, base
+/// runs, prebuild and wall seconds, printed as one `gate_timing=` line the
+/// merge queue keeps in the batch outcome so the manager can read the ETA.
 async fn run_affected_gate(
+    repo: &Path,
+    candidate_worktree: &Path,
+    base: &str,
+    spec: &GuardSpec,
+    gate: &mut TestGate,
+    disk_scratch_shards: &BTreeSet<String>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let result = run_affected_gate_inner(
+        repo,
+        candidate_worktree,
+        base,
+        spec,
+        gate,
+        disk_scratch_shards,
+    )
+    .await;
+    let shards = spec
+        .commands
+        .iter()
+        .filter(|command| is_test_guard(command))
+        .count();
+    println!(
+        "gate_timing=shards={shards} base_hits={} base_runs={} prebuild_secs={} wall_secs={}",
+        gate.base_reused.len(),
+        gate.base_runs,
+        gate.prebuild_secs,
+        started.elapsed().as_secs()
+    );
+    result
+}
+
+async fn run_affected_gate_inner(
     repo: &Path,
     candidate_worktree: &Path,
     base: &str,
@@ -3274,6 +3722,17 @@ async fn run_affected_gate(
     }
     if !gate.skip_tests {
         prefetch_remote_shards(candidate_worktree, base, spec, gate).await?;
+    }
+    if !gate.skip_tests && gate.remote.is_none() {
+        prebuild_shard_binaries(
+            repo,
+            candidate_worktree,
+            base,
+            spec,
+            gate,
+            disk_scratch_shards,
+        )
+        .await;
     }
     for command in spec
         .commands
@@ -3313,9 +3772,13 @@ async fn run_affected_gate(
         }
         let key = (base.to_owned(), format!("{command:?}"));
         let base_failures = if let Some(cached) = gate.base_cache.get(&key) {
-            if let Some((shard, _)) = full_shard(command) {
+            if let Some((shard, _, filterset)) = shard_command_parts(command) {
+                let display = match filterset {
+                    Some(filterset) => format!("{shard}[{filterset}]"),
+                    None => shard.to_owned(),
+                };
                 gate.base_reused
-                    .insert(format!("{base}:{shard}:in-process"));
+                    .insert(format!("{base}:{display}:in-process"));
             }
             cached.clone()
         } else {
@@ -3324,34 +3787,37 @@ async fn run_affected_gate(
             } else {
                 gate.cache_root.clone()
             };
-            let failures = if let (Some(root), Some((shard, jobs))) =
-                (cache_root.as_deref(), full_shard(command))
-            {
-                let fingerprint = shard_fingerprint(candidate_worktree, base, shard, jobs)?;
-                let env_class = shard_env_class(
-                    &scratch_spec.env,
-                    shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
-                );
-                let slot_key = shard_cache_key(&fingerprint, &env_class)?;
+            let identity = match cache_root.as_deref() {
+                Some(_) => {
+                    let env_class = shard_env_class(
+                        &scratch_spec.env,
+                        shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
+                    );
+                    base_cache_identity(candidate_worktree, base, command, &env_class)?
+                }
+                None => None,
+            };
+            let failures = if let (Some(root), Some(identity)) = (cache_root.as_deref(), identity) {
                 // The holder runs one base guard (bounded by guard_timeout), so a wait
                 // beyond twice that means the holder is wedged: refuse, do not hang.
                 let slot = base_cache::BaseShardSlot::acquire_within(
                     root,
                     base,
-                    shard,
-                    &slot_key,
+                    &identity.slot_label,
+                    &identity.slot_key,
                     guard_timeout() * 2,
                 )
                 .await?;
                 if let Some(entry) = slot.read()? {
                     gate.base_reused
-                        .insert(format!("{base}:{shard}:{}", entry.provenance));
+                        .insert(format!("{base}:{}:{}", identity.display, entry.provenance));
                     if entry.provenance.starts_with("qa:") {
                         gate.qa_cache_provenance
                             .insert(key.clone(), entry.provenance.clone());
                     }
                     entry.failures
                 } else {
+                    gate.base_runs += 1;
                     let failures = run_base_guard(
                         repo,
                         base,
@@ -3363,14 +3829,15 @@ async fn run_affected_gate(
                     .await?;
                     slot.write(&base_cache::BaseShardEntry::new(
                         base,
-                        shard,
-                        &slot_key,
+                        &identity.slot_label,
+                        &identity.slot_key,
                         failures.clone(),
                         "lander",
                     ))?;
                     failures
                 }
             } else {
+                gate.base_runs += 1;
                 run_base_guard(repo, base, &scratch_spec, command, gate, candidate_worktree).await?
             };
             gate.base_cache.insert(key.clone(), failures.clone());
@@ -3398,13 +3865,40 @@ async fn run_affected_gate(
             .difference(&base_failures)
             .cloned()
             .collect();
+        let mut changed_files: Option<Option<Vec<String>>> = None;
         for name in &new_failures {
-            let retry =
+            let mut retry =
                 run_isolated_retry(candidate_worktree, &scratch_spec, command, name).await?;
-            if retry.stdout_tail.contains("running 0 tests")
-                || retry.stderr_tail.contains("running 0 tests")
-            {
-                return Err(format!("isolated retry did not run {name}"));
+            let ran_no_test = |retry: &rsid::integration::GuardCommandReport| {
+                retry_ran_no_test(
+                    &format!("{}\n{}", retry.stdout_tail, retry.stderr_tail),
+                    name,
+                )
+            };
+            if ran_no_test(&retry) {
+                // One more attempt before the failure is called unverifiable.
+                retry =
+                    run_isolated_retry(candidate_worktree, &scratch_spec, command, name).await?;
+            }
+            if ran_no_test(&retry) {
+                // The gate could not verify this failure. It refuses only when
+                // the source can have caused it; a failure in a module the
+                // source does not touch is reported, not charged (#1167).
+                if changed_files.is_none() {
+                    changed_files = Some(
+                        git_text(candidate_worktree, &["diff", "--name-only", base, "HEAD"])
+                            .ok()
+                            .map(|text| text.lines().map(str::to_owned).collect()),
+                    );
+                }
+                let changed = changed_files.as_ref().and_then(|files| files.as_deref());
+                if source_touches_test_module(changed, name) {
+                    return Err(format!(
+                        "unverified candidate failure (isolated retry did not run twice, module touched by the source): {name}"
+                    ));
+                }
+                gate.unverified.insert(name.clone());
+                continue;
             }
             let retry_failures = observed_test_failures(&retry)?;
             let persistent: BTreeSet<_> =
@@ -3416,15 +3910,8 @@ async fn run_affected_gate(
                             "QA cached base {provenance} has unexpected isolated failures: {persistent:?}"
                         ));
                     }
-                    match confirm_local_base_failure(
-                        repo,
-                        base,
-                        &scratch_spec,
-                        &bounded_isolated_retry_command(command, name)?,
-                        name,
-                        gate,
-                    )
-                    .await
+                    match confirm_local_base_failure(repo, base, &scratch_spec, command, name, gate)
+                        .await
                     {
                         Ok(true) => {
                             gate.base_reds.insert(name.clone());
@@ -3572,7 +4059,7 @@ fn affected_crate_guard_spec(
                 commands.push(check);
             }
             for filter in package_filters {
-                let focused = if package == "rsid" {
+                let focused = if is_rsid_shard_package(package) {
                     match filter.strip_prefix("shard:") {
                         Some(shard) => rsid_shard_guard_command(shard)?,
                         None => cargo_guard_command(package, Some(filter)),
@@ -3584,11 +4071,15 @@ fn affected_crate_guard_spec(
                     commands.push(focused);
                 }
             }
-        } else if package == "rsid" {
+        } else if is_rsid_shard_package(package) {
             // Unfiltered: without a proven file-to-shard map, gate all
-            // shards for an rsid change.
+            // shards for an rsid or rsid-store change (the store's library
+            // tests run inside the shared shards).
             for shard in RSID_SHARDS {
-                commands.push(rsid_shard_guard_command(shard)?);
+                let shard_command = rsid_shard_guard_command(shard)?;
+                if !commands.contains(&shard_command) {
+                    commands.push(shard_command);
+                }
             }
         } else {
             commands.push(cargo_guard_command(package, None));
@@ -4631,7 +5122,7 @@ mod tests {
             write(
                 &repo,
                 "tools/released-migrations.json",
-                "{\"migration_file\":\"crates/rsid/src/store/mod.rs\",\"protected_sections\":{}}\n",
+                "{\"migration_file\":\"crates/rsid-store/src/store/mod.rs\",\"protected_sections\":{}}\n",
             );
             git_run(&repo, &["add", "."]);
             git_run(&repo, &["commit", "-q", "-m", "base"]);
@@ -5073,7 +5564,7 @@ exit 0
                 .find(|line| line.starts_with(&base))
                 .expect("the base ran the direct bounded harness");
             assert!(
-                base_direct.contains("nextest run --profile rsid-fast -p rsid --lib")
+                base_direct.contains("nextest run --profile rsid-fast -p rsid-store --lib")
                     && base_direct.contains("--features test-shard-store-01")
                     && base_direct.contains("-j 4"),
                 "{base_direct}"
@@ -5096,8 +5587,11 @@ exit 0
 
     #[test]
     fn direct_base_shard_command_mirrors_the_shard_script_harness() {
-        let plain =
-            direct_base_shard_command(&rsid_shard_guard_command("session-05").unwrap()).unwrap();
+        let plain = direct_base_shard_command(
+            &rsid_shard_guard_command("session-05").unwrap(),
+            ShardTree::Static,
+        )
+        .unwrap();
         assert_eq!(plain.program, "cargo");
         assert_eq!(
             plain.args.join(" "),
@@ -5106,6 +5600,7 @@ exit 0
         );
         let filtered = direct_base_shard_command(
             &rsid_shard_guard_command("store-01:test(demo_filter)").unwrap(),
+            ShardTree::Static,
         )
         .unwrap();
         assert!(
@@ -5113,7 +5608,72 @@ exit 0
                 .args
                 .ends_with(&["--filterset".to_string(), "test(demo_filter)".to_string()])
         );
-        assert!(direct_base_shard_command(&cargo_guard_command("demo", None)).is_none());
+        assert!(
+            direct_base_shard_command(&cargo_guard_command("demo", None), ShardTree::Static)
+                .is_none()
+        );
+    }
+
+    /// A base cut before the #1021 S4 crate split declares every shard in
+    /// `rsid` alone: its direct-harness and isolated-retry commands must name
+    /// that package, not the candidate binary's current-layout map (which has
+    /// store-01 in rsid-store only).
+    #[test]
+    fn base_shard_commands_follow_the_manifests_of_the_tree_they_run_in() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = |package: &str, features: &[&str]| {
+            let mut text = String::from("[features]\ndefault = []\ntest-shard-mode = []\n");
+            for feature in features {
+                text.push_str(&format!("test-shard-{feature} = [\"test-shard-mode\"]\n"));
+            }
+            write(root.path(), &format!("crates/{package}/Cargo.toml"), &text);
+        };
+        // Pre-split: rsid declares store-01 and session-05, no rsid-store.
+        manifest("rsid", &["store-01", "session-05"]);
+        let command = rsid_shard_guard_command("store-01").unwrap();
+        let pre_split = ShardTree::Worktree(root.path());
+        let direct = direct_base_shard_command(&command, pre_split).unwrap();
+        assert!(
+            direct
+                .args
+                .join(" ")
+                .contains("--profile rsid-fast -p rsid --lib --no-default-features --features test-shard-store-01"),
+            "{:?}",
+            direct.args
+        );
+        assert!(!direct.args.contains(&"rsid-store".to_string()));
+        let retry = isolated_retry_command(&command, "store::tests::red", pre_split).unwrap();
+        assert_eq!(
+            retry.args[..4],
+            ["test", "-p", "rsid", "--lib"],
+            "{:?}",
+            retry.args
+        );
+        // Split: rsid-store declares store-01, and store-04 spans both.
+        manifest("rsid", &["store-04", "session-05"]);
+        manifest("rsid-store", &["store-01", "store-04"]);
+        let split = ShardTree::Worktree(root.path());
+        let direct = direct_base_shard_command(&command, split).unwrap();
+        assert!(
+            direct.args.join(" ").contains("-p rsid-store --lib"),
+            "{:?}",
+            direct.args
+        );
+        let shared = rsid_shard_guard_command("store-04").unwrap();
+        let direct = direct_base_shard_command(&shared, split).unwrap();
+        assert!(
+            direct
+                .args
+                .join(" ")
+                .contains("-p rsid -p rsid-store --lib"),
+            "{:?}",
+            direct.args
+        );
+        // A tree with no readable manifest falls back to the current map.
+        let empty = tempfile::tempdir().unwrap();
+        let fallback =
+            direct_base_shard_command(&command, ShardTree::Worktree(empty.path())).unwrap();
+        assert!(fallback.args.join(" ").contains("-p rsid-store --lib"));
     }
 
     /// A base red named in a snapshot prints one `known_red=` annotation; an
@@ -5172,6 +5732,118 @@ exit 0
             vec!["known_red=demo::red:#77:regression".to_string()]
         );
         assert!(known_red_lines(&gate.base_reds, &gate.base_red_texts, None).is_empty());
+    }
+
+    /// #1167: a shard retry spans `-p rsid -p rsid-store`; the package without
+    /// the test prints `running 0 tests` even though the other ran it.
+    #[test]
+    fn a_zero_test_package_does_not_hide_the_package_that_ran_the_test() {
+        let name = "remote_read::owner::tests::kept";
+        let split =
+            "running 1 test\ntest remote_read::owner::tests::kept ... ok\n\nrunning 0 tests\n";
+        assert!(!retry_ran_no_test(split, name));
+        assert!(!retry_ran_no_test(
+            "running 0 tests\nrunning 1 test\n",
+            name
+        ));
+        assert!(retry_ran_no_test(
+            "running 0 tests\nrunning 0 tests\n",
+            name
+        ));
+        // No count line at all (a quiet stub) is not evidence of an empty run.
+        assert!(!retry_ran_no_test("", name));
+    }
+
+    #[test]
+    fn module_touch_follows_the_failing_tests_first_path_segment() {
+        let changed = |paths: &[&str]| paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        let edit = changed(&["crates/rsid/src/session/mod.rs", "docs/a.md"]);
+        assert!(source_touches_test_module(Some(&edit), "session::tests::x"));
+        assert!(!source_touches_test_module(
+            Some(&edit),
+            "remote_read::owner::tests::x"
+        ));
+        let file = changed(&["crates/rsid/src/remote_read/owner.rs"]);
+        assert!(source_touches_test_module(
+            Some(&file),
+            "remote_read::owner::tests::x"
+        ));
+        let stem = changed(&["crates/rsid/src/remote_read.rs"]);
+        assert!(source_touches_test_module(
+            Some(&stem),
+            "remote_read::owner::tests::x"
+        ));
+        let manifest = changed(&["crates/rsid/Cargo.toml"]);
+        assert!(source_touches_test_module(
+            Some(&manifest),
+            "remote_read::x"
+        ));
+        assert!(source_touches_test_module(None, "remote_read::x"));
+    }
+
+    /// #1167: a candidate-only failure whose isolated retry cannot run is
+    /// retried once more, then reported `unverified` without refusing when the
+    /// source does not touch its module, and refused when it does. A real,
+    /// reproducible new failure still refuses.
+    #[tokio::test]
+    async fn an_unrunnable_retry_is_unverified_not_new() {
+        for (scenario, touched_file) in [
+            ("untouched", "crates/demo/src/elsewhere.rs"),
+            ("touched", "crates/demo/src/other.rs"),
+        ] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                touched_file,
+                "pub fn value() {}\n",
+                "candidate",
+            );
+            let candidate_tree = fixture.root.path().join("candidate-gate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    candidate_tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let retries = fixture.root.path().join("retries");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\nif [ \"$oid\" = '{candidate}' ]; then\n  case \"$*\" in\n    *--exact*) echo x >> '{retries}'; echo 'running 0 tests'; exit 0;;\n    *) echo 'test other::red ... FAILED'; exit 1;;\n  esac\nfi",
+                candidate = candidate,
+                retries = retries.display(),
+            ));
+            let spec = GuardSpec {
+                commands: vec![cargo_guard_command("demo", None)],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &candidate_tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let attempts = fs::read_to_string(&retries).unwrap().lines().count();
+            assert_eq!(attempts, 2, "{scenario}: one retry plus one more attempt");
+            if scenario == "untouched" {
+                result.expect("an unverifiable untouched-module failure does not refuse");
+                assert!(gate.unverified.contains("other::red"));
+                assert!(gate.flakes.is_empty());
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("unverified candidate failure"), "{error}");
+                assert!(!error.contains("new test failures"), "{error}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -5264,6 +5936,290 @@ exit 0
             assert!(base_target.starts_with(fixture.root.path().to_str().unwrap()));
             assert!(candidate_target.starts_with(fixture.root.path().to_str().unwrap()));
         }
+    }
+
+    /// #1132: a filtered shard gate and a `cargo test -p` gate persist their
+    /// base result per (base tip, command), so a later batch on the same base
+    /// skips the base side; another base tip or another filterset re-runs it.
+    #[tokio::test]
+    async fn persistent_base_cache_covers_filtered_shards_and_cargo_tests() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let candidate_tree = fixture.root.path().join("filtered-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let log = fixture.root.path().join("filtered-runs.log");
+        let cache_root = fixture.root.path().join("filtered-cache");
+        let spec_for = |filter: &str| GuardSpec {
+            commands: vec![rsid_shard_guard_command(&format!("store-01:{filter}")).unwrap()],
+            env: BTreeMap::from([
+                ("RSI_QA899_RUN_LOG".into(), log.display().to_string()),
+                ("RSI_QA899_FAIL_ON_OID".into(), "none".into()),
+            ]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let base_runs = |oid: &str| {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| *line == oid)
+                .count()
+        };
+        let gate_once = |spec: GuardSpec, base: String, tree: PathBuf| {
+            let repo = fixture.repo.clone();
+            let cache_root = cache_root.clone();
+            async move {
+                let mut gate = TestGate {
+                    cache_root: Some(cache_root),
+                    ..TestGate::default()
+                };
+                run_affected_gate(&repo, &tree, &base, &spec, &mut gate, &BTreeSet::new())
+                    .await
+                    .expect("gate");
+                for tree in gate.base_worktrees.values() {
+                    git_run(
+                        &repo,
+                        &["worktree", "remove", "--force", tree.to_str().unwrap()],
+                    );
+                }
+                gate
+            }
+        };
+        let first = gate_once(
+            spec_for("test(demo)"),
+            fixture.base.clone(),
+            candidate_tree.clone(),
+        )
+        .await;
+        assert!(first.base_reused.is_empty());
+        assert_eq!(base_runs(&fixture.base), 1);
+        let second = gate_once(
+            spec_for("test(demo)"),
+            fixture.base.clone(),
+            candidate_tree.clone(),
+        )
+        .await;
+        assert_eq!(
+            base_runs(&fixture.base),
+            1,
+            "same base and filter skip the base side"
+        );
+        assert!(
+            second
+                .base_reused
+                .contains(&format!("{}:store-01[test(demo)]:lander", fixture.base)),
+            "{:?}",
+            second.base_reused
+        );
+        assert_eq!(base_runs(&candidate), 2, "the candidate side still runs");
+        gate_once(
+            spec_for("test(other)"),
+            fixture.base.clone(),
+            candidate_tree.clone(),
+        )
+        .await;
+        assert_eq!(
+            base_runs(&fixture.base),
+            2,
+            "another filterset re-runs the base"
+        );
+
+        let new_base = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/other.rs",
+            "pub fn other() {}\n",
+            "a published batch moves the base",
+        );
+        let new_candidate = fixture.commit(
+            &new_base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate2\" }\n",
+            "candidate on the new base",
+        );
+        let new_tree = fixture.root.path().join("filtered-candidate-2");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                new_tree.to_str().unwrap(),
+                &new_candidate,
+            ],
+        );
+        let moved = gate_once(spec_for("test(demo)"), new_base.clone(), new_tree).await;
+        assert_eq!(
+            base_runs(&new_base),
+            1,
+            "a different base tip re-runs the base"
+        );
+        assert!(moved.base_reused.is_empty());
+    }
+
+    /// #1132: the gate compiles the candidate and the uncached base shard
+    /// binaries up front (`--no-run`), skips the base build once its result
+    /// is cached, and records the timing.
+    #[tokio::test]
+    async fn gate_prebuilds_uncached_base_and_candidate_shard_binaries() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let tree = fixture.root.path().join("prebuild-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let builds = fixture.root.path().join("prebuilds.log");
+        fixture.add_fake_cargo(&format!(
+            "oid=$(/usr/bin/git rev-parse HEAD)\ncase \"$*\" in *--no-run*) printf '%s %s\\n' \"$oid\" \"$*\" >> '{}';; esac",
+            builds.display()
+        ));
+        let shard_log = fixture.root.path().join("prebuild-shard-runs.log");
+        let spec = GuardSpec {
+            commands: vec![rsid_shard_guard_command("store-01:test(demo)").unwrap()],
+            env: BTreeMap::from([
+                ("RSI_QA899_RUN_LOG".into(), shard_log.display().to_string()),
+                ("RSI_QA899_FAIL_ON_OID".into(), "none".into()),
+            ]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let cache_root = fixture.root.path().join("prebuild-cache");
+        let old_path = use_fake_path(&fixture);
+        let mut gates = Vec::new();
+        for round in 0..2 {
+            let mut gate = TestGate {
+                cache_root: Some(cache_root.clone()),
+                prebuild_forced: true,
+                ..TestGate::default()
+            };
+            run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await
+            .expect("gate");
+            if round == 0 {
+                for path in gate.base_worktrees.values() {
+                    git_run(
+                        &fixture.repo,
+                        &["worktree", "remove", "--force", path.to_str().unwrap()],
+                    );
+                }
+            }
+            gates.push(gate);
+        }
+        restore_path(old_path);
+        let log = fs::read_to_string(&builds).unwrap();
+        let count = |oid: &str| log.lines().filter(|line| line.starts_with(oid)).count();
+        assert_eq!(count(&fixture.base), 1, "{log}");
+        assert_eq!(count(&candidate), 2, "{log}");
+        assert!(log.contains("--features test-shard-store-01"), "{log}");
+        assert_eq!(gates[0].base_runs, 1);
+        assert_eq!(gates[1].base_runs, 0);
+    }
+
+    #[test]
+    fn shard_build_commands_compile_only_the_nextest_shard_binaries() {
+        let spec = GuardSpec {
+            commands: vec![
+                rsid_shard_guard_command("store-01").unwrap(),
+                rsid_shard_guard_command("session-02:test(rolling_queue)").unwrap(),
+                cargo_guard_command("demo", None),
+            ],
+            env: BTreeMap::new(),
+            output_tail_bytes: 1024,
+        };
+        let builds = shard_build_commands(&spec, ShardTree::Static);
+        assert_eq!(builds.len(), 2);
+        for build in &builds {
+            assert_eq!(&build.args[..3], ["nextest", "run", "--no-run"]);
+        }
+        assert!(builds[1].args.join(" ").contains("test-shard-session-02"));
+    }
+
+    #[tokio::test]
+    async fn persistent_base_cache_reuses_cargo_test_base_results() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let candidate_tree = fixture.root.path().join("cargo-cache-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let log = fixture.root.path().join("cargo-cache-runs");
+        fixture.add_fake_cargo(&format!(
+            "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> '{log}'\nif [ \"$oid\" = '{base}' ]; then echo 'test demo::red ... FAILED'; exit 1; fi",
+            log = log.display(),
+            base = fixture.base,
+        ));
+        let spec = GuardSpec {
+            commands: vec![cargo_guard_command("demo", None)],
+            env: BTreeMap::new(),
+            output_tail_bytes: 16 * 1024,
+        };
+        let cache_root = fixture.root.path().join("cargo-cache");
+        let old_path = use_fake_path(&fixture);
+        let mut reds = Vec::new();
+        for _ in 0..2 {
+            let mut gate = TestGate {
+                cache_root: Some(cache_root.clone()),
+                ..TestGate::default()
+            };
+            let result = run_affected_gate(
+                &fixture.repo,
+                &candidate_tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            result.expect("an identical base red is allowed");
+            reds.push(gate.base_reds.clone());
+        }
+        restore_path(old_path);
+        let lines = fs::read_to_string(log).unwrap();
+        assert_eq!(lines.lines().filter(|oid| *oid == fixture.base).count(), 1);
+        assert_eq!(lines.lines().filter(|oid| *oid == candidate).count(), 2);
+        assert!(reds.iter().all(|red| red.contains("demo::red")), "{reds:?}");
     }
 
     #[tokio::test]
@@ -6002,6 +6958,7 @@ fi",
         let retry = isolated_retry_command(
             &rsid_shard_guard_command("store-01").unwrap(),
             "store::tests::h1_trrev_v88_timed_out",
+            ShardTree::Static,
         )
         .unwrap();
         assert_eq!(retry.program, "cargo");
@@ -6264,14 +7221,15 @@ fi",
     #[test]
     fn shard_retry_targets_only_the_candidate_failure() {
         let command = rsid_shard_guard_command("store-01:test(existing_filter)").unwrap();
-        let retry = isolated_retry_command(&command, "store::tests::new_red").unwrap();
+        let retry =
+            isolated_retry_command(&command, "store::tests::new_red", ShardTree::Static).unwrap();
         assert_eq!(retry.program, "cargo");
         assert_eq!(
             retry.args,
             [
                 "test",
                 "-p",
-                "rsid",
+                "rsid-store",
                 "--lib",
                 "--no-default-features",
                 "--features",
@@ -7043,13 +8001,13 @@ repo = case.repo
 for name in ('scripts/rolling-landing-guard.py', 'tools/check-released-migrations.py', 'tools/rolling-migration-renumber.py'):
     case.write(repo, name, (root / name).read_text())
 case.write(repo, 'Cargo.toml', '[workspace]\nmembers = ["crates/rsid"]\nresolver = "2"\n')
-protected_path = 'crates/rsid/src/store/protected_fixture.rs'
+protected_path = 'crates/rsid-store/src/store/protected_fixture.rs'
 protected_text = '// RSI-RELEASED-MIGRATION-BEGIN: fixture-section\n// pinned\n// RSI-RELEASED-MIGRATION-END: fixture-section\n'
 case.write(repo, protected_path, protected_text)
 inventory = module.RENUMBER.guard.inventory({
     module.RENUMBER.STORE: case.base_store(),
-    'crates/rsid/src/store/cohort_settlement.rs': '',
-    'crates/rsid/src/store/tests.rs': case.base_tests(),
+    'crates/rsid-store/src/store/cohort_settlement.rs': '',
+    'crates/rsid-store/src/store/tests.rs': case.base_tests(),
     protected_path: protected_text,
 })
 case.write(repo, module.RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + '\n')
@@ -7079,7 +8037,7 @@ else:
     worktree = pathlib.Path(case.temp.name) / 'incoming'
     case.git(repo, 'worktree', 'add', '-q', '--detach', str(worktree), case.base)
     if change == 'store':
-        filename = 'crates/rsid/src/store/mod.rs'
+        filename = 'crates/rsid-store/src/store/mod.rs'
         (worktree / filename).chmod(0o755)
     elif change == 'catalog':
         filename = 'tools/released-migrations.json'
@@ -7089,7 +8047,7 @@ else:
             'renumber_tool': 'tools/rolling-migration-renumber.py',
             'released_tool': 'tools/check-released-migrations.py',
             'guard_tool': 'scripts/rolling-landing-guard.py',
-            'cohort': 'crates/rsid/src/store/cohort_settlement.rs',
+            'cohort': 'crates/rsid-store/src/store/cohort_settlement.rs',
             'protected': protected_path,
         }[change]
         comment = '# incoming\n' if change.endswith('tool') else '// incoming\n'
@@ -7165,8 +8123,11 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             let marker = fixture.root.path().join("advanced-once");
             let log = fixture.root.path().join("tested-commits");
             let metadata = serde_json::json!({
-                "workspace_members": ["rsid"],
-                "packages": [{"id":"rsid","name":"rsid","dependencies":[]}],
+                "workspace_members": ["rsid", "rsid-store"],
+                "packages": [
+                    {"id":"rsid","name":"rsid","dependencies":[]},
+                    {"id":"rsid-store","name":"rsid-store","dependencies":[]}
+                ],
             });
             let cargo = fixture.bin.join("cargo");
             fs::write(&cargo, format!(
@@ -7286,7 +8247,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[test]
     fn hermetic_migration_must_be_exactly_tip_plus_one_with_its_block() {
         let fixture = Fixture::new();
-        let store = "crates/rsid/src/store/mod.rs";
+        let store = "crates/rsid-store/src/store/mod.rs";
         let block = |version: u32| {
             format!(
                 "pub const LATEST_SCHEMA_VERSION: i32 = {version};\nfn migrate(version: i32) {{\n    if version < {version} {{\n    }}\n}}\n"
@@ -7351,7 +8312,8 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[test]
     fn hermetic_per_file_migration_must_be_exactly_tip_plus_one_with_its_block() {
         let fixture = Fixture::new();
-        let file = |version: u32| format!("crates/rsid/src/store/migrations/v{version:03}.rs");
+        let file =
+            |version: u32| format!("crates/rsid-store/src/store/migrations/v{version:03}.rs");
         let gate = |version: u32| {
             format!(
                 "impl Store {{\n    fn migrate_v{version:03}(&self, version: i32) {{\n        if version < {version} {{\n        }}\n    }}\n}}\n"
@@ -7405,7 +8367,8 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[test]
     fn hermetic_per_file_migrations_may_land_as_one_contiguous_run_from_tip_plus_one() {
         let fixture = Fixture::new();
-        let file = |version: u32| format!("crates/rsid/src/store/migrations/v{version:03}.rs");
+        let file =
+            |version: u32| format!("crates/rsid-store/src/store/migrations/v{version:03}.rs");
         let gate = |version: u32| {
             format!(
                 "impl Store {{\n    fn migrate_v{version:03}(&self, version: i32) {{\n        if version < {version} {{\n        }}\n    }}\n}}\n"
@@ -7459,6 +8422,137 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             "{}",
             unanchored.message
         );
+    }
+
+    /// Commit on `parent`: rename `from` to `to` and optionally rewrite `to`.
+    fn commit_move(
+        fixture: &Fixture,
+        parent: &str,
+        from: &str,
+        to: &str,
+        extra: Option<(&str, &str)>,
+    ) -> String {
+        let path = fixture
+            .root
+            .path()
+            .join(format!("mover-{}", uuid::Uuid::new_v4()));
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                path.to_str().unwrap(),
+                parent,
+            ],
+        );
+        fs::create_dir_all(path.join(to).parent().unwrap()).unwrap();
+        git_run(&path, &["mv", from, to]);
+        if let Some((file, content)) = extra {
+            write(&path, file, content);
+            git_run(&path, &["add", file]);
+        }
+        git_run(&path, &["commit", "-q", "-m", "move"]);
+        let oid = git_value(&path, &["rev-parse", "HEAD"]);
+        git_run(
+            &fixture.repo,
+            &["worktree", "remove", "--force", path.to_str().unwrap()],
+        );
+        oid
+    }
+
+    /// #1021 S4: `rsid-store/build.rs` runs only the new directory, so a
+    /// versioned unit left or added in the pre-split directory is refused
+    /// (the number and block checks would otherwise accept a migration the
+    /// daemon never executes), while a pre-split BASE is still read from its
+    /// own layout.
+    #[test]
+    fn hermetic_migrations_must_live_in_the_directory_the_store_build_consumes() {
+        let fixture = Fixture::new();
+        let old_file = |version: u32| format!("crates/rsid/src/store/migrations/v{version:03}.rs");
+        let new_file =
+            |version: u32| format!("crates/rsid-store/src/store/migrations/v{version:03}.rs");
+        let gate = |version: u32| {
+            format!(
+                "impl Store {{\n    fn migrate_v{version:03}(&self, version: i32) {{\n        if version < {version} {{\n        }}\n    }}\n}}\n"
+            )
+        };
+        write(
+            fixture.root.path(),
+            "tools/check-released-migrations.py",
+            "import sys\nsys.exit(0)\n",
+        );
+        let check = |target: &str, source: &str| {
+            landing_policy::check_with_work_and_proof(
+                &fixture.repo,
+                fixture.root.path(),
+                target,
+                source,
+                &[AcceptedPair {
+                    base: target.to_string(),
+                    source: source.to_string(),
+                }],
+                &[],
+                || Ok(vec![]),
+            )
+        };
+        // A pre-split base at V124.
+        let pre_split = fixture.commit(&fixture.base, &old_file(124), &gate(124), "pre-split V124");
+        // The S4 shape: the store tree (here its V124 unit) moves to the new
+        // directory; the old base's head is read from the old directory.
+        let split = commit_move(&fixture, &pre_split, &old_file(124), &new_file(124), None);
+        check(&pre_split, &split).expect("the layout move itself lands from a pre-split base");
+        // The first migration after the split is V125 in the new directory,
+        // counted from the pre-split base's head.
+        let next = fixture.commit(
+            &split,
+            &new_file(125),
+            &gate(125),
+            "V125 in the new directory",
+        );
+        check(&pre_split, &next).expect("V124 -> V125 across the layout move lands");
+        check(&split, &next).expect("V125 in the new directory lands on a split base");
+        // A bare old-path addition: valid V125 block, but in the dead directory.
+        let stray = fixture.commit(
+            &split,
+            &old_file(125),
+            &gate(125),
+            "V125 in the old directory",
+        );
+        let refused = check(&split, &stray).expect_err("an old-path migration must refuse");
+        assert_eq!(refused.fence, landing_policy::PolicyFence::MigrationNumber);
+        assert!(
+            refused
+                .message
+                .contains("crates/rsid-store/src/store/migrations")
+                && refused.message.contains(&old_file(125)),
+            "{}",
+            refused.message
+        );
+        // The same stray unit next to a correct new-path unit still refuses.
+        let mixed = fixture.commit(
+            &next,
+            &old_file(126),
+            &gate(126),
+            "V126 in the old directory",
+        );
+        assert!(check(&split, &mixed).is_err());
+        // A candidate that falls back to the pre-split layout on a split target.
+        let regress = commit_move(&fixture, &split, &new_file(124), &old_file(124), None);
+        let fell_back = check(&split, &regress).expect_err("falling back refuses");
+        assert_eq!(
+            fell_back.fence,
+            landing_policy::PolicyFence::MigrationNumber
+        );
+        assert!(
+            fell_back
+                .message
+                .contains("crates/rsid-store/src/store/migrations")
+        );
+        // A pre-split base and candidate (history before the split) still land.
+        let old_next = fixture.commit(&pre_split, &old_file(125), &gate(125), "pre-split V125");
+        check(&pre_split, &old_next).expect("both sides pre-split keep working");
     }
 
     #[test]
@@ -7783,9 +8877,9 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[test]
     fn released_guard_runs_for_pinned_file_without_store_mod_change() {
         let fixture = Fixture::new();
-        let protected = "crates/rsid/src/store/manager_ledger/facts.rs";
+        let protected = "crates/rsid-store/src/store/manager_ledger/facts.rs";
         let manifest = format!(
-            "{{\"migration_file\":\"crates/rsid/src/store/mod.rs\",\"protected_sections\":{{\"facts\":{{\"path\":\"{protected}\"}}}}}}\n"
+            "{{\"migration_file\":\"crates/rsid-store/src/store/mod.rs\",\"protected_sections\":{{\"facts\":{{\"path\":\"{protected}\"}}}}}}\n"
         );
         let base = fixture.commit(
             &fixture.base,
@@ -7818,7 +8912,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[test]
     fn lowered_schema_version_has_stable_policy_fence() {
         let fixture = Fixture::new();
-        let store = "crates/rsid/src/store/mod.rs";
+        let store = "crates/rsid-store/src/store/mod.rs";
         let base = fixture.commit(
             &fixture.base,
             store,
@@ -7881,13 +8975,13 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[tokio::test]
     async fn policy_refusal_runs_before_any_test_gate() {
         let fixture = Fixture::new();
-        let store = "crates/rsid/src/store/mod.rs";
+        let store = "crates/rsid-store/src/store/mod.rs";
         // Released DDL lives elsewhere in this fixture, so the store change
         // reaches the migration-number rule rather than the released guard.
         let manifest = fixture.commit(
             &fixture.base,
             "tools/released-migrations.json",
-            "{\"migration_file\":\"crates/rsid/src/store/released.rs\",\"protected_sections\":{}}\n",
+            "{\"migration_file\":\"crates/rsid-store/src/store/released.rs\",\"protected_sections\":{}}\n",
             "released DDL elsewhere",
         );
         let tip = fixture.commit(

@@ -58,6 +58,7 @@ const EMBEDDED_WORKER: &str = include_str!("guidance/worker_v1.md");
 const EMBEDDED_EPIC_LEAD: &str = include_str!("guidance/epic_lead_v1.md");
 const EMBEDDED_MANAGER: &str = include_str!("guidance/manager_v1.md");
 const EMBEDDED_REVIEWER: &str = include_str!("guidance/assigned_reviewer_v1.md");
+const EMBEDDED_GLOBAL_MANAGER: &str = include_str!("guidance/global_manager_v1.md");
 
 fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
     match kind {
@@ -89,6 +90,9 @@ fn check_guidance_ids(projection: &AgentAuthorityProjection) -> Result<()> {
     }
     if projection.is_reviewer {
         expected_ids.push("assigned_reviewer");
+    }
+    if projection.is_global_manager {
+        expected_ids.push("global_manager");
     }
     if projection.guidance_ids != expected_ids {
         return Err(DaemonError::Store(
@@ -320,6 +324,7 @@ fn role_guidance(id: &str) -> Option<&'static str> {
         "epic_lead" => Some(EMBEDDED_EPIC_LEAD),
         "manager" => Some(EMBEDDED_MANAGER),
         "assigned_reviewer" => Some(EMBEDDED_REVIEWER),
+        "global_manager" => Some(EMBEDDED_GLOBAL_MANAGER),
         _ => None,
     }
 }
@@ -759,6 +764,7 @@ mod tests {
             is_lead: false,
             is_manager: false,
             is_reviewer: false,
+            is_global_manager: false,
             verbs: vec![Verb::GetStatus, Verb::CreateIssue],
             update_variants: Vec::new(),
             control_actions: Vec::new(),
@@ -775,6 +781,7 @@ mod tests {
             is_lead: true,
             is_manager: true,
             is_reviewer: true,
+            is_global_manager: false,
             verbs: rsi_common::agent_control_schema::agent_control_catalog_v1()
                 .iter()
                 .map(|descriptor| descriptor.verb)

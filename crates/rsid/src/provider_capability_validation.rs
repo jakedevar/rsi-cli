@@ -925,7 +925,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     },
     ConsumerContract {
         role: ConsumerRole::Persistence,
-        path: "crates/rsid/src/store/sessions.rs",
+        path: "crates/rsid-store/src/store/sessions.rs",
         symbol: "persisted_context_budget",
         source: FlowSource::Parameter("resolved"),
         sinks: &[

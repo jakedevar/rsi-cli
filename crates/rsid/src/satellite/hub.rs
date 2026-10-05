@@ -164,6 +164,7 @@ pub(crate) async fn run_hub_poller(
     let mut schedule = PollSchedule::with_test_timing(Duration::from_millis(25), 0);
     let mut registered = HashSet::new();
     let dispatch_state = Arc::new(Mutex::new(super::dispatch::DispatchState::default()));
+    let report_state = Arc::new(Mutex::new(super::reports::ReportState::default()));
     let dispatch_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (done_tx, mut done_rx) = mpsc::channel::<(Uuid, u64, PollOutcome)>(MAX_IN_FLIGHT * 2);
     let mut ticker = tokio::time::interval(REGISTRY_TICK);
@@ -200,10 +201,14 @@ pub(crate) async fn run_hub_poller(
                     let store = Arc::clone(&store);
                     let root = satellite_root.clone();
                     let state = Arc::clone(&dispatch_state);
+                    let reports = Arc::clone(&report_state);
                     let running = Arc::clone(&dispatch_running);
                     tokio::spawn(async move {
                         let mut state = state.lock().await;
                         super::dispatch::dispatch_round(&store, &root, &mut state).await;
+                        // #1103: pull satellite reports on the same paced round.
+                        let mut reports = reports.lock().await;
+                        super::reports::report_round(&store, &root, &mut reports).await;
                         running.store(false, Ordering::Release);
                     });
                 }

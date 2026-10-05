@@ -21,6 +21,7 @@ mod sessions;
 mod state;
 
 pub(crate) use handoff::{DocregOperationContext, DocregOperationResult, PendingDocregOperation};
+pub(crate) use navigation::SidebarFold;
 pub(crate) use session_actions::{
     InteractiveLaunchOrigin, InteractiveLaunchResult, LaunchOptions, LaunchPlacement,
     PendingInteractiveLaunch,
@@ -685,6 +686,10 @@ pub struct App {
     /// Per-modal geometry deltas keyed by PromptPurpose variant name.
     pub modal_geometries: HashMap<String, crate::types::ModalGeometry>,
 
+    /// File explorer drawer width chosen with its resize keys (`None` uses
+    /// the default). Persisted so the drawer reopens at the same width.
+    pub file_explorer_width: Option<u16>,
+
     /// Last-used modal dropdown values (P2.4). Restored from `PersistedState`
     /// at startup; rewritten on every successful modal submit.
     pub modal_defaults: crate::state::ModalDefaults,
@@ -1297,6 +1302,7 @@ impl App {
             pending_dev_views,
             pending_fold_states,
             modal_geometries: persisted.modal_geometries.clone(),
+            file_explorer_width: persisted.file_explorer_width,
             modal_defaults: persisted.modal_defaults.clone(),
             taskrabbit_draft: Vec::new(),
             blank_draft: Vec::new(),
@@ -1317,7 +1323,9 @@ impl App {
             docreg_operation_rx,
             auto_launched_handoff_sessions: HashSet::new(),
             settings,
-            settings_state: crate::types::SettingsState::default(),
+            settings_state: crate::types::SettingsState::from_navigation(
+                persisted.settings_navigation.clone(),
+            ),
             pre_settings_pane: None,
             prompt_creator_state: crate::types::PromptCreatorState::default(),
             prompt_creator_viewer: None,
@@ -1904,7 +1912,10 @@ impl App {
             OverlayState::SortPicker { .. } => "SortPicker",
             OverlayState::PromptPreview { .. } => "PromptPreview",
             OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
+            OverlayState::LegacyScratch(..) => "LegacyScratch",
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
+            OverlayState::Remote(..) => "Remote",
+            OverlayState::ManagerTree(..) => "ManagerTree",
             OverlayState::HarnessManagerV2(..) => "HarnessManagerV2",
             OverlayState::HarnessManagerScope(..) => "HarnessManagerScope",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
@@ -1944,7 +1955,7 @@ impl App {
             OverlayState::None
             | OverlayState::Prompt { .. }
             | OverlayState::InputModal { .. }
-            | OverlayState::FileExplorer { .. }
+            | OverlayState::FileExplorer(..)
             | OverlayState::RecentCompletions { .. } => return None,
         })
     }

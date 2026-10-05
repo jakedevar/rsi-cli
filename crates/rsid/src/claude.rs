@@ -386,6 +386,11 @@ impl ClaudeProcess {
         Ok(self.child.wait().await?)
     }
 
+    /// OS pid of the provider child, `None` once it was reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Check if the process is still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)
@@ -1541,6 +1546,17 @@ worker prompt body\n\
                 .unwrap()
                 .ends_with("boundary-mail-hook"),
             "{hook}"
+        );
+        // #1097: the same hook also routes heavy Bash commands through the
+        // spill wrapper at PreToolUse.
+        let pre = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "Bash");
+        assert!(
+            pre["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("boundary-mail-hook"),
+            "{pre}"
         );
         assert!(
             !with.iter().any(|arg| arg.contains("s3cr3t-token-value")),

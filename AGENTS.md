@@ -23,6 +23,12 @@ stranded on a branch.
 - Tests: cover what you change. The landing gate is **no new failures relative
   to `rolling`**. Name baseline reds you hit; fix unrelated reds separately.
 - Preserve existing behaviour unless the task is to change it.
+- **Kaizen: improve the line, never stop it.** Any agent (worker, lead,
+  reviewer, manager) that notices a defect outside its task, friction, waste,
+  a repeated manual step or a better way files one Issue (`AgentCreateIssue`,
+  label `kaizen`, 3-6 lines: what, evidence, suggested change) and keeps
+  working. Do not fold the fix into the current task. Managers triage `kaizen`
+  Issues on every wake.
 
 ## Hard rules (the only ones)
 
@@ -35,7 +41,7 @@ stranded on a branch.
    or reset your sandbox branch: child launches pin to its commits.
 3. **Database.** Never hard-delete rows without operator consent. Schema changes
    only through a new versioned migration: one new file
-   `crates/rsid/src/store/migrations/vNNN.rs` holding the `if version < N`
+   `crates/rsid-store/src/store/migrations/vNNN.rs` holding the `if version < N`
    block and the `user_version` bump (`build.rs` collects the files; the head is
    the highest number, so no shared file is edited); released
    migrations are immutable. Timestamps are RFC3339 with nanoseconds, UUIDs are
@@ -45,10 +51,11 @@ stranded on a branch.
    logs, prompts or `--params`. The token is transport-only.
 5. **Wakes.** A self-wake always uses `mode:"resume"`. Never `agent_fresh` on
    your own session: it puts a second writer in your tree.
-6. **Formatting.** Format only files you changed:
-   `git diff --name-only --diff-filter=d -- '*.rs' | xargs -r rustfmt --edition 2024`.
-   Never `cargo fmt -- <paths>` (it reformats whole crates). Stage explicit
-   paths, never `git add -A`.
+6. **Formatting.** Format only files you changed: `scripts/fmt-changed.sh`
+   (add a base such as `origin/rolling` for committed changes). Plain
+   `rustfmt <file>` also rewrites that file's untouched child modules; the
+   script restores them (#1121). Never `cargo fmt -- <paths>` (it reformats
+   whole crates). Stage explicit paths, never `git add -A`.
 7. **Identity in tests.** Never assert that a user-visible name, title or label
    is absent; assert the positive end state (CI gate
    `scripts/check-identity-assertions.sh`).
@@ -76,6 +83,8 @@ stranded on a branch.
 
 - `crates/rsi`: the TUI (ratatui, crossterm, modalkit). TUI notes are in `crates/rsi/CLAUDE.md`.
 - `crates/rsid`: the daemon; spawns and manages provider subprocesses. RPC family contracts are in `crates/rsid/AGENTS.md`.
+- `crates/rsid-store`: the SQLite store (schema migrations, every table accessor) plus config, bus, model_control, sandbox, vault and bedrock; `rsid` re-exports each module at its old path, so `crate::store::...` still resolves in the daemon. Nothing in it may depend on `rsid`.
+- `crates/rsid-core`: leaf types below the store (error, path_safety, process_control, terminal_cause, provider_exhaustion).
 - `crates/rsi-common`: shared types, JSON-RPC protocol, validators.
 
 The TUI talks to the daemon over `~/.rsi/daemon.sock` (JSON-RPC 2.0). SQLite
@@ -87,7 +96,7 @@ diagnostics and repairs. Providers (`Session.provider`): `Claude`, `Codex`,
 ## Build and test
 
 ```bash
-make release-install      # build release binaries, relink ~/.local/bin, restart rsid
+make release-install      # build release binaries (plus the desktop UI if node/webkit2gtk exist), relink ~/.local/bin, restart rsid
 ./scripts/dev-daemon.sh   # dev daemon (must run before the TUI)
 ./scripts/dev-tui.sh
 make test-fast            # quick lanes; make test-full for everything
@@ -110,10 +119,17 @@ Rust is pinned by `rust-toolchain.toml`. Keybinding changes also update
 ## Landing
 
 Publish with `rsi-rolling-land --repo <sandbox> --remote origin --accepted <SHA>`.
-Until it is installed on PATH, use `~/.cargo/shared-target/debug/rsi-rolling-land`.
+`make release-install` installs it on PATH next to `rsid` (the daemon merge queue spawns it from there).
 Add `--test-filter PACKAGE=FILTER` for the modules you touched: a filtered
 package's gate is a compile check plus the named tests (no new failures against
-the base); the QA sweep runs the rest. The lander's policy is mechanical and
+the base); the QA sweep runs the rest. The `rsid` and `rsid-store` library tests
+are partitioned into 16 shards (`test-shard-*` features, `store-01..04`,
+`session-01..05`, `memory-01..02`, `other-01..05`); a shard is one feature name
+that every package with tests in it declares, and `scripts/run-rsid-test-shards.sh`
+runs it across those packages (`scripts/check-rsid-test-shards.py
+--list-shard-packages`). Name one as `--test-filter rsid=shard:store-01:test(NAME)`
+whichever package holds the test; the store tests live in `crates/rsid-store` and
+a filter on that package's modules is gated as the full shard set. The lander's policy is mechanical and
 runs before any test: no Work binding, seal or hot-file claim is required, and a
 new migration must be the rolling tip's schema head + 1 (the highest
 `store/migrations/vNNN.rs`) as its own file with its `if version < N` block; one

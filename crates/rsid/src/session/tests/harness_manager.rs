@@ -1177,6 +1177,24 @@ mod abandoned_delivery {
         )
     }
 
+    /// #653: the give-up names the last refusal when every re-delivery was refused.
+    fn refused_abandon_warning(
+        job: &ScheduledJob,
+        tip: Uuid,
+        watched: Uuid,
+        minutes: i64,
+        code: &str,
+        count: u32,
+    ) -> String {
+        format!(
+            "terminal watch '{}' (id={}) abandoned: delivery to {tip} was refused: \
+             continuation_refused:{code} ({count} refusals) over {minutes} min of re-delivery \
+             attempts for watched child {watched}. The notification is being dropped; resume \
+             {tip} manually to pick the work back up",
+            job.name, job.id
+        )
+    }
+
     fn warnings(events: &[Arc<crate::bus::DaemonEvent>]) -> Vec<String> {
         events
             .iter()
@@ -1937,13 +1955,20 @@ mod abandoned_delivery {
             "the refused re-deliveries never reached model admission"
         );
 
-        // Past the window: one atomic give-up.
+        // Past the window: one atomic give-up, naming the refusal (#653).
         age_child(UNCONSUMED_MINUTES).await;
         let events = fire_through_scheduler(&manager, &deferred).await;
         assert!(!job_enabled(&manager, job.id).await);
         assert_eq!(
             warnings(&events),
-            vec![abandon_warning(&job, lead, child, UNCONSUMED_MINUTES)]
+            vec![refused_abandon_warning(
+                &job,
+                lead,
+                child,
+                UNCONSUMED_MINUTES,
+                "sandbox_custody:cleanup_failed",
+                1
+            )]
         );
         let facts = health_facts(&manager, lead).await;
         assert_eq!(facts.len(), 1);
@@ -2311,6 +2336,35 @@ async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
     assert_eq!(manager.entry.source_session_id, pilot.owner);
     assert_eq!(manager.entry.owner_epic_id, None);
     assert!(manager.entry.sequence > lead.entry.sequence);
+
+    // #1129: a filter that selects no test is refused at enqueue, naming it.
+    std::fs::create_dir_all(repo.path().join("crates/rsid/src")).unwrap();
+    std::fs::write(
+        repo.path().join("crates/rsid/src/q.rs"),
+        "#[test]\nfn queue_lands_things() {}\n",
+    )
+    .unwrap();
+    git(&["add", "crates"]);
+    git(&["commit", "-q", "-m", "three"]);
+    let third = git(&["rev-parse", "HEAD"]);
+    let mut empty = request(&third, "e");
+    empty.test_filters = vec!["rsid=queue_lands".into(), "rsid=nowhere_to_be_found".into()];
+    let refused = control
+        .agent_enqueue_landing_source(pilot.leads[0], empty.clone(), true)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("filter_matches_no_tests: rsid=nowhere_to_be_found"),
+        "{refused}"
+    );
+    empty.test_filters = vec!["rsid=queue_lands".into()];
+    let admitted = control
+        .agent_enqueue_landing_source(pilot.leads[0], empty, true)
+        .await
+        .unwrap();
+    assert_eq!(admitted.entry.state, RollingQueueEntryState::Queued);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -2473,12 +2527,14 @@ async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them
     let deadline = chrono::Utc::now() + chrono::Duration::seconds(600);
     let live = DeployRow {
         id: Uuid::new_v4(),
-        owner_session_id: pilot.owner,
+        owner_session_id: Some(pilot.owner),
         sha: "0".repeat(40),
         manifest: Vec::new(),
         state: rsi_common::agent_deploy::DeployState::Staged,
         reason: None,
         deadline_at: deadline,
+        operator: false,
+        forced: false,
     };
     pilot
         .manager
@@ -2605,18 +2661,26 @@ async fn daemon_info_is_manager_and_lead_only_and_well_formed() {
 async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
     use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
     use rsi_common::agent_jobs::{
-        AgentGetJobRequestV1, AgentListJobsRequestV1, AgentSubmitJobRequestV1, JobKind, JobState,
+        AgentCancelJobRequestV1, AgentGetJobRequestV1, AgentListJobsRequestV1,
+        AgentSubmitJobRequestV1, JobKind, JobState,
     };
 
     #[derive(Default)]
-    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    struct Recorder(
+        std::sync::Mutex<Vec<LaunchSpec>>,
+        std::sync::Mutex<Vec<String>>,
+    );
     impl JobRuntime for Recorder {
         fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
             self.0.lock().unwrap().push(spec.clone());
             Ok(())
         }
         fn unit_active(&self, _unit: &str) -> bool {
-            true
+            self.1.lock().unwrap().is_empty()
+        }
+        fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+            self.1.lock().unwrap().push(unit.to_string());
+            Ok(())
         }
     }
 
@@ -2727,6 +2791,47 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
         .await
         .unwrap();
     assert!(theirs.jobs.is_empty());
+
+    // #1106: only the owner may cancel; a foreign caller learns nothing.
+    let refused = control
+        .agent_cancel_job(
+            pilot.owner,
+            AgentCancelJobRequestV1 {
+                job_id: receipt.job.id,
+            },
+            recorder.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("job_not_found"), "{refused}");
+    assert!(recorder.1.lock().unwrap().is_empty());
+    let cancelled = control
+        .agent_cancel_job(
+            worker,
+            AgentCancelJobRequestV1 {
+                job_id: receipt.job.id,
+            },
+            recorder.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.job.state, JobState::Failed);
+    assert_eq!(
+        cancelled.job.result.unwrap().refusal.as_deref(),
+        Some("job_cancelled")
+    );
+    assert_eq!(*recorder.1.lock().unwrap(), [receipt.job.unit_name.clone()]);
+    let read_back = control
+        .agent_get_job(
+            worker,
+            AgentGetJobRequestV1 {
+                job_id: receipt.job.id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_back.state, JobState::Failed);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -2891,4 +2996,140 @@ async fn send_satellite_message_admits_only_the_appointed_manager() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.message_id, receipt.message_id);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn report_to_hub_admits_only_the_appointed_manager_that_is_the_declared_seat() {
+    use rsi_common::satellite::SatelliteUuidV1;
+    use rsi_common::satellite_dispatch::{
+        AgentReportToHubRequestV1, SatelliteInboundPolicyV1, SatelliteReportKindV1,
+    };
+
+    let pilot = pilot().await;
+    let hub = Uuid::new_v4();
+    let request = || AgentReportToHubRequestV1 {
+        kind: SatelliteReportKindV1::DeployReady,
+        text: "DEPLOY-READY abc123".into(),
+    };
+    let control = pilot.manager.agent_control();
+
+    // No declared seat or hub yet: everyone is refused, with static text.
+    let none = control
+        .agent_report_to_hub(pilot.owner, request())
+        .await
+        .unwrap_err();
+    assert!(
+        none.to_string().contains("satellite_report_not_authorized"),
+        "{none}"
+    );
+
+    pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+            allowed_hub_installations: vec![SatelliteUuidV1(hub)],
+            scope_roots: vec![SatelliteUuidV1(pilot.owner)],
+        })
+        .unwrap();
+    let lead = control
+        .agent_report_to_hub(pilot.leads[0], request())
+        .await
+        .unwrap_err();
+    assert!(
+        lead.to_string().contains("satellite_report_not_authorized"),
+        "{lead}"
+    );
+
+    let receipt = control
+        .agent_report_to_hub(pilot.owner, request())
+        .await
+        .unwrap();
+    assert_eq!(receipt.state, "queued");
+    let pulled = pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .take_hub_reports(hub, &[])
+        .unwrap();
+    assert_eq!(pulled.reports.len(), 1);
+    assert_eq!(pulled.reports[0].report_id, receipt.report_id);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn report_to_hub_refuses_a_revoked_manager_appointment() {
+    use rsi_common::satellite::SatelliteUuidV1;
+    use rsi_common::satellite_dispatch::{
+        AgentReportToHubRequestV1, SatelliteInboundPolicyV1, SatelliteReportKindV1,
+    };
+
+    let pilot = pilot().await;
+    let hub = Uuid::new_v4();
+    let request = || AgentReportToHubRequestV1 {
+        kind: SatelliteReportKindV1::Result,
+        text: "RESULT abc123".into(),
+    };
+    let control = pilot.manager.agent_control();
+    {
+        let store = pilot.manager.store.lock().await;
+        store
+            .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                allowed_hub_installations: vec![SatelliteUuidV1(hub)],
+                scope_roots: vec![SatelliteUuidV1(pilot.owner)],
+            })
+            .unwrap();
+    }
+    // Unrevoked: still admitted.
+    control
+        .agent_report_to_hub(pilot.owner, request())
+        .await
+        .unwrap();
+
+    // The operator revokes the manager (explicit empty scope): the session is
+    // still the manager's session, but the appointment is over.
+    pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+            group_ids: Vec::new(),
+            project_id: pilot.config.project_id,
+            session_id: pilot.owner,
+            epic_ids: Some(Vec::new()),
+            expected_row_version: pilot.config.row_version,
+        })
+        .unwrap();
+    let revoked = control
+        .agent_report_to_hub(pilot.owner, request())
+        .await
+        .unwrap_err();
+    assert!(
+        revoked
+            .to_string()
+            .contains("satellite_report_not_authorized"),
+        "{revoked}"
+    );
+    let queued = pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .take_hub_reports(hub, &[])
+        .unwrap();
+    assert_eq!(queued.reports.len(), 1);
 }

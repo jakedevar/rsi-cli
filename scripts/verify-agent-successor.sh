@@ -103,5 +103,6 @@ case "$scenario" in
     ;;
 esac
 for test_name in "${tests[@]}"; do
-  cargo test -p rsid --lib "$test_name" -- --exact --test-threads=1
+  # `store::` tests live in rsid-store since the #1021 S4 crate split.
+  cargo test -p rsid -p rsid-store --lib "$test_name" -- --exact --test-threads=1
 done

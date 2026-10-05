@@ -61,6 +61,7 @@ async fn persist_tracked_provider_event(
     Option<rsi_common::types::PendingQuestion>,
     crate::error::Result<i64>,
 ) {
+    let mut rejection: Option<ConversationEvent> = None;
     let detected_question = {
         let mut guard = active.write().await;
         let Some(tracked) = guard
@@ -73,6 +74,15 @@ async fn persist_tracked_provider_event(
             );
         };
         let question = super::question::detect(tracked.session.provider, event);
+        // The headless CLI rejects AskUserQuestion inside the turn; tag that
+        // result so the pending question never reads as a human decline.
+        if super::question::is_rejection_of_pending(
+            event,
+            &tracked.events,
+            tracked.pending_question.as_ref(),
+        ) {
+            rejection = Some(super::question::tag_rejection(event));
+        }
         tracked.events.push(event.clone());
         if let Some(question) = question.as_ref() {
             tracked.pending_question = Some(question.clone());
@@ -83,6 +93,7 @@ async fn persist_tracked_provider_event(
         }
         question
     };
+    let event = rejection.as_ref().unwrap_or(event);
     let persisted = if let Some(question) = detected_question.as_ref() {
         persistence
             .publish_question_event(event.clone(), provenance, question.clone())
@@ -1165,6 +1176,53 @@ fn automatic_threshold_gate(
     ))
 }
 
+/// #1005: a coordinating seat whose measured live context reaches the
+/// operator's hard cap gets one durable cap rotation; the idle-boundary pass
+/// (`rotate_capped_coordinators`) rotates it with a daemon-written handoff.
+/// Workers and operator sessions hold no seat and are never capped.
+async fn advance_coordinator_context_cap(
+    tracked: &TrackedSession,
+    session_id: Uuid,
+    runtime_config: &crate::config::RuntimeConfig,
+    store: &Arc<tokio::sync::Mutex<Store>>,
+) {
+    if !tracked.rotation.is_enabled()
+        || !runtime_config
+            .context_rotation_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let cap = runtime_config
+        .coordinator_context_cap(tracked.session.provider, tracked.session.model.as_deref());
+    let (measured_tokens, ..) = live_context_state(tracked);
+    if cap.is_none_or(|cap| measured_tokens < cap) {
+        return;
+    }
+    let crossing = super::context_cap::evaluate_cap_crossing(
+        &*store.lock().await,
+        &tracked.session,
+        measured_tokens,
+        cap,
+        chrono::Utc::now(),
+    );
+    match crossing {
+        Ok(super::context_cap::CapCrossing::Recorded(true)) => tracing::info!(
+            %session_id,
+            measured_tokens,
+            cap,
+            "Coordinator context cap reached; the seat rotates at its next idle boundary"
+        ),
+        Ok(super::context_cap::CapCrossing::Deferred(reason)) => {
+            tracing::info!(%session_id, reason, "Coordinator context cap rotation deferred");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "Coordinator context cap check failed");
+        }
+    }
+}
+
 async fn advance_context_rotation_threshold(
     tracked: &mut TrackedSession,
     session_id: Uuid,
@@ -1173,6 +1231,15 @@ async fn advance_context_rotation_threshold(
     store: &Arc<tokio::sync::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
 ) {
+    // Boxed: the monitor's stream future is stack-sensitive, and this check
+    // must not grow it (#1005).
+    Box::pin(advance_coordinator_context_cap(
+        tracked,
+        session_id,
+        runtime_config,
+        store,
+    ))
+    .await;
     let threshold_pct = runtime_config.context_rotation_threshold_pct(tracked.session.provider);
     if pct < threshold_pct - AUTOMATIC_THRESHOLD_REARM_POINTS
         && tracked.rotation.automatic_threshold_latched()
@@ -1905,6 +1972,8 @@ impl SessionManager {
         // Accumulated assistant content since the last user event, for pipeline path scanning.
         // Reset on each user event so it tracks only the current assistant response.
         let mut accumulated_assistant_content = String::new();
+        // #1098: owned child processes still alive at the final result boundary.
+        let mut owned_children_at_result = false;
 
         // --- Summarization state ---
         // Count of assistant messages received in this session (for threshold checks).
@@ -4270,6 +4339,10 @@ impl SessionManager {
                                         continue;
                                     }
                                 } else {
+                                    owned_children_at_result = super::worker_result_guard::owned_children_alive_boxed(
+                                        &active, session_id,
+                                    )
+                                    .await;
                                     current_result = result;
                                     turn_outcome = TerminalTurnOutcome::Terminal;
                                     terminal_reason.get_or_insert(MonitorBreakReason::Result);
@@ -4456,6 +4529,7 @@ impl SessionManager {
         };
         let mut c5_disposition =
             crate::store::daemon_settings::RecoveryDisposition::NoRecoverySource;
+        let mut no_result_verdict = super::worker_result_guard::NoResultVerdict::NotApplicable;
         let finalize_decision = match terminal_decision(evidence) {
             TerminalDecision::StaleGeneration => {
                 tracing::warn!(
@@ -4475,6 +4549,17 @@ impl SessionManager {
                 return;
             }
             TerminalDecision::Finalize(decision) => {
+                // #1098: a covered worker ending a turn without RESULT. Boxed
+                // and out of line so the monitor future stays small.
+                no_result_verdict = super::worker_result_guard::verdict_for_active_boxed(
+                    &store,
+                    &active,
+                    session_id,
+                    decision.status,
+                    &accumulated_assistant_content,
+                    owned_children_at_result,
+                )
+                .await;
                 let mut active_guard = active.write().await;
                 let Some(tracked) = active_guard.get_mut(&session_id) else {
                     return;
@@ -4483,6 +4568,12 @@ impl SessionManager {
                     return;
                 }
                 let decision = apply_terminal_handoff_order(decision, evidence, tracked);
+                if no_result_verdict == super::worker_result_guard::NoResultVerdict::SecondMiss
+                    && decision.status == SessionStatus::Completed
+                {
+                    tracked.session.stop_reason =
+                        Some(super::worker_result_guard::NO_RESULT_STOP_REASON.to_string());
+                }
                 if tracked.session.stop_reason.is_none() {
                     tracked.session.stop_reason =
                         provider_launch_failure_stop_reason(evidence, decision);
@@ -4670,6 +4761,21 @@ impl SessionManager {
                     }
                 }
             }
+        }
+
+        // #1098: the single automatic continuation for a worker that ended
+        // its turn without RESULT while its run is still going.
+        if no_result_verdict == super::worker_result_guard::NoResultVerdict::FirstMiss
+            && finalized_decision == finalize_decision
+            && matches!(
+                post_finalize_outcome,
+                PostFinalizeRotationOutcome::ContinueNormalCompletion
+            )
+        {
+            super::worker_result_guard::schedule_for_completed_boxed(
+                &store, &completed, session_id,
+            )
+            .await;
         }
 
         // C5 runs only after rotation and retry disposition has installed its
@@ -9120,6 +9226,63 @@ mod pending_question_producer_tests {
             .manager_v2_claim_decision_delivery(config, Uuid::new_v4())
             .unwrap()
             .unwrap()
+    }
+
+    // The headless CLI rejects AskUserQuestion with an error tool_result. The
+    // question must stay recorded and visible, and the persisted rejection must
+    // carry the typed code so it never reads as a human decline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn pending_question_producer_cli_rejection_is_typed_and_question_stays_pending() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-rejected"))
+            .await
+            .unwrap();
+        let stream = StreamEvent {
+            event_type: "user".into(),
+            data: json!({"message":{"content":[
+                {"type":"tool_result","tool_use_id":"ask-rejected","is_error":true,
+                 "content":"Answer questions?"}
+            ]}}),
+        };
+        let mut prior = 1;
+        let mut events =
+            SessionManager::convert_recognized_stream_event(&stream, session, &mut prior).unwrap();
+        let result = events.pop().unwrap();
+        let (detected, persisted) = persist_tracked_provider_event(
+            &manager.active,
+            &manager.persistence,
+            session,
+            0,
+            &result,
+            None,
+        )
+        .await;
+        persisted.unwrap();
+        assert_eq!(detected, None);
+        let stored = manager
+            .store
+            .lock()
+            .await
+            .load_events(session)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == EventType::ToolResult)
+            .expect("rejection result persisted");
+        let metadata = stored.metadata.expect("typed metadata");
+        assert_eq!(metadata["rsi_code"], "ask_user_question_undeliverable");
+        assert_eq!(metadata["question_pending"], true);
+        assert_eq!(stored.content, "Answer questions?");
+        let store = manager.store.lock().await;
+        assert_eq!(
+            store
+                .get_session(session)
+                .unwrap()
+                .unwrap()
+                .pending_question,
+            Some(question())
+        );
+        assert!(store.manager_v2_question_target(session).unwrap().is_some());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

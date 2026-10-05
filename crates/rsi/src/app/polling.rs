@@ -22,6 +22,8 @@ const DAEMON_CPU_FIRST_INTERVAL: std::time::Duration = std::time::Duration::from
 pub(crate) struct DaemonHealthRead {
     pub(crate) pressure: Option<rsi_common::rpc::WorkerSliceMemoryPressure>,
     pub(crate) resources: crate::daemon_resources::DaemonResourceSample,
+    /// #1122: the pending operator restart line, when one is waiting.
+    pub(crate) restart_pending: Option<String>,
 }
 
 async fn fetch_worker_pressure(
@@ -35,9 +37,15 @@ async fn fetch_worker_pressure(
             .get_health_status()
             .await
             .map_err(|error| error.to_string())?;
+        let restart_pending = client
+            .get_operator_restart()
+            .await
+            .ok()
+            .and_then(|restart| restart.summary());
         Ok(DaemonHealthRead {
             resources: crate::daemon_resources::DaemonResourceSample::from_health(&status, pid),
             pressure: status.worker_slice_memory_pressure,
+            restart_pending,
         })
     })
     .await
@@ -170,15 +178,15 @@ impl App {
             .is_some_and(tokio::task::JoinHandle::is_finished)
             && let Some(handle) = self.worker_pressure_refresh_handle.take()
         {
-            let (pressure, resources) = match handle.await {
-                Ok(Ok(read)) => (read.pressure, Some(read.resources)),
+            let (pressure, resources, restart_pending) = match handle.await {
+                Ok(Ok(read)) => (read.pressure, Some(read.resources), read.restart_pending),
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "worker pressure Health refresh unavailable");
-                    (None, None)
+                    (None, None, None)
                 }
                 Err(error) => {
                     tracing::debug!(%error, "worker pressure Health task failed");
-                    (None, None)
+                    (None, None, None)
                 }
             };
             if self.worker_slice_memory_pressure != pressure {
@@ -186,10 +194,12 @@ impl App {
                 self.mark_dirty();
             }
             let resources = resources.map(|sample| {
-                crate::daemon_resources::DaemonResourceView::next(
+                let mut view = crate::daemon_resources::DaemonResourceView::next(
                     self.daemon_resources.as_ref(),
                     sample,
-                )
+                );
+                view.restart_pending = restart_pending;
+                view
             });
             if resources
                 .as_ref()

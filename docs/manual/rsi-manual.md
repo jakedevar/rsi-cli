@@ -98,7 +98,7 @@ A session's detail view shows its transcript above an input bar. These actions t
 
 | Keys | Command | Action | What it does |
 | --- | --- | --- | --- |
-| `Enter` `L` · Settings: `Enter` |  | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
+| `Enter` `L` · Settings: `Enter` |  | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | Settings: `q` `Esc` · Issues: `q` `Esc` · Scheduled jobs: `q` `Esc` · Theme role editor: `Esc` |  | Close or cancel | Closes the current view or cancels the pending action. |
 
 ## 4. Files and prompts
@@ -377,7 +377,7 @@ Text-area background, animation styles and detail column placement.
 | Background color | Sets the hex color used when the text area background is on. | edit | TUI (state.json) | immediately |
 | Formulation animation | Reveals each new live message with a top-to-bottom wipe. Off by default. | toggle | TUI (state.json) | immediately |
 | Formulation speed | Sets how long the formulation reveal runs when the animation is on. | choice | TUI (state.json) | immediately |
-| Activity indicator | Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight. | choice | TUI (state.json) | immediately |
+| Activity indicator | Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight; rainbow colours are tuned to each theme. | choice | TUI (state.json) | immediately |
 | Detail column | Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned. | choice | TUI (state.json) | immediately |
 
 ### WORKSPACE — What do I see in the list and a new transcript?
@@ -499,6 +499,7 @@ What the daemon does when a session fails.
 | Context rotation threshold (global) | Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%. | choice | daemon field `context_rotation_global_pct` | immediately |
 | Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | immediately |
 | Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | immediately |
+| Coordinator context cap (0 off) | Live-context tokens at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff; workers are never capped. Read or set a provider or model override with :context-cap <Provider[/model]> [tokens\|default]. Default 0 (off until #1156); 200000 is the suggested value. Needs context rotation on. | choice | daemon field `coordinator_context_cap_tokens` | immediately |
 
 #### Stall Detection
 
@@ -569,6 +570,7 @@ Background queue and recursive DAG controls.
 | Governor max workers-slice memory (GB) | Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30. | choice | daemon field `governor_max_workers_slice_gb` | immediately |
 | Harness web access | Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it. | choice | daemon field `harness_web_access` | next spawn |
 | Harness network egress | Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it. | choice | daemon field `harness_egress_mode` | next spawn |
+| Harness context editing | Default for Harness context editing: when on, direct-Anthropic Claude Harness sessions let the provider clear stale tool results server-side to save context. A session's own tool policy (context_editing) overrides it. Read at launch, so running sessions keep the value they started with (#1111). | toggle | daemon field `harness_context_editing` | next spawn |
 | Harness search call cap | Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues. | choice | daemon field `harness_max_search_calls` | next spawn |
 | Harness fetch call cap | Default cap on hosted web fetches per Harness session; 0 is unlimited. | choice | daemon field `harness_max_fetch_calls` | next spawn |
 | Harness completion gates | Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794). | toggle | daemon field `completion_gates_enabled` | next spawn |
@@ -626,6 +628,7 @@ Sandbox disk use, cache reclamation and settlement.
 | Preview cache reclaim | Runs a dry-run reclaim pass and reports what it would free. | action | daemon (sandbox storage) | immediately |
 | Reclaim sandbox caches now | Runs a real reclaim pass now and reports the result. **Destructive.** | action | daemon (sandbox storage) | immediately |
 | Source-worktree settlement | Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. **Destructive.** | action | daemon (source-worktree settlement) | immediately |
+| Legacy scratch adoption | Lists unrecorded scratch directories (worker TMPDIRs, /var/tmp/rsi-*, lander workspaces) and records chosen ones so scratch reclaim, which is enabled, deletes them automatically once old and unheld. Adopting asks you to confirm every full path first. Each adoption re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and refuses what fails it. **Destructive.** | action | daemon (legacy scratch adoption) | immediately |
 | Maximum sandbox roots | Maximum direct source roots under the sandbox base before a new allocation is refused. | choice | daemon field `sandbox_max_source_roots` | immediately |
 | Minimum free space (GiB) | Free filesystem space required before a new sandbox is allocated. | choice | daemon field `sandbox_min_free_gib` | immediately |
 | Purge archived sandboxes | Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. **Destructive.** | toggle | daemon field `archived_sandbox_purge_enabled` | immediately |
@@ -665,6 +668,14 @@ Registered peers, local links and cached remote sessions.
 | --- | --- | --- | --- | --- |
 | Satellite registry | Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads. | action | daemon (satellite_registry) | immediately |
 | Satellite polling | Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on. | toggle | daemon field `satellite_polling_enabled` | immediately |
+
+#### Remote
+
+Read-only phone view over your tailnet: enable, devices, projects.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Remote access | Enable the read-only phone view, pick allowed devices and exposed projects, and see the URL. Starts a managed gateway (systemd user unit) and a tailscale serve route; never Funnel. Needs one privilege step, `sudo tailscale set --operator=$USER`, shown here when pending. Disabling stops serving on the next request. | action | daemon (remote_access) | immediately |
 
 #### MCP Servers
 
@@ -763,8 +774,8 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
 | `gg` | Jump to first item | Jumps the session-list selection to the first row. |
 | `G` | Jump to last item | Jumps the session-list selection to the last row. |
-| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
-| `L` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
+| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
+| `L` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `/` | Filter sessions | Starts an incremental `/` filter over the session list; Enter keeps the filter, Esc clears it. |
 | `r` | Refresh navigation | Re-fetches sessions, projects and labels from the daemon. |
 | `T` | Choose built-in theme | Opens the built-in theme picker; `:theme <name>` applies a theme directly. |
@@ -911,7 +922,7 @@ Keys of the settings pane (category rail and items).
 | `?` | Contextual help | Opens contextual help listing the keys and commands available in the current view; Ctrl-Alt-G works even while typing. |
 | `j` | Move selection or scroll down | Moves the selection down one row, or scrolls the focused view down. |
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
-| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
+| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `Delete` | Reset selected role | Resets the selected theme role to the active theme's default color. |
 | `h` | Return to categories | Returns focus from the settings items to the category rail. |
 | `Left` | Return to categories | Returns focus from the settings items to the category rail. |
@@ -1075,8 +1086,8 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | --- | --- | --- |
 | `Left` | session list or detail focused, not inserting | previous session in the list |
 | `Right` | session list or detail focused, not inserting | next session in the list |
-| `Shift-Left` | session list or detail focused, not inserting | previous session and open its detail |
-| `Shift-Right` | session list or detail focused, not inserting | next session and open its detail |
+| `Shift-Left` | session list or detail focused, not inserting | previous session and open it; in detail a Group or Epic unfolds instead |
+| `Shift-Right` | session list or detail focused, not inserting | next session and open it; in detail a Group or Epic unfolds instead |
 | `Ctrl-Tab` | session list or detail focused, not inserting | previous session in the list |
 | `Ctrl-Shift-Tab` | session list or detail focused, not inserting | next session in the list |
 
@@ -1292,22 +1303,38 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | --- | --- |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
-| `Enter / l` | Open file or directory |
-| `h` | Go to parent directory |
-| `yy / yn` | Copy path / file name |
-| `dd` | Delete file to trash buffer |
-| `u` | Restore last deleted file |
-| `.` | Toggle hidden files |
+| `Ctrl-D / Ctrl-U, PageDown / PageUp` | Move half / a full page |
+| `Enter / o` | Open file in the viewer, or toggle directory |
+| `l / Right` | Expand directory or open file |
+| `h / Left` | Collapse directory or go to parent |
+| `Tab` | Preview file without leaving the tree |
+| `P` | Toggle follow preview |
+| `z` | Collapse all directories |
+| `R` | Refresh the tree from disk |
+| `a` | Add file (end with / for a directory) |
+| `A` | Add directory |
+| `r` | Rename |
+| `m` | Move to a project path |
+| `c` | Copy to a project path |
+| `d` | Delete to trash (confirm with y) |
+| `u` | Undo last file operation |
+| `yy / yn / yr` | Copy absolute path / name / relative path |
+| `i` | Show size, modified time and mode |
+| `. / H` | Toggle hidden files |
 | `/` | Open fuzzy finder |
+| `Ctrl-Shift-Left / Right, < / >` | Narrow / widen the drawer |
+| `Ctrl-0 / =` | Reset drawer width |
 | `Ctrl-L` | Focus file viewer |
-| `Esc / q, Space / Space Space` | Close explorer |
+| `?` | Show explorer help |
+| `Esc / q, Space` | Close explorer |
 
 #### File Explorer / Finder
 
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Filter files |
-| `j / k, Down / Up` | Move selection |
+| `Ctrl-U / Ctrl-W` | Clear query / delete last segment |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
 | `Enter` | Open selected file |
 | `Esc` | Return to explorer tree |
 | `Esc Esc` | Return to tree, then close explorer |
@@ -1318,7 +1345,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | --- | --- |
 | `Ctrl-H` | Focus explorer tree |
 | `Other keys` | Go to the file viewer |
-| `Esc / q` | Close explorer |
+| `Space e` | Close explorer (viewer normal mode) |
 
 #### File Viewer
 
@@ -1327,6 +1354,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `q, Space q` | Close viewer (normal mode) |
 | `Space m` | Toggle markdown preview |
 | `Space Space` | Open telescope file picker |
+| `Space e` | Toggle the file explorer |
 | `Ctrl-S` | Save file |
 | `:` | Command mode (:w, :wq, :q, :q!, :e!, :N) |
 | `/ / ?` | Search forward / backward |
@@ -1345,7 +1373,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Filter files |
-| `j / k, Down / Up` | Move selection |
+| `Ctrl-U` | Clear query |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
 | `Enter` | Open file in viewer |
 | `Esc` | Close telescope |
 | `Space o` | Close and open a TaskRabbit session prompt |
@@ -1932,6 +1961,9 @@ Screens without an overlay key catalog, and where their keys are documented.
 | Source-worktree settlement: authorization | A confirmation sub-mode of the settlement browser with its own key handling. | keybindings.md § Source-Worktree Settlement Authorization |
 | Graph review: info dashboard focused | The dashboard panel owns keys while focused, separate from graph editing. | keybindings.md § Graph Review Overlay (`<Space>v` or `:graph`) |
 | Satellite registry browser | The browser owns its peer, link and cached session keys. | keybindings.md § Satellite Registry Browser |
+| Remote settings | The page owns its enable, device and project keys. | keybindings.md § Remote Settings |
+| Manager tree (:manager tree) | The read-only tree owns its fold, paging and jump keys. | keybindings.md § Manager Tree |
+| Legacy scratch adoption | The browser owns its select, adopt and refresh keys. | keybindings.md § Legacy Scratch Adoption |
 
 ### Surfaces documented by hand
 

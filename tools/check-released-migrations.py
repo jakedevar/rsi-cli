@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Reject retroactive edits to released SQLite migrations.
 
-Each schema version lives in its own file, ``crates/rsid/src/store/migrations/
-vNNN.rs``; ``build.rs`` collects them in order and derives
-``LATEST_SCHEMA_VERSION`` (the highest file).  The committed manifest pins
+Each schema version lives in its own file, ``crates/rsid-store/src/store/
+migrations/vNNN.rs`` (``crates/rsid/src/store/migrations`` before the #1021 S4
+crate split; both layouts validate); ``build.rs`` collects them in order and
+derives ``LATEST_SCHEMA_VERSION`` (the highest file).  The committed manifest pins
 every released ``if version < N`` block plus explicitly marked catalog/helper
 regions.  Against a base revision, existing pins are append-only: changing
 source and refreshing its pin still fails.  Revisions that predate the split
@@ -23,8 +24,14 @@ from pathlib import Path
 from typing import Any
 
 
-MIGRATION_PATH = "crates/rsid/src/store/mod.rs"
-MIGRATION_DIR = "crates/rsid/src/store/migrations"
+# The store moved from `crates/rsid` to `crates/rsid-store` (issue #1021 S4);
+# revisions older than that keep the first layout, so both are recognised.
+STORE_ROOTS = ("crates/rsid-store/src/store", "crates/rsid/src/store")
+MIGRATION_PATHS = tuple(f"{root}/mod.rs" for root in STORE_ROOTS)
+MIGRATION_DIRS = tuple(f"{root}/migrations" for root in STORE_ROOTS)
+# The current layout, where new migrations are written.
+MIGRATION_PATH = MIGRATION_PATHS[0]
+MIGRATION_DIR = MIGRATION_DIRS[0]
 MANIFEST_PATH = "tools/released-migrations.json"
 LATEST_RE = re.compile(r"pub const LATEST_SCHEMA_VERSION: i32 = (\d+);")
 MIGRATION_FILE_RE = re.compile(r"^v(?P<version>\d+)\.rs$")
@@ -65,7 +72,7 @@ def read_revision(ref: str, path: str) -> str:
 def migration_file_version(path: str) -> int | None:
     """The schema version named by ``migrations/vNNN.rs``, else ``None``."""
     directory, _, name = path.rpartition("/")
-    if directory != MIGRATION_DIR:
+    if directory not in MIGRATION_DIRS:
         return None
     match = MIGRATION_FILE_RE.match(name)
     if match is None:
@@ -85,7 +92,7 @@ def latest_schema_version(files: dict[str, str]) -> int:
     ]
     if file_versions:
         return max(file_versions)
-    match = LATEST_RE.search(files.get(MIGRATION_PATH, ""))
+    match = LATEST_RE.search(next((files[path] for path in MIGRATION_PATHS if path in files), ""))
     if match is None:
         raise GuardError(f"cannot find the schema head in {MIGRATION_DIR} or {MIGRATION_PATH}")
     return int(match.group(1))
@@ -118,7 +125,7 @@ def migration_blocks(files: dict[str, str]) -> dict[str, str]:
     blocks: dict[str, str] = {}
     for path in sorted(files):
         file_version = migration_file_version(path)
-        if file_version is None and path != MIGRATION_PATH:
+        if file_version is None and path not in MIGRATION_PATHS:
             continue
         lines = files[path].splitlines(keepends=True)
         region = v0_region(lines)
@@ -181,6 +188,16 @@ def protected_sections(files: dict[str, str]) -> dict[str, dict[str, str]]:
 
 
 def inventory(files: dict[str, str]) -> dict[str, Any]:
+    layouts = sorted(
+        {path.rpartition("/")[0] for path in files if migration_file_version(path) is not None}
+    )
+    if len(layouts) > 1:
+        # build.rs collects only `MIGRATION_DIR`; a unit in the other directory
+        # would pass every number/manifest check yet never run (#1021 S4).
+        raise GuardError(
+            "migration files exist in more than one store layout "
+            f"({', '.join(layouts)}); only {MIGRATION_DIR} is built, move them there"
+        )
     latest = latest_schema_version(files)
     blocks = migration_blocks(files)
     released = {
@@ -190,10 +207,13 @@ def inventory(files: dict[str, str]) -> dict[str, Any]:
     }
     if not released or max(map(int, released)) != latest:
         raise GuardError(f"no migration block found for schema head V{latest}")
+    migration_dirs = sorted(
+        {path.rpartition("/")[0] for path in files if migration_file_version(path) is not None}
+    )
     layout = (
-        {"migration_dir": MIGRATION_DIR}
-        if any(migration_file_version(path) is not None for path in files)
-        else {"migration_file": MIGRATION_PATH}
+        {"migration_dir": migration_dirs[0]}
+        if migration_dirs
+        else {"migration_file": next((path for path in MIGRATION_PATHS if path in files), MIGRATION_PATH)}
     )
     return {
         "schema_version": 1,
@@ -204,29 +224,40 @@ def inventory(files: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def manifest_store_root(manifest: dict[str, Any] | None) -> str | None:
+    """The store directory a manifest's layout key names, when it is a known one."""
+    layout = (manifest or {}).get("migration_dir") or (manifest or {}).get("migration_file")
+    root = layout.rpartition("/")[0] if isinstance(layout, str) else None
+    return root if root in STORE_ROOTS else None
+
+
 def tracked_source_paths(manifest: dict[str, Any] | None = None) -> list[str]:
-    paths = {MIGRATION_PATH, "crates/rsid/src/store/cohort_settlement.rs"}
+    # The manifest's own layout when it names one; otherwise both layouts (the
+    # loaders skip the one a revision does not have).
+    root = manifest_store_root(manifest)
+    roots = (root,) if root else STORE_ROOTS
+    paths = {f"{store}/mod.rs" for store in roots}
+    paths.update(f"{store}/cohort_settlement.rs" for store in roots)
     if manifest is None:
-        paths.add("crates/rsid/src/store/manager_prepared_actions.rs")
+        paths.update(f"{store}/manager_prepared_actions.rs" for store in roots)
     if manifest:
         paths.update(section["path"] for section in manifest.get("protected_sections", {}).values())
     return sorted(paths)
 
 
 def worktree_migration_files() -> list[str]:
-    directory = Path(MIGRATION_DIR)
-    if not directory.is_dir():
-        return []
     return sorted(
-        f"{MIGRATION_DIR}/{entry.name}"
-        for entry in directory.iterdir()
+        f"{migration_dir}/{entry.name}"
+        for migration_dir in MIGRATION_DIRS
+        if Path(migration_dir).is_dir()
+        for entry in Path(migration_dir).iterdir()
         if entry.is_file() and entry.name.endswith(".rs")
     )
 
 
 def revision_migration_files(ref: str) -> list[str]:
     result = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", ref, "--", f"{MIGRATION_DIR}/"],
+        ["git", "ls-tree", "-r", "--name-only", ref, "--", *(f"{directory}/" for directory in MIGRATION_DIRS)],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -241,7 +272,7 @@ def load_worktree_files(
     paths = set(tracked_source_paths(manifest))
     paths.update(worktree_migration_files())
     paths.update(extra_paths or [])
-    return {path: Path(path).read_text() for path in sorted(paths)}
+    return {path: Path(path).read_text() for path in sorted(paths) if Path(path).is_file()}
 
 
 def marked_source_paths(extra_paths: list[str] | None = None) -> set[str]:
@@ -327,10 +358,10 @@ def load_revision_files(ref: str, manifest: dict[str, Any]) -> dict[str, str]:
     for path in sorted(paths):
         text = git_show(ref, path)
         if text is None:
-            if path == MIGRATION_PATH:
-                raise GuardError(f"{path} is missing at {ref}")
             continue
         files[path] = text
+    if not any(path in files for path in MIGRATION_PATHS):
+        raise GuardError(f"{MIGRATION_PATH} is missing at {ref}")
     return files
 
 

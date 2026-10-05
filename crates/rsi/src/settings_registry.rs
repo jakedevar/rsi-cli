@@ -11,7 +11,10 @@
 use rsi_common::daemon_config_catalog::ApplyClass;
 
 /// Settings rail groups, ordered by how often the operator uses them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SettingsGroup {
     Appearance,
     Workspace,
@@ -88,7 +91,10 @@ impl SettingsGroup {
 }
 
 /// Settings sections (the rail entries inside a group), in page order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SettingsSection {
     ThemeColors,
     Screen,
@@ -113,6 +119,7 @@ pub enum SettingsSection {
     ClaudeSkills,
     MessageBridges,
     Satellites,
+    Remote,
     McpServers,
 }
 
@@ -141,6 +148,7 @@ impl SettingsSection {
         Self::ClaudeSkills,
         Self::MessageBridges,
         Self::Satellites,
+        Self::Remote,
         Self::McpServers,
     ];
 
@@ -164,7 +172,7 @@ impl SettingsSection {
             | Self::SandboxStorage
             | Self::ClaudeHooks
             | Self::ClaudeSkills => SettingsGroup::ProvidersAndSandboxes,
-            Self::MessageBridges | Self::Satellites | Self::McpServers => {
+            Self::MessageBridges | Self::Satellites | Self::Remote | Self::McpServers => {
                 SettingsGroup::Integrations
             }
         }
@@ -196,6 +204,7 @@ impl SettingsSection {
             Self::ClaudeSkills => "Claude Skills",
             Self::MessageBridges => "Message Bridges",
             Self::Satellites => "Satellites",
+            Self::Remote => "Remote",
             Self::McpServers => "MCP Servers",
         }
     }
@@ -226,6 +235,7 @@ impl SettingsSection {
             Self::ClaudeSkills => "Claude user skills.",
             Self::MessageBridges => "Reach agents from Signal or iMessage.",
             Self::Satellites => "Registered peers, local links and cached remote sessions.",
+            Self::Remote => "Read-only phone view over your tailnet: enable, devices, projects.",
             Self::McpServers => "MCP server definitions and credential metadata.",
         }
     }
@@ -298,6 +308,7 @@ setting_ids! {
     ContextRotationGlobalPct,
     ContextRotationClaudePct,
     ContextRotationCodexPct,
+    CoordinatorContextCap,
     StallDetection,
     StallClassifier,
     ClassifierIdleClaude,
@@ -340,6 +351,7 @@ setting_ids! {
     ChildKeepaliveWindow,
     HarnessWebAccess,
     HarnessEgressMode,
+    HarnessContextEditing,
     HarnessSearchCap,
     HarnessFetchCap,
     HarnessCompletionGates,
@@ -370,6 +382,7 @@ setting_ids! {
     PreviewReclaim,
     ReclaimNow,
     SourceWorktreeSettlement,
+    LegacyScratchAdoption,
     SandboxMaxSourceRoots,
     SandboxMinFreeGib,
     McpDeferredToolThreshold,
@@ -383,6 +396,7 @@ setting_ids! {
     ImessageBridge,
     CompletedTranscriptCache,
     SatelliteRegistry,
+    RemoteAccess,
     SatellitePolling,
     GovernorBuildSlots,
     GovernorLanderSlots,
@@ -602,7 +616,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::ActivityIndicator,
         section: SettingsSection::Screen,
         label: "Activity indicator",
-        summary: "Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight.",
+        summary: "Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight; rainbow colours are tuned to each theme.",
         detail: None,
         keywords: &["indicator", "spinner", "rainbow"],
         kind: SettingKind::Cycle,
@@ -1069,6 +1083,29 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["rotation", "context", "threshold", "codex", "pioneer"],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("context_rotation_codex_pct"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CoordinatorContextCap,
+        section: SettingsSection::RetriesRecovery,
+        label: "Coordinator context cap (0 off)",
+        summary: "Live-context tokens at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff; workers are never capped. Read or set a provider or model override with :context-cap <Provider[/model]> [tokens|default].",
+        detail: Some(
+            "Default 0 (off until #1156); 200000 is the suggested value. Needs context rotation on.",
+        ),
+        keywords: &[
+            "rotation",
+            "context",
+            "cap",
+            "coordinator",
+            "manager",
+            "lead",
+            "handoff",
+            "tokens",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("coordinator_context_cap_tokens"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
@@ -1673,6 +1710,27 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::HarnessContextEditing,
+        section: SettingsSection::Orchestration,
+        label: "Harness context editing",
+        summary: "Default for Harness context editing: when on, direct-Anthropic Claude Harness sessions let the provider clear stale tool results server-side to save context. A session's own tool policy (context_editing) overrides it.",
+        detail: Some(
+            "Read at launch, so running sessions keep the value they started with (#1111).",
+        ),
+        keywords: &[
+            "harness",
+            "context",
+            "editing",
+            "clear",
+            "tool results",
+            "anthropic",
+        ],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("harness_context_editing"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::HarnessSearchCap,
         section: SettingsSection::Orchestration,
         label: "Harness search call cap",
@@ -2105,6 +2163,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: true,
     },
     SettingSpec {
+        id: SettingId::LegacyScratchAdoption,
+        section: SettingsSection::SandboxStorage,
+        label: "Legacy scratch adoption",
+        summary: "Lists unrecorded scratch directories (worker TMPDIRs, /var/tmp/rsi-*, lander workspaces) and records chosen ones so scratch reclaim, which is enabled, deletes them automatically once old and unheld. Adopting asks you to confirm every full path first.",
+        detail: Some(
+            "Each adoption re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and refuses what fails it.",
+        ),
+        keywords: &["scratch", "adopt", "legacy", "tmpdir", "reclaim"],
+        kind: SettingKind::Action,
+        owner: SettingOwner::DaemonState("legacy scratch adoption"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: true,
+    },
+    SettingSpec {
         id: SettingId::SandboxMaxSourceRoots,
         section: SettingsSection::SandboxStorage,
         label: "Maximum sandbox roots",
@@ -2214,6 +2286,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("satellite_polling_enabled"),
         apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::RemoteAccess,
+        section: SettingsSection::Remote,
+        label: "Remote access",
+        summary: "Enable the read-only phone view, pick allowed devices and exposed projects, and see the URL.",
+        detail: Some(
+            "Starts a managed gateway (systemd user unit) and a tailscale serve route; never Funnel. Needs one privilege step, `sudo tailscale set --operator=$USER`, shown here when pending. Disabling stops serving on the next request.",
+        ),
+        keywords: &["remote", "phone", "tailscale", "gateway", "mobile", "url"],
+        kind: SettingKind::Action,
+        owner: SettingOwner::DaemonState("remote_access"),
+        apply: SettingApply::Immediate,
         destructive: false,
     },
     SettingSpec {

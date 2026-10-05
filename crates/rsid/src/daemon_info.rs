@@ -113,6 +113,7 @@ impl DaemonInfoService {
             },
             load: load_average(),
             supervisor_mode: supervisor_mode(),
+            supervisor_binary: supervisor_binary().map(|path| path.display().to_string()),
         }
     }
 }
@@ -171,6 +172,23 @@ pub fn classify_supervisor(parent_cmdline: &str) -> &'static str {
     }
 }
 
+/// The rsid path a supervisor command line relaunches: the argument after the
+/// supervisor script (`rsid-supervisor.sh /path/to/rsid`).
+#[must_use]
+pub fn parse_supervisor_binary(parent_cmdline: &str) -> Option<PathBuf> {
+    let mut args = parent_cmdline.split('\0');
+    args.find(|arg| arg.rsplit('/').next() == Some(DAEMON_SUPERVISOR_SCRIPT))?;
+    args.next().filter(|arg| !arg.is_empty()).map(PathBuf::from)
+}
+
+/// The binary the supervising `rsid-supervisor.sh` relaunches (#1164); `None`
+/// when the daemon is not under the supervisor or its argv cannot be read.
+pub(crate) fn supervisor_binary() -> Option<PathBuf> {
+    let parent = std::os::unix::process::parent_id();
+    let cmdline = std::fs::read(format!("/proc/{parent}/cmdline")).ok()?;
+    parse_supervisor_binary(&String::from_utf8_lossy(&cmdline))
+}
+
 pub(crate) fn supervisor_mode() -> Option<String> {
     let parent = std::os::unix::process::parent_id();
     let cmdline = std::fs::read(format!("/proc/{parent}/cmdline")).ok()?;
@@ -208,6 +226,22 @@ mod tests {
             classify_supervisor("/usr/lib/systemd/systemd\0--user\0"),
             "none"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn daemon_info_names_the_binary_the_supervisor_relaunches() {
+        assert_eq!(
+            parse_supervisor_binary(
+                "/usr/bin/bash\0/r/scripts/rsid-supervisor.sh\0/h/.rsi/install/rsid\0"
+            ),
+            Some(PathBuf::from("/h/.rsi/install/rsid"))
+        );
+        assert_eq!(
+            parse_supervisor_binary("/usr/lib/systemd/systemd\0--user\0"),
+            None
+        );
+        assert_eq!(parse_supervisor_binary("bash\0rsid-supervisor.sh\0"), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

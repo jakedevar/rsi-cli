@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "version": 152,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v152.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:d607edce5251aaac0d4a6115dffbc0f30e25f03bc2505e3b640e318d4d07be59",
+      "sites": [
+        {
+          "anchor": "fn migrate_v152(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 152 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 152)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:be10b9eb0eebc2572c9f32f45bd9a78b5ed561aeab4206c8855d8833e74373ed",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 152;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "const WAKE_ORIGINS_SCHEMA_VERSION: i32 = 152;",
+          "replacement": "const WAKE_ORIGINS_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

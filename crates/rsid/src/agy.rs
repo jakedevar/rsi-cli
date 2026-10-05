@@ -39,6 +39,11 @@ impl AgyProcess {
         Ok(self.child.wait().await?)
     }
 
+    /// OS pid of the provider child, `None` once it was reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Check if the process is still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)

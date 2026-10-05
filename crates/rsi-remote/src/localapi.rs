@@ -124,20 +124,39 @@ fn key_expiry_ok(value: Option<&Value>, now: DateTime<Utc>) -> Result<(), Denial
     }
 }
 
+/// Like [`strict_bool_opt`] but `null` counts as absent. Used only for the
+/// whois node fields Tailscale 1.102.x reports as `null`; status `Self` stays
+/// strict.
+const fn nullable_bool_opt(value: Option<&Value>) -> Result<Option<bool>, Denial> {
+    match value {
+        Some(Value::Null) => Ok(None),
+        other => strict_bool_opt(other),
+    }
+}
+
 /// D4b Expired rule for a tailcfg object: `true` denies, omitted/null-free false allows.
-fn expired_ok(object: &Value) -> Result<(), Denial> {
-    if strict_bool_opt(object.get("Expired"))? == Some(true) {
+/// `whois` selects the nullable reading (whois nodes only); status `Self` is strict.
+fn expired_ok(object: &Value, whois: bool) -> Result<(), Denial> {
+    let expired = if whois {
+        nullable_bool_opt(object.get("Expired"))?
+    } else {
+        strict_bool_opt(object.get("Expired"))?
+    };
+    if expired == Some(true) {
         Err(Denial::Expired)
     } else {
         Ok(())
     }
 }
 
-/// D4b `MachineAuthorized` rule: anything other than an explicit `true` denies.
+/// D4b `MachineAuthorized` rule. Tailscale deprecated the field and 1.102.x
+/// reports it as `null` for every authorized device, so only an explicit
+/// `false` denies; absent/null defers to the other layers (node allowlist,
+/// owner, expiry, tags, sharer, source address).
 fn machine_authorized_ok(object: &Value) -> Result<(), Denial> {
-    match strict_bool_opt(object.get("MachineAuthorized"))? {
-        Some(true) => Ok(()),
-        _ => Err(Denial::NotAuthorized),
+    match nullable_bool_opt(object.get("MachineAuthorized"))? {
+        Some(false) => Err(Denial::NotAuthorized),
+        Some(true) | None => Ok(()),
     }
 }
 
@@ -218,7 +237,7 @@ pub fn server_binding(
     }
 
     // `Self` carries no MachineAuthorized field under the pinned tailcfg.
-    expired_ok(self_node)?;
+    expired_ok(self_node, false)?;
     key_expiry_ok(self_node.get("KeyExpiry"), now)?;
 
     Ok(ServerBinding {
@@ -299,7 +318,7 @@ pub fn client_identity(
     }
 
     machine_authorized_ok(node)?;
-    expired_ok(node)?;
+    expired_ok(node, true)?;
     key_expiry_ok(node.get("KeyExpiry"), now)?;
 
     Ok(ClientIdentity {
@@ -334,7 +353,7 @@ pub fn self_whois_matches(
     }
 
     machine_authorized_ok(node)?;
-    expired_ok(node)?;
+    expired_ok(node, true)?;
     key_expiry_ok(node.get("KeyExpiry"), now)?;
     Ok(())
 }
@@ -700,6 +719,108 @@ mod tests {
         );
     }
 
+    /// Captured from a live Tailscale 1.102.4 LocalAPI (`/whois` for a phone):
+    /// the deprecated `MachineAuthorized`, plus `Expired`, `Tags` and `Sharer`,
+    /// are reported as `null`.
+    fn real_whois_1_102() -> Value {
+        json!({
+            "Node": {
+                "ID": 1_234_567_890_123_456_u64,
+                "StableID": NODE,
+                "Name": "phone.example.ts.net.",
+                "User": OWNER,
+                "Key": "nodekey:00",
+                "KeyExpiry": "2027-01-01T00:00:00Z",
+                "Addresses": ["100.101.102.103/32", "fd7a:115c:a1e0::1/128"],
+                "Online": true,
+                "MachineAuthorized": null,
+                "Expired": null,
+                "Tags": null,
+                "Sharer": null
+            },
+            "UserProfile": { "ID": OWNER, "LoginName": "owner@example.com" },
+            "CapMap": null
+        })
+    }
+
+    #[test]
+    fn real_tailscale_1_102_whois_is_accepted() {
+        let identity =
+            client_identity(&encode(&real_whois_1_102()), &policy(), source(), now()).unwrap();
+        assert_eq!(identity.node_stable_id, NODE);
+        let binding = server_binding(&encode(&status()), &policy(), now()).unwrap();
+        let mut selfw = real_whois_1_102();
+        selfw["Node"]["StableID"] = json!(binding.node_id);
+        assert_eq!(self_whois_matches(&encode(&selfw), &binding, now()), Ok(()));
+    }
+
+    #[test]
+    fn status_self_stays_strict_about_null_expired() {
+        let mut null_expired = status();
+        null_expired["Self"]["Expired"] = json!(null);
+        assert_eq!(
+            server_binding(&encode(&null_expired), &policy(), now()),
+            Err(Denial::Malformed)
+        );
+        let mut stale = status();
+        stale["Self"]["Expired"] = json!(null);
+        stale["Self"]["KeyExpiry"] = json!("2020-01-01T00:00:00Z");
+        assert_eq!(
+            server_binding(&encode(&stale), &policy(), now()),
+            Err(Denial::Malformed)
+        );
+    }
+
+    #[test]
+    fn whois_null_expired_with_stale_key_still_denies() {
+        let mut stale = real_whois_1_102();
+        stale["Node"]["KeyExpiry"] = json!("2020-01-01T00:00:00Z");
+        assert_eq!(
+            client_identity(&encode(&stale), &policy(), source(), now()),
+            Err(Denial::KeyExpiring)
+        );
+    }
+
+    #[test]
+    fn real_whois_null_machine_authorized_still_obeys_other_layers() {
+        let mut other_node = real_whois_1_102();
+        other_node["Node"]["StableID"] = json!("nOther");
+        assert_eq!(
+            client_identity(&encode(&other_node), &policy(), source(), now()),
+            Err(Denial::NodeNotAllowed)
+        );
+        let mut tagged = real_whois_1_102();
+        tagged["Node"]["Tags"] = json!(["tag:server"]);
+        assert_eq!(
+            client_identity(&encode(&tagged), &policy(), source(), now()),
+            Err(Denial::Tagged)
+        );
+        let mut shared = real_whois_1_102();
+        shared["Node"]["Sharer"] = json!(7);
+        assert_eq!(
+            client_identity(&encode(&shared), &policy(), source(), now()),
+            Err(Denial::Shared)
+        );
+        let mut expired = real_whois_1_102();
+        expired["Node"]["Expired"] = json!(true);
+        assert_eq!(
+            client_identity(&encode(&expired), &policy(), source(), now()),
+            Err(Denial::Expired)
+        );
+        let mut explicit_false = real_whois_1_102();
+        explicit_false["Node"]["MachineAuthorized"] = json!(false);
+        assert_eq!(
+            client_identity(&encode(&explicit_false), &policy(), source(), now()),
+            Err(Denial::NotAuthorized)
+        );
+        let mut stale = real_whois_1_102();
+        stale["Node"]["KeyExpiry"] = json!("2020-01-01T00:00:00Z");
+        assert_eq!(
+            client_identity(&encode(&stale), &policy(), source(), now()),
+            Err(Denial::KeyExpiring)
+        );
+    }
+
     #[test]
     fn whois_accepts_pinned_client() {
         let identity = client_identity(&encode(&whois()), &policy(), source(), now()).unwrap();
@@ -813,17 +934,6 @@ mod tests {
             (
                 {
                     let mut v = whois();
-                    v["Node"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("MachineAuthorized");
-                    v
-                },
-                Denial::NotAuthorized,
-            ),
-            (
-                {
-                    let mut v = whois();
                     v["Node"]["MachineAuthorized"] = json!(false);
                     v
                 },
@@ -894,10 +1004,7 @@ mod tests {
             (
                 {
                     let mut v = whois();
-                    v["Node"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("MachineAuthorized");
+                    v["Node"]["MachineAuthorized"] = json!(false);
                     v
                 },
                 Denial::NotAuthorized,

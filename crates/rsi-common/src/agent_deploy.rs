@@ -10,15 +10,30 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Binaries the daemon may replace, by file name. `rsid` is mandatory.
-pub const DEPLOY_BINARIES: [&str; 6] = [
+/// Binaries the daemon may replace, by file name. `rsid` is mandatory; every
+/// other member is deployed (and sha-verified) when present in the binaries
+/// directory and reported in the receipt's `skipped` list when absent (#1110).
+pub const DEPLOY_BINARIES: [&str; 8] = [
     "rsid",
     "rsi",
     "rsi-rpc",
     "rsi-agent-mcp",
     "rsi-build-rustc",
     "rsi-contract-validate",
+    "rsi-rolling-land",
+    "rsi-remote",
 ];
+
+/// Managed binaries a deploy did not carry: those named in `DEPLOY_BINARIES`
+/// with no entry in `manifest`, in managed-set order.
+#[must_use]
+pub fn skipped_binaries(manifest: &[DeployBinaryV1]) -> Vec<String> {
+    DEPLOY_BINARIES
+        .iter()
+        .filter(|name| !manifest.iter().any(|entry| entry.name == **name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
 pub const DEPLOY_DEFAULT_MAX_WAIT_SECS: u32 = 900;
 pub const DEPLOY_MAX_WAIT_SECS: u32 = 3600;
 pub const DEPLOY_MAX_KEY_BYTES: usize = 128;
@@ -42,6 +57,9 @@ pub const DEPLOY_STAGE_FAILED: &str = "deploy_stage_failed";
 pub const DEPLOY_SHA_MISMATCH: &str = "deploy_sha_mismatch";
 pub const DEPLOY_SCHEMA_DOWNGRADE: &str = "deploy_schema_downgrade";
 pub const DEPLOY_NEEDS_SUPERVISOR: &str = "deploy_needs_supervisor";
+/// The supervisor runs an rsid outside the directory a deploy installs into, so
+/// a restart would relaunch the old binary (#1164). The message names both paths.
+pub const DEPLOY_TARGET_MISMATCH: &str = "deploy_target_mismatch";
 pub const DEPLOY_RESTART_BUDGET: &str = "deploy_restart_budget";
 /// A staged copy no longer matches its verified hash at swap time.
 pub const DEPLOY_STAGED_CHANGED: &str = "deploy_staged_copy_changed";
@@ -161,6 +179,31 @@ pub struct DeployBinaryV1 {
     pub name: String,
     pub dest: String,
     pub sha256: String,
+    /// Whether the install path held a binary when the deploy was staged. A
+    /// failed deploy restores exactly that set: a binary that was absent is
+    /// removed again, not left behind (#1114). Rows recorded before this field
+    /// existed read as present, which keeps the old restore-`.prev` behaviour.
+    #[serde(default = "default_prior_present")]
+    pub prior_present: bool,
+    /// The identity of the verified staged file, which the swap renames (so it
+    /// is also the identity of the installed file). A rollback removes a
+    /// first-time install only when the object at the path still has this
+    /// identity: a replacement installed by anyone else is preserved (#1127).
+    /// Rows recorded before this field existed carry none, and then nothing is
+    /// removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_identity: Option<ObjectIdentityV1>,
+}
+
+/// A file object's identity: device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectIdentityV1 {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+fn default_prior_present() -> bool {
+    true
 }
 
 /// Receipt: the deploy row as accepted (or replayed).
@@ -172,6 +215,9 @@ pub struct AgentRequestDeployReceiptV1 {
     /// RFC3339 nanos: the quiet-point wait ends here.
     pub deadline_at: String,
     pub binaries: Vec<DeployBinaryV1>,
+    /// Managed binaries absent from `binaries_dir`, so left as installed.
+    #[serde(default)]
+    pub skipped: Vec<String>,
     /// True when an earlier call with the same key already created this row.
     pub replayed: bool,
 }

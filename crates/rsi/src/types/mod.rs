@@ -183,15 +183,36 @@ impl Default for ModelDropdownState {
 /// separate `SettingsCategory` enum.
 pub use crate::settings_registry::SettingsSection;
 
+/// Durable navigation only; search, dropdowns and destructive confirmations
+/// remain runtime state and are never restored when Settings reopens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SettingsNavigation {
+    pub section: SettingsSection,
+    pub selected_index: usize,
+    pub focus: SettingsFocus,
+    pub section_rows: HashMap<SettingsSection, usize>,
+    pub group_sections: HashMap<crate::settings_registry::SettingsGroup, SettingsSection>,
+}
+
+impl Default for SettingsNavigation {
+    fn default() -> Self {
+        SettingsState::default().navigation()
+    }
+}
+
 /// Settings pane navigation state.
 #[derive(Debug, Clone)]
 pub struct SettingsState {
-    /// Active section in left panel.
+    /// Active section tab within the selected category.
     pub section: SettingsSection,
     /// Selected item index in right panel (within current section).
     pub selected_index: usize,
-    /// Whether we're in the left (section) or right (settings) panel.
+    /// Whether the category rail or settings items have focus.
     pub focus: SettingsFocus,
+    /// Last selected row in each section and last tab in each category.
+    pub section_rows: HashMap<SettingsSection, usize>,
+    pub group_sections: HashMap<crate::settings_registry::SettingsGroup, SettingsSection>,
     /// Model dropdown for model selection settings (Model Roles section).
     pub model_dropdown: ModelDropdownState,
     /// Which Model Roles item has the dropdown open (None = no dropdown active).
@@ -213,12 +234,73 @@ impl Default for SettingsState {
             section: SettingsSection::ThemeColors,
             selected_index: 0,
             focus: SettingsFocus::default(),
+            section_rows: HashMap::new(),
+            group_sections: HashMap::new(),
             model_dropdown: ModelDropdownState::default(),
             active_dropdown_item: None,
             query: String::new(),
             query_active: false,
             provider_key_clear_confirmation: None,
             rendered_layout: SettingsRenderedLayout::default(),
+        }
+    }
+}
+
+impl SettingsState {
+    pub fn remember_position(&mut self) {
+        self.section_rows.insert(self.section, self.selected_index);
+        self.group_sections
+            .insert(self.section.group(), self.section);
+    }
+
+    pub fn select_section(&mut self, section: SettingsSection) {
+        self.remember_position();
+        self.section = section;
+        self.selected_index = self.section_rows.get(&section).copied().unwrap_or(0);
+        self.group_sections.insert(section.group(), section);
+    }
+
+    pub fn select_group(&mut self, group: crate::settings_registry::SettingsGroup) {
+        let section = self
+            .group_sections
+            .get(&group)
+            .copied()
+            .filter(|section| section.group() == group)
+            .unwrap_or_else(|| group.first_section());
+        self.select_section(section);
+    }
+
+    pub fn clear_transient(&mut self) {
+        self.model_dropdown.close();
+        self.active_dropdown_item = None;
+        self.query.clear();
+        self.query_active = false;
+        self.provider_key_clear_confirmation = None;
+        self.rendered_layout = SettingsRenderedLayout::default();
+    }
+
+    pub fn navigation(&self) -> SettingsNavigation {
+        let mut section_rows = self.section_rows.clone();
+        section_rows.insert(self.section, self.selected_index);
+        let mut group_sections = self.group_sections.clone();
+        group_sections.insert(self.section.group(), self.section);
+        SettingsNavigation {
+            section: self.section,
+            selected_index: self.selected_index,
+            focus: self.focus,
+            section_rows,
+            group_sections,
+        }
+    }
+
+    pub fn from_navigation(navigation: SettingsNavigation) -> Self {
+        Self {
+            section: navigation.section,
+            selected_index: navigation.selected_index,
+            focus: navigation.focus,
+            section_rows: navigation.section_rows,
+            group_sections: navigation.group_sections,
+            ..Default::default()
         }
     }
 }
@@ -247,7 +329,8 @@ pub struct ProviderKeyClearConfirmation {
     pub armed_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SettingsFocus {
     /// Left panel: category selection
     #[default]
@@ -1952,11 +2035,15 @@ pub enum FileExplorerEntry {
         path: std::path::PathBuf,
         depth: usize,
         expanded: bool,
+        /// Ignored by git (rendered dimmed).
+        ignored: bool,
     },
     /// A file node.
     File {
         path: std::path::PathBuf,
         depth: usize,
+        /// Ignored by git (rendered dimmed).
+        ignored: bool,
     },
 }
 
@@ -1977,6 +2064,13 @@ impl FileExplorerEntry {
 
     pub fn is_dir(&self) -> bool {
         matches!(self, FileExplorerEntry::Directory { .. })
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        match self {
+            FileExplorerEntry::Directory { ignored, .. } => *ignored,
+            FileExplorerEntry::File { ignored, .. } => *ignored,
+        }
     }
 }
 
@@ -2387,6 +2481,40 @@ pub struct SourceWorktreeSettlementOverlayState {
     pub last_error: Option<String>,
 }
 
+/// State for the operator-only legacy-scratch adoption overlay (#1147). The
+/// daemon's typed listing is authoritative: the TUI never decides adoptability.
+#[derive(Debug, Clone, Default)]
+pub struct LegacyScratchOverlayState {
+    pub candidates: Vec<rsi_common::scratch_adopt::LegacyScratchCandidateV1>,
+    pub refused_roots: u32,
+    pub budget_exhausted: bool,
+    pub selected_index: usize,
+    /// One line per path of the last adoption (adopted or the typed refusal).
+    pub last_result: Vec<String>,
+    pub last_error: Option<String>,
+    /// The directories awaiting the operator's explicit confirmation. While
+    /// `Some`, the overlay shows every full path and sends nothing until `y`.
+    pub confirm: Option<Vec<String>>,
+    pub confirm_scroll: usize,
+}
+
+/// Which RSI Remote list owns the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteFocus {
+    Devices,
+    Projects,
+}
+
+/// Operator RSI Remote page (#1096). Selection edits go straight to the
+/// daemon; the daemon's returned status is the only source of truth shown.
+pub struct RemoteOverlayState {
+    pub status: rsi_common::remote_control::RemoteStatusV1,
+    pub focus: RemoteFocus,
+    pub selected_device: usize,
+    pub selected_project: usize,
+    pub last_error: Option<String>,
+}
+
 /// Operator satellite browser. Remote session rows remain display-only and
 /// never enter the local session action path.
 pub struct SatelliteRegistryOverlayState {
@@ -2503,6 +2631,8 @@ pub enum OverlayState {
     None,
     /// Hub-owned satellite registry, local link controls and cached remote reads.
     SatelliteRegistry(Box<SatelliteRegistryOverlayState>),
+    /// Operator RSI Remote settings: enable, devices, projects and live status.
+    Remote(Box<RemoteOverlayState>),
     /// Fuzzy command finder, with the context captured below this overlay.
     CommandPalette {
         query: String,
@@ -2515,6 +2645,8 @@ pub enum OverlayState {
     /// Operator appointment and versioned Epic scope for a project manager.
     HarnessManagerScope(Box<crate::overlay::harness_manager::HarnessManagerScopeState>),
     HarnessManagerV2(Box<crate::overlay::manager_v2::ManagerSurface>),
+    /// Read-only manager hierarchy tree (`:manager tree`, #890).
+    ManagerTree(Box<crate::overlay::manager_tree::ManagerTreeState>),
     /// Theme picker popup for Catppuccin + custom palettes.
     ThemePicker {
         /// Currently highlighted theme index.
@@ -2613,6 +2745,9 @@ pub enum OverlayState {
     /// Destructive maintenance browser reached from Settings. Mutation stays
     /// disabled until a fresh typed audit and exact operator phrase exist.
     SourceWorktreeSettlement(SourceWorktreeSettlementOverlayState),
+    /// Operator legacy-scratch adoption (#1147): list unrecorded scratch the
+    /// daemon retains and record chosen ones. Deletes nothing.
+    LegacyScratch(Box<LegacyScratchOverlayState>),
     /// Trash browser — browse, restore, and permanently purge soft-deleted sessions.
     TrashBrowser {
         sessions: Vec<Session>,
@@ -2644,39 +2779,8 @@ pub enum OverlayState {
         /// If editing an existing project, its ID.
         editing_id: Option<uuid::Uuid>,
     },
-    /// File explorer drawer — left-anchored tree view of session working directory.
-    FileExplorer {
-        /// Root directory being explored.
-        root: std::path::PathBuf,
-        /// Flattened tree entries (directories + files, depth-tracked).
-        entries: Vec<FileExplorerEntry>,
-        /// Index into `entries` of the highlighted row.
-        selected_index: usize,
-        /// Scroll offset for virtual scrolling.
-        scroll_offset: usize,
-        /// Whether to show hidden files (dotfiles). Default: false.
-        show_hidden: bool,
-        /// Trash buffer for undo: (original_path, file_contents).
-        /// Scoped to the explorer's lifetime.
-        trash: Vec<(std::path::PathBuf, Vec<u8>)>,
-        /// First key of yy/yn chord pressed.
-        pending_yank: bool,
-        /// First key of dd chord pressed.
-        pending_delete: bool,
-        /// Whether the fuzzy finder sub-mode is active.
-        finder_active: bool,
-        /// Current finder query string.
-        finder_query: String,
-        /// Cached file paths from `ignore::Walk` (relative to root). Populated on first `/`.
-        finder_cache: Vec<std::path::PathBuf>,
-        /// Scored + sorted results: indices into `finder_cache`.
-        finder_results: Vec<usize>,
-        /// Selected index within `finder_results`.
-        finder_selected: usize,
-        /// Whether the explorer panel has keyboard focus (vs the file viewer).
-        /// Ctrl+L shifts focus to the viewer, Ctrl+H shifts it back here.
-        explorer_focused: bool,
-    },
+    /// File explorer drawer — left-anchored tree of the current project.
+    FileExplorer(Box<crate::overlay::file_explorer::FileExplorerState>),
     /// Custom OpenAI-compatible provider add/edit form.
     ProviderForm {
         /// Which field is focused (0=Name, 1=URL, 2=API Key, 3=Default Model).

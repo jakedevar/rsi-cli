@@ -1436,6 +1436,125 @@ async fn manager_recovery_predecessor_wake_cannot_restart_retired_lineage_tip() 
     drop(dir);
 }
 
+/// #652: a Completed lead whose sandbox tuple is a historical cleanup failure
+/// (the on-disk root is only a path-only startup candidate) refuses its
+/// scheduled resume with the typed `sandbox_custody:cleanup_failed` code. The
+/// refusal must reach the manager as a durable notice naming the code, the
+/// sandbox directory must survive, and no provider process may start.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn path_only_sandbox_lead_resume_refusal_reaches_the_manager_as_a_typed_notice() {
+    use crate::issue_tracker::poller::SessionLauncher;
+    let p = pilot().await;
+    let wake = manager_program_job(&p, "resume", true);
+    let (base, path_only_root) = {
+        let base = p.manager.sandbox_allocator.base_dir().to_path_buf();
+        let root = base.join(p.lead.to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("unmerged-work"), "operator data\n").unwrap();
+        (base, root)
+    };
+    {
+        let store = p.manager.store.lock().await;
+        store.insert_scheduled_job(&wake).unwrap();
+        store
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET sandbox_kind='GitWorktree', sandbox_root=NULL, sandbox_branch=NULL, sandbox_cleanup_state='Failed' WHERE id=?1",
+                [p.lead.to_string()],
+            )
+            .unwrap();
+        let row = store.get_session(p.lead).unwrap().unwrap();
+        drop(store);
+        p.manager
+            .completed
+            .write()
+            .await
+            .get_mut(&p.lead)
+            .unwrap()
+            .session = row;
+    }
+    // The restart's custody pass retains the path-only candidate.
+    p.manager.sandbox_orphan_sweep().await.unwrap();
+    assert!(path_only_root.join("unmerged-work").exists(), "{base:?}");
+
+    let Pilot {
+        manager,
+        _dir: dir,
+        lead,
+        ..
+    } = p;
+    let process = super::super::launch::install_controller_candidate_test_process(lead);
+    let manager = std::sync::Arc::new(manager);
+    let launcher: std::sync::Arc<dyn SessionLauncher> = manager.clone();
+    crate::scheduler::fire_job_for_test(&manager.store, manager.event_bus(), &launcher, &wake)
+        .await;
+
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
+    assert!(path_only_root.join("unmerged-work").exists());
+    let store = manager.store.lock().await;
+    let (kind, state, settled, retired): (String, String, Option<String>, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT kind,state_json,settled_at,retired_at FROM harness_manager_notices
+             WHERE subject_id=?1 AND subject_version='custody_refused:cleanup_failed'",
+            [lead.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("typed custody refusal notice exists for the lead");
+    assert_eq!(kind, "session_state");
+    assert_eq!((settled, retired), (None, None));
+    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(
+        state["recovery_code"].as_str(),
+        Some("sandbox_custody:cleanup_failed")
+    );
+    assert_eq!(state["next_action"].as_str(), Some("inspect_lead"));
+    // A second firing of the same refusal never duplicates the notice.
+    let error = crate::error::sandbox_custody_error(rsi_common::types::SandboxCustodyErrorV1 {
+        version: 1,
+        code: rsi_common::types::SandboxCustodyErrorCodeV1::CleanupFailed,
+        session_id: Some(lead),
+        transition: rsi_common::types::SandboxCustodyTransitionV1::ResumeWake,
+        retryable: false,
+        recovery: rsi_common::types::SandboxCustodyRecoveryV1::InspectStatus,
+    });
+    assert!(
+        store
+            .record_manager_custody_refusal_notice(lead, &error)
+            .unwrap()
+    );
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE subject_id=?1 AND subject_version LIKE 'custody_refused:%'",
+            [lead.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    // A transient reclaim gate is deferred by the scheduler, never noticed.
+    let transient = crate::error::sandbox_custody_error(rsi_common::types::SandboxCustodyErrorV1 {
+        version: 1,
+        code: rsi_common::types::SandboxCustodyErrorCodeV1::ReclaimPrepared,
+        session_id: Some(lead),
+        transition: rsi_common::types::SandboxCustodyTransitionV1::ResumeWake,
+        retryable: true,
+        recovery: rsi_common::types::SandboxCustodyRecoveryV1::RetryAfterReconcile,
+    });
+    assert!(
+        !store
+            .record_manager_custody_refusal_notice(lead, &transient)
+            .unwrap()
+    );
+    drop(store);
+    super::super::launch::drop_controller_candidate_test_process(lead);
+    drop(dir);
+}
+
 impl Pilot {
     /// Record the keyed invocation of an uncertain lifecycle action exactly as
     /// launch settlement leaves it: failed, admitted, with the given class and

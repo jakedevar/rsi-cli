@@ -1986,6 +1986,17 @@ pub(super) enum ControllerCandidateTestPhase {
     ManagerQuestionCleanupRetained,
     /// #669: after every continuation await, before the final seat fence.
     ManagerSeatBeforeFinalGate,
+    /// #1143: manager-action candidate, provider process started, before
+    /// durable persistence and active publication.
+    ManagerActionAfterProviderStart,
+    /// #1143: manager-action candidate published in `active`, before its
+    /// monitor task is spawned.
+    ManagerActionAfterActiveInsertion,
+    /// #1143: manager-action candidate waiting for provider confirmation.
+    ManagerActionConfirming,
+    /// #1143: deferred manager-action launch parked mid-handshake while it
+    /// holds its start gate.
+    ManagerActionStartGateHeld,
 }
 
 #[cfg(test)]
@@ -2041,6 +2052,89 @@ pub(super) fn take_capacity_provider_spawn_failure(session_id: Uuid) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&session_id)
+}
+
+/// #1143: cancellation-safe ownership of a manager-action candidate between
+/// its `active` publication and the spawn of its monitor task. The launch
+/// future can be dropped in that window (a manager launch-step deadline), which
+/// would leave a provider in `active` that nothing monitors or reaps. While
+/// armed, dropping the guard removes exactly this incarnation from `active`
+/// and reaps its process cohort. The caller settles the durable rows.
+struct UnmonitoredLaunchGuard {
+    active: Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
+    session_id: Uuid,
+    generation: u64,
+    armed: bool,
+}
+
+impl UnmonitoredLaunchGuard {
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnmonitoredLaunchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let active = Arc::clone(&self.active);
+        let (session_id, generation) = (self.session_id, self.generation);
+        runtime.spawn(async move {
+            let removed = {
+                let mut active = active.write().await;
+                if active
+                    .get(&session_id)
+                    .is_some_and(|tracked| tracked.spawn_generation == generation)
+                {
+                    if let Some(process) = active
+                        .get(&session_id)
+                        .and_then(|tracked| tracked.process.as_ref())
+                    {
+                        let _ = process.interrupt();
+                    }
+                    active.remove(&session_id).is_some()
+                } else {
+                    false
+                }
+            };
+            if !removed {
+                return;
+            }
+            tracing::warn!(%session_id, "cancelled manager launch removed an unmonitored candidate");
+            let _ = tokio::task::spawn_blocking(move || {
+                super::reaper::reap_orphans_for_session(session_id)
+            })
+            .await;
+        });
+    }
+}
+
+/// #1143: abort handles of manager-action launch monitor tasks, keyed by
+/// candidate session. The action runner owns cancellation: it aborts the task
+/// directly, never through the deferred start gate the task itself holds.
+static MANAGER_LAUNCH_TASKS: std::sync::Mutex<Option<HashMap<Uuid, tokio::task::AbortHandle>>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn register_manager_launch_task(session_id: Uuid, handle: tokio::task::AbortHandle) {
+    let mut tasks = MANAGER_LAUNCH_TASKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tasks = tasks.get_or_insert_with(HashMap::new);
+    tasks.retain(|_, tracked| !tracked.is_finished());
+    tasks.insert(session_id, handle);
+}
+
+/// Take the (possibly already finished) monitor task handle of a candidate.
+pub(super) fn take_manager_launch_task(session_id: Uuid) -> Option<tokio::task::AbortHandle> {
+    MANAGER_LAUNCH_TASKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|tasks| tasks.remove(&session_id))
 }
 
 #[cfg(test)]
@@ -2493,6 +2587,14 @@ pub(super) fn provider_effective_model(
     let mut effective = model.map(str::to_string);
     apply_provider_model_default(provider, &mut effective);
     effective
+}
+
+/// Issue #692: the project, provider and model one launch resolved, frozen
+/// together so the allowlist check and the spawn see the same identity.
+struct LaunchIdentitySnapshot {
+    project_id: Option<Uuid>,
+    provider: SessionProvider,
+    model: Option<String>,
 }
 
 fn apply_provider_model_default(provider: SessionProvider, model: &mut Option<String>) {
@@ -3463,14 +3565,17 @@ async fn settle_failed_bound_fresh_pre_provider(
             .await;
         }
         LaunchPurpose::AgentChild(context) => {
-            store.lock().await.settle_post_bind_agent_child_failure(
+            crate::store::agent_coordination::settle_post_bind_agent_child_failure_store_first(
+                store,
                 context.spawn_request_id,
                 session_id,
                 permit.invocation_id(),
                 safe_error_class,
-            )?;
+            )
+            .await?;
         }
         LaunchPurpose::Interactive
+        | LaunchPurpose::GlobalAppointment(_)
         | LaunchPurpose::ManagerSuccessor(_)
         | LaunchPurpose::ManagerAction(_)
         | LaunchPurpose::TopologyNode(_)
@@ -3554,7 +3659,7 @@ fn provider_spawn_failure_classifies_missing_route_credential() {
 /// published its exact in-memory incarnation but before any provider process
 /// exists. The generation, invocation, and token fences prevent stale cleanup
 /// from touching a replacement incarnation of the same logical Session.
-async fn settle_failed_deferred_execution_scratch(
+pub(super) async fn settle_failed_deferred_execution_scratch(
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
     store: &Arc<tokio::sync::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
@@ -3570,40 +3675,69 @@ async fn settle_failed_deferred_execution_scratch(
 ) {
     const SAFE_ERROR_CLASS: &str = "execution_scratch_unavailable";
 
-    let old_status = {
-        let mut active = active.write().await;
-        let exact_incarnation = active
+    // The exact incarnation: still tracked at this spawn generation and still
+    // bound to this launch's invocation. Read under the active-registry guard.
+    async fn is_exact_incarnation(
+        active: &HashMap<Uuid, TrackedSession>,
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        session_id: Uuid,
+        permit: &crate::model_control::AdmissionPermit,
+        spawn_generation: u64,
+    ) -> bool {
+        active
             .get(&session_id)
-            .is_some_and(|tracked| tracked.spawn_generation == spawn_generation);
-        let exact_invocation = store
-            .lock()
-            .await
-            .session_model_invocation_id(session_id)
-            .is_ok_and(|bound| bound == Some(permit.invocation_id()));
-        if !exact_incarnation || !exact_invocation {
+            .is_some_and(|tracked| tracked.spawn_generation == spawn_generation)
+            && store
+                .lock()
+                .await
+                .session_model_invocation_id(session_id)
+                .is_ok_and(|bound| bound == Some(permit.invocation_id()))
+    }
+
+    let old_status = {
+        let mut active_guard = active.write().await;
+        if !is_exact_incarnation(&active_guard, store, session_id, permit, spawn_generation).await {
             return;
         }
 
-        let settlement = if let Some(context) = agent_child {
-            store.lock().await.settle_post_bind_agent_child_failure(
-                context.spawn_request_id,
-                session_id,
-                permit.invocation_id(),
-                SAFE_ERROR_CLASS,
-            )
-        } else if let Some(bound) = retry_bound {
-            custody_runtime
-                .settle_bound_retry_failure(
-                    session_id,
-                    bound,
-                    SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
-                )
-                .await
-        } else {
+        let settlement = if agent_child.is_none() && retry_bound.is_none() {
+            // One short Store transaction, no custody stripe: the exact
+            // incarnation gate stays held across it.
             store
                 .lock()
                 .await
                 .fail_bound_direct_launch(session_id, SAFE_ERROR_CLASS)
+        } else {
+            // Child and retry settlement take the custody root's stripe and
+            // wait for it Store-free (#1172). That wait can last a whole
+            // maintenance proof, so the global active registry (session
+            // listing and every other registry user) must not be pinned for
+            // it (#1179). The settlement is itself exact-fenced durably (child
+            // invocation, retry custody generation); the in-memory incarnation
+            // is re-fenced below before anything is removed.
+            drop(active_guard);
+            let settlement = if let Some(context) = agent_child {
+                crate::store::agent_coordination::settle_post_bind_agent_child_failure_store_first(
+                    store,
+                    context.spawn_request_id,
+                    session_id,
+                    permit.invocation_id(),
+                    SAFE_ERROR_CLASS,
+                )
+                .await
+            } else if let Some(bound) = retry_bound {
+                custody_runtime
+                    .settle_bound_retry_failure(
+                        session_id,
+                        bound,
+                        SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
+                    )
+                    .await
+            } else {
+                unreachable!("the direct launch settlement is handled above")
+            };
+            active_guard = active.write().await;
+            settlement
         };
         if let Err(error) = settlement {
             tracing::warn!(
@@ -3613,10 +3747,17 @@ async fn settle_failed_deferred_execution_scratch(
             );
             return;
         }
-        active
-            .remove(&session_id)
-            .map(|tracked| tracked.session.status)
-            .unwrap_or(SessionStatus::Starting)
+        // Remove only the exact incarnation: a replacement that registered
+        // while the guard was released (a different spawn generation or
+        // invocation) is left tracked.
+        if is_exact_incarnation(&active_guard, store, session_id, permit, spawn_generation).await {
+            active_guard
+                .remove(&session_id)
+                .map(|tracked| tracked.session.status)
+                .unwrap_or(SessionStatus::Starting)
+        } else {
+            SessionStatus::Starting
+        }
     };
 
     agent_tokens
@@ -3669,64 +3810,6 @@ const fn controller_launch_error_reason(error: &DaemonError) -> ControllerReleas
         | DaemonError::ExecutionScratchUnavailable(_)
         | DaemonError::StreamFallbackRequired(_) => ControllerReleaseReasonV1::ProviderSpawnFailed,
         _ => ControllerReleaseReasonV1::ConfirmationFailed,
-    }
-}
-
-/// #913: a manager-created session may fork from an unsandboxed container
-/// (e.g. an Epic) whose frozen source is the operator's shared checkout. That
-/// checkout's local `rolling` can lag the verified origin tip by hundreds of
-/// commits, so such a source is eligible to be rebased onto the origin tip.
-/// Sandboxed sources (lead forks, `replace_lead`) and historical review
-/// sources keep their exact frozen commit.
-fn manager_action_fresh_base_eligible(
-    source: Option<&crate::store::manager_actions::ManagerActionSourceV2>,
-) -> bool {
-    source.is_some_and(|source| source.sandbox_root.is_none() && !source.historical_commit)
-}
-
-/// Sandbox source (origin, commit) of a manager-action launch. An eligible
-/// source (see [`manager_action_fresh_base_eligible`]) observes the verified
-/// origin `rolling` tip through `fresh_rolling_base(FastForwardOnly)`. It
-/// stores the selection in `rolling_selection`, so allocation cleans up the
-/// private ref. Other sources keep their exact frozen commit.
-///
-/// This runs synchronously and is `#[inline(never)]`, like the sandbox
-/// allocation it feeds. Any new suspension point or large temporaries in the
-/// launch future overflow the 2 MiB debug test stack that
-/// `manager_intent_live_decision_pause_and_dependency_races_refuse_at_custody_provider_boundary`
-/// deliberately runs on (#985).
-#[inline(never)]
-fn manager_action_sandbox_source(
-    context: &super::types::ManagerActionLaunchContext,
-    session_id: Uuid,
-    rolling_selection: &mut Option<crate::sandbox::git_worktree::RollingBaseSelection>,
-) -> (std::path::PathBuf, String) {
-    let origin = context.fork.fork_origin().to_path_buf();
-    let fork_commit = context.fork.fork_commit().to_owned();
-    if !manager_action_fresh_base_eligible(context.claim.operation.context.source.as_ref()) {
-        return (origin, fork_commit);
-    }
-    match crate::sandbox::git_worktree::fresh_rolling_base(
-        &origin,
-        session_id,
-        fork_commit.clone(),
-        crate::sandbox::git_worktree::RollingBasePolicy::FastForwardOnly,
-    ) {
-        Ok(selection) => {
-            let commit = selection.commit.clone();
-            *rolling_selection = Some(selection);
-            (origin, commit)
-        }
-        // Observing the remote is best effort: the frozen commit stays the
-        // source, as `fresh_rolling_base` itself does when the fetch fails.
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "manager action rolling base observation failed; using the frozen source"
-            );
-            (origin, fork_commit)
-        }
     }
 }
 
@@ -3966,11 +4049,17 @@ impl SessionManager {
                     "retry controller cleanup persistence barrier failed"
                 );
             }
-            if let Err(error) = self.store.lock().await.fail_established_retry_successor(
-                reservation.candidate_session_id,
-                bound,
-                SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
-            ) {
+            // Store first, then the transfer root's stripe without waiting for
+            // it under the Store (#1172).
+            let settled =
+                crate::store::sandbox_custody::fail_established_retry_successor_store_first(
+                    &self.store,
+                    reservation.candidate_session_id,
+                    bound,
+                    SandboxCustodyErrorCodeV1::PersistenceTransitionFailed,
+                )
+                .await;
+            if let Err(error) = settled {
                 tracing::warn!(
                     session_id = %reservation.candidate_session_id,
                     error = %error,
@@ -4114,6 +4203,23 @@ impl SessionManager {
             None,
             false,
             LaunchPurpose::Interactive,
+            None,
+        )
+        .await
+    }
+
+    /// #872: launch the global manager's appointed PM under the session id its
+    /// appointment journal reserved, so a replay never launches a second PM.
+    pub(crate) async fn launch_global_appointment(
+        &self,
+        config: LaunchConfig,
+        session_id: Uuid,
+    ) -> Result<Uuid> {
+        self.boxed_launch_session_with_retry_admission(
+            config,
+            None,
+            false,
+            LaunchPurpose::GlobalAppointment(session_id),
             None,
         )
         .await
@@ -4987,6 +5093,70 @@ impl SessionManager {
         }
     }
 
+    /// Issue #12: admission for an agent-armed `fresh` wake that creates a new
+    /// root. The new session writes only the tree it will execute in: with a
+    /// requested sandbox that is its own fresh allocation, so a writer in the
+    /// source checkout is no conflict and nothing is fenced. An unsandboxed
+    /// launch writes `working_dir` itself and is admitted only while no other
+    /// live session writes that effective worktree (a sandboxed session counts
+    /// by its sandbox root, never by its source directory). The per-tree
+    /// admission is held through the durable `Starting` publication so two
+    /// fresh launches into one tree cannot both pass the scan. Only this entry
+    /// applies the check: continuation, resume, operator recovery and retry
+    /// paths are unchanged.
+    ///
+    /// Scope (#1185): the fence is best-effort. It covers writers that are
+    /// already live and fresh-vs-fresh admissions (both take the per-tree
+    /// lock). Other launch paths (continuation, retry, resume, operator
+    /// recovery) do NOT take the tree lock, so a fresh launch can still race
+    /// one of those publishing a writer; whole-tree writer serialization is
+    /// tracked in Issue #1185.
+    pub(super) async fn fresh_wake_tree_admission(
+        &self,
+        config: &LaunchConfig,
+    ) -> Result<Option<super::tree_admission::TreeAdmissionGuard>> {
+        if config.model_invocation_purpose
+            != rsi_common::model_control::ModelInvocationPurpose::AgentScheduleWakeFresh
+            || config.sandbox.is_some()
+        {
+            return Ok(None);
+        }
+        let dir = config
+            .working_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)
+            .map_err(|error| {
+                super::tree_admission::tree_occupied_error(format!(
+                    "cannot resolve the wake working directory: {error}"
+                ))
+            })?;
+        let identity = match super::tree_admission::tree_identity(&dir) {
+            Ok(identity) => identity,
+            // A directory that does not exist cannot be written by anyone; the
+            // launch itself reports it. Any other resolution failure is
+            // ambiguous and fails closed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(super::tree_admission::tree_occupied_error(format!(
+                    "cannot resolve the worktree identity of {}: {error}",
+                    dir.display()
+                )));
+            }
+        };
+        let guard = super::tree_admission::acquire_tree_admission(&identity).await?;
+        let occupants = super::tree_admission::live_occupants(&self.store, &identity, &dir).await?;
+        if let Some(first) = occupants.first() {
+            return Err(super::tree_admission::tree_occupied_error(format!(
+                "{} live session(s) (first {first}) already write the worktree {}; a fresh \
+                 wake would be a second writer in a live tree",
+                occupants.len(),
+                identity.display()
+            )));
+        }
+        Ok(Some(guard))
+    }
+
     /// Scheduled Fresh launches can inherit only the already-resolved origin
     /// rotation-disable state. This is private to the scheduler seam so normal
     /// public and retry launches cannot accidentally alter it.
@@ -4995,6 +5165,7 @@ impl SessionManager {
         config: LaunchConfig,
         initial_rotation_disabled: bool,
     ) -> Result<Uuid> {
+        let _tree_admission = self.fresh_wake_tree_admission(&config).await?;
         self.boxed_launch_session_with_retry_admission(
             config,
             None,
@@ -5033,7 +5204,9 @@ impl SessionManager {
         has_parent: bool,
     ) -> Result<()> {
         match purpose {
-            LaunchPurpose::Interactive => self.deploy_drain.refuse_if_draining(None, has_parent)?,
+            LaunchPurpose::Interactive | LaunchPurpose::GlobalAppointment(_) => {
+                self.deploy_drain.refuse_if_draining(None, has_parent)?;
+            }
             LaunchPurpose::TopologyNode(context) => {
                 self.deploy_drain
                     .wait_released(
@@ -5285,29 +5458,31 @@ impl SessionManager {
         Box::pin(self.launch_manager_action_candidate(config, context))
     }
 
-    /// Issue #692: the provider and model a launch will run, resolved the way
-    /// the launch resolves them: the explicit request, else the project's
-    /// `FLYWHEEL.md` default (never for a launch that skips it or replays a
-    /// frozen retry identity), then the provider's own default. `None` means
-    /// no effective model can be determined.
-    async fn effective_launch_identity(
+    /// Issue #692: the project, provider and model a launch will run, resolved
+    /// the way the launch resolves them: the explicit request, else the
+    /// project's `FLYWHEEL.md` default (never for a launch that skips it or
+    /// replays a frozen retry identity), then the provider's own default. A
+    /// `None` model means no effective model can be determined.
+    ///
+    /// The launch resolves this ONCE and carries the snapshot into its config
+    /// (see [`Self::freeze_launch_identity`]), so a project-settings refresh
+    /// after the allowlist check cannot change the identity that is spawned.
+    async fn resolve_launch_identity(
         &self,
         config: &LaunchConfig,
         authenticated_retry: bool,
-    ) -> (SessionProvider, Option<String>) {
+    ) -> LaunchIdentitySnapshot {
         let mut provider = config.provider;
         let mut model = config.model.clone();
+        let mut project_id = config.project_id;
         if !authenticated_retry {
-            let project_id = match config.project_id {
-                Some(id) => Some(id),
-                None => {
-                    let raw = config.working_dir.clone().unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-                    });
-                    let dir = raw.canonicalize().unwrap_or(raw);
-                    self.project_index.read().await.find_project_for_path(&dir)
-                }
-            };
+            if project_id.is_none() {
+                let raw = config.working_dir.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                });
+                let dir = raw.canonicalize().unwrap_or(raw);
+                project_id = self.project_index.read().await.find_project_for_path(&dir);
+            }
             if let Some(pid) = project_id {
                 let cache = self.workflow_config_cache.read().await;
                 if let Some(wf) = cache.get(&pid) {
@@ -5322,7 +5497,46 @@ impl SessionManager {
         }
         let provider = provider.unwrap_or(SessionProvider::Claude);
         apply_provider_model_default(provider, &mut model);
-        (provider, model)
+        LaunchIdentitySnapshot {
+            project_id,
+            provider,
+            model,
+        }
+    }
+
+    /// The provider and model a launch will run (see
+    /// [`Self::resolve_launch_identity`]).
+    #[cfg(test)]
+    async fn effective_launch_identity(
+        &self,
+        config: &LaunchConfig,
+        authenticated_retry: bool,
+    ) -> (SessionProvider, Option<String>) {
+        let identity = self
+            .resolve_launch_identity(config, authenticated_retry)
+            .await;
+        (identity.provider, identity.model)
+    }
+
+    /// Issue #692: resolve the launch identity once, refuse it when it is off
+    /// the operator allowlist, and write the checked project, provider and model
+    /// into `config`. Everything after this point (sandbox allocation, session
+    /// row, admission, spawn) reads the frozen config, so the identity that was
+    /// vetted is the identity that runs, and a refusal can only happen here,
+    /// before any side effect.
+    async fn freeze_launch_identity(
+        &self,
+        config: &mut LaunchConfig,
+        authenticated_retry: bool,
+    ) -> Result<()> {
+        let identity = self
+            .resolve_launch_identity(config, authenticated_retry)
+            .await;
+        self.enforce_launch_model_allowlist(identity.provider, identity.model.as_deref())?;
+        config.project_id = identity.project_id;
+        config.provider = Some(identity.provider);
+        config.model = identity.model;
+        Ok(())
     }
 
     /// Issue #692: refuse a launch whose EFFECTIVE model is off the operator
@@ -5393,10 +5607,8 @@ impl SessionManager {
         // effect (sandbox allocation, custody, session row, admission). The
         // check runs on the EFFECTIVE model: project and provider defaults are
         // resolved first, exactly as the launch does below.
-        let (effective_provider, effective_model) = self
-            .effective_launch_identity(&config, authenticated_retry)
-            .await;
-        self.enforce_launch_model_allowlist(effective_provider, effective_model.as_deref())?;
+        self.freeze_launch_identity(&mut config, authenticated_retry)
+            .await?;
         // #694 K1: refresh a missing/expired credential check (single-flight,
         // 5 s timeout) before any lock is taken, so the spawn chokepoint's
         // admission decides on a current result.
@@ -5428,6 +5640,8 @@ impl SessionManager {
             .remove(&config.query)
             .unwrap_or(session_id);
 
+        // #1166: name the await this launch is parked at for the watchdog.
+        let _launch_phase = crate::launch_breadcrumbs::PhaseGuard::new(session_id, "start");
         // A lead (including its same-Epic successor) retains incremental
         // builds; new children, reviewers, and topology workers use sccache.
         let build_worker = match &launch_purpose {
@@ -5458,6 +5672,7 @@ impl SessionManager {
         // uniform across every provider-spawn entry point. Held (local) through
         // the synchronous `active.insert`; not extended into the spawned monitor
         // / deferred app-server task (fresh UUID => no same-id contention).
+        crate::launch_breadcrumbs::note_phase(session_id, "spawn_guard");
         let spawn_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
         let cwd_admission_guard = match preheld_cwd_admission {
             Some(guard) => guard,
@@ -5584,6 +5799,7 @@ impl SessionManager {
                         "unsupported sandbox kind: {kind:?}"
                     )));
                 }
+                crate::launch_breadcrumbs::note_phase(session_id, "sandbox_allocation_admission");
                 let allocation_permit = self.admit_sandbox_allocation().await?;
                 // H1-04 (F-011): an agent child forks exclusively from the
                 // authenticated emitter HEAD captured by `launch_agent_child`.
@@ -5620,10 +5836,15 @@ impl SessionManager {
                             claim.reservation.frozen.handoff.source_commit.clone(),
                         )
                     } else if let Some(context) = launch_purpose.manager_action() {
-                        // #913: see manager_action_sandbox_source. It is
-                        // synchronous, so this branch adds no suspension point
-                        // to the launch future.
-                        manager_action_sandbox_source(context, session_id, &mut rolling_selection)
+                        // #1144: a manager-action child is allocated from the
+                        // EXACT commit pinned at prepare time (the source gates
+                        // already accepted the source as that commit or a
+                        // verified published fast-forward of it). Never from a
+                        // newer fetched `rolling` tip.
+                        (
+                            context.fork.fork_origin().to_path_buf(),
+                            context.fork.fork_commit().to_owned(),
+                        )
                     } else if let Some(context) = launch_purpose.topology_node() {
                         (
                             context.fork.origin().to_path_buf(),
@@ -5687,8 +5908,10 @@ impl SessionManager {
                         let mut source_commit = String::from_utf8_lossy(&source_commit.stdout)
                             .trim()
                             .to_string();
-                        if matches!(launch_purpose, LaunchPurpose::Interactive)
-                            && config.closure_selector.is_none()
+                        if matches!(
+                            launch_purpose,
+                            LaunchPurpose::Interactive | LaunchPurpose::GlobalAppointment(_)
+                        ) && config.closure_selector.is_none()
                         {
                             let origin = working_dir.clone();
                             let selection = tokio::task::spawn_blocking(move || {
@@ -5852,23 +6075,18 @@ impl SessionManager {
             let cache = self.workflow_config_cache.read().await;
             if let Some(wf) = cache.get(&pid) {
                 let ps = &wf.settings;
-                if config.provider.is_none() {
-                    config.provider = ps.provider;
-                }
-                if config.model.is_none() && !config.skip_project_model_default {
-                    config.model = ps.model.clone();
-                }
+                // Provider and model were frozen with the allowlist check
+                // (`freeze_launch_identity`); a project refresh since then must
+                // not change them.
                 if config.session_kind.is_none() {
                     config.session_kind = ps.session_kind;
                 }
             }
         }
-        // Re-resolve provider after settings override
+        // The provider and model are the snapshot frozen (and allowlist-checked)
+        // before any side effect; the sandbox is already allocated here, so no
+        // second resolution may refuse or change them (#692).
         let provider = config.provider.unwrap_or(SessionProvider::Claude);
-        apply_provider_model_default(provider, &mut config.model);
-        // #692: authoritative check on the effective model (project default and
-        // provider default applied).
-        self.enforce_launch_model_allowlist(provider, config.model.as_deref())?;
         if let Some(context) = launch_purpose.manager_action() {
             let frozen = context
                 .claim
@@ -5892,7 +6110,9 @@ impl SessionManager {
         // Launches replaying a frozen identity keep their recorded provider.
         let provider = if matches!(
             launch_purpose,
-            LaunchPurpose::Interactive | LaunchPurpose::AgentChild(_)
+            LaunchPurpose::Interactive
+                | LaunchPurpose::GlobalAppointment(_)
+                | LaunchPurpose::AgentChild(_)
         ) {
             let route = self.runtime_config.bedrock_route_for(
                 config
@@ -5930,6 +6150,7 @@ impl SessionManager {
             }
             _ => {}
         }
+        crate::launch_breadcrumbs::note_phase(session_id, "provider_catalog_refresh");
         if let Err(error) = crate::provider_capabilities::refresh_installed_catalog_for_provider(
             provider,
             Arc::clone(&self.runtime_config),
@@ -6469,33 +6690,44 @@ impl SessionManager {
             let binding = direct_binding
                 .clone()
                 .expect("direct interactive launches always construct a custody binding");
-            let commit = if let Some(context) = launch_purpose.agent_child() {
-                self.store.lock().await.admit_agent_child_session(
-                    &session,
-                    admission_permit.invocation_id(),
-                    context.spawn_request_id,
-                    context.owner_session_id,
-                    binding,
-                )
-            } else if let LaunchPurpose::AgentSuccessor(context) = &launch_purpose {
-                self.store
-                    .lock()
-                    .await
-                    .insert_agent_successor_session_with_custody(
+            // The Store and the new root's stripe are taken together Store
+            // first: a busy stripe (a maintenance proof on a colliding shard)
+            // drops the Store and waits asynchronously, so it can delay only
+            // this launch. A blocking stripe wait under the Store pinned every
+            // RPC and the watchdog's Store probe (#1166).
+            crate::launch_breadcrumbs::note_phase(session_id, "custody_bind");
+            let commit = {
+                let (mut store, root) =
+                    crate::store::custody_lock_order::lock_store_then_binding_root(
+                        &self.store,
+                        &binding,
+                    )
+                    .await;
+                if let Some(context) = launch_purpose.agent_child() {
+                    store.admit_agent_child_session_holding(
+                        &session,
+                        admission_permit.invocation_id(),
+                        context.spawn_request_id,
+                        context.owner_session_id,
+                        binding,
+                        root,
+                    )
+                } else if let LaunchPurpose::AgentSuccessor(context) = &launch_purpose {
+                    store.insert_agent_successor_session_with_custody_holding(
                         &context.reservation,
                         &session,
                         admission_permit.invocation_id(),
                         binding,
+                        root,
                     )
-            } else {
-                self.store
-                    .lock()
-                    .await
-                    .insert_direct_session_with_custody_and_invocation(
+                } else {
+                    store.insert_direct_session_with_custody_and_invocation_holding(
                         &session,
                         binding,
                         admission_permit.invocation_id(),
+                        root,
                     )
+                }
             };
             if let Err(error) = commit {
                 if let Err(settlement_error) = complete_invocation(
@@ -6525,17 +6757,25 @@ impl SessionManager {
                     .record_manager_succession_candidate_bound(&claim)?;
                 context.refresh().await?;
             }
-            let authorization = {
-                let mut store = self.store.lock().await;
-                match allocation.as_ref() {
-                    Some(_) => CustodyService::authorize_live(
+            crate::launch_breadcrumbs::note_phase(session_id, "custody_authorize");
+            // Store first, stripe without blocking the Store (see the bind above).
+            let authorization = match allocation.as_ref() {
+                Some(_) => {
+                    let (mut store, root) =
+                        crate::store::custody_lock_order::lock_store_then_session_root(
+                            &self.store,
+                            session_id,
+                        )
+                        .await;
+                    CustodyService::authorize_live_holding(
                         &session,
                         &mut store,
                         self.sandbox_allocator.base_dir(),
                         rsi_common::types::SandboxCustodyTransitionV1::FreshLaunch,
-                    ),
-                    None => CustodyService::authorize_ordinary(&session),
+                        root,
+                    )
                 }
+                None => CustodyService::authorize_ordinary(&session),
             };
             let handle = match authorization {
                 Ok(handle) => handle,
@@ -6577,6 +6817,7 @@ impl SessionManager {
             self.check_manager_action_runtime(&context.claim, false)
                 .await?;
         }
+        crate::launch_breadcrumbs::note_phase(session_id, "context_effect");
         let mut direct_context_permit = if let (Some(session), Some(prepared)) =
             (direct_session.as_ref(), direct_prepared_launch.as_ref())
         {
@@ -7178,6 +7419,7 @@ impl SessionManager {
             return Err(DaemonError::CodexBinaryNotFound);
         }
 
+        crate::launch_breadcrumbs::note_phase(session_id, "model_admission");
         tracing::info!(session_id = %session_id, "Launch: requesting model admission");
         let admission_permit = if let Some(permit) = retry_admission_permit.take() {
             permit
@@ -7370,6 +7612,7 @@ impl SessionManager {
                     tool_policy: launch_tool_policy,
                 },
             };
+            crate::launch_breadcrumbs::note_phase(session_id, "provider_spawn");
             tracing::info!(session_id = %session_id, ?provider, "Launch: spawning provider process");
             #[cfg(test)]
             observe_provider_config_for_test(session_id, &config);
@@ -7445,6 +7688,14 @@ impl SessionManager {
                 }
             };
             tracing::info!(session_id = %session_id, "Launch: provider process spawned");
+            #[cfg(test)]
+            if launch_purpose.manager_action().is_some() {
+                pause_controller_candidate_test(
+                    session_id,
+                    ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+                )
+                .await;
+            }
             #[cfg(test)]
             if launch_purpose.is_agent_successor() || launch_purpose.manager_successor().is_some() {
                 pause_controller_candidate_test(
@@ -7756,6 +8007,21 @@ impl SessionManager {
         // dropped after this point.
         sandbox_guard.disarm();
         self.active.write().await.insert(session_id, tracked);
+        let manager_action_launch = launch_purpose.manager_action().is_some();
+        let mut unmonitored_launch_guard = UnmonitoredLaunchGuard {
+            active: Arc::clone(&self.active),
+            session_id,
+            generation: spawn_generation,
+            armed: manager_action_launch,
+        };
+        #[cfg(test)]
+        if launch_purpose.manager_action().is_some() {
+            pause_controller_candidate_test(
+                session_id,
+                ControllerCandidateTestPhase::ManagerActionAfterActiveInsertion,
+            )
+            .await;
+        }
         self.event_bus.publish(DaemonEvent::SessionCreated {
             session: session.clone(),
         });
@@ -7779,6 +8045,7 @@ impl SessionManager {
             LaunchPurpose::ControllerCandidate(context) => (Some(context), None),
             LaunchPurpose::AgentSuccessor(context) => (None, Some(context)),
             LaunchPurpose::Interactive
+            | LaunchPurpose::GlobalAppointment(_)
             | LaunchPurpose::AgentChild(_)
             | LaunchPurpose::ClosureSource(_)
             | LaunchPurpose::ManagerAction(_)
@@ -7942,7 +8209,9 @@ impl SessionManager {
         #[cfg(test)]
         let deferred_test_control_key = direct_test_control_key.clone();
 
-        tokio::spawn(async move {
+        // The monitor task below owns the entry from here.
+        unmonitored_launch_guard.disarm();
+        let monitor_task = tokio::spawn(async move {
             let root_exit = manager_successor_context.clone();
             let task = async {
                 // Project was pre-resolved synchronously for the context pipeline.
@@ -8480,6 +8749,8 @@ impl SessionManager {
                     }
                     let manager_gate_context = manager_successor_context.clone();
                     #[cfg(test)]
+                    let manager_action_gate = manager_action_context.is_some();
+                    #[cfg(test)]
                     inject_final_scratch_drift_for_test(&deferred_test_control_key, true, &config);
                     match app_server_client
                         .launch_with_gate(
@@ -8491,6 +8762,12 @@ impl SessionManager {
                             move |_checkpoint| {
                                 let context = manager_gate_context.clone();
                                 async move {
+                                    #[cfg(test)]
+                                    if manager_action_gate
+                                        && _checkpoint == crate::codex_app_server::AppServerLaunchGate::BeforeThreadAdmission
+                                    {
+                                        pause_controller_candidate_test(session_id, ControllerCandidateTestPhase::ManagerActionStartGateHeld).await;
+                                    }
                                     #[cfg(test)]
                                     if context.is_some() && _checkpoint == crate::codex_app_server::AppServerLaunchGate::BeforeThreadAdmission {
                                         pause_controller_candidate_test(session_id, ControllerCandidateTestPhase::ManagerAfterDeferredInitialize).await;
@@ -8735,16 +9012,15 @@ impl SessionManager {
                                 let child_settlement = if let Some(context) =
                                     deferred_agent_child_context.as_ref()
                                 {
-                                    store
-                                        .lock()
-                                        .await
-                                        .settle_post_bind_agent_child_failure(
-                                            context.spawn_request_id,
-                                            session_id,
-                                            admission_permit_for_task.invocation_id(),
-                                            "codex_app_server_launch_failed",
-                                        )
-                                        .map_err(|error| error.to_string())
+                                    crate::store::agent_coordination::settle_post_bind_agent_child_failure_store_first(
+                                        &store,
+                                        context.spawn_request_id,
+                                        session_id,
+                                        admission_permit_for_task.invocation_id(),
+                                        "codex_app_server_launch_failed",
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())
                                 } else {
                                     Ok(())
                                 };
@@ -8866,6 +9142,9 @@ impl SessionManager {
             }
             drop(manager_successor_guards);
         });
+        if manager_action_launch {
+            register_manager_launch_task(session_id, monitor_task.abort_handle());
+        }
 
         Ok(session_id)
     }
@@ -10715,6 +10994,7 @@ mod tests {
     use crate::config::{Config, RuntimeConfig};
     use crate::project_workflow::{FileFingerprint, ProjectSettings, ProjectWorkflow};
     use crate::store::Store;
+    use crate::test_support::disk_backed_tempdir;
     use rsi_common::harness_manager::{
         AgentManagerInboxRequestV1, ConfigureHarnessManagerRequestV1,
     };
@@ -10988,6 +11268,96 @@ mod tests {
             .effective_launch_identity(&project_launch, false)
             .await;
         assert_eq!(effective, None);
+    }
+
+    /// Issue #692 (review): the launch resolves project, provider and model once
+    /// and carries that snapshot into the config. A project-settings refresh
+    /// after the allowlist check (an allowed default replaced by a disallowed
+    /// one) must neither change the identity that runs nor refuse after the
+    /// check, where a sandbox would already be allocated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn launch_identity_is_frozen_with_the_allowlist_check_across_a_project_refresh() {
+        let (manager, _db_dir, sandbox_base) = manager();
+        manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["allowed-project-model"]),
+            )
+            .unwrap();
+        let work = tempfile::tempdir().expect("work dir");
+        let project_id = Uuid::new_v4();
+        let set_project_default = |model: &'static str| {
+            let manager = &manager;
+            async move {
+                manager.workflow_config_cache.write().await.insert(
+                    project_id,
+                    crate::project_workflow::ProjectWorkflow {
+                        settings: crate::project_workflow::ProjectSettings {
+                            model: Some(model.to_string()),
+                            ..Default::default()
+                        },
+                        template_body: String::new(),
+                        fingerprint: crate::project_workflow::FileFingerprint {
+                            mtime_secs: 0,
+                            size: 0,
+                            content_hash: 0,
+                        },
+                        loaded_at: chrono::Utc::now(),
+                        last_error: None,
+                    },
+                );
+            }
+        };
+        set_project_default("allowed-project-model").await;
+        let mut config = direct_interactive_test_config(work.path().to_path_buf());
+        config.provider = None;
+        config.model = None;
+        config.project_id = Some(project_id);
+
+        manager
+            .freeze_launch_identity(&mut config, false)
+            .await
+            .expect("the allowed project default passes the check");
+        assert_eq!(config.model.as_deref(), Some("allowed-project-model"));
+        assert_eq!(config.provider, Some(SessionProvider::Claude));
+        assert_eq!(config.project_id, Some(project_id));
+
+        // The project default is refreshed to a disallowed model after the check.
+        set_project_default("disallowed-project-model").await;
+        let (provider, effective) = manager.effective_launch_identity(&config, false).await;
+        assert_eq!(provider, SessionProvider::Claude);
+        assert_eq!(
+            effective.as_deref(),
+            Some("allowed-project-model"),
+            "the frozen identity ignores the refreshed project default"
+        );
+        manager
+            .freeze_launch_identity(&mut config, false)
+            .await
+            .expect("re-freezing the frozen identity stays allowed");
+        assert_eq!(config.model.as_deref(), Some("allowed-project-model"));
+
+        // A fresh launch after the refresh sees the new default and is refused
+        // before any side effect.
+        let mut fresh = direct_interactive_test_config(work.path().to_path_buf());
+        fresh.provider = None;
+        fresh.model = None;
+        fresh.project_id = Some(project_id);
+        let error = manager
+            .launch_session(fresh)
+            .await
+            .expect_err("the refreshed disallowed default is refused");
+        assert!(
+            error.to_string().contains("launch_model_not_allowed"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(sandbox_base.path()).unwrap().count(),
+            0,
+            "a refused launch must not allocate a sandbox root"
+        );
     }
 
     /// Issue #692: a launch and its continuation name the same model with and
@@ -11320,18 +11690,6 @@ mod tests {
     // unit-test execution cannot replace a hook or fill another test's queue.
     fn reclaim_test_isolation() -> std::sync::MutexGuard<'static, ()> {
         crate::sandbox::target_reclaim::reclaim_test_isolation_for_test()
-    }
-
-    fn disk_backed_tempdir(label: &str) -> TempDir {
-        let root = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target"))
-            .join("rsid-test-fixtures");
-        std::fs::create_dir_all(&root).expect("create disk-backed test fixture root");
-        tempfile::Builder::new()
-            .prefix(label)
-            .tempdir_in(root)
-            .expect("create disk-backed test fixture")
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -17638,6 +17996,223 @@ done
         manager.revoke_agent_token_for_session(session_id).await;
     }
 
+    /// Issue #12: an agent `fresh` wake refuses to start while another live
+    /// session writes the same effective worktree, whether named by an alias
+    /// symlink or a subdirectory; an independent worktree is not blocked.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn agent_fresh_launch_refuses_a_live_writer_in_the_same_effective_worktree() {
+        let (manager, _dir, _sandbox) = manager();
+        let tree = TempDir::new().expect("tree root");
+        let repo = tree.path().join("repo");
+        std::fs::create_dir_all(repo.join("crates/x")).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let alias = tree.path().join("alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let live_id = Uuid::new_v4();
+        {
+            let store = manager.store.lock().await;
+            let mut live = test_session(live_id);
+            live.working_dir = repo.join("crates/x");
+            live.status = SessionStatus::Running;
+            store.insert_session(&live).expect("insert live neighbour");
+        }
+        for dir in [repo.clone(), alias.clone(), alias.join("crates/x")] {
+            let config = scheduled_fresh_test_config(
+                ModelInvocationPurpose::AgentScheduleWakeFresh,
+                SessionProvider::Local,
+                dir.clone(),
+                None,
+                Uuid::new_v4(),
+            );
+            let error = manager
+                .launch_scheduled_fresh(config, false)
+                .await
+                .expect_err("a live writer in the same worktree must block the launch");
+            assert!(
+                crate::session::tree_admission::is_tree_occupied_error(&error),
+                "{}: {error}",
+                dir.display()
+            );
+        }
+        assert_eq!(
+            manager
+                .store
+                .lock()
+                .await
+                .load_sessions()
+                .expect("list")
+                .len(),
+            1,
+            "a refused launch creates no session row"
+        );
+    }
+
+    /// Issue #12 fence: while another admission into the tree is in flight, a
+    /// fresh-wake launch waits; a writer published during that window is then
+    /// seen and the launch is refused (only one writer is admitted).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn fresh_wake_admissions_into_one_tree_are_serialized_and_see_a_published_writer() {
+        let (manager, _dir, _sandbox) = manager();
+        let manager = Arc::new(manager);
+        let tree = TempDir::new().expect("tree root");
+        std::fs::create_dir(tree.path().join(".git")).unwrap();
+        let identity = crate::session::tree_admission::tree_identity(tree.path()).unwrap();
+
+        // A concurrent admission is mid-flight and holds the tree.
+        let held = crate::session::tree_admission::acquire_tree_admission(&identity)
+            .await
+            .expect("hold the tree admission");
+        let launching = {
+            let manager = Arc::clone(&manager);
+            let dir = tree.path().to_path_buf();
+            tokio::spawn(async move {
+                let config = scheduled_fresh_test_config(
+                    ModelInvocationPurpose::AgentScheduleWakeFresh,
+                    SessionProvider::Local,
+                    dir,
+                    None,
+                    Uuid::new_v4(),
+                );
+                manager.launch_scheduled_fresh(config, false).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !launching.is_finished(),
+            "the launch must wait for the held admission"
+        );
+
+        // The competing writer is published (wake-owned, live) before release.
+        let origin = Uuid::new_v4();
+        let writer_id = Uuid::new_v4();
+        {
+            let store = manager.store.lock().await;
+            let mut job = rsi_common::types::ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "fence".into(),
+                message: "m".into(),
+                schedule: rsi_common::types::ScheduleSpec {
+                    recurrence: rsi_common::types::Recurrence::Once,
+                    anchor: chrono::Utc::now(),
+                },
+                last_fired_at: None,
+                next_fire_at: chrono::Utc::now(),
+                enabled: false,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                wake_mode: rsi_common::types::WakeMode::AgentFresh,
+                wake_session_id: Some(origin),
+            };
+            job.working_dir = Some(tree.path().to_path_buf());
+            store.insert_scheduled_job(&job).unwrap();
+            let mut writer = test_session(writer_id);
+            writer.working_dir = tree.path().to_path_buf();
+            writer.status = SessionStatus::Running;
+            writer.scheduled_job_id = Some(job.id);
+            store.insert_session(&writer).unwrap();
+        }
+        drop(held);
+        let error = launching
+            .await
+            .expect("join launch")
+            .expect_err("the second writer must be refused");
+        assert!(
+            crate::session::tree_admission::is_tree_occupied_error(&error),
+            "{error}"
+        );
+    }
+
+    /// Issue #12: the fence covers only the tree the new root will WRITE. A
+    /// requested sandbox is a fresh allocation (nothing to fence), and a live
+    /// sandboxed session counts by its sandbox root, not its source checkout.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn fresh_wake_fence_uses_the_effective_write_tree_not_the_source_checkout() {
+        let (manager, _dir, _sandbox) = manager();
+        let tree = TempDir::new().expect("tree root");
+        let repo = tree.path().join("repo");
+        let sandbox_root = tree.path().join("sandbox");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::write(sandbox_root.join(".git"), "gitdir: x").unwrap();
+        let sandboxed_id = Uuid::new_v4();
+        {
+            let store = manager.store.lock().await;
+            let mut sandboxed = test_session(sandboxed_id);
+            sandboxed.working_dir = repo.clone(); // the source checkout
+            sandboxed.sandbox_root = Some(sandbox_root.clone());
+            sandboxed.status = SessionStatus::Running;
+            store
+                .insert_session(&sandboxed)
+                .expect("insert sandboxed writer");
+        }
+        let mut config = scheduled_fresh_test_config(
+            ModelInvocationPurpose::AgentScheduleWakeFresh,
+            SessionProvider::Local,
+            repo.clone(),
+            None,
+            Uuid::new_v4(),
+        );
+        assert!(
+            manager
+                .fresh_wake_tree_admission(&config)
+                .await
+                .expect("a writer confined to its own sandbox does not occupy the source checkout")
+                .is_some(),
+            "an unsandboxed fresh launch into the free source checkout is admitted"
+        );
+
+        // The same sandboxed writer does occupy its own sandbox root.
+        config.working_dir = Some(sandbox_root.clone());
+        let error = manager
+            .fresh_wake_tree_admission(&config)
+            .await
+            .err()
+            .expect("the sandbox root is occupied by its writer");
+        assert!(
+            crate::session::tree_admission::is_tree_occupied_error(&error),
+            "{error}"
+        );
+
+        // A launch that requests its own sandbox writes a fresh tree: no fence.
+        let direct_id = Uuid::new_v4();
+        {
+            let store = manager.store.lock().await;
+            let mut direct = test_session(direct_id);
+            direct.working_dir = repo.clone();
+            direct.status = SessionStatus::Running;
+            store
+                .insert_session(&direct)
+                .expect("insert unsandboxed writer");
+        }
+        config.working_dir = Some(repo.clone());
+        assert!(crate::session::tree_admission::is_tree_occupied_error(
+            &manager
+                .fresh_wake_tree_admission(&config)
+                .await
+                .err()
+                .expect("an unsandboxed writer occupies the source checkout")
+        ));
+        config.sandbox = Some(rsi_common::types::SandboxSpec {
+            kind: None,
+            branch: None,
+        });
+        assert!(
+            manager
+                .fresh_wake_tree_admission(&config)
+                .await
+                .expect("a sandboxed fresh launch is not fenced")
+                .is_none()
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn scheduled_fresh_pins_effective_standard_kind_against_project_worker_default() {
@@ -17702,6 +18277,115 @@ done
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
 
         cleanup_active_test_session(&manager, session_id, invocation_id).await;
+        server.abort();
+    }
+
+    /// #872 R1: the global manager's appointment goes through the real launch
+    /// funnel under the session id its journal reserved, and that exact
+    /// session is the one appointed (no unappointed stray session).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn global_appointment_launch_persists_and_appoints_the_reserved_session_id() {
+        use rsi_common::global_manager::{
+            AgentGlobalAppointManagerRequestV1, ConfigureGlobalManagerRequestV1,
+        };
+        use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+        let (manager, _dir, _sandbox) = manager();
+        let (server, base_url, dispatches) = spawn_blocking_local_test_provider().await;
+        let cwd = std::env::current_dir().expect("current working directory");
+        let project_id = Uuid::new_v4();
+        let seat = Uuid::new_v4();
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Local,
+            model: "scheduled-fresh-test-model".into(),
+            effort: None,
+        };
+        {
+            let store = manager.store.lock().await;
+            let now = chrono::Utc::now();
+            store
+                .insert_project(&rsi_common::types::Project {
+                    id: project_id,
+                    name: format!("global appointment {project_id}"),
+                    path: Some(cwd.clone()),
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            let mut seat_row = test_session(seat);
+            seat_row.working_dir = cwd.clone();
+            store.insert_session(&seat_row).unwrap();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: seat,
+                        project_ids: vec![project_id],
+                        allowed_launches: vec![launch.clone()],
+                        project_policy: ManagerPolicyV2::default(),
+                        expected_grant_version: 0,
+                        idempotency_key: "global-grant".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        let request = AgentGlobalAppointManagerRequestV1 {
+            project_id,
+            launch,
+            query: "You are the project manager.".into(),
+            idempotency_key: "gm-launch-1".into(),
+            sandbox: Some(false),
+        };
+        let result = super::super::global_manager_verbs::global_appoint_manager_with(
+            &manager.store,
+            seat,
+            &request,
+            |session_id| {
+                let mut config = super::super::global_manager_verbs::global_manager_launch_config(
+                    &request,
+                    cwd.clone(),
+                    session_id,
+                );
+                config.openai_base_url = Some(base_url.clone());
+                manager.launch_global_appointment(config, session_id)
+            },
+        )
+        .await
+        .expect("appointment through the real launch path");
+        wait_for_backend_dispatch(&dispatches).await;
+        let invocation_id = {
+            let store = manager.store.lock().await;
+            let session = store
+                .get_session(result.session_id)
+                .unwrap()
+                .expect("the reserved session id is the persisted session");
+            assert_eq!(session.project_id, Some(project_id));
+            assert_eq!(session.session_kind, SessionKind::Standard);
+            let sessions: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE project_id=?1",
+                    [project_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sessions, 1, "exactly one PM session was launched");
+            let config = store.get_harness_manager(project_id).unwrap().unwrap();
+            assert_eq!(config.current_session_id, Some(result.session_id));
+            let policy = store
+                .get_harness_manager_policy(project_id)
+                .unwrap()
+                .unwrap();
+            assert!(!policy.revoked);
+            store
+                .session_model_invocation_id(result.session_id)
+                .unwrap()
+                .expect("the PM launch has an admission binding")
+        };
+        cleanup_active_test_session(&manager, result.session_id, invocation_id).await;
         server.abort();
     }
 
@@ -21068,9 +21752,9 @@ done
             .find("let mut direct_context_permit")
             .expect("direct ContextRead boundary");
         for durable_bind in [
-            "admit_agent_child_session(",
-            "insert_agent_successor_session_with_custody(",
-            "insert_direct_session_with_custody_and_invocation(",
+            "admit_agent_child_session_holding(",
+            "insert_agent_successor_session_with_custody_holding(",
+            "insert_direct_session_with_custody_and_invocation_holding(",
         ] {
             assert!(
                 launch_body.find(durable_bind).expect("durable bind call") < context_boundary,
@@ -21079,7 +21763,7 @@ done
         }
         assert_eq!(
             launch_body
-                .matches("insert_agent_successor_session_with_custody(")
+                .matches("insert_agent_successor_session_with_custody_holding(")
                 .count(),
             1,
             "AgentSuccessor must have one durable insertion boundary"
@@ -24364,12 +25048,14 @@ done
         let spawn_request_id = request.spawn_request_id;
         let live = crate::store::agent_deploys::DeployRow {
             id: Uuid::new_v4(),
-            owner_session_id: Uuid::new_v4(),
+            owner_session_id: Some(Uuid::new_v4()),
             sha: "0".repeat(40),
             manifest: Vec::new(),
             state: rsi_common::agent_deploy::DeployState::Staged,
             reason: None,
             deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+            operator: false,
+            forced: false,
         };
         manager
             .deploy_drain()
@@ -24447,12 +25133,14 @@ done
         };
         let live = crate::store::agent_deploys::DeployRow {
             id: Uuid::new_v4(),
-            owner_session_id: Uuid::new_v4(),
+            owner_session_id: Some(Uuid::new_v4()),
             sha: "0".repeat(40),
             manifest: Vec::new(),
             state: rsi_common::agent_deploy::DeployState::Staged,
             reason: None,
             deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+            operator: false,
+            forced: false,
         };
         manager
             .deploy_drain()
@@ -24825,19 +25513,45 @@ done
         spawn_request_id: Uuid,
         child_id: Uuid,
     ) {
+        // The settlement is several steps after the durable Failed commit: the
+        // registry removal (the guard is released across the custody settlement,
+        // #1179), the token revoke and the invocation completion. Wait for the
+        // last of them, not just the first, before asserting any of them.
         let settled = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let failed = manager
-                    .store
-                    .lock()
+                let (failed, invocation_terminal) = {
+                    let store = manager.store.lock().await;
+                    let failed = store
+                        .get_session(child_id)
+                        .expect("load post-preparation child")
+                        .is_some_and(|child| child.status == SessionStatus::Failed);
+                    let invocation_terminal = store
+                        .session_model_invocation_id(child_id)
+                        .expect("load post-preparation invocation id")
+                        .is_some_and(|id| {
+                            store
+                                .conn
+                                .query_row(
+                                    "SELECT status FROM model_invocations WHERE id=?1",
+                                    [id.to_string()],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .expect("load post-preparation invocation status")
+                                != "running"
+                        });
+                    (failed, invocation_terminal)
+                };
+                let removed = !manager.active.read().await.contains_key(&child_id);
+                let revoked = manager
+                    .agent_tokens
+                    .read()
                     .await
-                    .get_session(child_id)
-                    .expect("load post-preparation child")
-                    .is_some_and(|child| child.status == SessionStatus::Failed);
-                if failed {
+                    .token_for_session(child_id)
+                    .is_none();
+                if failed && invocation_terminal && removed && revoked {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await;
@@ -27853,34 +28567,6 @@ done
         );
         assert!(!scripted.alive.load(Ordering::SeqCst));
         drop_controller_candidate_test_stream(receipt.candidate_session_id);
-    }
-    /// #913: only an unsandboxed, non-historical manager source may be
-    /// rebased onto the verified origin tip. Sandboxed (lead fork,
-    /// `replace_lead`) and historical review sources keep their frozen commit.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
-    #[test]
-    fn manager_action_fresh_base_eligible_only_for_unsandboxed_live_sources() {
-        let source = |sandbox_root: Option<PathBuf>, historical_commit: bool| {
-            crate::store::manager_actions::ManagerActionSourceV2 {
-                session_id: Uuid::new_v4(),
-                working_dir: PathBuf::from("/tmp/fixture"),
-                sandbox_root,
-                commit: "a".repeat(40),
-                custody_generation: None,
-                historical_commit,
-            }
-        };
-        assert!(manager_action_fresh_base_eligible(Some(&source(
-            None, false
-        ))));
-        assert!(!manager_action_fresh_base_eligible(Some(&source(
-            Some(PathBuf::from("/tmp/fixture-sandbox")),
-            false
-        ))));
-        assert!(!manager_action_fresh_base_eligible(Some(&source(
-            None, true
-        ))));
-        assert!(!manager_action_fresh_base_eligible(None));
     }
 
     mod manager_admission_tests;

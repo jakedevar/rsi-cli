@@ -986,8 +986,8 @@ fn contains(root: &Path, candidate: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Config, RuntimeConfig};
-    use crate::store::tests::make_test_session;
     use chrono::Utc;
+    use rsid_store::test_support::make_test_session;
     use std::process::Command;
     use std::sync::atomic::Ordering;
     use uuid::Uuid;

@@ -274,22 +274,14 @@ async fn schedule_browser_single_space_toggles_selected_job() {
 
 fn file_explorer_app(finder_active: bool) -> App {
     let mut app = test_app();
-    app.overlay = OverlayState::FileExplorer {
-        root: PathBuf::from("/tmp"),
-        entries: Vec::new(),
-        selected_index: 0,
-        scroll_offset: 0,
-        show_hidden: false,
-        trash: Vec::new(),
-        pending_yank: false,
-        pending_delete: false,
-        finder_active,
-        finder_query: String::new(),
-        finder_cache: vec![PathBuf::from("query file")],
-        finder_results: Vec::new(),
-        finder_selected: 0,
-        explorer_focused: true,
-    };
+    let mut state = crate::overlay::file_explorer::FileExplorerState::with_entries(
+        PathBuf::from("/tmp"),
+        Vec::new(),
+        std::env::temp_dir(),
+    );
+    state.finder.active = finder_active;
+    state.finder.cache = vec![PathBuf::from("query file")];
+    app.overlay = OverlayState::FileExplorer(Box::new(state));
     app
 }
 
@@ -311,16 +303,13 @@ async fn file_explorer_finder_keeps_printable_keys_and_escape_returns_to_tree() 
     }
     assert!(matches!(
         &app.overlay,
-        OverlayState::FileExplorer { finder_query, .. } if finder_query == "q "
+        OverlayState::FileExplorer(state) if state.finder.query == "q "
     ));
 
     assert!(handle_overlay_key(&mut app, key(KeyCode::Esc)).await);
     assert!(matches!(
         &app.overlay,
-        OverlayState::FileExplorer {
-            finder_active: false,
-            ..
-        }
+        OverlayState::FileExplorer(state) if !state.finder.active
     ));
     assert!(handle_overlay_key(&mut app, key(KeyCode::Esc)).await);
     assert!(matches!(app.overlay, OverlayState::None));

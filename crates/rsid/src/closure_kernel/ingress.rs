@@ -421,7 +421,7 @@ mod tests {
             .expect("repository identity");
 
             let mut store = Store::open_in_memory().expect("store");
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.status = SessionStatus::Starting;
             session.working_dir = repository.clone();
             session.sandbox_kind = Some(SandboxKind::GitWorktree);
@@ -709,7 +709,7 @@ mod tests {
 
         async fn rotate(&self) -> (Uuid, Uuid) {
             let mut store = self.store.lock().await;
-            let mut successor = crate::store::tests::make_test_session();
+            let mut successor = rsid_store::test_support::make_test_session();
             successor.id = Uuid::new_v4();
             successor.status = SessionStatus::Starting;
             successor.working_dir = self.repository.clone();
@@ -777,7 +777,7 @@ mod tests {
         }
 
         async fn insert_unbound_successor(&self) -> Uuid {
-            let mut successor = crate::store::tests::make_test_session();
+            let mut successor = rsid_store::test_support::make_test_session();
             successor.id = Uuid::new_v4();
             successor.status = SessionStatus::Starting;
             successor.working_dir = self.repository.clone();
@@ -818,7 +818,7 @@ mod tests {
             ))
             .expect("repository identity");
             let mut store = self.store.lock().await;
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = Uuid::new_v4();
             session.status = SessionStatus::Starting;
             session.working_dir = self.repository.clone();

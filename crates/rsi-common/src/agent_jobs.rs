@@ -28,6 +28,10 @@ pub const JOB_NOT_FOUND: &str = "job_not_found";
 pub const JOB_KIND_NOT_AUTHORIZED: &str = "job_kind_not_authorized";
 pub const JOB_LAUNCH_FAILED: &str = "job_launch_failed";
 pub const JOB_KEY_CONFLICT: &str = "job_idempotency_key_conflict";
+/// `AgentCancelJob` (#1106): the refusal recorded on a job its owner stopped.
+/// The job settles `failed` with this refusal, the same typed route the
+/// scratch-quota stop uses, so no new state or migration is needed.
+pub const JOB_CANCELLED: &str = "job_cancelled";
 
 /// Typed job kind. Strings match the SQLite CHECK exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +159,13 @@ pub struct AgentGetJobRequestV1 {
     pub job_id: Uuid,
 }
 
+/// `AgentCancelJob` (#1106): stop one of your running jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCancelJobRequestV1 {
+    pub job_id: Uuid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentListJobsRequestV1 {
@@ -175,12 +186,18 @@ pub struct TestJobParams {
     /// Run `cargo test -p <package>`.
     #[serde(default)]
     pub package: Option<String>,
-    /// Test-name filters after `--` (package runs only).
+    /// Test-name filters after `--` (package runs only). Empty runs every test
+    /// of the package (#1106).
     #[serde(default)]
     pub filters: Vec<String>,
     /// Package runs: pass `--lib`.
     #[serde(default)]
     pub lib_only: bool,
+    /// #1099 candidate receipt (manager/Epic lead only): the branch or full
+    /// commit to verify against `origin/rolling` in a temporary detached
+    /// worktree. The typed receipt is `result.receipt`.
+    #[serde(default)]
+    pub candidate_receipt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,8 +317,33 @@ fn test_filterset(value: &str) -> bool {
         })
 }
 
+/// A branch name, `origin/<branch>` or full commit id for `candidate_receipt`:
+/// never an option, never a revision expression.
+fn candidate_ref(value: &str) -> bool {
+    bare_token(value, &['/', '.'])
+        && !value.contains("..")
+        && !value.contains("//")
+        && !value.ends_with(['/', '.'])
+}
+
 impl TestJobParams {
+    /// A `candidate_receipt` run: only the appointed manager or an Epic lead
+    /// may submit it (it fetches and builds an arbitrary branch).
+    #[must_use]
+    pub const fn is_candidate_receipt(&self) -> bool {
+        self.candidate_receipt.is_some()
+    }
+
     fn validate(&self) -> Result<(), &'static str> {
+        if let Some(candidate) = &self.candidate_receipt {
+            let ok = self.shard.is_none()
+                && self.package.is_none()
+                && self.filterset.is_none()
+                && self.filters.is_empty()
+                && !self.lib_only
+                && candidate_ref(candidate);
+            return ok.then_some(()).ok_or(JOB_INVALID_PARAMS);
+        }
         let ok = match (&self.shard, &self.package) {
             (Some(shard), None) => {
                 bare_token(shard, &[])
@@ -312,7 +354,6 @@ impl TestJobParams {
             (None, Some(package)) => {
                 bare_token(package, &['.'])
                     && self.filterset.is_none()
-                    && !self.filters.is_empty()
                     && self.filters.len() <= JOB_MAX_TEST_FILTERS
                     && self.filters.iter().all(|f| bare_token(f, &[':', '.']))
             }
@@ -462,6 +503,11 @@ pub struct AgentJobResultV1 {
     /// `cloud_sweep` jobs: the typed sweep verdict.
     #[serde(default)]
     pub sweep: Option<CloudSweepResultV1>,
+    /// `test` jobs with `candidate_receipt` (#1099): the typed candidate
+    /// receipt `scripts/check-touched-shards` produced (base, head, merge
+    /// clean, shards compiled, audit verdicts, migrations, suggested filters).
+    #[serde(default)]
+    pub receipt: Option<serde_json::Value>,
 }
 
 /// One job as reported to its owner.
@@ -490,6 +536,16 @@ pub struct AgentSubmitJobReceiptV1 {
     pub job: AgentJobV1,
     /// True when an identical idempotent retry returned the original job.
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCancelJobResultV1 {
+    /// The job after the call: `failed` with refusal `job_cancelled` when this
+    /// call stopped it, or its existing terminal state otherwise.
+    pub job: AgentJobV1,
+    /// True when this call stopped a running job; false when it had already
+    /// settled (a repeat cancel changes nothing).
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,6 +580,20 @@ mod tests {
             .typed_params(),
             Ok(JobParams::Test(_))
         ));
+        // #1106: a package run needs no filters; it runs every test.
+        for all in [
+            json!({"package":"rsid"}),
+            json!({"package":"rsid","filters":[]}),
+            json!({"package":"rsid","lib_only":true}),
+        ] {
+            assert!(
+                matches!(
+                    request(JobKind::Test, all.clone()).typed_params(),
+                    Ok(JobParams::Test(_))
+                ),
+                "{all}"
+            );
+        }
         assert!(matches!(
             request(
                 JobKind::Test,
@@ -615,5 +685,33 @@ mod tests {
         ok.name = Some("check".into());
         ok.idempotency_key = Some(String::new());
         assert_eq!(ok.typed_params().unwrap_err(), JOB_KEY_INVALID);
+    }
+
+    #[test]
+    fn a_candidate_receipt_takes_only_a_bare_ref() {
+        let ok = |value: serde_json::Value| request(JobKind::Test, value).typed_params().is_ok();
+        for good in [
+            "rsi/8e8b947d-4dcd",
+            "origin/rolling",
+            "a".repeat(40).as_str(),
+        ] {
+            assert!(ok(json!({"candidate_receipt": good})), "{good}");
+        }
+        for bad in [
+            "",
+            "--upload-pack=x",
+            "a..b",
+            "a//b",
+            "ref/",
+            "sh -c id",
+            "a;b",
+            "HEAD~1",
+        ] {
+            assert!(!ok(json!({"candidate_receipt": bad})), "{bad}");
+        }
+        // It takes no other test selector.
+        assert!(!ok(json!({"candidate_receipt":"x","package":"rsid"})));
+        assert!(!ok(json!({"candidate_receipt":"x","shard":"other-01"})));
+        assert!(!ok(json!({"candidate_receipt":"x","lib_only":true})));
     }
 }

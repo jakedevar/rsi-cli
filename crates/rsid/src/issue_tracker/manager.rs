@@ -486,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn restore_from_db_filters_cross_kind_dispatches_under_local_kind() {
         let store = Store::open_in_memory().unwrap();
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.project_id = Some(crate::store::d04_test_project_id());
         store.insert_session(&session).unwrap();
         let issue = store

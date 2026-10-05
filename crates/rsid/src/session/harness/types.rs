@@ -312,6 +312,9 @@ pub struct ChatRequest {
     pub tools: Vec<HarnessToolSpec>,
     pub stream: bool,
     pub reasoning_effort: Option<String>,
+    /// The session allows server-side context editing (#1097). Only the
+    /// direct Anthropic transport acts on it; it never changes a message.
+    pub context_editing: bool,
 }
 
 /// Response from an LLM provider (blocking path).

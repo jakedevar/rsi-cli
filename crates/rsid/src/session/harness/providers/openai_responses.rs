@@ -548,6 +548,7 @@ mod tests {
                 freeform: None,
                 kind: HarnessToolSpecKind::Function,
             }],
+            context_editing: false,
         }
     }
 
@@ -584,6 +585,7 @@ mod tests {
             stream: false,
             reasoning_effort: Some("high".into()),
             tools: vec![crate::session::harness::tools::apply_patch::ApplyPatchTool.to_spec()],
+            context_editing: false,
         };
         let body = OpenAiResponsesProvider::request_body(&request);
 

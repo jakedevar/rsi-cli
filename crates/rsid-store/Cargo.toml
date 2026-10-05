@@ -1,0 +1,80 @@
+[package]
+name = "rsid-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Internal to the daemon: never published, and `rsid` is the only dependent
+# (crates/rsid/tests/store_crate_seal.rs).
+publish = false
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+rsid-core = { path = "../rsid-core" }
+rsi-graph = { path = "../rsi-graph" }
+rsi-codegraph = { path = "../rsi-codegraph" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+nix = { workspace = true }
+rusqlite = { workspace = true, features = ["load_extension", "functions", "blob", "hooks"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+anyhow = "1"
+async-trait = "0.1"
+reqwest = { workspace = true }
+futures = { workspace = true }
+sha2 = "0.10"
+zeroize = "1"
+hex = "0.4"
+walkdir = "2"
+parking_lot = "0.12"
+blake3 = "1"
+rand = { workspace = true }
+tempfile = "3"
+
+[build-dependencies]
+blake3 = "1"
+
+[dev-dependencies]
+rusqlite = { workspace = true, features = ["backup"] }
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = "0.6"
+temp-env = { workspace = true, features = ["async_closure"] }
+tracing-subscriber = { workspace = true }
+# Self dev-dependency: enables the test-only `test-seam` feature for tests.
+rsid-store = { path = ".", features = ["test-seam"] }
+
+[features]
+default = []
+# Test seam: lets tests in `rsid` (and this crate's own tests) reuse the
+# fixtures that live next to the store (`test_support`) and the hermetic /proc
+# inventory hooks (#393). It exists only in test builds (enabled through the
+# self dev-dependency above and `rsid`'s own `test-seam`); no RPC, agent verb,
+# setting or environment variable can turn it on, and release builds never
+# compile it.
+test-seam = ["rsid-core/test-seam", "rusqlite/backup"]
+# Unit-test shards keep direct `cargo test -p rsid-store --lib` complete.
+# Selecting exactly one shard feature enables mode and compiles only that
+# shard's tests. The shard names are shared with `rsid`: the gate runs one
+# shard across both packages (scripts/run-rsid-test-shards.sh).
+test-shard-mode = []
+test-shard-store-01 = ["test-shard-mode"]
+test-shard-store-02 = ["test-shard-mode"]
+test-shard-store-03 = ["test-shard-mode"]
+test-shard-store-04 = ["test-shard-mode"]
+test-shard-other-01 = ["test-shard-mode"]
+test-shard-other-02 = ["test-shard-mode"]
+test-shard-other-03 = ["test-shard-mode"]
+test-shard-other-04 = ["test-shard-mode"]
+test-shard-other-05 = ["test-shard-mode"]
+
+[lints]
+workspace = true

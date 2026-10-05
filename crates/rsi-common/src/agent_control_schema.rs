@@ -51,6 +51,7 @@ pub enum AgentControlVerbV1 {
     ManagerPrepareControl,
     ManagerCommitPreparedControl,
     ManagerGetAction,
+    ManagerLaunchIssueWorker,
     ManagerWorkView,
     ManagerDelegateNode,
     ManagerEscalate,
@@ -68,10 +69,16 @@ pub enum AgentControlVerbV1 {
     SubmitJob,
     GetJob,
     ListJobs,
+    CancelJob,
     SendSatelliteMessage,
+    ReportToHub,
     GetDaemonInfo,
     RequestDeploy,
     QueryFailureSignatures,
+    GlobalOverview,
+    GlobalSend,
+    GlobalAppointManager,
+    ReportToGlobal,
 }
 
 /// Native tool whose advertised input is the same request schema as one
@@ -106,6 +113,7 @@ pub enum NativeAgentControlToolV1 {
     RsiControlManagerPrepareControl,
     RsiControlManagerCommitPreparedControl,
     RsiControlManagerGetAction,
+    RsiControlManagerLaunchIssueWorker,
     RsiControlManagerWorkView,
     RsiControlTopologyUpsert,
     RsiControlTopologyList,
@@ -115,6 +123,9 @@ pub enum NativeAgentControlToolV1 {
     RsiControlTopologyResolveAttempt,
     RsiControlReadSessionEvents,
     RsiControlQueryFailureSignatures,
+    RsiControlGlobalOverview,
+    RsiControlGlobalSend,
+    RsiControlReportToGlobal,
 }
 
 impl NativeAgentControlToolV1 {
@@ -151,6 +162,7 @@ impl NativeAgentControlToolV1 {
                 "rsi_control_manager_commit_prepared_control"
             }
             Self::RsiControlManagerGetAction => "rsi_control_manager_get_action",
+            Self::RsiControlManagerLaunchIssueWorker => "rsi_control_manager_launch_issue_worker",
             Self::RsiControlManagerWorkView => "rsi_control_manager_work_view",
             Self::RsiControlTopologyUpsert => "rsi_control_topology_upsert",
             Self::RsiControlTopologyList => "rsi_control_topology_list",
@@ -160,6 +172,9 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlTopologyResolveAttempt => "rsi_control_topology_resolve_attempt",
             Self::RsiControlReadSessionEvents => "rsi_control_read_session_events",
             Self::RsiControlQueryFailureSignatures => "rsi_control_query_failure_signatures",
+            Self::RsiControlGlobalOverview => "rsi_control_global_overview",
+            Self::RsiControlGlobalSend => "rsi_control_global_send",
+            Self::RsiControlReportToGlobal => "rsi_control_report_to_global",
         }
     }
 
@@ -197,6 +212,9 @@ impl NativeAgentControlToolV1 {
                 AgentControlVerbV1::ManagerCommitPreparedControl
             }
             Self::RsiControlManagerGetAction => AgentControlVerbV1::ManagerGetAction,
+            Self::RsiControlManagerLaunchIssueWorker => {
+                AgentControlVerbV1::ManagerLaunchIssueWorker
+            }
             Self::RsiControlManagerWorkView => AgentControlVerbV1::ManagerWorkView,
             Self::RsiControlTopologyUpsert => AgentControlVerbV1::TopologyUpsert,
             Self::RsiControlTopologyList => AgentControlVerbV1::TopologyList,
@@ -206,6 +224,9 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlTopologyResolveAttempt => AgentControlVerbV1::TopologyResolveAttempt,
             Self::RsiControlReadSessionEvents => AgentControlVerbV1::ReadSessionEvents,
             Self::RsiControlQueryFailureSignatures => AgentControlVerbV1::QueryFailureSignatures,
+            Self::RsiControlGlobalOverview => AgentControlVerbV1::GlobalOverview,
+            Self::RsiControlGlobalSend => AgentControlVerbV1::GlobalSend,
+            Self::RsiControlReportToGlobal => AgentControlVerbV1::ReportToGlobal,
         }
     }
 }
@@ -411,6 +432,11 @@ impl AgentControlVerbV1 {
                 crate::harness_manager_v2::AgentManagerGetActionRequestV2,
                 |r: &crate::harness_manager_v2::AgentManagerGetActionRequestV2| r.validate()
             ),
+            Self::ManagerLaunchIssueWorker => decode!(
+                crate::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1,
+                |r: &crate::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1| r
+                    .validate()
+            ),
             Self::ManagerWorkView => decode!(
                 crate::harness_manager::AgentManagerWorkViewRequestV1,
                 |r: &crate::harness_manager::AgentManagerWorkViewRequestV1| r.validate()
@@ -488,9 +514,17 @@ impl AgentControlVerbV1 {
                 crate::agent_jobs::AgentListJobsRequestV1,
                 |_: &crate::agent_jobs::AgentListJobsRequestV1| Ok::<(), ()>(())
             ),
+            Self::CancelJob => decode!(
+                crate::agent_jobs::AgentCancelJobRequestV1,
+                |_: &crate::agent_jobs::AgentCancelJobRequestV1| Ok::<(), ()>(())
+            ),
             Self::SendSatelliteMessage => decode!(
                 crate::satellite_dispatch::AgentSendSatelliteMessageRequestV1,
                 |r: &crate::satellite_dispatch::AgentSendSatelliteMessageRequestV1| r.validate()
+            ),
+            Self::ReportToHub => decode!(
+                crate::satellite_dispatch::AgentReportToHubRequestV1,
+                |r: &crate::satellite_dispatch::AgentReportToHubRequestV1| r.validate()
             ),
             Self::GetDaemonInfo => decode!(
                 crate::agent_daemon_info::AgentGetDaemonInfoRequestV1,
@@ -504,6 +538,22 @@ impl AgentControlVerbV1 {
             Self::RequestDeploy => decode!(
                 crate::agent_deploy::AgentRequestDeployRequestV1,
                 |r: &crate::agent_deploy::AgentRequestDeployRequestV1| r.validate()
+            ),
+            Self::GlobalOverview => decode!(
+                crate::global_manager::AgentGlobalOverviewRequestV1,
+                |_: &crate::global_manager::AgentGlobalOverviewRequestV1| Ok::<(), ()>(())
+            ),
+            Self::GlobalSend => decode!(
+                crate::global_manager::AgentGlobalSendRequestV1,
+                |r: &crate::global_manager::AgentGlobalSendRequestV1| r.validate()
+            ),
+            Self::GlobalAppointManager => decode!(
+                crate::global_manager::AgentGlobalAppointManagerRequestV1,
+                |r: &crate::global_manager::AgentGlobalAppointManagerRequestV1| r.validate()
+            ),
+            Self::ReportToGlobal => decode!(
+                crate::global_manager::AgentReportToGlobalRequestV1,
+                |r: &crate::global_manager::AgentReportToGlobalRequestV1| r.validate()
             ),
         }
     }
@@ -721,6 +771,12 @@ const SEND_MESSAGE_SCHEMA: &str = r#"{"type":"object","additionalProperties":fal
 const READ_SESSION_EVENTS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["session_id"],"properties":{"session_id":{"type":"string","format":"uuid","description":"A session you may observe: your own child, a child of an Epic you lead, or a session in your manager scope"},"after_sequence":{"type":["integer","null"],"minimum":0,"default":null,"description":"Forward page: events with a greater sequence, ascending. Omit for the tail (newest events, ascending)."},"limit":{"type":["integer","null"],"minimum":1,"maximum":100,"default":20},"event_types":{"type":["array","null"],"maxItems":8,"items":{"type":"string","enum":["Message","ToolUse","ToolResult","System","Thinking","Compressed","CompletionGate"]},"default":null,"description":"Only these event types"},"max_bytes":{"type":["integer","null"],"minimum":1024,"maximum":262144,"default":32768,"description":"Page byte budget; content, tool_input and metadata are also clipped per event"}}}"#;
 const REQUEST_DEPLOY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["sha","idempotency_key"],"properties":{"sha":{"type":"string","minLength":40,"maxLength":40,"pattern":"^[0-9a-f]{40}$","description":"Full lowercase commit SHA the binaries were built from"},"binaries_dir":{"type":["string","null"],"default":null,"description":"Absolute directory of freshly built binaries (rsid required); under the sandbox base, ~/.rsi/staging or ~/.cargo/shared-target"},"build":{"type":["boolean","null"],"default":null,"description":"Reserved: build at sha through the job path; refused deploy_build_not_supported"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Required stable dedup key; an exact retry returns the same deploy"},"max_wait_secs":{"type":["integer","null"],"minimum":1,"maximum":3600,"default":null,"description":"Bound on the wait for a quiet point; default 900"},"peer_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Deploy on this paired satellite over the hub link instead of on this daemon; binaries_dir is then a path on the satellite. Confirm with AgentGetDaemonInfo satellites"}}}"#;
 const QUERY_FAILURE_SIGNATURES_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"test_id":{"type":["string","null"],"minLength":1,"maxLength":512,"default":null,"description":"Exact libtest/nextest test id, e.g. session::launch::tests::x"},"digest":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$","default":null,"description":"sha256 failure digest (rsi-known-failure block prints it); both fields must match when both are set"}}}"#;
+const GLOBAL_OVERVIEW_SCHEMA: &str =
+    r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
+const MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["issue","brief","launch","idempotency_key"],"properties":{"issue":{"type":"integer","minimum":1,"description":"The Issue's display number in your project"},"brief":{"type":"string","minLength":1,"maxLength":24576,"description":"The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue"},"launch":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","description":"Provider; must be in your policy's allowed_launches"},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":["string","null"],"maxLength":32,"default":null}}},"parent_epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"The Epic to create the worker under; optional when your scope holds exactly one Epic"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; a replay returns the same worker"}}}"#;
+const GLOBAL_SEND_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id","message","idempotency_key"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your grant; the message goes to its current project manager"},"message":{"type":"string","minLength":1,"maxLength":32768,"description":"The full request or note for that project manager, with acceptance criteria"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
+const GLOBAL_APPOINT_MANAGER_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id","launch","query","idempotency_key"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your grant"},"launch":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","enum":["Claude","Codex","Pioneer","OpenRouter","Bedrock","Local","Antigravity","CodexAppServer","Harness","Gemini"],"description":"Provider; must be in your grant's allowed_launches"},"model":{"type":"string","minLength":1,"maxLength":128,"description":"Model; must be in your grant's allowed_launches"},"effort":{"type":["string","null"],"default":null,"description":"Effort; must match the allowlist entry when it names one"}},"description":"The new project manager's launch"},"query":{"type":"string","minLength":1,"maxLength":65536,"description":"The new project manager's self-contained first prompt"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, e.g. gm-<project>-<purpose>-<n>; a replay returns the same session"},"sandbox":{"type":["boolean","null"],"default":null,"description":"Launch in its own git worktree sandbox (default true)"}}}"#;
+const REPORT_TO_GLOBAL_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","idempotency_key"],"properties":{"message":{"type":"string","minLength":1,"maxLength":32768,"description":"Your report to the global manager: landed work, a gate that blocks you, or your handoff path"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
 const GET_DAEMON_INFO_SCHEMA: &str =
     r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
 const GET_PROVIDER_STATUS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"provider":{"type":["string","null"],"enum":["claude","codex","pioneer","openrouter","bedrock","local","antigravity","codex_app_server","harness","anthropic","openai",null],"default":null,"description":"Provider to report; omit for every provider"}}}"#;
@@ -754,12 +810,15 @@ const MANAGER_RESOLVE_ESCALATION_SCHEMA: &str = r#"{"type":"object","additionalP
 
 const GET_AUTHORITY_CATALOG_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"verb":{"type":["string","null"],"default":null,"description":"Optional control name: an Agent* method, a native rsi_control_* tool, or its mcp__rsi-agent__ spelling. With verb the response is compact: just that control's detail (whether you may call it, parameter schema, one minimal valid example request, and its stable refusal codes with next steps); omit verb for the full manual."}}}"#;
 
-const SUBMIT_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","params"],"properties":{"kind":{"type":"string","enum":["test","build","landing","cloud_gate","cloud_sweep"]},"params":{"type":"object","description":"test: {shard,filterset?} or {package,filters[],lib_only?}; build: {command:check|build,package|workspace,all_targets?,release?}; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."},"name":{"type":"string","minLength":1,"maxLength":80},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Optional replay key"},"worktree":{"type":"string","description":"Appointed manager only: another worktree of your own repository to run in; default is your sandbox"},"wake":{"type":["string","null"],"enum":["owner","none",null],"default":"owner","description":"owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"}}}"#;
+const SUBMIT_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","params"],"properties":{"kind":{"type":"string","enum":["test","build","landing","cloud_gate","cloud_sweep"]},"params":{"type":"object","description":"test: {shard,filterset?} or {package,filters[],lib_only?} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; build: {command:check|build,package|workspace,all_targets?,release?}; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."},"name":{"type":"string","minLength":1,"maxLength":80},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Optional replay key"},"worktree":{"type":"string","description":"Appointed manager only: another worktree of your own repository to run in; default is your sandbox"},"wake":{"type":["string","null"],"enum":["owner","none",null],"default":"owner","description":"owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"}}}"#;
 
 const GET_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["job_id"],"properties":{"job_id":{"type":"string","format":"uuid"}}}"#;
 
+const CANCEL_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["job_id"],"properties":{"job_id":{"type":"string","format":"uuid"}}}"#;
+
 const LIST_JOBS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"limit":{"type":"integer","minimum":1,"maximum":100}}}"#;
 
+const REPORT_TO_HUB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","text"],"properties":{"kind":{"type":"string","enum":["enqueue","deploy_ready","result"],"description":"Report line type (ENQUEUE, DEPLOY-READY, RESULT)"},"text":{"type":"string","minLength":1,"maxLength":1024,"description":"Short report line; informational and untrusted on the hub"}}}"#;
 const SEND_SATELLITE_MESSAGE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["peer_id","remote_session_id","message","idempotency_key"],"properties":{"peer_id":{"type":"string","description":"Operator-registered satellite peer id"},"remote_session_id":{"type":"string","description":"Session id on the satellite, inside the operator-declared scope"},"message":{"type":"string","minLength":1,"maxLength":16384,"description":"Message text; queued until the remote session is idle"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"expires_at":{"type":"string","description":"Optional RFC3339 expiry, at most 24 hours ahead; default 30 minutes"}}}"#;
 const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["source_commit","idempotency_key"],"properties":{"source_commit":{"type":"string","pattern":"^[0-9a-f]{40}$","description":"Full lowercase 40-hex accepted source commit reachable from your sandbox"},"test_filters":{"type":"array","maxItems":32,"items":{"type":"string","minLength":3,"maxLength":256,"description":"PACKAGE=FILTER; the gate is a compile check plus the named tests"},"default":[]},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
 
@@ -770,7 +829,7 @@ const TOPOLOGY_GET_EXECUTION_SCHEMA: &str = r#"{"type":"object","additionalPrope
 const TOPOLOGY_INTERRUPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"expected_row_version":{"type":"integer","minimum":1,"description":"row_version observed via get_execution; refresh after stale_version"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
 const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","attempt_id","action","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"attempt_id":{"type":"string","format":"uuid","description":"Attempt blocked on preserved work"},"action":{"type":"string","enum":["inspect","accept","retry","discard"],"description":"discard is manager (Automation) only; a lead is refused"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"confirm_preserved_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex preserved_commit; required iff action=discard, refused otherwise"}}}"#;
 
-static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 53]> = LazyLock::new(|| {
+static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 60]> = LazyLock::new(|| {
     [
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetAuthorityCatalog,
@@ -1002,6 +1061,13 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 53]> = Lazy
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerGetAction),
         },
         AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ManagerLaunchIssueWorker,
+            method: "AgentManagerLaunchIssueWorker",
+            description: "Manager seat (#1100): launch one worker bound to one Issue in a single idempotent call. The daemon runs the create_session action (same authority, allowlist, capacity and Epic scope as AgentManagerControl; refused before any effect), appends an Issue note naming the worker, sets the Issue InProgress and arms your on_terminal watch on the worker once it exists. Needs the SessionCreate and IssueCoordinate grants. The bound worker may read only its own Issue with AgentGetIssue, so do not paste the Issue text into the brief. A replay under the same idempotency_key returns the same worker. Poll the returned action with AgentManagerGetAction.",
+            parameters_json: MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlManagerLaunchIssueWorker),
+        },
+        AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerWorkView,
             method: "AgentManagerWorkView",
             description: "Read your Epic's live work, granted file ownership, pause and unanswered-request delivery state as a session the current manager created; read-only, no message bodies.",
@@ -1121,10 +1187,24 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 53]> = Lazy
             native_tool: None,
         },
         AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::CancelJob,
+            method: "AgentCancelJob",
+            description: "Stop one of your own running daemon-owned jobs (a mistaken or over-broad run) without systemctl: the unit is stopped and the job settles failed with refusal job_cancelled. Cancelling a job that already settled changes nothing.",
+            parameters_json: CANCEL_JOB_SCHEMA,
+            native_tool: None,
+        },
+        AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SendSatelliteMessage,
             method: "AgentSendSatelliteMessage",
             description: "Queue one message for an idle session on a paired satellite host (current appointed manager only; the operator must enable dispatch and declare the target in scope). Delivery waits until the remote session is idle and never interrupts; `queued` is acceptance, not delivery. Every refusal is the same target_not_authorized.",
             parameters_json: SEND_SATELLITE_MESSAGE_SCHEMA,
+            native_tool: None,
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ReportToHub,
+            method: "AgentReportToHub",
+            description: "Queue one short typed report (enqueue, deploy_ready or result) for the hub manager (#1103). Satellite-side only: the current appointed manager that is also the operator-declared seat (or its rotation tip), and the operator must allowlist a hub. The hub pulls reports over the existing link and shows them in its AgentManagerInbox as an untrusted, informational satellite report that carries no authority; `queued` is acceptance, not delivery (at most once; a restart loses unsent reports). Every authorization failure is the same satellite_report_not_authorized. RPC-only.",
+            parameters_json: REPORT_TO_HUB_SCHEMA,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
@@ -1147,6 +1227,34 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 53]> = Lazy
             description: "Before debugging a red, ask whether it is already known: read the known-failure signature records (#1016) that open Issues of your project carry, by exact test_id and/or failure digest (at least one). Each record names its owner Issue (record.issue, issue_id), class (regression, flake, env, seed) and matcher; a record whose owner Issue is Closed, Cancelled or archived is never returned, so expiry is live. Read-only, project-scoped, open to every session; no Issue body is returned. An unknown query returns records [] (a clean, not-known answer); malformed_issues lists open Issues whose signature blocks did not parse.",
             parameters_json: QUERY_FAILURE_SIGNATURES_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlQueryFailureSignatures),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::GlobalOverview,
+            method: "AgentGlobalOverview",
+            description: "Global manager only (#872): one bounded read of every granted project: its current project manager (status, provider, model, context fill %, cost, updated_at), that manager's policy (mode, revoked, paused, capabilities), Issue counts (Open, InProgress, Open operator-request), Running and WaitingApproval session counts, and pending questions and approvals. Read-only.",
+            parameters_json: GLOBAL_OVERVIEW_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlGlobalOverview),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::GlobalSend,
+            method: "AgentGlobalSend",
+            description: "Global manager only (#872): queue durable mail to a granted project's current project manager. It is delivered at that manager's next idle boundary and wakes it when idle. A replay under the same idempotency_key returns the same message_id.",
+            parameters_json: GLOBAL_SEND_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlGlobalSend),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::GlobalAppointManager,
+            method: "AgentGlobalAppointManager",
+            description: "Global manager only (#872): in one idempotent call, launch a Standard root session in a granted project (launch must be in your grant's allowed_launches; checked before any effect), appoint it with whole-project scope (displacing the current project manager exactly as the operator's appoint does) and save your grant's project policy under the new scope version. Returns {session_id, scope_version, policy_version}; a replay returns the same session. RPC-only.",
+            parameters_json: GLOBAL_APPOINT_MANAGER_SCHEMA,
+            native_tool: None,
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ReportToGlobal,
+            method: "AgentReportToGlobal",
+            description: "Project manager of a project in the active global grant (#872): queue durable mail to the global manager (landed work, a gate that blocks you, your handoff path). It wakes the global manager when idle. A replay under the same idempotency_key returns the same message_id.",
+            parameters_json: REPORT_TO_GLOBAL_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlReportToGlobal),
         },
     ]
 });
@@ -1215,6 +1323,10 @@ mod tests {
             .map(drop),
             AgentControlVerbV1::ManagerGetAction => serde_json::from_value::<
                 crate::harness_manager_v2::AgentManagerGetActionRequestV2,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::ManagerLaunchIssueWorker => serde_json::from_value::<
+                crate::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1,
             >(value)
             .map(drop),
             AgentControlVerbV1::SpawnChild => {
@@ -1338,6 +1450,10 @@ mod tests {
             AgentControlVerbV1::ListJobs => {
                 serde_json::from_value::<crate::agent_jobs::AgentListJobsRequestV1>(value).map(drop)
             }
+            AgentControlVerbV1::CancelJob => {
+                serde_json::from_value::<crate::agent_jobs::AgentCancelJobRequestV1>(value)
+                    .map(drop)
+            }
             AgentControlVerbV1::EnqueueLandingSource => serde_json::from_value::<
                 crate::rolling_queue::AgentEnqueueLandingSourceRequestV1,
             >(value)
@@ -1354,6 +1470,10 @@ mod tests {
                 crate::satellite_dispatch::AgentSendSatelliteMessageRequestV1,
             >(value)
             .map(drop),
+            AgentControlVerbV1::ReportToHub => serde_json::from_value::<
+                crate::satellite_dispatch::AgentReportToHubRequestV1,
+            >(value)
+            .map(drop),
             AgentControlVerbV1::GetDaemonInfo => serde_json::from_value::<
                 crate::agent_daemon_info::AgentGetDaemonInfoRequestV1,
             >(value)
@@ -1366,71 +1486,33 @@ mod tests {
                 serde_json::from_value::<crate::agent_deploy::AgentRequestDeployRequestV1>(value)
                     .map(drop)
             }
+            AgentControlVerbV1::GlobalOverview => {
+                serde_json::from_value::<crate::global_manager::AgentGlobalOverviewRequestV1>(value)
+                    .map(drop)
+            }
+            AgentControlVerbV1::GlobalSend => {
+                serde_json::from_value::<crate::global_manager::AgentGlobalSendRequestV1>(value)
+                    .map(drop)
+            }
+            AgentControlVerbV1::GlobalAppointManager => serde_json::from_value::<
+                crate::global_manager::AgentGlobalAppointManagerRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::ReportToGlobal => {
+                serde_json::from_value::<crate::global_manager::AgentReportToGlobalRequestV1>(value)
+                    .map(drop)
+            }
         }
     }
 
     #[test]
     fn catalog_is_closed_ordered_unique_and_valid() {
         let catalog = agent_control_catalog_v1();
-        assert_eq!(catalog.len(), 53);
-        assert_eq!(
-            catalog.iter().map(|entry| entry.method).collect::<Vec<_>>(),
-            [
-                "AgentGetAuthorityCatalog",
-                "AgentSpawnChild",
-                "AgentReserveSuccessor",
-                "AgentGetProgress",
-                "AgentSendMessage",
-                "AgentGetStatus",
-                "AgentHalt",
-                "AgentContinueChild",
-                "AgentArchiveChild",
-                "AgentScheduleWake",
-                "AgentCancelWake",
-                "AgentListWakes",
-                "AgentCreateIssue",
-                "AgentListIssues",
-                "AgentGetIssue",
-                "AgentUpdateIssue",
-                "AgentUpdateIssueStatus",
-                "AgentArchiveIssue",
-                "AgentRestoreIssue",
-                "AgentListIssueEvents",
-                "AgentManagerProgress",
-                "AgentManagerInbox",
-                "AgentManagerSend",
-                "AgentManagerReply",
-                "AgentManagerNotify",
-                "AgentManagerInspect",
-                "AgentManagerUpdate",
-                "AgentSubmitReviewReceipt",
-                "AgentManagerControl",
-                "AgentManagerPrepareControl",
-                "AgentManagerCommitPreparedControl",
-                "AgentManagerGetAction",
-                "AgentManagerWorkView",
-                "AgentManagerDelegateNode",
-                "AgentManagerEscalate",
-                "AgentManagerListEscalations",
-                "AgentManagerResolveEscalation",
-                "AgentTopologyUpsert",
-                "AgentTopologyList",
-                "AgentTopologyExecute",
-                "AgentTopologyGetExecution",
-                "AgentTopologyInterrupt",
-                "AgentTopologyResolveAttempt",
-                "AgentEnqueueLandingSource",
-                "AgentReadSessionEvents",
-                "AgentGetProviderStatus",
-                "AgentSubmitJob",
-                "AgentGetJob",
-                "AgentListJobs",
-                "AgentSendSatelliteMessage",
-                "AgentGetDaemonInfo",
-                "AgentRequestDeploy",
-                "AgentQueryFailureSignatures",
-            ]
-        );
+        // No hand-pinned count or roster (#1116): the catalog is the single
+        // declaration, so its length and order are not re-listed here. What
+        // this test pins is shape: the authority catalog is served first, and
+        // names are unique, `Agent`-prefixed and round-trip to their verb.
+        assert_eq!(catalog[0].method, "AgentGetAuthorityCatalog");
         let names = catalog
             .iter()
             .map(|entry| entry.method)
@@ -1460,9 +1542,12 @@ mod tests {
                 "AgentSubmitJob",
                 "AgentGetJob",
                 "AgentListJobs",
+                "AgentCancelJob",
                 "AgentSendSatelliteMessage",
+                "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentGlobalAppointManager",
             ]),
             "the RPC-only verb set changed without review"
         );
@@ -1841,6 +1926,17 @@ mod tests {
                 &["operation_id"],
             ),
             (
+                AgentControlVerbV1::ManagerLaunchIssueWorker,
+                &[
+                    "brief",
+                    "idempotency_key",
+                    "issue",
+                    "launch",
+                    "parent_epic_id",
+                ],
+                &["issue", "brief", "launch", "idempotency_key"],
+            ),
+            (
                 AgentControlVerbV1::ManagerWorkView,
                 &["after_work_key", "limit", "work_key"],
                 &[],
@@ -1980,6 +2076,7 @@ mod tests {
             ),
             (AgentControlVerbV1::GetJob, &["job_id"], &["job_id"]),
             (AgentControlVerbV1::ListJobs, &["limit"], &[]),
+            (AgentControlVerbV1::CancelJob, &["job_id"], &["job_id"]),
             (
                 AgentControlVerbV1::EnqueueLandingSource,
                 &["idempotency_key", "source_commit", "test_filters"],
@@ -1992,6 +2089,28 @@ mod tests {
                 &["digest", "test_id"],
                 &[],
             ),
+            (AgentControlVerbV1::GlobalOverview, &[], &[]),
+            (
+                AgentControlVerbV1::GlobalSend,
+                &["idempotency_key", "message", "project_id"],
+                &["project_id", "message", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::GlobalAppointManager,
+                &[
+                    "idempotency_key",
+                    "launch",
+                    "project_id",
+                    "query",
+                    "sandbox",
+                ],
+                &["project_id", "launch", "query", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::ReportToGlobal,
+                &["idempotency_key", "message"],
+                &["message", "idempotency_key"],
+            ),
             (
                 AgentControlVerbV1::RequestDeploy,
                 &[
@@ -2003,6 +2122,11 @@ mod tests {
                     "sha",
                 ],
                 &["sha", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::ReportToHub,
+                &["kind", "text"],
+                &["kind", "text"],
             ),
             (
                 AgentControlVerbV1::SendSatelliteMessage,
@@ -2285,6 +2409,17 @@ mod tests {
                             | AgentControlVerbV1::TopologyUpsert
                             | AgentControlVerbV1::TopologyList
                             | AgentControlVerbV1::TopologyExecute
+                    )
+                {
+                    continue;
+                }
+                // #872: the global seat names a target project inside its
+                // operator grant; the daemon checks it against the grant and
+                // never reads it as the caller's own project.
+                if field == "project_id"
+                    && matches!(
+                        descriptor.verb,
+                        AgentControlVerbV1::GlobalSend | AgentControlVerbV1::GlobalAppointManager
                     )
                 {
                     continue;

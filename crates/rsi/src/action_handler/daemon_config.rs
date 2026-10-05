@@ -80,6 +80,46 @@ pub async fn set_openrouter_model_route(app: &mut App, args: &str) {
     }
 }
 
+/// #1005: read, set, or clear one provider or model override of the
+/// coordinator context cap from the TUI command line. The key is `<Provider>`
+/// or `<Provider>/<model>`; the daemon validates it and the token range.
+#[allow(clippy::future_not_send)] // App belongs to the single-threaded event loop.
+pub async fn set_coordinator_context_cap(app: &mut App, args: &str) {
+    let mut parts = args.split_whitespace();
+    let (Some(key), tokens, None) = (parts.next(), parts.next(), parts.next()) else {
+        app.notify("Usage: :context-cap <Provider[/model]> [tokens|0|default]");
+        return;
+    };
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let field = format!("coordinator_context_cap.{key}");
+    let Some(tokens) = tokens else {
+        match app.client.get_daemon_config().await {
+            Ok(config) => {
+                let current = config[field.as_str()]
+                    .as_u64()
+                    .map_or_else(|| "default".to_string(), |n| n.to_string());
+                app.notify(format!("Coordinator context cap for {key}: {current}"));
+            }
+            Err(error) => app.notify(format!("Failed to read coordinator context cap: {error}")),
+        }
+        return;
+    };
+    let value = if tokens == "default" {
+        serde_json::Value::Null
+    } else if let Ok(n) = tokens.parse::<u64>() {
+        serde_json::json!(n)
+    } else {
+        app.notify("Cap must be a token count, 0 (off), or default");
+        return;
+    };
+    match app.client.update_daemon_config(&field, value).await {
+        Ok(()) => app.notify_success(format!("Coordinator context cap for {key}: {tokens}")),
+        Err(error) => app.notify(format!("Failed to update coordinator context cap: {error}")),
+    }
+}
+
 /// Read, set, or clear the operator launch-model allowlist from the TUI command
 /// line (Issue #692). The daemon validates and enforces it on every launch path;
 /// an empty list means unrestricted.
@@ -552,6 +592,7 @@ async fn run_sandbox_build_cache_reclaim(app: &mut App, dry_run: bool) {
                 &mut app.daemon_features,
                 report.report(),
                 dry_run,
+                report.v2().map(|v2| &v2.candidate_sweep),
             );
             if dry_run {
                 app.finish_direct_storage_refresh(storage_generation, Ok(report.report().clone()));

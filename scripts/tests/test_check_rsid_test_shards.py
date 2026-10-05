@@ -36,12 +36,17 @@ class SourceInventoryTests(unittest.TestCase):
             'test-shard-store-02 = ["test-shard-mode"]\n'
         )
         self.root_patch = mock.patch.object(checker, "ROOT", self.root)
-        self.source_patch = mock.patch.object(checker, "SOURCE", self.source)
+        self.crates_patch = mock.patch.object(
+            checker, "CRATES", {"rsid": self.root / "crates/rsid"}
+        )
+        self.source_patch = mock.patch.object(checker, "SOURCES", [self.source])
         self.conditional_patch = mock.patch.object(checker, "CONDITIONAL_RUNTIME_NAMES", {})
         self.root_patch.start()
+        self.crates_patch.start()
         self.source_patch.start()
         self.conditional_patch.start()
         self.addCleanup(self.root_patch.stop)
+        self.addCleanup(self.crates_patch.stop)
         self.addCleanup(self.source_patch.stop)
         self.addCleanup(self.conditional_patch.stop)
 
@@ -72,7 +77,7 @@ class SourceInventoryTests(unittest.TestCase):
         with mock.patch.object(checker, "HOST_TARGET_OS", "macos"), mock.patch.object(
             checker, "PLATFORM_CONDITIONAL_NAMES", {}
         ):
-            manifest, _ = checker.source_inventory(checker.read_shards(), True)
+            manifest, _ = checker.source_inventory(checker.read_shard_packages(), True)
             conditional = set(checker.PLATFORM_CONDITIONAL_NAMES["store-01"])
         self.assertEqual(
             conditional,
@@ -102,7 +107,9 @@ class SourceInventoryTests(unittest.TestCase):
         self.git("merge", "--no-edit", "left")
 
         shards = checker.read_shards()
-        manifest, gated = checker.source_inventory(shards, require_gates=True)
+        manifest, gated = checker.source_inventory(
+            checker.read_shard_packages(), require_gates=True
+        )
         self.assertEqual(shards, ["store-01", "store-02"])
         self.assertEqual(gated, 2)
         self.assertEqual(set(manifest.values()), {"store-01"})
@@ -114,19 +121,19 @@ class SourceInventoryTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text("#[test]\nfn ungated_test() {}\n")
         with self.assertRaisesRegex(ValueError, "ungated test"):
-            checker.source_inventory(checker.read_shards(), require_gates=True)
+            checker.source_inventory(checker.read_shard_packages(), require_gates=True)
 
         gate = source_test("test_with_duplicate_gates")
         path.write_text(gate.splitlines()[0] + "\n" + gate)
         with self.assertRaisesRegex(ValueError, "duplicate shard gates"):
-            checker.source_inventory(checker.read_shards(), require_gates=True)
+            checker.source_inventory(checker.read_shard_packages(), require_gates=True)
 
     def test_one_source_file_cannot_span_shards(self) -> None:
         path = self.source / "store/tests.rs"
         path.parent.mkdir(parents=True)
         path.write_text(source_test("first") + source_test("second", "store-02"))
         with self.assertRaisesRegex(ValueError, "one source file spans shards"):
-            checker.source_inventory(checker.read_shards(), require_gates=True)
+            checker.source_inventory(checker.read_shard_packages(), require_gates=True)
 
     def test_runtime_count_follows_new_source_tests(self) -> None:
         self.write_test("store/tests.rs", "first")
@@ -149,15 +156,99 @@ class SourceInventoryTests(unittest.TestCase):
                 }
             )
         )
-        shards = checker.read_shards()
-        manifest, _ = checker.source_inventory(shards, require_gates=True)
-        checker.check_runtime(lists, manifest, ["store-01"])
+        packages = checker.read_shard_packages()
+        manifest, _ = checker.source_inventory(packages, require_gates=True)
+        checker.check_runtime(lists, manifest, packages, ["store-01"])
 
         path = self.source / "store/tests.rs"
         path.write_text(path.read_text() + source_test("second"))
-        manifest, _ = checker.source_inventory(shards, require_gates=True)
+        manifest, _ = checker.source_inventory(packages, require_gates=True)
         with self.assertRaisesRegex(ValueError, "runtime/static test identities differ"):
-            checker.check_runtime(lists, manifest, ["store-01"])
+            checker.check_runtime(lists, manifest, packages, ["store-01"])
+
+
+class TwoPackageShardTests(unittest.TestCase):
+    """The #1021 S4 split: one shard name spans rsid and rsid-store."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        crates = {"rsid": self.root / "crates/rsid", "rsid-store": self.root / "crates/rsid-store"}
+        for package, directory in crates.items():
+            (directory / "src").mkdir(parents=True)
+        (crates["rsid"] / "Cargo.toml").write_text(
+            '[features]\ndefault = []\ntest-shard-mode = []\n'
+            'test-shard-store-04 = ["test-shard-mode"]\n'
+            'test-shard-session-01 = ["test-shard-mode"]\n'
+        )
+        (crates["rsid-store"] / "Cargo.toml").write_text(
+            '[features]\ndefault = []\ntest-shard-mode = []\n'
+            'test-shard-store-01 = ["test-shard-mode"]\n'
+            'test-shard-store-04 = ["test-shard-mode"]\n'
+        )
+        for patch in (
+            mock.patch.object(checker, "ROOT", self.root),
+            mock.patch.object(checker, "CRATES", crates),
+            mock.patch.object(checker, "SOURCES", [crate / "src" for crate in crates.values()]),
+            mock.patch.object(checker, "CONDITIONAL_RUNTIME_NAMES", {}),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, package: str, file: str, name: str, shard: str) -> None:
+        path = self.root / "crates" / package / "src" / file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source_test(name, shard))
+
+    def test_shards_are_the_ordered_union_and_list_their_packages(self) -> None:
+        self.assertEqual(checker.read_shards(), ["store-01", "store-04", "session-01"])
+        self.assertEqual(
+            checker.read_shard_packages(),
+            {
+                "store-01": ["rsid-store"],
+                "store-04": ["rsid", "rsid-store"],
+                "session-01": ["rsid"],
+            },
+        )
+
+    def test_a_gate_must_name_a_shard_its_own_package_declares(self) -> None:
+        self.write("rsid", "session/a.rs", "in_session", "session-01")
+        self.write("rsid", "session/b.rs", "wrong_package_shard", "store-01")
+        with self.assertRaisesRegex(ValueError, "shard store-01 is not a rsid feature"):
+            checker.source_inventory(checker.read_shard_packages(), require_gates=True)
+
+    def test_runtime_check_requires_one_suite_per_declared_package(self) -> None:
+        self.write("rsid", "remote/a.rs", "remote_one", "store-04")
+        self.write("rsid-store", "store/a.rs", "store_one", "store-04")
+        packages = checker.read_shard_packages()
+        manifest, _ = checker.source_inventory(packages, require_gates=True)
+        lists = self.root / "lists"
+        lists.mkdir()
+
+        def suite(binary: str, name: str) -> dict:
+            return {
+                binary: {
+                    "binary-id": binary,
+                    "testcases": {
+                        f"mod::{name}": {"ignored": False, "filter-match": {"status": "matches"}}
+                    },
+                }
+            }
+
+        (lists / "store-04.json").write_text(
+            json.dumps({"rust-suites": {**suite("rsid", "remote_one"), **suite("rsid-store", "store_one")}})
+        )
+        checker.check_runtime(lists, manifest, packages, ["store-04"])
+        (lists / "store-04.json").write_text(json.dumps({"rust-suites": suite("rsid", "remote_one")}))
+        with self.assertRaisesRegex(ValueError, "expected one library suite for each"):
+            checker.check_runtime(lists, manifest, packages, ["store-04"])
+        # A test that moved to the other package is a runtime/static difference.
+        (lists / "store-04.json").write_text(
+            json.dumps({"rust-suites": {**suite("rsid", "store_one"), **suite("rsid-store", "remote_one")}})
+        )
+        with self.assertRaisesRegex(ValueError, "runtime/static test identities differ"):
+            checker.check_runtime(lists, manifest, packages, ["store-04"])
 
 
 if __name__ == "__main__":

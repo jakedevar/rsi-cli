@@ -291,6 +291,134 @@ pub struct PutSatelliteInboundPolicyRequestV1 {
     pub policy: SatelliteInboundPolicyV1,
 }
 
+// ---------------------------------------------------------------------------
+// #1103: satellite -> hub typed reports. Informational only: a report carries
+// no authority, and the hub verifies every SHA it acts on. The hub PULLS them
+// over the existing hub-initiated link (`FetchHubReports`), so the satellite
+// never dials the hub and the sender identity is the authenticated peer.
+// ---------------------------------------------------------------------------
+
+/// Wire method the satellite accepts to hand queued reports to an allowlisted
+/// hub (its own one-method allowlist on the hub side).
+pub const FETCH_HUB_REPORTS_METHOD: &str = "FetchHubReports";
+/// Bound on one report's text (a short ENQUEUE / DEPLOY-READY / RESULT line).
+pub const SATELLITE_REPORT_TEXT_MAX_BYTES: usize = 1_024;
+/// Reports a satellite keeps un-acknowledged; further reports are refused.
+pub const SATELLITE_REPORT_OUTBOX_MAX: usize = 32;
+/// Reports handed over (and recorded) per fetch.
+pub const SATELLITE_REPORT_MAX_PER_FETCH: usize = 8;
+/// Acknowledged report ids the hub returns per fetch.
+pub const SATELLITE_REPORT_MAX_ACKS: usize = 64;
+/// Per-peer rate limit, enforced on the hub when it records a report.
+pub const SATELLITE_REPORT_RATE_LIMIT: i64 = 12;
+pub const SATELLITE_REPORT_RATE_WINDOW_SECS: i64 = 300;
+/// Cumulative cap on retained report notices per peer. Notices are immutable
+/// and never deleted, so the hub stops recording new reports from a peer at
+/// this count and keeps them on the satellite (already-seen ids still dedupe).
+pub const SATELLITE_REPORT_RETAINED_MAX_PER_PEER: i64 = 2048;
+/// Uniform refusal: not the declared seat (or its current tip), no allowlisted
+/// hub, or not the appointed manager. Static text, nothing about the satellite.
+pub const SATELLITE_REPORT_NOT_AUTHORIZED: &str = "satellite_report_not_authorized";
+pub const SATELLITE_REPORT_INVALID: &str = "satellite_report_invalid";
+pub const SATELLITE_REPORT_QUEUE_FULL: &str = "satellite_report_queue_full";
+
+/// The report line types. The text is free-form but bounded and untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SatelliteReportKindV1 {
+    Enqueue,
+    DeployReady,
+    Result,
+}
+
+impl SatelliteReportKindV1 {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Enqueue => "ENQUEUE",
+            Self::DeployReady => "DEPLOY-READY",
+            Self::Result => "RESULT",
+        }
+    }
+}
+
+/// Shared by the satellite (on enqueue) and the hub (on record, fail closed).
+///
+/// # Errors
+/// `satellite_report_invalid` for empty, oversized or control-character text.
+pub fn validate_satellite_report_text(text: &str) -> Result<(), &'static str> {
+    if text.trim().is_empty()
+        || text.len() > SATELLITE_REPORT_TEXT_MAX_BYTES
+        || text.chars().any(|c| c.is_control() && c != '\n')
+    {
+        return Err(SATELLITE_REPORT_INVALID);
+    }
+    Ok(())
+}
+
+/// Agent verb on the satellite: the appointed manager queues one report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReportToHubRequestV1 {
+    pub kind: SatelliteReportKindV1,
+    pub text: String,
+}
+
+impl AgentReportToHubRequestV1 {
+    /// # Errors
+    /// The stable code of the invalid text.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_satellite_report_text(&self.text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReportToHubReceiptV1 {
+    pub report_id: Uuid,
+    /// Always `queued`: acceptance, not delivery. The hub pulls reports and
+    /// delivery is at most once (an unsent report is lost on a restart).
+    pub state: String,
+}
+
+/// Hub to satellite. `acked` names reports the hub already recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteFetchReportsRequestV1 {
+    pub wire_version: u16,
+    pub hub_installation_id: SatelliteUuidV1,
+    #[serde(default)]
+    pub acked: Vec<Uuid>,
+}
+
+impl SatelliteFetchReportsRequestV1 {
+    /// # Errors
+    /// `satellite_report_invalid` for a wrong version, nil id or too many acks.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.wire_version != crate::satellite::SATELLITE_WIRE_VERSION_V1
+            || self.hub_installation_id.0.is_nil()
+            || self.acked.len() > SATELLITE_REPORT_MAX_ACKS
+        {
+            return Err(SATELLITE_REPORT_INVALID);
+        }
+        Ok(())
+    }
+}
+
+/// One report as it crosses the link: no session ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteReportV1 {
+    pub report_id: Uuid,
+    pub kind: SatelliteReportKindV1,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteFetchReportsReplyV1 {
+    pub reports: Vec<SatelliteReportV1>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

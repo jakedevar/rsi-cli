@@ -7,6 +7,7 @@ pub(crate) mod hub;
 pub(crate) mod link;
 pub(crate) mod poll;
 pub(crate) mod registry;
+pub(crate) mod reports;
 
 use crate::error::{DaemonError, Result};
 #[allow(unused_imports)]

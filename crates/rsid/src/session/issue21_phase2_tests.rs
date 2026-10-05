@@ -878,11 +878,13 @@ mod p2_07_gate_permit_spine {
         };
         let digest = format!("sha256:{:x}", sha2::Sha256::digest(region.as_bytes()));
         let lowered = region.to_ascii_lowercase();
-        Ok(section["path"] == "crates/rsid/src/store/rolling_queue.rs"
-            && section["sha256"] == digest.as_str()
-            && ["agent_message_provider", "effect_permits", "turn_gates"]
-                .iter()
-                .all(|protected| !lowered.contains(protected)))
+        Ok(
+            section["path"] == "crates/rsid-store/src/store/rolling_queue.rs"
+                && section["sha256"] == digest.as_str()
+                && ["agent_message_provider", "effect_permits", "turn_gates"]
+                    .iter()
+                    .all(|protected| !lowered.contains(protected)),
+        )
     }
 
     fn semantic_ident(ident: &syn::Ident) -> String {
@@ -1838,6 +1840,18 @@ mod p2_07_gate_permit_spine {
     fn cfg_possibilities_without_test(meta: &syn::Meta) -> Result<(bool, bool), String> {
         match meta {
             syn::Meta::Path(path) if path_is_semantic_ident(path, "test") => Ok((true, false)),
+            // `test-seam` is a test-build-only feature (never compiled into a
+            // production build), so it counts as false like `test` itself.
+            syn::Meta::NameValue(pair)
+                if path_is_semantic_ident(&pair.path, "feature")
+                    && matches!(
+                        &pair.value,
+                        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. })
+                            if value.value() == "test-seam"
+                    ) =>
+            {
+                Ok((true, false))
+            }
             syn::Meta::Path(_) | syn::Meta::NameValue(_) => Ok((true, true)),
             syn::Meta::List(list) => {
                 use syn::parse::Parser;
@@ -8985,7 +8999,8 @@ mod p2_07_gate_permit_spine {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_expands_generated_migrations_include_to_every_collected_file() {
-        let source_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let source_root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rsid-store/src");
         let declaring = source_root.join("store/mod.rs");
         let invocation: syn::Macro = syn::parse_quote! {
             include!(concat!(env!("OUT_DIR"), "/store_migrations.rs"))
@@ -10482,9 +10497,9 @@ mod p2_07_gate_permit_spine {
     #[test]
     fn released_queue_migration_provenance_fails_closed_on_drift() {
         let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = repo.join("crates/rsid/src/store/rolling_queue.rs");
+        let source = repo.join("crates/rsid-store/src/store/rolling_queue.rs");
         let expected = [RELEASED_QUEUE_REJECTION.to_string()];
-        let real_root = repo.join("crates/rsid/src");
+        let real_root = repo.join("crates/rsid-store/src");
         assert!(
             released_queue_rejections_are_proven(&real_root, &source, &expected).unwrap(),
             "the released queue region must match its inventory digest"
@@ -10509,7 +10524,7 @@ mod p2_07_gate_permit_spine {
         // A one-byte edit inside the released region no longer matches the
         // inventory digest.
         let tree = tempfile::tempdir().unwrap();
-        let root = tree.path().join("crates/rsid/src");
+        let root = tree.path().join("crates/rsid-store/src");
         std::fs::create_dir_all(tree.path().join("tools")).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         std::fs::copy(
@@ -10537,7 +10552,7 @@ mod p2_07_gate_permit_spine {
     #[test]
     fn frozen_v114_catalog_provenance_fails_closed_on_source_or_sink_drift() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/store/catalog_convergence.rs");
+            .join("../rsid-store/src/store/catalog_convergence.rs");
         let expected = FROZEN_V114_CATALOG_REJECTIONS.map(str::to_string);
         assert!(
             frozen_v114_catalog_rejections_match(&source, &expected).unwrap(),
@@ -10560,11 +10575,19 @@ mod p2_07_gate_permit_spine {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn exactly_one_production_writer_of_gate_closing_and_effect_permits() {
-        let crate_scan = scan_crate_production_writers(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
-        )
-        .expect("every crate production source must be discoverable and parseable Rust");
-        let report = crate_scan.report;
+        // Both crates: the protected writers live in `rsid-store` (owner paths
+        // are relative to its `src`), and `rsid` must not grow a second one.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut report = scan_crate_production_writers(&manifest.join("src"))
+            .expect("every rsid production source must be discoverable and parseable Rust")
+            .report;
+        let store_report = scan_crate_production_writers(&manifest.join("../rsid-store/src"))
+            .expect("every rsid-store production source must be discoverable and parseable Rust")
+            .report;
+        report
+            .dynamic_rejections
+            .extend(store_report.dynamic_rejections);
+        report.writers.extend(store_report.writers);
         assert!(
             report.dynamic_rejections.is_empty(),
             "protected DML must have a statically provable target and closing assignment: {:#?}",
@@ -17931,4 +17954,99 @@ fn harness_mail_claim_persists_the_released_capability_kind() {
         BoundaryCapabilityKindV1::from_persisted_str(request.provider_kind, &capability),
         Some(BoundaryCapabilityKindV1::HarnessToolBoundary)
     );
+}
+
+/// #46: record the hand-off (`claimed -> injected`) for a fixture message.
+fn inject_claimed(store: &Store, fence: &MessageAttemptFenceV1) {
+    store
+        .record_agent_message_admission(
+            fence,
+            &admission(
+                fence,
+                BoundaryClassificationV1::AdmittedEffectPossible,
+                None,
+            ),
+            NoEffectDisposition::Requeue,
+            Uuid::new_v4(),
+        )
+        .expect("admission recorded");
+}
+
+/// #46: delivered mail is settled `acknowledged` by the assistant event that
+/// follows the hand-off, once: the next assistant event finds nothing to settle.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn an_assistant_event_after_the_handoff_acknowledges_injected_mail_exactly_once() {
+    let store = Store::open_in_memory().expect("open store");
+    let (_owner, target, message_id, fence) = claimed_fixture(&store, "ack-after-handoff");
+    inject_claimed(&store, &fence);
+    assert_eq!(aggregate_state(&store, message_id).0, "injected");
+
+    store
+        .insert_event(&provider_response(target, 1))
+        .expect("assistant event persists");
+    let (state, _, acknowledged_at) = aggregate_state(&store, message_id);
+    assert_eq!(state, "acknowledged");
+    assert!(acknowledged_at.is_some());
+    assert_eq!(
+        attempt_seal(&store, message_id, 1).3.as_deref(),
+        Some("acknowledged")
+    );
+
+    store
+        .insert_event(&provider_response(target, 2))
+        .expect("a second assistant event persists");
+    let (state, version, _) = aggregate_state(&store, message_id);
+    assert_eq!(
+        (state.as_str(), version),
+        ("acknowledged", 3),
+        "a settled message is never settled twice"
+    );
+}
+
+/// #46: only a provider-originated event AFTER the hand-off answers the mail.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn events_that_do_not_answer_the_handoff_leave_injected_mail_injected() {
+    let store = Store::open_in_memory().expect("open store");
+    let (_owner, target, message_id, fence) = claimed_fixture(&store, "ack-not-answered");
+    inject_claimed(&store, &fence);
+
+    let mut user = provider_response(target, 1);
+    user.role = Some(Role::User);
+    store.insert_event(&user).expect("user event persists");
+
+    let mut earlier = provider_response(target, 2);
+    earlier.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    store
+        .insert_event(&earlier)
+        .expect("a pre-handoff assistant event persists");
+    assert_eq!(aggregate_state(&store, message_id).0, "injected");
+
+    store
+        .insert_event(&provider_response(target, 3))
+        .expect("post-handoff assistant event persists");
+    assert_eq!(aggregate_state(&store, message_id).0, "acknowledged");
+}
+
+/// #46: when the delivery invocation has moved on, the fence is lost and the
+/// message stays `injected` (restart recovery later strands it `uncertain`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn a_lost_invocation_fence_leaves_injected_mail_unacknowledged() {
+    let store = Store::open_in_memory().expect("open store");
+    let (_owner, target, message_id, fence) = claimed_fixture(&store, "ack-fence-lost");
+    inject_claimed(&store, &fence);
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET model_invocation_id=?2 WHERE id=?1",
+            rusqlite::params![target.to_string(), Uuid::new_v4().to_string()],
+        )
+        .expect("move the session to another invocation");
+
+    store
+        .insert_event(&provider_response(target, 1))
+        .expect("assistant event persists");
+    assert_eq!(aggregate_state(&store, message_id).0, "injected");
 }

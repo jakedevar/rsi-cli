@@ -22,7 +22,9 @@ pub const MAX_READER_LOOKUP_FILES: usize = 2000;
 
 /// The single source of truth for the rsid test shard inventory. The landing
 /// tool (`rsi-rolling-land`) imports this list; `rsid_shards_match_cargo_features`
-/// keeps it equal to the `test-shard-*` features in `crates/rsid/Cargo.toml`.
+/// keeps it equal to the union of the `test-shard-*` features in
+/// `crates/rsid/Cargo.toml` and `crates/rsid-store/Cargo.toml` (the library
+/// tests live in both packages since the #1021 S4 crate split).
 pub const RSID_SHARDS: &[&str] = &[
     "memory-01",
     "memory-02",
@@ -41,6 +43,45 @@ pub const RSID_SHARDS: &[&str] = &[
     "store-03",
     "store-04",
 ];
+
+/// The packages whose library tests a shard selects: the packages that declare
+/// its `test-shard-*` feature. `rsid_shard_packages_match_cargo_features` keeps
+/// this equal to the manifests; the shard script gets the same list from
+/// `scripts/check-rsid-test-shards.py --list-shard-packages`.
+pub const RSID_SHARD_PACKAGES: &[(&str, &[&str])] = &[
+    ("memory-01", &["rsid"]),
+    ("memory-02", &["rsid"]),
+    ("other-01", &["rsid", "rsid-store"]),
+    ("other-02", &["rsid", "rsid-store"]),
+    ("other-03", &["rsid", "rsid-store"]),
+    ("other-04", &["rsid", "rsid-store"]),
+    ("other-05", &["rsid", "rsid-store"]),
+    ("session-01", &["rsid"]),
+    ("session-02", &["rsid"]),
+    ("session-03", &["rsid"]),
+    ("session-04", &["rsid"]),
+    ("session-05", &["rsid"]),
+    ("store-01", &["rsid-store"]),
+    ("store-02", &["rsid-store"]),
+    ("store-03", &["rsid-store"]),
+    ("store-04", &["rsid", "rsid-store"]),
+];
+
+/// The `-p PACKAGE` names to build and run for one shard; empty for a name
+/// that is not a shard.
+#[must_use]
+pub fn rsid_shard_packages(shard: &str) -> &'static [&'static str] {
+    RSID_SHARD_PACKAGES
+        .iter()
+        .find(|(name, _)| *name == shard)
+        .map_or(&[], |(_, packages)| packages)
+}
+
+/// Whether `package` holds rsid library tests that run through the shard gate.
+#[must_use]
+pub fn is_rsid_shard_package(package: &str) -> bool {
+    package == "rsid" || package == "rsid-store"
+}
 
 const FIXED_SMOKE_TESTS: &[(&str, &str)] = &[
     (
@@ -413,7 +454,7 @@ pub fn select_tests_with_readers(
             add_full_package(&mut affected, &package, &file.path, "shared test support");
             continue;
         }
-        if file.path == "crates/rsid/src/store/mod.rs" {
+        if file.path == "crates/rsid-store/src/store/mod.rs" {
             fallback = Some(format!("{} may contain a schema migration", file.path));
             add_full_rsids(&mut affected, &file.path);
             continue;
@@ -518,6 +559,17 @@ pub fn select_tests_with_readers(
     }
     for (package, selections) in reader_only {
         affected.entry(package).or_default().extend(selections);
+    }
+    // rsid-store's library tests run inside the shared rsid shards, never as
+    // one unsharded `cargo test -p rsid-store` harness: any selection in it
+    // gates the full shard set (the same blast radius a store edit had before
+    // the crate split).
+    if let Some(store_selections) = affected.remove("rsid-store") {
+        let reason = store_selections.first().map_or_else(
+            || "rsid-store".to_owned(),
+            |selection| selection.reason.clone(),
+        );
+        add_full_rsids(&mut affected, &reason);
     }
     Ok(dedup_and_finalize(graph_status, fallback, notes, affected))
 }
@@ -873,7 +925,7 @@ fn add_full_package(
     path: &str,
     reason: &str,
 ) {
-    if package == "rsid" {
+    if is_rsid_shard_package(package) {
         add_full_rsids(affected, path);
         return;
     }
@@ -907,7 +959,7 @@ fn full_workspace(
 ) -> ImpactSelection {
     let mut affected = BTreeMap::new();
     for package in workspace_packages(metadata) {
-        if package == "rsid" {
+        if is_rsid_shard_package(&package) {
             add_full_rsids(&mut affected, "workspace-wide fallback");
         } else {
             add_full_package(
@@ -1153,7 +1205,7 @@ mod tests {
     fn rsid_full_shards_render_as_lander_arguments() {
         let selection = select_tests(
             &[ChangedFile::new(
-                "crates/rsid/src/store/mod.rs",
+                "crates/rsid-store/src/store/mod.rs",
                 "if version < 1000 {}\n",
             )],
             &metadata(),
@@ -1386,23 +1438,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rsid_shards_match_cargo_features() {
-        let manifest =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../rsid/Cargo.toml"))
-                .expect("rsid manifest");
-        let mut features: Vec<&str> = manifest
+    fn shard_features(package: &str) -> Vec<String> {
+        let manifest = std::fs::read_to_string(format!(
+            "{}/../{package}/Cargo.toml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("package manifest");
+        manifest
             .lines()
             .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
             .filter_map(|name| name.strip_prefix("test-shard-"))
             .filter(|name| *name != "mode")
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn rsid_shards_match_cargo_features() {
+        let mut features: Vec<String> = ["rsid", "rsid-store"]
+            .into_iter()
+            .flat_map(shard_features)
             .collect();
         features.sort_unstable();
-        let mut shards: Vec<&str> = RSID_SHARDS.to_vec();
+        features.dedup();
+        let mut shards: Vec<String> = RSID_SHARDS
+            .iter()
+            .map(|shard| (*shard).to_owned())
+            .collect();
         shards.sort_unstable();
         assert_eq!(
             features, shards,
-            "RSID_SHARDS must list every rsid test-shard-* feature"
+            "RSID_SHARDS must list every rsid/rsid-store test-shard-* feature"
+        );
+    }
+
+    #[test]
+    fn rsid_shard_packages_match_cargo_features() {
+        for shard in RSID_SHARDS {
+            let declaring: Vec<&str> = ["rsid", "rsid-store"]
+                .into_iter()
+                .filter(|package| shard_features(package).iter().any(|name| name == shard))
+                .collect();
+            assert_eq!(
+                rsid_shard_packages(shard),
+                declaring.as_slice(),
+                "shard {shard} must select exactly the packages declaring its feature"
+            );
+        }
+        assert_eq!(RSID_SHARD_PACKAGES.len(), RSID_SHARDS.len());
+        assert!(rsid_shard_packages("no-such-shard").is_empty());
+    }
+
+    #[test]
+    fn rsid_store_edits_gate_the_shared_shards_not_an_unsharded_package_run() {
+        let mut meta = metadata();
+        meta.workspace_members.push("store-id".into());
+        meta.packages.push(WorkspaceImpactPackage {
+            id: "store-id".into(),
+            name: "rsid-store".into(),
+            dependencies: Vec::new(),
+        });
+        meta.packages[2].dependencies = vec![WorkspaceImpactDependency {
+            name: "rsid-store".into(),
+            path: Some("../rsid-store".into()),
+        }];
+        let selection = select_tests(
+            &[ChangedFile::new(
+                "crates/rsid-store/src/store/agent_jobs.rs",
+                "pub fn changed() {}\n",
+            )],
+            &meta,
+            None,
+        )
+        .unwrap();
+        assert!(
+            selection
+                .selections
+                .iter()
+                .all(|item| item.package != "rsid-store"),
+            "{selection:?}"
+        );
+        assert_eq!(
+            selection
+                .selections
+                .iter()
+                .filter(|item| item.kind == SelectionKind::FullShardSet)
+                .count(),
+            RSID_SHARDS.len()
         );
     }
 
@@ -1413,7 +1535,7 @@ mod tests {
             "/../rsid/src/bin/rsi-rolling-land.rs"
         ))
         .expect("lander source");
-        assert!(lander.contains("use rsi_codegraph::impact::RSID_SHARDS;"));
+        assert!(lander.contains("use rsi_codegraph::impact::{RSID_SHARDS"));
         assert!(!lander.contains("const RSID_SHARDS"));
     }
 }

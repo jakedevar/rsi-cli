@@ -72,8 +72,8 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | --- | --- | --- |
 | `Left` | session list or detail focused, not inserting | previous session in the list |
 | `Right` | session list or detail focused, not inserting | next session in the list |
-| `Shift-Left` | session list or detail focused, not inserting | previous session and open its detail |
-| `Shift-Right` | session list or detail focused, not inserting | next session and open its detail |
+| `Shift-Left` | session list or detail focused, not inserting | previous session and open it; in detail a Group or Epic unfolds instead |
+| `Shift-Right` | session list or detail focused, not inserting | next session and open it; in detail a Group or Epic unfolds instead |
 | `Ctrl-Tab` | session list or detail focused, not inserting | previous session in the list |
 | `Ctrl-Shift-Tab` | session list or detail focused, not inserting | next session in the list |
 
@@ -127,8 +127,8 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
 | `gg` | Jump to first item | Jumps the session-list selection to the first row. |
 | `G` | Jump to last item | Jumps the session-list selection to the last row. |
-| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
-| `L` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
+| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
+| `L` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `/` | Filter sessions | Starts an incremental `/` filter over the session list; Enter keeps the filter, Esc clears it. |
 | `r` | Refresh navigation | Re-fetches sessions, projects and labels from the daemon. |
 | `T` | Choose built-in theme | Opens the built-in theme picker; `:theme <name>` applies a theme directly. |
@@ -1355,35 +1355,66 @@ Activated with `ga`. Browse and restore archived sessions as a zone tab in the s
 
 ### File Explorer Overlay (`<Space>e`)
 
-Left-anchored file tree drawer rooted at the focused session's working directory.
+Left-anchored file tree drawer rooted at the current project's directory. Opening it reveals the file shown in the viewer. Files at any depth open in the in-app viewer/editor, which sits beside the drawer; `Ctrl+L` / `Ctrl+H` move focus between them. Entries ignored by git are dimmed, the file open in the viewer is highlighted, and `●` marks unsaved drafts (on the file and its parent directories).
+
+**Navigation:**
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `j` / `Down` | Move Down | Navigate to next entry |
-| `k` / `Up` | Move Up | Navigate to previous entry |
-| `g` | Jump Top | Jump to first entry |
-| `G` | Jump Bottom | Jump to last entry |
-| `Enter` / `l` | Open/Expand | Open file in viewer, or expand/collapse directory |
-| `h` | Parent | Jump to parent directory |
-| `yy` | Copy Path | Copy full file path to clipboard |
-| `yn` | Copy Name | Copy filename only to clipboard |
-| `dd` | Delete | Delete file (to trash buffer) |
-| `u` | Undo | Restore last deleted file |
-| `/` | Find | Activate fuzzy file finder (type to search, including `q` and Space; j/k nav, Enter open, `Esc` returns to the tree) |
-| `.` | Toggle Hidden | Show/hide dotfiles |
+| `j` / `Down`, `k` / `Up` | Move | Navigate entries |
+| `g` / `G` (`Home` / `End`) | Jump | First / last entry |
+| `Ctrl+d` / `Ctrl+u`, `PageDown` / `PageUp` | Page | Move half / a full page |
+| `Enter` / `o` | Open/Toggle | Open file in the viewer (focus moves there), or expand/collapse directory |
+| `l` / `Right` | Open/Expand | Expand directory (step into it when already expanded) or open file |
+| `h` / `Left` | Close | Collapse directory, or collapse the parent and select it |
+| `Tab` | Preview | Open file in the viewer while the tree keeps focus |
+| `P` | Follow Preview | Toggle opening each file in the viewer as the selection moves |
+| `z` | Collapse All | Collapse every directory |
+| `R` | Refresh | Re-read the tree from disk (expansion and selection kept) |
+| `/` | Find | Fuzzy file finder over the whole project (type anything, including `j`, `k`, `q` and Space; `Down`/`Up` or `Ctrl+j`/`Ctrl+k` move, `Ctrl+u` clears, `Enter` opens and reveals, `Esc` returns to the tree) |
+| `.` / `H` | Toggle Hidden | Show/hide dotfiles |
+| Mouse | Click / Wheel | Click selects, a second click opens; the wheel moves the selection; clicking outside the drawer focuses the viewer |
+
+**File operations** (prompts open at the bottom of the drawer; `Tab` completes paths, `Esc` cancels, a failed operation keeps the prompt open for correction):
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `a` | Add | Create a file in the selected directory (or the selected file's directory); end the name with `/` to create a directory, nested paths create parents |
+| `A` | Add Directory | Create a directory |
+| `r` | Rename | Rename the selected entry (cursor starts before the extension); open viewers follow the file |
+| `m` | Move | Move to a project-relative path; an existing directory receives the entry under its own name |
+| `c` | Copy | Copy (recursively) to a project-relative path |
+| `d` | Delete | Confirm with `y`, `d` or `Enter` (`n`/`Esc` cancels), so `dd` deletes. Files and directories move to `~/.rsi/explorer-trash/` (batches older than 7 days are pruned) |
+| `u` | Undo | Undo the last add, rename, move, copy or delete |
+| `yy` / `yn` / `yr` | Copy Path | Copy the absolute path / file name / project-relative path |
+| `i` | Info | Show size (or item count), modified time and mode |
+
+Paths always stay inside the project; nothing is overwritten.
+
+**Drawer:**
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Ctrl+Shift+Left` / `Ctrl+Shift+Right` | Resize | Narrow / widen the drawer (`<` / `>` also work); the width is remembered across restarts |
+| `Ctrl+0` / `=` | Reset Width | Return to the default width |
+| `Ctrl+L` | Focus Viewer | Move focus to the open file viewer |
+| `?` | Help | Show the explorer's key help |
 | `Esc` / `q` | Close | Close file explorer |
 | `Space` / `Space Space` | Close | Close file explorer from the tree; the first Space closes it |
 
+While the viewer has focus, every key (including `Esc`, `q` and Space) goes to the viewer; `Ctrl+H` refocuses the tree, `Space e` (viewer normal mode) closes the explorer, and closing the viewer hands focus back to the tree. Pastes go to the focused side.
+
 ### Telescope File Picker (`<Space><Space>`)
 
-Fuzzy file finder rooted at the focused session's working directory.
+Fuzzy file finder over every file in the current project (gitignored files excluded).
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| *any char* | Filter | Fuzzy search files by path |
+| *any char* | Filter | Fuzzy search files by path (including `j` and `k`) |
 | `Backspace` | Delete | Remove last character from query |
-| `j` / `Down` | Move Down | Navigate to next result |
-| `k` / `Up` | Move Up | Navigate to previous result |
+| `Ctrl+u` | Clear | Clear the query |
+| `Down` / `Ctrl+j` | Move Down | Navigate to next result |
+| `Up` / `Ctrl+k` | Move Up | Navigate to previous result |
 | `Enter` | Open | Open selected file in file viewer |
 | `Esc` | Close | Close telescope |
 
@@ -1397,6 +1428,9 @@ The file viewer uses the shared vim text surface for source navigation and limit
 |-----|--------|-------------|
 | `Space+q` | Close | Close file viewer (cached for undo/redo on reopen) |
 | `Space+m` | Markdown Preview | Toggle rendered markdown preview (`.md` files only) |
+| `Space+e` | File Explorer | Toggle the file explorer drawer (opens on this file) |
+| `Space+Space` | Telescope | Open the telescope file picker |
+| `Ctrl+V` / paste | Paste | Paste into the file (enters insert mode) |
 | `PageDown` / `Ctrl+f` | Page Down | Scroll down one viewer page |
 | `PageUp` / `Ctrl+b` | Page Up | Scroll up one viewer page |
 | `Ctrl+d` / `Ctrl+u` | Half Page | Scroll down/up half a viewer page |
@@ -1501,10 +1535,12 @@ Layout keys (decoded by the settings pane itself; the table below lists the regi
 
 | Keys | Action | What it does |
 | --- | --- | --- |
-| `j` / `k` (rail focused) | Category | Select the next / previous category; it opens on its first tab |
-| `Tab` / `Shift+Tab`, `]` / `[` | Section tab | Next / previous section tab of the selected category, wrapping inside it; works from the rail or the list |
+| `j` / `k` (rail focused) | Category | Select the next / previous category; restore its last tab and row (first tab on first visit) |
+| `Tab` / `Shift+Tab`, `]` / `[` | Section tab | Next / previous section tab of the selected category, wrapping inside it; move focus into its items and restore its last row |
 | `>` / `<` | Resize | Widen / narrow the focused panel: the rail when it is focused, otherwise the list, which takes room from the info card beside it (or from the rail) |
 | `=` | Reset layout | Restore the automatic panel widths |
+
+Settings reopens at its last category, section, row, and focused panel. Each category remembers its last tab; each tab remembers its last row. Navigation persists across restarts in `state.json`. Reopening clears searches, open dropdowns, and armed credential-clear confirmations; saved rows are clamped when their lists are available.
 
 Panel widths persist in `state.json`. Below 72 columns one panel shows at a time; below 110 columns the rail collapses to its icons while the list is focused; from 150 columns the info card sits beside the list instead of below it.
 
@@ -1517,7 +1553,7 @@ Keys of the settings pane (category rail and items).
 | `?` | Contextual help | Opens contextual help listing the keys and commands available in the current view; Ctrl-Alt-G works even while typing. |
 | `j` | Move selection or scroll down | Moves the selection down one row, or scrolls the focused view down. |
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
-| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting. |
+| `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `Delete` | Reset selected role | Resets the selected theme role to the active theme's default color. |
 | `h` | Return to categories | Returns focus from the settings items to the category rail. |
 | `Left` | Return to categories | Returns focus from the settings items to the category rail. |
@@ -1881,6 +1917,46 @@ Open **Settings → Integrations → Satellites → Satellite registry**. The br
 | `r` | Refresh the registry and cached page |
 | `Esc` / `q` | Close the browser |
 
+### Legacy Scratch Adoption
+
+Open **Settings → Providers & Sandboxes → Sandbox Storage → Legacy scratch adoption**. Scratch reclaim deletes only directories that carry a creation record; worker TMPDIRs, `/var/tmp/rsi-*` and lander workspaces made before that rule have none and are kept. The list shows each such directory with the daemon's verdict (adoptable now, or why not). Adopting re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and records the directory. Adopting itself deletes nothing, but **scratch reclaim is enabled**: an adopted directory that is old enough and unheld is then deleted automatically. So adoption is two steps: the first key only opens a confirmation that lists every full path and the count; nothing is sent until you press `y`.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Select a directory (scroll the paths while confirming) |
+| `a` / `Enter` | Open the confirmation for the selected directory (refused with a reason if it is not adoptable) |
+| `A` | Open the confirmation for every directory the daemon reports as adoptable now (at most 32), listing each |
+| `y` | In the confirmation: confirm and adopt exactly the listed paths |
+| `Esc` / `n` / `q` | In the confirmation: cancel, nothing is sent. In the list: close |
+| `r` | Refresh the list |
+
+### Remote Settings
+
+Open **Settings → Integrations → Remote → Remote access**. The page edits the read-only phone view served over your tailnet; the daemon owns all state and the page shows what it returns. Owner id and host are auto-detected. If `tailscale serve` needs privilege the page shows the exact one-time command (`sudo tailscale set --operator=$USER`); run it once, then enable again with `e`.
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch between the Devices and Projects lists |
+| `j` / `k` | Select a row |
+| `Space` / `Enter` | Allow or remove the selected device, or expose or hide the selected project (max 32 projects) |
+| `e` | Enable or disable Remote. Enable is all-or-nothing (a failure rolls back to disabled); disable takes effect on the gateway's next request |
+| `a` | Apply: re-converge the gateway and `tailscale serve` route while enabled |
+| `r` | Refresh status |
+| `Esc` / `q` | Close |
+
+### Manager Tree
+
+`:manager tree` opens a read-only tree of the manager hierarchy from one bounded operator snapshot (`GetManagerTree`): the active global grant, each project's manager seat, its area manager nodes, and Epics with leads. Each row shows seat health (status, model, context fill, last activity), the selected scope, live capabilities, the allowance and what it has reserved for reports, and load counts (running workers, direct reports, pending escalations, pending operator decisions). A count the daemon could not traverse completely shows `?`, and the header says the traversal is incomplete. Large trees page: the header shows `N of M nodes loaded` and `n` (or moving past the last row) loads the next page. Appointment, scope, grants and revocation stay on `:manager appoint`, `:manager global` and `:manager node`; human decisions stay in `:manager decisions`.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `g` / `G` | Move the selection |
+| `h` / `l` | Fold (or fold the parent) / unfold the selected node |
+| `Enter` | Open the selected node's session |
+| `n` | Load the next page |
+| `r` | Refresh the snapshot, keeping the selected node |
+| `Esc` / `q` | Close |
+
 ## Overlay Key Reference (generated)
 
 Generated from the overlay help catalog: the same rows `?` shows inside each overlay. The hand-written overlay sections above explain behavior; these tables list every key.
@@ -2085,15 +2161,30 @@ Keys of the theme role editor.
 | --- | --- |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
-| `Enter / l` | Open file or directory |
-| `h` | Go to parent directory |
-| `yy / yn` | Copy path / file name |
-| `dd` | Delete file to trash buffer |
-| `u` | Restore last deleted file |
-| `.` | Toggle hidden files |
+| `Ctrl-D / Ctrl-U, PageDown / PageUp` | Move half / a full page |
+| `Enter / o` | Open file in the viewer, or toggle directory |
+| `l / Right` | Expand directory or open file |
+| `h / Left` | Collapse directory or go to parent |
+| `Tab` | Preview file without leaving the tree |
+| `P` | Toggle follow preview |
+| `z` | Collapse all directories |
+| `R` | Refresh the tree from disk |
+| `a` | Add file (end with / for a directory) |
+| `A` | Add directory |
+| `r` | Rename |
+| `m` | Move to a project path |
+| `c` | Copy to a project path |
+| `d` | Delete to trash (confirm with y) |
+| `u` | Undo last file operation |
+| `yy / yn / yr` | Copy absolute path / name / relative path |
+| `i` | Show size, modified time and mode |
+| `. / H` | Toggle hidden files |
 | `/` | Open fuzzy finder |
+| `Ctrl-Shift-Left / Right, < / >` | Narrow / widen the drawer |
+| `Ctrl-0 / =` | Reset drawer width |
 | `Ctrl-L` | Focus file viewer |
-| `Esc / q, Space / Space Space` | Close explorer |
+| `?` | Show explorer help |
+| `Esc / q, Space` | Close explorer |
 <!-- rsi:generated:end -->
 
 ### File Explorer / Finder
@@ -2102,7 +2193,8 @@ Keys of the theme role editor.
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Filter files |
-| `j / k, Down / Up` | Move selection |
+| `Ctrl-U / Ctrl-W` | Clear query / delete last segment |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
 | `Enter` | Open selected file |
 | `Esc` | Return to explorer tree |
 | `Esc Esc` | Return to tree, then close explorer |
@@ -2115,7 +2207,7 @@ Keys of the theme role editor.
 | --- | --- |
 | `Ctrl-H` | Focus explorer tree |
 | `Other keys` | Go to the file viewer |
-| `Esc / q` | Close explorer |
+| `Space e` | Close explorer (viewer normal mode) |
 <!-- rsi:generated:end -->
 
 ### File Viewer
@@ -2126,6 +2218,7 @@ Keys of the theme role editor.
 | `q, Space q` | Close viewer (normal mode) |
 | `Space m` | Toggle markdown preview |
 | `Space Space` | Open telescope file picker |
+| `Space e` | Toggle the file explorer |
 | `Ctrl-S` | Save file |
 | `:` | Command mode (:w, :wq, :q, :q!, :e!, :N) |
 | `/ / ?` | Search forward / backward |
@@ -2146,7 +2239,8 @@ Keys of the theme role editor.
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Filter files |
-| `j / k, Down / Up` | Move selection |
+| `Ctrl-U` | Clear query |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
 | `Enter` | Open file in viewer |
 | `Esc` | Close telescope |
 | `Space o` | Close and open a TaskRabbit session prompt |
@@ -2829,6 +2923,9 @@ Screens without an overlay key catalog, and where their keys are documented.
 | Source-worktree settlement: authorization | A confirmation sub-mode of the settlement browser with its own key handling. | keybindings.md § Source-Worktree Settlement Authorization |
 | Graph review: info dashboard focused | The dashboard panel owns keys while focused, separate from graph editing. | keybindings.md § Graph Review Overlay (`<Space>v` or `:graph`) |
 | Satellite registry browser | The browser owns its peer, link and cached session keys. | keybindings.md § Satellite Registry Browser |
+| Remote settings | The page owns its enable, device and project keys. | keybindings.md § Remote Settings |
+| Manager tree (:manager tree) | The read-only tree owns its fold, paging and jump keys. | keybindings.md § Manager Tree |
+| Legacy scratch adoption | The browser owns its select, adopt and refresh keys. | keybindings.md § Legacy Scratch Adoption |
 <!-- rsi:generated:end -->
 
 ### Surfaces Documented by Hand

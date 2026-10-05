@@ -269,6 +269,10 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
             cohort_settlement::open(app).await;
         }
 
+        LcAction::OpenLegacyScratch => {
+            crate::overlay::legacy_scratch::open(app).await;
+        }
+
         LcAction::EditHarnessManagerPolicy
         | LcAction::OpenHarnessManagerBoard
         | LcAction::OpenHarnessManagerDecisions
@@ -284,6 +288,12 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::ManagerNodeCommand(command) => {
             crate::overlay::harness_manager::dispatch_node_command(app, &command).await;
+        }
+        LcAction::ManagerGlobalCommand(command) => {
+            crate::overlay::global_manager_command::dispatch_global_command(app, &command).await;
+        }
+        LcAction::OperatorRestartCommand(command) => {
+            crate::overlay::operator_restart_command::dispatch(app, &command).await;
         }
 
         // Window/layout: tabs, splits, input bar, settings, quit
@@ -316,6 +326,9 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::OpenSatelliteRegistry => {
             crate::overlay::satellite_registry::open(app).await;
+        }
+        LcAction::OpenRemoteSettings => {
+            crate::overlay::remote::open(app).await;
         }
         LcAction::SyncTitleModelConfig => {
             daemon_config::sync_title_model_config(app).await;
@@ -822,6 +835,12 @@ pub async fn dispatch_catalog_command(app: &mut App, command: &str) {
     if let Some(args) = command.trim().strip_prefix("openrouter-route") {
         if args.is_empty() || args.starts_with(char::is_whitespace) {
             daemon_config::set_openrouter_model_route(app, args).await;
+            return;
+        }
+    }
+    if let Some(args) = command.trim().strip_prefix("context-cap") {
+        if args.is_empty() || args.starts_with(char::is_whitespace) {
+            daemon_config::set_coordinator_context_cap(app, args).await;
             return;
         }
     }

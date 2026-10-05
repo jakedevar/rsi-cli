@@ -270,11 +270,14 @@ async fn step_once_with_clock<C: EventClock>(
 
         // Only paste in insert mode contexts
         let handled = if app.any_overlay_active() {
-            // Overlay is active - delegate to overlay paste
+            // Overlay is active - delegate to overlay paste. An unfocused
+            // explorer drawer declines so the file viewer beside it pastes.
             crate::overlay::try_paste_overlay(app)
+                || crate::file_viewer::try_paste_clipboard_file_viewer(app)
         } else {
-            // Try input bar paste
-            crate::input_bar::try_paste_input_bar(app)
+            // A visible file viewer owns the paste; otherwise the input bar.
+            crate::file_viewer::try_paste_clipboard_file_viewer(app)
+                || crate::input_bar::try_paste_input_bar(app)
         };
         // Update timestamp AFTER the paste completes (after clipboard I/O).
         // If set before, screenshot PNG encoding (100-300ms) causes the
@@ -592,7 +595,13 @@ pub async fn run_event_loop(
                         const MOUSE_SCROLL_LINES: usize = 3;
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                if !handle_file_viewer_mouse_click(
+                                if crate::overlay::file_explorer::handle_mouse_click(
+                                    &mut *app,
+                                    mouse.column,
+                                    mouse.row,
+                                ) {
+                                    // The explorer drawer consumed the click.
+                                } else if !handle_file_viewer_mouse_click(
                                     &mut *app,
                                     mouse.column,
                                     mouse.row,
@@ -601,7 +610,12 @@ pub async fn run_event_loop(
                                 }
                             }
                             MouseEventKind::ScrollUp => {
-                                if !handle_file_viewer_mouse_scroll(
+                                if !crate::overlay::file_explorer::handle_mouse_scroll(
+                                    &mut *app,
+                                    mouse.column,
+                                    mouse.row,
+                                    true,
+                                ) && !handle_file_viewer_mouse_scroll(
                                     &mut *app,
                                     mouse.column,
                                     mouse.row,
@@ -614,7 +628,12 @@ pub async fn run_event_loop(
                                 }
                             }
                             MouseEventKind::ScrollDown => {
-                                if !handle_file_viewer_mouse_scroll(
+                                if !crate::overlay::file_explorer::handle_mouse_scroll(
+                                    &mut *app,
+                                    mouse.column,
+                                    mouse.row,
+                                    false,
+                                ) && !handle_file_viewer_mouse_scroll(
                                     &mut *app,
                                     mouse.column,
                                     mouse.row,
@@ -648,9 +667,13 @@ pub async fn run_event_loop(
                                 }
                                 true
                             } else if app.any_overlay_active() {
+                                // An unfocused explorer drawer declines the
+                                // paste so the file viewer beside it gets it.
                                 crate::overlay::try_paste_text_overlay(app, &text)
+                                    || crate::file_viewer::try_paste_text_file_viewer(app, &text)
                             } else {
-                                crate::input_bar::try_paste_text_input_bar(app, &text)
+                                crate::file_viewer::try_paste_text_file_viewer(app, &text)
+                                    || crate::input_bar::try_paste_text_input_bar(app, &text)
                             };
                             if handled {
                                 app.mark_dirty();
@@ -2090,9 +2113,18 @@ fn handle_session_list_nav_key(app: &mut crate::app::App, key: KeyEvent) -> bool
         }
     }
 
-    // Shift+Left/Right: also open the newly selected session in detail view
+    // Shift+Left/Right: also open the newly selected session in detail view.
+    // In session detail a Group/Epic is a sidebar folder: landing on one
+    // unfolds it (so the next step walks into its children) and the detail
+    // pane keeps its session.
     if should_enter {
-        app.enter_session();
+        let unfolded_container = is_session_detail
+            && app
+                .selected_session_id_from_list()
+                .is_some_and(|id| app.fold_sidebar_container(id, crate::app::SidebarFold::Open));
+        if !unfolded_container {
+            app.enter_session();
+        }
     }
 
     // Auto-expand sidebar when at minimum percentage width and navigating
@@ -2709,6 +2741,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn space_r_in_detail_toggles_rotation_on_the_selected_list_row() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let (mut app, displayed_id, selected_id) = detail_app_with_different_selected_row();
+        let socket_path = crate::test_support::short_socket_path("detail-rotation");
+        let listener = UnixListener::bind(&socket_path).expect("bind rotation daemon");
+        app.client = crate::client::DaemonClient::new(socket_path.clone());
+        app.client.connect().await.expect("connect rotation daemon");
+        app.poll.connected = true;
+
+        let rpc = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept rotation connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read rotation request");
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("decode rotation request");
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"].clone(),
+                            "result": {"rotation_disabled_at": "2026-10-03T00:00:00.000000000Z"},
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("ack rotation request");
+            request
+        });
+
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .await;
+        step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .await;
+        let request = rpc.await.expect("rotation daemon task");
+        std::fs::remove_file(&socket_path).expect("remove rotation daemon socket");
+
+        assert_ne!(displayed_id, selected_id);
+        assert_eq!(request["method"], "ToggleRotationDisabled");
+        assert_eq!(request["params"]["session_id"], selected_id.to_string());
+        assert!(
+            app.sessions[&selected_id]
+                .session
+                .rotation_disabled_at
+                .is_some()
+        );
+        assert_eq!(
+            app.sessions[&displayed_id].session.rotation_disabled_at,
+            None
+        );
+    }
+
+    /// Run `toggle` from the detail pane (list selection differs from the
+    /// displayed session) against a one-shot local daemon that answers with
+    /// `result`; returns the app, displayed id, selected id and the request.
+    /// Pin and testing-needed are not key-reachable from the detail pane
+    /// (their availability requires the session list surface), so the app
+    /// method is driven directly.
+    async fn detail_toggle_request(
+        socket_name: &str,
+        toggle: fn(&mut crate::app::App) -> std::pin::Pin<Box<dyn Future<Output = ()> + '_>>,
+        result: serde_json::Value,
+    ) -> (crate::app::App, uuid::Uuid, uuid::Uuid, serde_json::Value) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let (mut app, displayed_id, selected_id) = detail_app_with_different_selected_row();
+        assert_ne!(displayed_id, selected_id);
+        let socket_path = crate::test_support::short_socket_path(socket_name);
+        let listener = UnixListener::bind(&socket_path).expect("bind toggle daemon");
+        app.client = crate::client::DaemonClient::new(socket_path.clone());
+        app.client.connect().await.expect("connect toggle daemon");
+        app.poll.connected = true;
+
+        let rpc = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept toggle connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read toggle request");
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("decode toggle request");
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"].clone(),
+                            "result": result,
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("ack toggle request");
+            request
+        });
+
+        toggle(&mut app).await;
+        let request = rpc.await.expect("toggle daemon task");
+        std::fs::remove_file(&socket_path).expect("remove toggle daemon socket");
+        (app, displayed_id, selected_id, request)
+    }
+
+    #[tokio::test]
+    async fn pin_toggle_in_detail_targets_the_selected_list_row() {
+        let (app, displayed_id, selected_id, request) = detail_toggle_request(
+            "detail-pin",
+            |app| Box::pin(app.toggle_pin_focused_session()),
+            serde_json::json!({"pinned_at": "2026-10-03T00:00:00.000000000Z"}),
+        )
+        .await;
+
+        assert_eq!(request["method"], "TogglePin");
+        assert_eq!(request["params"]["session_id"], selected_id.to_string());
+        assert!(app.sessions[&selected_id].session.pinned_at.is_some());
+        assert_eq!(app.sessions[&displayed_id].session.pinned_at, None);
+    }
+
+    #[tokio::test]
+    async fn testing_needed_toggle_in_detail_targets_the_selected_list_row() {
+        let (app, displayed_id, selected_id, request) = detail_toggle_request(
+            "detail-testing",
+            |app| Box::pin(app.toggle_testing_needed_focused_session()),
+            serde_json::json!({"testing_needed_at": "2026-10-03T00:00:00.000000000Z"}),
+        )
+        .await;
+
+        assert_eq!(request["method"], "ToggleTestingNeeded");
+        assert_eq!(request["params"]["session_id"], selected_id.to_string());
+        assert!(
+            app.sessions[&selected_id]
+                .session
+                .testing_needed_at
+                .is_some()
+        );
+        assert_eq!(app.sessions[&displayed_id].session.testing_needed_at, None);
+    }
+
+    #[tokio::test]
     async fn enter_in_detail_opens_selected_session_list_row() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -3276,6 +3468,119 @@ mod tests {
             _ => panic!("expected ESP Square overlay"),
         }
         assert!(app.needs_redraw);
+    }
+
+    fn sidebar_row(app: &crate::app::App, id: uuid::Uuid) -> usize {
+        app.filtered_session_order
+            .iter()
+            .position(|row| *row == id)
+            .expect("row must be visible in the main list")
+    }
+
+    fn physical_detail_session(app: &crate::app::App) -> Option<uuid::Uuid> {
+        let tab = app.active_tab();
+        match tab.layout.find_pane(tab.focused_pane) {
+            Some(Pane::SessionDetail { session_id }) => Some(*session_id),
+            _ => None,
+        }
+    }
+
+    /// Shift+Left/Right "move and open" from session detail: landing on a
+    /// Group or Epic unfolds it in the sidebar tree and keeps the detail
+    /// pane on its session, so the next step walks into the children;
+    /// landing on a leaf opens it.
+    #[tokio::test]
+    async fn detail_sidebar_shift_arrows_unfold_containers_then_open_leaf() {
+        use crate::app::app_test_helpers::{select_sidebar_row, with_detail_sidebar_tree};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        // Root rows follow focus sections; reach the Group from whichever
+        // neighbour the two-root list gives it.
+        let group_row = sidebar_row(&app, tree.group);
+        let (start, code) = if group_row > 0 {
+            (app.filtered_session_order[group_row - 1], KeyCode::Right)
+        } else {
+            (app.filtered_session_order[group_row + 1], KeyCode::Left)
+        };
+        select_sidebar_row(&mut app, start);
+
+        step_once(&mut app, KeyEvent::new(code, KeyModifiers::SHIFT)).await;
+
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.group));
+        assert_eq!(physical_detail_session(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        let group_row = sidebar_row(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order.get(group_row + 1),
+            Some(&tree.epic)
+        );
+
+        step_once(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)).await;
+
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.epic));
+        assert_eq!(physical_detail_session(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.epic].list_card_expanded);
+        let epic_row = sidebar_row(&app, tree.epic);
+        assert_eq!(
+            app.filtered_session_order.get(epic_row + 1),
+            Some(&tree.leaf)
+        );
+
+        step_once(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)).await;
+
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.leaf));
+        assert_eq!(physical_detail_session(&app), Some(tree.leaf));
+    }
+
+    /// Stepping back onto an unfolded container with Shift+Left never folds
+    /// it shut: the move-and-open chord only ever unfolds.
+    #[tokio::test]
+    async fn detail_sidebar_shift_left_onto_open_group_keeps_it_open() {
+        use crate::app::app_test_helpers::{select_sidebar_row, with_detail_sidebar_tree};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        app.sessions
+            .get_mut(&tree.group)
+            .expect("group state")
+            .list_card_expanded = true;
+        app.recalculate_filtered_order();
+        select_sidebar_row(&mut app, tree.epic);
+
+        step_once(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)).await;
+
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.group));
+        assert_eq!(physical_detail_session(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        let group_row = sidebar_row(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order.get(group_row + 1),
+            Some(&tree.epic)
+        );
+    }
+
+    /// The real Enter key in session detail (registry route) folds a
+    /// selected Group open in the sidebar instead of opening it as a detail.
+    #[tokio::test]
+    async fn detail_sidebar_enter_key_unfolds_group_in_place() {
+        use crate::app::app_test_helpers::with_detail_sidebar_tree;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+
+        step_once(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+
+        assert_eq!(physical_detail_session(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.group));
+        let group_row = sidebar_row(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order.get(group_row + 1),
+            Some(&tree.epic)
+        );
     }
 
     /// Epic M slice (a) T8c: behavior pin for the raw-key decoders, recorded

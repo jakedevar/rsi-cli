@@ -219,6 +219,32 @@ impl RpcServer {
                 "resource_governor".to_string(),
                 serde_json::to_value(crate::governor::Governor::global().snapshot(&policy))?,
             );
+            // #999: free space above the sandbox launch floor, so the manager
+            // sees pressure before launches are refused, plus the latest scratch
+            // reclaim pass.
+            let floor_bytes = self
+                .runtime_config
+                .sandbox_min_free_gib
+                .load(Ordering::Relaxed)
+                .saturating_mul(1024 * 1024 * 1024);
+            if let Ok(stats) =
+                nix::sys::statvfs::statvfs(self.session_manager.sandbox_allocator().base_dir())
+            {
+                let available =
+                    (stats.blocks_available() as u64).saturating_mul(stats.fragment_size() as u64);
+                object.insert(
+                    "launch_floor".to_string(),
+                    serde_json::json!({
+                        "available_bytes": available,
+                        "floor_bytes": floor_bytes,
+                        "margin_bytes": i128::from(available) - i128::from(floor_bytes),
+                    }),
+                );
+            }
+            object.insert(
+                "agent_scratch_reclaim".to_string(),
+                serde_json::to_value(crate::agent_scratch_reclaim::last_report())?,
+            );
         }
         Ok(value)
     }

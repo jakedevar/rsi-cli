@@ -19,6 +19,7 @@ use crate::agent_coordination::{
 use crate::agent_deploy::{
     DEPLOY_CAPABILITY_REQUIRED, DEPLOY_EXECUTE_REQUIRED, DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT,
     DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED, DEPLOY_SHA_INVALID, DEPLOY_SHA_MISMATCH,
+    DEPLOY_TARGET_MISMATCH,
 };
 use crate::agent_jobs::{
     JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_INVALID_REQUEST, JOB_KEY_CONFLICT,
@@ -27,14 +28,20 @@ use crate::agent_jobs::{
 };
 use crate::agent_provider_status::PROVIDER_STATUS_UNKNOWN_PROVIDER;
 use crate::agent_session_events::AGENT_READ_EVENTS_SCOPE_DENIED;
+use crate::global_manager::{
+    GLOBAL_LAUNCH_NOT_ALLOWED, GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT, GLOBAL_MANAGER_MAILBOX_FULL,
+    GLOBAL_MANAGER_NOT_SEAT, GLOBAL_PROJECT_HAS_NO_MANAGER, GLOBAL_PROJECT_NOT_IN_GRANT,
+    GLOBAL_REPORT_NOT_AUTHORIZED,
+};
 use crate::rolling_queue::{
-    QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_FILTER_INVALID, QUEUE_KEY_INVALID,
-    QUEUE_NOT_AUTHORIZED, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
+    QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS,
+    QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
 };
 use crate::rpc::AgentIssueErrorCodeV1;
 use crate::satellite_dispatch::{
     SATELLITE_MESSAGE_INVALID, SATELLITE_MESSAGE_KEY_CONFLICT, SATELLITE_MESSAGE_KEY_INVALID,
-    SATELLITE_MESSAGE_QUEUE_FULL, SATELLITE_TARGET_NOT_AUTHORIZED,
+    SATELLITE_MESSAGE_QUEUE_FULL, SATELLITE_REPORT_INVALID, SATELLITE_REPORT_NOT_AUTHORIZED,
+    SATELLITE_REPORT_QUEUE_FULL, SATELLITE_TARGET_NOT_AUTHORIZED,
 };
 use crate::wake_predicate::{
     WAKE_WHEN_CAP_REACHED, WAKE_WHEN_FIELD_MISPLACED, WAKE_WHEN_JOB_NOT_FOUND,
@@ -136,6 +143,11 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::ManagerGetAction => {
                 serde_json::json!({"operation_id":issue})
             }
+            AgentControlVerbV1::ManagerLaunchIssueWorker => serde_json::json!({
+                "issue": 1100, "brief": "Build the Issue you are bound to; read it with AgentGetIssue.",
+                "launch": {"provider": "Claude", "model": "claude-sonnet-5-5", "effort": "high"},
+                "parent_epic_id": issue, "idempotency_key": "launch-issue-1100-worker-1"
+            }),
             AgentControlVerbV1::ManagerProgress => serde_json::json!({}),
             AgentControlVerbV1::ManagerInbox => serde_json::json!({
                 "after_sequence": 0, "limit": 32, "request_id": issue
@@ -207,6 +219,7 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::GetJob => serde_json::json!({"job_id": issue}),
             AgentControlVerbV1::ListJobs => serde_json::json!({"limit": 10}),
+            AgentControlVerbV1::CancelJob => serde_json::json!({"job_id": issue}),
             AgentControlVerbV1::EnqueueLandingSource => serde_json::json!({
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
                 "test_filters": ["rsid=rolling_queue"], "idempotency_key": "enqueue-v1"
@@ -220,9 +233,27 @@ impl AgentControlVerbV1 {
                 "peer_id": issue, "remote_session_id": issue,
                 "message": "status?", "idempotency_key": "sat-msg-v1"
             }),
+            AgentControlVerbV1::ReportToHub => serde_json::json!({
+                "kind": "result", "text": "RESULT abc123 issue=#1 status=green"
+            }),
             AgentControlVerbV1::GetDaemonInfo => serde_json::json!({}),
             AgentControlVerbV1::QueryFailureSignatures => serde_json::json!({
                 "test_id": "session::launch::tests::example_test"
+            }),
+            AgentControlVerbV1::GlobalOverview => serde_json::json!({}),
+            AgentControlVerbV1::GlobalSend => serde_json::json!({
+                "project_id": issue, "message": "Land #872 and report back.",
+                "idempotency_key": "gm-rsi-route-1"
+            }),
+            AgentControlVerbV1::GlobalAppointManager => serde_json::json!({
+                "project_id": issue,
+                "launch": {"provider": "Claude", "model": "claude-opus-5-5", "effort": "high"},
+                "query": "You are the project manager of this project. Call AgentGetAuthorityCatalog {} first.",
+                "idempotency_key": "gm-rsi-appoint-1"
+            }),
+            AgentControlVerbV1::ReportToGlobal => serde_json::json!({
+                "message": "Landed #872 on rolling; no gate pending.",
+                "idempotency_key": "pm-report-1"
             }),
             AgentControlVerbV1::RequestDeploy => serde_json::json!({
                 "sha": "0123456789abcdef0123456789abcdef01234567",
@@ -681,6 +712,30 @@ impl AgentControlVerbV1 {
                 )];
                 R
             }
+            Self::CancelJob => {
+                const R: &[AgentControlRefusalV1] = &[refusal(
+                    JOB_NOT_FOUND,
+                    "cancel only job ids you submitted; list yours with AgentListJobs",
+                )];
+                R
+            }
+            Self::ReportToHub => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        SATELLITE_REPORT_NOT_AUTHORIZED,
+                        "every authorization failure looks the same: only the appointed manager that is the operator-declared seat (or its rotation tip) may report, and the operator must allowlist a hub",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_INVALID,
+                        "send a short non-empty line within the size bound without control characters",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_QUEUE_FULL,
+                        "wait for the hub to collect queued reports before sending more",
+                    ),
+                ];
+                R
+            }
             Self::SendSatelliteMessage => {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
@@ -719,6 +774,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         QUEUE_FILTER_INVALID,
                         "use PACKAGE=FILTER test_filters within the schema bounds",
+                    ),
+                    refusal(
+                        QUEUE_FILTER_MATCHES_NO_TESTS,
+                        "a test filter selects no test; the refusal names it: fix the filter (shard and test name) and enqueue again",
                     ),
                     refusal(
                         QUEUE_KEY_INVALID,
@@ -776,6 +835,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         DEPLOY_NEEDS_SUPERVISOR,
                         "the daemon is not running under rsid-supervisor.sh; ask the operator",
+                    ),
+                    refusal(
+                        DEPLOY_TARGET_MISMATCH,
+                        "the supervisor runs a different rsid than a deploy installs; ask the operator to move it (make release-install NOW=1)",
                     ),
                     refusal(
                         "deploy_build_not_supported",
@@ -886,6 +949,101 @@ impl AgentControlVerbV1 {
                     "failure_signature_query_invalid",
                     "send test_id, digest (64 lowercase hex) or both; at least one is required",
                 )];
+                R
+            }
+            Self::ManagerLaunchIssueWorker => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "manager_issue_worker_invalid_request",
+                        "send issue (display number >= 1), a non-empty brief, launch and an idempotency_key",
+                    ),
+                    refusal(
+                        "manager_issue_worker_issue_unavailable",
+                        "the Issue is not in your project, is archived, or is Closed or Cancelled; nothing was changed",
+                    ),
+                    refusal(
+                        "manager_issue_worker_parent_required",
+                        "name parent_epic_id: your scope holds no single Epic to default to",
+                    ),
+                    refusal(
+                        "manager_issue_worker_authority_denied",
+                        "needs the IssueCoordinate grant as well as SessionCreate; re-check AgentGetAuthorityCatalog",
+                    ),
+                ];
+                R
+            }
+            Self::GlobalOverview => {
+                const R: &[AgentControlRefusalV1] = &[refusal(
+                    GLOBAL_MANAGER_NOT_SEAT,
+                    "only the operator-appointed global seat may call it; re-check AgentGetAuthorityCatalog",
+                )];
+                R
+            }
+            Self::GlobalSend => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        GLOBAL_MANAGER_NOT_SEAT,
+                        "only the operator-appointed global seat may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        GLOBAL_PROJECT_NOT_IN_GRANT,
+                        "name a project from AgentGlobalOverview; the operator owns the project list",
+                    ),
+                    refusal(
+                        GLOBAL_PROJECT_HAS_NO_MANAGER,
+                        "appoint a project manager with AgentGlobalAppointManager first",
+                    ),
+                    refusal(
+                        GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        GLOBAL_MANAGER_MAILBOX_FULL,
+                        "wait for the recipient to take its queued messages",
+                    ),
+                ];
+                R
+            }
+            Self::GlobalAppointManager => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        GLOBAL_MANAGER_NOT_SEAT,
+                        "only the operator-appointed global seat may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        GLOBAL_PROJECT_NOT_IN_GRANT,
+                        "name a project from AgentGlobalOverview; the operator owns the project list",
+                    ),
+                    refusal(
+                        GLOBAL_LAUNCH_NOT_ALLOWED,
+                        "pick a launch from your grant's allowed_launches",
+                    ),
+                    refusal(
+                        GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        "manager_node_root_has_active_delegates",
+                        "the current project manager has active area delegates; ask it to revoke them first",
+                    ),
+                ];
+                R
+            }
+            Self::ReportToGlobal => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        GLOBAL_REPORT_NOT_AUTHORIZED,
+                        "only the current project manager of a project in the global grant may report up",
+                    ),
+                    refusal(
+                        GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        GLOBAL_MANAGER_MAILBOX_FULL,
+                        "wait for the global manager to take its queued messages",
+                    ),
+                ];
                 R
             }
             Self::GetDaemonInfo => {

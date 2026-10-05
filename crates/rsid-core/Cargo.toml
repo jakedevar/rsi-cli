@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal to the daemon: never published, and `rsid` is the only dependent
+# (crates/rsid/tests/store_crate_seal.rs).
+publish = false
 
 [dependencies]
 rsi-common = { path = "../rsi-common" }
@@ -12,6 +15,21 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+chrono = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[features]
+default = []
+# Test seam: process-group signal recorder for tests in dependent crates. No
+# RPC, setting or environment variable can turn it on; it is enabled only
+# through the `rsid` dev-dependency on itself.
+test-seam = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
 
 [lints]
 workspace = true

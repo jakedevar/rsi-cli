@@ -36,6 +36,10 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+pub(crate) use crate::store_support::manager_gates::{
+    check_manager_notice_program_gate, manager_notice_deferred, resumable_provider_session_id,
+};
+
 #[cfg(test)]
 type FinalizerPause = (
     tokio::sync::oneshot::Sender<()>,
@@ -256,10 +260,6 @@ pub(super) async fn pause_continuation_seam_for_test(
     }
 }
 
-fn manager_notice_deferred() -> DaemonError {
-    DaemonError::InvalidParam("manager_notice_deferred".into())
-}
-
 fn manager_notice_scope_revoked() -> DaemonError {
     DaemonError::InvalidParam("manager_notice_scope_revoked".into())
 }
@@ -356,18 +356,6 @@ pub(crate) fn heal_bootstrap_events_have_no_effect(events: &[ConversationEvent])
     })
 }
 
-pub(crate) fn resumable_provider_session_id(session: &Session) -> Option<String> {
-    match session.provider {
-        SessionProvider::Local => Some(
-            session
-                .claude_session_id
-                .clone()
-                .unwrap_or_else(|| session.id.to_string()),
-        ),
-        _ => session.claude_session_id.clone(),
-    }
-}
-
 /// The old Codex CLI thread repeatedly replays a websocket-closed turn on
 /// explicit Continue. Rotate only after terminal failure evidence; ordinary
 /// reconnect notices are nonterminal and remain owned by the live provider.
@@ -403,342 +391,6 @@ fn codex_websocket_recovery_context(session_id: Uuid, events: &[ConversationEven
         "## Codex transport recovery\nThe previous Codex provider thread for RSI session {session_id} ended when the websocket closed before response.completed. This is a fresh provider thread in the same RSI session. The previous turn outcome may be uncertain: inspect the workspace and durable task state before repeating an action. Continue the user's request using the recent conversation below and the current repository state.\n\n{}",
         recent_messages.join("\n\n")
     )
-}
-
-/// The single manager resumability predicate. `resume_lead` admission,
-/// `retry_lead` admission and the manager continuation gate all call it, so no
-/// lead is queued for a resume the gate refuses. `CodexAppServer` leads are never
-/// manager-resumable; other providers need a resumable provider session.
-pub(crate) fn manager_lead_provider_resumable(session: &Session) -> bool {
-    session.provider != SessionProvider::CodexAppServer
-        && resumable_provider_session_id(session).is_some()
-}
-
-/// Manager `resume_lead` target check, shared by admission (for settled leads)
-/// and the continuation gate. A lead that is not a settled leaf is not
-/// resumable now; a settled lead failing [`manager_lead_provider_resumable`]
-/// gets typed `manager_v2_resume_unavailable` naming `retry_lead`.
-pub(crate) fn check_manager_resume_target(session: &Session) -> Result<()> {
-    if !matches!(
-        session.status,
-        SessionStatus::Completed | SessionStatus::Interrupted | SessionStatus::Failed
-    ) || !rsi_common::is_leaf_kind(session.session_kind)
-    {
-        return Err(DaemonError::InvalidParam(
-            "manager_v2_lead_not_resumable".into(),
-        ));
-    }
-    if !manager_lead_provider_resumable(session) {
-        return Err(manager_resume_unavailable());
-    }
-    Ok(())
-}
-
-/// Typed manager refusal naming the lifecycle action that can proceed. The
-/// message is the bare code, so `safe_action_error` still passes it through.
-pub(crate) fn manager_refusal_with_next_action(
-    code: &'static str,
-    next_action: &'static str,
-) -> DaemonError {
-    DaemonError::StructuredRpc {
-        rpc_code: rsi_common::rpc::INVALID_PARAMS,
-        message: code.into(),
-        data: serde_json::json!({ "code": code, "next_action": next_action }),
-    }
-}
-
-/// A lead whose provider session cannot be resumed; a fresh-successor
-/// `retry_lead` is the continuity-preserving route (Issue #670).
-pub(crate) fn manager_resume_unavailable() -> DaemonError {
-    manager_refusal_with_next_action("manager_v2_resume_unavailable", "retry_lead")
-}
-
-/// Reconstruct the monitor's current-turn assistant accumulator from durable
-/// events. Refuse on budget exhaustion rather than overlook a split gate report.
-/// The caller holds the Store lock; lifecycle dispatch repeats this proof
-/// under the session's spawn guard before provider effects.
-pub(crate) fn check_manager_action_program_gate(
-    store: &crate::store::Store,
-    target: Uuid,
-    allow_interrupted_resume: bool,
-) -> Result<()> {
-    // K2 (#390): an explicit manager retirement supersedes exactly the
-    // evidence it witnessed; any later output or re-registration is evaluated.
-    if store.manager_lead_program_outcome_superseded(target)? {
-        return Ok(());
-    }
-    let interrupted_resume = allow_interrupted_resume
-        && store
-            .get_session(target)?
-            .is_some_and(|s| s.status == SessionStatus::Interrupted);
-    check_manager_program_gate(store, target, false, interrupted_resume)
-}
-
-/// Classify the lead's current program evidence for a retirement witness.
-/// Store errors propagate; only the two typed gate classes are recorded.
-pub(crate) fn classify_manager_program_evidence(
-    store: &crate::store::Store,
-    target: Uuid,
-) -> Result<&'static str> {
-    match check_manager_program_gate(store, target, false, false) {
-        Ok(()) => Ok("none"),
-        Err(error) => {
-            let message = error.to_string();
-            if message.contains("manager_v2_program_evidence_unknown") {
-                Ok("program_evidence_unknown")
-            } else if message.contains("manager_v2_human_or_recovery_owner") {
-                Ok("human_or_recovery_owner")
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
-pub(crate) fn check_manager_notice_program_gate(
-    store: &crate::store::Store,
-    target: Uuid,
-) -> Result<()> {
-    check_manager_program_gate(store, target, true, false)
-}
-
-fn check_manager_program_gate(
-    store: &crate::store::Store,
-    target: Uuid,
-    allow_child_watch: bool,
-    allow_interrupted_resume: bool,
-) -> Result<()> {
-    use super::harness::tools::schedule_wake::{
-        deterministic_program_guard_job_id, is_program_guard_sentinel,
-    };
-    use rsi_common::agent_contract::{
-        ContractError, OrchestrationContinuationStateV1, ProgramContinuationIntentV1,
-        parse_orchestration_outcome_v1, program_continuation_intent_v1_with_registration,
-    };
-
-    const MAX_EVENTS: usize = 256;
-    const MAX_BYTES: usize = 256 * 1024;
-    let evidence_unknown = || {
-        if allow_child_watch {
-            manager_notice_deferred()
-        } else {
-            DaemonError::InvalidParam("manager_v2_program_evidence_unknown".into())
-        }
-    };
-    let recovery_owned = || {
-        if allow_child_watch {
-            manager_notice_deferred()
-        } else {
-            DaemonError::InvalidParam("manager_v2_human_or_recovery_owner".into())
-        }
-    };
-    let sentinel_id = deterministic_program_guard_job_id(target);
-    let sentinel = store.get_scheduled_job(&sentinel_id)?;
-    if sentinel
-        .as_ref()
-        .is_some_and(|job| !is_program_guard_sentinel(job, target))
-        || (sentinel.is_none() && store.scheduled_job_exists(&sentinel_id)?)
-    {
-        return Err(evidence_unknown());
-    }
-    let registered = sentinel.as_ref().is_some_and(|job| job.enabled);
-    let last_user: Option<i64> = store.conn.query_row(
-        "SELECT MAX(sequence) FROM conversation_events WHERE session_id=?1 AND role='User'",
-        [target.to_string()],
-        |row| row.get(0),
-    )?;
-    let mut stmt = store.conn.prepare(
-        "SELECT substr(content,1,?2), length(CAST(content AS BLOB))
-         FROM conversation_events
-         WHERE session_id=?1 AND role='Assistant'
-           AND sequence > ?4
-         ORDER BY sequence LIMIT ?3",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![
-        target.to_string(),
-        MAX_BYTES + 1,
-        MAX_EVENTS + 1,
-        last_user.unwrap_or(-1),
-    ])?;
-    let mut output = String::new();
-    let mut separated = String::new();
-    let mut count = 0;
-    while let Some(row) = rows.next()? {
-        count += 1;
-        let bytes: usize = row.get(1)?;
-        if count > MAX_EVENTS || bytes > MAX_BYTES.saturating_sub(output.len()) {
-            return Err(evidence_unknown());
-        }
-        let text = row.get::<_, String>(0)?;
-        // #413: streamed Assistant events may split one carrier mid-line, so
-        // the verbatim concatenation stays the primary reading. A second
-        // reading puts each event on its own line, so a carrier followed (or
-        // preceded) by prose in another event is not glued into trailing
-        // characters or a missing key.
-        if !separated.is_empty() {
-            separated.push('\n');
-        }
-        separated.push_str(&text);
-        output.push_str(&text);
-    }
-    let mut outcome = parse_orchestration_outcome_v1(&output);
-    if outcome.is_err() && separated != output {
-        let separated_outcome = parse_orchestration_outcome_v1(&separated);
-        if separated_outcome.is_ok() {
-            output = separated;
-            outcome = separated_outcome;
-        }
-    }
-    if outcome.as_ref().is_ok_and(|outcome| {
-        outcome.continuation_state == OrchestrationContinuationStateV1::HumanGate
-    }) {
-        return Err(recovery_owned());
-    }
-    // An Interrupted provider need not have emitted a terminal report. An
-    // explicit manager Resume may continue its ordinary partial text, after a
-    // known User boundary, without pretending malformed report fragments are
-    // a valid outcome. No prose is interpreted as completion or permission.
-    if registered
-        && allow_interrupted_resume
-        && last_user.is_some()
-        && matches!(outcome, Err(ContractError::MissingField { ref field }) if field == "orchestration_outcome_v1")
-        && program_continuation_intent_v1_with_registration(&output, false)
-            == ProgramContinuationIntentV1::NotProgram
-        && ordinary_interrupted_program_text(&output)
-    {
-        return if manager_program_continuation_job_enabled(store, target, sentinel_id)? {
-            Err(recovery_owned())
-        } else {
-            Ok(())
-        };
-    }
-    match program_continuation_intent_v1_with_registration(&output, registered) {
-        // All remaining missing or malformed evidence stays unknown. Terminal
-        // settlement retains responsibility for invalid terminal output.
-        ProgramContinuationIntentV1::InvalidProgram(_)
-        | ProgramContinuationIntentV1::RequireAnyGuard => Err(evidence_unknown()),
-        intent @ (ProgramContinuationIntentV1::RequireChildWatch { job_id }
-        | ProgramContinuationIntentV1::RequireResumeWake { job_id })
-            if !allow_child_watch =>
-        {
-            if !registered || job_id == sentinel_id || last_user.is_none() {
-                return Err(evidence_unknown());
-            }
-            // Use the terminal-settlement validator for the declared owner.
-            // Interrupted turns do not run that settlement, so a declaration
-            // alone cannot prove they have a recovery path.
-            if super::agent_verbs::exact_master_continuation_guard_present(
-                store,
-                target,
-                sentinel_id,
-                &intent,
-            )? {
-                return Err(recovery_owned());
-            }
-            if !allow_interrupted_resume {
-                return Err(recovery_owned());
-            }
-            // A different enabled job (including a pending child-watch
-            // delivery) still owns continuation. Inspect raw rows so an
-            // unreadable job cannot disappear through tolerant hydration.
-            if manager_program_continuation_job_enabled(store, target, sentinel_id)? {
-                return Err(recovery_owned());
-            }
-            // Only proven absence or a well-formed disabled continuation is
-            // stranded. Wrong mode/recipient or unreadable rows stay unknown.
-            match store.get_scheduled_job(&job_id)? {
-                Some(job) => {
-                    use rsi_common::types::{Recurrence, WakeMode};
-                    let expected_shape = match intent {
-                        ProgramContinuationIntentV1::RequireChildWatch { .. } => {
-                            matches!(job.wake_mode, WakeMode::OnTerminal(watched) if watched != target)
-                        }
-                        ProgramContinuationIntentV1::RequireResumeWake { .. } => {
-                            job.wake_mode == WakeMode::Resume
-                                && matches!(job.schedule.recurrence, Recurrence::Once)
-                        }
-                        _ => unreachable!("only exact continuation intents enter this gate"),
-                    };
-                    if job.enabled || job.wake_session_id != Some(target) || !expected_shape {
-                        return Err(evidence_unknown());
-                    }
-                }
-                None if store.scheduled_job_exists(&job_id)? => return Err(evidence_unknown()),
-                None => {}
-            }
-            // Existing action claims, runtime retry/capacity/human gates and
-            // the spawn guard own the subsequent same-session Resume. This
-            // read-only proof neither schedules a wake nor resets a budget.
-            Ok(())
-        }
-        ProgramContinuationIntentV1::RequireResumeWake { .. } => Err(manager_notice_deferred()),
-        ProgramContinuationIntentV1::RequireChildWatch { .. }
-        | ProgramContinuationIntentV1::NotProgram
-        | ProgramContinuationIntentV1::TerminalAllowed => Ok(()),
-    }
-}
-
-fn manager_program_continuation_job_enabled(
-    store: &crate::store::Store,
-    target: Uuid,
-    sentinel: Uuid,
-) -> Result<bool> {
-    Ok(store.conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
-         WHERE enabled=1 AND wake_session_id=?1 AND id<>?2)",
-        rusqlite::params![target.to_string(), sentinel.to_string()],
-        |row| row.get(0),
-    )?)
-}
-
-/// Conservatively distinguish ordinary interrupted prose from an attempted
-/// report or question. Ambiguous syntax remains unknown; this is not a parser
-/// fallback and never manufactures an orchestration outcome.
-fn ordinary_interrupted_program_text(output: &str) -> bool {
-    let text = output.trim();
-    let lower = text.to_ascii_lowercase();
-    !text.is_empty()
-        && !text.contains(['{', '}', '[', ']', '`', ':', '?'])
-        // The legacy ORCHESTRATION COMPLETE heading and Mode field can be
-        // interrupted before any colon is emitted. Look through Markdown
-        // presentation only to refuse known report tokens, never to parse an
-        // outcome. Unbalanced delimiters still leave the evidence unknown.
-        && !lower.lines().any(|line| {
-            let line = line.replace(['*', '_', '~'], "");
-            let mut words = line
-                .split(|c: char| c.is_whitespace() || c == '|')
-                .map(|word| word.trim_start_matches(['#', '>']))
-                .filter(|word| !word.is_empty());
-            // Skip nested quote/heading/list prefixes and table cell borders.
-            let first = words.find(|word| {
-                !matches!(*word, "-" | "+")
-                    && !word.strip_suffix(['.', ')']).is_some_and(|number| {
-                        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-                    })
-            });
-            match first {
-                Some("mode") => true,
-                Some("orchestration") => words
-                    .next()
-                    .is_none_or(|word| "complete".starts_with(word)),
-                _ => false,
-            }
-        })
-        && ![
-            "orchestration_outcome",
-            "continuation_",
-            "continuation state",
-            "blocker_",
-            "human_gate",
-            "human gate",
-            "queue_exhausted",
-            "next_slice",
-            "next-slice",
-            "next slice",
-            "pipeline handoff",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2428,11 +2080,16 @@ impl SessionManager {
             );
             return Err(error);
         }
-        let rebound = self.store.lock().await.replace_terminal_session_custody(
+        // Store first, then the fresh root's stripe without waiting for it
+        // under the Store: a long maintenance proof on a colliding stripe
+        // delays only this Continue, never an unrelated Store RPC (#1172).
+        let rebound = crate::store::sandbox_custody::replace_terminal_session_custody_store_first(
+            &self.store,
             session.id,
             terminal.custody_id,
             binding,
-        );
+        )
+        .await;
         match rebound {
             Ok(rebound) => {
                 tracing::info!(
@@ -2822,7 +2479,28 @@ impl SessionManager {
         intent: ContinuationIntent,
         fence: Option<ContinuationFenceV1>,
     ) -> Result<ContinueSessionOutcome> {
-        Box::pin(self.continue_session_fenced_inner(session_id, query, intent, fence)).await
+        // #1158: the operator's continuation of the exact successor a blocked
+        // rotation reserved publishes it once it runs, in this boot, instead of
+        // waiting for a restart's recovery scan.
+        let blocked = if matches!(
+            intent,
+            ContinuationIntent::Operator | ContinuationIntent::OperatorMessage(_)
+        ) {
+            self.store
+                .lock()
+                .await
+                .blocked_rotation_of_successor(session_id)?
+        } else {
+            None
+        };
+        let outcome =
+            Box::pin(self.continue_session_fenced_inner(session_id, query, intent, fence)).await?;
+        if let Some(blocked) = blocked.as_ref()
+            && matches!(outcome, ContinueSessionOutcome::Started)
+        {
+            self.publish_continued_blocked_successor(blocked).await?;
+        }
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2846,6 +2524,34 @@ impl SessionManager {
         store.codex_usage_limit_hold(chrono::Utc::now())
     }
 
+    /// Issue #692: refuse a continuation whose effective model is off the
+    /// operator allowlist. A queued model switch that will apply at this
+    /// continuation (the same invocation fence `apply_pending_session_model_update`
+    /// checks) replaces the stored model; a stale or absent one leaves the
+    /// stored model in force. Reads only; callers hold the continuation guard.
+    async fn preflight_continuation_launch_model(&self, session_id: Uuid) -> Result<()> {
+        let store = self.store.lock().await;
+        let Some(session) = store.get_session(session_id)? else {
+            return Ok(());
+        };
+        let pending = match store.session_model_invocation_id(session_id)? {
+            Some(invocation_id) => {
+                store.peek_pending_session_model_update(session_id, invocation_id)?
+            }
+            None => None,
+        };
+        let model = pending
+            .map(|update| update.model)
+            .or_else(|| session.model.clone());
+        let Some(reason) = self.runtime_config.launch_model_refusal(
+            session.provider,
+            super::launch::provider_effective_model(session.provider, model.as_deref()).as_deref(),
+        ) else {
+            return Ok(());
+        };
+        Err(DaemonError::PolicyDenied(reason))
+    }
+
     async fn continue_session_fenced_inner(
         &self,
         session_id: Uuid,
@@ -2860,19 +2566,6 @@ impl SessionManager {
             return Err(DaemonError::PolicyDenied(
                 "daemon restart drain is in progress".into(),
             ));
-        }
-        // #692: a continuation re-launches the session's stored model, so the
-        // operator launch-model allowlist is preflighted here, before the
-        // continuation claims its fence, interrupts a live turn, or admits a
-        // model invocation. `spawn_provider_process` is the structural backstop.
-        if let Some(session) = self.store.lock().await.get_session(session_id)?
-            && let Some(reason) = self.runtime_config.launch_model_refusal(
-                session.provider,
-                super::launch::provider_effective_model(session.provider, session.model.as_deref())
-                    .as_deref(),
-            )
-        {
-            return Err(DaemonError::PolicyDenied(reason));
         }
         // #1073: an automated continuation of a child session starts a worker
         // turn, so it is refused (typed, retryable) behind a draining deploy;
@@ -3024,6 +2717,14 @@ impl SessionManager {
             self.check_continuation_fence(&spawn_guard, session_id, fence)
                 .await?;
         }
+        // #692: a continuation re-launches the session's EFFECTIVE model: a
+        // queued operator model switch is committed at this boundary, so the
+        // operator launch-model allowlist is checked on the pending model when
+        // one will apply, else the stored one. Resolved here, under the
+        // continuation guard and before any effect (audit, interrupt, model
+        // switch, invocation); the switch itself re-checks atomically with its
+        // commit. `spawn_provider_process` is the structural backstop.
+        self.preflight_continuation_launch_model(session_id).await?;
         // Replays return above under this guard. Audit only a new authorized
         // attempt, before its effect, so an exact retry cannot publish a
         // second manager watch or requested event.
@@ -3130,7 +2831,10 @@ impl SessionManager {
         // (SetEpicLead of the caller's Epic). Revalidate and commit the first
         // durable write in one IMMEDIATE transaction before any effect below.
         if let Some(fence) = fence.as_ref() {
-            self.store.lock().await.claim_continuation_effect(fence)?;
+            self.store.lock().await.claim_continuation_effect(
+                fence,
+                scheduled_wake_jobs.as_deref().unwrap_or_default(),
+            )?;
         }
 
         // Acquire settlement-producer ownership before removing the completed
@@ -3338,12 +3042,19 @@ impl SessionManager {
                     CustodyService::authorize_ordinary(&completed_session.session).map(|_| ())
                 }
                 Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                    let mut store = self.store.lock().await;
-                    CustodyService::authorize_live(
+                    // Store first, stripe without blocking the Store (#1166).
+                    let (mut store, root) =
+                        crate::store::custody_lock_order::lock_store_then_session_root(
+                            &self.store,
+                            completed_session.session.id,
+                        )
+                        .await;
+                    CustodyService::authorize_live_holding(
                         &completed_session.session,
                         &mut store,
                         self.sandbox_allocator.base_dir(),
                         rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                        root,
                     )
                     .map(|_| ())
                 }
@@ -3422,12 +3133,19 @@ impl SessionManager {
                 CustodyService::authorize_ordinary(&completed_session.session)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                let mut store = self.store.lock().await;
-                CustodyService::authorize_live(
+                // Store first, stripe without blocking the Store (#1166).
+                let (mut store, root) =
+                    crate::store::custody_lock_order::lock_store_then_session_root(
+                        &self.store,
+                        completed_session.session.id,
+                    )
+                    .await;
+                CustodyService::authorize_live_holding(
                     &completed_session.session,
                     &mut store,
                     self.sandbox_allocator.base_dir(),
                     rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                    root,
                 )
             }
             Err(error) => Err(error),
@@ -3478,11 +3196,41 @@ impl SessionManager {
                 .unwrap_or(&[])
                 .iter()
                 .any(|id| store.transient_heal_state(*id).ok().flatten().is_some())
+                // #1158: the operator's Continue of a rotation successor that
+                // failed before it ever started finishes that exact rotation:
+                // it starts in a new thread from its own recorded query.
+                //
+                // #1180: publication commits when the continuation installs its
+                // provider, which can precede the first provider event. A crash
+                // then leaves the published seat Failed with no thread and the
+                // rotation closed; the operator's next Continue of that exact
+                // successor starts it the same way (custody stays forward-only,
+                // and a thread ID or transcript effect ends this path).
+                || (operator_intent
+                    && (store
+                        .blocked_rotation_of_successor(session_id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        || store
+                            .published_blocked_rotation_of_successor(session_id)
+                            .ok()
+                            .flatten()
+                            .is_some()))
         } else {
             false
         };
         if heal_bootstrap {
             query = format!("{}\n\n{query}", completed_session.session.query);
+        }
+        // A continuation that is not the answer (answer_question clears the
+        // pending question first; a manager decision carries the answer) must
+        // tell the agent that no human answered, in the typed documented form.
+        if manager_decision.is_none() {
+            query = super::question::with_unanswered_notice(
+                completed_session.session.pending_question.as_ref(),
+                query,
+            );
         }
         let fresh_relaunch = agent_child.is_some() && resumable_id.is_none();
         let (provider_session_id, conversation_history) = match resumable_id {
@@ -3509,11 +3257,20 @@ impl SessionManager {
         // keeping its conversation identifier and history intact.
         let pending_model_update = {
             let mut store = self.store.lock().await;
+            let provider = completed_session.session.provider;
             match store.session_model_invocation_id(session_id) {
-                Ok(Some(invocation_id)) => store.apply_pending_session_model_update(
+                Ok(Some(invocation_id)) => store.apply_pending_session_model_update_checked(
                     session_id,
                     invocation_id,
                     initial_sequence,
+                    |pending_model| match self.runtime_config.launch_model_refusal(
+                        provider,
+                        super::launch::provider_effective_model(provider, Some(pending_model))
+                            .as_deref(),
+                    ) {
+                        Some(reason) => Err(DaemonError::PolicyDenied(reason)),
+                        None => Ok(()),
+                    },
                 ),
                 Ok(None) => Ok(None),
                 Err(error) => Err(error),
@@ -6227,6 +5984,7 @@ mod d00_tests {
     use crate::store::Store;
     use crate::store::program_runs::{ProgramRunExternalReferenceV1, ProgramRunTransitionInputV1};
     use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
+    use crate::store_support::manager_gates::check_manager_program_gate;
     use rsi_common::archive_cleanup::ArchivePreservationClassV1;
     use rsi_common::program_runs::{
         CreateProgramRunRequestV1, ProgramRunActionKindV1, ProgramRunBudgetLimitsV1,
@@ -6375,10 +6133,29 @@ mod d00_tests {
         String::from_utf8(output.stdout).expect("git output utf8")
     }
 
+    /// Sandbox execution scratch refuses a sandbox root on tmpfs/ramfs, and the
+    /// rolling lander runs test gates with `TMPDIR` on tmpfs, so the sandbox
+    /// base and source repository live under the cargo target directory.
+    fn disk_backed_tempdir(label: &str) -> TempDir {
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+            })
+            .join("rsid-d00-fixtures");
+        std::fs::create_dir_all(&base).expect("create disk-backed fixture base");
+        // Sandbox allocation refuses a non-canonical base.
+        let base = std::fs::canonicalize(&base).expect("canonical fixture base");
+        tempfile::Builder::new()
+            .prefix(label)
+            .tempdir_in(base)
+            .expect("disk-backed fixture tempdir")
+    }
+
     fn test_manager() -> TestManager {
         let db = TempDir::new().expect("db tempdir");
-        let sandbox_base = TempDir::new().expect("sandbox tempdir");
-        let repo = TempDir::new().expect("repo tempdir");
+        let sandbox_base = disk_backed_tempdir("sandbox-");
+        let repo = disk_backed_tempdir("repo-");
         git(repo.path(), &["init", "-q", "-b", "main"]);
         git(
             repo.path(),
@@ -6501,6 +6278,79 @@ mod d00_tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
+    async fn toggle_rotation_disabled_persists_only_the_target_row_and_emits_metadata() {
+        let test = test_manager();
+        let target = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        for id in [target, bystander] {
+            let row = session(id, test.repo.path());
+            test.manager
+                .store
+                .lock()
+                .await
+                .insert_session(&row)
+                .expect("insert fixture row");
+        }
+        let mut events = test.manager.event_bus.subscribe();
+
+        let disabled = test
+            .manager
+            .toggle_rotation_disabled(target)
+            .await
+            .expect("toggle on");
+        assert!(disabled.is_some());
+        {
+            let store = test.manager.store.lock().await;
+            let stored = store.get_session(target).unwrap().unwrap();
+            assert_eq!(
+                stored
+                    .rotation_disabled_at
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+                disabled
+                    .as_deref()
+                    .map(|raw| chrono::DateTime::parse_from_rfc3339(raw)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            );
+            assert_eq!(
+                store
+                    .get_session(bystander)
+                    .unwrap()
+                    .unwrap()
+                    .rotation_disabled_at,
+                None
+            );
+        }
+        let event = events.recv().await.expect("metadata event");
+        assert!(matches!(
+            event.as_ref(),
+            DaemonEvent::SessionMetadataChanged {
+                session_id,
+                rotation_disabled_at: Some(Some(_)),
+                ..
+            } if *session_id == target
+        ));
+
+        let enabled = test
+            .manager
+            .toggle_rotation_disabled(target)
+            .await
+            .expect("toggle off");
+        assert_eq!(enabled, None);
+        let stored = test
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.rotation_disabled_at, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
     async fn operator_continue_replaces_quarantined_custody_with_fresh_sandbox_at_old_tip() {
         use rsi_common::types::SandboxCustodyErrorCodeV1;
 
@@ -6572,6 +6422,65 @@ mod d00_tests {
         );
         assert!(old_root.exists(), "old root is retained as history");
         assert!(test.manager.active.read().await.contains_key(&session_id));
+    }
+
+    /// #1172: the replacement root's stripe used to be taken while holding the
+    /// Store, so a maintenance proof on a colliding stripe pinned every Store
+    /// user for the whole proof. The fresh root's id is generated during the
+    /// allocation, so every stripe is held; the Continue waits Store-free and
+    /// still replaces the quarantined root once the proof ends.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_continue_replacement_waits_for_held_stripes_without_pinning_the_store() {
+        use rsi_common::types::SandboxCustodyErrorCodeV1;
+
+        let test = test_manager();
+        let (session_id, old_root) = insert_completed_continue_fixture(&test, true).await;
+        let old_root = old_root.expect("quarantined fixture root");
+        let old_custody = {
+            let mut store = test.manager.store.lock().await;
+            let live = store
+                .live_custody_for_session(session_id)
+                .expect("live custody before quarantine");
+            store
+                .record_failed_revalidation(
+                    live.custody_id,
+                    live.generation,
+                    SandboxCustodyErrorCodeV1::SourceRevisionUnavailable,
+                    rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                )
+                .expect("quarantine durable root");
+            live.custody_id
+        };
+        install_continue_custody_config_observation_for_test(session_id, 0);
+        super::super::launch::install_controller_candidate_test_process(session_id);
+
+        let run = crate::store::stripe_liveness_support::run_behind_held_stripes(
+            &test.manager.store,
+            None,
+            std::time::Duration::from_secs(3),
+            test.manager
+                .continue_session_operator(session_id, "resume after quarantine".to_string()),
+        )
+        .await;
+        run.assert_store_stayed_free("operator continue replacement")
+            .expect("the continue replaces the terminal custody once the stripes free");
+
+        let (cwd, _target) =
+            take_continue_custody_config_for_test(session_id, 0).expect("provider config built");
+        assert_ne!(
+            cwd, old_root,
+            "the continuation runs in the replacement root"
+        );
+        let live = test
+            .manager
+            .store
+            .lock()
+            .await
+            .live_custody_for_session(session_id)
+            .expect("replacement custody is live");
+        assert_ne!(live.custody_id, old_custody);
+        assert_eq!(live.owner_session_id, session_id);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -9735,6 +9644,171 @@ mod d00_tests {
                 "{error}"
             );
         }
+    }
+
+    /// Binds the fixture session to a completed invocation and queues a model
+    /// switch to `queued_model` for its next continuation.
+    async fn queue_model_switch_for_continue_test(
+        test: &TestManager,
+        session_id: Uuid,
+        queued_model: &str,
+    ) {
+        let invocation_id = Uuid::new_v4();
+        // The fixture names no model; give it one in the store and the map.
+        test.manager
+            .completed
+            .write()
+            .await
+            .get_mut(&session_id)
+            .unwrap()
+            .session
+            .model = Some("claude-sonnet-4-5".to_string());
+        let mut store = test.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET model = 'claude-sonnet-4-5' WHERE id = ?1",
+                [session_id.to_string()],
+            )
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations (
+                     id, purpose, invocation_kind, foreground, paid_risk,
+                     admission_status, status, provider, model, trigger_source,
+                     session_id, policy_snapshot_json, usage_confidence,
+                     created_at, started_at, completed_at
+                 ) VALUES (
+                     ?1, 'session.launch.fresh', 'model', 'foreground',
+                     'paid_capable', 'admitted', 'completed', 'Claude',
+                     'claude-sonnet-4-5', 'continue-allowlist-fixture',
+                     ?2, '{}', 'unavailable', ?3, ?3, ?3
+                 )",
+                rusqlite::params![invocation_id.to_string(), session_id.to_string(), now],
+            )
+            .expect("insert completed invocation lineage fixture");
+        store
+            .set_session_model_invocation(session_id, Some(invocation_id))
+            .expect("bind completed session to its current invocation");
+        let receipt = store
+            .queue_session_model_update(
+                session_id,
+                invocation_id,
+                queued_model,
+                None,
+                "continue-allowlist-update",
+            )
+            .expect("queue model update for next continuation");
+        assert_eq!(receipt.state, "queued");
+    }
+
+    /// Issue #692 (review): the allowlist is checked on the model the
+    /// continuation will run, which is the QUEUED replacement when one will
+    /// apply. Stored model allowed but queued model disallowed is refused before
+    /// the switch commits, leaving the model, segments, queued request and
+    /// invocations untouched.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn continue_refuses_a_queued_model_off_the_allowlist_without_committing_the_switch() {
+        let test = test_manager();
+        let (session_id, _root) = insert_completed_continue_fixture(&test, false).await;
+        // Queue B (unrestricted at the time), then restrict the list to the stored A.
+        queue_model_switch_for_continue_test(&test, session_id, "claude-opus-4-1").await;
+        let stored = test
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(session_id)
+            .unwrap()
+            .unwrap()
+            .model;
+        let stored = stored.expect("the fixture session names a model");
+        test.manager
+            .runtime_config
+            .update_field("launch_model_allowlist", &serde_json::json!([stored]))
+            .unwrap();
+        let snapshot = |test: &TestManager| {
+            let store = test.manager.store.try_lock().unwrap();
+            let one = |sql: &str| -> String {
+                store
+                    .conn
+                    .query_row(sql, [], |row| row.get::<_, String>(0))
+                    .unwrap()
+            };
+            (
+                one("SELECT COALESCE(model, '-') FROM sessions"),
+                one("SELECT group_concat(state) FROM session_model_updates"),
+                one(
+                    "SELECT COUNT(*) || ':' || COALESCE(group_concat(model_id || from_sequence || COALESCE(to_sequence, 'open')), '') FROM model_segments",
+                ),
+                one("SELECT CAST(COUNT(*) AS TEXT) FROM model_invocations"),
+                one("SELECT CAST(COUNT(*) AS TEXT) FROM sessions"),
+                one("SELECT COALESCE(model_invocation_id, '-') FROM sessions"),
+            )
+        };
+        let before = snapshot(&test);
+        let error = test
+            .manager
+            .continue_session(
+                session_id,
+                "continue into a disallowed queued model".to_string(),
+            )
+            .await
+            .expect_err("the queued model is off the allowlist");
+        assert!(matches!(error, DaemonError::PolicyDenied(_)), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains("launch_model_not_allowed"), "{text}");
+        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert_eq!(
+            before,
+            snapshot(&test),
+            "refusal leaves model, segments, queued update, invocations unchanged"
+        );
+        assert!(test.manager.active.read().await.is_empty());
+        assert!(
+            test.manager
+                .completed
+                .read()
+                .await
+                .contains_key(&session_id)
+        );
+    }
+
+    /// Issue #692 (review): the reverse direction. The stored model is off the
+    /// allowlist but the queued replacement is on it, so the continuation is not
+    /// refused prematurely and launches the queued model.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn continue_admits_an_allowed_queued_model_when_the_stored_model_is_off_the_allowlist() {
+        let test = test_manager();
+        let (session_id, _root) = insert_completed_continue_fixture(&test, false).await;
+        queue_model_switch_for_continue_test(&test, session_id, "claude-opus-4-1").await;
+        test.manager
+            .runtime_config
+            .update_field(
+                "launch_model_allowlist",
+                &serde_json::json!(["claude-opus-4-1"]),
+            )
+            .unwrap();
+        install_continue_model_effort_config_observation_for_test(session_id, 0);
+        crate::session::launch::install_controller_candidate_test_process(session_id);
+        test.manager
+            .continue_session(
+                session_id,
+                "continue into the allowed queued model".to_string(),
+            )
+            .await
+            .expect("the allowed queued model is not refused by the stored model");
+        assert_eq!(
+            take_continue_model_effort_config_for_test(session_id, 0)
+                .and_then(|(model, _effort)| model),
+            Some("claude-opus-4-1".to_string()),
+            "the continuation launches the queued model"
+        );
+        crate::session::launch::drop_controller_candidate_test_stream(session_id);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

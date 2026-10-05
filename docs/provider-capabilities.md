@@ -84,7 +84,7 @@ The semantic fixture is bounded and omits provider prompt payloads. Its digest i
 | rotation | `crates/rsid/src/session/rotation.rs` | `SessionManager::decide_rotation_successor` | `call:resolve_new_incarnation_context_budget` → `field:context_window, field:resolved_context_budget` |
 | context-injection | `crates/rsid/src/session/launch.rs` | `SessionManager::launch_session_with_retry_admission` | `call:context_injection_allowance` → `call:assemble` |
 | harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch_with_binding` | `parameter:resolved_context_budget` → `call:run_harness_loop_with_compact_budget` |
-| persistence | `crates/rsid/src/store/sessions.rs` | `persisted_context_budget` | `parameter:resolved` → `field:source, field:source_version, field:source_digest, field:observed_at` |
+| persistence | `crates/rsid-store/src/store/sessions.rs` | `persisted_context_budget` | `parameter:resolved` → `field:source, field:source_version, field:source_digest, field:observed_at` |
 | rpc-session | `crates/rsid/src/session/queries.rs` | `rehydrate_context_budget_projection` | `call:rehydrate_resolved_context_budget` → `assignment:session.resolved_context_budget` |
 | bus-publication | `crates/rsid/src/monitor.rs` | `publish_context_usage` | `parameter:resolved_context_budget` → `field:context_window, field:resolved_context_budget` |
 | polling | `crates/rsi/src/app/polling.rs` | `App::apply_push_event` | `field:parsed.resolved_context_budget` → `assignment:state.session.resolved_context_budget` |

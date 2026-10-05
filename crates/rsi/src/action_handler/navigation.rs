@@ -21,6 +21,13 @@ fn refresh_session_list_after_fold(app: &mut App) {
 pub(super) fn dispatch(app: &mut App, action: LcAction) {
     match action {
         LcAction::EnterSession => {
+            // Session detail: Enter targets the sidebar list's selection, not
+            // the session on screen. `enter_session` folds a selected
+            // Group/Epic in place there and opens a selected leaf.
+            if app.physical_pane_is_session_detail() {
+                app.enter_session();
+                return;
+            }
             // Phase 4: route Enter on container cards into descent_path navigation.
             if let Some(sid) = app.selected_session_id() {
                 let kind = app.sessions.get(&sid).map(|s| s.session.session_kind);
@@ -1230,6 +1237,157 @@ mod descent_tests {
 
         super::dispatch(&mut app, LcAction::AscendOrBack);
         assert!(app.tabs[app.active_tab].descent_path.is_empty());
+    }
+
+    fn row_position(app: &App, id: uuid::Uuid) -> usize {
+        app.filtered_session_order
+            .iter()
+            .position(|row| *row == id)
+            .expect("row must be visible in the main list")
+    }
+
+    fn detail_session_id(app: &App) -> Option<uuid::Uuid> {
+        let tab = app.active_tab();
+        match tab.layout.find_pane(tab.focused_pane) {
+            Some(Pane::SessionDetail { session_id }) => Some(*session_id),
+            _ => None,
+        }
+    }
+
+    fn sorted(mut ids: Vec<uuid::Uuid>) -> Vec<uuid::Uuid> {
+        ids.sort();
+        ids
+    }
+
+    /// Enter on a Group in the session-detail sidebar folds it open in place:
+    /// the detail pane keeps the session already on screen, the Group's
+    /// child splices in directly below it, and the list does not descend.
+    /// A second Enter folds it shut again (file-tree toggle).
+    #[test]
+    fn detail_sidebar_enter_on_group_toggles_fold_and_keeps_detail() {
+        use crate::app::app_test_helpers::with_detail_sidebar_tree;
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        let group_row = row_position(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order.get(group_row + 1),
+            Some(&tree.epic)
+        );
+        assert_eq!(
+            sorted(app.filtered_session_order.clone()),
+            sorted(vec![tree.viewed, tree.group, tree.epic])
+        );
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.group));
+        assert_eq!(app.active_tab().descent_path, Vec::<uuid::Uuid>::new());
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+        assert!(!app.sessions[&tree.group].list_card_expanded);
+        assert_eq!(
+            sorted(app.filtered_session_order.clone()),
+            sorted(vec![tree.viewed, tree.group])
+        );
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.group));
+    }
+
+    /// The sidebar tree is fully walkable from session detail: unfold the
+    /// Group, unfold its Epic, then Enter on the nested leaf opens that
+    /// leaf in the detail pane.
+    #[test]
+    fn detail_sidebar_enter_walks_nested_tree_then_opens_leaf() {
+        use crate::app::app_test_helpers::{select_sidebar_row, with_detail_sidebar_tree};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+        select_sidebar_row(&mut app, tree.epic);
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.epic].list_card_expanded);
+        let group_row = row_position(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order[group_row..group_row + 3],
+            [tree.group, tree.epic, tree.leaf]
+        );
+        assert_eq!(
+            crate::ui::session::session_tree_depths(
+                &app.filtered_session_order[group_row..group_row + 3],
+                &app.sessions,
+            ),
+            vec![0, 1, 2]
+        );
+
+        select_sidebar_row(&mut app, tree.leaf);
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.leaf));
+        // Opening a leaf leaves the tree as the user unfolded it.
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        assert!(app.sessions[&tree.epic].list_card_expanded);
+        assert_eq!(app.selected_session_id_from_list(), Some(tree.leaf));
+    }
+
+    /// With the sidebar list focused (`detail_list_focused` proxy), Enter on
+    /// a container still folds it in place: no descent, no container detail.
+    #[test]
+    fn detail_sidebar_list_focus_enter_folds_container_without_descending() {
+        use crate::app::app_test_helpers::with_detail_sidebar_tree;
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        app.detail_list_focused = true;
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+        assert!(app.sessions[&tree.group].list_card_expanded);
+        assert_eq!(app.active_tab().descent_path, Vec::<uuid::Uuid>::new());
+        let group_row = row_position(&app, tree.group);
+        assert_eq!(
+            app.filtered_session_order.get(group_row + 1),
+            Some(&tree.epic)
+        );
+    }
+
+    /// Enter in the detail of a container (opened elsewhere) acts on the
+    /// sidebar selection too, instead of descending into the viewed
+    /// container.
+    #[test]
+    fn detail_of_container_enter_targets_sidebar_selection() {
+        use crate::app::app_test_helpers::{select_sidebar_row, with_detail_sidebar_tree};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        app.open_session_in_current_pane(tree.group);
+        select_sidebar_row(&mut app, tree.viewed);
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert_eq!(detail_session_id(&app), Some(tree.viewed));
+        assert_eq!(app.active_tab().descent_path, Vec::<uuid::Uuid>::new());
+    }
+
+    /// Outside session detail the full list keeps its descent behaviour:
+    /// Enter on a Group drills into it.
+    #[test]
+    fn session_list_enter_on_group_still_descends() {
+        use crate::app::app_test_helpers::{select_sidebar_row, with_detail_sidebar_tree};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        app.back_to_list();
+        select_sidebar_row(&mut app, tree.group);
+
+        super::dispatch(&mut app, LcAction::EnterSession);
+
+        assert!(matches!(app.focused_pane(), Some(Pane::SessionList { .. })));
+        assert_eq!(app.active_tab().descent_path, vec![tree.group]);
+        assert_eq!(app.filtered_session_order, vec![tree.epic]);
     }
 }
 

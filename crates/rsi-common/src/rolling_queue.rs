@@ -23,6 +23,9 @@ pub const QUEUE_SOURCE_INVALID: &str = "queue_source_invalid";
 pub const QUEUE_FILTER_INVALID: &str = "queue_filter_invalid";
 pub const QUEUE_KEY_INVALID: &str = "queue_idempotency_key_invalid";
 pub const QUEUE_DUPLICATE_SOURCE: &str = "queue_duplicate_source";
+/// A test filter selects no test (refused at enqueue, or reported by the gate
+/// when "no tests to run" slips past the static check). Names the filter.
+pub const QUEUE_FILTER_MATCHES_NO_TESTS: &str = "filter_matches_no_tests";
 pub const QUEUE_NOT_AUTHORIZED: &str = "queue_not_authorized";
 pub const QUEUE_REGATE_EXHAUSTED: &str = "queue_out_of_band_regate_exhausted";
 /// A source's merge onto the tip (or onto its batch predecessors) conflicted.

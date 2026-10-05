@@ -9,6 +9,7 @@ pub mod issues;
 pub mod navigator_layout;
 pub mod overlay;
 pub mod prompt_creator;
+pub mod rainbow_loaders;
 pub mod session;
 pub mod settings;
 pub mod status;
@@ -432,8 +433,8 @@ fn render_pane(
             }
         }
         Pane::Settings => {
-            settings::render_settings(app, frame, area);
             settings::record_rendered_layout(app, area);
+            settings::render_settings(app, frame, area);
         }
         Pane::PromptCreator => {
             prompt_creator::render_prompt_creator(frame, area, focused, app);
@@ -814,20 +815,19 @@ fn paint_detail_gutters(
     }
 }
 
+/// Shift the file viewer right of an open explorer drawer so the tree and
+/// the file sit side by side whichever of them has focus.
 fn file_viewer_area_with_explorer_drawer(area: Rect, frame_area: Rect, app: &App) -> Rect {
-    if !matches!(
-        app.overlay,
-        OverlayState::FileExplorer {
-            explorer_focused: false,
-            ..
-        }
-    ) {
+    let OverlayState::FileExplorer(explorer) = &app.overlay else {
         return area;
-    }
+    };
 
     let drawer_right = frame_area
         .x
-        .saturating_add(overlay::file_explorer_drawer_width(frame_area.width));
+        .saturating_add(overlay::file_explorer_drawer_width(
+            frame_area.width,
+            explorer.width,
+        ));
     let min_x = drawer_right.saturating_add(1);
     let area_right = area.x.saturating_add(area.width);
 

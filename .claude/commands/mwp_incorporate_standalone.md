@@ -87,8 +87,8 @@ Mark any ticket effectively done in code **CLOSE-ON-AUDIT** and drop its slice.
 
 **Step B — RESOLVE THE THREE BLOCKER QUESTIONS AND MUTATE SCOPE** (known answers to verify, then propagate):
 
-- `compiled_prompts` is DB-BACKED (`crates/rsid/src/store/mod.rs:~722`), NOT git ⇒ D4/S11 reversibility needs DB prompt versioning + rollback.
-- `rsi-graph::CacheKey` is PERSISTED in `crates/rsid/src/store/graph_cache.rs` (3 columns) ⇒ D6/S10 is a schema-migration slice; expand its manifest.
+- `compiled_prompts` is DB-BACKED (`crates/rsid-store/src/store/mod.rs:~722`), NOT git ⇒ D4/S11 reversibility needs DB prompt versioning + rollback.
+- `rsi-graph::CacheKey` is PERSISTED in `crates/rsid-store/src/store/graph_cache.rs` (3 columns) ⇒ D6/S10 is a schema-migration slice; expand its manifest.
 - `retry_attempt` corrective-burn vs routine-retry classification: confirm location; if absent, S11 adds it.
 
 **Step C — WRITE THE ARTIFACTS** (extend the pre-generated skeletons): slice plan + program ledger with complete per-slice manifests (incl. storage/migration/test files), freeze status, deps, pinning test, done-means. Then STOP for Jake's go + freeze decision.

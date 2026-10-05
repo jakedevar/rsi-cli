@@ -242,6 +242,73 @@ pub(crate) fn with_session_detail() -> (App, Uuid) {
     (app, session_id)
 }
 
+/// Session ids in [`with_detail_sidebar_tree`].
+pub(crate) struct SidebarTree {
+    /// Standalone root leaf whose detail pane is open.
+    pub viewed: Uuid,
+    /// Root Group container.
+    pub group: Uuid,
+    /// Epic nested under `group`.
+    pub epic: Uuid,
+    /// Task nested under `epic`.
+    pub leaf: Uuid,
+}
+
+/// Daemon-free single-pane session detail open on a standalone leaf, with a
+/// Group → Epic → Task tree beside it in the left sidebar list. Every
+/// container starts folded and the sidebar selection is on the Group row.
+/// Root rows follow the list's focus sections, so locate rows by id.
+pub(crate) fn with_detail_sidebar_tree() -> (App, SidebarTree) {
+    let mut app = with_session_list(0);
+    let tree = SidebarTree {
+        viewed: Uuid::new_v4(),
+        group: Uuid::new_v4(),
+        epic: Uuid::new_v4(),
+        leaf: Uuid::new_v4(),
+    };
+    let mut viewed = baseline_session(tree.viewed, SessionKind::Standard);
+    viewed.title = Some("Viewed leaf".to_string());
+    let mut group = baseline_session(tree.group, SessionKind::Group);
+    group.title = Some("Alpha group".to_string());
+    let mut epic = baseline_session(tree.epic, SessionKind::Epic);
+    epic.title = Some("Beta epic".to_string());
+    epic.parent_id = Some(tree.group);
+    let mut leaf = baseline_session(tree.leaf, SessionKind::Task);
+    leaf.title = Some("Gamma task".to_string());
+    leaf.parent_id = Some(tree.epic);
+    for session in [viewed, group, epic, leaf] {
+        app.session_order.push(session.id);
+        app.sessions.insert(session.id, SessionState::new(session));
+    }
+    // Production data path: builds `children_by_parent` and the filtered
+    // root order (both containers folded, so only the two roots are rows).
+    app.sort_sessions(true);
+    select_sidebar_row(&mut app, tree.viewed);
+    app.enter_session();
+    select_sidebar_row(&mut app, tree.group);
+    (app, tree)
+}
+
+/// Point the session-list selection at `id`'s visible main-zone row: the
+/// real list pane when one is in the layout, otherwise the tab-stored list
+/// that the single-pane detail sidebar renders.
+pub(crate) fn select_sidebar_row(app: &mut App, id: Uuid) {
+    let index = app
+        .filtered_session_order
+        .iter()
+        .position(|row| *row == id)
+        .expect("row must be visible in the main list");
+    if let Pane::SessionList {
+        selected_index,
+        selected_session,
+        ..
+    } = app.session_list_pane_mut()
+    {
+        *selected_index = index;
+        *selected_session = Some(id);
+    }
+}
+
 /// T6 Decision D6 (F-001, F-017): a canonical `ToolUse` (with `tool_input`) +
 /// matching `ToolResult` event pair, parameterized by `SessionProvider`.
 ///

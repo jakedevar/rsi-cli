@@ -9,6 +9,7 @@ use rsi_common::harness_manager_v2::*;
 use rsi_common::types::Project;
 
 mod fence;
+mod launch_liveness;
 mod lead_wakes;
 mod recovery;
 
@@ -1616,6 +1617,66 @@ async fn prepared_manager_action_reports_runtime_blocker_without_queueing() {
         )
         .unwrap();
     assert_eq!(actions, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn prepared_pause_blocker_names_the_paused_subject_and_the_unpause_step() {
+    let p = pilot().await;
+    let store = p.manager.store.lock().await;
+    let mut policy = p.policy.clone();
+    policy.paused_epic_ids = vec![p.epic];
+    store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: "pause-epic".into(),
+            policy: policy.clone(),
+        })
+        .unwrap();
+    let prepared = store
+        .prepare_manager_action(p.owner, prepared_resume(&p))
+        .unwrap();
+    let blocker = prepared
+        .blockers
+        .iter()
+        .find(|b| b.code == ManagerPreparedActionBlockerCodeV2::OperatorPause)
+        .expect("pause blocker");
+    assert_eq!(
+        blocker.required_action,
+        ManagerPreparedActionRequiredActionV2::ResumePolicyPause
+    );
+    let detail = blocker.detail.as_ref().expect("pause detail");
+    assert_eq!(
+        detail.subject,
+        ManagerPreparedActionPauseSubjectV2::PolicyEpic
+    );
+    assert_eq!(detail.epic_id, Some(p.epic));
+    assert_eq!(detail.paused_by, "operator policy");
+    assert!(detail.since.is_some());
+
+    policy.paused_epic_ids.clear();
+    policy.paused = true;
+    store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 2,
+            idempotency_key: "pause-policy".into(),
+            policy,
+        })
+        .unwrap();
+    let prepared = store
+        .prepare_manager_action(p.owner, prepared_resume(&p))
+        .unwrap();
+    let detail = prepared
+        .blockers
+        .iter()
+        .find_map(|b| b.detail.as_ref())
+        .expect("pause detail");
+    assert_eq!(detail.subject, ManagerPreparedActionPauseSubjectV2::Policy);
+    assert_eq!(detail.epic_id, None);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -3454,14 +3515,15 @@ fn advance_origin_rolling(p: &Pilot, origin: &std::path::Path) -> String {
     git(&scratch, &["rev-parse", "HEAD"])
 }
 
-/// #913: a manager-created session whose source is an unsandboxed container
-/// (an Epic) forks from the verified origin `rolling` tip rather than the
-/// checkout's stale local `rolling`, and never moves a checkout ref.
+/// #1144 (supersedes #913): a manager-created session whose source is an
+/// unsandboxed container (an Epic) is allocated from the EXACT commit pinned
+/// at prepare time, never from a newer fetched origin `rolling` tip, and never
+/// moves a checkout ref.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures, clippy::significant_drop_tightening)]
-async fn manager_actions_unsandboxed_source_forks_from_origin_rolling_tip() {
+async fn manager_actions_unsandboxed_source_forks_from_frozen_pin_when_origin_is_newer() {
     let p = pilot().await;
     let origin = rolling_checkout_with_origin(&p);
     let stale = git(&p.repo, &["rev-parse", "HEAD"]);
@@ -3495,7 +3557,8 @@ async fn manager_actions_unsandboxed_source_forks_from_origin_rolling_tip() {
         .unwrap()
         .sandbox_root
         .unwrap();
-    assert_eq!(git(&root, &["rev-parse", "HEAD"]), fresh);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), stale);
+    assert_ne!(git(&root, &["rev-parse", "HEAD"]), fresh);
     assert_eq!(git(&p.repo, &["rev-parse", "refs/heads/rolling"]), stale);
     assert_eq!(
         git(&p.repo, &["rev-parse", "refs/remotes/origin/rolling"]),
@@ -4017,6 +4080,9 @@ async fn due_child_creation_keeps_priority_after_restart() {
 #[tokio::test]
 async fn stale_child_source_fails_closed_then_recovery_can_claim() {
     let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    // #1144: a clean but unpublished commit after admission is no verified
+    // published fast-forward, so the source gate refuses it; restoring the
+    // pinned commit passes again, and a rewrite refuses.
     std::fs::write(p.repo.join("source"), "source changed after admission\n").unwrap();
     git(&p.repo, &["add", "source"]);
     git(
@@ -4025,6 +4091,21 @@ async fn stale_child_source_fails_closed_then_recovery_can_claim() {
     );
     let claim = p.claim().await;
     assert_eq!(claim.id(), child.operation_id);
+    let error = p
+        .manager
+        .check_manager_action_runtime(&claim, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_v2_source_changed"));
+    git(&p.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    p.manager
+        .check_manager_action_runtime(&claim, true)
+        .await
+        .unwrap();
+    git(
+        &p.repo,
+        &["commit", "--amend", "-qm", "rewrite source after admission"],
+    );
     let error = p
         .manager
         .check_manager_action_runtime(&claim, true)
@@ -5331,6 +5412,9 @@ mod session_actions;
 #[path = "manager_operator_delegation.rs"]
 mod operator_delegation;
 
+#[path = "manager_issue_worker.rs"]
+mod issue_worker;
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_group_scope_enrolls_created_epics_above_32_with_explicit_policy() {
@@ -6622,8 +6706,8 @@ async fn manager_appserver_lead_with_provider_session_is_retried_not_resumed() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[test]
 fn manager_resume_and_retry_predicates_agree_with_continuation_gate() {
-    use crate::session::lifecycle::check_manager_resume_target as gate;
     use crate::store::manager_actions::{manager_resume_available, manager_retry_admissible};
+    use crate::store_support::manager_gates::check_manager_resume_target as gate;
     let code = |result: &Result<()>| match result {
         Ok(()) => "ok".to_owned(),
         Err(DaemonError::StructuredRpc { message, data, .. }) => {
@@ -6907,12 +6991,14 @@ async fn manager_declines_its_own_stale_request_and_frees_capacity() {
 fn engage_deploy_drain(p: &Pilot) {
     let live = crate::store::agent_deploys::DeployRow {
         id: Uuid::new_v4(),
-        owner_session_id: Uuid::new_v4(),
+        owner_session_id: Some(Uuid::new_v4()),
         sha: "0".repeat(40),
         manifest: Vec::new(),
         state: rsi_common::agent_deploy::DeployState::Staged,
         reason: None,
         deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        operator: false,
+        forced: false,
     };
     p.manager
         .deploy_drain()
@@ -7057,4 +7143,544 @@ async fn a_draining_deploy_refuses_a_manager_resume_of_a_child_lead_and_the_acti
         ManagerActionStateV2::Queued,
         "the durable action is deferred, not blocked"
     );
+}
+
+fn create_session_op(i: usize) -> ManagerActionV2 {
+    ManagerActionV2::CreateSession {
+        parent_id: Uuid::nil(),
+        kind: SessionKind::Task,
+        query: format!("independent launch {i}"),
+        launch: ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Codex,
+            model: "configured-model".into(),
+            effort: None,
+        },
+    }
+}
+
+async fn admit_create_session(p: &Pilot, key: &str, i: usize) -> ManagerActionReceiptV2 {
+    admit_create_session_under(p, key, i, p.epic).await
+}
+
+/// A second Epic in the pilot's group, so creates can target a distinct parent.
+async fn second_epic(p: &Pilot) -> Uuid {
+    let mut request = p.request(
+        "second-epic",
+        ManagerActionV2::CreateContainer {
+            parent_id: Some(p.group),
+            kind: SessionKind::Epic,
+            name: "Second parent".into(),
+            tags: vec!["manager".into()],
+        },
+    );
+    request.fence.policy_version = 2;
+    let epic = p
+        .manager
+        .agent_control()
+        .agent_manager_control(p.owner, request)
+        .await
+        .unwrap()
+        .target_session_id
+        .unwrap();
+    p.execute().await.unwrap();
+    epic
+}
+
+/// Lift the launch allow-list (policy v2) so a create may use any launch.
+async fn open_launch_policy(p: &mut Pilot, key: &str) {
+    p.policy.allowed_launches.clear();
+    p.policy.max_active_sessions = 12;
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: key.into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+}
+
+async fn admit_create_session_under(
+    p: &Pilot,
+    key: &str,
+    i: usize,
+    parent_id: Uuid,
+) -> ManagerActionReceiptV2 {
+    admit_create_session_with(p, key, i, parent_id, SessionProvider::Codex).await
+}
+
+async fn admit_create_session_with(
+    p: &Pilot,
+    key: &str,
+    i: usize,
+    parent_id: Uuid,
+    provider: SessionProvider,
+) -> ManagerActionReceiptV2 {
+    let ManagerActionV2::CreateSession {
+        kind,
+        query,
+        mut launch,
+        ..
+    } = create_session_op(i)
+    else {
+        unreachable!()
+    };
+    launch.provider = provider;
+    let mut request = p.request(
+        key,
+        ManagerActionV2::CreateSession {
+            parent_id,
+            kind,
+            query,
+            launch,
+        },
+    );
+    request.fence.policy_version = 2;
+    p.manager
+        .agent_control()
+        .agent_manager_control(p.owner, request)
+        .await
+        .unwrap()
+}
+
+/// #1118: independent create_session launches in one project are claimable
+/// together (bounded), while any other action stays behind the one-active
+/// fence and is not starved by later creates.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn independent_create_session_actions_claim_in_parallel_up_to_the_bound() {
+    let mut p = pilot().await;
+    p.policy.allowed_launches.clear();
+    p.policy.max_active_sessions = 12;
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: "parallel-launches".into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+    let other_epic = second_epic(&p).await;
+    let first = admit_create_session(&p, "par-1", 1).await;
+    let second = admit_create_session_under(&p, "par-2", 2, other_epic).await;
+    // The first launch is stuck (running); the second, under a distinct
+    // parent, must still establish.
+    let c1 = p.claim().await;
+    assert_eq!(c1.id(), first.operation_id);
+    let c2 = p.claim().await;
+    assert_eq!(c2.id(), second.operation_id);
+    assert_eq!(
+        p.receipt(first.operation_id).await.state,
+        ManagerActionStateV2::Running
+    );
+
+    // A non-create action queued after the running creates waits for them, and
+    // a create queued after it does not jump ahead (no starvation).
+    let mut pause_request = p.request(
+        "par-pause",
+        ManagerActionV2::PauseLead {
+            epic_id: p.epic,
+            expected: p.fence().await,
+            reason: "pause".into(),
+        },
+    );
+    pause_request.fence.policy_version = 2;
+    let pause = p
+        .manager
+        .agent_control()
+        .agent_manager_control(p.owner, pause_request)
+        .await
+        .unwrap();
+    let late = admit_create_session(&p, "par-late", 3).await;
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action(p.manager.program_run_boot_id)
+            .unwrap()
+            .is_none()
+    );
+
+    // The stuck launch settles with a named cause; the replay of a settled
+    // action is unchanged.
+    let code = "manager_v2_launch_timeout_prepare_fork";
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(&c1, ManagerActionStateV2::Blocked, code)
+        .unwrap();
+    let settled = p.receipt(first.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Blocked);
+    assert_eq!(settled.outcome.as_deref(), Some(code));
+    let replay = admit_create_session(&p, "par-1", 1).await;
+    assert_eq!(replay.operation_id, first.operation_id);
+    assert_eq!(replay.state, ManagerActionStateV2::Blocked);
+
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(&c2, ManagerActionStateV2::Blocked, code)
+        .unwrap();
+    let next = p.claim().await;
+    assert_eq!(next.id(), pause.operation_id, "oldest queued action first");
+    let _ = late;
+}
+
+/// #1143: creates under the same parent serialize (transactional predicate),
+/// while a distinct parent still claims in parallel.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn same_parent_create_session_actions_serialize_and_distinct_parents_overlap() {
+    let mut p = pilot().await;
+    p.policy.allowed_launches.clear();
+    p.policy.max_active_sessions = 12;
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: "same-parent-launches".into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+    let other_epic = second_epic(&p).await;
+    let first = admit_create_session(&p, "sp-1", 1).await;
+    let same_parent = admit_create_session(&p, "sp-2", 2).await;
+    let distinct = admit_create_session_under(&p, "sp-3", 3, other_epic).await;
+
+    let c1 = p.claim().await;
+    assert_eq!(c1.id(), first.operation_id);
+    // The same-parent create is fenced by the running one; the distinct
+    // parent's create (queued after it) overtakes.
+    let c3 = p.claim().await;
+    assert_eq!(c3.id(), distinct.operation_id);
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action(p.manager.program_run_boot_id)
+            .unwrap()
+            .is_none(),
+        "a second create under a running create's parent never claims"
+    );
+    assert_eq!(
+        p.receipt(same_parent.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+
+    // Settling the first create releases its parent; the replay of its
+    // idempotency key still dedupes onto the settled action.
+    let code = "manager_v2_launch_timeout_prepare_fork";
+    p.manager
+        .store
+        .lock()
+        .await
+        .finish_manager_action(&c1, ManagerActionStateV2::Blocked, code)
+        .unwrap();
+    let replay = admit_create_session(&p, "sp-1", 1).await;
+    assert_eq!(replay.operation_id, first.operation_id);
+    let c2 = p.claim().await;
+    assert_eq!(c2.id(), same_parent.operation_id);
+    for claim in [&c2, &c3] {
+        p.manager
+            .store
+            .lock()
+            .await
+            .finish_manager_action(claim, ManagerActionStateV2::Blocked, code)
+            .unwrap();
+    }
+}
+
+/// #1143: drive one `create_session` whose launch stalls at `phase` past the
+/// step deadline, then assert the deadline left no orphan: nothing in
+/// `active`, the candidate row settled, and exactly one provider launch.
+async fn deadline_during_create_leaves_no_orphan(
+    phase: crate::session::launch::ControllerCandidateTestPhase,
+) {
+    let mut p = pilot().await;
+    open_launch_policy(&mut p, "deadline-launches").await;
+    let parent = second_epic(&p).await;
+    // A CLI provider: its process starts synchronously, before `active`
+    // publication (an app-server launch defers its start past the window).
+    let receipt =
+        admit_create_session_with(&p, "deadline-create", 1, parent, SessionProvider::Claude).await;
+    let child = receipt.target_session_id.unwrap();
+    let process = crate::session::launch::install_controller_candidate_test_process(child);
+    let (reached, _resume) =
+        crate::session::launch::install_controller_candidate_test_pause(child, phase);
+    p.manager
+        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
+    let claim = p.claim().await;
+    assert!(
+        p.manager.run_claimed_manager_action(claim).await.unwrap(),
+        "the timed-out action settles"
+    );
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
+            Ok(Ok(()))
+        ),
+        "the launch stalled at the intended phase"
+    );
+    let settled = p.receipt(receipt.operation_id).await;
+    assert!(
+        matches!(
+            settled.state,
+            ManagerActionStateV2::Blocked | ManagerActionStateV2::Uncertain
+        ),
+        "the action never stays running: {:?}",
+        settled.state
+    );
+    assert!(
+        settled
+            .outcome
+            .as_deref()
+            .is_some_and(|code| code.starts_with("manager_v2_launch_timeout")),
+        "the receipt names the stuck step: {:?}",
+        settled.outcome
+    );
+    assert!(
+        !p.manager.active.read().await.contains_key(&child),
+        "no launched provider stays in active"
+    );
+    assert_ne!(
+        session_status_of(&p, child).await,
+        SessionStatus::Starting,
+        "the candidate row is settled"
+    );
+    assert!(
+        process.productive_start_count.load(Ordering::SeqCst) <= 1,
+        "no double launch"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_deadline_after_provider_start_leaves_no_orphan() {
+    deadline_during_create_leaves_no_orphan(
+        crate::session::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_deadline_after_active_insertion_leaves_no_orphan() {
+    deadline_during_create_leaves_no_orphan(
+        crate::session::launch::ControllerCandidateTestPhase::ManagerActionAfterActiveInsertion,
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_deadline_during_confirmation_leaves_no_orphan() {
+    deadline_during_create_leaves_no_orphan(
+        crate::session::launch::ControllerCandidateTestPhase::ManagerActionConfirming,
+    )
+    .await;
+}
+
+/// #1143: a candidate launch parked while holding its deferred start gate
+/// (app-server handshake) is cancelled by the runner at the deadline, not
+/// through that gate: the launch task exits and the action settles with a
+/// verified drain, never `Running` with the candidate still `active`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_deadline_cancels_a_launch_parked_at_its_deferred_start_gate() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = pilot().await;
+    open_launch_policy(&mut p, "gate-launches").await;
+    let parent = second_epic(&p).await;
+    let receipt = admit_create_session_with(
+        &p,
+        "gate-create",
+        1,
+        parent,
+        SessionProvider::CodexAppServer,
+    )
+    .await;
+    let child = receipt.target_session_id.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("fake-app-server");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+trap 'exit 0' INT TERM
+while IFS= read -r request; do
+    case "$request" in
+        *'"method":"initialize"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"gate-fake-thread"}}}'
+            ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::session::launch::install_controller_candidate_test_app_server_binary(child, binary);
+    // The pause sits inside the deferred launch while it holds the start gate.
+    let (reached, resume) = crate::session::launch::install_controller_candidate_test_pause(
+        child,
+        crate::session::launch::ControllerCandidateTestPhase::ManagerActionStartGateHeld,
+    );
+    p.manager
+        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
+    let claim = p.claim().await;
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        p.manager.run_claimed_manager_action(claim),
+    )
+    .await
+    .expect("the deadline drain must not wait behind the deferred start gate")
+    .unwrap();
+    assert!(settled);
+    let early = p.receipt(receipt.operation_id).await;
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
+            Ok(Ok(()))
+        ),
+        "the launch parked at the start gate: {early:?}"
+    );
+    // The parked launch task was dropped (its resume receiver is gone).
+    assert!(resume.is_closed(), "the launch task exited");
+    let after = p.receipt(receipt.operation_id).await;
+    assert!(
+        matches!(
+            after.state,
+            ManagerActionStateV2::Blocked | ManagerActionStateV2::Uncertain
+        ),
+        "{:?}",
+        after.state
+    );
+    assert!(
+        after
+            .outcome
+            .as_deref()
+            .is_some_and(|code| code.starts_with("manager_v2_launch_timeout")),
+        "a verified drain keeps the timeout class: {:?}",
+        after.outcome
+    );
+    assert!(!p.manager.active.read().await.contains_key(&child));
+    assert_ne!(session_status_of(&p, child).await, SessionStatus::Starting);
+}
+
+/// #1143: a reap failure leaves durable drain-pending debt (the row and
+/// invocation stay open behind an `uncertain` receipt); only a later retry that
+/// proves exit settles them and clears the debt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launch_drain_debt_survives_a_reap_failure_until_exit_is_proved() {
+    use crate::store::manager_actions::{
+        MANAGER_LAUNCH_DRAIN_PENDING, MANAGER_LAUNCH_DRAIN_VERIFIED,
+    };
+    let mut p = pilot().await;
+    open_launch_policy(&mut p, "debt-launches").await;
+    let parent = second_epic(&p).await;
+    let receipt =
+        admit_create_session_with(&p, "debt-create", 1, parent, SessionProvider::Claude).await;
+    let child = receipt.target_session_id.unwrap();
+    let _process = crate::session::launch::install_controller_candidate_test_process(child);
+    let (_reached, _resume) = crate::session::launch::install_controller_candidate_test_pause(
+        child,
+        crate::session::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+    );
+    // The provider started before `active` publication: nothing tracks it, so
+    // only a reaped (and verified-empty) cohort proves it gone.
+    crate::session::reaper::fail_runtime_orphan_reap_for_test(child);
+    p.manager
+        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
+    let claim = p.claim().await;
+    assert!(p.manager.run_claimed_manager_action(claim).await.unwrap());
+
+    let owed = p.receipt(receipt.operation_id).await;
+    assert_eq!(owed.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(owed.outcome.as_deref(), Some(MANAGER_LAUNCH_DRAIN_PENDING));
+    assert_eq!(
+        session_status_of(&p, child).await,
+        SessionStatus::Starting,
+        "the unproved drain leaves the row open"
+    );
+    let invocation_open = |p: &Pilot| {
+        let store = p.manager.store.clone();
+        async move {
+            let store = store.lock().await;
+            let id = store.session_model_invocation_id(child).unwrap().unwrap();
+            let record = store.load_model_invocation_record(id).unwrap().unwrap();
+            matches!(
+                record.raw_status.as_str(),
+                "running" | "cancellation_requested"
+            )
+        }
+    };
+    assert!(invocation_open(&p).await, "the invocation stays open");
+
+    // A retry whose reap fails again keeps the debt.
+    crate::session::reaper::fail_runtime_orphan_reap_for_test(child);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert!(!crate::session::reaper::runtime_orphan_reap_failure_pending_for_test(child));
+    let still_owed = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        still_owed.outcome.as_deref(),
+        Some(MANAGER_LAUNCH_DRAIN_PENDING)
+    );
+    assert_eq!(session_status_of(&p, child).await, SessionStatus::Starting);
+    assert!(invocation_open(&p).await);
+
+    // A retry that proves exit settles the rows and clears the debt.
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let cleared = p.receipt(receipt.operation_id).await;
+    assert_eq!(cleared.state, ManagerActionStateV2::Uncertain);
+    assert_eq!(
+        cleared.outcome.as_deref(),
+        Some(MANAGER_LAUNCH_DRAIN_VERIFIED)
+    );
+    assert_eq!(session_status_of(&p, child).await, SessionStatus::Failed);
+    assert!(!invocation_open(&p).await);
+}
+
+/// #1118: a launch step that never finishes settles as a typed, named
+/// timeout; a step that finishes is untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(start_paused = true)]
+async fn launch_step_deadline_names_the_stuck_step() {
+    use crate::session::manager_actions::{bound_launch_steps, note_launch_step_for_tests};
+    let deadline = std::time::Duration::from_secs(30);
+    let stuck = bound_launch_steps(deadline, Uuid::new_v4(), async {
+        note_launch_step_for_tests("settle_predecessor");
+        note_launch_step_for_tests("prepare_fork");
+        std::future::pending::<Result<()>>().await
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        crate::session::manager_actions::safe_action_error(&stuck),
+        "manager_v2_launch_timeout_prepare_fork"
+    );
+    let fine = bound_launch_steps(deadline, Uuid::new_v4(), async {
+        note_launch_step_for_tests("prepare_fork");
+        Ok(7)
+    })
+    .await
+    .unwrap();
+    assert_eq!(fine, 7);
 }

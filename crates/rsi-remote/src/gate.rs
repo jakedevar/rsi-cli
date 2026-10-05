@@ -275,13 +275,13 @@ mod tests {
 
     fn self_whois_json() -> String {
         format!(
-            r#"{{"UserProfile":{{"ID":{OWNER}}},"Node":{{"StableID":"{SERVER_NODE}","User":{OWNER},"MachineAuthorized":true,"Expired":false,"KeyExpiry":"0001-01-01T00:00:00Z"}}}}"#
+            r#"{{"UserProfile":{{"ID":{OWNER}}},"Node":{{"StableID":"{SERVER_NODE}","User":{OWNER},"MachineAuthorized":null,"Expired":false,"KeyExpiry":"0001-01-01T00:00:00Z"}}}}"#
         )
     }
 
     fn client_whois_json(stable_id: &str) -> String {
         format!(
-            r#"{{"UserProfile":{{"ID":{OWNER}}},"Node":{{"StableID":"{stable_id}","User":{OWNER},"MachineAuthorized":true,"Expired":false,"KeyExpiry":"0001-01-01T00:00:00Z","Addresses":["{CLIENT_IP}/32"],"Tags":[],"Sharer":0}}}}"#
+            r#"{{"UserProfile":{{"ID":{OWNER}}},"Node":{{"StableID":"{stable_id}","User":{OWNER},"MachineAuthorized":null,"Expired":false,"KeyExpiry":"0001-01-01T00:00:00Z","Addresses":["{CLIENT_IP}/32"],"Tags":[],"Sharer":0}}}}"#
         )
     }
 

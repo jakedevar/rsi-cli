@@ -59,12 +59,20 @@ pub(crate) fn retryable_resume_refusal(error: &DaemonError) -> bool {
         // #1073: the drain engaged between the wake precheck and the
         // continuation; the wake stays due and is retried after the deploy.
         || crate::deploy_drain::is_draining_error(error)
+        // #1157: effect admission surrendered a busy custody stripe after its
+        // bounded wait; nothing ran, so the wake backs off and the scheduler
+        // keeps serving other jobs.
+        || crate::store::custody_lock_order::is_lock_order_busy_error(error)
 }
 
 /// The retry code recorded and logged for a retained wake refusal.
 fn resume_refusal_code(error: &DaemonError) -> &'static str {
     continuation_fence_code(error)
         .or_else(|| transient_resume_refusal_code(error))
+        .or_else(|| {
+            crate::store::custody_lock_order::is_lock_order_busy_error(error)
+                .then_some("custody_root_busy")
+        })
         .unwrap_or("continuation_fence")
 }
 
@@ -571,6 +579,39 @@ async fn fire_job_inner(
     if job.wake_mode == WakeMode::Resume {
         match job.wake_session_id {
             Some(target) => {
+                // #872: a global-manager message is delivered only while its
+                // grant and recipient seat are current; a stale one is
+                // retired without delivery, and an unreadable fence holds it.
+                let deliverable = {
+                    let guard = store.lock().await;
+                    guard
+                        .global_message_deliverable(job.id)
+                        .and_then(|current| {
+                            if !current {
+                                guard.retire_global_message(job.id)?;
+                            }
+                            Ok(current)
+                        })
+                };
+                match deliverable {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            job_id = %job.id,
+                            target = %target,
+                            "global manager message retired: grant or recipient seat changed"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            %error,
+                            "global manager message fence unavailable; holding the wake"
+                        );
+                        return;
+                    }
+                }
                 // #794 S3: hold a program master's wake while its children run;
                 // retire a keep-alive row whose children settled. An operator
                 // manual trigger bypasses both, and any read failure delivers
@@ -631,7 +672,12 @@ async fn fire_job_inner(
                 let delivery = rsi_common::daemon_message::wrap("scheduled-wake", &job.message);
                 // Bound to this exact row: a stale due-list snapshot of a job
                 // retired or disabled since capture must not resume its target.
-                let resumed = if manual {
+                // #872: a global-manager message is always delivered through the
+                // job-bound path, so the effect claim re-checks it atomically
+                // against the actual resumed tip (an unreadable flag binds).
+                let job_bound =
+                    !manual || store.lock().await.is_global_message(job.id).unwrap_or(true);
+                let resumed = if !job_bound {
                     launcher.resume_scheduled(target, delivery).await
                 } else {
                     launcher
@@ -756,6 +802,17 @@ async fn fire_job_inner(
                             }
                         }
                     }
+                    // #1124: the no-result continuation re-proved its worker
+                    // ineligible (halted, paused, archived, or a human gate):
+                    // retire the one-shot row quietly, never retry or deliver.
+                    Err(e) if crate::session::worker_result_guard::is_no_result_retired(&e) => {
+                        tracing::info!(
+                            job_id = %job.id,
+                            target = %target,
+                            "no-result continuation retired: worker no longer eligible"
+                        );
+                        advance_job_after_attempt(store, job).await;
+                    }
                     Err(e) => {
                         if crate::error::is_retryable_custody_wake_error(&e) {
                             defer_retryable_custody_wake(store, job, &WatchFireCapture::default())
@@ -763,6 +820,9 @@ async fn fire_job_inner(
                             return;
                         }
                         tracing::error!("Scheduled resume job '{}' failed: {e}", job.name);
+                        // #652: a terminal custody refusal is also a durable
+                        // manager notice, not only a bus message.
+                        record_custody_refusal_notice(store, job, target, &e).await;
                         bus.publish(DaemonEvent::SystemMessage {
                             level: "error".into(),
                             message: format!("Scheduled resume job '{}' failed: {e}", job.name),
@@ -960,6 +1020,13 @@ async fn fire_job_inner(
                 session_id,
             });
         }
+        // Issue #12: a live session already writes the wake's tree. The
+        // launcher refused before any effect, so the one-shot is NOT consumed:
+        // it stays armed and is retried for a bounded window; only then is it
+        // settled and the owner told.
+        Err(e) if crate::session::tree_admission::is_tree_occupied_error(&e) => {
+            settle_tree_occupied_fresh(store, bus, job, &e).await;
+        }
         Err(e) => {
             tracing::error!("Failed to fire scheduled job '{}': {e}", job.name);
             bus.publish(DaemonEvent::SystemMessage {
@@ -967,6 +1034,128 @@ async fn fire_job_inner(
                 message: format!("Scheduled job '{}' failed to fire: {e}", job.name),
             });
             advance_job_after_attempt(store, job).await;
+        }
+    }
+}
+
+/// How long a fresh wake keeps retrying while its tree is occupied.
+const TREE_OCCUPIED_RETRY_WINDOW: chrono::Duration = chrono::Duration::minutes(60);
+/// Delay between retries while its tree is occupied.
+const TREE_OCCUPIED_RETRY_DELAY: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Issue #12: handle a fresh wake whose tree is occupied.
+///
+/// A recurring wake skips this occurrence and stays armed for the next one
+/// (the recurrence is its own retry). A one-shot is retained and re-armed for a
+/// bounded window from its anchor; past that it is settled and its owner is
+/// resumed with exactly ONE durable note (deterministic job id, so a repeated
+/// settle can never queue a second one), so a decline is never silent.
+async fn settle_tree_occupied_fresh(
+    store: &Arc<Mutex<Store>>,
+    bus: &Arc<EventBus>,
+    job: &rsi_common::types::ScheduledJob,
+    error: &DaemonError,
+) {
+    let now = Utc::now();
+    if !matches!(job.schedule.recurrence, Recurrence::Once) {
+        let message = format!(
+            "Scheduled fresh job '{}' (id={}) skipped this occurrence: {error}; it stays armed \
+             for the next one",
+            job.name, job.id
+        );
+        tracing::warn!("{message}");
+        bus.publish(DaemonEvent::SystemMessage {
+            level: "warn".into(),
+            message,
+        });
+        advance_job_after_attempt(store, job).await;
+        return;
+    }
+    let deadline = job.schedule.anchor + TREE_OCCUPIED_RETRY_WINDOW;
+    if now < deadline && job.enabled {
+        let rearm_at = now + TREE_OCCUPIED_RETRY_DELAY;
+        let moved = {
+            let guard = store.lock().await;
+            guard.defer_wake_when(job.id, rearm_at)
+        };
+        match moved {
+            Ok(()) => {
+                let message = format!(
+                    "Scheduled fresh job '{}' (id={}) held: {error}; retrying no earlier than \
+                     {rearm_at} (gives up at {deadline})",
+                    job.name, job.id
+                );
+                tracing::warn!("{message}");
+                bus.publish(DaemonEvent::SystemMessage {
+                    level: "warn".into(),
+                    message,
+                });
+                return;
+            }
+            Err(move_error) => {
+                tracing::error!(job_id = %job.id, %move_error, "could not re-arm an occupied fresh wake; settling it");
+            }
+        }
+    }
+    let notice = job.wake_session_id.map(|origin| {
+        let notice_name = format!("fresh-wake-declined:{}", job.id);
+        rsi_common::types::ScheduledJob {
+            id: Uuid::new_v5(&job.id, notice_name.as_bytes()),
+            name: notice_name,
+            message: format!(
+                "Your fresh wake '{}' (id={}) never launched: {error}. Another live session \
+                 still writes that worktree. Re-arm it once the tree is quiet, or continue the \
+                 work yourself.",
+                job.name, job.id
+            ),
+            schedule: rsi_common::types::ScheduleSpec {
+                recurrence: Recurrence::Once,
+                anchor: now,
+            },
+            last_fired_at: None,
+            next_fire_at: now,
+            enabled: true,
+            working_dir: job.working_dir.clone(),
+            provider: job.provider,
+            model: job.model.clone(),
+            project_id: job.project_id,
+            created_at: now,
+            updated_at: now,
+            wake_mode: WakeMode::Resume,
+            wake_session_id: Some(origin),
+        }
+    });
+    // ONE store transaction settles the exact one-shot and inserts its
+    // deterministic notice, so a crash or an insertion failure can never leave
+    // the wake consumed without its notice (or the notice without the
+    // settlement). On failure the wake stays armed and the next poll retries.
+    let settled = {
+        let guard = store.lock().await;
+        guard.settle_declined_fresh_wake(job.id, &now, notice.as_ref())
+    };
+    match settled {
+        Ok(_) => {
+            let message = format!(
+                "Scheduled fresh job '{}' (id={}) declined after the retry window: {error}",
+                job.name, job.id
+            );
+            tracing::warn!("{message}");
+            bus.publish(DaemonEvent::SystemMessage {
+                level: "warn".into(),
+                message,
+            });
+        }
+        Err(settle_error) => {
+            let message = format!(
+                "Scheduled fresh job '{}' (id={}) could not be settled with its owner notice: \
+                 {settle_error}; it stays armed and is retried",
+                job.name, job.id
+            );
+            tracing::error!("{message}");
+            bus.publish(DaemonEvent::SystemMessage {
+                level: "error".into(),
+                message,
+            });
         }
     }
 }
@@ -1313,6 +1502,23 @@ async fn hold_wake_for_provider_exhaustion(
     }
 }
 
+/// #652: surface a terminal sandbox-custody refusal of a lead's wake as a
+/// durable, typed manager notice. Best effort: the wake settles as before.
+pub(crate) async fn record_custody_refusal_notice(
+    store: &Arc<Mutex<Store>>,
+    job: &rsi_common::types::ScheduledJob,
+    target: Uuid,
+    error: &DaemonError,
+) {
+    if let Err(record_error) = store
+        .lock()
+        .await
+        .record_manager_custody_refusal_notice(target, error)
+    {
+        tracing::error!(job_id = %job.id, %record_error, "could not record custody refusal notice");
+    }
+}
+
 async fn defer_retryable_custody_wake(
     store: &Arc<Mutex<Store>>,
     job: &rsi_common::types::ScheduledJob,
@@ -1407,7 +1613,8 @@ async fn settle_retryable_resume_refusal(
                 // A pause, capacity or drain refusal means the session never
                 // ran: keep the backoff but spend no heal budget (#1082).
                 let spend = transient_resume_refusal_code(error).is_none()
-                    && !crate::deploy_drain::is_draining_error(error);
+                    && !crate::deploy_drain::is_draining_error(error)
+                    && !crate::store::custody_lock_order::is_lock_order_busy_error(error);
                 Some(guard.defer_transient_heal(
                     job.id,
                     resume_refusal_code(error),
@@ -1615,6 +1822,7 @@ mod tests {
         fire_watch_calls: StdMutex<Vec<Uuid>>,
         fire_watch_outcomes: StdMutex<VecDeque<crate::error::Result<WatchFireOutcome>>>,
         usage_hold: StdMutex<Option<chrono::DateTime<Utc>>>,
+        scheduled_fresh_outcomes: StdMutex<VecDeque<crate::error::Result<Uuid>>>,
     }
 
     impl MockLauncher {
@@ -1630,6 +1838,7 @@ mod tests {
                 fire_watch_calls: StdMutex::new(Vec::new()),
                 fire_watch_outcomes: StdMutex::new(outcomes.into()),
                 usage_hold: StdMutex::new(None),
+                scheduled_fresh_outcomes: StdMutex::new(VecDeque::new()),
             })
         }
     }
@@ -1654,7 +1863,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(config.model_invocation_purpose);
-            Ok(Uuid::new_v4())
+            self.scheduled_fresh_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Uuid::new_v4()))
         }
 
         async fn resume_scheduled(
@@ -2651,7 +2864,7 @@ mod tests {
 
     fn capacity_fixture(due: bool) -> (Arc<Mutex<Store>>, Arc<EventBus>, ScheduledJob, Uuid) {
         let store = Store::open_in_memory().expect("capacity scheduler store");
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.id = Uuid::new_v4();
         session.provider = rsi_common::types::SessionProvider::Codex;
         session.model = Some("gpt-5.4".into());
@@ -2794,7 +3007,7 @@ mod tests {
                             .unwrap();
                     }
                     1 => {
-                        let mut wrong = crate::store::tests::make_test_session();
+                        let mut wrong = rsid_store::test_support::make_test_session();
                         wrong.id = Uuid::new_v4();
                         let wrong_id = wrong.id;
                         locked.insert_session(&wrong).unwrap();
@@ -2981,6 +3194,230 @@ mod tests {
         assert!(
             !job_row(&store, &job.id).await.enabled,
             "the one-shot Fresh job should be settled after launch"
+        );
+    }
+
+    /// Issue #12: an occupied tree does not consume the one-shot. The wake
+    /// stays armed and is re-armed for a retry; the retry launches once the
+    /// launcher admits it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn occupied_tree_keeps_fresh_wake_armed_then_launches_when_quiet() {
+        let (store, bus) = fixture();
+        let origin_id = Uuid::new_v4();
+        let job = mk_agent_fresh_job(origin_id);
+        {
+            let guard = store.lock().await;
+            guard
+                .insert_session(&mk_origin_session(origin_id, false))
+                .expect("insert settled origin");
+            guard.insert_scheduled_job(&job).expect("insert job");
+        }
+        let launcher = MockLauncher::new(Vec::new());
+        launcher
+            .scheduled_fresh_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::session::tree_admission::tree_occupied_error(
+                "a neighbour writes the tree",
+            )));
+        let dyn_launcher: Arc<dyn SessionLauncher> = launcher.clone();
+        let before = Utc::now();
+
+        fire_job(&store, &bus, &dyn_launcher, &job).await;
+
+        let held = job_row(&store, &job.id).await;
+        assert!(
+            held.enabled,
+            "an occupied tree must not consume the one-shot"
+        );
+        assert!(
+            held.next_fire_at >= before + chrono::Duration::seconds(30),
+            "the wake is re-armed for a later retry, not left due"
+        );
+        assert!(
+            store
+                .lock()
+                .await
+                .list_scheduled_jobs()
+                .unwrap()
+                .iter()
+                .all(|row| !row.name.starts_with("fresh-wake-declined:")),
+            "no owner notice while the wake is still retrying"
+        );
+
+        fire_job(&store, &bus, &dyn_launcher, &held).await;
+        assert!(
+            !job_row(&store, &job.id).await.enabled,
+            "once the launcher admits the launch the one-shot settles"
+        );
+    }
+
+    /// Issue #12: past the retry window the wake is settled and its owner is
+    /// resumed with a durable note, so the decline is never silent.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn occupied_tree_past_the_window_settles_and_notifies_the_owner() {
+        let (store, bus) = fixture();
+        let origin_id = Uuid::new_v4();
+        let mut job = mk_agent_fresh_job(origin_id);
+        job.schedule.anchor = Utc::now() - chrono::Duration::minutes(61);
+        {
+            let guard = store.lock().await;
+            guard
+                .insert_session(&mk_origin_session(origin_id, false))
+                .expect("insert settled origin");
+            guard.insert_scheduled_job(&job).expect("insert job");
+        }
+        let launcher = MockLauncher::new(Vec::new());
+        launcher
+            .scheduled_fresh_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::session::tree_admission::tree_occupied_error(
+                "a neighbour writes the tree",
+            )));
+        let dyn_launcher: Arc<dyn SessionLauncher> = launcher.clone();
+
+        launcher
+            .scheduled_fresh_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::session::tree_admission::tree_occupied_error(
+                "a neighbour writes the tree",
+            )));
+        fire_job(&store, &bus, &dyn_launcher, &job).await;
+        // A repeated settle of the same decline never queues a second note.
+        fire_job(&store, &bus, &dyn_launcher, &job).await;
+
+        assert!(!job_row(&store, &job.id).await.enabled);
+        let notices: Vec<_> = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.name == format!("fresh-wake-declined:{}", job.id))
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one durable decline note");
+        let notice = &notices[0];
+        assert!(notice.enabled);
+        assert_eq!(notice.wake_mode, WakeMode::Resume);
+        assert_eq!(notice.wake_session_id, Some(origin_id));
+    }
+
+    /// Issue #12 (F2): if the owner notice cannot be written, the one-shot is
+    /// NOT consumed (the settlement rolls back with the failed insert); the
+    /// next poll settles it together with its single notice.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn occupied_tree_notice_failure_leaves_the_one_shot_armed_for_retry() {
+        let (store, bus) = fixture();
+        let origin_id = Uuid::new_v4();
+        let mut job = mk_agent_fresh_job(origin_id);
+        job.schedule.anchor = Utc::now() - chrono::Duration::minutes(61);
+        {
+            let guard = store.lock().await;
+            guard
+                .insert_session(&mk_origin_session(origin_id, false))
+                .expect("insert settled origin");
+            guard.insert_scheduled_job(&job).expect("insert job");
+            guard
+                .conn
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_notice BEFORE INSERT ON scheduled_jobs
+                     WHEN NEW.name LIKE 'fresh-wake-declined:%'
+                     BEGIN SELECT RAISE(ABORT, 'injected notice failure'); END;",
+                )
+                .expect("inject failure");
+        }
+        let launcher = MockLauncher::new(Vec::new());
+        let dyn_launcher: Arc<dyn SessionLauncher> = launcher.clone();
+        for _ in 0..2 {
+            launcher
+                .scheduled_fresh_outcomes
+                .lock()
+                .unwrap()
+                .push_back(Err(crate::session::tree_admission::tree_occupied_error(
+                    "a neighbour writes the tree",
+                )));
+        }
+
+        fire_job(&store, &bus, &dyn_launcher, &job).await;
+        assert!(
+            job_row(&store, &job.id).await.enabled,
+            "a failed notice insert must not consume the wake"
+        );
+
+        store
+            .lock()
+            .await
+            .conn
+            .execute_batch("DROP TRIGGER fail_notice;")
+            .expect("clear failure");
+        let current = job_row(&store, &job.id).await;
+        fire_job(&store, &bus, &dyn_launcher, &current).await;
+        assert!(!job_row(&store, &job.id).await.enabled);
+        let notices = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.name == format!("fresh-wake-declined:{}", job.id))
+            .count();
+        assert_eq!(notices, 1, "the retry settles with exactly one notice");
+    }
+
+    /// Issue #12: a recurring fresh wake skips the declined occurrence and
+    /// stays armed for the next one: no retry window, no notice jobs, however
+    /// old the job is and however many polls decline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn occupied_tree_skips_a_recurring_fresh_wake_occurrence_and_stays_armed() {
+        let (store, bus) = fixture();
+        let origin_id = Uuid::new_v4();
+        let mut job = mk_agent_fresh_job(origin_id);
+        job.schedule = ScheduleSpec {
+            recurrence: Recurrence::EverySeconds(60),
+            anchor: Utc::now() - chrono::Duration::hours(3),
+        };
+        {
+            let guard = store.lock().await;
+            guard
+                .insert_session(&mk_origin_session(origin_id, false))
+                .expect("insert settled origin");
+            guard.insert_scheduled_job(&job).expect("insert job");
+        }
+        let launcher = MockLauncher::new(Vec::new());
+        let dyn_launcher: Arc<dyn SessionLauncher> = launcher.clone();
+        for _ in 0..3 {
+            launcher
+                .scheduled_fresh_outcomes
+                .lock()
+                .unwrap()
+                .push_back(Err(crate::session::tree_admission::tree_occupied_error(
+                    "a neighbour writes the tree",
+                )));
+            let current = job_row(&store, &job.id).await;
+            fire_job(&store, &bus, &dyn_launcher, &current).await;
+        }
+
+        let after = job_row(&store, &job.id).await;
+        assert!(after.enabled, "the recurring wake stays armed");
+        assert!(
+            after.next_fire_at > Utc::now(),
+            "armed for the next occurrence"
+        );
+        assert!(
+            store
+                .lock()
+                .await
+                .list_scheduled_jobs()
+                .unwrap()
+                .iter()
+                .all(|row| !row.name.starts_with("fresh-wake-declined:")),
+            "a skipped occurrence queues no decline jobs"
         );
     }
 

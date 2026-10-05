@@ -559,6 +559,97 @@ impl RsiControlReadSessionEventsTool {
     }
 }
 
+/// The global manager verbs that have a native tool (#872 Slice B).
+pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 3] = [
+    AgentControlVerbV1::GlobalOverview,
+    AgentControlVerbV1::GlobalSend,
+    AgentControlVerbV1::ReportToGlobal,
+];
+
+/// Run one native global-manager verb (#872 Slice B). Authority is checked by
+/// the control handle against the server-bound caller.
+pub(crate) async fn execute_global_verb(
+    control: &AgentControlHandle,
+    caller: Uuid,
+    verb: AgentControlVerbV1,
+    args: serde_json::Value,
+) -> crate::error::Result<serde_json::Value> {
+    let invalid = |error: serde_json::Error| {
+        crate::error::DaemonError::InvalidParam(format!("invalid {verb:?} arguments: {error}"))
+    };
+    let value = match verb {
+        AgentControlVerbV1::GlobalOverview => serde_json::to_value(
+            control
+                .agent_global_overview(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::GlobalSend => serde_json::to_value(
+            control
+                .agent_global_send(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::ReportToGlobal => serde_json::to_value(
+            control
+                .agent_report_to_global(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        _ => {
+            return Err(crate::error::DaemonError::InvalidParam(format!(
+                "{verb:?} is not a native global manager verb"
+            )));
+        }
+    };
+    value.map_err(crate::error::DaemonError::Json)
+}
+
+/// `rsi_control_global_overview`, `rsi_control_global_send` and
+/// `rsi_control_report_to_global` (#872 Slice B).
+pub struct RsiControlGlobalTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+    verb: AgentControlVerbV1,
+}
+
+impl RsiControlGlobalTool {
+    pub fn new(
+        control: AgentControlHandle,
+        caller_session_id: Uuid,
+        verb: AgentControlVerbV1,
+    ) -> Self {
+        Self {
+            control,
+            caller_session_id,
+            verb,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlGlobalTool {
+    fn name(&self) -> &str {
+        native_tool_name(self.verb)
+    }
+
+    fn description(&self) -> &str {
+        self.verb.descriptor().description
+    }
+
+    fn parameters_json(&self) -> &str {
+        self.verb.descriptor().parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        match execute_global_verb(&self.control, self.caller_session_id, self.verb, args).await {
+            Ok(value) => ToolResult {
+                success: true,
+                output: value.to_string(),
+                error_msg: None,
+            },
+            Err(e) => err(e.to_string()),
+        }
+    }
+}
+
 /// `rsi_control_query_failure_signatures` (#1016): read-only, project-scoped
 /// lookup of known-failure signature records by test id and/or digest.
 pub struct RsiControlQueryFailureSignaturesTool {
@@ -922,11 +1013,12 @@ pub enum ManagerControlToolKind {
     PrepareControl,
     CommitPreparedControl,
     GetAction,
+    LaunchIssueWorker,
     WorkView,
 }
 
 impl ManagerControlToolKind {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::AuthorityCatalog,
         Self::Progress,
         Self::Inbox,
@@ -940,6 +1032,7 @@ impl ManagerControlToolKind {
         Self::PrepareControl,
         Self::CommitPreparedControl,
         Self::GetAction,
+        Self::LaunchIssueWorker,
         Self::WorkView,
     ];
 
@@ -958,6 +1051,7 @@ impl ManagerControlToolKind {
             Self::PrepareControl => AgentControlVerbV1::ManagerPrepareControl,
             Self::CommitPreparedControl => AgentControlVerbV1::ManagerCommitPreparedControl,
             Self::GetAction => AgentControlVerbV1::ManagerGetAction,
+            Self::LaunchIssueWorker => AgentControlVerbV1::ManagerLaunchIssueWorker,
             Self::WorkView => AgentControlVerbV1::ManagerWorkView,
         }
     }
@@ -1051,6 +1145,14 @@ pub(crate) async fn execute_manager_tool(
                 parse_manager_args(args)?;
             control
                 .agent_manager_get_action(caller, request)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json))
+        }
+        ManagerControlToolKind::LaunchIssueWorker => {
+            let request: rsi_common::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1 =
+                parse_manager_args(args)?;
+            control
+                .agent_manager_launch_issue_worker(caller, request)
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json))
         }
@@ -1320,6 +1422,11 @@ mod tests {
                 ManagerControlToolKind::GetAction => {
                     serde_json::json!({"operation_id":reference})
                 }
+                ManagerControlToolKind::LaunchIssueWorker => serde_json::json!({
+                    "issue": 1, "brief": "build it",
+                    "launch": {"provider": "Claude", "model": "claude-sonnet-5-5"},
+                    "idempotency_key": "launch-1"
+                }),
                 ManagerControlToolKind::Send => serde_json::json!({
                     "epic_id": reference, "message": "evidence?", "idempotency_key": "request-1"
                 }),

@@ -222,6 +222,27 @@ impl RpcServer {
         Ok(serde_json::to_value(job)?)
     }
 
+    /// `AgentCancelJob` (#1106): stop one of the caller's running jobs.
+    pub(super) async fn handle_agent_cancel_job(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::agent_jobs::AgentCancelJobRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam("job_invalid_request".into()))?;
+        let cancelled = self
+            .session_manager
+            .agent_control()
+            .agent_cancel_job(
+                caller,
+                params,
+                std::sync::Arc::new(crate::agent_jobs::SystemdJobRuntime::default()),
+            )
+            .await?;
+        Ok(serde_json::to_value(cancelled)?)
+    }
+
     pub(super) async fn handle_agent_list_jobs(
         &self,
         request: &RpcRequest,
@@ -330,6 +351,22 @@ impl RpcServer {
             .session_manager
             .agent_control()
             .agent_send_satellite_message(caller, params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    pub(super) async fn handle_agent_report_to_hub(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::satellite_dispatch::AgentReportToHubRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam("satellite_report_invalid".into()))?;
+        let receipt = self
+            .session_manager
+            .agent_control()
+            .agent_report_to_hub(caller, params)
             .await?;
         Ok(serde_json::to_value(receipt)?)
     }

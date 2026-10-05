@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rsi_common::types::{
-    EdgeWhen, TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS, TOPOLOGY_STEP_PARAM, TOPOLOGY_WHEN_PARAM,
-    TopologyDefinition, TopologyStep,
+    EdgeWhen, TOPOLOGY_STEP_PARAM, TOPOLOGY_WHEN_PARAM, TopologyDefinition, TopologyStep,
 };
 use rsi_graph::data::Value as GraphValue;
 use rsi_graph::format::WorkflowDefinition;
@@ -137,164 +136,9 @@ impl WorkflowSteps {
     }
 }
 
-/// One node of the normalized validation graph.
-pub(crate) struct StepNode<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) step: Option<&'a TopologyStep>,
-    /// Author parameter keys (or `key=value` tags) on the node.
-    pub(crate) author_keys: Vec<&'a str>,
-}
-
-/// One edge of the normalized validation graph.
-pub(crate) struct StepEdge<'a> {
-    pub(crate) from: &'a str,
-    pub(crate) to: &'a str,
-    pub(crate) loop_edge: bool,
-    pub(crate) when: EdgeWhen,
-}
-
-/// Plan §3 static rules 1, 2, 7, 8 and 9 plus edge-routing consistency.
-pub(crate) fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<(), String> {
-    let known: HashSet<&str> = nodes.iter().map(|node| node.id).collect();
-    for node in nodes {
-        // Rule 8: never an author-chosen argv, env, script or effect class.
-        if let Some(key) = node
-            .author_keys
-            .iter()
-            .find(|key| TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS.contains(key))
-        {
-            return Err(format!(
-                "node {}: author-supplied {key} is refused; command nodes run only daemon catalog ops (#645)",
-                node.id
-            ));
-        }
-    }
-    let mut forward_preds: HashMap<&str, Vec<&str>> = HashMap::new();
-    for edge in edges {
-        if !known.contains(edge.from) || !known.contains(edge.to) {
-            return Err(format!(
-                "edge {} -> {} names an unknown node",
-                edge.from, edge.to
-            ));
-        }
-        let source_step = nodes
-            .iter()
-            .find(|node| node.id == edge.from)
-            .and_then(|node| node.step);
-        match edge.when {
-            EdgeWhen::Success | EdgeWhen::Failure | EdgeWhen::Completed => {}
-            EdgeWhen::GateTrue | EdgeWhen::GateFalse => {
-                if !matches!(source_step, Some(TopologyStep::Gate { .. })) {
-                    return Err(format!(
-                        "edge {} -> {}: gate_true/gate_false edges must leave a gate node",
-                        edge.from, edge.to
-                    ));
-                }
-            }
-            // Rule 9: review/land are refused until the T3b prerequisites.
-            EdgeWhen::VerdictAccepted | EdgeWhen::VerdictChangesRequested => {
-                return Err(format!(
-                    "edge {} -> {}: verdict routing needs review nodes, which are not available yet",
-                    edge.from, edge.to
-                ));
-            }
-        }
-        if edge.loop_edge && edge.when != EdgeWhen::Success {
-            return Err(format!(
-                "loop edge {} -> {} must be a success edge",
-                edge.from, edge.to
-            ));
-        }
-        if !edge.loop_edge {
-            forward_preds.entry(edge.to).or_default().push(edge.from);
-        }
-    }
-    for node in nodes {
-        match node.step {
-            None | Some(TopologyStep::Session { .. }) => {}
-            // Rule 7: the op is in the catalog and its params validate.
-            Some(TopologyStep::Command { op }) => op
-                .validate()
-                .map_err(|error| format!("node {}: {error}", node.id))?,
-            // Rule 2: gate paths reference ancestors only.
-            Some(TopologyStep::Gate { condition }) => {
-                let referenced = condition
-                    .validate()
-                    .map_err(|error| format!("node {}: {error}", node.id))?;
-                let ancestors = ancestors(node.id, &forward_preds);
-                if let Some(missing) = referenced
-                    .iter()
-                    .find(|id| !ancestors.contains(id.as_str()))
-                {
-                    return Err(format!(
-                        "node {}: gate path references {missing}, which is not an ancestor",
-                        node.id
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ancestors<'a>(node: &str, forward_preds: &HashMap<&str, Vec<&'a str>>) -> HashSet<&'a str> {
-    let mut seen = HashSet::new();
-    let mut stack: Vec<&str> = forward_preds.get(node).cloned().unwrap_or_default();
-    while let Some(next) = stack.pop() {
-        if seen.insert(next)
-            && let Some(preds) = forward_preds.get(next)
-        {
-            stack.extend(preds.iter().copied());
-        }
-    }
-    seen
-}
-
-/// Upsert-time validation over a stored topology definition.
-pub(crate) fn validate_topology(def: &TopologyDefinition) -> Result<(), String> {
-    let mut steps = Vec::with_capacity(def.nodes.len());
-    let mut routing: HashMap<(String, String), EdgeWhen> = HashMap::new();
-    for node in &def.nodes {
-        steps.push(node.step()?);
-        for (from, when) in node.incoming_when()? {
-            if !def
-                .edges
-                .iter()
-                .any(|edge| edge.from == from && edge.to == node.id)
-            {
-                return Err(format!(
-                    "node {}: when names {from}, which has no edge into it",
-                    node.id
-                ));
-            }
-            routing.insert((from, node.id.clone()), when);
-        }
-    }
-    let nodes: Vec<StepNode<'_>> = def
-        .nodes
-        .iter()
-        .zip(&steps)
-        .map(|(node, step)| StepNode {
-            id: &node.id,
-            step: step.as_ref(),
-            author_keys: node.params.keys().map(String::as_str).collect(),
-        })
-        .collect();
-    let edges: Vec<StepEdge<'_>> = def
-        .edges
-        .iter()
-        .map(|edge| StepEdge {
-            from: &edge.from,
-            to: &edge.to,
-            loop_edge: edge.loop_edge,
-            when: routing
-                .get(&(edge.from.clone(), edge.to.clone()))
-                .copied()
-                .unwrap_or_default(),
-        })
-        .collect();
-    validate_graph(&nodes, &edges)
-}
+pub(crate) use crate::store_support::topology_validation::{
+    StepEdge, StepNode, validate_graph, validate_topology,
+};
 
 /// Execute-time validation over a workflow snapshot (bridged or authored
 /// directly through `ExecuteWorkflow`).

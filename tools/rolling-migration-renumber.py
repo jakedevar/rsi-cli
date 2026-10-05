@@ -4,8 +4,8 @@
 An author adds one ``tools/provisional-migrations/*.json`` file with:
 
   {"schema_version": 1, "version": 130, "files": [
-    {"path": "crates/rsid/src/store/mod.rs",
-     "path_template": "crates/rsid/src/store/mod.rs",
+    {"path": "crates/rsid-store/src/store/mod.rs",
+     "path_template": "crates/rsid-store/src/store/mod.rs",
      "source_blob": "sha256:<sha256 of the complete source file>",
      "sites": [{"anchor": "if version < 130 {", "scope": "unit",
                 "replacement": "if version < ${VERSION} {"}]}
@@ -39,7 +39,9 @@ assert SPEC and SPEC.loader
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
-STORE = "crates/rsid/src/store/mod.rs"
+# The store lives in `crates/rsid-store` since the #1021 S4 crate split; the
+# guard recognises both layouts for revisions cut before it.
+STORE = guard.MIGRATION_PATH
 MIGRATION_DIR = guard.MIGRATION_DIR
 MANIFEST = "tools/released-migrations.json"
 DECLARATIONS = "tools/provisional-migrations/"
@@ -122,7 +124,8 @@ def layout_of(manifest: dict) -> str:
 
 
 def revision_migration_files(repo: Path, revision: str) -> list[str]:
-    listing = run(repo, "ls-tree", "-r", "--name-only", revision, "--", f"{MIGRATION_DIR}/",
+    listing = run(repo, "ls-tree", "-r", "--name-only", revision, "--",
+                  *(f"{directory}/" for directory in guard.MIGRATION_DIRS),
                   check=False).decode().splitlines()
     return [name for name in listing if guard.migration_file_version(name) is not None]
 
@@ -223,7 +226,8 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
         destination = path(file["path_template"].replace(TOKEN, str(target_manifest["latest_schema_version"] + 1)))
         if source_path in declared_paths or destination in destinations or source_path not in all_changed:
             raise Refusal("duplicate, unchanged, or colliding provisional file")
-        if (source_path.startswith("crates/rsid/src/store/") and source_path != STORE and
+        if (source_path.startswith(tuple(f"{root}/" for root in guard.STORE_ROOTS)) and
+                source_path not in guard.MIGRATION_PATHS and
                 not is_migration_unit_file(source_path) and
                 source_path not in guard.tracked_source_paths(source_manifest)):
             raise Refusal(f"migration helper or rewind source is not pinned: {source_path}")

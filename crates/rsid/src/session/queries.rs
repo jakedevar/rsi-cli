@@ -1097,10 +1097,15 @@ impl SessionManager {
             })
             .await
             .map_err(|error| DaemonError::Store(error.to_string()))??;
-            let restored = {
-                let mut store = self.store.lock().await;
-                store.restore_archived_session_with_fresh_custody(session_id, binding)
-            };
+            // Store first, then the fresh root's stripe without waiting for it
+            // under the Store (#1172).
+            let restored =
+                crate::store::sandbox_custody::restore_archived_session_with_fresh_custody_store_first(
+                    &self.store,
+                    session_id,
+                    binding,
+                )
+                .await;
             match restored {
                 Ok(session) => session,
                 Err(error) => {

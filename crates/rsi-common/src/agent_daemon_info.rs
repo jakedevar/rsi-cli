@@ -59,6 +59,11 @@ pub struct DaemonInfoV1 {
     /// `rsid-supervisor.sh` or `none`; absent when it cannot be determined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_mode: Option<String>,
+    /// The rsid binary the supervisor relaunches (#1164); a deploy installs
+    /// there or is refused as `deploy_target_mismatch`. Absent when the daemon
+    /// is not under the supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_binary: Option<String>,
 }
 
 /// One paired satellite's daemon, read over the hub link at call time
@@ -112,7 +117,7 @@ pub const DEPLOY_DRAINING: &str = "deploy_draining";
 /// One piece of work parked behind a draining deploy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldWorkV1 {
-    /// `child_spawn`, `topology_node`.
+    /// `child_spawn`, `topology_node`, `queue_batch` (merge queue held, #1128).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<uuid::Uuid>,
@@ -136,6 +141,11 @@ pub struct DeployDrainV1 {
     pub release_by: Option<String>,
     #[serde(default)]
     pub held: Vec<HeldWorkV1>,
+    /// Why the waiting deploy has not restarted yet (#1177): the latest
+    /// quiet-point blockers (`landing_in_progress`, `job_running`,
+    /// `worker_mid_turn`, ...). Empty when no deploy waits or none blocks.
+    #[serde(default)]
+    pub blockers: Vec<String>,
     /// Launches, continuations and jobs refused with `deploy_draining` since
     /// the daemon started.
     #[serde(default)]

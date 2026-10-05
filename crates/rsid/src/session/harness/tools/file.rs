@@ -418,17 +418,7 @@ mod tests {
         std::env::temp_dir()
     }
 
-    fn disk_backed_working_dir(label: &str) -> tempfile::TempDir {
-        let root = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target"))
-            .join("rsid-test-fixtures");
-        std::fs::create_dir_all(&root).expect("create disk-backed test fixture root");
-        tempfile::Builder::new()
-            .prefix(label)
-            .tempdir_in(root)
-            .expect("create disk-backed test fixture")
-    }
+    use crate::test_support::disk_backed_tempdir as disk_backed_working_dir;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
@@ -479,7 +469,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn read_file_context_policy_narrows_output_and_preserves_lines() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = disk_backed_working_dir("session-harness-file-context-policy-");
         let content = format!("first line\n{}\nlast line\n", "x".repeat(200));
         tokio::fs::write(temp.path().join("large.txt"), &content)
             .await

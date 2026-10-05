@@ -4,7 +4,7 @@
 //! into label/value rows, each value shown next to its target. A value the
 //! daemon reports as `None` is shown as `unknown`, never as zero.
 
-use crate::model_control_stats::StatsRow;
+use crate::model_control_stats::{StatsGroup, StatsRow, StatsTone};
 use rsi_common::rpc::{EfficiencyMetricTargets, EfficiencyMetricValues, EfficiencyMetricsResponse};
 
 const UNKNOWN: &str = "unknown";
@@ -43,11 +43,33 @@ pub(crate) fn efficiency_rows(response: Option<&EfficiencyMetricsResponse>) -> V
 }
 
 fn row(label: &str, value: &str) -> StatsRow {
-    StatsRow {
-        label: label.to_string(),
-        value: value.to_string(),
-        action: None,
+    let description = match label {
+        "Efficiency (today, UTC)" => {
+            "Delivery metrics for today's UTC calendar day. Missing measurements remain unknown, not zero."
+        }
+        "Opus tokens / landing" => {
+            "Opus tokens consumed per change published to rolling. Lower is better; target shown beside the measurement."
+        }
+        "Poll share of lead turns" => {
+            "Share of lead-agent turns spent checking progress instead of doing work. Lower is better."
+        }
+        "Landings" => "Number of changes published to rolling today.",
+        "Gate-hours / landing" => "Hours spent in build and test gates per published change.",
+        "Seal to rolling p50 / p90" => {
+            "Time from accepting a change to publishing it: median (p50) and the time within which 90% land (p90)."
+        }
+        "Reviewer receipt success" => {
+            "Share of review receipts submitted successfully; failed submissions count against this rate."
+        }
+        _ => "Delivery metric for today (UTC).",
+    };
+    let mut row = StatsRow::info(StatsGroup::Efficiency, label, value, description);
+    if value.contains("over target") {
+        row.tone = StatsTone::Warning;
+    } else if value.contains("within target") {
+        row.tone = StatsTone::Positive;
     }
+    row
 }
 
 fn status(within_target: bool) -> &'static str {

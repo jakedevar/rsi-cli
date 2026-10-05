@@ -162,6 +162,9 @@ pub enum LcAction {
     /// Open the operator-only source-worktree settlement audit/apply overlay.
     OpenSourceWorktreeSettlement,
 
+    /// Open the operator-only legacy-scratch adoption overlay (#1147).
+    OpenLegacyScratch,
+
     // --- Model Selection ---
     /// Toggle the model dropdown widget below the status bar (or prompt model badge).
     ToggleModelDropdown,
@@ -417,6 +420,8 @@ pub enum LcAction {
     RefreshDaemonFeatures,
     /// Open the operator satellite registry and read-only remote-session browser.
     OpenSatelliteRegistry,
+    /// Open the operator RSI Remote settings page.
+    OpenRemoteSettings,
 
     /// Sync title model configuration from UserSettings to daemon RuntimeConfig.
     SyncTitleModelConfig,
@@ -500,6 +505,11 @@ pub enum LcAction {
     OpenHarnessManagerInspect,
     /// Operator node list, inspect, configure, and revoke command.
     ManagerNodeCommand(String),
+    /// #872: operator global-manager show, appoint, configure and revoke.
+    ManagerGlobalCommand(String),
+    /// #1122: `:manager restart [status|now|cancel]` for the operator's
+    /// pending quiet-point restart.
+    OperatorRestartCommand(String),
 
     /// P1.12: fire `ExecuteTopology` against the focused Epic's bound topology
     /// with `parent_id = Epic.id`. No-op (with error toast) if the focused
@@ -654,6 +664,7 @@ impl LcAction {
             LcAction::OpenRecursiveDagBrowser => "OpenRecursiveDagBrowser",
             LcAction::OpenMemorySearch => "OpenMemorySearch",
             LcAction::OpenSourceWorktreeSettlement => "OpenSourceWorktreeSettlement",
+            LcAction::OpenLegacyScratch => "OpenLegacyScratch",
             LcAction::ToggleModelDropdown => "ToggleModelDropdown",
             LcAction::SelectModel(..) => "SelectModel",
             LcAction::OpenThemePicker => "OpenThemePicker",
@@ -727,6 +738,7 @@ impl LcAction {
             LcAction::CancelModelInvocation(..) => "CancelModelInvocation",
             LcAction::RefreshDaemonFeatures => "RefreshDaemonFeatures",
             LcAction::OpenSatelliteRegistry => "OpenSatelliteRegistry",
+            LcAction::OpenRemoteSettings => "OpenRemoteSettings",
             LcAction::SyncTitleModelConfig => "SyncTitleModelConfig",
             LcAction::SyncMemoryModelConfig => "SyncMemoryModelConfig",
             LcAction::SyncPromptProcessorConfig => "SyncPromptProcessorConfig",
@@ -755,6 +767,8 @@ impl LcAction {
             LcAction::OpenHarnessManagerInbox => "OpenHarnessManagerInbox",
             LcAction::OpenHarnessManagerInspect => "OpenHarnessManagerInspect",
             LcAction::ManagerNodeCommand(..) => "ManagerNodeCommand",
+            LcAction::ManagerGlobalCommand(..) => "ManagerGlobalCommand",
+            LcAction::OperatorRestartCommand(..) => "OperatorRestartCommand",
             LcAction::RunEpicTopology => "RunEpicTopology",
             LcAction::JumpAttentionN(..) => "JumpAttentionN",
             LcAction::OpenRecentFileN(..) => "OpenRecentFileN",
@@ -1022,6 +1036,7 @@ mod tests {
             LcAction::CancelModelInvocation(uuid::Uuid::nil()),
             LcAction::RefreshDaemonFeatures,
             LcAction::OpenSatelliteRegistry,
+            LcAction::OpenRemoteSettings,
             LcAction::OpenScheduleBrowser,
             LcAction::OpenColorCustomizer,
             LcAction::SyncMemoryModelConfig,
@@ -1079,6 +1094,7 @@ mod tests {
             // actually exhaustive. ---
             LcAction::CancelRetry,
             LcAction::OpenSourceWorktreeSettlement,
+            LcAction::OpenLegacyScratch,
             LcAction::SyncTitleModelConfig,
             LcAction::OpenHarnessManager,
             LcAction::AppointHarnessManager,
@@ -1090,6 +1106,8 @@ mod tests {
             LcAction::OpenHarnessManagerInbox,
             LcAction::OpenHarnessManagerInspect,
             LcAction::ManagerNodeCommand("list".into()),
+            LcAction::ManagerGlobalCommand("show".into()),
+            LcAction::OperatorRestartCommand("status".into()),
             LcAction::JumpAttentionN(1),
             LcAction::OpenRecentFileN(1),
             // --- Provider Keys / key vault (#694 K1b) ---

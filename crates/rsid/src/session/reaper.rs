@@ -75,6 +75,9 @@ const STARTUP_ORPHAN_FIXED_POINT_MAX_PASSES: usize = 8;
 const STARTUP_ORPHAN_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const QUARANTINE_HOLDER_FIXED_POINT_PASSES: usize = 2;
 const QUARANTINE_HOLDER_TOTAL_DEADLINE: Duration = Duration::from_secs(10);
+/// Wall-clock budget of the final holder re-proof taken under the repository
+/// lock (#1141): short, so the locked section stays a bounded critical section.
+pub(super) const QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET: Duration = Duration::from_secs(3);
 const QUARANTINE_HOLDER_INVENTORY_ATTEMPTS: usize = 6;
 const QUARANTINE_HOLDER_INVENTORY_BACKOFF: Duration = Duration::from_millis(50);
 const QUARANTINE_HOLDER_INVENTORY_INCOMPLETE: &str = "quarantine holder inventory is incomplete:";
@@ -738,16 +741,15 @@ fn reap_orphans_for_session_with_runtime_reap_proc_root_lease(
 }
 
 #[cfg(test)]
-static RUNTIME_REAP_FAILURE: std::sync::LazyLock<std::sync::Mutex<Option<Uuid>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static RUNTIME_REAP_FAILURE: std::sync::LazyLock<std::sync::Mutex<HashSet<Uuid>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 #[cfg(test)]
 fn take_runtime_orphan_reap_failure(session_id: Uuid) -> crate::error::Result<()> {
     let mut guard = RUNTIME_REAP_FAILURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if *guard == Some(session_id) {
-        *guard = None;
+    if guard.remove(&session_id) {
         return Err(crate::error::DaemonError::Process(
             "injected runtime orphan reap failure".into(),
         ));
@@ -755,11 +757,22 @@ fn take_runtime_orphan_reap_failure(session_id: Uuid) -> crate::error::Result<()
     Ok(())
 }
 
+/// True while an injected reap failure for `session_id` is still unconsumed,
+/// i.e. no runtime reap of that session has run since it was injected.
+#[cfg(test)]
+pub(crate) fn runtime_orphan_reap_failure_pending_for_test(session_id: Uuid) -> bool {
+    RUNTIME_REAP_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&session_id)
+}
+
 #[cfg(test)]
 pub(crate) fn fail_runtime_orphan_reap_for_test(session_id: Uuid) {
-    *RUNTIME_REAP_FAILURE
+    RUNTIME_REAP_FAILURE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id);
 }
 
 #[cfg(test)]
@@ -2047,13 +2060,151 @@ pub(super) fn prove_archive_cleanup_has_no_provider_processes(
 pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
     tree: &QuarantineTreeProof,
 ) -> crate::error::Result<QuarantineHolderProof> {
+    prove_quarantine_holders_within(tree, None)
+}
+
+/// The final holder re-proof taken under the destructive-step fence (#1141,
+/// #1123 F10). The first proof runs outside the repository lock and can be stale
+/// by the time the lock is held; this one runs on a supervised helper thread and
+/// the caller waits at most `budget` wall-clock for it, so even a `/proc` or
+/// path read stalled in the kernel (a hung NFS/FUSE/autofs target) cannot hold
+/// the caller's repository lock past the budget. A holder acquired since the
+/// first proof, a scan that does not finish inside the budget, or an earlier
+/// helper for the same `repository` that is still blocked, is an error and the
+/// caller retains the quarantine. The helper only reads: it holds no lock and
+/// deletes nothing, and when it times out it is left to finish and be dropped.
+pub(super) fn reprove_quarantine_has_no_untrusted_same_uid_holders_within(
+    repository: &Path,
+    tree: &QuarantineTreeProof,
+    budget: Duration,
+) -> crate::error::Result<QuarantineHolderProof> {
+    let slot = LockedReproofSlot::claim(repository)?;
+    let tree = tree.clone();
+    #[cfg(any(test, feature = "test-seam"))]
+    let test_context = current_quarantine_holder_test_proc_context();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("quarantine-holder-reproof".into())
+        .spawn(move || {
+            // Released when this thread ends, however it ends.
+            let _slot = slot;
+            #[cfg(test)]
+            locked_reproof_test_hook::run(tree.root());
+            #[cfg(any(test, feature = "test-seam"))]
+            let result = match test_context {
+                Some(context) => {
+                    with_quarantine_holder_test_proc(&context.proc_root, context.uid, || {
+                        prove_quarantine_holders_within(&tree, Some(budget))
+                    })
+                }
+                None => prove_quarantine_holders_within(&tree, Some(budget)),
+            };
+            #[cfg(not(any(test, feature = "test-seam")))]
+            let result = prove_quarantine_holders_within(&tree, Some(budget));
+            // The caller may have given up already.
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            crate::error::DaemonError::Process(format!(
+                "quarantine holder re-proof helper could not start: {error}"
+            ))
+        })?;
+    receiver.recv_timeout(budget).unwrap_or_else(|_| {
+        Err(crate::error::DaemonError::Process(
+            "quarantine holder re-proof exceeded its wall-clock budget".into(),
+        ))
+    })
+}
+
+/// At most one re-proof helper per repository may be outstanding: a helper
+/// blocked in a stalled syscall keeps its slot until the syscall returns, so a
+/// stalled target can strand one thread per repository, never one per pass.
+struct LockedReproofSlot {
+    repository: std::path::PathBuf,
+}
+
+static LOCKED_REPROOF_SLOTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl LockedReproofSlot {
+    fn claim(repository: &Path) -> crate::error::Result<Self> {
+        let mut slots = LOCKED_REPROOF_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slots.iter().any(|held| held == repository) {
+            return Err(crate::error::DaemonError::Process(
+                "an earlier quarantine holder re-proof for this repository is still blocked".into(),
+            ));
+        }
+        slots.push(repository.to_path_buf());
+        Ok(Self {
+            repository: repository.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for LockedReproofSlot {
+    fn drop(&mut self) {
+        LOCKED_REPROOF_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|held| *held != self.repository);
+    }
+}
+
+/// Test seam: parks the supervised helper before it reads anything, keyed by
+/// quarantine root, to model a syscall stalled on a hung mount.
+#[cfg(test)]
+pub(super) mod locked_reproof_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Hook>>> = Mutex::new(None);
+
+    pub(in crate::session) fn install(root: &Path, hook: impl Fn() + Send + Sync + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(root.to_path_buf(), Arc::new(hook));
+    }
+
+    pub(super) fn run(root: &Path) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|hooks| hooks.get(root).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// The holder proof, with the whole run (retries included) bounded by `budget`
+/// when one is given.
+fn prove_quarantine_holders_within(
+    tree: &QuarantineTreeProof,
+    budget: Option<Duration>,
+) -> crate::error::Result<QuarantineHolderProof> {
+    let started = StdInstant::now();
+    let limits = || {
+        let mut limits = QuarantineHolderScanLimits::default();
+        if let Some(budget) = budget {
+            limits.total_deadline = limits
+                .total_deadline
+                .min(budget.saturating_sub(started.elapsed()));
+        }
+        limits
+    };
     #[cfg(all(test, target_os = "linux"))]
     if let Some(context) = archive_cleanup_test_proc_for_tree(tree.root()) {
         return prove_quarantine_has_no_untrusted_same_uid_holders_at(
             &context.proc_root,
             context.uid,
             tree,
-            QuarantineHolderScanLimits::default(),
+            limits(),
         );
     }
     #[cfg(any(test, feature = "test-seam"))]
@@ -2062,7 +2213,7 @@ pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
             &context.proc_root,
             context.uid,
             tree,
-            QuarantineHolderScanLimits::default(),
+            limits(),
         );
     }
     let proc_root = Path::new("/proc");
@@ -2081,7 +2232,7 @@ pub(super) fn prove_quarantine_has_no_untrusted_same_uid_holders(
                 proc_root,
                 self_uid,
                 tree,
-                QuarantineHolderScanLimits::default(),
+                limits(),
             )
         },
     )
@@ -3537,7 +3688,7 @@ fn process_io_uring_fdinfo_holds_tree(
             ));
         }
         let target = process_namespace_path_metadata(process_root, &path, "io_uring fixed file")?;
-        if tree.contains_identity(target.dev(), target.ino()) {
+        if tree.contains_identity(target.device, target.inode) {
             return Ok(true);
         }
     }
@@ -3667,9 +3818,17 @@ fn process_mountinfo_holds_tree(
             observation.holder = true;
             continue;
         }
+        // An autofs record is only the trigger directory of an automount: it
+        // holds no files, and a filesystem mounted through it has a record of
+        // its own. Resolving it would start the mount and block this proof
+        // (and the repository lock above it) until the mount settles, 90 s per
+        // attempt for an absent disk (#1117), so it is never resolved.
+        if filesystem_type == b"autofs" {
+            continue;
+        }
         match process_namespace_mount_path_metadata(process_root, &mountpoint, "mountpoint")? {
             NamespaceMountPathMetadata::Present(mount_target) => {
-                if tree.contains_identity(mount_target.dev(), mount_target.ino()) {
+                if tree.contains_identity(mount_target.device, mount_target.inode) {
                     observation.holder = true;
                 }
             }
@@ -3688,7 +3847,7 @@ fn process_mountinfo_holds_tree(
         // proof for ordinary and bind mounts.
         match process_namespace_mount_path_metadata(process_root, &root, "mount root") {
             Ok(NamespaceMountPathMetadata::Present(source_root)) => {
-                if tree.contains_identity(source_root.dev(), source_root.ino()) {
+                if tree.contains_identity(source_root.device, source_root.inode) {
                     observation.holder = true;
                 }
             }
@@ -3722,9 +3881,31 @@ fn mount_path_lexically_names_tree(path: &[u8], tree: &QuarantineTreeProof) -> b
 }
 
 enum NamespaceMountPathMetadata {
-    Present(std::fs::Metadata),
+    Present(NamespacePathIdentity),
     PermissionDenied,
     NotFound,
+}
+
+/// The device and inode of a path reached through `/proc/<pid>/root`.
+#[derive(Clone, Copy, Debug)]
+struct NamespacePathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Stats `path` (following symlinks) without triggering an automount of its
+/// final component. `std::fs::metadata` uses `statx` without
+/// `AT_NO_AUTOMOUNT`, so stat-ing an untriggered automount point starts the
+/// mount and blocks until it settles (#1117). With the flag an untriggered
+/// automount point reports its own trigger directory, and a mounted one
+/// reports the mounted root as before.
+fn namespace_path_identity(path: &Path) -> std::io::Result<NamespacePathIdentity> {
+    let stat = nix::sys::stat::fstatat(None, path, nix::fcntl::AtFlags::AT_NO_AUTOMOUNT)
+        .map_err(std::io::Error::from)?;
+    Ok(NamespacePathIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
 }
 
 fn process_namespace_mount_path_metadata(
@@ -3745,8 +3926,8 @@ fn process_namespace_mount_path_metadata(
             "quarantine holder {label} is not normalized"
         )));
     }
-    match std::fs::metadata(process_root.join("root").join(relative)) {
-        Ok(metadata) => Ok(NamespaceMountPathMetadata::Present(metadata)),
+    match namespace_path_identity(&process_root.join("root").join(relative)) {
+        Ok(identity) => Ok(NamespaceMountPathMetadata::Present(identity)),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             Ok(NamespaceMountPathMetadata::PermissionDenied)
         }
@@ -3763,7 +3944,7 @@ fn process_namespace_path_metadata(
     process_root: &Path,
     absolute: &[u8],
     label: &str,
-) -> crate::error::Result<std::fs::Metadata> {
+) -> crate::error::Result<NamespacePathIdentity> {
     let relative = absolute.strip_prefix(b"/").ok_or_else(|| {
         crate::error::DaemonError::Process(format!("quarantine holder {label} is not absolute"))
     })?;
@@ -3777,7 +3958,7 @@ fn process_namespace_path_metadata(
             "quarantine holder {label} is not normalized"
         )));
     }
-    std::fs::metadata(process_root.join("root").join(relative)).map_err(|error| {
+    namespace_path_identity(&process_root.join("root").join(relative)).map_err(|error| {
         crate::error::DaemonError::Process(format!(
             "quarantine holder {label} identity failed: {error}"
         ))
@@ -4580,7 +4761,30 @@ fn authenticate_portal_fuse_mount_helper(
     pid: i32,
     uid: u32,
 ) -> crate::error::Result<Option<TrustedPlatformProcessIdentity>> {
+    #[cfg(test)]
+    if let Some((privileged_uid, portal_executable)) =
+        PORTAL_TRUST_BASELINE_TEST_OVERRIDE.with(|slot| slot.borrow().clone())
+    {
+        return authenticate_portal_fuse_mount_helper_at(
+            proc_root,
+            pid,
+            uid,
+            PortalTrustBaseline {
+                privileged_uid,
+                portal_executable: &portal_executable,
+            },
+        );
+    }
     authenticate_portal_fuse_mount_helper_at(proc_root, pid, uid, PortalTrustBaseline::production())
+}
+
+/// Test-only, thread-local replacement for the production portal trust
+/// baseline (privileged uid and portal executable path), so a bounded fake
+/// `/proc` fixture can drive the full holder proof without walking the host.
+#[cfg(test)]
+thread_local! {
+    static PORTAL_TRUST_BASELINE_TEST_OVERRIDE: std::cell::RefCell<Option<(u32, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn authenticate_portal_fuse_mount_helper_at(
@@ -6083,6 +6287,60 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
+    fn quarantine_holder_proof_never_resolves_an_autofs_trigger_directory() {
+        // #1117: resolving an untriggered automount point starts the mount and
+        // blocks the proof until it settles. The fake namespace has no
+        // /mnt/backup, so any resolution attempt would fail the proof as a
+        // vanished mountpoint instead of passing it.
+        let (_tree_temp, tree, _file) = holder_tree_fixture();
+        let proc_temp = tempfile::tempdir().expect("fake proc root");
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_temp.path());
+        let process =
+            write_fake_holder_process(proc_temp.path(), 404, &namespace_root, &namespace_root);
+        let rootfs = "1 0 00:00 / / rw - rootfs rootfs rw\n";
+        let autofs_options = "rw,fd=90,pgrp=1,timeout=120,minproto=5,maxproto=5,direct";
+        std::fs::write(
+            process.join("mountinfo"),
+            format!(
+                "{rootfs}2 1 0:63 / /mnt/backup rw,relatime shared:9 - autofs systemd-1 \
+                 {autofs_options}\n"
+            ),
+        )
+        .expect("fake mountinfo with an automount trigger");
+        prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect("an automount trigger outside the tree holds nothing and is not resolved");
+
+        // A mount at or below the quarantined tree still holds it, autofs or not.
+        std::fs::write(
+            process.join("mountinfo"),
+            format!(
+                "{rootfs}2 1 0:63 / {} rw,relatime shared:9 - autofs systemd-1 {autofs_options}\n",
+                tree.root().display()
+            ),
+        )
+        .expect("fake mountinfo with an automount inside the tree");
+        let error = prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_temp.path(),
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        )
+        .expect_err("an automount inside the tree retains it");
+        assert!(
+            error
+                .to_string()
+                .contains("retains quarantine through mount"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
     fn quarantine_holder_proof_fails_closed_on_proc_denial_and_work_bounds() {
         let (_tree_temp, tree, _file) = holder_tree_fixture();
         let proc_temp = tempfile::tempdir().expect("fake proc root");
@@ -6720,9 +6978,149 @@ mod tests {
         }
     }
 
+    /// Deterministic counterpart of the live-host smoke test below: the exact
+    /// portal fusermount helper (with permission-only unreadable inventory
+    /// fields) sits in a bounded fake `/proc`, and the full production holder
+    /// proof must record its exemption without walking the real host.
     #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
+    fn fake_proc_exact_portal_fusermount_helper_does_not_block_an_empty_tree_proof() {
+        let (_tree_temp, tree, _file) = holder_tree_fixture();
+        let proc_temp = tempfile::tempdir().expect("fake portal proc root");
+        let proc_root = proc_temp.path();
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_root);
+        let (manager_pid, portal_pid, helper_pid) = (700, 701, 702);
+        let manager_task = write_fake_holder_task(
+            proc_root,
+            manager_pid,
+            manager_pid,
+            &namespace_root,
+            &namespace_root,
+            b'S',
+            10_001,
+        );
+        let portal_task = write_fake_holder_task(
+            proc_root,
+            portal_pid,
+            portal_pid,
+            &namespace_root,
+            &namespace_root,
+            b'S',
+            10_002,
+        );
+        let helper_task = write_fake_holder_task(
+            proc_root,
+            helper_pid,
+            helper_pid,
+            &namespace_root,
+            &namespace_root,
+            b'S',
+            10_003,
+        );
+        let manager_root = proc_root.join(manager_pid.to_string());
+        let portal_root = proc_root.join(portal_pid.to_string());
+        let helper_root = proc_root.join(helper_pid.to_string());
+        for (root, task, pid, comm, parent, start) in [
+            (
+                &manager_root,
+                &manager_task,
+                manager_pid,
+                "systemd",
+                1,
+                10_001,
+            ),
+            (
+                &portal_root,
+                &portal_task,
+                portal_pid,
+                "xdg-document-po",
+                manager_pid,
+                10_002,
+            ),
+            (
+                &helper_root,
+                &helper_task,
+                helper_pid,
+                "fusermount3",
+                portal_pid,
+                10_003,
+            ),
+        ] {
+            write_fake_platform_stat(root, pid, comm, parent, start);
+            write_fake_platform_stat(task, pid, comm, parent, start);
+        }
+        std::fs::write(
+            manager_root.join("cgroup"),
+            format!("0::/user.slice/user-{uid}.slice/user@{uid}.service/init.scope\n"),
+        )
+        .expect("fake manager cgroup");
+        let portal_binary = proc_root.join("xdg-document-portal");
+        std::fs::write(&portal_binary, "trusted portal binary\n").expect("fake portal binary");
+        std::fs::write(
+            portal_root.join("cgroup"),
+            format!("{}\n", portal_service_cgroup(uid)),
+        )
+        .expect("fake portal cgroup");
+        std::fs::write(
+            portal_root.join("cmdline"),
+            nul_terminated_path(&portal_binary),
+        )
+        .expect("fake portal argv");
+        std::os::unix::fs::symlink(&portal_binary, portal_root.join("exe"))
+            .expect("fake portal exe");
+        write_fake_platform_status(&portal_root, portal_pid, uid, uid);
+        write_fake_platform_status(&helper_root, helper_pid, uid, uid);
+        std::fs::write(
+            helper_root.join("cgroup"),
+            format!("{}\n", portal_service_cgroup(uid)),
+        )
+        .expect("fake helper cgroup");
+        std::fs::write(
+            helper_root.join("cmdline"),
+            portal_fuse_mount_helper_cmdline(uid),
+        )
+        .expect("fake helper argv");
+        // The privileged helper's own cwd is unreadable to the same uid.
+        let denied = proc_root.join("denied");
+        std::fs::create_dir(&denied).expect("denied inventory parent");
+        std::fs::write(denied.join("target"), "denied\n").expect("denied inventory target");
+        std::fs::remove_file(helper_task.join("cwd")).expect("replace helper cwd");
+        std::os::unix::fs::symlink(denied.join("target"), helper_task.join("cwd"))
+            .expect("denied helper cwd");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("deny inventory traversal");
+
+        PORTAL_TRUST_BASELINE_TEST_OVERRIDE
+            .with(|slot| *slot.borrow_mut() = Some((uid, portal_binary.clone())));
+        let helper_identity = authenticate_portal_fuse_mount_helper(proc_root, helper_pid, uid)
+            .expect("authenticate fake portal helper")
+            .expect("exact fake portal helper is trusted");
+        let proof = prove_quarantine_has_no_untrusted_same_uid_holders_at(
+            proc_root,
+            uid,
+            &tree,
+            QuarantineHolderScanLimits::default(),
+        );
+        PORTAL_TRUST_BASELINE_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700))
+            .expect("restore inventory traversal");
+        let proof =
+            proof.expect("the exact portal helper receives a recorded permission exemption");
+        assert_eq!(
+            helper_identity.class,
+            TrustedPlatformProcessClass::PortalFuseMountHelper
+        );
+        assert_eq!(proof.trusted_platform_exemptions(), 2);
+    }
+
+    /// Live-host smoke check (walks every real process on the machine against
+    /// the production deadline, so it depends on host load): run explicitly
+    /// with `--ignored`. The deterministic coverage is the fake-/proc test.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    #[ignore = "walks the live host /proc against the production deadline (#832); run with --ignored"]
     fn live_exact_portal_fusermount_helper_does_not_block_an_empty_tree_proof() {
         let proc_root = Path::new("/proc");
         let uid = std::fs::metadata(proc_root.join("self"))
@@ -7478,7 +7876,7 @@ mod tests {
             (completed_id, rsi_common::types::SessionStatus::Completed),
             (failed_id, rsi_common::types::SessionStatus::Failed),
         ] {
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = id;
             session.status = status;
             store
@@ -7514,7 +7912,7 @@ mod tests {
         let fixture = StartupReaperFixture::new();
         let foreign_fixture = StartupReaperFixture::new();
         let foreign_id = Uuid::new_v4();
-        let mut foreign_session = crate::store::tests::make_test_session();
+        let mut foreign_session = rsid_store::test_support::make_test_session();
         foreign_session.id = foreign_id;
         local
             .insert_session(&foreign_session)
@@ -7585,7 +7983,7 @@ mod tests {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
         let fixture = StartupReaperFixture::new();
         let wrong_fixture = StartupReaperFixture::new();
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.status = rsi_common::types::SessionStatus::Completed;
         store.insert_session(&session).expect("insert legacy owner");
         let mut exact = fixture.spawn(Some(session.id), None, &fixture.domain(), false);

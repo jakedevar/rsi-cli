@@ -253,8 +253,17 @@ absent from `AGENT_VERBS`, `READ_VERBS`, native tools and the agent CLI catalog,
 and `AgentSpawnChild` (`deny_unknown_fields`) has no field for it.
 
 - **Launch parameter.** `LaunchSessionParams.tool_policy`:
-  `{enabled_tools?, denied_tools[], web_access?, budgets{max_search_calls?,
-  max_fetch_calls?, max_result_bytes?, max_web_cost_usd_micros?}}`.
+  `{enabled_tools?, denied_tools[], web_access?, egress?, context_editing?,
+  budgets{max_search_calls?, max_fetch_calls?, max_result_bytes?,
+  max_web_cost_usd_micros?}}`. `context_editing` (#1097; default on, `false`
+  turns it off) asks the Anthropic API to clear old tool results server-side
+  (`clear_tool_uses_20250919`, beta `context-management-2025-06-27`, trigger
+  100k input tokens, keep 8 recent tool uses, clear at least 40k tokens). It is
+  sent only on the direct Anthropic Harness transport for Claude models
+  (never Bedrock, OpenAI-style or other providers) and never edits a message
+  client-side. Harness tool results over 8 KB / 200 lines spill into the
+  rsi-common spill store and return a stub; the `read_output` tool reads them
+  back.
   `web_access` is `enabled | hosted_only | disabled`; `denied_tools` wins over
   `enabled_tools`. It is validated at launch (`tool_policy_invalid`) and refused
   for providers that do not run the Harness loop
@@ -271,6 +280,11 @@ and `AgentSpawnChild` (`deny_unknown_fields`) has no field for it.
   `harness_max_fetch_calls`, `harness_max_result_bytes` and
   `harness_max_web_cost_usd_micros` (0 = unlimited) through
   `GetDaemonConfig`/`UpdateDaemonConfig` and the TUI Orchestration settings.
+  `harness_context_editing` (bool, default on; #1111) is the daemon default for
+  the session `context_editing` field: an explicit `tool_policy.context_editing`
+  wins, else the daemon default decides. A running session keeps the value it
+  launched with; a continue or rotation re-resolves its stored policy, so a
+  stored policy that left `context_editing` unset follows the default then.
   A session policy overrides a default it sets; unset fields inherit. Read at
   each Harness launch.
 - **Network egress (#774).** `egress` (`deny_private` | `offline`; unset =
@@ -303,7 +317,7 @@ and `AgentSpawnChild` (`deny_unknown_fields`) has no field for it.
   (hosted searches at 0.01 USD, fetches token-only).
 ## Durable agent jobs (#1002)
 
-`AgentSubmitJob`, `AgentGetJob` and `AgentListJobs` are agent verbs (in
+`AgentSubmitJob`, `AgentGetJob`, `AgentListJobs` and `AgentCancelJob` (#1106; owner-only stop, the job settles `failed` with refusal `job_cancelled`) are agent verbs (in
 `AGENT_VERBS`, the closed catalog and `rsi-rpc`; no native tool, none in
 `READ_VERBS`). The daemon binds the caller from the token; the job is owned by
 that session. `params` are typed per `kind` (`test`, `build`, `landing`,
@@ -317,7 +331,7 @@ gate and the sweep run the scripts and Terraform embedded in the daemon binary
 the caller's repository only as `--repo`: git never runs there or with its
 configuration; the `origin` URL is read with `git config --file` and `rolling` is
 fetched into the daemon-owned bare mirror `~/.rsi/jobs/sweep-mirror.git` under
-sanitized git configuration, then bundled from it); `cloud_sweep {sha}` runs
+sanitized git configuration, then bundled from it); `test {candidate_receipt: ref}` (#1099; manager/Epic lead only, `job_kind_not_authorized` otherwise; the ref is a bare branch or sha, no new job kind or migration) runs `scripts/candidate-receipt.sh <ref>` in the cwd, which checks the candidate out in a temporary detached worktree with its own cargo target dir and runs `scripts/check-touched-shards`; the job settles with the typed `result.receipt` (the script's final `RECEIPT_JSON` line), `succeeded` only when its `ok` is true, refusal `candidate_receipt_missing` when no receipt was printed; `cloud_sweep {sha}` runs
 `cloud-sweep.sh cloud <sha> --repo <cwd> --mirror <jobs_dir>/sweep-mirror.git` (unit `RuntimeMaxSec` 8 h, `TimeoutStopSec` 20 min) and settles with a typed
 `result.sweep` (`verdict` GREEN|RED|INCOMPLETE from the last log line, which
 must be exactly `VERDICT <GREEN|RED|INCOMPLETE> <sha> new=<n>` (GREEN only with

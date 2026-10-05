@@ -2565,6 +2565,7 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                         sha: wire.sha.clone(),
                                         deadline_at: "2026-09-29T12:15:00.000000000Z".into(),
                                         binaries: Vec::new(),
+                                        skipped: Vec::new(),
                                         replayed: false,
                                     };
                                 d.lock().unwrap().push(wire);

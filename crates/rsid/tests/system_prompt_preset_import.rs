@@ -1,7 +1,7 @@
 //! RSI-026 — backcompat import test for `maybe_import_legacy_system_prompt_preset`.
 //!
 //! Phase 4 — cross-layer integration tests. The lib-level unit tests in
-//! `crates/rsid/src/store/daemon_settings.rs` already cover the happy paths;
+//! `crates/rsid-store/src/store/daemon_settings.rs` already cover the happy paths;
 //! this file locks the end-to-end import-then-restart guarantees that the
 //! `master_implement` verification manifest demands.
 

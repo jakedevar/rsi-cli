@@ -152,7 +152,14 @@ async fn appoint_filters_project_epics_space_toggles_and_enter_saves_version_zer
     child.project_id = manager.project_id;
     child.parent_id = Some(a.id);
     app.sessions.insert(child.id, SessionState::new(child));
-    let saved = config(&manager, vec![a.id, b.id], 1);
+    let saved = rsi_common::harness_manager::ConfigureHarnessManagerResultV1 {
+        config: config(&manager, vec![a.id, b.id], 1),
+        policy: HarnessManagerPolicyOutcomeV1 {
+            kind: HarnessManagerPolicyOutcomeKindV1::RevokedNeedsConfirmation,
+            capability_count: 3,
+            paused_epic_ids: vec![b.id],
+        },
+    };
     let (_dir, task) = connect_scope(&mut app, vec![
         ("GetHarnessManager", json!({"project_id": manager.project_id}), json!({"result": null})),
         ("ConfigureHarnessManager", json!({"project_id": manager.project_id, "session_id": manager.id, "epic_ids": [a.id, b.id], "expected_row_version": 0}), json!({"result": saved})),
@@ -182,7 +189,42 @@ async fn appoint_filters_project_epics_space_toggles_and_enter_saves_version_zer
             .message
             .contains("2 Epics")
     );
+    // #1145: the save says what happened to the policy: nothing was carried.
+    let message = &app.notifications.back().unwrap().message;
+    assert!(
+        message.contains("Policy revoked, nothing carried to this scope"),
+        "{message}"
+    );
+    assert!(message.contains("3 capabilities"), "{message}");
+    assert!(message.contains("1 paused Epics stay paused"), "{message}");
     finished(task).await;
+}
+
+#[test]
+fn policy_outcome_note_states_each_outcome() {
+    let note = |kind, capability_count, paused: usize| {
+        policy_outcome_note(&HarnessManagerPolicyOutcomeV1 {
+            kind,
+            capability_count,
+            paused_epic_ids: vec![Uuid::new_v4(); paused],
+        })
+    };
+    assert_eq!(
+        note(HarnessManagerPolicyOutcomeKindV1::NoPolicy, 0, 0),
+        "No policy saved; none granted."
+    );
+    assert_eq!(
+        note(HarnessManagerPolicyOutcomeKindV1::Unchanged, 2, 1),
+        "Policy kept unchanged (2 capabilities, 1 paused Epics)."
+    );
+    assert!(
+        note(
+            HarnessManagerPolicyOutcomeKindV1::RevokedNeedsConfirmation,
+            2,
+            0
+        )
+        .contains("re-save it in :manager policy")
+    );
 }
 
 #[tokio::test]

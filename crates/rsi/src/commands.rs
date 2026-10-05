@@ -37,7 +37,7 @@ pub fn parse_command(input: &str) -> CommandResult {
     };
     if !args.is_empty() && descriptor.command_aliases[0].starts_with("manager ") {
         return CommandResult::Unhandled(
-            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
+            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
                 .to_string(),
         );
     }
@@ -260,12 +260,26 @@ pub fn parse_command(input: &str) -> CommandResult {
 
         ActionId::Manager => match args {
             None => CommandResult::LcAction(LcAction::OpenHarnessManager),
+            Some("tree") => CommandResult::LcAction(LcAction::ManagerNodeCommand("tree".into())),
             Some("node") => CommandResult::LcAction(LcAction::ManagerNodeCommand("list".into())),
             Some(command) if command.starts_with("node ") => CommandResult::LcAction(
                 LcAction::ManagerNodeCommand(command[5..].trim().to_string()),
             ),
+            Some("global") => {
+                CommandResult::LcAction(LcAction::ManagerGlobalCommand("show".into()))
+            }
+            Some(command) if command.starts_with("global ") => CommandResult::LcAction(
+                LcAction::ManagerGlobalCommand(command[7..].trim().to_string()),
+            ),
+            // #1122: the operator's pending quiet-point restart.
+            Some("restart") => {
+                CommandResult::LcAction(LcAction::OperatorRestartCommand("status".into()))
+            }
+            Some(command) if command.starts_with("restart ") => CommandResult::LcAction(
+                LcAction::OperatorRestartCommand(command[8..].trim().to_string()),
+            ),
             Some(_) => CommandResult::Unhandled(
-                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
+                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
                     .to_string(),
             ),
         },
@@ -408,6 +422,31 @@ mod tests {
             ("manager inbox", LcAction::OpenHarnessManagerInbox),
             ("manager inspect", LcAction::OpenHarnessManagerInspect),
             ("manager node", LcAction::ManagerNodeCommand("list".into())),
+            ("manager tree", LcAction::ManagerNodeCommand("tree".into())),
+            (
+                "manager global",
+                LcAction::ManagerGlobalCommand("show".into()),
+            ),
+            (
+                "manager global appoint Rsi, Dictate Agent",
+                LcAction::ManagerGlobalCommand("appoint Rsi, Dictate Agent".into()),
+            ),
+            (
+                "manager global revoke",
+                LcAction::ManagerGlobalCommand("revoke".into()),
+            ),
+            (
+                "manager restart",
+                LcAction::OperatorRestartCommand("status".into()),
+            ),
+            (
+                "manager restart now",
+                LcAction::OperatorRestartCommand("now".into()),
+            ),
+            (
+                "manager restart cancel",
+                LcAction::OperatorRestartCommand("cancel".into()),
+            ),
         ] {
             assert_eq!(parse_command(command), CommandResult::LcAction(action));
         }
@@ -415,7 +454,7 @@ mod tests {
             assert_eq!(
                 parse_command(command),
                 CommandResult::Unhandled(
-                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node]"
+                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
                         .to_string()
                 )
             );

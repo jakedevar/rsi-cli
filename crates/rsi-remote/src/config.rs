@@ -2,9 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+/// Largest policy file the reader accepts. The writer enforces the same bound
+/// so an accepted edit can never produce a file the gateway cannot read.
+pub const MAX_POLICY_BYTES: usize = 16 * 1024;
 
 /// Local operator policy. This foundation does not grant data access even when enabled.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -92,7 +96,7 @@ pub fn read(path: &Path) -> io::Result<Config> {
     if !metadata.file_type().is_file()
         || metadata.uid() != uid
         || metadata.mode() & 0o077 != 0
-        || metadata.len() > 16 * 1024
+        || metadata.len() > MAX_POLICY_BYTES as u64
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -100,8 +104,9 @@ pub fn read(path: &Path) -> io::Result<Config> {
         ));
     }
     let mut content = String::new();
-    file.take(16 * 1024 + 1).read_to_string(&mut content)?;
-    if content.len() > 16 * 1024 {
+    file.take(MAX_POLICY_BYTES as u64 + 1)
+        .read_to_string(&mut content)?;
+    if content.len() > MAX_POLICY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "remote policy too large",
@@ -113,8 +118,20 @@ pub fn read(path: &Path) -> io::Result<Config> {
     Ok(config)
 }
 
-pub fn write(path: &Path, config: &Config, create_only: bool) -> io::Result<()> {
+/// Serialize `config`, refusing a policy the reader would reject.
+pub fn encode(config: &Config) -> io::Result<String> {
     config.validate()?;
+    let content = toml::to_string_pretty(config).map_err(io::Error::other)?;
+    if content.len() > MAX_POLICY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote policy too large",
+        ));
+    }
+    Ok(content)
+}
+
+fn check_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "policy path has no parent"))?;
@@ -127,6 +144,12 @@ pub fn write(path: &Path, config: &Config, create_only: bool) -> io::Result<()> 
             "unsafe policy directory",
         ));
     }
+    Ok(())
+}
+
+pub fn write(path: &Path, config: &Config, create_only: bool) -> io::Result<()> {
+    let content = encode(config)?;
+    check_parent(path)?;
     if path.exists() || fs::symlink_metadata(path).is_ok() {
         if create_only {
             return Err(io::Error::new(
@@ -136,7 +159,29 @@ pub fn write(path: &Path, config: &Config, create_only: bool) -> io::Result<()> 
         }
         read(path)?;
     }
-    let content = toml::to_string_pretty(config).map_err(io::Error::other)?;
+    replace_atomically(path, &content)
+}
+
+/// Replace a policy that may be unreadable (corrupt, oversized, too open) so
+/// the operator can always disable Remote. The target must still be a regular
+/// file we own: a symlink or foreign file is never overwritten.
+pub fn write_replacing_unreadable(path: &Path, config: &Config) -> io::Result<()> {
+    let content = encode(config)?;
+    check_parent(path)?;
+    if let Ok(existing) = fs::symlink_metadata(path) {
+        // SAFETY: geteuid has no preconditions and does not dereference pointers.
+        let uid = unsafe { libc::geteuid() };
+        if !existing.file_type().is_file() || existing.uid() != uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe remote policy file",
+            ));
+        }
+    }
+    replace_atomically(path, &content)
+}
+
+fn replace_atomically(path: &Path, content: &str) -> io::Result<()> {
     let temp = temporary_path(path)?;
     let mut file = OpenOptions::new()
         .write(true)
@@ -144,6 +189,8 @@ pub fn write(path: &Path, config: &Config, create_only: bool) -> io::Result<()> 
         .mode(0o600)
         .open(&temp)?;
     let result = (|| {
+        // Explicit, so a permissive umask or inherited ACL cannot widen it.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
@@ -233,5 +280,48 @@ mod tests {
         fs::write(&path, "x".repeat(16 * 1024 + 1)).unwrap();
         assert!(read(&path).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn enabled_with_nodes(count: usize) -> Config {
+        Config {
+            enabled: true,
+            canonical_host: "host.example.ts.net".into(),
+            owner_user_id: 1,
+            allowed_node_ids: (0..count).map(|n| format!("{n:0>128}")).collect(),
+            project_ids: vec!["550e8400-e29b-41d4-a716-446655440000".into()],
+        }
+    }
+
+    #[test]
+    fn writer_refuses_a_policy_the_reader_would_reject_and_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("policy.toml");
+        write(&path, &enabled_with_nodes(2), true).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = write(&path, &enabled_with_nodes(200), false).unwrap_err();
+        assert!(error.to_string().contains("too large"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(read(&path).is_ok());
+        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn replacing_writer_recovers_an_unreadable_policy_but_never_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("policy.toml");
+        fs::write(&path, "x".repeat(MAX_POLICY_BYTES + 5)).unwrap();
+        assert!(read(&path).is_err());
+        assert!(write(&path, &Config::default(), false).is_err());
+        write_replacing_unreadable(&path, &Config::default()).unwrap();
+        assert!(read(&path).is_ok_and(|policy| !policy.enabled));
+        let target = dir.path().join("other.toml");
+        fs::write(&target, "keep").unwrap();
+        let link = dir.path().join("link.toml");
+        symlink(&target, &link).unwrap();
+        assert!(write_replacing_unreadable(&link, &Config::default()).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
     }
 }

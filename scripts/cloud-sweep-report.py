@@ -12,6 +12,7 @@ seed_file = Path(seed_path)
 seeds = set(seed_file.read_text().splitlines()) if seed_file.exists() else set()
 statuses = sorted((result / "status").glob("*.tsv"))
 failures = set()
+failure_classes = {}
 flakes = set()
 rows = []
 for status_file in statuses:
@@ -32,10 +33,22 @@ for status_file in statuses:
         failed = sum(item[1] for item in counts)
         skipped = sum(item[2] for item in counts)
     names = re.findall(r"^test (.+?) \.\.\. FAILED$", log, re.MULTILINE)
-    names += re.findall(r"^\s*(?:FAIL|TIMEOUT) \[[^\]]*\] \([^)]*\) \S+ (.+)$", log, re.MULTILINE)
+    names += re.findall(r"^\s*(?:FAIL|TIMEOUT|SIG[A-Z0-9]+) \[[^\]]*\] \([^)]*\) \S+ (.+)$",
+                        log, re.MULTILINE)
+    # A test that crashed (SIGABRT, SIGSEGV, stack overflow) or timed out is a
+    # named red with its class (#1120), never a harness failure.
+    for kind, name in re.findall(
+            r"^\s*(TIMEOUT|SIG[A-Z0-9]+) \[[^\]]*\] \([^)]*\) \S+ (.+)$", log, re.MULTILINE):
+        failure_classes[name] = "timeout" if kind == "TIMEOUT" else "crash"
     names = sorted(set(names))
     failures.update(names)
-    if int(exit_code) and not names:
+    # A lane binary killed by a signal before any test was named (libtest
+    # prints only "process didn't exit successfully ... (signal: 6, SIGABRT").
+    unnamed_crash = re.search(r"\(signal: \d+, SIG[A-Z0-9]+", log)
+    if int(exit_code) and not names and unnamed_crash:
+        failures.add(f"{label}:crash")
+        failure_classes[f"{label}:crash"] = "crash"
+    elif int(exit_code) and not names:
         failures.add(f"{label}:build_or_harness_failure")
     flakes.update(line.strip() for line in log.splitlines() if re.search(r"\bFLAKE\b|\bflaky\b", line, re.I))
     rows.append((label, passed, failed, skipped, exit_code))
@@ -70,3 +83,8 @@ for line in sorted(flakes):
     print(f"- `{line.replace('`', '')[:300]}`")
 if not flakes:
     print("- none observed")
+print("Crash and timeout classes:")
+for name, kind in sorted(failure_classes.items()):
+    print(f"- `{name}` [{kind}]")
+if not failure_classes:
+    print("- none")

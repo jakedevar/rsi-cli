@@ -381,10 +381,20 @@ run_lane() {
   printf '%s\t%s\n' "$label" "$status" >"$result_dir/status/$label.tsv"
 }
 
+# shard -> "-p PACKAGE ..." flags (#1021 S4: a shard spans rsid and rsid-store).
+declare -A shard_package_flags
+while read -r shard_name shard_packages; do
+  flags=""
+  for package_name in $shard_packages; do flags+="-p $package_name "; done
+  shard_package_flags[$shard_name]="${flags% }"
+done < <(python3.11 scripts/check-rsid-test-shards.py --list-shard-packages)
+
 run_list() {
   local shard="$1" status
+  local -a package_flags
+  read -r -a package_flags <<<"${shard_package_flags[$shard]}"
   if env CARGO_TARGET_DIR="$sweep_root/target/cloud-$sha/rsid-$shard" \
-    cargo nextest list --profile rsid-fast -p rsid --lib --no-default-features \
+    cargo nextest list --profile rsid-fast "${package_flags[@]}" --lib --no-default-features \
     --features "test-shard-$shard" --message-format json \
     >"$result_dir/lists/$shard.json" 2>"$result_dir/logs/list-$shard.log"; then
     status=0
@@ -435,8 +445,8 @@ run_lane rsi-common cargo nextest run --profile ci-full -p rsi-common --all-targ
   --status-level all --final-status-level all -j 8 &
 wait || true
 run_lane other-workspace cargo nextest run --profile ci-full --workspace \
-  --exclude rsid --exclude rsi --exclude rsi-common \
+  --exclude rsid --exclude rsid-store --exclude rsi --exclude rsi-common \
   --status-level all --final-status-level all -j 8 &
-run_lane rsid-doctests cargo test -p rsid --doc -- --test-threads=8 &
-run_lane other-doctests cargo test --workspace --exclude rsid --doc -- --test-threads=8 &
+run_lane rsid-doctests cargo test -p rsid -p rsid-store --doc -- --test-threads=8 &
+run_lane other-doctests cargo test --workspace --exclude rsid --exclude rsid-store --doc -- --test-threads=8 &
 wait || true

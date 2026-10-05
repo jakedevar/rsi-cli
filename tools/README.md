@@ -61,7 +61,7 @@ When the migration adds a new helper file, include it in the refresh so its
 marked sections are pinned:
 
 ```bash
-python3 tools/check-released-migrations.py --refresh --include-path crates/rsid/src/store/new_migration.rs
+python3 tools/check-released-migrations.py --refresh --include-path crates/rsid-store/src/store/new_migration.rs
 ```
 
 Released migration DDL, catalog projections, and fingerprints are immutable.

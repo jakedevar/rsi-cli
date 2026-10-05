@@ -4,13 +4,21 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/rsid-processes.sh"
 source "$ROOT/scripts/rsid-health.sh"
+source "$ROOT/scripts/rsid-quiet-restart.sh"
 BIN_DIR="${RSI_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 RSI_HOME_DIR="$HOME/.rsi"
 DAEMON_LOG="$RSI_HOME_DIR/daemon.log"
 RSID_SCOPE_SETTINGS="$RSI_HOME_DIR/rsid-scope.env"
+
+daemon_socket_path() {
+    printf '%s\n' "${RSI_DAEMON_SOCKET_PATH:-${RSI_SOCKET:-${MOTHERSHIP_SOCKET:-${FLYWHEEL_SOCKET:-$RSI_HOME_DIR/daemon.sock}}}}"
+}
 LINK_ONLY=0
 NO_RESTART=0
 TUI_ONLY=0
+# Restart rsid immediately (today's behaviour) instead of at a quiet point:
+# --now, or NOW=1 in the environment (make release-install NOW=1).
+RESTART_NOW="${NOW:-0}"
 
 while (($#)); do
     case "$1" in
@@ -22,6 +30,10 @@ while (($#)); do
             NO_RESTART=1
             shift
             ;;
+        --now)
+            RESTART_NOW=1
+            shift
+            ;;
         --tui-only)
             # Build and link only the `rsi` TUI binary. The daemon is left
             # untouched, so this never restarts rsid.
@@ -31,7 +43,7 @@ while (($#)); do
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [--link-only] [--no-restart] [--tui-only]" >&2
+            echo "Usage: $0 [--link-only] [--no-restart] [--tui-only] [--now]" >&2
             exit 1
             ;;
     esac
@@ -47,10 +59,28 @@ RSI_BIN="$TARGET_DIR/release/rsi"
 RSID_BIN="$TARGET_DIR/release/rsid"
 BUILD_RUSTC_BIN="$TARGET_DIR/release/rsi-build-rustc"
 RSI_RPC_BIN="$TARGET_DIR/release/rsi-rpc"
+ROLLING_LAND_BIN="$TARGET_DIR/release/rsi-rolling-land"
 RSI_AGENT_MCP_BIN="$TARGET_DIR/release/rsi-agent-mcp"
 # The worker preamble tells agents `rsi-contract-validate` parses their handoff.
 CONTRACT_VALIDATE_BIN="$TARGET_DIR/release/rsi-contract-validate"
+# RSI Remote gateway (#1096): rsid's managed systemd user unit runs it from here.
+RSI_REMOTE_BIN="$TARGET_DIR/release/rsi-remote"
+# #1137: the spill stub tells workers to run a bare `rsi-spill show ...`. It is a
+# repo script (a thin shim over `rsi-rpc spill`), so link it next to rsi-rpc.
+RSI_SPILL_SCRIPT="$ROOT/scripts/rsi-spill"
 COMPAT_RELEASE_DIR="$ROOT/target/release"
+# #1164: one source of truth for "the rsid the supervisor runs". Cargo's output
+# is only a build product. The daemon, the supervisor and the ~/.local/bin links
+# all use the copy under INSTALL_DIR, which is where AgentRequestDeploy and
+# RequestOperatorRestart swap new binaries in, so a deploy restarts the very
+# binary it installed.
+INSTALL_DIR="$RSI_HOME_DIR/install"
+
+if [[ "$LINK_ONLY" -eq 0 ]]; then
+    # The test seam (fake capabilities, route-validation bypasses) must never
+    # ship; refuse before spending a build on it (#1021 S4).
+    "$ROOT/scripts/check-release-seam.sh"
+fi
 
 if [[ "$TUI_ONLY" -eq 1 ]]; then
     if [[ "$LINK_ONLY" -eq 0 ]]; then
@@ -76,14 +106,52 @@ if [[ "$TUI_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
+# #1122: by default ask the daemon to restart at a quiet point, so an operator
+# rebuild does not cut off running manager and worker turns. NOW=1 / --now
+# restarts immediately; a daemon that is positively down (or not under the
+# supervisor) is restarted directly.
+QUIET_RESTART=0
+if [[ "$LINK_ONLY" -eq 0 && "$NO_RESTART" -eq 0 && "$RESTART_NOW" != 1 ]]; then
+    QUIET_RESTART=1
+    # Keep the prior installed executables out of Cargo's output directory, so
+    # the build cannot overwrite what the daemon keeps as `.prev` for rollback.
+    stabilize_installed_binaries "$BIN_DIR" "$TARGET_DIR/release" "$RSI_HOME_DIR/install"
+fi
+
 if [[ "$LINK_ONLY" -eq 0 ]]; then
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc --bin rsi-contract-validate
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc --bin rsi-contract-validate --bin rsi-rolling-land --bin rsi-remote
 fi
 
 if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" || ! -x "$BUILD_RUSTC_BIN" || ! -x "$CONTRACT_VALIDATE_BIN" ]]; then
     echo "Release binaries not found at $TARGET_DIR/release" >&2
     exit 1
 fi
+
+if [[ "$QUIET_RESTART" -eq 1 ]]; then
+    # The daemon stages, verifies and swaps the new binaries in at a quiet point
+    # (nothing is relinked here: the installed set stays the previous, working
+    # one until then) and verifies the running build after the restart.
+    quiet_status=0
+    request_quiet_restart "$RSI_RPC_BIN" "$(daemon_socket_path)" "$TARGET_DIR/release" \
+        || quiet_status=$?
+    case "$quiet_status" in
+        0) exit 0 ;;
+        10) ;;
+        *) exit 1 ;;
+    esac
+fi
+
+# Direct (non-quiet) install: copy the built binaries into INSTALL_DIR
+# (atomically, per file) and point every link and the supervisor at that copy.
+install_built_binaries "$TARGET_DIR/release" "$INSTALL_DIR"
+RSI_BIN="$INSTALL_DIR/rsi"
+RSID_BIN="$INSTALL_DIR/rsid"
+BUILD_RUSTC_BIN="$INSTALL_DIR/rsi-build-rustc"
+RSI_RPC_BIN="$INSTALL_DIR/rsi-rpc"
+ROLLING_LAND_BIN="$INSTALL_DIR/rsi-rolling-land"
+RSI_AGENT_MCP_BIN="$INSTALL_DIR/rsi-agent-mcp"
+CONTRACT_VALIDATE_BIN="$INSTALL_DIR/rsi-contract-validate"
+RSI_REMOTE_BIN="$INSTALL_DIR/rsi-remote"
 
 mkdir -p "$BIN_DIR"
 ln -sfn "$RSI_BIN" "$BIN_DIR/rsi"
@@ -92,6 +160,15 @@ ln -sfn "$BUILD_RUSTC_BIN" "$BIN_DIR/rsi-build-rustc"
 ln -sfn "$RSI_RPC_BIN" "$BIN_DIR/rsi-rpc"
 ln -sfn "$RSI_AGENT_MCP_BIN" "$BIN_DIR/rsi-agent-mcp"
 ln -sfn "$CONTRACT_VALIDATE_BIN" "$BIN_DIR/rsi-contract-validate"
+[[ -x "$RSI_REMOTE_BIN" ]] && ln -sfn "$RSI_REMOTE_BIN" "$BIN_DIR/rsi-remote"
+ln -sfn "$RSI_SPILL_SCRIPT" "$BIN_DIR/rsi-spill"
+# The daemon rolling merge queue spawns the lander: it looks next to rsid first,
+# then on PATH (rolling_queue.rs LanderLauncher::discover).
+if [[ -x "$ROLLING_LAND_BIN" ]]; then
+    ln -sfn "$ROLLING_LAND_BIN" "$BIN_DIR/rsi-rolling-land"
+else
+    echo "warning: $ROLLING_LAND_BIN not built; the daemon merge queue cannot land until it is" >&2
+fi
 
 if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
     mkdir -p "$COMPAT_RELEASE_DIR"
@@ -109,6 +186,8 @@ echo "  $BIN_DIR/rsi-build-rustc -> $BUILD_RUSTC_BIN"
 echo "  $BIN_DIR/rsi-rpc -> $RSI_RPC_BIN"
 echo "  $BIN_DIR/rsi-agent-mcp -> $RSI_AGENT_MCP_BIN"
 echo "  $BIN_DIR/rsi-contract-validate -> $CONTRACT_VALIDATE_BIN"
+echo "  $BIN_DIR/rsi-rolling-land -> $ROLLING_LAND_BIN"
+echo "  $BIN_DIR/rsi-spill -> $RSI_SPILL_SCRIPT"
 if [[ "$TARGET_DIR" != "$ROOT/target" ]]; then
     echo "Compatibility links:"
     echo "  $COMPAT_RELEASE_DIR/rsi     -> $RSI_BIN"
@@ -123,10 +202,6 @@ fi
 # daemon here so `make release-install` always leaves the running process
 # matching what it just built, instead of silently leaving a stale rsid
 # serving requests from before this build.
-daemon_socket_path() {
-    printf '%s\n' "${RSI_DAEMON_SOCKET_PATH:-${RSI_SOCKET:-${MOTHERSHIP_SOCKET:-${FLYWHEEL_SOCKET:-$RSI_HOME_DIR/daemon.sock}}}}"
-}
-
 run_restart_drain_hook() {
     # #929 can install this operator-owned hook to request a safe daemon drain.
     # Its failure prevents the restart. No provider environment is printed.

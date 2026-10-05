@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": 150,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v150.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:0db40f6ef35c98ed4f92a8e267e8659854952e0982e2b67bc339e78abe097725",
+      "sites": [
+        {
+          "anchor": "fn migrate_v150(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 150 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "global_manager::apply_migration(self, 150)?;",
+          "replacement": "global_manager::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/global_manager.rs",
+      "path_template": "crates/rsid/src/store/global_manager.rs",
+      "source_blob": "sha256:bfcd826011ed3f39915fd679d993401b28ddaec7cac43f42e6cf3464490cbbe3",
+      "sites": [
+        {
+          "anchor": "pub(crate) const GLOBAL_MANAGER_SCHEMA_VERSION: i32 = 150;",
+          "replacement": "pub(crate) const GLOBAL_MANAGER_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:0c0f89da650c0bad80ce144c1fd42cc1035e849acfb4127b81e7802c87ee9b45",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 150;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

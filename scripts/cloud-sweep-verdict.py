@@ -33,6 +33,9 @@ import tempfile
 DEFAULT_SNAPSHOT = Path.home() / ".rsi/qa/known-failures.v1.json"
 HARNESS = re.compile(r"^- `([^`]+):build_or_harness_failure`$", re.MULTILINE)
 NAME = re.compile(r"^- `([^`]+)`$", re.MULTILINE)
+# `- `name` [crash]` lines cloud-sweep-report.py writes for crashed (SIGABRT,
+# SIGSEGV) and timed-out tests (#1120).
+CLASS = re.compile(r"^- `([^`]+)` \[(crash|timeout)\]$", re.MULTILINE)
 
 
 def find_classifier(explicit=None):
@@ -120,18 +123,23 @@ def build_verdict(qa_text, sha, classify):
     if state != "ok":
         section.append(f"Classification unavailable: {matches}; reds are unclassified.")
         matches = {}
+    classes = dict(CLASS.findall(qa_text))
     known, new = {}, []
     for name in names:
+        tag = f" [{classes[name]}]" if name in classes else ""
         kind, issue = matches.get(name, ("new", ""))
         if kind == "known":
             known[name] = issue
-            section.append(f"- KNOWN {issue} `{name}`")
+            section.append(f"- KNOWN {issue} `{name}`{tag}")
         else:
             new.append(name)
             note = f" (name-only match {issue}; signature unverified)" if kind == "name-only" else ""
-            section.append(f"- NEW `{name}`{note}")
+            section.append(f"- NEW `{name}`{tag}{note}")
     if not names:
         section.append("- no failing test names")
+    crashed = [name for name in new if name in classes]
+    if crashed:
+        section.append(f"Crashed or timed out (NEW): {len(crashed)}; the verdict is RED, not INCOMPLETE.")
     if incomplete:
         verdict = f"VERDICT INCOMPLETE {sha} new={len(new)}"
     elif new:

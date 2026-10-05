@@ -38,16 +38,35 @@ fn score_text(descriptor: &ActionDescriptor) -> String {
     )
 }
 
+/// True when an alias literally starts with the query and has the same number
+/// of words, so `mana` prefers `:manager` over `:manager policy` until the
+/// operator types a space and starts the next word.
+fn word_prefix_match(descriptor: &ActionDescriptor, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    let query_words = query.split_whitespace().count();
+    descriptor.command_aliases.iter().any(|alias| {
+        alias.split_whitespace().count() == query_words && alias.to_lowercase().starts_with(&query)
+    })
+}
+
 fn ranked(origin: &ActionContext, query: &str) -> Vec<ActionId> {
+    const LIMIT: usize = 100;
     let entries = candidates(origin);
-    crate::overlay::telescope::rank_finder(
+    let fuzzy = crate::overlay::telescope::rank_finder(
         query,
         entries.iter().map(|descriptor| score_text(descriptor)),
-        100,
-    )
-    .into_iter()
-    .map(|index| entries[index].id)
-    .collect()
+        usize::MAX,
+    );
+    // Stable partition: word-count-matching prefix hits first, fuzzy order kept.
+    let (mut front, back): (Vec<usize>, Vec<usize>) = fuzzy
+        .into_iter()
+        .partition(|&index| word_prefix_match(entries[index], query));
+    front.extend(back);
+    front.truncate(LIMIT);
+    front.into_iter().map(|index| entries[index].id).collect()
 }
 
 pub fn open_command_palette(app: &mut App) {
@@ -323,6 +342,27 @@ mod tests {
         paste_text(&mut app, "zzzzzzzzzzzzzz");
         assert!(
             matches!(&app.overlay, OverlayState::CommandPalette { results, selected: 0, .. } if results.is_empty())
+        );
+    }
+
+    #[test]
+    fn command_palette_plain_alias_leads_until_next_word() {
+        let app = crate::app::app_test_helpers::with_session_list(0);
+        let origin = ActionContext::from_app(&app);
+        for query in ["mana", "manager", "manager "] {
+            assert_eq!(
+                ranked(&origin, query).first(),
+                Some(&ActionId::Manager),
+                "query {query:?}"
+            );
+        }
+        assert_eq!(
+            ranked(&origin, "manager pol").first(),
+            Some(&ActionId::ManagerPolicy)
+        );
+        assert_eq!(
+            ranked(&origin, "manager sc").first(),
+            Some(&ActionId::ManagerScope)
         );
     }
 

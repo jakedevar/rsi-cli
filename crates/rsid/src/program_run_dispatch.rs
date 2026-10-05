@@ -690,7 +690,7 @@ mod tests {
             updated_at: now,
         };
         store.insert_project(&project).expect("insert project");
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.project_id = Some(project.id);
         session.status = SessionStatus::Running;
         store
@@ -944,7 +944,7 @@ mod tests {
                 updated_at: now,
             };
             store.insert_project(&project).unwrap();
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.project_id = Some(project.id);
             session.status = SessionStatus::Running;
             store.insert_session(&session).unwrap();
@@ -1917,7 +1917,7 @@ mod tests {
             let mut tokens = manager.agent_tokens.write().await;
             let store = manager.store.lock().await;
             for index in 1..SPARSE_LIVE_AUTHORITIES {
-                let mut sparse = crate::store::tests::make_test_session();
+                let mut sparse = rsid_store::test_support::make_test_session();
                 sparse.project_id = Some(project.id);
                 sparse.status = SessionStatus::Running;
                 active.insert(sparse.id, TrackedSession::new_for_test(sparse.clone()));
@@ -2417,7 +2417,7 @@ mod tests {
                         timestamp(),
                     )
                     .unwrap();
-                let mut attempt_session = crate::store::tests::make_test_session();
+                let mut attempt_session = rsid_store::test_support::make_test_session();
                 attempt_session.project_id = Some(project.id);
                 attempt_session.status = rsi_common::SessionStatus::Running;
                 store.insert_session(&attempt_session).unwrap();

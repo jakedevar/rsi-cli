@@ -103,20 +103,17 @@ use rsi_common::rpc::{
     AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
 };
 use rsi_common::types::{
-    IssueEventPageRequestV1, IssueEventPageV1, IssuePageV1, NewIssue, Recurrence, ScheduledJob,
-    Session, SessionKind, WakeMode,
+    IssueEventPageRequestV1, IssueEventPageV1, IssuePageV1, NewIssue, ScheduledJob, Session,
+    SessionKind, WakeMode,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// A8: hard ceiling on enabled `OnTerminal` watch rows per wake target
-/// (master). Bounds self-DoS from a runaway arming loop; dedup on the
-/// (caller, watched) natural key keeps legitimate re-arms free. Lives here
-/// (not `rpc.rs`) because [`AgentControlHandle::arm_terminal_watch`] is the
-/// single enforcement point for every arm transport.
-pub const MAX_TERMINAL_WATCHES_PER_MASTER: usize = 64;
+pub(crate) use crate::store_support::manager_gates::exact_master_continuation_guard_present;
+
+pub use crate::store_support::watch_limits::MAX_TERMINAL_WATCHES_PER_MASTER;
 
 /// Outcome of [`AgentControlHandle::arm_terminal_watch`].
 #[derive(Debug)]
@@ -1613,7 +1610,7 @@ impl AgentControlHandle {
     /// Resolve a session through the same snapshot path the RPC read verbs
     /// use, so the handle and `SessionManager` never diverge on read
     /// semantics.
-    async fn get_session(&self, session_id: Uuid) -> Option<Session> {
+    pub(super) async fn get_session(&self, session_id: Uuid) -> Option<Session> {
         super::queries::get_session_snapshot(&self.active, &self.completed, &self.store, session_id)
             .await
     }
@@ -1891,12 +1888,12 @@ impl AgentControlHandle {
             .await
     }
 
-    async fn arm_automatic_child_watch_inner(
+    /// The automatic on_terminal watch row for `(owner, child)`, not yet stored.
+    pub(crate) async fn build_automatic_child_watch_candidate(
         &self,
         owner_session_id: Uuid,
         child_session_id: Uuid,
-        reset_existing: bool,
-    ) -> Result<ArmWatchOutcome> {
+    ) -> Result<ScheduledJob> {
         use crate::session::harness::tools::schedule_wake::{
             ScheduleWakeRequest, build_agent_scheduled_job,
         };
@@ -1904,7 +1901,7 @@ impl AgentControlHandle {
             .get_session(owner_session_id)
             .await
             .ok_or(DaemonError::SessionNotFound(owner_session_id))?;
-        let candidate = build_agent_scheduled_job(ScheduleWakeRequest {
+        build_agent_scheduled_job(ScheduleWakeRequest {
             message: format!("automatic child terminal watch {child_session_id}"),
             in_seconds: None,
             at: None,
@@ -1918,7 +1915,18 @@ impl AgentControlHandle {
             origin_session_id: Some(owner_session_id),
             watch_session_id: Some(child_session_id),
         })
-        .map_err(DaemonError::InvalidParam)?;
+        .map_err(DaemonError::InvalidParam)
+    }
+
+    async fn arm_automatic_child_watch_inner(
+        &self,
+        owner_session_id: Uuid,
+        child_session_id: Uuid,
+        reset_existing: bool,
+    ) -> Result<ArmWatchOutcome> {
+        let candidate = self
+            .build_automatic_child_watch_candidate(owner_session_id, child_session_id)
+            .await?;
         let outcome = self
             .arm_terminal_watch_inner(owner_session_id, candidate, reset_existing, false)
             .await?;
@@ -1995,6 +2003,20 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         target_session_id: Uuid,
     ) -> Result<Session> {
+        // #872: the active global seat may read (AgentGetStatus,
+        // AgentReadSessionEvents) and arm terminal watches on the PM seat of
+        // each granted project. This is the non-mutation path only.
+        let global_read = self
+            .store
+            .lock()
+            .await
+            .global_seat_reads_manager(caller_session_id, target_session_id)?;
+        if global_read {
+            return self
+                .get_session(target_session_id)
+                .await
+                .ok_or(DaemonError::SessionNotFound(target_session_id));
+        }
         Ok(self
             .authorize_agent_target_impl(caller_session_id, target_session_id, false, false)
             .await?
@@ -2080,6 +2102,17 @@ impl AgentControlHandle {
             .lock()
             .await
             .parent_lead_authorizes_child(caller_session_id, target_session_id)?
+        {
+            return Ok((target, None));
+        }
+
+        // Issue #12: the arming session owns a session its `fresh` wake
+        // created (a top-level root no parent/Epic path reaches).
+        if self
+            .store
+            .lock()
+            .await
+            .wake_origin_authorizes_target(caller_session_id, target_session_id)?
         {
             return Ok((target, None));
         }
@@ -3654,51 +3687,6 @@ fn master_program_guard_state(
     }
 }
 
-pub(crate) fn exact_master_continuation_guard_present(
-    store: &crate::store::Store,
-    session_id: Uuid,
-    program_guard_id: Uuid,
-    intent: &ProgramContinuationIntentV1,
-) -> Result<bool> {
-    let is_one_shot_resume = |job: &ScheduledJob| {
-        job.id != program_guard_id
-            && job.enabled
-            && job.wake_session_id == Some(session_id)
-            && job.wake_mode == WakeMode::Resume
-            && matches!(&job.schedule.recurrence, Recurrence::Once)
-    };
-    let present = match intent {
-        ProgramContinuationIntentV1::RequireChildWatch { job_id } => {
-            let consumed_at = store.last_provider_output_at(session_id)?;
-            store.get_scheduled_job(job_id)?.is_some_and(|job| {
-                // The declared watch may still be enabled while its delivered
-                // owner turn settles. Provider output after that delivery is
-                // proof the watch was consumed; a later scheduler tick will
-                // retire it, so it cannot own the next program continuation.
-                let already_consumed = job
-                    .last_fired_at
-                    .zip(consumed_at)
-                    .is_some_and(|(delivered, produced)| produced > delivered);
-                job.enabled
-                    && job.wake_session_id == Some(session_id)
-                    && matches!(job.wake_mode, WakeMode::OnTerminal(_))
-                    && !already_consumed
-            })
-        }
-        ProgramContinuationIntentV1::RequireResumeWake { job_id } => store
-            .get_scheduled_job(job_id)?
-            .is_some_and(|job| is_one_shot_resume(&job)),
-        // Legacy reports do not carry an exact durable row identity. Recover
-        // conservatively instead of scanning enabled historical jobs.
-        ProgramContinuationIntentV1::RequireAnyGuard => false,
-        ProgramContinuationIntentV1::InvalidProgram(_) => false,
-        ProgramContinuationIntentV1::NotProgram | ProgramContinuationIntentV1::TerminalAllowed => {
-            true
-        }
-    };
-    Ok(present)
-}
-
 fn is_transient_master_no_idle_store_error(error: &DaemonError) -> bool {
     match error {
         DaemonError::Store(message) => {
@@ -3717,103 +3705,12 @@ fn is_transient_master_no_idle_store_error(error: &DaemonError) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::store::Store;
+    use rsi_common::types::Recurrence;
     use rsi_common::types::{ContextUsageConfidence, SessionProvider, SessionStatus};
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
-    /// Minimal persisted-session fixture. `pub(crate)` so sibling test modules
-    /// (e.g. the `schedule_wake` harness-tool tests) reuse one Session literal
-    /// instead of duplicating this 70-line struct.
-    pub(crate) fn test_session(id: Uuid, working_dir: std::path::PathBuf) -> Session {
-        let now = chrono::Utc::now();
-        Session {
-            context_fill_pct: None,
-            id,
-            status: SessionStatus::Failed,
-            session_kind: SessionKind::Task,
-            provider: SessionProvider::Codex,
-            context_usage_confidence: ContextUsageConfidence::Missing,
-            rotation_depth: 0,
-            retry_attempt: Some(0),
-            max_retries: Some(2),
-            created_at: now,
-            updated_at: now,
-            pinned_at: None,
-            testing_needed_at: None,
-            rotation_disabled_at: None,
-            query: "pending retry".to_string(),
-            title: None,
-            agent_role: None,
-            epic_spawn_ordinal: None,
-            description: None,
-            short_summary: None,
-            working_dir,
-            git_branch: None,
-            model: None,
-            claude_session_id: Some("provider-session".to_string()),
-            project_id: Some(crate::store::d04_test_project_id()),
-            continued_from: None,
-            parent_id: None,
-            lead_session_id: None,
-            handoff_filepath: None,
-            active_task: None,
-            group_id: None,
-            tag: String::new(),
-            tags: Vec::new(),
-            scheduled_job_id: None,
-            stop_reason: None,
-            cost_usd: None,
-            duration_ms: None,
-            num_turns: None,
-            input_tokens: None,
-            output_tokens: None,
-            context_window: None,
-            resolved_context_budget: None,
-            total_input_tokens: None,
-            total_prompt_tokens: None,
-            total_output_tokens: None,
-            total_cache_creation_tokens: None,
-            total_cache_read_tokens: None,
-            daemon_input_tokens: None,
-            daemon_output_tokens: None,
-            pipeline_artifact: None,
-            workflow_id: None,
-            workflow_id_override: None,
-            pending_question: None,
-            pending_archive: false,
-            effort: None,
-            issue_identifier: None,
-            issue_url: None,
-            issue_tracker_id: None,
-            rating: None,
-            harness_version_hash: None,
-            test_passed: None,
-            clippy_passed: None,
-            turn_count: None,
-            retry_count: None,
-            approval_wait_ms: Some(0),
-            work_time_ms: None,
-            approval_started_at: None,
-            sandbox_kind: None,
-            sandbox_root: None,
-            sandbox_branch: None,
-            sandbox_cleanup_state: None,
-            is_eval: false,
-            capability_class: None,
-            topology_node_id: None,
-            topology_iteration: 0,
-            provider_cli_version: None,
-            provider_capabilities: Vec::new(),
-            thinking_tokens: None,
-            service_tier: None,
-            cache_creation_1h_tokens: None,
-            cache_creation_5m_tokens: None,
-            permission_denial_count: None,
-            subagent_stats_json: None,
-            queued_turn_count: None,
-            terminal_reason: None,
-        }
-    }
+    pub(crate) use rsid_store::test_support::test_session;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
@@ -3943,6 +3840,107 @@ pub(crate) mod tests {
         assert_eq!(
             tracked.interrupt_source,
             Some(crate::terminal_cause::InterruptSource::ManagerHalt)
+        );
+    }
+
+    /// Issue #12: a session launched by a `fresh` wake is a top-level root
+    /// (no parent), yet its arming session owns it and can halt it; a
+    /// stranger still cannot.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_halt_admits_the_arming_session_of_a_fresh_wake_created_root() {
+        use crate::session::harness::tools::schedule_wake::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        let (control, store, _) = control_handle_with_store_and_bus();
+        let dir = TempDir::new().unwrap();
+        let origin_id = Uuid::new_v4();
+        let stranger_id = Uuid::new_v4();
+        let created_id = Uuid::new_v4();
+        let job = build_agent_scheduled_job(ScheduleWakeRequest {
+            message: "later".to_string(),
+            in_seconds: Some(60),
+            at: None,
+            name: None,
+            every_seconds: None,
+            mode: Some("fresh".to_string()),
+            working_dir: dir.path().to_path_buf(),
+            provider: None,
+            model: None,
+            project_id: None,
+            origin_session_id: Some(origin_id),
+            watch_session_id: None,
+        })
+        .expect("valid fresh wake");
+        assert_eq!(job.wake_mode, WakeMode::AgentFresh);
+        let mut created = test_session(created_id, dir.path().to_path_buf());
+        created.status = SessionStatus::Running;
+        created.parent_id = None;
+        created.scheduled_job_id = Some(job.id);
+        {
+            let guard = store.lock().await;
+            for id in [origin_id, stranger_id] {
+                guard
+                    .insert_session(&test_session(id, dir.path().to_path_buf()))
+                    .unwrap();
+            }
+            guard.insert_scheduled_job(&job).unwrap();
+            guard.insert_session(&created).unwrap();
+        }
+        control.active.write().await.insert(
+            created_id,
+            super::super::TrackedSession::new_for_test(created),
+        );
+
+        let denied = control
+            .agent_halt(stranger_id, created_id)
+            .await
+            .expect_err("a session that did not arm the wake has no scope");
+        assert!(denied.to_string().contains("agent_verb_scope_denied"));
+
+        control
+            .agent_halt(origin_id, created_id)
+            .await
+            .expect("the arming session halts the session its wake created");
+        assert!(
+            control
+                .active
+                .read()
+                .await
+                .get(&created_id)
+                .expect("tracked")
+                .interrupt_requested
+        );
+
+        // The ownership is immutable provenance: it survives deletion of the
+        // scheduled job and extends to the root's rotation successor.
+        store.lock().await.delete_scheduled_job(&job.id).unwrap();
+        let successor_id = Uuid::new_v4();
+        let mut successor = test_session(successor_id, dir.path().to_path_buf());
+        successor.status = SessionStatus::Running;
+        successor.continued_from = Some(created_id);
+        store.lock().await.insert_session(&successor).unwrap();
+        control.active.write().await.insert(
+            successor_id,
+            super::super::TrackedSession::new_for_test(successor),
+        );
+        let denied = control
+            .agent_halt(stranger_id, successor_id)
+            .await
+            .expect_err("a stranger has no scope over the successor");
+        assert!(denied.to_string().contains("agent_verb_scope_denied"));
+        control
+            .agent_halt(origin_id, successor_id)
+            .await
+            .expect("the arming session still owns the rotation successor");
+        assert!(
+            control
+                .active
+                .read()
+                .await
+                .get(&successor_id)
+                .expect("tracked successor")
+                .interrupt_requested
         );
     }
 

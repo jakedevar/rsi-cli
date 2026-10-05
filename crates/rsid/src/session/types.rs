@@ -291,6 +291,9 @@ pub(super) struct TopologyNodeLaunchContext {
 #[derive(Debug)]
 pub(super) enum LaunchPurpose {
     Interactive,
+    /// #872: an interactive launch under the daemon-reserved session id the
+    /// global manager's appointment journal recorded before the launch.
+    GlobalAppointment(Uuid),
     ManagerSuccessor(Box<super::manager_succession::ManagerSuccessionLaunchContext>),
     ManagerAction(Box<ManagerActionLaunchContext>),
     TopologyNode(TopologyNodeLaunchContext),
@@ -304,6 +307,7 @@ impl LaunchPurpose {
     pub(super) fn session_id(&self) -> Uuid {
         match self {
             Self::Interactive => Uuid::new_v4(),
+            Self::GlobalAppointment(session_id) => *session_id,
             Self::ManagerSuccessor(context) => context.candidate_id(),
             Self::ManagerAction(context) => context
                 .claim
@@ -368,6 +372,7 @@ impl LaunchPurpose {
         matches!(
             self,
             Self::Interactive
+                | Self::GlobalAppointment(_)
                 | Self::ClosureSource(_)
                 | Self::ManagerAction(_)
                 | Self::TopologyNode(_)
@@ -377,7 +382,10 @@ impl LaunchPurpose {
     pub(super) const fn prospective_a6(&self) -> Option<&ProspectiveAgentTokenWitness> {
         match self {
             Self::ManagerSuccessor(context) => Some(&context.prospective_a6),
-            Self::Interactive | Self::ManagerAction(_) | Self::TopologyNode(_) => None,
+            Self::Interactive
+            | Self::GlobalAppointment(_)
+            | Self::ManagerAction(_)
+            | Self::TopologyNode(_) => None,
             Self::ControllerCandidate(context) => Some(&context.prospective_a6),
             Self::AgentSuccessor(context) => Some(&context.prospective_a6),
             Self::AgentChild(_) | Self::ClosureSource(_) => None,
@@ -792,6 +800,19 @@ impl ProviderProcess {
             Self::Harness(p) => !p.is_finished(),
             #[cfg(test)]
             Self::Scripted(p) => p.is_alive(),
+        }
+    }
+
+    /// OS pid of the provider subprocess; `None` for task providers.
+    pub(crate) fn os_pid(&self) -> Option<u32> {
+        match self {
+            Self::Claude(p) => p.pid(),
+            Self::Codex(p) => p.pid(),
+            Self::Antigravity(p) => p.pid(),
+            Self::CodexAppServer(p) => p.pid(),
+            Self::Local(_) | Self::Harness(_) => None,
+            #[cfg(test)]
+            Self::Scripted(_) => None,
         }
     }
 

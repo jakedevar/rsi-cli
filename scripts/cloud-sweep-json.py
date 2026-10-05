@@ -41,7 +41,7 @@ def summary(log):
 
 def failures(log):
     return sorted(set(re.findall(
-        r"^\s*(?:FAIL|TIMEOUT) \[[^\]]*\] \([^)]*\) \S+ (.+)$", log, re.MULTILINE
+        r"^\s*(?:FAIL|TIMEOUT|SIG[A-Z0-9]+) \[[^\]]*\] \([^)]*\) \S+ (.+)$", log, re.MULTILINE
     )))
 
 

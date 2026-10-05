@@ -96,7 +96,7 @@ artifact is the handoff you write at baton pass.
   caught two #1000 bugs that its review missed (the idea row mapper was
   shifted, and old-schema test fixtures broke).
 - **Migrations.** A new migration is one file
-  `crates/rsid/src/store/migrations/vNNN.rs` and takes the tip's schema head
+  `crates/rsid-store/src/store/migrations/vNNN.rs` and takes the tip's schema head
   (highest `vNNN.rs`) + 1 at merge time: renumber in landing order with
   `tools/rolling-migration-renumber.py` (file name, `migrate_vNNN`, the
   `if version < N` block, `PRAGMA user_version`, test rewind constants), run
@@ -295,6 +295,22 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
 - The operator policy "Operator pause" blocks every `create_session` preflight
   (`operator_pause` → `resume_manager_or_policy`); only the operator clears it.
 
+## The global manager (when one is appointed)
+
+When your authority catalog lists `AgentReportToGlobal`, the operator has
+appointed a global manager over this project. Its playbook is
+`.claude/skills/rsi-global-manager/SKILL.md`. It manages project managers and
+does no project work.
+- **Report up only at milestones.** Call `AgentReportToGlobal` once per
+  event: work landed (Issue and SHA), blocked on an operator gate (name the
+  gate), or handing off (the handoff path). Do not send status chatter: it
+  reads your state through `AgentGlobalOverview`.
+- **Its requests arrive as mail.** Take them like operator requests, ahead of
+  the rest of the queue. If one conflicts with the operator's own direct
+  instruction, the operator wins: say so in your report.
+- **It may replace you** (`AgentGlobalAppointManager`). If it asks for a
+  handoff, write it, commit it, reply with the path, and end your turn.
+
 ## Wakes
 
 On every wake, before dispatching, take operator requests first: list the
@@ -302,6 +318,10 @@ newest Issues (`AgentListIssues` with `order:"desc"`), pick the Open ones
 labelled `operator-request` (filed by the operator's `/intake` command), dedupe
 each against the other open Issues (comment on or merge into a duplicate rather
 than dispatching twice), then dispatch them ahead of the rest of the queue.
+Then triage new `kaizen` Issues (the jidoka channel: any agent may log an
+improvement without stopping its work): close duplicates and noise with a
+one-line note, give the rest a priority, and fold the useful ones into the
+queue. Log your own improvements the same way.
 
 Dispatch work and end the turn. Worker terminal watches, durable units and mail
 wake you by event; a batch of jobs wakes you once through a `mode:"when"`

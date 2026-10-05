@@ -122,10 +122,13 @@ mod tests {
             .canonicalize()
             .expect("repository root");
         let fixture = fixture_root(name);
-        copy_tree(
-            &source_root.join("crates/rsid/src"),
-            &fixture.join("crates/rsid/src"),
-        );
+        for crate_source in [
+            "crates/rsid/src",
+            "crates/rsid-store/src",
+            "crates/rsid-core/src",
+        ] {
+            copy_tree(&source_root.join(crate_source), &fixture.join(crate_source));
+        }
         let registry = "thoughts/shared/reference/model-invocation-registry.md";
         let destination = fixture.join(registry);
         fs::create_dir_all(destination.parent().expect("registry parent"))
@@ -150,7 +153,7 @@ mod tests {
     ) -> ValidationInput {
         ValidationInput {
             repo_root: root.to_path_buf(),
-            source_root: root.join("crates/rsid/src"),
+            source_roots: vec![root.join("crates/rsid/src")],
             markdown: None,
             purposes,
             boundaries,
@@ -428,6 +431,53 @@ fn launch_with_gate(binary: &str) {
             .expect_err("invalid capability flow must fail");
             fs::remove_dir_all(root).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn sink_in_a_cfg_test_tests_file_is_ignored_but_production_sink_needs_a_contract() {
+        let sink = "fn injected() { client.post(\"https://example.com/v1/chat/completions\"); }";
+        // Both module layouts: `<dir>/mod.rs` and the sibling `<dir>.rs`.
+        for (declaring, name) in [
+            ("crates/rsid/src/holder/mod.rs", "mod-rs"),
+            ("crates/rsid/src/holder.rs", "sibling"),
+        ] {
+            let root = fixture_root(name);
+            write(&root, "crates/rsid/src/provider.rs", valid_http_source());
+            write(&root, declaring, "#[cfg(test)]\nmod tests;\n");
+            write(&root, "crates/rsid/src/holder/tests.rs", sink);
+            validate_repository(input(
+                &root,
+                vec![purpose("http")],
+                vec![HTTP_BOUNDARY],
+                vec![],
+            ))
+            .unwrap_or_else(|error| panic!("{name}: test-file sink must be ignored: {error}"));
+            // The same sink in a production file of that module is still rejected.
+            write(&root, "crates/rsid/src/holder/prod.rs", sink);
+            let error = validate_repository(input(
+                &root,
+                vec![purpose("http")],
+                vec![HTTP_BOUNDARY],
+                vec![],
+            ))
+            .expect_err("production sink needs a contract");
+            assert!(error.contains("prod.rs"), "{name}: {error}");
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+        // A `tests.rs` that is not declared `#[cfg(test)]` is production code.
+        let root = fixture_root("undeclared");
+        write(&root, "crates/rsid/src/provider.rs", valid_http_source());
+        write(&root, "crates/rsid/src/holder.rs", "mod tests;\n");
+        write(&root, "crates/rsid/src/holder/tests.rs", sink);
+        let error = validate_repository(input(
+            &root,
+            vec![purpose("http")],
+            vec![HTTP_BOUNDARY],
+            vec![],
+        ))
+        .expect_err("non-test tests.rs is production");
+        assert!(error.contains("tests.rs"), "{error}");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1047,32 +1097,32 @@ fn execute(execution: CliExecutionCapability) {
                 "RuntimeExecutionRoute::SessionHarnessAnthropicHttp, req",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "\"max_tokens\": 1,",
                 "\"max_tokens\": 2,",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "crate::bedrock::BEDROCK_DEFAULT_MODEL,",
                 "\"uncontrolled-model\",",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "\"content\": \"ping\"",
                 "\"content\": \"perform a task\"",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "{base}/openai/v1/chat/completions",
                 "{base}/v1/chat/completions",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "request.send().await",
                 "other_request.send().await",
             ),
             (
-                "crates/rsid/src/vault/check.rs",
+                "crates/rsid-store/src/vault/check.rs",
                 "let response = match request.send().await",
                 "let _extra = request.send().await; let response = match request.send().await",
             ),

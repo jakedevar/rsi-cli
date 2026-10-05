@@ -209,15 +209,29 @@ fn process_candidate(
     let root_exists = root.exists();
     prove_exact_allocation_path(sandbox_base, &root, candidate, root_exists)?;
     let _root_guard = sandbox_custody::lock_custody_root(candidate.custody_id);
+    // The slow, read-only proofs (worktree observation, quarantine tree proof,
+    // and the /proc-wide holder scan) run before the repository mutation lock:
+    // `git_worktree::allocate` takes the same lock, so holding it across a slow
+    // proof would starve every sandbox allocation in this repository (#1123).
+    // The locked sections below only do cheap Git reads and re-validate that
+    // the proved tree is unchanged before removal.
+    let unlocked_proof = if root_exists {
+        let observation = git_worktree::observe_worktree_ignoring_ignored_locked(&origin, &root)?;
+        if !observation.clean {
+            return Ok(CandidateOutcome::Retained("worktree_dirty"));
+        }
+        let tree = git_worktree::prove_quarantine_tree_safe(&root)?;
+        #[cfg(test)]
+        proof_test_hook::run(&root, proof_test_hook::Stage::BeforeHolderProof);
+        reaper::prove_quarantine_has_no_untrusted_same_uid_holders(&tree)?;
+        #[cfg(test)]
+        proof_test_hook::run(&root, proof_test_hook::Stage::AfterProofs);
+        Some(tree)
+    } else {
+        None
+    };
     let tip = git_worktree::with_repository_mutation(&origin, || {
         if root_exists {
-            let observation =
-                git_worktree::observe_worktree_ignoring_ignored_locked(&origin, &root)?;
-            if !observation.clean {
-                return Ok::<String, DaemonError>(String::new());
-            }
-            let tree = git_worktree::prove_quarantine_tree_safe(&root)?;
-            reaper::prove_quarantine_has_no_untrusted_same_uid_holders(&tree)?;
             let tip = branch_tip(&origin, &source_ref)?;
             git_worktree::prove_registered_worktree_exact_ignoring_ignored_locked(
                 &origin,
@@ -245,9 +259,6 @@ fn process_candidate(
             }
         }
     })?;
-    if root_exists && tip.is_empty() {
-        return Ok(CandidateOutcome::Retained("worktree_dirty"));
-    }
     {
         let store = store.blocking_lock_checked()?;
         let dependencies = if root_exists {
@@ -299,8 +310,24 @@ fn process_candidate(
         }
     }
     let root_bytes = purge_bytes(root_exists, &root)?;
-    git_worktree::with_repository_mutation(&origin, || {
-        if root_exists {
+    let removed = git_worktree::with_repository_mutation(&origin, || {
+        if let Some(tree) = &unlocked_proof {
+            // The unlocked proof is only as fresh as this check: a tree that
+            // changed since (a late writer, a new holder's output) is retained
+            // for the next pass instead of removed on a stale proof.
+            if !git_worktree::quarantine_tree_matches(tree)? {
+                return Ok::<bool, DaemonError>(false);
+            }
+            // The holder proof above ran outside the lock and is stale by now:
+            // a task that took a cwd or fd inside the tree since is missed by
+            // the digest check. Re-prove, with its own short wall-clock budget
+            // so the locked section stays bounded, immediately before the
+            // destructive step; a holder or a timeout retains the candidate.
+            reaper::reprove_quarantine_has_no_untrusted_same_uid_holders_within(
+                &origin,
+                tree,
+                reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET,
+            )?;
             git_worktree::remove_live_worktree_non_force_locked(&origin, &root, &source_ref, &tip)?;
         }
         if git_worktree::observe_direct_ref_locked(&origin, &source_ref)?
@@ -308,8 +335,11 @@ fn process_candidate(
         {
             git_worktree::delete_ref_compare_locked(&origin, &source_ref, &tip)?;
         }
-        Ok::<(), DaemonError>(())
+        Ok(true)
     })?;
+    if !removed {
+        return Ok(CandidateOutcome::Retained("worktree_changed"));
+    }
     {
         let mut store = store.blocking_lock_checked()?;
         store.finalize_archived_sandbox_purge(candidate)?;
@@ -460,6 +490,44 @@ fn directory_size(root: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Test seam: lets a test park or mutate the unlocked proof section of
+/// `process_candidate`, keyed by sandbox root so parallel tests do not collide.
+#[cfg(test)]
+mod proof_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stage {
+        BeforeHolderProof,
+        AfterProofs,
+    }
+
+    type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Hook>>> = Mutex::new(None);
+
+    pub(super) fn install(root: &Path, hook: impl Fn(Stage) + Send + Sync + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(root.to_path_buf(), Arc::new(hook));
+    }
+
+    pub(super) fn run(root: &Path, stage: Stage) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|hooks| hooks.get(root).cloned());
+        if let Some(hook) = hook {
+            hook(stage);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,8 +535,8 @@ mod tests {
     use crate::config::{Config, RuntimeConfig};
     use crate::sandbox::SandboxAllocator;
     use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
-    use crate::store::tests::make_test_session;
     use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionKind, SessionStatus};
+    use rsid_store::test_support::make_test_session;
     use std::process::Command;
 
     struct PurgeFixture {
@@ -810,6 +878,172 @@ mod tests {
         assert_eq!(report.retained["worktree_dirty"], 1);
         assert!(fixture.root.join("untracked").exists());
         assert_eq!(fixture.session_row().0, "Live");
+    }
+
+    /// #1123: a purge candidate parked inside its holder proof must not hold
+    /// the repository mutation lock, so a concurrent repository mutation (a
+    /// sandbox allocation) is never delayed by a slow proof.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn parked_holder_proof_does_not_block_repository_mutation() {
+        let fixture = PurgeFixture::new();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked_tx = std::sync::Mutex::new(parked_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        proof_test_hook::install(&fixture.root, move |stage| {
+            if stage != proof_test_hook::Stage::BeforeHolderProof {
+                return;
+            }
+            parked_tx.lock().expect("parked sender").send(()).ok();
+            let _ = release_rx
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(20));
+        });
+        let origin = fixture.repository.clone();
+        let observer = tokio::task::spawn_blocking(move || {
+            parked_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("purge reached its holder proof");
+            let started = std::time::Instant::now();
+            git_worktree::with_repository_mutation(&origin, || Ok::<(), DaemonError>(()))
+                .expect("repository mutation");
+            let waited = started.elapsed();
+            release_tx.send(()).ok();
+            waited
+        });
+        let (report, waited) = tokio::join!(fixture.run(false), observer);
+        let waited = waited.expect("observer task");
+        assert!(
+            waited < Duration::from_secs(5),
+            "repository mutation waited {waited:?} behind a parked holder proof"
+        );
+        assert_eq!(report.purged.no_output, 1);
+        assert!(!fixture.root.exists());
+    }
+
+    /// #1123: the unlocked proof is re-validated under the lock; a tree that
+    /// changed in between is retained for the next pass, not removed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn tree_changed_after_unlocked_proof_is_retained() {
+        let fixture = PurgeFixture::new();
+        let root = fixture.root.clone();
+        proof_test_hook::install(&fixture.root, move |stage| {
+            if stage != proof_test_hook::Stage::AfterProofs {
+                return;
+            }
+            std::fs::create_dir_all(root.join("target")).expect("create ignored dir");
+            std::fs::write(root.join("target").join("late"), "late writer\n")
+                .expect("write late file");
+        });
+        let report = fixture.run(false).await;
+        assert_eq!(report.retained["worktree_changed"], 1);
+        assert!(fixture.root.join("target").join("late").exists());
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
+    }
+
+    /// #1141 (#1123 F10): a holder acquired after the unlocked proof leaves the
+    /// tree digest unchanged, so only the final holder re-proof under the lock
+    /// can see it. The candidate is retained and nothing is removed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn holder_acquired_after_unlocked_proof_is_retained() {
+        let fixture = PurgeFixture::new();
+        let manager = fixture.manager();
+        let holder = Arc::new(manager.install_archive_cleanup_test_holder_proc(fixture.session_id));
+        let root = fixture.root.clone();
+        let late_holder = Arc::clone(&holder);
+        proof_test_hook::install(&fixture.root, move |stage| {
+            if stage != proof_test_hook::Stage::AfterProofs {
+                return;
+            }
+            // A task opens a file inside the tree: no tree content changes.
+            late_holder.add_fd_holder(&root.join("tracked"));
+        });
+        let report = manager
+            .run_archived_sandbox_purge(false, 32, None)
+            .await
+            .expect("purge pass");
+        assert_eq!(report.retained["proof_failed"], 1, "{report:?}");
+        assert!(fixture.root.join("tracked").exists());
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
+    }
+
+    /// #1141: the locked holder re-proof is supervised. A proof stalled in the
+    /// kernel (a hung mount) times out inside its budget, the candidate is
+    /// retained, a competing repository mutation makes progress meanwhile,
+    /// nothing is deleted, and a second pass while the helper is still blocked
+    /// is refused at once instead of stranding another thread.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn stalled_locked_holder_reproof_times_out_without_holding_the_repository_lock() {
+        let fixture = PurgeFixture::new();
+        let manager = fixture.manager();
+        let _holder = manager.install_archive_cleanup_test_holder_proc(fixture.session_id);
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked_tx = std::sync::Mutex::new(parked_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        reaper::locked_reproof_test_hook::install(&fixture.root, move || {
+            parked_tx.lock().expect("parked sender").send(()).ok();
+            let _ = release_rx
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(30));
+        });
+        let origin = fixture.repository.clone();
+        let observer = tokio::task::spawn_blocking(move || {
+            parked_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the locked re-proof helper parked");
+            let started = std::time::Instant::now();
+            git_worktree::with_repository_mutation(&origin, || Ok::<(), DaemonError>(()))
+                .expect("repository mutation");
+            started.elapsed()
+        });
+        let started = std::time::Instant::now();
+        let (report, waited) = tokio::join!(
+            manager.run_archived_sandbox_purge(false, 32, None),
+            observer
+        );
+        let report = report.expect("purge pass");
+        let waited = waited.expect("observer task");
+        assert_eq!(report.retained["proof_failed"], 1, "{report:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the purge pass was not bounded by the re-proof budget"
+        );
+        assert!(
+            waited <= reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET + Duration::from_secs(5),
+            "repository mutation waited {waited:?} behind a stalled re-proof"
+        );
+        // Nothing was deleted or finalized.
+        assert!(fixture.root.join("tracked").exists());
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
+        // The helper is still blocked: a second pass is refused immediately.
+        let second_started = std::time::Instant::now();
+        let second = manager
+            .run_archived_sandbox_purge(false, 32, None)
+            .await
+            .expect("second purge pass");
+        assert_eq!(second.retained["proof_failed"], 1, "{second:?}");
+        assert!(second_started.elapsed() < reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET);
+        assert!(fixture.root.join("tracked").exists());
+        release_tx.send(()).ok();
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]

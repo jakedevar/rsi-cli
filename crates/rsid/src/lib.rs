@@ -1,11 +1,35 @@
-//! Provider execution authority is sealed inside `rsid`.
+//! Provider execution authority is sealed inside the daemon crates.
 //!
-//! External crates cannot name either the one-use capability or the provider
-//! extension trait, so they cannot implement a raw-send provider that accepts
-//! and drops model-control authority.
+//! External crates cannot name the one-use capabilities, the admitted command
+//! and request wrappers, the admission entry points or the provider extension
+//! trait, so they cannot implement a raw-send provider that accepts and drops
+//! model-control authority. The capability types live in `rsid-store`, whose
+//! only permitted dependent is this crate (`tests/store_crate_seal.rs` enforces
+//! it, and `test-seam` never reaches a release build); the facade below keeps
+//! every item that was crate-private before the split crate-private here.
 //!
 //! ```compile_fail
 //! use rsid::model_control::ModelExecutionCapability;
+//! ```
+//!
+//! ```compile_fail
+//! use rsid::model_control::CliExecutionCapability;
+//! ```
+//!
+//! ```compile_fail
+//! use rsid::model_control::AdmittedCliCommand;
+//! ```
+//!
+//! ```compile_fail
+//! use rsid::model_control::AdmittedHttpRequest;
+//! ```
+//!
+//! ```compile_fail
+//! use rsid::model_control::admit_launch_invocation;
+//! ```
+//!
+//! ```compile_fail
+//! use rsid::idea_control::BoundControllerWriteAuthority;
 //! ```
 //!
 //! ```compile_fail
@@ -20,8 +44,7 @@ pub(crate) mod app_server_control;
 /// The bounded control worker that commits the plane's in-memory seals to
 /// durable storage (C-P2-15). Crate-private for the same reason as the plane.
 pub(crate) mod app_server_seal_worker;
-pub mod bedrock;
-pub mod bus;
+pub use rsid_store::{bedrock, bus};
 pub mod claude;
 #[doc(hidden)]
 pub mod closure_kernel;
@@ -30,28 +53,41 @@ pub mod codegraph;
 pub mod codex;
 pub mod codex_app_server;
 pub mod command_frontmatter;
-pub mod config;
+pub use rsid_store::config;
 pub mod dialectic;
 pub mod dotenv;
 pub mod dreamer;
-pub use rsid_core::{error, path_safety};
+pub(crate) use rsid_core::process_control;
+pub use rsid_core::{error, path_safety, provider_exhaustion, terminal_cause, terminal_output};
 pub mod governor;
 pub mod graph_exec;
-pub(crate) use store::daemon_restart_persistence;
-pub(crate) mod idea_control;
+pub(crate) use rsid_store::{daemon_restart_persistence, idea_control};
+pub mod agent_scratch_reclaim;
 pub mod instance_guard;
 pub mod integration;
 pub mod issue_tracker;
 pub mod mcp_config;
 pub mod memory;
-pub mod model_control;
+/// `rsid_store::model_control` as seen from outside the daemon. Every item that
+/// was crate-private before the `rsid-store` split (the capabilities, the
+/// admitted command and request wrappers, the admission entry points) stays
+/// crate-private to `rsid`: an explicit import shadows the glob.
+pub mod model_control {
+    pub use rsid_store::model_control::*;
+    pub(crate) use rsid_store::model_control::{
+        AdmittedCliCommand, AdmittedHttpRequest, AppServerDispatchOutcome,
+        CapacityAdmissionDecision, CliExecutionCapability, ModelExecutionCapability,
+        admit_capacity_invocation, admit_launch_invocation, classify_model_tier,
+        resume_unexecuted_agent_successor_admission, resume_unexecuted_capacity_delivery_admission,
+        resume_unexecuted_closure_launch_admission,
+    };
+}
 pub mod monitor;
 pub mod observation;
 pub mod ollama_client;
 pub mod openai;
 pub mod openrouter;
 pub mod pioneer;
-pub(crate) mod process_control;
 pub mod shared_target_prune;
 // Foundation module is intentionally unwired until the real scope lifecycle
 // gate passes and the provider call sites have separate ownership.
@@ -69,36 +105,41 @@ pub mod provider;
 pub(crate) mod provider_capabilities;
 pub mod provider_capability_validation;
 pub mod provider_cli;
-pub(crate) mod provider_exhaustion;
 pub mod queue;
 pub mod reconciliation;
 pub mod recursive_dag;
+pub mod remote_control;
 // Bounded source projections for operator-only Remote reads.
 pub mod agent_jobs;
 pub mod daemon_info;
 pub mod deploy;
 pub mod deploy_drain;
+pub mod deploy_operator;
 pub mod provider_status;
 #[allow(dead_code)]
 pub(crate) mod remote_read;
 pub mod rolling_queue;
 pub mod rpc;
-pub mod sandbox;
+pub use rsid_store::sandbox;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) mod satellite;
 pub mod scheduler;
 pub mod session;
 pub mod stall_classifier;
 pub mod stall_detector;
-pub mod store;
-pub(crate) mod store_support;
+pub use rsid_store::store;
+pub(crate) use rsid_store::store_support;
+pub mod launch_breadcrumbs;
+#[cfg(test)]
+mod store_split_tests;
 pub mod store_worker;
-pub mod terminal_cause;
-pub(crate) mod terminal_output;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod thread_stacks;
 pub mod tool_registry;
 pub(crate) mod topology;
 pub mod turn_controller;
-pub mod vault;
+pub use rsid_store::vault;
 pub mod watch_service;
 pub mod watchdog;
 

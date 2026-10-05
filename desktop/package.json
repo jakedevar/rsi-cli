@@ -1,0 +1,15 @@
+{
+  "name": "rsi-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p . && node scripts/copy-static.mjs",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "tauri": "cargo tauri"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

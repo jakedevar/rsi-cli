@@ -13,94 +13,75 @@ the API, so the browser holds the gateway session as an HttpOnly cookie.
 ## Requirements
 
 - `rsid` running as your normal user (the gateway reads the daemon socket).
-- Tailscale on the host and the phone, in the same tailnet.
-- Tailscale is pinned to **v1.102.3** for this design. This host's installed
-  build is **not yet qualified** — treat that as a known gap, not a guarantee.
-- The gateway must run as your normal user, never as root.
+- Tailscale on the host and the phone, in the same tailnet, with MagicDNS and
+  HTTPS certificates enabled.
+- The `rsi-remote` binary on the host. `make release-install` builds it and
+  links it to `~/.local/bin/rsi-remote`.
+- Tailscale **1.102.x, patch 3 or later** is the qualified line. The settings
+  page shows the installed version and flags anything outside it. The gateway's
+  identity checks were verified against live LocalAPI output from 1.102.4
+  (#1101): that build reports the deprecated `MachineAuthorized` as `null` for
+  an authorized device, so only an explicit `false` denies. Every other check
+  (node allowlist, owner, tags, sharer, source address, key expiry, Funnel off)
+  is unchanged. A different minor line is flagged until re-qualified.
+- The gateway runs as your normal user, never as root (the daemon manages it as
+  a systemd *user* unit).
 
-## Steps
+## One-time setup
 
-### 1. Install
-
-```bash
-cargo install --path crates/rsi-remote --locked
-```
-
-### 2. Find the IDs you need
-
-```bash
-tailscale status --json | jq '{owner: .Self.UserID, host: .Self.DNSName}'
-tailscale status --json | jq '.Peer[] | {HostName, ID}'
-sqlite3 ~/.rsi/rsi.db "select id, name from projects"
-```
-
-Use the phone's `ID` from the second command. Project IDs must be the canonical
-lowercase UUIDs from the database.
-
-### 3. Write and check the policy
+`tailscale serve` needs privilege. Grant it once, instead of using sudo every
+time:
 
 ```bash
-mkdir -p -m 700 ~/.config/rsi-remote
-rsi-remote config init ~/.config/rsi-remote/policy.toml
+sudo tailscale set --operator=$USER
 ```
 
-Edit `~/.config/rsi-remote/policy.toml`:
-
-- `enabled = true`
-- `canonical_host` — the host `DNSName` without its trailing dot
-- `owner_user_id` — the `owner` value above
-- `allowed_node_ids = ["<phone ID>"]`
-- `project_ids = ["<uuid>", ...]` — at most 32
+Optional, so the gateway also starts at boot before you log in:
 
 ```bash
-rsi-remote config check ~/.config/rsi-remote/policy.toml
+loginctl enable-linger $USER
 ```
 
-### 4. Create the socket directory
+## Use it
 
-```bash
-install -d -m 700 "$XDG_RUNTIME_DIR/rsi-remote"
-```
+1. In the TUI open **Settings → Integrations → Remote → Remote access**.
+2. Press `Tab` to move between **Devices** and **Projects**; `Space` allows a
+   device (your phone) and exposes the projects you want (at most 32). Owner id
+   and host name are detected from Tailscale; nothing is typed.
+3. Press `e` to enable. rsid validates the policy, starts the gateway as the
+   user unit `rsi-remote.service` (restarts on failure, starts at login),
+   and adds the `tailscale serve` route. The page shows gateway running, serve
+   route present, Funnel off, the Tailscale version and the URL. It refuses,
+   changing nothing, if Tailscale's HTTPS port 443 is already used by another
+   service or if its serve config cannot be read: Remote never replaces a route
+   it does not own.
+4. Enabling is all-or-nothing. If any step fails (gateway unit, serve route),
+   rsid disables the policy again, removes whatever this attempt created, keeps
+   your device and project choices and shows the error. If the serve step needs
+   privilege the page shows the exact command; run it once, then press `e` again.
+5. Open the URL on the phone: `https://<host>/`.
 
-### 5. Run the gateway (as your normal user)
+Press `e` again to disable: the policy is rewritten first (the gateway re-reads
+it per request, so access stops with the next request), then the unit is
+stopped and the serve route removed. Your device and project choices are kept.
 
-```bash
-rsi-remote run ~/.config/rsi-remote/policy.toml "$XDG_RUNTIME_DIR/rsi-remote/ingress.sock"
-```
+Never use Tailscale Funnel. RSI never enables it; the gateway refuses to serve
+while Funnel is on and the page tells you the command to turn it off.
 
-### 6. Expose it on the tailnet only
-
-```bash
-sudo tailscale serve --bg --https=443 "unix:$XDG_RUNTIME_DIR/rsi-remote/ingress.sock"
-```
-
-`sudo` may drop `XDG_RUNTIME_DIR`; expand the path yourself, for example
-`unix:/run/user/$(id -u)/rsi-remote/ingress.sock`.
-
-Never use Tailscale Funnel. The gateway refuses to serve while Funnel is on.
-
-### 7. Open it on the phone
-
-Go to `https://<canonical_host>/` in the phone browser.
-
-## Stop / disable
-
-```bash
-# Ctrl-C the gateway, then:
-sudo tailscale serve --https=443 off
-rsi-remote config disable ~/.config/rsi-remote/policy.toml
-```
-
-Disabling the policy takes effect without a restart; the gateway re-reads it per
-request.
+The policy file `~/.config/rsi-remote/policy.toml` is still the source of truth
+the gateway reads; the settings page writes it. `rsi-remote config check|show`
+still work for inspection. Remote control is operator-only: agents have no
+RPC to change the device or project lists.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 | --- | --- |
-| `403` | Phone not in `allowed_node_ids`; the Serve route is not exactly the socket; Funnel is on; `tailscaled` is not Running; the node key is expiring. |
+| `403` (plain text `forbidden`) | The page deliberately does not say which check failed. Read the host log: `journalctl --user -u rsi-remote` shows `rsi-remote: denied: <code>` (for example `node_not_allowed`, `funnel_on`, `not_authorized`, `expired`, `not_ready`), rate-limited to one line per code per 5 s. Likely causes: phone not in `allowed_node_ids`; the Serve route is not exactly the socket; Funnel is on; `tailscaled` is not Running; the node key is expiring. |
 | `401` | The gateway session expired. Reload the page to re-bootstrap. |
 | `502` | `rsid` is not running, or the daemon socket path is wrong. |
+| Page shows "One-time step pending" | Run `sudo tailscale set --operator=$USER`, then press `e` again. |
+| Gateway stopped | `systemctl --user status rsi-remote.service`; check the policy with `rsi-remote config check`. |
 | Page does not load | Check `tailscale serve` config and the socket file's permissions/ownership. |
 
 ## Qualifying the phone path (please report back)
@@ -111,9 +92,8 @@ manager.
 
 Host facts:
 
-- `tailscale version` and `sha256sum "$(command -v tailscaled)"` (the design
-  pins v1.102.3; any other build needs a quick source check before we call it
-  supported).
+- `tailscale version` and `sha256sum "$(command -v tailscaled)"` (the qualified
+  line is 1.102.x, patch 3 or later; other lines need a source check first).
 - `sudo tailscale serve status --json`: exactly one HTTPS 443 route, `/` to
   `unix:<your ingress.sock>`; and `sudo tailscale funnel status` shows Funnel off.
 - As the user that runs the gateway (not root): `tailscale status --json >/dev/null && echo ok`
@@ -143,6 +123,8 @@ Walkthrough on the phone:
   kept on screen).
 - Updates are polled while the page is visible; there is no push stream.
 - No actions.
-- The installed Tailscale build and a real phone have not been qualified yet
-  (#879 / #880); the gateway passed an independent network-exposure review.
+- Tailscale 1.102.4 whois output is covered by a captured-fixture test (#1101),
+  and 1.102.x patch 3+ is the qualified line; the gateway passed an independent
+  network-exposure review. A full phone walkthrough is still worth reporting
+  back (#879 / #880).
 - Waiting questions show that a question exists, not its text.

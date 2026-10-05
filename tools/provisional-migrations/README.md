@@ -11,8 +11,8 @@ commit; it is retained as historical evidence after landing.
   "version": 130,
   "files": [
     {
-      "path": "crates/rsid/src/store/migrations/v130.rs",
-      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "path": "crates/rsid-store/src/store/migrations/v130.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
       "source_blob": "sha256:<64 lowercase hex digits>",
       "sites": [
         {
@@ -31,7 +31,7 @@ commit; it is retained as historical evidence after landing.
 }
 ```
 
-A migration is one new file, `crates/rsid/src/store/migrations/vNNN.rs`
+A migration is one new file, `crates/rsid-store/src/store/migrations/vNNN.rs`
 (three-digit name). The schema head is the highest file, so there is no shared
 constant or list to declare; `crates/rsid/build.rs` collects the files. The
 declaration must name that file with a `v${VERSION}.rs` template and a `unit`

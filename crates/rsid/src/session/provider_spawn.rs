@@ -1159,13 +1159,21 @@ mod route_tests {
             assert!(reason.contains("vendor/allowed-model"), "{reason}");
         }
 
-        // The continuation's stored id is the bare form of a `[1m]` launch.
-        runtime
-            .update_field(
-                "launch_model_allowlist",
-                &serde_json::json!(["vendor/allowed-model[1m]"]),
-            )
-            .unwrap();
+        // A bracket suffix is part of a non-Claude model string (OpenRouter
+        // preserves it on the wire), so it never rides the bare allowlist entry.
+        let tagged = route_config("vendor/allowed-model[bogus]".to_string());
+        let refused = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &tagged,
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        );
+        let Err(DaemonError::PolicyDenied(reason)) = refused else {
+            panic!("a fabricated variant tag must be refused");
+        };
+        assert!(reason.contains("launch_model_not_allowed"), "{reason}");
+
         let config = route_config("vendor/allowed-model".to_string());
         let (mut process, _) = spawn_provider_process(
             SessionProvider::OpenRouter,

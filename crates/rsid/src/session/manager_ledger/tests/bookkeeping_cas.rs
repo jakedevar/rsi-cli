@@ -5,7 +5,7 @@ use crate::error::Result;
 #[tokio::test]
 async fn ownership_expansion_survives_work_row_advance_and_keeps_ownership_cas() -> Result<()> {
     let f = fixture().await;
-    let initial_files = vec!["crates/rsid/src/store/a.rs".to_string()];
+    let initial_files = vec!["crates/rsid-store/src/store/a.rs".to_string()];
     let initial = f
         .handle
         .agent_manager_update(
@@ -45,9 +45,9 @@ async fn ownership_expansion_survives_work_row_advance_and_keeps_ownership_cas()
         .await?;
 
     let expanded_files = vec![
-        "crates/rsid/src/store/a.rs".to_string(),
-        "crates/rsid/src/store/b.rs".to_string(),
-        "crates/rsid/src/store/c.rs".to_string(),
+        "crates/rsid-store/src/store/a.rs".to_string(),
+        "crates/rsid-store/src/store/b.rs".to_string(),
+        "crates/rsid-store/src/store/c.rs".to_string(),
     ];
     let expansion = f
         .handle
@@ -120,7 +120,7 @@ async fn ownership_expansion_still_refuses_an_exclusive_domain_conflict() -> Res
                     expected_row_version: 0,
                     domain: "store-ledger".into(),
                     mode: ManagerOwnershipModeV2::Exclusive,
-                    files: vec!["crates/rsid/src/store/a.rs".into()],
+                    files: vec!["crates/rsid-store/src/store/a.rs".into()],
                     active: true,
                 },
                 "ownership-domain-owner",
@@ -161,7 +161,7 @@ async fn ownership_expansion_still_refuses_an_exclusive_domain_conflict() -> Res
                     expected_row_version: 0,
                     domain: "store-ledger".into(),
                     mode: ManagerOwnershipModeV2::Exclusive,
-                    files: vec!["crates/rsid/src/store/b.rs".into()],
+                    files: vec!["crates/rsid-store/src/store/b.rs".into()],
                     active: true,
                 },
                 "ownership-domain-conflict",
@@ -231,7 +231,7 @@ fn source_bound_update_classification_is_explicit() {
         expected_row_version: 1,
         domain: "store-ledger".into(),
         mode: ManagerOwnershipModeV2::Exclusive,
-        files: vec!["crates/rsid/src/store/a.rs".into()],
+        files: vec!["crates/rsid-store/src/store/a.rs".into()],
         active: true,
     };
     let source_bound = ManagerUpdateV2::Stage {
@@ -325,7 +325,7 @@ async fn ownership_update_commits_across_concurrent_work_row_advance() -> Result
                     expected_row_version: 0,
                     domain: "store-ledger".into(),
                     mode: ManagerOwnershipModeV2::Exclusive,
-                    files: vec!["crates/rsid/src/store/a.rs".into()],
+                    files: vec!["crates/rsid-store/src/store/a.rs".into()],
                     active: true,
                 },
                 "ownership-initial",
@@ -345,7 +345,7 @@ async fn ownership_update_commits_across_concurrent_work_row_advance() -> Result
                         expected_row_version: 1,
                         domain: "store-ledger".into(),
                         mode: ManagerOwnershipModeV2::Exclusive,
-                        files: vec!["crates/rsid/src/store/b.rs".into()],
+                        files: vec!["crates/rsid-store/src/store/b.rs".into()],
                         active: true,
                     },
                     "ownership-race",

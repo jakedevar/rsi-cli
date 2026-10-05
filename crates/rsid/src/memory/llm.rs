@@ -647,6 +647,7 @@ async fn generate_api(
                 tools: Vec::new(),
                 stream: false,
                 reasoning_effort: None,
+                context_editing: false,
             },
             execution,
         )

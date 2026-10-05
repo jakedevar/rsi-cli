@@ -573,6 +573,137 @@ async fn ineligible_parents_get_no_valve_row() {
 
 // ---- AC4: no second writer ------------------------------------------------
 
+/// #1157: resumes the `blocked` target through the real bounded effect
+/// admission wait on a custody stripe the test holds; every other target
+/// resumes at once.
+struct StripeBlockedLauncher {
+    store: Arc<Mutex<Store>>,
+    blocked: Uuid,
+    custody_id: Uuid,
+    resumes: StdMutex<Vec<Uuid>>,
+}
+
+#[async_trait::async_trait]
+impl SessionLauncher for StripeBlockedLauncher {
+    async fn launch(&self, _: LaunchConfig) -> crate::error::Result<Uuid> {
+        panic!("a resume must never launch a session");
+    }
+
+    async fn launch_scheduled_fresh(&self, _: LaunchConfig, _: bool) -> crate::error::Result<Uuid> {
+        panic!("a resume must never launch a Fresh session");
+    }
+
+    async fn resume_scheduled(&self, target: Uuid, _: String) -> crate::error::Result<Uuid> {
+        self.resume_scheduled_job(target, String::new(), Vec::new())
+            .await
+    }
+
+    async fn resume_scheduled_job(
+        &self,
+        target: Uuid,
+        _: String,
+        _: Vec<Uuid>,
+    ) -> crate::error::Result<Uuid> {
+        if target == self.blocked {
+            let admitted = crate::store::custody_lock_order::lock_store_then_root_within(
+                &self.store,
+                self.custody_id,
+                crate::store::custody_lock_order::admission_wait(),
+            )
+            .await;
+            if admitted.is_none() {
+                return Err(crate::sandbox::custody::CustodyService::refusal(
+                    rsi_common::types::SandboxCustodyErrorCodeV1::RootBusy,
+                    Some(target),
+                    rsi_common::types::SandboxCustodyTransitionV1::EffectRevalidation,
+                ));
+            }
+        }
+        self.resumes.lock().unwrap().push(target);
+        Ok(target)
+    }
+
+    async fn fire_watch(&self, _: &ScheduledJob) -> crate::error::Result<WatchFireOutcome> {
+        Ok(WatchFireOutcome::NotReady)
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_wake_blocked_on_a_held_custody_stripe_backs_off_and_an_unrelated_wake_still_fires() {
+    let world = world(1000).await;
+    let other = Uuid::new_v4();
+    world
+        .store
+        .lock()
+        .await
+        .insert_session(&session(other, "Completed", 1000))
+        .unwrap();
+    // The blocked wake is due first, so the sequential scheduler reaches it
+    // before the unrelated wake.
+    let blocked_wake = due_resume(&world, 20).await;
+    let mut unrelated_wake = agent_job(other, "resume", None, Some("unrelated".into()), Some(60));
+    let due = Utc::now() - chrono::Duration::seconds(10);
+    unrelated_wake.schedule.anchor = due;
+    unrelated_wake.next_fire_at = due;
+    world
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&unrelated_wake)
+        .unwrap();
+
+    let custody_id = Uuid::new_v4();
+    let launcher = Arc::new(StripeBlockedLauncher {
+        store: Arc::clone(&world.store),
+        blocked: world.parent,
+        custody_id,
+        resumes: StdMutex::new(Vec::new()),
+    });
+    // An unrelated purge parks on the stripe for far longer than the budget.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _root = crate::store::sandbox_custody::lock_custody_root(custody_id);
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+    crate::store::custody_lock_order::set_bounded_wait_for_test(Some(
+        std::time::Duration::from_millis(100),
+    ));
+
+    let dynamic: Arc<dyn SessionLauncher> = launcher.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        process_due_jobs(&world.store, &world.bus, &dynamic, None),
+    )
+    .await
+    .expect("the scheduler tick finishes while the first stripe is still held");
+
+    assert_eq!(
+        launcher.resumes.lock().unwrap().clone(),
+        vec![other],
+        "the unrelated wake advanced while the stripe was held"
+    );
+    let retained = job(&world, blocked_wake.id).await;
+    assert!(retained.enabled, "the busy wake is retained, not consumed");
+    assert!(
+        world
+            .store
+            .lock()
+            .await
+            .continuation_retry(blocked_wake.id)
+            .unwrap()
+            .is_some_and(|retry| retry.last_code == "custody_root_busy"),
+        "the busy wake recorded its bounded backoff"
+    );
+
+    crate::store::custody_lock_order::set_bounded_wait_for_test(None);
+    drop(release_tx);
+    holder.join().unwrap();
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn a_busy_parent_retries_the_same_row_and_never_launches_a_writer() {
@@ -615,7 +746,7 @@ fn the_autonomy_modules_never_reference_a_fresh_or_provider_launch() {
         ("scheduler/child_gate.rs", include_str!("child_gate.rs")),
         (
             "store/child_autonomy.rs",
-            include_str!("../store/child_autonomy.rs"),
+            include_str!("../../../rsid-store/src/store/child_autonomy.rs"),
         ),
     ] {
         for needle in &forbidden {

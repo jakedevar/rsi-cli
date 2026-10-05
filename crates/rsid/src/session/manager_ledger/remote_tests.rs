@@ -95,7 +95,7 @@ if sys.argv[3] == 'same':
     t.write(worktree, 'docs/accepted.txt', 'accepted line\n')
     # Like #884's migration_allocation.rs: a protected section in an
     # undeclared file, appended last and reordered by the landing inventory.
-    catalog = 'crates/rsid/src/store/alpha_catalog.rs'
+    catalog = 'crates/rsid-store/src/store/alpha_catalog.rs'
     t.write(worktree, catalog, '// RSI-RELEASED-MIGRATION-BEGIN: alpha-catalog\npub const ALPHA: &str = "alpha";\n// RSI-RELEASED-MIGRATION-END: alpha-catalog\n')
     tracked = renumber.guard.tracked_source_paths(renumber.revision_inventory(t.repo, source))
     files = {name: (worktree / name).read_text() for name in tracked}
@@ -104,9 +104,9 @@ if sys.argv[3] == 'same':
     t.git(worktree, 'add', 'docs/accepted.txt', catalog, renumber.MANIFEST)
     t.git(worktree, 'commit', '-q', '-m', 'accepted document')
     source = t.git(worktree, 'rev-parse', 'HEAD')
-    cohort = 'crates/rsid/src/store/cohort_settlement.rs'
+    cohort = 'crates/rsid-store/src/store/cohort_settlement.rs'
     t.write(t.repo, cohort, '// RSI-RELEASED-MIGRATION-BEGIN: target-extra\n// target\n// RSI-RELEASED-MIGRATION-END: target-extra\n')
-    paths = [renumber.STORE, cohort, 'crates/rsid/src/store/tests.rs']
+    paths = [renumber.STORE, cohort, 'crates/rsid-store/src/store/tests.rs']
     files = {name: (t.repo / name).read_text() for name in paths}
     inventory = renumber.guard.inventory(files)
     t.write(t.repo, renumber.MANIFEST, json.dumps(inventory, indent=2) + '\n')
@@ -320,11 +320,11 @@ async fn accepted_content_provisional_transform_still_rejects_dropped_accepted_l
             &fixture_string(&fixture, "candidate"),
         ],
     );
-    let store = repo.join("crates/rsid/src/store/mod.rs");
+    let store = repo.join("crates/rsid-store/src/store/mod.rs");
     let original = std::fs::read_to_string(&store).unwrap();
     assert_eq!(original.matches("// V131: beta migration\n").count(), 1);
     std::fs::write(&store, original.replace("// V131: beta migration\n", "")).unwrap();
-    git(&repo, &["add", "crates/rsid/src/store/mod.rs"]);
+    git(&repo, &["add", "crates/rsid-store/src/store/mod.rs"]);
     git(
         &repo,
         &["commit", "-q", "-m", "drop accepted migration line"],

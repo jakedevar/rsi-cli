@@ -6,6 +6,7 @@ mod manager_actions;
 mod terminal_cause;
 mod terminal_watch_owner;
 mod transient_heal;
+mod worker_no_result;
 
 use super::types::{PIPELINE_PATH_RE, TerminalFinalizeDecision};
 use super::*;
@@ -32,24 +33,9 @@ use uuid::Uuid;
 
 /// A fixture directory on the Cargo target filesystem, never `$TMPDIR`.
 ///
-/// Sandbox execution scratch refuses a sandbox root on tmpfs/ramfs, and the
-/// rolling lander runs its test gates with `TMPDIR` on `/dev/shm`. A fixture
-/// under `$TMPDIR` therefore failed every candidate launch in the gate while
-/// passing on a developer host. The lander requires `CARGO_TARGET_DIR` outside
-/// the system temp directory.
+/// Disk-backed fixture dir (never under `$TMPDIR`); see `crate::test_support`.
 fn disk_backed_tempdir() -> TempDir {
-    let base = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
-        .join("rsid-session-fixtures");
-    std::fs::create_dir_all(&base).unwrap();
-    // Sandbox allocation refuses a non-canonical base, and the fallback above
-    // contains `..` whenever CARGO_TARGET_DIR is unset (daemon test jobs).
-    let base = std::fs::canonicalize(&base).unwrap();
-    tempfile::Builder::new()
-        .prefix("session-")
-        .tempdir_in(base)
-        .unwrap()
+    crate::test_support::disk_backed_tempdir("session-")
 }
 
 fn manager() -> (SessionManager, TempDir) {
@@ -8089,6 +8075,135 @@ async fn busy_master_delivery_defers_to_not_ready() {
         crate::issue_tracker::poller::WatchFireOutcome::NotReady,
         "busy master must map to NotReady (row stays armed)"
     );
+}
+
+/// #653: a refused watch delivery is counted with its typed code and never
+/// stamps `last_fired_at`; the give-up then names the last refusal. A watch
+/// with no recorded refusal keeps the historical "no provider output" reason,
+/// and an accepted delivery (cleared state) resets the count.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
+async fn watch_give_up_names_last_refusal_not_missing_provider_output() {
+    let (manager, _dir) = manager();
+    let master = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    insert_row(&manager, &bare_session(master)).await;
+    let mut stale_child = bare_session(child);
+    stale_child.updated_at =
+        chrono::Utc::now() - super::WATCH_DELIVERY_GIVE_UP_AFTER - chrono::Duration::minutes(1);
+    insert_row(&manager, &stale_child).await;
+
+    let mut job = mk_watch_job_for(child, master, "note");
+    job.last_fired_at = Some(chrono::Utc::now());
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&job)
+        .unwrap();
+
+    // No refusal recorded: the historical wording stands.
+    match manager.plan_terminal_watch_fire(&job).await.expect("plan") {
+        super::WatchFirePlan::AbandonUnconsumed(delivery) => {
+            assert!(delivery.reason().contains("no provider output"));
+        }
+        other => panic!("expected give-up, got {other:?}"),
+    }
+
+    let refusal = "sandbox_custody:cleanup_failed";
+    for expected in 1..=3u32 {
+        let count = manager
+            .store
+            .lock()
+            .await
+            .record_watch_refusal(job.id, refusal, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(count, expected);
+    }
+    match manager.plan_terminal_watch_fire(&job).await.expect("plan") {
+        super::WatchFirePlan::AbandonUnconsumed(delivery) => {
+            let reason = delivery.reason();
+            assert!(
+                reason.contains(&format!("continuation_refused:{refusal}")),
+                "{reason}"
+            );
+            assert!(reason.contains("3 refusals"), "{reason}");
+            assert!(!reason.contains("no provider output"), "{reason}");
+        }
+        other => panic!("expected give-up, got {other:?}"),
+    }
+
+    // An accepted delivery clears the count.
+    manager
+        .store
+        .lock()
+        .await
+        .clear_continuation_retry(job.id)
+        .unwrap();
+    assert_eq!(
+        manager.store.lock().await.watch_refusal(job.id).unwrap(),
+        None
+    );
+}
+
+/// #653: refusals are typed. A non-fence continue failure is counted as a
+/// refusal, leaves `last_fired_at` null and the row armed, and a sandbox
+/// custody token in the error becomes the typed code.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
+async fn refused_watch_delivery_is_counted_and_never_stamps_last_fired() {
+    use crate::error::DaemonError;
+    assert_eq!(
+        super::watch_refusal_code(&DaemonError::InvalidParam(
+            "continuation_tip_changed: moved".into()
+        )),
+        "continuation_tip_changed"
+    );
+    assert_eq!(
+        super::watch_refusal_code(&DaemonError::InvalidParam(
+            "launch refused (sandbox_custody:cleanup_failed): x".into()
+        )),
+        "sandbox_custody:cleanup_failed"
+    );
+    assert_eq!(
+        super::watch_refusal_code(&DaemonError::InvalidParam("boom".into())),
+        "continue_failed"
+    );
+
+    let (manager, _dir) = manager();
+    let child = Uuid::new_v4();
+    let master = Uuid::new_v4();
+    insert_row(&manager, &bare_session(child)).await;
+    // A terminal master with no resumable provider state refuses the
+    // continuation with a non-fence error.
+    let mut master_row = bare_session(master);
+    master_row.status = SessionStatus::Completed;
+    insert_row(&manager, &master_row).await;
+    let job = mk_watch_job_for(child, master, "");
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&job)
+        .unwrap();
+
+    let outcome = manager.fire_terminal_watch(&job).await.expect("fire");
+    assert_eq!(
+        outcome,
+        crate::issue_tracker::poller::WatchFireOutcome::NotReady
+    );
+    let store = manager.store.lock().await;
+    let refusal = store
+        .watch_refusal(job.id)
+        .unwrap()
+        .expect("refusal counted");
+    assert_eq!(refusal.count, 1);
+    assert!(!refusal.code.is_empty());
+    let row = store.get_scheduled_job(&job.id).unwrap().unwrap();
+    assert!(row.enabled, "a refusal keeps the watch armed");
+    assert_eq!(row.last_fired_at, None);
 }
 
 /// K2 design test 6 (child watch): a retryable fence refusal (busy tip)

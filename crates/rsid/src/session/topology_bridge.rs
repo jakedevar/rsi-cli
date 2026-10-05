@@ -26,21 +26,7 @@ use uuid::Uuid;
 
 // ─── P1.12 §9: bridge-side workflows-table upsert ────────────────────────────
 
-/// Stable namespace for v5-derived workflow ids that mirror topologies.
-///
-/// **MUST NEVER CHANGE across releases** — the v5 algebra depends on a fixed
-/// namespace UUID. Bumping it would break idempotency for every already-
-/// mirrored topology (new id ≠ old id), creating orphan duplicates.
-const BRIDGE_NAMESPACE_UUID: Uuid = uuid::uuid!("c5c5f8d6-3d6a-4f5e-9b4e-1f8c3a7d6b9e");
-
-/// Derive the deterministic workflow row id for a given topology.
-///
-/// The bridge mirrors each topology into the `workflows` table for `gv`-picker
-/// visibility. The mirrored row's primary key is `Uuid::new_v5(NS, topology_id)`
-/// so the upsert path is idempotent via `ON CONFLICT(id) DO UPDATE`.
-pub(crate) fn derive_workflow_id(topology_id: Uuid) -> Uuid {
-    Uuid::new_v5(&BRIDGE_NAMESPACE_UUID, topology_id.as_bytes())
-}
+pub(crate) use crate::store_support::topology_validation::derive_workflow_id;
 
 // ─── BridgeError ─────────────────────────────────────────────────────────────
 

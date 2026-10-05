@@ -16,8 +16,8 @@
 mod agent_jobs_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
-pub(crate) mod agent_message_dispatcher;
-pub(crate) mod agent_message_reconciler;
+pub(crate) mod tree_admission;
+pub(crate) use rsid_store::store::{agent_message_dispatcher, agent_message_reconciler};
 mod agent_read_events;
 pub mod agent_verbs;
 mod archive_cleanup;
@@ -28,13 +28,15 @@ pub mod chain_driver;
 mod cohort_settlement;
 mod completed_transcript_cache;
 mod completion_gates_launch;
+mod context_cap;
 mod context_pipeline;
 mod context_succession;
 mod daemon_info_verb;
-mod failure_signature_verb;
 mod delegated_operator;
 pub(crate) mod deploy_verb;
 mod esp_games;
+mod failure_signature_verb;
+mod global_manager_verbs; // #872 Slice B
 pub(crate) mod graph_executions;
 pub(crate) mod graph_runner;
 pub(crate) mod harness;
@@ -47,6 +49,7 @@ mod launch;
 pub(crate) mod lifecycle;
 pub(crate) mod manager_actions;
 mod manager_coordinator;
+mod manager_issue_worker; // #1100
 pub(crate) mod manager_ledger;
 pub(crate) mod manager_reviews;
 mod manager_succession;
@@ -64,6 +67,7 @@ mod reaper;
 pub mod retention;
 mod rolling_queue_verb;
 mod satellite_message_verb;
+mod satellite_report_verb;
 mod tool_policy_launch;
 #[cfg(test)]
 pub(crate) use reaper::fail_runtime_orphan_reap_for_test;
@@ -84,9 +88,10 @@ pub(crate) mod title;
 pub(crate) mod topology_agent_verbs;
 pub(crate) mod topology_bridge;
 pub(crate) mod topology_ops;
-pub(crate) mod transient_heal;
+pub(crate) use rsid_store::store::session_transient_heal as transient_heal;
 pub mod types;
 pub(crate) mod until_evaluator;
+pub(crate) mod worker_result_guard;
 mod workflows;
 
 #[cfg(test)]
@@ -416,6 +421,8 @@ pub struct SessionManager {
     /// not process-global: a global guard made concurrent managers (parallel
     /// tests in one process) return `Ok(0)` without reconciling (#1095).
     pub(crate) manager_action_reconcile: tokio::sync::Mutex<()>,
+    /// #1118: per-step launch deadline for manager create/replace actions.
+    pub(crate) manager_launch_step_deadline: std::sync::Mutex<std::time::Duration>,
     /// Restart evidence is fixed for this daemon incarnation. A health read
     /// can return it even while another task holds the Store mutex.
     pub(crate) latest_daemon_restart: Option<rsi_common::rpc::DaemonRestartRecordV1>,
@@ -712,6 +719,9 @@ impl SessionManager {
             agent_tokens: Arc::new(RwLock::new(AgentTokenRegistry::default())),
             program_run_boot_id,
             manager_action_reconcile: tokio::sync::Mutex::new(()),
+            manager_launch_step_deadline: std::sync::Mutex::new(
+                manager_actions::MANAGER_LAUNCH_STEP_DEADLINE,
+            ),
             latest_daemon_restart,
             spawn_epoch: Arc::new(AtomicU64::new(1)),
             agent_message_arbiter,
@@ -1371,10 +1381,7 @@ pub(super) async fn revoke_agent_tokens_for_session(
 // A8 terminal watch — daemon-owned watcher bridge (plan §3.4).
 // ---------------------------------------------------------------------------
 
-/// Depth cap for the rotation-lineage chase (`continued_from` successors).
-/// Rotation chains are short in practice; the cap only bounds pathological
-/// or cyclic data.
-pub(crate) const WATCH_LINEAGE_DEPTH_CAP: usize = 8;
+pub(crate) use crate::store_support::watch_limits::WATCH_LINEAGE_DEPTH_CAP;
 
 /// A8 fire decision for one watched session, derived from its PERSISTED row
 /// (never the bus event or the active-map snapshot — the §3.6 ordering
@@ -1540,11 +1547,27 @@ impl SessionManager {
             .await
             .get(&watched)
             .is_some_and(|cs| cs.retry_cancel.is_some() || cs.retry_fired_at.is_some());
-        let decision = watch_fire_decision(
+        let mut decision = watch_fire_decision(
             row.as_ref().map(|s| s.status),
             retry_eligible,
             live_retry_timer,
         );
+        // #1109: a Completed worker whose automatic no-result continuation is
+        // still armed is not done: hold the watch. It fires on the final
+        // Completed, or once the continuation is retired or declined.
+        if matches!(decision, WatchDecision::Fire { .. })
+            && row
+                .as_ref()
+                .is_some_and(|s| s.status == rsi_common::types::SessionStatus::Completed)
+            && self
+                .store
+                .lock()
+                .await
+                .no_result_wake_pending(watched)
+                .unwrap_or(false)
+        {
+            decision = WatchDecision::NotReady;
+        }
         Ok((decision, row))
     }
 
@@ -1762,6 +1785,14 @@ impl SessionManager {
             // slide forward with our own retries the way `last_fired_at` does.
             let unconsumed_for = chrono::Utc::now().signed_duration_since(primary_row.updated_at);
             if unconsumed_for > WATCH_DELIVERY_GIVE_UP_AFTER {
+                // #653: name the last refused delivery, if any, rather than
+                // blaming missing provider output.
+                let last_refusal = self
+                    .store
+                    .lock()
+                    .await
+                    .watch_refusal(job.id)?
+                    .map(|refusal| (refusal.code, refusal.count));
                 // Typed (issue #648): the scheduler settles this exactly like
                 // `Abandon`, then records the tip's health fact and, for a
                 // managed Epic lead, a manager notice.
@@ -1770,6 +1801,7 @@ impl SessionManager {
                         tip,
                         watched,
                         minutes: unconsumed_for.num_minutes(),
+                        last_refusal,
                     },
                 ));
             }
@@ -2044,6 +2076,7 @@ impl SessionManager {
                         let code = crate::store::manager_actions::fence::continuation_fence_code(&e)
                             .unwrap_or("continuation_fence")
                             .to_string();
+                        self.note_watch_refusal(job, tip, &code, &e, true).await;
                         let recorded = self.store.lock().await.record_continuation_retry(
                             job.id,
                             &code,
@@ -2078,11 +2111,15 @@ impl SessionManager {
                         if crate::error::is_retryable_custody_wake_error(&e) {
                             return Ok(WatchFireOutcome::CustodyUnavailable);
                         }
-                        tracing::debug!(
-                            job_id = %job.id,
-                            error = %e,
-                            "terminal watch delivery deferred (master busy or continue failed); staying armed"
-                        );
+                        let code = watch_refusal_code(&e);
+                        self.note_watch_refusal(job, tip, &code, &e, !managed).await;
+                        crate::scheduler::record_custody_refusal_notice(
+                            &self.store,
+                            job,
+                            tip,
+                            &e,
+                        )
+                        .await;
                         Ok(WatchFireOutcome::NotReady)
                     }
                 }
@@ -2091,7 +2128,69 @@ impl SessionManager {
     }
 }
 
+/// Typed code of a refused watch delivery: the continuation fence code, else
+/// the `sandbox_custody:<code>` token the launch refusal carries, else
+/// `continue_failed`.
+fn watch_refusal_code(error: &crate::error::DaemonError) -> String {
+    if let Some(code) = crate::store::manager_actions::fence::continuation_fence_code(error) {
+        return code.to_string();
+    }
+    let text = error.to_string();
+    text.find("sandbox_custody:")
+        .map(|at| {
+            text[at..]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                .next()
+                .unwrap_or("sandbox_custody")
+                .to_string()
+        })
+        .unwrap_or_else(|| "continue_failed".to_string())
+}
+
 impl SessionManager {
+    /// #653: surface a refused watch delivery. A busy master is expected
+    /// back-pressure and stays at debug; every other refusal logs at warn with
+    /// its typed code and, for an ordinary child watch (`record`), is counted
+    /// durably so the give-up reason can name it. Never alters when the watch
+    /// fires or gives up.
+    async fn note_watch_refusal(
+        &self,
+        job: &rsi_common::types::ScheduledJob,
+        tip: Uuid,
+        code: &str,
+        error: &crate::error::DaemonError,
+        record: bool,
+    ) {
+        if code == crate::store::manager_actions::fence::CONTINUATION_TARGET_BUSY {
+            tracing::debug!(job_id = %job.id, %tip, "terminal watch delivery deferred: master busy");
+            return;
+        }
+        let count = if record {
+            match self
+                .store
+                .lock()
+                .await
+                .record_watch_refusal(job.id, code, chrono::Utc::now())
+            {
+                Ok(count) => Some(count),
+                Err(record_error) => {
+                    tracing::error!(%record_error, job_id = %job.id, "could not count watch refusal");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        tracing::warn!(
+            job_id = %job.id,
+            %tip,
+            refusal = code,
+            refusals = count,
+            %error,
+            "terminal watch delivery refused; staying armed"
+        );
+    }
+
     /// Shared scheduled delivery. With `job_ids`, the exact job rows are
     /// revalidated under the target spawn guard before any provider effect.
     async fn resume_scheduled_for(

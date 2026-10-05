@@ -85,10 +85,10 @@ CLOSE-ON-AUDIT and drop its slice.
 **Step B — RESOLVE THE THREE BLOCKER QUESTIONS, AND MUTATE SCOPE FROM THE ANSWERS**
 (not merely record them). Known answers to start from (verify, then propagate):
 
-- `compiled_prompts` is DB-BACKED (`crates/rsid/src/store/mod.rs:~722`), NOT git.
+- `compiled_prompts` is DB-BACKED (`crates/rsid-store/src/store/mod.rs:~722`), NOT git.
   ⇒ D4/S11 reversibility requires DB-level prompt versioning + rollback; git alone is
   insufficient. Rewrite S11's manifest accordingly.
-- `rsi-graph::CacheKey` is PERSISTED in `crates/rsid/src/store/graph_cache.rs` (3
+- `rsi-graph::CacheKey` is PERSISTED in `crates/rsid-store/src/store/graph_cache.rs` (3
   columns). ⇒ D6/S10 is a schema-migration slice; expand its manifest (below).
 - `retry_attempt` "corrective burn" vs routine-retry classification: CONFIRM where (if
   anywhere) this distinction is made; it gates D4 signal quality. If absent, S11 must
@@ -161,7 +161,7 @@ meta-harness TND#17). Verify the tag, then stop and ask Jake before Tier 2.
   break freeze for an unmeasured prompt change).
 - S10 · D6 Content-staleness · extend `CacheKey` with artifact-content hashes AND its
   persistence. MANIFEST (schema-migration gate): `crates/rsi-graph/src/cache.rs` +
-  `crates/rsid/src/store/graph_cache.rs` + a store migration with `user_version` bump +
+  `crates/rsid-store/src/store/graph_cache.rs` + a store migration with `user_version` bump +
   persistence tests + review of RPC cache-hit/miss behavior +
   `recursive_dag/scheduler_core.rs` staleness check. Hash-based first, semantic later.
 - S11 · D4 Edit-source loop — MVP, PROPOSE-ONLY · capture correction signals (human

@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -123,6 +124,65 @@ class ReleasedMigrationRefreshTest(unittest.TestCase):
             updated["protected_sections"]["delta-catalog"]["path"],
             "crates/rsid/src/store/delta.rs",
         )
+
+    def test_a_store_moved_to_the_new_layout_still_validates_against_the_old_base(self):
+        # #1021 S4: the store moved from crates/rsid to crates/rsid-store. The
+        # base revision keeps the pre-split layout; the head is the new one.
+        # Re-create the base in the old layout, then move the whole store tree.
+        old_root = "crates/rsid/src/store"
+        new_root = GUARD.STORE_ROOTS[0]
+        self.git("rm", "-q", "-r", "--cached", ".")
+        shutil.rmtree(self.repo / "crates")
+        files = {
+            f"{old_root}/mod.rs": self.store(),
+            f"{old_root}/cohort_settlement.rs": "",
+            f"{old_root}/alpha.rs": self.section("alpha-catalog"),
+            f"{old_root}/beta.rs": self.section("beta-catalog"),
+        }
+        for name, value in files.items():
+            self.write(name, value)
+        legacy = GUARD.inventory(files)
+        self.assertEqual(legacy["migration_file"], f"{old_root}/mod.rs")
+        self.write(GUARD.MANIFEST_PATH, json.dumps(legacy, indent=2) + "\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "pre-split layout")
+        self.git("mv", "crates/rsid", "crates/rsid-store")
+        moved = {name.replace("crates/rsid/", "crates/rsid-store/"): value for name, value in files.items()}
+        self.write(GUARD.MANIFEST_PATH, json.dumps(GUARD.inventory(moved), indent=2) + "\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "move the store")
+        run = lambda: subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"), "HEAD^", "HEAD"],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+        passed = run()
+        self.assertEqual(passed.returncode, 0, passed.stderr + passed.stdout)
+        self.write(f"{new_root}/alpha.rs", self.section("alpha-catalog").replace("fn apply", "pub fn changed_apply"))
+        self.write(GUARD.MANIFEST_PATH, json.dumps(GUARD.inventory({**moved, f"{new_root}/alpha.rs": (self.repo / f"{new_root}/alpha.rs").read_text()}), indent=2) + "\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "edit a released section")
+        refused = run()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("alpha-catalog", refused.stderr)
+
+    def test_a_revision_with_migrations_in_both_store_layouts_is_refused(self):
+        # build.rs consumes only the new directory: an old-path unit (with a
+        # refreshed manifest) would be a contiguous append that never runs.
+        old_unit = "crates/rsid/src/store/migrations/v003.rs"
+        new_unit = f"{GUARD.MIGRATION_DIR}/v002.rs"
+        self.write(new_unit, "if version < 2 {\n    migrate_v2();\n}\n")
+        self.write(old_unit, "if version < 3 {\n    migrate_v3();\n}\n")
+        files = {
+            GUARD.MIGRATION_PATH: self.store(),
+            new_unit: (self.repo / new_unit).read_text(),
+            old_unit: (self.repo / old_unit).read_text(),
+        }
+        with self.assertRaisesRegex(GUARD.GuardError, "more than one store layout"):
+            GUARD.inventory(files)
+        # The refresh path reads the worktree the same way and refuses too.
+        refused = self.refresh()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("more than one store layout", refused.stderr)
 
     def test_markers_quoted_outside_rust_sources_do_not_affect_refresh(self):
         # Plans and fixtures quote real sections; only crates/**/*.rs pins count.

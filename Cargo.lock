@@ -4105,8 +4105,10 @@ dependencies = [
  "rsi-codegraph",
  "rsi-common",
  "rsi-graph",
+ "rsi-remote",
  "rsid",
  "rsid-core",
+ "rsid-store",
  "rusqlite",
  "rustix 1.1.3",
  "serde",
@@ -4137,11 +4139,55 @@ dependencies = [
 name = "rsid-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "nix 0.29.0",
  "rsi-common",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "rsid-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "chrono",
+ "dirs 5.0.1",
+ "futures",
+ "hex",
+ "libsqlite3-sys",
+ "nix 0.29.0",
+ "parking_lot",
+ "proc-macro2",
+ "rand 0.8.6",
+ "reqwest",
+ "rsi-codegraph",
+ "rsi-common",
+ "rsi-graph",
+ "rsid-core",
+ "rsid-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]

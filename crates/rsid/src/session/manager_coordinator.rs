@@ -272,6 +272,54 @@ impl SessionManager {
         Ok(changed)
     }
 
+    /// #1102: tell the appointed manager its saved policy was revoked by an
+    /// operator scope action (re-appoint, scope edit or clear). Best effort:
+    /// delivery waits out a busy turn (the continuation fence refuses a busy
+    /// tip) and gives up after about ten minutes.
+    pub(crate) fn notify_manager_policy_revoked(
+        self: &std::sync::Arc<Self>,
+        project: Uuid,
+        reason: &'static str,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let message = rsi_common::daemon_message::wrap(
+                "manager-policy",
+                &format!(
+                    "Your manager policy was revoked by an operator action ({reason}). Until the operator re-saves it you cannot launch workers, touch Issues or deploy. Ask the operator to re-save the policy (`:manager policy`); `AgentManagerInspect {{}}` shows policy.revoked."
+                ),
+            );
+            for _ in 0..20 {
+                let tip = match manager
+                    .store
+                    .lock()
+                    .await
+                    .get_harness_manager_notice_config(project)
+                {
+                    Ok(Some(config)) => config.current_session_id,
+                    _ => None,
+                };
+                let Some(tip) = tip else {
+                    return;
+                };
+                let sent = async {
+                    let fence = manager
+                        .capture_exact_continuation_fence(
+                            tip,
+                            crate::store::manager_actions::fence::ContinuationAuthorityV1::Automated,
+                        )
+                        .await?;
+                    manager.continue_fenced(tip, message.clone(), fence).await
+                }
+                .await;
+                if sent.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     /// Execute one exact seat claim through the gated `ManagerSeat`
     /// continuation and settle it. Refusals at the boundary are typed
     /// non-success outcomes; only an established continuation succeeds.

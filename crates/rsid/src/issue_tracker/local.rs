@@ -1,5 +1,5 @@
 //! Native single-user issue tracker backed directly by the daemon's own
-//! store (C1 `issues`/`issue_deps`, `crates/rsid/src/store/issues.rs`).
+//! store (C1 `issues`/`issue_deps`, `crates/rsid-store/src/store/issues.rs`).
 //!
 //! Selected in place of Linear via `RSI_ISSUE_TRACKER_KIND=local`
 //! (`config.rs::issue_tracker_config`); see
@@ -540,7 +540,7 @@ mod tests {
     impl SessionLauncher for MockLauncher {
         async fn launch(&self, config: LaunchConfig) -> Result<Uuid> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = Uuid::new_v4();
             session.project_id = config.project_id;
             self.store.lock().await.insert_session(&session)?;

@@ -113,8 +113,19 @@ struct ArchiveProofPause {
 }
 
 #[cfg(test)]
-static ARCHIVE_PROOF_PAUSE: std::sync::Mutex<Option<ArchiveProofPause>> =
-    std::sync::Mutex::new(None);
+static ARCHIVE_PROOF_PAUSE: std::sync::Mutex<Vec<ArchiveProofPause>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Registers a pause keyed by its session id, so concurrent tests (each with a
+/// distinct fixture session) never replace one another's channels.
+#[cfg(test)]
+fn install_archive_proof_pause(pause: ArchiveProofPause) {
+    let mut slots = ARCHIVE_PROOF_PAUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots.retain(|existing| existing.session_id != pause.session_id);
+    slots.push(pause);
+}
 
 #[cfg(test)]
 fn pause_archive_proof_if_requested(session_id: Uuid) {
@@ -122,10 +133,9 @@ fn pause_archive_proof_if_requested(session_id: Uuid) {
         let mut slot = ARCHIVE_PROOF_PAUSE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match slot.as_ref() {
-            Some(pause) if pause.session_id == session_id => slot.take(),
-            _ => None,
-        }
+        slot.iter()
+            .position(|pause| pause.session_id == session_id)
+            .map(|index| slot.remove(index))
     };
     if let Some(pause) = pause {
         let _ = pause.reached.send(());
@@ -1924,7 +1934,7 @@ mod tests {
             let common_dir = std::fs::canonicalize(common_dir).expect("canonical common dir");
 
             let session_id = Uuid::new_v4();
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = session_id;
             session.project_id = None;
             session.session_kind = SessionKind::Task;
@@ -2063,7 +2073,7 @@ mod tests {
                 let common_dir =
                     std::fs::canonicalize(common_dir).expect("canonical batch common dir");
                 let session_id = Uuid::new_v4();
-                let mut session = crate::store::tests::make_test_session();
+                let mut session = rsid_store::test_support::make_test_session();
                 session.id = session_id;
                 session.project_id = None;
                 session.session_kind = SessionKind::Task;
@@ -2693,7 +2703,7 @@ mod tests {
             let (reached_tx, reached_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             if pause_inside_proof {
-                *ARCHIVE_PROOF_PAUSE.lock().unwrap() = Some(ArchiveProofPause {
+                install_archive_proof_pause(ArchiveProofPause {
                     session_id: fixture.session_id,
                     reached: reached_tx,
                     release: release_rx,
@@ -2770,7 +2780,7 @@ mod tests {
             .expect("runtime");
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *ARCHIVE_PROOF_PAUSE.lock().unwrap() = Some(ArchiveProofPause {
+        install_archive_proof_pause(ArchiveProofPause {
             session_id: fixture.session_id,
             reached: reached_tx,
             release: release_rx,
@@ -3757,6 +3767,67 @@ mod tests {
         );
     }
 
+    /// #1172: the unarchive used to take the fresh root's stripe while holding
+    /// the Store, so a maintenance proof on a colliding stripe pinned every
+    /// Store user for the whole proof. It now takes the Store first and the
+    /// stripe by try-acquire, and still restores once the stripe frees.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn fresh_custody_unarchive_waits_for_a_held_stripe_without_pinning_the_store() {
+        let fixture = CleanupFixture::new();
+        let receipt = fixture.settle();
+        let target_oid = git(&fixture.repository, &["rev-parse", "refs/heads/main"]);
+        let allocation = SandboxAllocator::new(fixture.sandbox_base.clone())
+            .allocate(
+                Uuid::new_v4(),
+                &fixture.repository,
+                SandboxKind::GitWorktree,
+                &target_oid,
+                None,
+            )
+            .expect("allocate fresh unarchive worktree");
+        let custody_id = Uuid::new_v4();
+        let binding = SessionCustodyBinding::New(NewCustodyRoot {
+            custody_id,
+            canonical_repo_dir: fixture.repository.display().to_string(),
+            sandbox_root: allocation.root.display().to_string(),
+            sandbox_branch: allocation.branch.clone().expect("fresh branch"),
+            repository_identity: git(
+                &fixture.repository,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+            source_commit: target_oid,
+            cause: CustodyCause::FreshLaunch,
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let run = runtime.block_on(crate::store::stripe_liveness_support::run_behind_held_stripes(
+            &fixture.store,
+            Some(vec![custody_id]),
+            std::time::Duration::from_secs(3),
+            crate::store::sandbox_custody::restore_archived_session_with_fresh_custody_store_first(
+                &fixture.store,
+                fixture.session_id,
+                binding,
+            ),
+        ));
+        let restored = run
+            .assert_store_stayed_free("fresh-custody unarchive")
+            .expect("the unarchive completes once the stripe frees");
+        assert_eq!(restored.id, fixture.session_id);
+        assert_eq!(restored.status, SessionStatus::Completed);
+        let live = fixture
+            .store
+            .blocking_lock()
+            .live_custody_for_session(fixture.session_id)
+            .expect("the restored session owns the fresh live root");
+        assert_eq!(live.custody_id, custody_id);
+        assert_ne!(live.custody_id, receipt.custody_id);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn unique_output_is_refused_before_intent_with_zero_git_effects() {
@@ -3825,7 +3896,7 @@ mod tests {
     #[test]
     fn later_lineage_successor_is_refused_before_intent() {
         let fixture = CleanupFixture::new();
-        let mut successor = crate::store::tests::make_test_session();
+        let mut successor = rsid_store::test_support::make_test_session();
         successor.id = Uuid::new_v4();
         successor.continued_from = Some(fixture.session_id);
         successor.session_kind = SessionKind::Task;

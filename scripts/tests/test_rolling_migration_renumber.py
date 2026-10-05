@@ -31,14 +31,15 @@ class ProvisionalMigrationTest(unittest.TestCase):
         self.git(self.repo, "init", "-q", "-b", "rolling")
         self.git(self.repo, "config", "user.name", "Migration Test")
         self.git(self.repo, "config", "user.email", "migration@example.invalid")
-        self.write(self.repo, "crates/rsid/src/store/mod.rs", self.base_store())
+        self.write(self.repo, "crates/rsid-store/src/store/mod.rs", self.base_store())
         self.write(self.repo, "crates/rsid/Cargo.toml", '[package]\nname = "rsid"\nversion = "0.1.0"\n')
-        self.write(self.repo, "crates/rsid/src/store/cohort_settlement.rs", "")
-        self.write(self.repo, "crates/rsid/src/store/tests.rs", self.base_tests())
+        self.write(self.repo, "crates/rsid-store/Cargo.toml", '[package]\nname = "rsid-store"\nversion = "0.1.0"\n')
+        self.write(self.repo, "crates/rsid-store/src/store/cohort_settlement.rs", "")
+        self.write(self.repo, "crates/rsid-store/src/store/tests.rs", self.base_tests())
         inventory = RENUMBER.guard.inventory({
             RENUMBER.STORE: self.base_store(),
-            "crates/rsid/src/store/cohort_settlement.rs": "",
-            "crates/rsid/src/store/tests.rs": self.base_tests(),
+            "crates/rsid-store/src/store/cohort_settlement.rs": "",
+            "crates/rsid-store/src/store/tests.rs": self.base_tests(),
         })
         self.write(self.repo, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
         self.git(self.repo, "add", ".")
@@ -79,7 +80,7 @@ class ProvisionalMigrationTest(unittest.TestCase):
     def source(self, label, extra="", released_edit=False):
         worktree = Path(self.temp.name) / f"source-{label}"
         self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.base)
-        helper = f"crates/rsid/src/store/{label}_v130.rs"
+        helper = f"crates/rsid-store/src/store/{label}_v130.rs"
         helper_text = (f"// RSI-RELEASED-MIGRATION-BEGIN: v130-{label}-migration\n"
                        f"pub fn apply_v130() {{}}\n"
                        f"// RSI-RELEASED-MIGRATION-END: v130-{label}-migration\n")
@@ -95,12 +96,12 @@ class ProvisionalMigrationTest(unittest.TestCase):
             store = store.replace("migrate_v129();", "changed_v129();")
         self.write(worktree, RENUMBER.STORE, store)
         tests = self.base_tests().replace("REWIND: i32 = 129", "REWIND: i32 = 130")
-        self.write(worktree, "crates/rsid/src/store/tests.rs", tests)
+        self.write(worktree, "crates/rsid-store/src/store/tests.rs", tests)
         base_manifest = RENUMBER.revision_inventory(self.repo, self.base)
         files = {name: (worktree / name).read_text()
                  for name in RENUMBER.guard.tracked_source_paths(base_manifest)}
         files.update({RENUMBER.STORE: store,
-                      "crates/rsid/src/store/tests.rs": tests,
+                      "crates/rsid-store/src/store/tests.rs": tests,
                       helper: helper_text})
         inventory = RENUMBER.guard.inventory(files)
         self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
@@ -114,11 +115,11 @@ class ProvisionalMigrationTest(unittest.TestCase):
                 (f"{label}_v130::apply_v130();",
                  f"{label}_v${{VERSION}}::apply_v${{VERSION}}();", "unit"),
             ]),
-            ("crates/rsid/src/store/tests.rs", tests,
-             "crates/rsid/src/store/tests.rs", [
+            ("crates/rsid-store/src/store/tests.rs", tests,
+             "crates/rsid-store/src/store/tests.rs", [
                  ("const REWIND: i32 = 130;", "const REWIND: i32 = ${VERSION};", "head"),
              ]),
-            (helper, helper_text, f"crates/rsid/src/store/{label}_v${{VERSION}}.rs", [
+            (helper, helper_text, f"crates/rsid-store/src/store/{label}_v${{VERSION}}.rs", [
                 (f"// RSI-RELEASED-MIGRATION-BEGIN: v130-{label}-migration",
                  f"// RSI-RELEASED-MIGRATION-BEGIN: v${{VERSION}}-{label}-migration", "unit"),
                 ("pub fn apply_v130() {}", "pub fn apply_v${VERSION}() {}", "unit"),
@@ -311,7 +312,7 @@ class ProvisionalMigrationTest(unittest.TestCase):
             RENUMBER.inspect(self.repo, self.base, malformed, self.base)
 
 
-MIGRATIONS = "crates/rsid/src/store/migrations"
+MIGRATIONS = "crates/rsid-store/src/store/migrations"
 
 
 class PerFileProvisionalMigrationTest(unittest.TestCase):
@@ -340,8 +341,9 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         files = {
             RENUMBER.STORE: "// runner only\n",
             "crates/rsid/Cargo.toml": '[package]\nname = "rsid"\nversion = "0.1.0"\n',
-            "crates/rsid/src/store/cohort_settlement.rs": "",
-            "crates/rsid/src/store/tests.rs": self.TESTS,
+            "crates/rsid-store/Cargo.toml": '[package]\nname = "rsid-store"\nversion = "0.1.0"\n',
+            "crates/rsid-store/src/store/cohort_settlement.rs": "",
+            "crates/rsid-store/src/store/tests.rs": self.TESTS,
             f"{MIGRATIONS}/v000.rs": self.V0,
             f"{MIGRATIONS}/v129.rs": self.V129,
         }
@@ -362,10 +364,10 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
                 f"        Ok(())\n    }}\n}}\n")
         tests = self.TESTS.replace("REWIND: i32 = 129", "REWIND: i32 = 130")
         self.write(worktree, f"{MIGRATIONS}/v130.rs", unit)
-        self.write(worktree, "crates/rsid/src/store/tests.rs", tests)
+        self.write(worktree, "crates/rsid-store/src/store/tests.rs", tests)
         files = {name: (worktree / name).read_text() for name in (
-            RENUMBER.STORE, "crates/rsid/src/store/cohort_settlement.rs",
-            "crates/rsid/src/store/tests.rs", f"{MIGRATIONS}/v000.rs",
+            RENUMBER.STORE, "crates/rsid-store/src/store/cohort_settlement.rs",
+            "crates/rsid-store/src/store/tests.rs", f"{MIGRATIONS}/v000.rs",
             f"{MIGRATIONS}/v129.rs", f"{MIGRATIONS}/v130.rs")}
         inventory = RENUMBER.guard.inventory(files)
         self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
@@ -374,7 +376,7 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
                 ("fn migrate_v130(", "fn migrate_v${VERSION}(", "unit"),
                 ("if version < 130 {", "if version < ${VERSION} {", "unit"),
             ]),
-            ("crates/rsid/src/store/tests.rs", tests, "crates/rsid/src/store/tests.rs", [
+            ("crates/rsid-store/src/store/tests.rs", tests, "crates/rsid-store/src/store/tests.rs", [
                 ("const REWIND: i32 = 130;", "const REWIND: i32 = ${VERSION};", "head"),
             ]),
         ]

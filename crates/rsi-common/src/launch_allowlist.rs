@@ -86,10 +86,39 @@ pub fn normalize_launch_model_allowlist(value: &serde_json::Value) -> Result<Vec
     Ok(out)
 }
 
-/// The comparison form of a model id: trimmed, lower-cased, without a trailing
-/// context-variant tag (`claude-sonnet-5-5[1m]` is the 1M variant of
-/// `claude-sonnet-5-5`; the daemon adds the tag at launch and strips it from the
-/// stored id, #273/#1038) and without the routing prefix its provider accepts as
+/// Drops the `[1m]` context-variant tag from a Claude-family id.
+///
+/// Only the Claude CLI launch path adds and understands the tag (`claude-sonnet-5-5[1m]`
+/// is the 1M variant of `claude-sonnet-5-5`, #273/#1038), so it is stripped only for the
+/// Claude provider (or a provider-less allowlist entry) and only for a `claude-` id with
+/// exactly `[1m]`. Every other bracket suffix is preserved on the wire by the other
+/// providers (OpenRouter, the Harness OpenAI-compatible path), so it is a different
+/// model string and must not match its bare allowlist entry.
+fn strip_claude_one_million_variant(
+    provider: Option<crate::types::SessionProvider>,
+    model: &str,
+) -> &str {
+    use crate::types::SessionProvider;
+    if !matches!(provider, None | Some(SessionProvider::Claude)) {
+        return model;
+    }
+    let Some(base) = model
+        .len()
+        .checked_sub(4)
+        .filter(|at| model.is_char_boundary(*at))
+        .filter(|at| model[*at..].eq_ignore_ascii_case("[1m]"))
+        .map(|at| model[..at].trim_end())
+    else {
+        return model;
+    };
+    let is_claude = base
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("claude-"));
+    if is_claude { base } else { model }
+}
+
+/// The comparison form of a model id: trimmed, lower-cased, without the Claude
+/// `[1m]` context-variant tag (see [`strip_claude_one_million_variant`]) and without the routing prefix its provider accepts as
 /// an alias (`openrouter/` for OpenRouter, `bedrock/` for Bedrock). With
 /// `provider == None` (an allowlist entry, which names no provider) both
 /// prefixes are dropped. Comparison after this canonicalisation stays exact.
@@ -99,8 +128,7 @@ pub fn canonical_launch_model(
     model: &str,
 ) -> String {
     use crate::types::SessionProvider;
-    let trimmed = crate::claude_catalog::strip_context_variant_suffix(model.trim()).trim();
-    let lowered = trimmed.to_ascii_lowercase();
+    let lowered = strip_claude_one_million_variant(provider, model.trim()).to_ascii_lowercase();
     let prefixes: &[&str] = match provider {
         Some(SessionProvider::OpenRouter) => &["openrouter/"],
         Some(SessionProvider::Bedrock) => &["bedrock/"],
@@ -234,6 +262,42 @@ mod tests {
             Some(OpenRouter),
             Some("openrouter/z-ai/glm-5.3-flashx")
         ));
+        // A fabricated bracket tag is preserved on the wire by OpenRouter, so it is a
+        // different model string and must not ride the bare entry (review of #692).
+        for model in [
+            "z-ai/glm-5.3-flashx[bogus]",
+            "z-ai/glm-5.3-flashx[1m]",
+            "openrouter/z-ai/glm-5.3-flashx[bogus]",
+        ] {
+            assert!(
+                !launch_model_allowed(&list, Some(OpenRouter), Some(model)),
+                "{model}"
+            );
+        }
+        // Claude ids accept only the `[1m]` variant, not an arbitrary tag.
+        let claude = vec!["claude-sonnet-5-5".to_string()];
+        for model in ["claude-sonnet-5-5[bogus]", "claude-sonnet-5-5[200k]"] {
+            assert!(
+                !launch_model_allowed(&claude, Some(Claude), Some(model)),
+                "{model}"
+            );
+        }
+        // A non-Claude entry's `[1m]` is part of its name; it does not collapse.
+        let tagged = vec!["vendor/model[1m]".to_string()];
+        assert!(!launch_model_allowed(
+            &tagged,
+            Some(OpenRouter),
+            Some("vendor/model")
+        ));
+        assert!(launch_model_allowed(
+            &tagged,
+            Some(OpenRouter),
+            Some("vendor/model[1m]")
+        ));
+        assert_eq!(
+            normalize_launch_model_allowlist(&json!(["vendor/model", "vendor/model[1m]"])).unwrap(),
+            vec!["vendor/model", "vendor/model[1m]"]
+        );
         // The routing prefix is an alias only for the provider that accepts it.
         assert!(!launch_model_allowed(
             &list,

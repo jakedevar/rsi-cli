@@ -199,6 +199,33 @@ impl RpcServer {
         Ok(serde_json::to_value(result)?)
     }
 
+    /// #1103: the allowlisted hub pulls the reports the satellite's manager
+    /// queued. Operator-only wire method (never in the agent catalog); the
+    /// satellite enforces its own inbound policy.
+    pub(super) async fn handle_fetch_hub_reports(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::satellite_dispatch::SatelliteFetchReportsRequestV1;
+        if serde_json::to_vec(&request.params)?.len() > 8_192 {
+            return Err(DaemonError::InvalidParam(
+                "hub report fetch exceeds byte limit".into(),
+            ));
+        }
+        let input: SatelliteFetchReportsRequestV1 = serde_json::from_value(request.params.clone())
+            .map_err(|_| DaemonError::InvalidParam("satellite_report_invalid".into()))?;
+        input
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        let reply = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .take_hub_reports(input.hub_installation_id.0, &input.acked)?;
+        Ok(serde_json::to_value(reply)?)
+    }
+
     /// #1017 slice 2: hub-initiated deploy on this satellite. Operator-only
     /// wire method (never in the agent catalog); the satellite enforces its own
     /// inbound policy.

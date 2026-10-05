@@ -30,7 +30,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 use crate::model_control_budgets::{budget_row_label_value, budget_rows};
-use crate::model_control_stats::{StatsRowAction, stats_row_label_value, stats_rows};
+use crate::model_control_stats::{
+    StatsGroup, StatsRow, StatsRowAction, StatsTone, stats_rows, status_label,
+};
 use crate::settings::{
     ActivityIndicatorStyle, DaemonFeatureEntry, DaemonFeatureValue, DetailColumnAlignment,
     FORMULATION_ANIM_DURATIONS, SystemPromptPreset, UserSettings,
@@ -180,6 +182,13 @@ enum ValueWidget {
         color: Color,
         text: String,
     },
+    /// One model call: status, optional stop button, then model and purpose.
+    Activity {
+        status: String,
+        color: Color,
+        detail: String,
+        stop: bool,
+    },
     /// Plain text: an editable string or read-only telemetry.
     Text(String),
     /// Empty-state rows show their first key prompt instead of a value.
@@ -198,6 +207,7 @@ impl ValueWidget {
             Self::Palette(colors) => format!("{} colors", colors.len()),
             Self::Action { button, detail } if detail.is_empty() => button.clone(),
             Self::Action { button, detail } => format!("{button} {detail}"),
+            Self::Activity { status, detail, .. } => format!("{status} {detail}"),
             Self::Empty => String::new(),
         }
     }
@@ -218,6 +228,7 @@ const REFRESH_KEY: KeyHint = key_hint("R", "refresh");
 
 #[derive(Debug, Clone)]
 struct SettingsRow {
+    group: Option<StatsGroup>,
     label: String,
     widget: ValueWidget,
     /// What Enter (and Space) does; empty for read-only rows.
@@ -397,6 +408,7 @@ fn stack_info(column: Rect) -> (Rect, Option<Rect>) {
 
 /// Record the geometry the resize keys step from (`SettingsRenderedLayout`).
 pub fn record_rendered_layout(app: &mut App, area: Rect) {
+    crate::settings_keys::clamp_settings_selection(app);
     let rendered = pane_regions(area)
         .map(|(body, _)| {
             let layout = settings_workspace_layout(body, app.settings_state.focus, &app.settings);
@@ -798,6 +810,91 @@ fn row_columns(inner: Rect, rows: &[SettingsRow]) -> RowColumns {
     }
 }
 
+/// Headings are visual separators, not selectable rows. Actions keep their
+/// original row index even while headings are inserted or pinned on scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsListLine {
+    Heading(StatsGroup, usize),
+    Row(usize),
+}
+
+fn settings_list_lines(rows: &[SettingsRow]) -> Vec<SettingsListLine> {
+    let mut lines = Vec::new();
+    let mut previous = None;
+    for (idx, row) in rows.iter().enumerate() {
+        if row.group != previous {
+            if let Some(group) = row.group {
+                let count = rows
+                    .iter()
+                    .filter(|row| {
+                        row.group == Some(group)
+                            && matches!(row.widget, ValueWidget::Activity { .. })
+                    })
+                    .count();
+                lines.push(SettingsListLine::Heading(group, count));
+            }
+            previous = row.group;
+        }
+        lines.push(SettingsListLine::Row(idx));
+    }
+    lines
+}
+
+fn visible_settings_lines(
+    rows: &[SettingsRow],
+    selected: usize,
+    capacity: usize,
+) -> (Vec<SettingsListLine>, usize, usize) {
+    let lines = settings_list_lines(rows);
+    let position = lines
+        .iter()
+        .position(|line| *line == SettingsListLine::Row(selected))
+        .unwrap_or(0);
+    let (mut start, mut end) = visible_window(lines.len(), position, capacity);
+    let mut visible = Vec::new();
+    if start > 0 && capacity > 1 && matches!(lines.get(start), Some(SettingsListLine::Row(_))) {
+        // Reserve a line for the current group's heading when scrolled inside it.
+        let narrower = visible_window(lines.len(), position, capacity - 1);
+        if let Some(SettingsListLine::Row(idx)) = lines.get(narrower.0)
+            && let Some(group) = rows[*idx].group
+        {
+            start = narrower.0;
+            end = narrower.1;
+            let count = rows
+                .iter()
+                .filter(|row| {
+                    row.group == Some(group) && matches!(row.widget, ValueWidget::Activity { .. })
+                })
+                .count();
+            visible.push(SettingsListLine::Heading(group, count));
+        }
+    }
+    visible.extend_from_slice(&lines[start..end]);
+    (visible, start, lines.len())
+}
+
+fn render_stats_heading(frame: &mut Frame, area: Rect, group: StatsGroup, count: usize) {
+    let color = stats_group_color(group);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::card_bg())),
+        area,
+    );
+    let count = match group {
+        StatsGroup::Active | StatsGroup::Recent | StatsGroup::Denied => format!("  {count}"),
+        _ => String::new(),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_to_width(
+                &format!(" {}{}", group.label(), count),
+                usize::from(area.width),
+            ),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        area,
+    );
+}
+
 /// Render the settings list panel and return the model-picker anchor when
 /// the picker's row is visible.
 fn render_list_panel(
@@ -840,6 +937,8 @@ fn render_list_panel(
         let summary = if describe_selected && focused {
             rows.get(selected)
                 .map_or(section.summary(), |row| row.description.as_str())
+        } else if section == SettingsSection::Usage {
+            "Lifetime costs and live model work. Select a row for details; Enter activates its stop button."
         } else {
             section.summary()
         };
@@ -861,7 +960,8 @@ fn render_list_panel(
         return None;
     }
 
-    let (start, end) = visible_window(rows.len(), selected, usize::from(items_height));
+    let (visible, start, total_lines) =
+        visible_settings_lines(rows, selected, usize::from(items_height));
     let columns = row_columns(inner, rows);
     // Selectors share one width per tab so their arrows and pips line up.
     let choice_width = rows
@@ -873,22 +973,28 @@ fn render_list_panel(
         .max()
         .unwrap_or(0)
         .min(CHOICE_MAX_WIDTH);
-    for (offset, idx) in (start..end).enumerate() {
-        render_setting_row(
-            frame,
-            Rect::new(inner.x, items_y + offset as u16, inner.width, 1),
-            columns,
-            &rows[idx],
-            RowState {
-                selected: idx == selected,
-                focused,
-                matched: search_row_matches(section, idx, &state.query),
-            },
-            accent,
-            choice_width,
-        );
+    for (offset, line) in visible.iter().enumerate() {
+        let row_area = Rect::new(inner.x, items_y + offset as u16, inner.width, 1);
+        match *line {
+            SettingsListLine::Heading(group, count) => {
+                render_stats_heading(frame, row_area, group, count)
+            }
+            SettingsListLine::Row(idx) => render_setting_row(
+                frame,
+                row_area,
+                columns,
+                &rows[idx],
+                RowState {
+                    selected: idx == selected,
+                    focused,
+                    matched: search_row_matches(section, idx, &state.query),
+                },
+                accent,
+                choice_width,
+            ),
+        }
     }
-    if rows.len() > usize::from(items_height) && area.width > 0 {
+    if total_lines > usize::from(items_height) && area.width > 0 {
         let border = if highlighted {
             theme::focused_border()
         } else {
@@ -898,24 +1004,28 @@ fn render_list_panel(
             frame,
             Rect::new(area.x + area.width - 1, items_y, 1, items_height),
             start,
-            rows.len(),
+            total_lines,
             accent,
             border,
         );
     }
 
     let active_idx = state.active_dropdown_item.unwrap_or(selected);
-    (section == SettingsSection::ModelRoles
-        && state.model_dropdown.open
-        && (start..end).contains(&active_idx))
-    .then(|| {
-        Rect::new(
-            columns.value_x,
-            items_y + (active_idx - start) as u16,
-            columns.value_width.max(1),
-            1,
-        )
-    })
+    let offset = visible
+        .iter()
+        .position(|line| *line == SettingsListLine::Row(active_idx));
+    if section == SettingsSection::ModelRoles && state.model_dropdown.open {
+        offset.map(|offset| {
+            Rect::new(
+                columns.value_x,
+                items_y + offset as u16,
+                columns.value_width.max(1),
+                1,
+            )
+        })
+    } else {
+        None
+    }
 }
 
 /// The visible window of tabs: the active tab plus as many neighbours as
@@ -1310,8 +1420,37 @@ fn widget_spans(row: &SettingsRow, accent: Color, choice_width: usize) -> Vec<Sp
                 format!("{glyph} "),
                 Style::default().fg(*color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(text.clone(), Style::default().fg(tone)),
+            Span::styled(
+                text.clone(),
+                Style::default().fg(if row.group.is_some() { *color } else { tone }),
+            ),
         ],
+        ValueWidget::Activity {
+            status,
+            color,
+            detail,
+            stop,
+        } => {
+            let mut spans = vec![Span::styled(
+                format!("● {status}"),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            )];
+            if *stop {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    " Stop ",
+                    Style::default()
+                        .fg(theme::crust())
+                        .bg(theme::error_status())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {detail}"),
+                Style::default().fg(theme::subtext1()),
+            ));
+            spans
+        }
         ValueWidget::Text(text) => vec![Span::styled(text.clone(), Style::default().fg(tone))],
         ValueWidget::Empty => row
             .keys
@@ -1417,7 +1556,13 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App, row: &SettingsRow
     let group = section.group();
     let accent = group_color(group);
     let spec = spec_for_row(app, section, selected);
-    let kind = if row.empty {
+    let kind = if section == SettingsSection::Usage {
+        if row.action.is_empty() {
+            "details"
+        } else {
+            "action"
+        }
+    } else if row.empty {
         "empty"
     } else {
         spec.map_or("info", |spec| spec.kind.label())
@@ -1493,7 +1638,30 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App, row: &SettingsRow
             });
         }
     }
-    if let Some(spec) = spec.filter(|_| !row.empty) {
+    if section == SettingsSection::Usage {
+        if let Some(stats) = stats_rows(app).get(selected) {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                stats.value.clone(),
+                Style::default()
+                    .fg(stats_tone_color(stats.tone))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            if !stats.details.is_empty() {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "DETAILS",
+                    dim_style().add_modifier(Modifier::BOLD),
+                )));
+                for (key, value) in &stats.details {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{key}: "), Style::default().fg(theme::sky())),
+                        Span::styled(value.clone(), Style::default().fg(theme::subtext1())),
+                    ]));
+                }
+            }
+        }
+    } else if let Some(spec) = spec.filter(|_| !row.empty) {
         if roomy {
             lines.push(Line::default());
         }
@@ -1717,6 +1885,9 @@ fn settings_item_count(app: &App) -> usize {
 /// Every row of the selected section, in page order (at least one).
 fn section_rows(app: &App) -> Vec<SettingsRow> {
     let section = app.settings_state.section;
+    if section == SettingsSection::Usage {
+        return stats_rows(app).into_iter().map(usage_row).collect();
+    }
     if DAEMON_FEATURE_SECTIONS.contains(&section) {
         let rows: Vec<SettingsRow> = daemon_feature_rows_for_section(app, section)
             .into_iter()
@@ -1747,6 +1918,7 @@ fn base_row(
     description: impl Into<String>,
 ) -> SettingsRow {
     SettingsRow {
+        group: None,
         label: label.into(),
         widget,
         action: action.into(),
@@ -1820,6 +1992,75 @@ fn empty_row(label: &str, keys: Vec<KeyHint>, action: &str, description: &str) -
         tone: ValueTone::Muted,
         empty: true,
         ..base_row(label, ValueWidget::Empty, action, description)
+    }
+}
+
+fn stats_tone_color(tone: StatsTone) -> Color {
+    match tone {
+        StatsTone::Neutral => theme::text(),
+        StatsTone::Positive => theme::green(),
+        StatsTone::Warning => theme::warning_status(),
+        StatsTone::Error => theme::error_status(),
+        StatsTone::Muted => theme::dim_metadata(),
+        StatsTone::Accent => theme::sky(),
+    }
+}
+
+fn stats_group_color(group: StatsGroup) -> Color {
+    match group {
+        StatsGroup::Overview | StatsGroup::ModelSpend => theme::yellow(),
+        StatsGroup::Safety | StatsGroup::Alerts => theme::warning_status(),
+        StatsGroup::Active => theme::green(),
+        StatsGroup::Denied => theme::error_status(),
+        StatsGroup::Tokens => theme::sky(),
+        StatsGroup::Recent => theme::mauve(),
+        StatsGroup::Efficiency => theme::teal(),
+    }
+}
+
+fn usage_row(stats: StatsRow) -> SettingsRow {
+    let widget = if let Some(status) = stats.status {
+        ValueWidget::Activity {
+            status: status_label(status).to_string(),
+            color: stats_tone_color(stats.tone),
+            detail: stats.value,
+            stop: matches!(stats.action, Some(StatsRowAction::CancelInvocation(_))),
+        }
+    } else if stats.action == Some(StatsRowAction::EmergencyStopAll) {
+        ValueWidget::Action {
+            button: "Stop all".to_string(),
+            detail: stats.value,
+        }
+    } else {
+        ValueWidget::Text(stats.value)
+    };
+    let action = match stats.action {
+        Some(StatsRowAction::EmergencyStopAll) => "stop all model work",
+        Some(StatsRowAction::CancelInvocation(_)) => "stop selected model work",
+        None => "",
+    };
+    let tone = match stats.tone {
+        StatsTone::Positive => ValueTone::Positive,
+        StatsTone::Warning => ValueTone::Warning,
+        StatsTone::Error => ValueTone::Destructive,
+        StatsTone::Muted => ValueTone::Muted,
+        StatsTone::Neutral | StatsTone::Accent => ValueTone::Neutral,
+    };
+    // Text telemetry carries its own semantic color, including spend and tokens.
+    let widget = match widget {
+        ValueWidget::Text(text) => ValueWidget::Badge {
+            glyph: "·",
+            color: stats_tone_color(stats.tone),
+            text,
+        },
+        widget => widget,
+    };
+    SettingsRow {
+        group: Some(stats.group),
+        tone,
+        destructive: !action.is_empty(),
+        keys: vec![REFRESH_KEY],
+        ..base_row(stats.label, widget, action, stats.description)
     }
 }
 
@@ -1900,6 +2141,11 @@ fn daemon_feature_row(entry: &DaemonFeatureEntry, spec: &SettingSpec) -> Setting
                 ..action_row("Open audit", "", "open the settlement audit")
             }
         }
+        DaemonFeatureValue::Display(_) if entry.field == "legacy_scratch_adoption" => SettingsRow {
+            tone: ValueTone::Destructive,
+            destructive: true,
+            ..action_row("Open list", "", "list and adopt legacy scratch")
+        },
         DaemonFeatureValue::Display(value) => SettingsRow {
             tone: if value == "?" {
                 ValueTone::Warning
@@ -2128,6 +2374,18 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
             },
             _ => unknown_row(),
         },
+        SettingsSection::Remote => match idx {
+            0 => base_row(
+                "Remote access",
+                ValueWidget::Action {
+                    button: "Open".to_string(),
+                    detail: "enable, devices, projects, phone URL".to_string(),
+                },
+                "open the remote settings",
+                "Read-only phone view over your tailnet. Starts a managed gateway and a tailscale serve route (never Funnel).",
+            ),
+            _ => unknown_row(),
+        },
         SettingsSection::SystemPrompt => match idx {
             0 => SettingsRow {
                 action: "next preset".to_string(),
@@ -2204,57 +2462,11 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
                 ),
             }
         }
-        SettingsSection::Usage => match stats_rows(app).get(idx) {
-            Some(stats_row) => {
-                let (label, value) = stats_row_label_value(app, idx);
-                let loading = value.contains("loading");
-                let mut row = match stats_row.action {
-                    Some(StatsRowAction::EmergencyStopAll) => SettingsRow {
-                        tone: ValueTone::Destructive,
-                        destructive: true,
-                        ..base_row(
-                            label,
-                            ValueWidget::Action {
-                                button: "Stop all".to_string(),
-                                detail: value,
-                            },
-                            "stop all model calls",
-                            "Explicit operator action for daemon model-control state.",
-                        )
-                    },
-                    Some(StatsRowAction::CancelInvocation(_)) => SettingsRow {
-                        tone: ValueTone::Warning,
-                        destructive: true,
-                        ..base_row(
-                            label,
-                            ValueWidget::Action {
-                                button: "Cancel".to_string(),
-                                detail: value,
-                            },
-                            "cancel invocation",
-                            "Explicit operator action for daemon model-control state.",
-                        )
-                    },
-                    None => base_row(
-                        label,
-                        ValueWidget::Text(value),
-                        "",
-                        "Refreshable daemon usage or model-control telemetry.",
-                    ),
-                };
-                if loading {
-                    row.tone = ValueTone::Warning;
-                }
-                row.keys.push(REFRESH_KEY);
-                row
-            }
-            None => empty_row(
-                "Stats loading",
-                vec![REFRESH_KEY],
-                "",
-                "Waiting for daemon usage and model-control telemetry.",
-            ),
-        },
+        SettingsSection::Usage => stats_rows(app)
+            .into_iter()
+            .nth(idx)
+            .map(usage_row)
+            .unwrap_or_else(unknown_row),
         SettingsSection::Budgets => {
             if budget_rows(app).get(idx).is_some() {
                 let (label, value) = budget_row_label_value(app, idx);
@@ -3017,6 +3229,7 @@ mod tests {
             SettingsSection::SystemPrompt,
             SettingsSection::MessageBridges,
             SettingsSection::Satellites,
+            SettingsSection::Remote,
             SettingsSection::ModelControl,
             SettingsSection::RetriesRecovery,
             SettingsSection::StallDetection,
@@ -3433,5 +3646,78 @@ mod tests {
         let visible = buffer_text(&buffer);
         assert!(visible.contains(ProviderCredentialSlot::ALL[0].as_str()));
         assert!(visible.contains("s set"));
+    }
+    #[test]
+    fn usage_dashboard_renders_groups_names_and_semantic_status_color() {
+        let mut app = crate::model_control_stats::tests::named_work_app();
+        app.settings_state.section = SettingsSection::Usage;
+        app.settings_state.focus = SettingsFocus::Items;
+        let rows = section_rows(&app);
+        let selected = rows
+            .iter()
+            .position(|row| row.group == Some(StatsGroup::Active))
+            .unwrap();
+        app.settings_state.selected_index = selected;
+        let buffer = rendered_settings(&app, 220, 55);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("LIFETIME USAGE"));
+        assert!(text.contains("SPENDING CONTROLS"));
+        assert!(text.contains("LIVE MODEL WORK  1"));
+        assert!(text.contains("Fix settings navigation · RSI"));
+        assert!(text.contains("Start session"));
+        assert!(text.contains("Interrupt the owning session"));
+        let spans = widget_spans(&rows[selected], theme::yellow(), 0);
+        assert_eq!(spans[0].content, "● Running");
+        assert_eq!(spans[0].style.fg, Some(theme::green()));
+        let stop = spans.iter().find(|span| span.content == " Stop ").unwrap();
+        assert_eq!(stop.style.bg, Some(theme::error_status()));
+    }
+
+    #[test]
+    fn usage_headings_preserve_row_indices_and_scroll_selection_at_small_sizes() {
+        let mut app = crate::model_control_stats::tests::named_work_app();
+        app.settings_state.section = SettingsSection::Usage;
+        let rows = section_rows(&app);
+        let lines = settings_list_lines(&rows);
+        let row_indices: Vec<_> = lines
+            .iter()
+            .filter_map(|line| match line {
+                SettingsListLine::Row(idx) => Some(*idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(row_indices, (0..rows.len()).collect::<Vec<_>>());
+        for selected in 0..rows.len() {
+            for capacity in [1, 2, 3, 7, 20] {
+                let (visible, _, _) = visible_settings_lines(&rows, selected, capacity);
+                assert!(visible.len() <= capacity);
+                assert!(visible.contains(&SettingsListLine::Row(selected)));
+            }
+        }
+        let first_token = rows
+            .iter()
+            .position(|row| row.group == Some(StatsGroup::Tokens))
+            .unwrap();
+        let (visible, _, _) = visible_settings_lines(&rows, first_token + 3, 3);
+        assert!(matches!(
+            visible.first(),
+            Some(SettingsListLine::Heading(StatsGroup::Tokens, _))
+        ));
+    }
+
+    #[test]
+    fn usage_dashboard_keeps_selected_name_visible_in_narrow_pane() {
+        let mut app = crate::model_control_stats::tests::named_work_app();
+        app.settings_state.section = SettingsSection::Usage;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.selected_index = section_rows(&app)
+            .iter()
+            .position(|row| row.group == Some(StatsGroup::Active))
+            .unwrap();
+        let buffer = rendered_settings(&app, 70, 24);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Fix settings navigation"));
+        assert!(text.contains("Running"));
+        assert!(text.contains("Stop"));
     }
 }

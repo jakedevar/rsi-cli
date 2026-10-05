@@ -12,7 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::agent_deploy::{
     AgentRequestDeployReceiptV1, AgentRequestDeployRequestV1, DEPLOY_CAPABILITY_REQUIRED,
-    DEPLOY_EXECUTE_REQUIRED, DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED,
+    DEPLOY_EXECUTE_REQUIRED, DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED, skipped_binaries,
 };
 use rsi_common::harness_manager_v2::ManagerCapabilityV2;
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteUuidV1};
@@ -28,6 +28,7 @@ fn receipt(row: &DeployRow, replayed: bool) -> AgentRequestDeployReceiptV1 {
         sha: row.sha.clone(),
         deadline_at: row.deadline_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
         binaries: row.manifest.clone(),
+        skipped: skipped_binaries(&row.manifest),
         replayed,
     }
 }
@@ -83,7 +84,7 @@ impl AgentControlHandle {
                 .request_satellite_deploy(caller, &request, peer.0, satellite_root)
                 .await;
         }
-        stage_owned_deploy(&self.store, caller, request, service, now).await
+        stage_owned_deploy(&self.store, caller, None, request, service, now).await
     }
 
     /// #1017 slice 2: ask the paired satellite to run its own deploy flow over
@@ -140,13 +141,24 @@ impl AgentControlHandle {
     }
 }
 
+/// #1131: the stable replay identity of a satellite hub deploy. The declared
+/// scope roots are looked up for a replay; the resolved root keys a new row,
+/// so an identical retry after the seat rotated returns the original deploy.
+pub(crate) struct DeployReplayScope<'a> {
+    pub(crate) lookup: &'a [Uuid],
+    pub(crate) record: Uuid,
+}
+
 /// The satellite-independent core: replay, supervisor and budget gates, stage
-/// and verify the binaries, and record the `staged` row owned by `owner`.
+/// and verify the binaries, and record the `staged` row owned by `owner` (the
+/// session whose wake settles it). `scope` is `None` for an owner-keyed replay
+/// (the hub) and the declared scope roots on a satellite.
 /// Authority is the caller's job (the manager on the hub, the allowlisted hub
 /// on a satellite).
 pub(crate) async fn stage_owned_deploy(
     store: &Arc<Mutex<Store>>,
     owner: Uuid,
+    scope: Option<DeployReplayScope<'_>>,
     request: AgentRequestDeployRequestV1,
     service: &DeployService,
     now: DateTime<Utc>,
@@ -159,14 +171,26 @@ pub(crate) async fn stage_owned_deploy(
     let fingerprint = DeployService::fingerprint(&request.sha, &dir, request.wait_secs());
     {
         let store = store.lock().await;
-        if let Some(row) =
-            store.replay_agent_deploy(owner, &request.idempotency_key, &fingerprint)?
-        {
+        let scoped = match &scope {
+            Some(scope) => store.replay_agent_deploy_scoped(
+                scope.lookup,
+                &request.idempotency_key,
+                &fingerprint,
+            )?,
+            None => None,
+        };
+        // A row recorded before the scope existed is owner-keyed.
+        let replay = match scoped {
+            Some(row) => Some(row),
+            None => store.replay_agent_deploy(owner, &request.idempotency_key, &fingerprint)?,
+        };
+        if let Some(row) = replay {
             return Ok(receipt(&row, true));
         }
         if !service.is_supervised() {
             return Err(DaemonError::PolicyDenied(DEPLOY_NEEDS_SUPERVISOR.into()));
         }
+        service.check_target()?;
         service.check_budget(&store, now)?;
     }
     let id = Uuid::new_v4();
@@ -180,7 +204,7 @@ pub(crate) async fn stage_owned_deploy(
             .map_err(|error| DaemonError::Store(error.to_string()))??
     };
     let store = store.lock().await;
-    let inserted = store.insert_agent_deploy(
+    let inserted = store.insert_agent_deploy_scoped(
         &NewDeploy {
             id,
             owner_session_id: owner,
@@ -190,6 +214,7 @@ pub(crate) async fn stage_owned_deploy(
             manifest: &staged,
             max_wait_secs: request.wait_secs(),
         },
+        scope.as_ref().map(|scope| scope.record),
         now,
     );
     match inserted {

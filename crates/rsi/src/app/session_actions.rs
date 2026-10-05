@@ -1288,9 +1288,10 @@ impl App {
         }
     }
 
-    /// Toggle pin state of the currently selected session.
+    /// Toggle pin state of the currently selected session. In session detail the
+    /// target is the selected list row, like the other lifecycle toggles.
     pub async fn toggle_pin_focused_session(&mut self) {
-        let session_id = match self.selected_session_id() {
+        let session_id = match self.selected_session_id_for_lifecycle_action() {
             Some(id) => id,
             None => {
                 self.notify("No session selected");
@@ -1349,9 +1350,11 @@ impl App {
         }
     }
 
-    /// Toggle "testing needed" marker on the currently selected session.
+    /// Toggle "testing needed" marker on the currently selected session. In
+    /// session detail the target is the selected list row, like the other
+    /// lifecycle toggles.
     pub async fn toggle_testing_needed_focused_session(&mut self) {
-        let session_id = match self.selected_session_id() {
+        let session_id = match self.selected_session_id_for_lifecycle_action() {
             Some(id) => id,
             None => {
                 self.notify("No session selected");
@@ -1382,8 +1385,10 @@ impl App {
     }
 
     /// Toggle auto-rotation disabled state on the currently selected session.
+    /// In session detail the target is the selected session-list row, like the
+    /// other lifecycle actions, not the session the detail pane displays.
     pub async fn toggle_rotation_disabled_focused_session(&mut self) {
-        let session_id = match self.selected_session_id() {
+        let session_id = match self.selected_session_id_for_lifecycle_action() {
             Some(id) => id,
             None => {
                 self.notify("No session selected");

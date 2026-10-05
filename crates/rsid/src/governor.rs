@@ -240,6 +240,8 @@ pub struct Governor {
     /// Current identity of a pid, or `None` when it is gone. A lease is live
     /// only while this equals the identity recorded at acquire time.
     resolve_holder: HolderFn,
+    /// A disk-floor stall was already logged this episode (#932).
+    disk_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Governor {
@@ -249,6 +251,7 @@ impl Governor {
             state: Mutex::new(State::default()),
             sample,
             resolve_holder,
+            disk_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -271,6 +274,10 @@ impl Governor {
         params: &AcquireParams,
     ) -> Result<AcquireOutcome, String> {
         let sample = (self.sample)();
+        if sample.disk_free_gb >= policy.min_free_disk_gb as f64 {
+            self.disk_warned
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut state = self.state();
         self.reap(&mut state);
         if let Some(ticket) = params.ticket_id {
@@ -313,6 +320,7 @@ impl Governor {
         let (class, position) = Self::position_of(&state, ticket)
             .ok_or_else(|| "ticket vanished during admission".to_string())?;
         let reason = Self::reason_for(&state, policy, &sample, class, position);
+        self.note_disk_stall(policy, &sample, &reason);
         Ok(AcquireOutcome::Queued {
             ticket_id: ticket,
             class,
@@ -320,6 +328,34 @@ impl Governor {
             message: reason.describe(),
             reason,
         })
+    }
+
+    /// Log one warning per episode when the disk floor stalls admission, so a
+    /// silent stall of every landing is visible in the daemon log (#932). The
+    /// client prints the same reason; health shows the gate margin.
+    fn note_disk_stall(
+        &self,
+        policy: &GovernorPolicy,
+        sample: &ResourceSample,
+        reason: &BlockReason,
+    ) {
+        use std::sync::atomic::Ordering;
+        if matches!(reason, BlockReason::Disk { .. })
+            && !self.disk_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                free_gb = sample.disk_free_gb,
+                min_gb = policy.min_free_disk_gb,
+                "Resource governor: cargo/lander admission is stalled by the disk floor; \
+                 reclaim stale lander scratch and agent scratch (GetHealthStatus shows margins)"
+            );
+        }
+    }
+
+    /// Whether a disk-floor stall warning is currently latched.
+    #[cfg(test)]
+    fn disk_warning_latched(&self) -> bool {
+        self.disk_warned.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Release a lease or cancel a queued ticket. Returns whether it existed.
@@ -560,7 +596,7 @@ pub fn resolve_proc_holder(pid: u32) -> Option<Holder> {
 
 /// Field 22 of `/proc/<pid>/stat`. The command name (field 2) may contain
 /// spaces and parentheses, so parse after the last `)`.
-fn parse_start_ticks(stat: &str) -> Option<u64> {
+pub(crate) fn parse_start_ticks(stat: &str) -> Option<u64> {
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     // `rest` begins at field 3 (state); starttime is field 22 = index 19.
     rest.split_whitespace().nth(19)?.parse().ok()
@@ -793,6 +829,23 @@ mod tests {
         // A full build pool does not block a lander.
         granted(&g.acquire(&p, &req(AdmissionClass::Lander, 2)).unwrap());
         queued(&g.acquire(&p, &req(AdmissionClass::Build, 3)).unwrap());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn disk_floor_stall_latches_one_warning_until_the_gate_reopens() {
+        let (w, g) = World::new();
+        let p = GovernorPolicy::default();
+        assert!(!g.disk_warning_latched());
+        w.set(|s| s.disk_free_gb = 29.0);
+        let (ticket, _, _) = queued(&g.acquire(&p, &req(AdmissionClass::Lander, 1)).unwrap());
+        assert!(g.disk_warning_latched());
+        // Polling again while still stalled keeps the single latched warning.
+        queued(&poll(&g, &p, ticket, AdmissionClass::Lander));
+        assert!(g.disk_warning_latched());
+        w.set(|s| *s = healthy());
+        granted(&poll(&g, &p, ticket, AdmissionClass::Lander));
+        assert!(!g.disk_warning_latched());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

@@ -122,6 +122,12 @@ pub struct HarnessToolPolicy {
     /// `None` inherits the daemon default (`deny_private` when unset too).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressMode>,
+    /// Server-side context editing (#1097 slice 4): the Anthropic API clears
+    /// old tool results in bulk (`clear_tool_uses_20250919`). `None` inherits
+    /// the default, which is on for Claude Harness sessions; it is never
+    /// applied to other providers. Nothing is edited client-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_editing: Option<bool>,
     #[serde(default)]
     pub budgets: ToolBudgets,
 }
@@ -166,6 +172,7 @@ impl HarnessToolPolicy {
             denied_tools: denied,
             web_access: self.web_access.or(defaults.web_access),
             egress: self.egress.or(defaults.egress),
+            context_editing: self.context_editing.or(defaults.context_editing),
             budgets: self.budgets.or(defaults.budgets),
         }
     }
@@ -179,6 +186,7 @@ impl HarnessToolPolicy {
             denied_tools: Vec::new(),
             web_access: Some(WebAccessMode::Disabled),
             egress: Some(EgressMode::Offline),
+            context_editing: None,
             budgets: ToolBudgets::default(),
         }
     }
@@ -192,6 +200,12 @@ impl HarnessToolPolicy {
     #[must_use]
     pub fn egress_mode(&self) -> EgressMode {
         self.egress.unwrap_or_default()
+    }
+
+    /// Whether server-side context editing is requested (default on).
+    #[must_use]
+    pub fn context_editing_enabled(&self) -> bool {
+        self.context_editing.unwrap_or(true)
     }
 
     /// Effective web mode (`enabled` when unspecified everywhere).
@@ -299,5 +313,29 @@ mod tests {
         let parsed: HarnessToolPolicy =
             serde_json::from_value(serde_json::json!({"egress": "offline"})).unwrap();
         assert_eq!(parsed.egress, Some(EgressMode::Offline));
+    }
+
+    #[test]
+    fn context_editing_defaults_on_layers_and_stays_out_of_a_default_wire_form() {
+        let unset = HarnessToolPolicy::default();
+        assert!(unset.context_editing_enabled());
+        assert!(
+            !serde_json::to_string(&unset)
+                .unwrap()
+                .contains("context_editing")
+        );
+        assert!(unset.is_default());
+
+        let off: HarnessToolPolicy =
+            serde_json::from_value(serde_json::json!({"context_editing": false})).unwrap();
+        assert!(!off.context_editing_enabled());
+        assert!(!off.is_default());
+        let layered = HarnessToolPolicy::default().or_defaults(&off);
+        assert_eq!(layered.context_editing, Some(false));
+        let session_on = HarnessToolPolicy {
+            context_editing: Some(true),
+            ..Default::default()
+        };
+        assert!(session_on.or_defaults(&off).context_editing_enabled());
     }
 }

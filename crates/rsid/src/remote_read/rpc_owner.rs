@@ -16,6 +16,26 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// The limiter every operator Remote read shares. Production uses the one
+/// daemon-wide limiter: 250 ms from admission and a 50 ms Store transaction,
+/// both of which a loaded host can exceed, so a read then answers `busy`
+/// (#1168). A test that asserts the content of a dispatched read gets its own
+/// limiter with generous deadlines, which also keeps it clear of the permits
+/// other tests in the process hold on the global one.
+#[cfg(not(test))]
+fn operator_limiter() -> &'static RemoteReadLimiter {
+    RemoteReadLimiter::global()
+}
+
+#[cfg(test)]
+fn operator_limiter() -> &'static RemoteReadLimiter {
+    static LIMITER: std::sync::OnceLock<RemoteReadLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let generous = std::time::Duration::from_secs(30);
+        RemoteReadLimiter::with_deadline(generous, generous)
+    })
+}
+
 pub fn is_operator_read_method(method: &str) -> bool {
     matches!(
         method,
@@ -61,7 +81,7 @@ pub async fn send_operator_read<W: AsyncWrite + Unpin>(
         Ok(request) if rpc.jsonrpc == "2.0" => request,
         _ => return send_error(writer, id, ReadError::InvalidSource).await,
     };
-    let limiter = RemoteReadLimiter::global();
+    let limiter = operator_limiter();
     match &request {
         ReadRequestV1::RemoteGetInfoV1(_) => {
             settle(spawn_info_read(limiter, &request, daemon_epoch), id, writer).await

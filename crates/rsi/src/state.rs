@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicU8;
 
 use crate::app::SortOrder;
 use crate::settings::UserSettings;
-use crate::types::{PopupMode, Tab};
+use crate::types::{PopupMode, SettingsNavigation, Tab};
 use crate::ui::theme;
 use rsi_common::types::SessionProvider;
 
@@ -490,6 +490,11 @@ pub struct PersistedState {
     #[serde(default)]
     pub settings: UserSettings,
 
+    /// Last Settings location and per-section cursors. Invalid navigation
+    /// falls back independently, preserving the rest of the operator's state.
+    #[serde(default, deserialize_with = "deserialize_settings_navigation")]
+    pub settings_navigation: SettingsNavigation,
+
     /// Per-session fold state for list cards. Key is session UUID string, value is expanded.
     #[serde(default)]
     pub session_fold_states: HashMap<String, bool>,
@@ -509,6 +514,10 @@ pub struct PersistedState {
     /// Last-used modal dropdown values (P2.4). See `ModalDefaults` doc.
     #[serde(default)]
     pub modal_defaults: ModalDefaults,
+
+    /// File explorer drawer width chosen with its resize keys.
+    #[serde(default)]
+    pub file_explorer_width: Option<u16>,
 }
 
 impl PersistedState {
@@ -534,6 +543,7 @@ impl PersistedState {
             selected_effort: app.selected_effort.clone(),
             theme_flavor: Some(theme::active_theme_key().to_string()),
             settings: app.settings.clone(),
+            settings_navigation: app.settings_state.navigation(),
             session_fold_states,
             border_color_overrides: {
                 let arr = [
@@ -550,6 +560,7 @@ impl PersistedState {
             theme_role_overrides: ThemeRoleOverrides::capture(),
             modal_geometries: app.modal_geometries.clone(),
             modal_defaults: app.modal_defaults.clone(),
+            file_explorer_width: app.file_explorer_width,
         }
     }
 
@@ -580,6 +591,14 @@ impl PersistedState {
     fn state_path() -> PathBuf {
         state_file_path(StateFile::Persisted)
     }
+}
+
+fn deserialize_settings_navigation<'de, D>(deserializer: D) -> Result<SettingsNavigation, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// Serializable per-session view state (excludes events, caches, TextArea).
@@ -1125,11 +1144,13 @@ mod tests {
             selected_effort: None,
             theme_flavor: Some("latte".to_string()),
             settings: UserSettings::default(),
+            settings_navigation: SettingsNavigation::default(),
             session_fold_states: HashMap::new(),
             border_color_overrides: BorderColorOverrides::default(),
             theme_role_overrides: ThemeRoleOverrides::default(),
             modal_geometries: HashMap::new(),
             modal_defaults: ModalDefaults::default(),
+            file_explorer_width: Some(64),
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1141,6 +1162,7 @@ mod tests {
         assert!(restored.last_viewed_session.is_some());
         assert_eq!(restored.selected_model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(restored.theme_flavor.as_deref(), Some("latte"));
+        assert_eq!(restored.file_explorer_width, Some(64));
     }
 
     #[test]
@@ -1149,6 +1171,7 @@ mod tests {
         let json = r#"{"sort_order":"NewestFirst"}"#;
         let state: PersistedState = serde_json::from_str(json).unwrap();
 
+        assert!(state.file_explorer_width.is_none());
         assert!(state.session_jumplist.is_empty());
         assert_eq!(state.jumplist_cursor, 0);
         assert!(state.tabs.is_empty());
@@ -1529,6 +1552,63 @@ mod tests {
             assert!(defaults.model.is_none());
             assert!(defaults.effort.is_none());
             assert!(!defaults.sandbox);
+        }
+    }
+    #[test]
+    fn settings_navigation_roundtrip_keeps_locations_without_transient_state() {
+        use crate::types::{SettingsFocus, SettingsSection, SettingsState};
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.selected_index = 5;
+        app.settings_state.select_section(SettingsSection::Screen);
+        app.settings_state.selected_index = 1;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.query = "temporary".into();
+        app.settings_state.query_active = true;
+        app.settings_state.model_dropdown.open = true;
+        let json = serde_json::to_value(PersistedState::capture(&app)).unwrap();
+        assert_eq!(json["settings_navigation"]["section"], "screen");
+        assert_eq!(json["settings_navigation"]["selected_index"], 1);
+        assert_eq!(json["settings_navigation"]["focus"], "items");
+        let restored: PersistedState = serde_json::from_value(json).unwrap();
+        let mut state = SettingsState::from_navigation(restored.settings_navigation);
+        assert_eq!(state.section, SettingsSection::Screen);
+        assert_eq!(state.selected_index, 1);
+        assert_eq!(state.focus, SettingsFocus::Items);
+        assert!(state.query.is_empty());
+        assert!(!state.query_active);
+        assert!(!state.model_dropdown.open);
+        state.select_section(SettingsSection::ThemeColors);
+        assert_eq!(state.selected_index, 5);
+        state.select_section(SettingsSection::Screen);
+        assert_eq!(state.selected_index, 1);
+    }
+
+    #[test]
+    fn missing_or_future_settings_navigation_preserves_other_saved_preferences() {
+        use crate::types::{SettingsFocus, SettingsSection};
+        let legacy: PersistedState = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy.settings_navigation.section,
+            SettingsSection::ThemeColors
+        );
+        assert_eq!(legacy.settings_navigation.focus, SettingsFocus::Categories);
+        for navigation in [
+            serde_json::json!({"section": "future_section"}),
+            serde_json::json!({"section": "screen", "selected_index": "invalid"}),
+            serde_json::Value::Null,
+        ] {
+            let mut json = serde_json::to_value(PersistedState {
+                sort_order: SortOrder::FreshestFirst,
+                ..Default::default()
+            })
+            .unwrap();
+            json["settings_navigation"] = navigation;
+            let restored: PersistedState = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.sort_order, SortOrder::FreshestFirst);
+            assert_eq!(
+                restored.settings_navigation.section,
+                SettingsSection::ThemeColors
+            );
         }
     }
 }

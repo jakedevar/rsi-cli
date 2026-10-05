@@ -1672,7 +1672,7 @@ mod tests {
         use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
         use rsi_common::archive_cleanup::{ArchiveCleanupPhaseV1, ArchivePreservationClassV1};
         use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionKind, SessionStatus};
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.project_id = None;
         session.session_kind = SessionKind::Task;
         session.status = SessionStatus::Completed;

@@ -17,6 +17,6 @@ Facts that bite:
 - Caller identity comes from the transport token, never from request JSON.
 - `SwitchSessionModel` is deprecated; the model is fixed at session creation.
 - Agent mail: `queued` is not delivered. The default expiry is 30 minutes from
-  first acceptance. Other CLI providers receive mail only at idle boundaries; Claude sessions also get it at each tool boundary through the per-session PostToolUse hook (`rsi-rpc boundary-mail-hook` -> hook-only `ClaimBoundaryMail`, `session/boundary_mail.rs`, #1049).
+  first acceptance. Other CLI providers receive mail only at idle boundaries; Claude sessions also get it at each tool boundary through the per-session PostToolUse hook (`rsi-rpc boundary-mail-hook` -> hook-only `ClaimBoundaryMail`, `session/boundary_mail.rs`, #1049). The same hook also spills large tool results (PostToolUse `updatedToolOutput` for Bash/Grep) and routes heavy Bash commands (cargo, make, test runners) through `rsi-rpc spill` at PreToolUse (#1097, `rsi-common/src/spill.rs`; a failing command is a `PostToolUseFailure`, which cannot rewrite output, hence the PreToolUse route).
 - The full `cargo test -p rsid --lib` run takes more than 10 minutes. Scope
   runs to the modules you touch.

@@ -451,7 +451,7 @@ fn submit_budget_policy_form(app: &mut App) {
     policy.alert_threshold_ratio = alert_threshold_ratio_parsed;
 
     // Mirror rsid's `validate_model_budget_policy` "at least one limit" rule
-    // (crates/rsid/src/store/model_control.rs) EXACTLY — checked against the
+    // (crates/rsid-store/src/store/model_control.rs) EXACTLY — checked against the
     // final merged policy so a hidden field already set on `original` (e.g.
     // max_retries from some other tool) satisfies the check even though this
     // form doesn't expose it. Note max_cache_creation_tokens/

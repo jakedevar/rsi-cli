@@ -70,7 +70,7 @@ pub(crate) fn model_tier_index(tier: Option<ModelTier>) -> usize {
 /// One (label, value) row per configured budget policy. Empty list renders a
 /// single synthetic row: an empty Budgets list does NOT mean "unlimited" —
 /// the daemon enforces hardcoded per-scope defaults whenever no explicit
-/// policy exists for a scope (see `crates/rsid/src/store/model_control.rs`).
+/// policy exists for a scope (see `crates/rsid-store/src/store/model_control.rs`).
 pub(crate) fn budget_rows(app: &App) -> Vec<(String, String)> {
     let policies: &[ModelBudgetPolicy] = app
         .cached_model_control_status

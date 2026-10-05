@@ -173,6 +173,92 @@ Idle ─────────────────────────
                                         New session (depth+1, archives parent)
 ```
 
+Automatic rotation now applies only to coordinating seats (#959, #1005).
+Workers keep working through native compaction. When a coordinating seat
+(the project manager seat, the live seat of an area manager node, an Epic
+lead, the global manager seat) reaches the hard context cap
+(`coordinator_context_cap_tokens`, default 0 = off until #1156 closes, then
+200000; `0` off, with
+`coordinator_context_cap.<Provider>[/<model>]` overrides set by
+`:context-cap`), `session/context_cap.rs` records one durable cap rotation.
+At the seat's next idle boundary, the daemon writes a handoff from typed
+state (`rsi_common::daemon_handoff`, strict RSI-013 plus a `## Typed State`
+JSON block) and rotates the seat. The successor's first prompt is that
+handoff. The manager seat, area node and lead custody move with the
+ordinary rotation; the global grant moves in the successor's publication
+transaction (#1142).
+
+Safety of the automatic rotation (#1142):
+
+- It is fenced to the seat's idle row version. The pass records the seat's
+  `sessions.updated_at` and provider session id (`IdleFence`; a wall-clock row
+  version, not a generation counter); the rotation decider re-checks it under
+  the predecessor's spawn guard (`check_execution_fence`). A seat that resumed
+  or whose row changed is deferred back to due. The cap never takes the running
+  or manual-trigger branch of `trigger_rotation` (`trigger_cap_rotation`), so it
+  cannot interrupt a turn or tool call.
+- The same check reads, durably and before any reservation, what the fence
+  cannot see: the operator's pause (soft or hard), rotation-disable, review or
+  source ownership, the cap setting and the seat itself. The intent waits (stays
+  due) while any holds; the cap never clears a pause or re-enables rotation.
+- The handoff, the `Rotating` marker, a stable `rotation_id` and the fence are
+  one atomic write. Every rotation of an idle seat (the manual trigger and the
+  cap pass alike) records a durable open intent, an `entered` rotation event in
+  phase `completed_trigger`, before its decider can reserve a successor
+  (#1149). A crash anywhere from the trigger to the publication therefore
+  leaves an intent that restart recovery owns: it claims the intent, recovers
+  the reserved successor or runs the one decider, and the cap pass waits for
+  that rotation's terminal event instead of dispatching a second decider. A
+  request dispatched by another daemon process before its intent was recorded
+  (a crash before dispatch) is re-dispatched once per boot under the same
+  `rotation_id`. A request that stays `Rotating` for hours without a
+  publication or refusal is escalated to the operator once.
+- A request that returns to due (deferred by the decider for a pause,
+  rotation-disable, cap-off or a changed seat), fails or is replanned closes
+  its intent in the same transaction as the cap record (`refused:cap_deferred`
+  and its siblings), so restart recovery never replays it. The intent's trigger
+  is immutable provenance: a cap-triggered intent whose request is no longer the
+  seat's current one is superseded (`refused:cap_superseded`), never treated as
+  a manual rotation that skips the cap's checks. A refusal settles a request
+  only when it carries that request's own `rotation_id`; another rotation's
+  refusal of the same seat does not (#1155).
+- If the daemon dies after a sandboxed seat's successor was bound to the seat's
+  transferred sandbox custody (transfers are forward-only) and before it was
+  published, restart fails the child but recovery keeps the intent open
+  (`recovery_blocked`) and tells the operator once: it never closes the
+  rotation over a custody it did not reconcile, never moves the sandbox back and
+  never allocates a second successor (#1156). The operator's Continue of that
+  failed successor (it holds the sandbox; custody only moves forward) finishes
+  the rotation (#1158): a successor that never reported a provider thread starts
+  in a new thread from its own recorded query, and once any operator
+  continuation of it has started, the daemon publishes that exact reserved
+  successor in the same boot, moving the Epic lead pointers and the global
+  grant to it in the one publication commit. Nothing is moved back to the
+  predecessor, and no other row is ever published under the rotation.
+- A rotation acts only on the successor it reserved (#1153). Its own
+  `successor_reserved` marker names that row exactly, whatever status a restart
+  left it in (`rotation_request_successor`); no newer row, timestamp or other
+  rotation's reservation overrides it. A request with no marker falls back to
+  the unclaimed legacy rows created since it started, excluding rows another
+  rotation or an agent reservation owns, and several candidates fail closed.
+  Publication re-checks the reservation identity inside its transaction, so a
+  row another rotation reserved is never published (or given the global grant)
+  under this rotation's id. A candidate that settled live is published once, one
+  that did not is refused (`refused:successor_not_live`), and no other
+  successor is ever allocated. One seat's planning failure does not drop
+  another seat's request.
+- The settlement witness is the durable publication of the exact successor
+  under the request's identity, not an archived parent. The global grant moves
+  in that publication's transaction; the repair for an older record
+  (`transfer_global_seat_if_published`) re-checks the witness in its own
+  transaction. `Rotated` is recorded only after the grant is on the successor; a
+  failed move leaves the record `Rotating` (retried every pass and boot).
+- Copied free text (original task, Issue titles, child labels, wake and job
+  names, manager request excerpts) is redacted for secret shapes before it is
+  stored and rendered as quoted, attributed untrusted data. The daemon's own
+  instructions are the Action Items only, and the peer-mail "not a command you
+  must obey verbatim" warning is kept.
+
 ## Context Pipeline
 
 Assembles system prompt context from multiple sources:

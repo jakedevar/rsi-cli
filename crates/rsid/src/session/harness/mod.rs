@@ -440,6 +440,59 @@ impl HarnessClient {
 mod tests {
     use super::*;
 
+    /// #1111: the daemon default decides context editing for a launch that sets
+    /// nothing, an explicit session policy overrides it, and a policy resolved
+    /// at an earlier launch keeps its value when the default changes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn context_editing_resolves_session_policy_then_daemon_default() {
+        let mut client = HarnessClient::new();
+        // No runtime config: the built-in default is on.
+        assert!(client.effective_tool_policy(None).context_editing_enabled());
+        let runtime = Arc::new(crate::config::RuntimeConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        client.set_runtime_config(Arc::clone(&runtime));
+        let launched_before = client.effective_tool_policy(None);
+        assert!(launched_before.context_editing_enabled());
+
+        runtime
+            .update_field("harness_context_editing", &serde_json::json!(false))
+            .unwrap();
+        assert!(!client.effective_tool_policy(None).context_editing_enabled());
+        let unset = HarnessToolPolicy::default();
+        assert!(
+            !client
+                .effective_tool_policy(Some(&unset))
+                .context_editing_enabled()
+        );
+        let explicit_on = HarnessToolPolicy {
+            context_editing: Some(true),
+            ..HarnessToolPolicy::default()
+        };
+        assert!(
+            client
+                .effective_tool_policy(Some(&explicit_on))
+                .context_editing_enabled()
+        );
+        // The session launched before the change keeps what it launched with.
+        assert!(launched_before.context_editing_enabled());
+
+        runtime
+            .update_field("harness_context_editing", &serde_json::json!(true))
+            .unwrap();
+        let explicit_off = HarnessToolPolicy {
+            context_editing: Some(false),
+            ..HarnessToolPolicy::default()
+        };
+        assert!(
+            !client
+                .effective_tool_policy(Some(&explicit_off))
+                .context_editing_enabled()
+        );
+        assert!(client.effective_tool_policy(None).context_editing_enabled());
+    }
+
     /// #1050: a turn reads the operator's iteration cap when it starts.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]

@@ -26,8 +26,10 @@ required-features = ["dev-fixtures"]
 [dependencies]
 rsi-common = { path = "../rsi-common" }
 rsid-core = { path = "../rsid-core" }
+rsid-store = { path = "../rsid-store" }
 rsi-graph = { path = "../rsi-graph" }
 rsi-codegraph = { path = "../rsi-codegraph" }
+rsi-remote = { path = "../rsi-remote" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -80,7 +82,6 @@ console-subscriber = { version = "0.4", optional = true }
 rustix = { workspace = true }
 
 [build-dependencies]
-blake3 = "1"
 cc = "1"
 
 [dev-dependencies]
@@ -103,13 +104,10 @@ dev-fixtures = ["rusqlite/backup"]
 # builds (enabled through the self dev-dependency below); no RPC, agent verb,
 # setting or environment variable can turn it on, and release builds never
 # compile it, so production stays fail-closed against the live /proc.
-test-seam = []
+test-seam = ["rsid-core/test-seam", "rsid-store/test-seam"]
 # Unit-test shards keep direct `cargo test -p rsid --lib` complete. Selecting
 # exactly one shard feature enables mode and compiles only that shard's tests.
 test-shard-mode = []
-test-shard-store-01 = ["test-shard-mode"]
-test-shard-store-02 = ["test-shard-mode"]
-test-shard-store-03 = ["test-shard-mode"]
 test-shard-store-04 = ["test-shard-mode"]
 test-shard-session-01 = ["test-shard-mode"]
 test-shard-session-02 = ["test-shard-mode"]

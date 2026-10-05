@@ -35,7 +35,7 @@ deviations as findings; do not fix them here.
    ```
    Sub-task A - Schema and persistence:
    Did the plan's migration land as an inline `if version < N` block in
-   crates/rsid/src/store/mod.rs with the matching user_version bump?
+   crates/rsid-store/src/store/mod.rs with the matching user_version bump?
    Compare the DDL with the plan's DDL.
    Return: planned vs actual, with file:line.
 

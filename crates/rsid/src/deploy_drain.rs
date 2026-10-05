@@ -12,6 +12,11 @@
 //! running jobs are never interrupted. A parentless operator session and the
 //! deploy's own caller are never held.
 //!
+//! The merge queue is held too (#1128): while a deploy drains, the queue loop
+//! admits no new batch (queued entries wait, the running batch finishes, so the
+//! `landing_in_progress` quiet-point blocker clears). The held queue shows in
+//! `deploy_drain.held` as one `queue_batch` item.
+//!
 //! Held work is deferred, never dropped: durable work (spawn requests, topology
 //! nodes) waits in place and runs when the hold releases; scheduled wakes stay
 //! due and are re-evaluated next tick; work whose caller keeps the request
@@ -82,7 +87,8 @@ impl HeldKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Active {
     deploy_id: Uuid,
-    owner: Uuid,
+    /// `None` for an operator restart (#1122): every child is held.
+    owner: Option<Uuid>,
     deadline: DateTime<Utc>,
 }
 
@@ -97,6 +103,10 @@ struct Held {
 pub struct DeployDrain {
     state: watch::Sender<Option<Active>>,
     waiting: Mutex<Vec<Held>>,
+    /// Since when the merge queue has had queued entries it will not admit.
+    queue_held: Mutex<Option<DateTime<Utc>>>,
+    /// What the waiting deploy's last quiet-point poll found (#1177).
+    blockers: Mutex<Vec<&'static str>>,
     next_ticket: AtomicU64,
     refused: AtomicU64,
     wakes_held: AtomicU64,
@@ -128,6 +138,8 @@ impl DeployDrain {
         Self {
             state: watch::channel(None).0,
             waiting: Mutex::new(Vec::new()),
+            queue_held: Mutex::new(None),
+            blockers: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             wakes_held: AtomicU64::new(0),
@@ -156,6 +168,14 @@ impl DeployDrain {
         });
     }
 
+    /// Record the quiet-point blockers the latest poll found (empty clears).
+    pub(crate) fn set_blockers(&self, blockers: &[&'static str]) {
+        if let Ok(mut current) = self.blockers.lock() {
+            current.clear();
+            current.extend_from_slice(blockers);
+        }
+    }
+
     fn active_at(&self, now: DateTime<Utc>) -> Option<Active> {
         (*self.state.borrow()).filter(|active| now < active.deadline)
     }
@@ -174,8 +194,9 @@ impl DeployDrain {
     }
 
     fn holds_at(&self, session: Option<Uuid>, has_parent: bool, now: DateTime<Utc>) -> bool {
-        self.active_at(now)
-            .is_some_and(|active| has_parent && session != Some(active.owner))
+        self.active_at(now).is_some_and(|active| {
+            has_parent && active.owner.is_none_or(|owner| session != Some(owner))
+        })
     }
 
     /// Refuse with the typed `deploy_draining` code when `session` is held.
@@ -189,6 +210,22 @@ impl DeployDrain {
             return Err(draining_error());
         }
         Ok(())
+    }
+
+    /// Merge-queue admission gate (#1128): `true` when the queue must not admit
+    /// a new batch because a deploy is draining. `has_queued` records (or
+    /// clears) the held-queue item that [`Self::status`] reports.
+    #[must_use]
+    pub fn hold_queue_admission(&self, has_queued: bool) -> bool {
+        let draining = self.is_draining();
+        if let Ok(mut held) = self.queue_held.lock() {
+            if draining && has_queued {
+                held.get_or_insert_with(Utc::now);
+            } else {
+                *held = None;
+            }
+        }
+        draining
     }
 
     /// Note a queued manager action that was returned to the queue.
@@ -261,12 +298,32 @@ impl DeployDrain {
                     .collect()
             },
         );
+        let mut held = held;
+        if active.is_some()
+            && let Ok(queue) = self.queue_held.lock()
+            && let Some(since) = *queue
+        {
+            held.push(HeldWorkV1 {
+                kind: "queue_batch".to_string(),
+                session_id: None,
+                since: since.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                reason: DEPLOY_DRAINING.to_string(),
+            });
+        }
         DeployDrainV1 {
             draining: active.is_some(),
             deploy_id: active.map(|value| value.deploy_id),
             release_by: active
                 .map(|value| value.deadline.to_rfc3339_opts(SecondsFormat::Nanos, true)),
             held,
+            blockers: if active.is_some() {
+                self.blockers.lock().map_or_else(
+                    |_| Vec::new(),
+                    |b| b.iter().map(|b| (*b).to_string()).collect(),
+                )
+            } else {
+                Vec::new()
+            },
             refused_total: self.refused.load(Ordering::Relaxed),
             wakes_held_total: self.wakes_held.load(Ordering::Relaxed),
         }
@@ -282,12 +339,14 @@ mod tests {
     fn row(owner: Uuid, deadline: DateTime<Utc>) -> DeployRow {
         DeployRow {
             id: Uuid::new_v4(),
-            owner_session_id: owner,
+            owner_session_id: Some(owner),
             sha: "0".repeat(40),
             manifest: Vec::new(),
             state: DeployState::Staged,
             reason: None,
             deadline_at: deadline,
+            operator: false,
+            forced: false,
         }
     }
 
@@ -432,5 +491,32 @@ mod tests {
                 .await,
             "after release nothing waits"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn the_queue_hold_is_reported_in_held_only_while_draining_with_queued_entries() {
+        let drain = DeployDrain::new();
+        assert!(!drain.hold_queue_admission(true), "no deploy: admit");
+        assert!(drain.status().held.is_empty());
+        let now = Utc::now();
+        let live = row(Uuid::new_v4(), now + chrono::Duration::minutes(5));
+        drain.sync(Some(&live), true, now);
+        assert!(
+            drain.hold_queue_admission(false),
+            "draining holds admission"
+        );
+        assert!(
+            drain.status().held.is_empty(),
+            "nothing queued, nothing held"
+        );
+        assert!(drain.hold_queue_admission(true));
+        let held = drain.status().held;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].kind, "queue_batch");
+        assert_eq!(held[0].reason, DEPLOY_DRAINING);
+        drain.sync(None, true, now);
+        assert!(!drain.hold_queue_admission(true));
+        assert!(drain.status().held.is_empty());
     }
 }

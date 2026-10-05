@@ -20,6 +20,8 @@ mod input_modal;
 pub(crate) mod keybindings_help;
 mod label_form;
 mod label_picker;
+mod legacy_scratch;
+mod manager_tree;
 mod manager_v2;
 mod mcp_server_form;
 mod memory_search;
@@ -35,6 +37,7 @@ mod provider_form;
 mod question_modal;
 mod rating;
 pub(crate) mod recursive_dag;
+mod remote;
 mod rename_session;
 mod satellite_registry;
 mod schedule_browser;
@@ -689,8 +692,8 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
     render_regular_overlay(frame, area, app);
 }
 
-pub(crate) fn file_explorer_drawer_width(area_width: u16) -> u16 {
-    file_explorer::drawer_width(area_width)
+pub(crate) fn file_explorer_drawer_width(area_width: u16, preferred: Option<u16>) -> u16 {
+    crate::overlay::file_explorer::drawer_width(area_width, preferred)
 }
 
 /// Render all input overlays as a vertical stack (oldest at top, newest at bottom).
@@ -847,6 +850,15 @@ fn render_regular_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
+    // The explorer records its rendered geometry and scroll position, so it
+    // renders from a mutable borrow before the shared-borrow match below.
+    if matches!(app.overlay, OverlayState::FileExplorer(..)) {
+        let marks = crate::overlay::file_explorer::viewer_marks(app);
+        if let OverlayState::FileExplorer(state) = &mut app.overlay {
+            file_explorer::render_file_explorer(frame, area, state, &marks);
+        }
+        return;
+    }
     match &app.overlay {
         OverlayState::None => {}
         OverlayState::ThemePicker {
@@ -991,8 +1003,17 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         OverlayState::SourceWorktreeSettlement(state) => {
             cohort_settlement::render_source_worktree_settlement(frame, area, state);
         }
+        OverlayState::LegacyScratch(state) => {
+            legacy_scratch::render(frame, area, state);
+        }
         OverlayState::SatelliteRegistry(state) => {
             satellite_registry::render(frame, area, state);
+        }
+        OverlayState::Remote(state) => {
+            remote::render(frame, area, state);
+        }
+        OverlayState::ManagerTree(state) => {
+            manager_tree::render(frame, area, state);
         }
         OverlayState::HarnessManagerV2(state) => {
             manager_v2::render(frame, area, state);
@@ -1217,36 +1238,7 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
                 *loading,
             );
         }
-        OverlayState::FileExplorer {
-            root,
-            entries,
-            selected_index,
-            scroll_offset,
-            show_hidden,
-            finder_active,
-            finder_query,
-            finder_cache,
-            finder_results,
-            finder_selected,
-            explorer_focused,
-            ..
-        } => {
-            file_explorer::render_file_explorer(
-                frame,
-                area,
-                root,
-                entries,
-                *selected_index,
-                *scroll_offset,
-                *show_hidden,
-                *finder_active,
-                finder_query,
-                finder_cache,
-                finder_results,
-                *finder_selected,
-                *explorer_focused,
-            );
-        }
+        OverlayState::FileExplorer(..) => {} // rendered above
         OverlayState::RenameSession { title, .. } => {
             rename_session::render_rename_session_overlay(frame, area, title);
         }

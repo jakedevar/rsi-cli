@@ -178,6 +178,43 @@ pub enum DaemonFeatureValue {
     },
 }
 
+/// Read-only preview line: states it is a page of the current sweep, shows
+/// cursor progress, whether more pages remain, and skip-reason counts.
+fn sandbox_cache_preview_summary(
+    report: &SandboxBuildCacheReclaimReport,
+    sweep: Option<&rsi_common::sandbox_storage::SandboxTargetReclaimSweepV2>,
+) -> String {
+    let mut out = format!(
+        "Read-only preview of current sweep page · {} eligible / {} checked",
+        report.eligible_candidates, report.candidates_considered
+    );
+    if let Some(sweep) = sweep {
+        let pos = match (&sweep.cursor_before, &sweep.cursor_after) {
+            (None, None) => "start".to_string(),
+            (None, Some(_)) => "start → next page".to_string(),
+            (Some(_), Some(_)) => "cursor → next page".to_string(),
+            (Some(_), None) => "cursor → end".to_string(),
+        };
+        out.push_str(&format!(
+            " · cursor {pos}{}",
+            if sweep.wrapped { " (wrapped)" } else { "" }
+        ));
+    }
+    out.push_str(if report.candidate_budget_exhausted {
+        " · has_more: yes"
+    } else {
+        " · has_more: no"
+    });
+    let skipped: u32 = report.skip_counts.values().sum();
+    if skipped > 0 {
+        out.push_str(&format!(" · {skipped} skipped"));
+        for (reason, n) in &report.skip_counts {
+            out.push_str(&format!(" {reason:?}={n}"));
+        }
+    }
+    out
+}
+
 impl DaemonFeatureEntry {
     fn rotation_threshold(field: &str, label: &str) -> Self {
         let mut options = vec!["Default".to_string()];
@@ -282,6 +319,17 @@ impl DaemonFeatureEntry {
                 "Rotation threshold (Claude Code)",
             ),
             Self::rotation_threshold("context_rotation_codex_pct", "Rotation threshold (Codex)"),
+            Self {
+                field: "coordinator_context_cap_tokens".to_string(),
+                label: "Coordinator context cap (0 off)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "100000", "150000", "200000", "300000", "500000"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
             Self {
                 field: "memory_enabled".to_string(),
                 label: "Memory system".to_string(),
@@ -656,6 +704,11 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "harness_context_editing".to_string(),
+                label: "Harness context editing".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
                 field: "harness_max_search_calls".to_string(),
                 label: "Harness search call cap".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -791,6 +844,11 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Display("Open destructive audit…".to_string()),
             },
             Self {
+                field: "legacy_scratch_adoption".to_string(),
+                label: "⚠ Legacy scratch adoption".to_string(),
+                value: DaemonFeatureValue::Display("Open adoption list…".to_string()),
+            },
+            Self {
                 field: "sandbox_build_cache_reclaim_ttl_secs".to_string(),
                 label: "Cache reclaim TTL".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -838,7 +896,7 @@ impl DaemonFeatureEntry {
                 field: "sandbox_build_cache_reclaim_max_candidates".to_string(),
                 label: "Cache reclaim pass limit".to_string(),
                 value: DaemonFeatureValue::Cycle {
-                    options: ["8", "16", "32", "64", "128", "256"]
+                    options: ["8", "16", "32", "64", "128", "256", "512", "1024"]
                         .into_iter()
                         .map(str::to_string)
                         .collect(),
@@ -1207,14 +1265,12 @@ impl DaemonFeatureEntry {
         entries: &mut [Self],
         report: &SandboxBuildCacheReclaimReport,
         dry_run: bool,
+        sweep: Option<&rsi_common::sandbox_storage::SandboxTargetReclaimSweepV2>,
     ) {
         let (field, summary) = if dry_run {
             (
                 "sandbox_build_cache_dry_run",
-                format!(
-                    "{} eligible / {} checked · capacity estimate unavailable",
-                    report.eligible_candidates, report.candidates_considered
-                ),
+                sandbox_cache_preview_summary(report, sweep),
             )
         } else {
             (
@@ -1420,15 +1476,18 @@ pub enum ActivityIndicatorStyle {
     /// A single quiet status line. This is the default for new and existing users.
     #[default]
     Semantic,
-    /// The original animated half-block rainbow, preserved unchanged.
+    /// The original animated half-block rainbow; its motion is preserved and
+    /// its colours follow the active theme's loader spectrum.
     RainbowClassic,
     /// A calmer solid-cell rainbow animation.
     RainbowCompact,
-    /// The classic half-block rainbow strip reserved to one terminal row.
+    /// Rainbow Classic's interlaced ribbon in one row, flowing smoothly with a
+    /// glint sweeping across it.
     RainbowClassicCompact,
-    /// Fast-moving rainbow speed streaks.
+    /// Parallax rainbow comets with white-hot heads that surge in boosts.
     SonicSpeedUp,
-    /// A field of animated, rainbow-colored sparkles.
+    /// Twinkling rainbow stars over a drifting nebula, crossed by shooting
+    /// stars.
     RainbowStarlight,
 }
 
@@ -2916,6 +2975,31 @@ mod tests {
         }
     }
 
+    /// #1005: the coordinator context cap is an operator row that follows
+    /// the daemon value (default 0 = off until #1142; `0` off).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn daemon_feature_defaults_expose_coordinator_context_cap() {
+        let cap = |entries: &[DaemonFeatureEntry]| match &entries
+            .iter()
+            .find(|entry| entry.field == "coordinator_context_cap_tokens")
+            .unwrap()
+            .value
+        {
+            DaemonFeatureValue::Cycle { options, current } => options[*current].clone(),
+            other => panic!("cap row must be a cycle, got {other:?}"),
+        };
+        let mut entries = DaemonFeatureEntry::defaults();
+        assert_eq!(cap(&entries), "0");
+        for value in [200_000_u64, 0, 150_000] {
+            DaemonFeatureEntry::update_from_json(
+                &mut entries,
+                &serde_json::json!({ "coordinator_context_cap_tokens": value }),
+            );
+            assert_eq!(cap(&entries), value.to_string());
+        }
+    }
+
     #[test]
     fn sandbox_storage_status_states_and_build_cache_entries_round_trip() {
         let mut entries = DaemonFeatureEntry::defaults();
@@ -3078,12 +3162,25 @@ mod tests {
                     rsi_common::sandbox_storage::SandboxBuildCacheReclaimStopReason::Completed,
             }
         };
-        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &report, true);
+        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &report, true, None);
         assert_eq!(
             DaemonFeatureEntry::display_value(&entries, "sandbox_build_cache_dry_run"),
-            Some("3 eligible / 3 checked · capacity estimate unavailable")
+            Some("Read-only preview of current sweep page · 3 eligible / 3 checked · has_more: no")
         );
-        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &report, false);
+        let mut more = report.clone();
+        more.candidate_budget_exhausted = true;
+        more.skip_counts.insert(
+            rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason::ActiveOwner,
+            2,
+        );
+        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &more, true, None);
+        assert_eq!(
+            DaemonFeatureEntry::display_value(&entries, "sandbox_build_cache_dry_run"),
+            Some(
+                "Read-only preview of current sweep page · 3 eligible / 3 checked · has_more: yes · 2 skipped ActiveOwner=2"
+            )
+        );
+        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &report, false, None);
         assert_eq!(
             DaemonFeatureEntry::display_value(&entries, "sandbox_build_cache_reclaim_now"),
             Some("2 rm · 1 pend")
@@ -3138,14 +3235,14 @@ mod tests {
             ..report
         };
         DaemonFeatureEntry::update_sandbox_storage_report(&mut entries, &empty);
-        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &empty, true);
+        DaemonFeatureEntry::update_sandbox_storage_action(&mut entries, &empty, true, None);
         let empty_status =
             DaemonFeatureEntry::display_value(&entries, "sandbox_storage_status").unwrap();
         assert!(empty_status.contains("0 checked · 0 eligible"));
         assert!(empty_status.contains("capacity estimate unavailable"));
         assert_eq!(
             DaemonFeatureEntry::display_value(&entries, "sandbox_build_cache_dry_run"),
-            Some("0 eligible / 0 checked · capacity estimate unavailable")
+            Some("Read-only preview of current sweep page · 0 eligible / 0 checked · has_more: no")
         );
     }
 
@@ -3678,6 +3775,26 @@ mod tests {
     }
 
     #[test]
+    fn context_editing_tui_default_and_toggle_match_daemon_defaults() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let find = |features: &[DaemonFeatureEntry]| {
+            features
+                .iter()
+                .find(|feature| feature.field == "harness_context_editing")
+                .map(|feature| (feature.label.clone(), feature.value.clone()))
+                .expect("context editing default must be in the settings overlay")
+        };
+        let (label, value) = find(&features);
+        assert_eq!(label, "Harness context editing");
+        assert!(matches!(value, DaemonFeatureValue::Bool(true)));
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({"harness_context_editing": false}),
+        );
+        assert!(matches!(find(&features).1, DaemonFeatureValue::Bool(false)));
+    }
+
+    #[test]
     fn completion_gate_tui_default_and_toggle_match_daemon_defaults() {
         let mut features = DaemonFeatureEntry::defaults();
         let entry = features
@@ -3769,6 +3886,26 @@ mod tests {
                 }
                 other => panic!("{field} should be a cycle setting, got {other:?}"),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod pass_limit_preview_tests {
+        use super::*;
+
+        #[test]
+        fn pass_limit_cycle_reaches_contract_max_and_wraps() {
+            let entries = DaemonFeatureEntry::defaults();
+            let entry = entries
+                .iter()
+                .find(|e| e.field == "sandbox_build_cache_reclaim_max_candidates")
+                .unwrap();
+            let DaemonFeatureValue::Cycle { options, .. } = &entry.value else {
+                panic!("cycle expected");
+            };
+            let max = rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_MAX;
+            assert_eq!(options.last().unwrap(), &max.to_string());
+            assert_eq!(options.first().unwrap(), "8");
         }
     }
 }

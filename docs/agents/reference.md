@@ -238,13 +238,14 @@ Do not overwrite user or parallel-agent changes. If the worktree is dirty, inspe
 
 **Never use `cargo fmt` to format a subset of files — `cargo fmt -- <paths>` does not scope to those paths.** Cargo hands rustfmt each crate's entry point and rustfmt walks the whole module tree, so the path arguments restrict nothing: passing a single `crates/rsi/` file reformats `crates/rsid/` files too. This idiom was recommended here previously and is the direct cause of at least one corrupted diff.
 
-Format only the files you changed, by invoking `rustfmt` directly (no cargo):
+Format only the files you changed, with `rustfmt` directly (no cargo):
 
 ```bash
-git diff --name-only --diff-filter=d -- '*.rs' | xargs -r rustfmt --edition 2024
+scripts/fmt-changed.sh                 # .rs files that differ from HEAD
+scripts/fmt-changed.sh origin/rolling  # .rs files changed since a base (integration worktrees)
 ```
 
-After any format, run `git status` and `git checkout -- <file>` for anything you did not intend to touch. Stage explicit paths, never `git add -A`, so stray churn cannot ride along in a commit.
+rustfmt also rewrites every out-of-line child module (`mod foo;`) of a file it is given, and `skip_children` is nightly-only, so `rustfmt crates/rsid/src/session/mod.rs` reformats untouched `session/*.rs` files too (#1121). The script restores every file the formatter rewrote that was clean before and is not part of the change. After any format, still run `git status` and `git checkout -- <file>` for anything you did not intend to touch. Stage explicit paths, never `git add -A`, so stray churn cannot ride along in a commit.
 
 The workspace baseline is rustfmt-clean as of `9ef48b18`. Keep it that way: if `cargo fmt --all -- --check` reports diffs in files you did not touch, that is drift to fix in its own commit, not something to route around. A `cargo fmt --all --check` CI gate is the outstanding follow-up.
 

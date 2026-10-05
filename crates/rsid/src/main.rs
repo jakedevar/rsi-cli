@@ -650,6 +650,7 @@ async fn run_daemon() -> Result<()> {
         Arc::clone(session_manager.store()),
         Arc::clone(&runtime_config),
         rsid::rolling_queue::LanderLauncher::discover(),
+        session_manager.deploy_drain(),
     ));
 
     // Issue #1045: daemon-owned deploys. Verifies a `restarting` deploy once,
@@ -1478,6 +1479,11 @@ async fn run_daemon() -> Result<()> {
                 if let Err(error) = succession_runtime.deliver_due_context_successions().await {
                     warn!(error = %error, "Context succession pass deferred");
                 }
+                // #1005: rotate capped coordinating seats at their idle
+                // boundary with a daemon-written handoff.
+                if let Err(error) = succession_runtime.rotate_capped_coordinators().await {
+                    warn!(error = %error, "Coordinator context cap pass deferred");
+                }
             }
         });
     }
@@ -1542,6 +1548,28 @@ async fn run_daemon() -> Result<()> {
             }
         });
     }
+
+    // #999: reclaim stale agent scratch outside sandboxes (/var/tmp and worker
+    // TMPDIRs). Fixed conservative policy (#1140): only directories RSI
+    // recorded creating, 72 h old, unheld, in authenticated unmounted roots,
+    // holding no dirty or unpublished git work; bounded per pass. Runs on a
+    // blocking thread, first pass after ten minutes.
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(3600),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // #1150: deletion is on after the hardened core's final check
+            // (registry pruning stays off; see agent_scratch_reclaim).
+            let _ = tokio::task::spawn_blocking(|| {
+                rsid::agent_scratch_reclaim::run_and_log(false, "periodic")
+            })
+            .await;
+        }
+    });
 
     info!(
         startup_milestone = "request_ready",

@@ -763,10 +763,10 @@ probe_command() {
     case "$probe" in
         store-fixture)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("store::tests::load_sessions_survives_legacy_comma_fraction_timestamp")
-            PROBE_COMMAND=(cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
+            PROBE_COMMAND=(cargo test -p rsid-store --lib --no-default-features --features test-shard-store-01 "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
         v87-matrices)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("store::tests::h1_v87_session_fence_initial_bind_requires_exact_active_authority" "store::tests::h1_v87_session_fence_provider_live_writes_are_exact_next_sequence" "store::tests::h1_v87_session_fence_finalize_requires_complete_terminal_bundle")
-            PROBE_COMMAND=(bash -c 'set -e; threads=$1; shift; for test_id; do cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "$test_id" -- --exact --test-threads "$threads"; done' benchmark-v87 "$threads" "${PROBE_TEST_IDENTITY[@]}") ;;
+            PROBE_COMMAND=(bash -c 'set -e; threads=$1; shift; for test_id; do cargo test -p rsid-store --lib --no-default-features --features test-shard-store-01 "$test_id" -- --exact --test-threads "$threads"; done' benchmark-v87 "$threads" "${PROBE_TEST_IDENTITY[@]}") ;;
         source-scanner)
             PROBE_IDENTITY_MODE=exact; PROBE_TEST_IDENTITY=("session::issue21_phase2_tests::p2_07_gate_permit_spine::exactly_one_production_writer_of_gate_closing_and_effect_permits")
             PROBE_COMMAND=(cargo test -p rsid --lib --no-default-features --features test-shard-session-02 "${PROBE_TEST_IDENTITY[0]}" -- --exact --test-threads "$threads") ;;
@@ -1799,7 +1799,7 @@ def verify_logs(container, label, probe, expected_status_label, parse_tests=True
 
 def expected_command(probe, threads):
     if probe == "store-fixture":
-        return "cargo test -p rsid --lib store::tests::load_sessions_survives_legacy_comma_fraction_timestamp -- --exact --test-threads 1", "", "execution"
+        return "cargo test -p rsid-store --lib store::tests::load_sessions_survives_legacy_comma_fraction_timestamp -- --exact --test-threads 1", "", "execution"
     if probe == "source-scanner":
         return "cargo test -p rsid --lib session::issue21_phase2_tests::p2_07_gate_permit_spine::exactly_one_production_writer_of_gate_closing_and_effect_permits -- --exact --test-threads 1", "", "execution"
     if probe == "nextest-fast":
@@ -5533,7 +5533,7 @@ def successful_schema(root, out, baseline, expected_label, expected_outcome,
     }, f"unexpected successful capture metadata fields: {sorted(metadata)}")
     require(expected_outcome in ("green", "warmup-red"), f"invalid expected capture outcome: {expected_outcome}")
     expected_command = (
-        "cargo test -p rsid --lib --no-default-features --features test-shard-store-01 "
+        "cargo test -p rsid-store --lib --no-default-features --features test-shard-store-01 "
         "store::tests::load_sessions_survives_legacy_comma_fraction_timestamp "
         "-- --exact --test-threads 1"
     )

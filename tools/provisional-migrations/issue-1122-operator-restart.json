@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": 151,
+  "files": [
+    {
+      "path": "crates/rsid/src/store/migrations/v151.rs",
+      "path_template": "crates/rsid/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:53d90d502ef3e7dcbecc6c1383ea3ca5a929e476cf6d4b2f540ec9c4c87bd1a4",
+      "sites": [
+        {
+          "anchor": "fn migrate_v151(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 151 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "agent_deploys_operator::apply_migration(self, 151)?;",
+          "replacement": "agent_deploys_operator::apply_migration(self, ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/agent_deploys_operator.rs",
+      "path_template": "crates/rsid/src/store/agent_deploys_operator.rs",
+      "source_blob": "sha256:69930db8d5820c131c13e92d3ee736256eeddfa5b0aac2ce6d89054a84211c43",
+      "sites": [
+        {
+          "anchor": "pub(crate) const AGENT_DEPLOYS_OPERATOR_SCHEMA_VERSION: i32 = 151;",
+          "replacement": "pub(crate) const AGENT_DEPLOYS_OPERATOR_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/src/store/tests.rs",
+      "path_template": "crates/rsid/src/store/tests.rs",
+      "source_blob": "sha256:1672045cfce2e738fd4197ec0667d382558bf2e75a1bfea94e5c2dfb472e05f5",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 151;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        }
+      ]
+    }
+  ]
+}

@@ -259,6 +259,8 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // at launch), so a change reaches the next Harness launch.
     page("harness_web_access", NextSpawn),
     page("harness_egress_mode", NextSpawn),
+    // #1111: the Harness context-editing default, read at launch.
+    page("harness_context_editing", NextSpawn),
     page("harness_max_search_calls", NextSpawn),
     page("harness_max_fetch_calls", NextSpawn),
     page("harness_max_result_bytes", NextSpawn),
@@ -296,6 +298,10 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("openrouter_context_budget_tokens", NextSpawn),
     // #1050: the Harness turn reads the iteration cap when it starts.
     page("harness_max_iterations_per_turn", NextSpawn),
+    // #1005: rsid session/context_cap.rs reads the cap at each usage update
+    // of a coordinating seat. Overrides are `coordinator_context_cap.<key>`
+    // fields written by the TUI command `:context-cap`.
+    page("coordinator_context_cap_tokens", LIVE),
 ];
 
 /// The catalog entry for `field`, if any.

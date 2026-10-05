@@ -51,6 +51,9 @@ elif args[:2] == ["nextest", "run"]:
         binary.write_text("#!/bin/sh\nexit 0\n")
         binary.chmod(0o755)
     (control / f"running-{name}").touch()
+    (control / f"env-{name}").write_text(
+        "".join(f"{key}\n" for key in sorted(os.environ) if key.startswith("RSI_"))
+    )
     if os.environ.get("FAKE_HOLD_RUN"):
         wait_for(control / f"release-{name}")
     # Exec the feature-hashed harness after the peer has attempted cleanup.
@@ -96,15 +99,18 @@ class ArtifactLockTests(unittest.TestCase):
                 process.kill()
             process.communicate(timeout=20)
 
-    def start(self, name, *, mode="shard", keep=False, dry_run=False, env_target=False, **flags):
+    def start(self, name, *, mode="shard", keep=False, dry_run=False, env_target=False, extra_env=None, **flags):
         # Separate worktrees sharing metadata's resolved (e.g. global-config)
         # target directory, rather than accidentally locking each repo/target.
         repo = self.root / name
         scripts = repo / "scripts"
         scripts.mkdir(parents=True)
         shutil.copyfile(RUNNER, scripts / RUNNER.name)
+        packages = chr(10).join(f"{shard} rsid rsid-store" for shard in SHARDS)
         (scripts / "check-rsid-test-shards.py").write_text(
-            "import sys\nif '--list-shards' in sys.argv:\n"
+            "import sys\nif '--list-shard-packages' in sys.argv:\n"
+            f"    print({packages!r})\n"
+            "elif '--list-shards' in sys.argv:\n"
             f"    print({chr(10).join(SHARDS)!r})\n"
         )
         integrations = repo / "crates/rsid/tests"
@@ -121,6 +127,8 @@ class ArtifactLockTests(unittest.TestCase):
         env.update({f"FAKE_{key.upper()}": str(value) for key, value in flags.items()})
         if env_target:
             env["CARGO_TARGET_DIR"] = str(self.target)
+        if extra_env:
+            env.update(extra_env)
         command = ["bash", str(scripts / RUNNER.name), mode]
         if mode == "shard":
             command.append("store-01")
@@ -180,6 +188,27 @@ class ArtifactLockTests(unittest.TestCase):
         self.assertTrue((self.control / "cleaning-alone").is_file())
         self.assertEqual(list((self.target / "debug/deps").glob("rsid-*")), [])
 
+    def test_shards_run_with_only_build_and_lander_rsi_variables(self):
+        # #1163: a worker shell inherits the daemon's RSI_* configuration and the
+        # merge-queue lander does not; tests must see the same environment in both.
+        inherited = {
+            "RSI_CONTEXT_ROTATION_ENABLED": "true",
+            "RSI_SANDBOX_BASE": str(self.root / "daemon-sandboxes"),
+            "RSI_SESSION_ID": "00000000-0000-0000-0000-000000000000",
+            "RSI_BUILD_SLOTS": "2",
+            "RSI_JOB_CARGO_SLOT": "1",
+            "RSI_LANDER_PREBUILD": "1",
+        }
+        self.finish(self.start("environment", extra_env=inherited))
+        seen = set((self.control / "env-environment").read_text().split())
+        environment = {**os.environ, **inherited}
+        expected = {
+            key
+            for key in environment
+            if key.startswith(("RSI_BUILD_", "RSI_JOB_", "RSI_LANDER_"))
+        }
+        self.assertEqual(seen, expected)
+
     def test_keep_artifacts_retains_binary(self):
         self.finish(self.start("keep", keep=True))
         self.assertTrue((self.target / "debug/deps/rsid-keep").is_file())
@@ -221,6 +250,13 @@ class ArtifactLockTests(unittest.TestCase):
         self.assertIn("static plan:", output)
         self.assertEqual(list(self.control.iterdir()), [])
         self.assertFalse(self.target.exists())
+
+    def test_a_shard_selects_every_package_that_declares_it(self):
+        # #1021 S4: the store tests live in rsid-store, the rest in rsid; one
+        # shard run lists, runs and cleans both.
+        output = self.finish(self.start("pair", dry_run=True))
+        self.assertIn("-p rsid -p rsid-store --lib --no-default-features --features test-shard-store-01", output)
+        self.assertIn("cargo clean -p rsid -p rsid-store --profile test", output)
 
 
 if __name__ == "__main__":

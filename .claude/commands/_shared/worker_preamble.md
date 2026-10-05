@@ -1,5 +1,5 @@
 ---
-version: 22
+version: 23
 role_variants: [research, planning, implementation]
 ---
 
@@ -8,6 +8,8 @@ role_variants: [research, planning, implementation]
 Finish the assigned deliverable, verify it, commit scoped changes, and return compactly. `AGENTS.md` is the canonical repository rule list; workflow detail is in `docs/agents/worker-contract.md`.
 
 For durable follow-ups outside this deliverable, use `AgentCreateIssue` or its native equivalent; the full authority and payload contract is in `.agents/skills/rsi-agent-control/SKILL.md`.
+
+Kaizen: improve the line, never stop it. Every agent may log improvements. When you notice a defect outside your task, friction, waste, a repeated manual step, or a better way (in code, tests, tools, prompts, process or the harness itself), file one Issue with `AgentCreateIssue`: label `kaizen`, 3-6 lines (what you saw, evidence, suggested change). Then continue your task. Do not fix it inside this deliverable. Managers dedupe and prioritize.
 
 An operator-direct, parentless session may answer plainly. If either condition is unknown, use the worker return contract; an explicit operator return format still applies.
 

@@ -360,6 +360,27 @@ fn register_rsi_control_tools(
         registry.register(spec, handler);
     }
 
+    // global manager (#872 Slice B)
+    for verb in crate::session::harness::tools::rsi_control::GLOBAL_NATIVE_VERBS {
+        let control = control.clone();
+        let descriptor = verb.descriptor();
+        let spec = ToolSpec {
+            name: crate::session::harness::tools::rsi_control::native_tool_name(verb).to_string(),
+            description: descriptor.description.to_string(),
+            parameters: descriptor.parameters(),
+        };
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                crate::session::harness::tools::rsi_control::execute_global_verb(
+                    &control, caller, verb, args,
+                )
+                .await
+            })
+        });
+        registry.register(spec, handler);
+    }
+
     // halt
     {
         let control = control.clone();
@@ -782,9 +803,12 @@ mod tests {
                 "AgentSubmitJob",
                 "AgentGetJob",
                 "AgentListJobs",
+                "AgentCancelJob",
                 "AgentSendSatelliteMessage",
+                "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentGlobalAppointManager",
             ]),
             "the native CodexAppServer RPC-only verb set changed without review"
         );
@@ -898,7 +922,16 @@ mod tests {
             Some(test_control_handle()),
             Some(uuid::Uuid::new_v4()),
         );
-        assert_eq!(registry.len(), 37);
+        // Derived from the descriptor table (#1116): every catalog native
+        // tool except the Harness-only `schedule_wake`, plus the native-only
+        // argument-free `rsi_control_program_guard` convenience.
+        let expected_len = rsi_common::agent_control_schema::agent_control_catalog_v1()
+            .iter()
+            .filter_map(|descriptor| descriptor.native_tool)
+            .filter(|native| native.name() != "schedule_wake")
+            .count()
+            + 1;
+        assert_eq!(registry.len(), expected_len);
         for kind in ManagerControlToolKind::ALL {
             let reference = uuid::Uuid::new_v4();
             let mut args = match kind {
@@ -923,6 +956,11 @@ mod tests {
                     json!({"prepared_id":reference,"target_digest":format!("sha256:{}", "a".repeat(64)),"idempotency_key":"commit"})
                 }
                 ManagerControlToolKind::GetAction => json!({"operation_id":reference}),
+                ManagerControlToolKind::LaunchIssueWorker => json!({
+                    "issue": 1, "brief": "build it",
+                    "launch": {"provider": "Claude", "model": "claude-sonnet-5-5"},
+                    "idempotency_key": "launch"
+                }),
                 ManagerControlToolKind::Send => json!({
                     "epic_id": reference, "message": "evidence?", "idempotency_key": "request"
                 }),

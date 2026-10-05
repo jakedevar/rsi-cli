@@ -1088,6 +1088,7 @@ fn render_dense_rows(
     manager_ids: &HashSet<uuid::Uuid>,
     operator_pauses: &HashMap<uuid::Uuid, crate::client::OperatorPauseLevel>,
     _descent_head: Option<uuid::Uuid>,
+    tree_depths: &[usize],
     bg: Color,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -1181,7 +1182,7 @@ fn render_dense_rows(
             area.width,
             (row_height as u16).min(visible_height),
         );
-        render_navigator_row(
+        render_navigator_row_at_depth(
             frame,
             row_rect,
             &row,
@@ -1193,8 +1194,47 @@ fn render_dense_rows(
             is_focused,
             accent_color,
             bg,
+            tree_depths.get(idx).copied().unwrap_or(0),
         );
     }
+}
+
+/// Cells of title indentation per nesting level in the session-list tree.
+pub(crate) const TREE_INDENT_CELLS: usize = 2;
+/// Title cells an indented row always keeps, so deep nesting on a narrow
+/// sidebar can never indent a row's name out of view.
+const TREE_MIN_TITLE_CELLS: usize = 6;
+
+/// Nesting depth of each row in a main-zone order, relative to the current
+/// descent level. `recalculate_filtered_order` splices an unfolded
+/// container's children directly below it in depth-first preorder, so a row
+/// is one level deeper than its parent exactly when that parent is an
+/// earlier visible row; rows whose parent is not visible (the descent level's
+/// own children) are depth 0.
+pub(crate) fn session_tree_depths(
+    order: &[uuid::Uuid],
+    sessions: &std::collections::HashMap<uuid::Uuid, crate::types::SessionState>,
+) -> Vec<usize> {
+    let mut position: HashMap<uuid::Uuid, usize> = HashMap::with_capacity(order.len());
+    let mut depths = Vec::with_capacity(order.len());
+    for (idx, id) in order.iter().enumerate() {
+        let depth = sessions
+            .get(id)
+            .and_then(|state| state.session.parent_id)
+            .and_then(|parent| position.get(&parent).copied())
+            .and_then(|parent_idx| depths.get(parent_idx).copied())
+            .map_or(0, |parent_depth: usize| parent_depth + 1);
+        depths.push(depth);
+        position.entry(*id).or_insert(idx);
+    }
+    depths
+}
+
+/// Indentation cells for a row at `depth` inside a title cell `width` wide.
+fn tree_indent_cells(depth: usize, width: usize) -> usize {
+    depth
+        .saturating_mul(TREE_INDENT_CELLS)
+        .min(width.saturating_sub(TREE_MIN_TITLE_CELLS))
 }
 
 fn container_function_parts(
@@ -1250,6 +1290,9 @@ fn container_function_parts(
     (title, Some(format!("  {suffix}")))
 }
 
+/// Depth-0 [`render_navigator_row_at_depth`]; row-level render tests draw a
+/// single unnested row through it.
+#[cfg(test)]
 fn render_navigator_row(
     frame: &mut Frame,
     area: Rect,
@@ -1262,6 +1305,39 @@ fn render_navigator_row(
     is_focused: bool,
     accent_color: Color,
     bg: Color,
+) {
+    render_navigator_row_at_depth(
+        frame,
+        area,
+        row,
+        session,
+        settings,
+        ordinal_width,
+        is_selected,
+        is_viewed,
+        is_focused,
+        accent_color,
+        bg,
+        0,
+    );
+}
+
+/// [`render_navigator_row`] for a row nested `tree_depth` levels under an
+/// unfolded container: the Function (title) cell is indented so the list
+/// reads as a folded tree, while every other column stays aligned.
+fn render_navigator_row_at_depth(
+    frame: &mut Frame,
+    area: Rect,
+    row: &crate::types::row::SessionRowViewModel,
+    session: Option<&Session>,
+    settings: &crate::settings::UserSettings,
+    ordinal_width: usize,
+    is_selected: bool,
+    is_viewed: bool,
+    is_focused: bool,
+    accent_color: Color,
+    bg: Color,
+    tree_depth: usize,
 ) {
     if area.height == 0 {
         return;
@@ -1309,12 +1385,17 @@ fn render_navigator_row(
     let column_count = layout.columns.len();
     for (index, cell) in layout.columns.iter().enumerate() {
         if cell.column == navigator_layout::NavigatorColumn::Function {
+            let indent = tree_indent_cells(tree_depth, cell.width);
+            if indent > 0 {
+                spans.push(fixed_span("", indent, Style::default().bg(row_bg)));
+            }
+            let title_width = cell.width - indent;
             let (marker, marker_color) = match row.operator_pause {
                 crate::client::OperatorPauseLevel::None => ("", theme::dim_metadata()),
                 crate::client::OperatorPauseLevel::Soft => ("SOFT ", theme::warning_status()),
                 crate::client::OperatorPauseLevel::Hard => ("HARD ", theme::status_interrupted()),
             };
-            let marker_width = marker.len().min(cell.width);
+            let marker_width = marker.len().min(title_width);
             if marker_width > 0 {
                 spans.push(Span::styled(
                     navigator_layout::span_cells(marker, marker_width),
@@ -1324,10 +1405,10 @@ fn render_navigator_row(
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            if cell.width > marker_width {
+            if title_width > marker_width {
                 spans.extend(function_cell_spans(
                     row,
-                    cell.width - marker_width,
+                    title_width - marker_width,
                     title_style(row, is_selected, row_bg, accent_color),
                     row_bg,
                 ));
@@ -3435,6 +3516,15 @@ fn daemon_resource_lines(
         })
         .unwrap_or_default();
     let mut lines = spread_lines(label, uptime, width, bg);
+    if let Some(restart) = &view.restart_pending {
+        lines.push(Line::from(Span::styled(
+            restart.clone(),
+            Style::default()
+                .fg(theme::peach())
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
 
     let mut cpu = vec![Span::styled("cpu   ", dim)];
     if let Some(percent) = view.cpu_percent {
@@ -4132,6 +4222,13 @@ fn render_zone_table(
             );
         }
     } else {
+        // Only the main zone splices unfolded containers' children under
+        // them; other zones are flat lists, so their rows never indent.
+        let tree_depths = if active_zone == crate::types::SessionListZone::Main {
+            session_tree_depths(order, sessions)
+        } else {
+            Vec::new()
+        };
         render_dense_rows(
             frame,
             body_area,
@@ -4150,6 +4247,7 @@ fn render_zone_table(
             manager_ids,
             operator_pauses,
             descent_head,
+            &tree_depths,
             bg,
         );
     }
@@ -6559,9 +6657,15 @@ pub fn render_activity_indicator(
         ActivityIndicatorStyle::Semantic => render_semantic_activity_indicator(frame, area, state),
         ActivityIndicatorStyle::RainbowClassic => render_loading_container(frame, area),
         ActivityIndicatorStyle::RainbowCompact => render_compact_rainbow_container(frame, area),
-        ActivityIndicatorStyle::RainbowClassicCompact => render_loading_strip(frame, area),
-        ActivityIndicatorStyle::SonicSpeedUp => render_sonic_speed_up(frame, area),
-        ActivityIndicatorStyle::RainbowStarlight => render_rainbow_starlight(frame, area),
+        ActivityIndicatorStyle::RainbowClassicCompact => {
+            super::rainbow_loaders::render_classic_compact(frame, area);
+        }
+        ActivityIndicatorStyle::SonicSpeedUp => {
+            super::rainbow_loaders::render_sonic_speed_up(frame, area);
+        }
+        ActivityIndicatorStyle::RainbowStarlight => {
+            super::rainbow_loaders::render_starlight(frame, area);
+        }
     }
 }
 
@@ -6630,52 +6734,6 @@ fn render_compact_rainbow_container(frame: &mut Frame, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn render_sonic_speed_up(frame: &mut Frame, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let palette = theme::rainbow_palette();
-    let tick = (chrono::Utc::now().timestamp_millis() / 24) as usize;
-    let spans = (0..area.width as usize)
-        .map(|column| {
-            let phase = (column * 3 + tick) % 16;
-            let (symbol, color_offset) = match phase {
-                0..=2 => ('>', 0),
-                3..=6 => ('=', 1),
-                7..=11 => ('-', 2),
-                _ => ('.', 3),
-            };
-            let color = palette[(column + tick / 4 + color_offset) % palette.len()];
-            Span::styled(symbol.to_string(), Style::default().fg(color))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn render_rainbow_starlight(frame: &mut Frame, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let palette = theme::rainbow_palette();
-    let tick = (chrono::Utc::now().timestamp_millis() / 90) as usize;
-    let spans = (0..area.width as usize)
-        .map(|column| {
-            let sparkle = (column * 7 + tick * 3) % 19;
-            let symbol = match sparkle {
-                0 => '*',
-                1..=3 => '+',
-                4..=8 => ':',
-                _ => '.',
-            };
-            let color = palette[(column + tick / 2 + sparkle % 3) % palette.len()];
-            Span::styled(symbol.to_string(), Style::default().fg(color))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -9513,7 +9571,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rainbow_indicators_fill_one_row_with_theme_palette() {
+    fn new_rainbow_indicators_render_their_signature_glyphs_in_one_row() {
         let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers;
         use ratatui::{Terminal, backend::TestBackend};
@@ -9521,42 +9579,54 @@ mod tests {
         let (app, session_id) = app_test_helpers::with_session_detail();
         let state = app.sessions.get(&session_id).expect("fixture state");
         let width = 40;
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, COMPACT_RAINBOW_HEIGHT)).expect("test terminal");
 
         for style in [
             ActivityIndicatorStyle::RainbowClassicCompact,
             ActivityIndicatorStyle::SonicSpeedUp,
             ActivityIndicatorStyle::RainbowStarlight,
         ] {
+            let height = activity_indicator_height(style);
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test terminal");
             terminal
                 .draw(|frame| {
-                    render_activity_indicator(
-                        frame,
-                        Rect::new(0, 0, width, COMPACT_RAINBOW_HEIGHT),
-                        state,
-                        style,
-                    );
+                    render_activity_indicator(frame, Rect::new(0, 0, width, height), state, style);
                 })
                 .expect("rainbow indicator render");
 
             let buffer = terminal.backend().buffer();
+            let mut drawn = 0;
             for x in 0..width {
                 let cell = &buffer[(x, 0)];
-                assert!(
-                    theme::rainbow_palette().contains(&cell.fg),
-                    "{style:?} cell ({x},0) should use the theme rainbow palette"
-                );
                 let symbol = cell.symbol();
                 let valid_symbol = match style {
-                    ActivityIndicatorStyle::RainbowClassicCompact => symbol == "▀",
-                    ActivityIndicatorStyle::SonicSpeedUp => matches!(symbol, ">" | "=" | "-" | "."),
+                    ActivityIndicatorStyle::RainbowClassicCompact => {
+                        theme::test_rgb_channels(cell.fg).is_some()
+                            && theme::test_rgb_channels(cell.bg).is_some()
+                            && symbol == "▀"
+                    }
+                    ActivityIndicatorStyle::SonicSpeedUp => {
+                        matches!(symbol, " " | "▀" | "▄" | "·")
+                    }
                     ActivityIndicatorStyle::RainbowStarlight => {
-                        matches!(symbol, "*" | "+" | ":" | ".")
+                        matches!(symbol, " " | "·" | "✧" | "✦" | "━" | "─")
                     }
                     _ => false,
                 };
-                assert!(valid_symbol, "unexpected {style:?} symbol {symbol:?}");
+                assert!(
+                    valid_symbol,
+                    "unexpected {style:?} cell {symbol:?} at ({x},0)"
+                );
+                if symbol != " " {
+                    drawn += 1;
+                    assert!(
+                        theme::test_rgb_channels(cell.fg).is_some(),
+                        "{style:?} glyph at ({x},0) is drawn from the theme spectrum"
+                    );
+                }
+            }
+            if style != ActivityIndicatorStyle::SonicSpeedUp {
+                assert!(drawn > 0, "{style:?} draws something");
             }
         }
     }
@@ -9863,6 +9933,120 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Depth counts visible ancestors: a row is one level under its parent
+    /// only when that parent is an earlier row; rows whose parent is not
+    /// listed (the descent level's own children) stay at depth 0.
+    #[test]
+    fn session_tree_depths_follow_unfolded_parents() {
+        use crate::app::app_test_helpers::baseline_session;
+        use crate::types::SessionState;
+
+        let root_leaf = uuid::Uuid::new_v4();
+        let group = uuid::Uuid::new_v4();
+        let epic = uuid::Uuid::new_v4();
+        let task = uuid::Uuid::new_v4();
+        let orphan = uuid::Uuid::new_v4();
+        let hidden_parent = uuid::Uuid::new_v4();
+        let mut sessions = HashMap::new();
+        for (id, kind, parent) in [
+            (root_leaf, SessionKind::Standard, None),
+            (group, SessionKind::Group, None),
+            (epic, SessionKind::Epic, Some(group)),
+            (task, SessionKind::Task, Some(epic)),
+            (orphan, SessionKind::Standard, Some(hidden_parent)),
+        ] {
+            let mut session = baseline_session(id, kind);
+            session.parent_id = parent;
+            sessions.insert(id, SessionState::new(session));
+        }
+
+        assert_eq!(
+            session_tree_depths(&[root_leaf, group, epic, task, orphan], &sessions),
+            vec![0, 0, 1, 2, 0]
+        );
+        // Folding the Epic leaves the rest of the tree's depths unchanged.
+        assert_eq!(
+            session_tree_depths(&[group, epic, root_leaf], &sessions),
+            vec![0, 1, 0]
+        );
+    }
+
+    /// Indentation never eats a row's whole title on a narrow sidebar.
+    #[test]
+    fn tree_indent_keeps_title_cells() {
+        assert_eq!(tree_indent_cells(0, 30), 0);
+        assert_eq!(tree_indent_cells(2, 30), 2 * TREE_INDENT_CELLS);
+        assert_eq!(
+            tree_indent_cells(40, 30),
+            30 - TREE_MIN_TITLE_CELLS,
+            "deep nesting clamps so the title keeps its minimum cells"
+        );
+        assert_eq!(tree_indent_cells(3, 4), 0);
+    }
+
+    /// The session-detail sidebar renders an unfolded Group → Epic → Task
+    /// tree with each nested title indented one step per level, while the
+    /// container names and the sibling root row stay findable.
+    #[test]
+    fn detail_sidebar_indents_unfolded_tree_rows_by_depth() {
+        use crate::app::app_test_helpers::with_detail_sidebar_tree;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut app, tree) = with_detail_sidebar_tree();
+        for id in [tree.group, tree.epic] {
+            app.sessions
+                .get_mut(&id)
+                .expect("container state")
+                .list_card_expanded = true;
+        }
+        app.recalculate_filtered_order();
+        let list_pane = app.tabs[app.active_tab].session_list_state.clone();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_list(
+                    frame,
+                    Rect::new(0, 0, 80, 40),
+                    &list_pane,
+                    true,
+                    &mut app,
+                    SessionListSurface::Embedded,
+                    Some(tree.viewed),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+        let at = |needle: &str| {
+            buffer_text_position(buffer, needle)
+                .unwrap_or_else(|| panic!("{needle:?} must render in the sidebar:\n{text}"))
+        };
+        // First words survive title truncation on a narrow title column.
+        let (viewed_x, viewed_y) = at("Viewed");
+        let (group_x, group_y) = at("Alpha");
+        let (epic_x, epic_y) = at("Beta");
+        let (task_x, task_y) = at("Gamma");
+
+        assert_eq!(
+            epic_y,
+            group_y + 1,
+            "Epic sits directly under its Group:\n{text}"
+        );
+        assert_eq!(
+            task_y,
+            epic_y + 1,
+            "Task sits directly under its Epic:\n{text}"
+        );
+        assert!(viewed_y != group_y, "root rows stay distinct:\n{text}");
+        // Containers share a kind-glyph prefix, so their titles line up one
+        // indent step apart per level.
+        assert_eq!(epic_x, group_x + TREE_INDENT_CELLS as u16, "\n{text}");
+        // Leaves share no glyph prefix: the depth-2 Task is two indent steps
+        // right of the depth-0 root leaf.
+        assert_eq!(task_x, viewed_x + 2 * TREE_INDENT_CELLS as u16, "\n{text}");
     }
 
     #[test]

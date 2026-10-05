@@ -215,6 +215,33 @@ The hub client must use the same Unix user that owns the hub-side socket. A
 forwarded RSI daemon socket grants full operator control of that daemon,
 including its sessions and data.
 
+## Satellite reports to the hub manager (#1103)
+
+The satellite's appointed manager (when it is also the declared seat or its
+rotation tip in the inbound policy) can call `AgentReportToHub` with a short
+typed line (`enqueue`, `deploy_ready`, `result`). The satellite never dials the
+hub: the hub pulls queued reports over its existing hub-initiated link with the
+`FetchHubReports` wire method (allowlisted hub installation only), after
+re-verifying the pinned installation. Each report becomes one `ledger_change`
+manager notice (subject `satellite_report`, version = report id) that wakes the
+hub manager once and appears in `AgentManagerInbox` as an untrusted,
+informational satellite report. It carries no authority and the wake text never
+includes the satellite's words; the hub still verifies every SHA it acts on.
+
+Bounds: 1024 bytes of text, 32 queued reports per satellite, 8 per pull, and 12
+recorded per peer per 5 minutes (enforced on the hub; excess is refused and
+dropped). The hub needs exactly one harness manager project, an enabled, paired,
+read- and dispatch-enabled peer, and a declared peer scope. Delivery is at most
+once: the satellite queue is in memory, so a satellite restart loses unsent
+reports. A replayed report never creates a second notice or wake: the dedup key
+is the peer plus the report id, looked up across every notice job, so it holds
+across manager re-scoping, re-appointment and retrieval. Notices are immutable
+and never deleted, so the hub keeps at most 2048 report notices per peer; at
+that cap new reports stay on the satellite (its 32-slot outbox then refuses
+more) while already-seen ids still dedupe. A revoked manager scope or policy
+ends the right to report, and reports fetched from an installation that is no
+longer the peer's pin by the time they are ingested are dropped, not recorded.
+
 ## Remove
 
 On the hub, stop and disable a direct unit, then remove its instance settings

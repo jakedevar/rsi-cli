@@ -1403,7 +1403,7 @@ mod tests {
             source_commit: &ClosureGitShaV1,
             model: &str,
         ) {
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = session_id;
             session.status = SessionStatus::Starting;
             session.provider = SessionProvider::Claude;

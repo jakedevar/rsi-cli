@@ -400,6 +400,11 @@ pub(crate) async fn reconcile_store_consistency(
                 "Reconciliation: failed to update store status"
             );
         } else {
+            // #33: a daemon that died without a graceful drain never ran the
+            // finalizer, so the sandbox's uncommitted work was never observed.
+            // Record it now so the lead's progress view reports it instead of
+            // the work sitting unseen in a retained worktree.
+            record_orphaned_sandbox_observation(store, sid).await;
             event_bus.publish(DaemonEvent::SessionReconciled {
                 session_id: *session_id,
                 // We don't know the exact old status without another query; approximate.
@@ -428,6 +433,44 @@ pub(crate) async fn reconcile_store_consistency(
             level: "warn".to_string(),
             message: format!("Session {session_id} is active in memory but not in store"),
         });
+    }
+}
+
+/// Persist the final worktree observation for a session the reconciler just
+/// failed as an orphan (#33). The graceful path records it in the finalizer
+/// (`record_terminal_sandbox_worktree`); an orphan skipped that, so its
+/// uncommitted sandbox work was invisible. The probe is read-only: every byte
+/// stays in place, and sandbox cleanup already refuses a dirty worktree.
+async fn record_orphaned_sandbox_observation(store: &tokio::sync::Mutex<Store>, sid: Uuid) {
+    let sandbox = match store.lock().await.get_session(sid) {
+        Ok(Some(row)) => match (row.sandbox_kind, row.sandbox_root) {
+            (Some(rsi_common::types::SandboxKind::GitWorktree), Some(root)) => Some(root),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(root) = sandbox else { return };
+    let dirty = match tokio::task::spawn_blocking(move || {
+        crate::sandbox::git_worktree::observe_clean_head_bounded(&root)
+    })
+    .await
+    {
+        Ok(Ok((clean, _))) => Some(!clean),
+        Ok(Err(error)) => {
+            tracing::warn!(session_id = %sid, %error, "Orphaned sandbox status probe failed");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %sid, %error, "Orphaned sandbox status probe task failed");
+            None
+        }
+    };
+    if let Err(error) = store
+        .lock()
+        .await
+        .record_terminal_sandbox_worktree(sid, dirty)
+    {
+        tracing::warn!(session_id = %sid, %error, "Failed to persist orphaned sandbox status");
     }
 }
 
@@ -745,6 +788,63 @@ mod tests {
                 status,
                 SessionStatus::Failed,
                 "row must be flipped to Failed"
+            );
+        }
+
+        /// #33: a session orphaned by a daemon that died without draining is
+        /// failed by reconciliation AND its sandbox's uncommitted work is
+        /// recorded as a terminal dirty observation (visible to the lead),
+        /// while the files stay in place.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn orphaned_session_with_dirty_sandbox_records_dirty_observation() {
+            let sid = Uuid::new_v4();
+            let repo = tempfile::tempdir().expect("tempdir");
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .output()
+                    .expect("git");
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            git(&["init", "-q"]);
+            git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ]);
+            std::fs::write(repo.path().join("work.txt"), "uncommitted\n").expect("write work");
+
+            let mut row = active_session_row(sid);
+            row.sandbox_kind = Some(rsi_common::types::SandboxKind::GitWorktree);
+            row.sandbox_root = Some(repo.path().to_path_buf());
+            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            store.lock().await.insert_session(&row).expect("insert");
+
+            let active = RwLock::new(HashMap::new());
+            let event_bus = EventBus::new(16);
+            reconcile_store_consistency(&active, &store, &event_bus, None).await;
+
+            let guard = store.lock().await;
+            assert_eq!(
+                guard.get_session(sid).unwrap().unwrap().status,
+                SessionStatus::Failed
+            );
+            assert_eq!(
+                guard.terminal_sandbox_worktree_dirty(sid).unwrap(),
+                Some(true),
+                "uncommitted work must be reported on the failed orphan"
+            );
+            assert!(
+                repo.path().join("work.txt").exists(),
+                "uncommitted work must be preserved in place"
             );
         }
 

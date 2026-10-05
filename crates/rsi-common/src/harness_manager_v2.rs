@@ -614,6 +614,37 @@ pub enum ManagerPreparedActionRequiredActionV2 {
     ResumeManagerOrPolicy,
     InspectProgramEvidence,
     WaitOrAdjustCapacity,
+    /// The manager's own `PauseLead` pause on one Epic: `ResumeLead` clears it.
+    ResumeEpicLead,
+    /// The operator-saved policy pauses the manager or this Epic: edit the policy.
+    ResumePolicyPause,
+}
+
+/// What a pause blocker is about (#1104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerPreparedActionPauseSubjectV2 {
+    /// The whole policy is paused.
+    Policy,
+    /// One Epic is listed in the policy's paused Epics.
+    PolicyEpic,
+    /// One Epic's lead continuations were paused by a `PauseLead` action.
+    EpicLead,
+}
+
+/// Names exactly what is paused, by whom and since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerPreparedActionPauseDetailV2 {
+    pub subject: ManagerPreparedActionPauseSubjectV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic_title: Option<String>,
+    /// `operator policy` or `manager session <id>`.
+    pub paused_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +652,9 @@ pub enum ManagerPreparedActionRequiredActionV2 {
 pub struct ManagerPreparedActionBlockerV2 {
     pub code: ManagerPreparedActionBlockerCodeV2,
     pub required_action: ManagerPreparedActionRequiredActionV2,
+    /// Present on `operator_pause` blockers (#1104).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ManagerPreparedActionPauseDetailV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

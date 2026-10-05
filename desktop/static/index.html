@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RSI</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">rsi</span>
+    <span id="conn" class="conn conn-unknown" title="">connecting…</span>
+    <span class="spacer"></span>
+    <button id="new-session" class="btn primary" type="button">New session</button>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="view-toggle" role="group" aria-label="Session view">
+        <button id="view-active" class="seg active" type="button" aria-pressed="true">Active</button>
+        <button id="view-archived" class="seg" type="button" aria-pressed="false">Archived</button>
+      </div>
+      <div class="filters">
+        <select id="project-filter" aria-label="Project"><option value="">All projects</option></select>
+        <input id="search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions">
+        <label class="check"><input id="show-finished" type="checkbox"> Show completed</label>
+      </div>
+      <ul id="session-list" class="session-list" aria-label="Sessions"></ul>
+    </aside>
+    <main class="detail">
+      <div id="empty" class="empty">Select a session.</div>
+      <section id="session-view" class="session-view" hidden>
+        <div class="session-head">
+          <div class="head-main">
+            <h1 id="s-title"></h1>
+            <div id="s-meta" class="meta"></div>
+          </div>
+          <div class="head-actions">
+            <button id="toggle-tools" class="btn" type="button">Hide tools</button>
+            <span id="pause-state" class="pause-state" hidden></span>
+            <button id="clear-pause" class="btn" type="button" hidden>Clear pause</button>
+            <button id="interrupt" class="btn danger" type="button" title="Soft pause: interrupt the running turn">Interrupt</button>
+            <button id="hard-pause" class="btn danger" type="button" title="Hard pause: interrupt and hold until cleared">Hard pause</button>
+            <button id="archive" class="btn" type="button">Archive</button>
+          </div>
+        </div>
+        <div id="approval-banner" class="approval-banner" hidden></div>
+        <div id="events" class="events" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <textarea id="message" rows="3" placeholder="Message this session (Ctrl+Enter to send)"></textarea>
+          <button class="btn primary" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="launch-dialog">
+    <form id="launch-form" method="dialog" class="launch-form">
+      <h2>New session</h2>
+      <label>Prompt<textarea name="query" rows="6" required></textarea></label>
+      <div class="row">
+        <label>Provider<select name="provider"></select></label>
+        <label>Model<input name="model" placeholder="default"></label>
+        <label>Effort
+          <select name="effort">
+            <option value="">default</option>
+            <option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Project<select name="project_id"><option value="">none</option></select></label>
+        <label class="grow">Working dir<input name="working_dir" placeholder="project path"></label>
+      </div>
+      <div class="actions">
+        <button class="btn" type="button" id="launch-cancel">Cancel</button>
+        <button class="btn primary" type="submit" value="launch">Launch</button>
+      </div>
+    </form>
+  </dialog>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

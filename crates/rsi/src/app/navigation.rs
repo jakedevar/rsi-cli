@@ -10,7 +10,70 @@ use super::{App, EventApplyMode, FocusFetchResult, ModelSegmentsFetchResult};
 use crate::types::{Pane, PaneId};
 use uuid::Uuid;
 
+/// How opening a Group/Epic row in the session-detail sidebar changes its
+/// fold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarFold {
+    /// Enter / `L`: open a folded container, fold an open one (file-tree
+    /// style).
+    Toggle,
+    /// Shift+Left/Right "move and open": landing on a container unfolds it
+    /// so the next step walks into its children; it never folds.
+    Open,
+}
+
 impl App {
+    /// The tab's real focused pane is a session detail. Unlike
+    /// [`App::focused_pane`], this ignores the `detail_list_focused` proxy:
+    /// the sidebar list is hosted by the detail pane either way.
+    pub(crate) fn physical_pane_is_session_detail(&self) -> bool {
+        let tab = self.active_tab();
+        matches!(
+            tab.layout.find_pane(tab.focused_pane),
+            Some(Pane::SessionDetail { .. })
+        )
+    }
+
+    /// Session detail hosts the session list as a left sidebar tree. A Group
+    /// or Epic there is a folder, not a session to view: opening it folds
+    /// it in place (its children splice in below it, indented by depth)
+    /// while the detail pane keeps showing the session already open.
+    ///
+    /// Returns `true` when `session_id` is a container and the physical pane
+    /// is a session detail (the open request is consumed, even when the fold
+    /// was already in the requested state). Returns `false` for leaves and
+    /// outside session detail, so callers fall through to their normal open.
+    pub(crate) fn fold_sidebar_container(&mut self, session_id: Uuid, fold: SidebarFold) -> bool {
+        if !self.physical_pane_is_session_detail() {
+            return false;
+        }
+        let Some(state) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        if !rsi_common::types::is_container_kind(state.session.session_kind) {
+            return false;
+        }
+        let expand = match fold {
+            SidebarFold::Toggle => !state.list_card_expanded,
+            SidebarFold::Open => true,
+        };
+        let changed = state.list_card_expanded != expand;
+        state.list_card_expanded = expand;
+        if changed {
+            // Same projection refresh as the list's explicit fold commands:
+            // selection stays on the container by UUID.
+            self.recalculate_filtered_order();
+            self.reconcile_all_session_list_selections(false);
+            self.invalidate_card_cache();
+        }
+        if expand {
+            // Children may not be loaded yet; the fetch result re-sorts and
+            // splices them under the open container. No-op when offline.
+            self.trigger_hierarchy_fetch_immediate(Some(session_id));
+        }
+        true
+    }
+
     /// Dispatch an on-demand `GetConversation` for a leaf detail view. This
     /// is called by the navigation-node effect when the active view changes
     /// to a leaf session.
@@ -387,7 +450,6 @@ impl App {
     /// I/O-backed so we resolve it through the App-level cache rather than
     /// `UserSettings`.
     fn settings_nav_down(&mut self) {
-        use crate::settings_registry::SettingsSection;
         match self.settings_state.focus {
             crate::types::SettingsFocus::Categories => {
                 let before = self.settings_state.section;
@@ -395,20 +457,8 @@ impl App {
                 self.refresh_settings_section_if_changed(before);
             }
             crate::types::SettingsFocus::Items => {
-                let max = match self.settings_state.section {
-                    SettingsSection::ClaudeHooks => crate::settings_keys::hook_row_count(self),
-                    SettingsSection::ClaudeSkills => crate::settings_keys::skill_row_count(self),
-                    SettingsSection::Usage => crate::model_control_stats::stats_row_count(self),
-                    SettingsSection::Budgets => {
-                        crate::model_control_budgets::budget_row_count(self)
-                    }
-                    SettingsSection::McpServers => self
-                        .cached_mcp_servers
-                        .as_ref()
-                        .map_or(1, |list| list.servers.len().max(1)),
-                    section => crate::settings_keys::item_count(section, &self.settings),
-                };
-                if self.settings_state.selected_index + 1 < max {
+                let max = crate::settings_keys::settings_row_count(self);
+                if self.settings_state.selected_index < max.saturating_sub(1) {
                     self.settings_state.selected_index += 1;
                 }
             }
@@ -421,7 +471,7 @@ impl App {
         self.refresh_settings_section_if_changed(before);
     }
 
-    /// The Settings rail opens each category on its first tab, which the
+    /// The Settings rail restores each category's last tab, which the
     /// list shows at once; load that tab's data as entering it would.
     fn refresh_settings_section_if_changed(
         &mut self,
@@ -433,6 +483,9 @@ impl App {
     }
 
     /// Enter a selected session's detail view (in the focused pane).
+    ///
+    /// From session detail, a selected Group/Epic folds in the sidebar
+    /// instead (see [`App::fold_sidebar_container`]).
     pub fn enter_session(&mut self) {
         // First pass: extract the session_id (immutable borrow, temporary)
         let session_id = match self.focused_pane() {
@@ -449,6 +502,11 @@ impl App {
             }
             _ => return,
         };
+        // A Group/Epic selected in the session-detail sidebar folds in place
+        // instead of replacing the detail pane with the container.
+        if self.fold_sidebar_container(session_id, SidebarFold::Toggle) {
+            return;
+        }
         // Track as last viewed session (for 'i' in session list)
         self.last_viewed_session = Some(session_id);
         self.push_jumplist(session_id);

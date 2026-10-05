@@ -20,9 +20,15 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-const STORE: &str = "crates/rsid/src/store/mod.rs";
+const STORE: &str = "crates/rsid-store/src/store/mod.rs";
 /// Each schema version is one `vNNN.rs` here; the head is the highest number.
-const MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
+const MIGRATION_DIR: &str = "crates/rsid-store/src/store/migrations";
+/// The layout before the #1021 S4 crate split (the store lived in `crates/rsid`).
+/// A target or a stale source cut before the split still lands through it.
+const PRE_SPLIT_STORE: &str = "crates/rsid/src/store/mod.rs";
+const PRE_SPLIT_MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
+const STORES: [&str; 2] = [STORE, PRE_SPLIT_STORE];
+const MIGRATION_DIRS: [&str; 2] = [MIGRATION_DIR, PRE_SPLIT_MIGRATION_DIR];
 const MAX_CHANGED_PATHS: usize = 1024;
 const MAX_WORK_PAGES: usize = 16;
 const RELEASED_MANIFEST: &str = "tools/released-migrations.json";
@@ -109,7 +115,9 @@ fn is_protected(protected: &HashSet<String>, path: &str) -> bool {
 
 /// `NNN` of a `migrations/vNNN.rs` path, else `None`.
 fn migration_file_version(path: &str) -> Option<u32> {
-    let name = path.strip_prefix(MIGRATION_DIR)?.strip_prefix('/')?;
+    let name = MIGRATION_DIRS
+        .iter()
+        .find_map(|dir| path.strip_prefix(dir)?.strip_prefix('/'))?;
     let number = name.strip_prefix('v')?.strip_suffix(".rs")?;
     if number.contains('/') {
         None
@@ -119,18 +127,37 @@ fn migration_file_version(path: &str) -> Option<u32> {
 }
 
 fn is_migration_path(path: &str) -> bool {
-    path == STORE || migration_file_version(path).is_some()
+    STORES.contains(&path) || migration_file_version(path).is_some()
 }
 
-/// The highest `migrations/vNNN.rs` at `revision`, if the layout is per-file.
-fn migration_file_head(repo: &Path, revision: &str) -> Result<Option<u32>, String> {
+/// Which store layout a revision builds from. `rsid-store/build.rs` collects
+/// ONLY `crates/rsid-store/src/store/migrations/vNNN.rs`, so a revision whose
+/// migration directory is populated there is `Split` and the pre-split
+/// `crates/rsid/src/store/migrations` is dead to its daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreLayout {
+    Split,
+    PreSplit,
+}
+
+impl StoreLayout {
+    const fn migration_dir(self) -> &'static str {
+        match self {
+            Self::Split => MIGRATION_DIR,
+            Self::PreSplit => PRE_SPLIT_MIGRATION_DIR,
+        }
+    }
+}
+
+fn migration_files_in(repo: &Path, revision: &str, directory: &str) -> Result<Vec<String>, String> {
     let output = git_output(
         repo,
         &[
             "ls-tree",
+            "-r",
             "--name-only",
             revision,
-            &format!("{MIGRATION_DIR}/"),
+            &format!("{directory}/"),
         ],
     )?;
     if !output.status.success() {
@@ -138,7 +165,60 @@ fn migration_file_head(repo: &Path, revision: &str) -> Result<Option<u32>, Strin
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(migration_file_version)
+        .filter(|path| migration_file_version(path).is_some())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn store_layout(repo: &Path, revision: &str) -> Result<StoreLayout, String> {
+    Ok(
+        if migration_files_in(repo, revision, MIGRATION_DIR)?.is_empty() {
+            StoreLayout::PreSplit
+        } else {
+            StoreLayout::Split
+        },
+    )
+}
+
+/// A candidate may only carry migrations in the directory its build consumes.
+/// A base cut before the split is still read from its own (pre-split) layout;
+/// what is refused is a split candidate that leaves or adds a versioned unit
+/// in the dead pre-split directory (the daemon would never run it while the
+/// number and manifest checks accept it), and a candidate that falls back to
+/// the pre-split layout on a split target.
+fn check_migration_layout(repo: &Path, target: &str, candidate: &str) -> Result<(), PolicyRefusal> {
+    let refuse = |message: String| PolicyRefusal::new(PolicyFence::MigrationNumber, message);
+    let layout = |revision| {
+        store_layout(repo, revision)
+            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))
+    };
+    let candidate_layout = layout(candidate)?;
+    if candidate_layout == StoreLayout::Split {
+        let stray = migration_files_in(repo, candidate, PRE_SPLIT_MIGRATION_DIR)
+            .map_err(|message| PolicyRefusal::new(PolicyFence::SchemaVersion, message))?;
+        if let Some(path) = stray.first() {
+            return Err(refuse(format!(
+                "migration {path} is in the pre-split directory {PRE_SPLIT_MIGRATION_DIR}; \
+                 the store's build only runs {MIGRATION_DIR}/vNNN.rs, so move it there \
+                 (a migration outside it is never executed)"
+            )));
+        }
+    } else if layout(target)? == StoreLayout::Split {
+        return Err(refuse(format!(
+            "the landing candidate has no migrations under {MIGRATION_DIR} but the \
+             target does; new migrations belong in {MIGRATION_DIR}/vNNN.rs"
+        )));
+    }
+    Ok(())
+}
+
+/// The highest `migrations/vNNN.rs` at `revision` in the directory its layout
+/// builds from, if the layout is per-file.
+fn migration_file_head(repo: &Path, revision: &str) -> Result<Option<u32>, String> {
+    let directory = store_layout(repo, revision)?.migration_dir();
+    Ok(migration_files_in(repo, revision, directory)?
+        .iter()
+        .filter_map(|path| migration_file_version(path))
         .max())
 }
 
@@ -174,12 +254,14 @@ fn changed_paths(repo: &Path, target: &str, candidate: &str) -> Result<Vec<Strin
 }
 
 fn store_source(repo: &Path, revision: &str) -> Result<String, String> {
-    let path = format!("{revision}:{STORE}");
-    let output = git_output(repo, &["show", &path])?;
-    if !output.status.success() {
-        return Err("cannot inspect landing migration source".into());
+    for store in STORES {
+        let output = git_output(repo, &["show", &format!("{revision}:{store}")])?;
+        if output.status.success() {
+            return String::from_utf8(output.stdout)
+                .map_err(|_| "landing migration source is not UTF-8".into());
+        }
     }
-    String::from_utf8(output.stdout).map_err(|_| "landing migration source is not UTF-8".into())
+    Err("cannot inspect landing migration source".into())
 }
 
 fn schema_version(repo: &Path, revision: &str) -> Result<u32, String> {
@@ -207,12 +289,10 @@ fn schema_version(repo: &Path, revision: &str) -> Result<u32, String> {
 fn has_migration_block(repo: &Path, revision: &str, version: u32) -> Result<bool, String> {
     let block = format!("if version < {version} {{");
     if migration_file_head(repo, revision)?.is_some() {
+        let dir = store_layout(repo, revision)?.migration_dir();
         let output = git_output(
             repo,
-            &[
-                "show",
-                &format!("{revision}:{MIGRATION_DIR}/v{version:03}.rs"),
-            ],
+            &["show", &format!("{revision}:{dir}/v{version:03}.rs")],
         )?;
         if !output.status.success() {
             return Ok(false);
@@ -452,6 +532,7 @@ pub fn check_with_work_and_proof(
 ) -> Result<Vec<SourceBinding>, PolicyRefusal> {
     let paths = changed_paths(repo, target, candidate)
         .map_err(|message| PolicyRefusal::new(PolicyFence::PathInspection, message))?;
+    check_migration_layout(repo, target, candidate)?;
     let protected = protected_migration_paths(repo, target)
         .and_then(|mut paths| {
             paths.extend(protected_migration_paths(repo, candidate)?);

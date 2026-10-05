@@ -353,8 +353,31 @@ impl RpcServer {
             rsi_common::harness_manager::decode_manager_request(request.params.clone())
                 .map_err(|_| DaemonError::InvalidParam("manager_invalid_request".into()))?;
         let store = self.session_manager.store();
-        let result = store.lock().await.configure_harness_manager(&params)?;
-        Ok(serde_json::to_value(result)?)
+        let (granted_before, result, granted_after) = {
+            let store = store.lock().await;
+            let before = store
+                .get_harness_manager_policy(params.project_id)?
+                .is_some_and(|policy| !policy.revoked);
+            let result = store.configure_harness_manager_with_outcome(&params)?;
+            let after = store
+                .get_harness_manager_policy(params.project_id)?
+                .is_some_and(|policy| !policy.revoked);
+            (before, result, after)
+        };
+        if granted_before && !granted_after {
+            self.session_manager.notify_manager_policy_revoked(
+                params.project_id,
+                if params.is_revocation() {
+                    "appointment cleared"
+                } else {
+                    "re-appoint or scope change"
+                },
+            );
+        }
+        let (config, policy) = result;
+        Ok(serde_json::to_value(
+            rsi_common::harness_manager::ConfigureHarnessManagerResultV1 { config, policy },
+        )?)
     }
 
     pub(super) async fn handle_list_manager_nodes(
@@ -383,6 +406,51 @@ impl RpcServer {
             rows,
         };
         Ok(serde_json::to_value(result)?)
+    }
+
+    /// `GetManagerTree` (#890): operator-only bounded snapshot of the manager
+    /// hierarchy. The cursor is the `key` of the previous page's last row.
+    pub(super) async fn handle_get_manager_tree(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::manager_tree::{
+            GetManagerTreeRequestV1, GetManagerTreeResultV1, MANAGER_TREE_INVALID_REQUEST,
+            MANAGER_TREE_STALE_CURSOR,
+        };
+        let params: GetManagerTreeRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam(MANAGER_TREE_INVALID_REQUEST.into()))?;
+        params
+            .validate()
+            .map_err(|error| DaemonError::InvalidParam(error.into()))?;
+        let store = self.session_manager.store();
+        let snapshot = store.lock().await.manager_tree_snapshot()?;
+        let total_rows = snapshot.rows.len() as u64;
+        let complete = snapshot.rows.iter().all(|row| row.complete);
+        let start = match params.after.as_deref() {
+            None => 0,
+            Some(key) => {
+                snapshot
+                    .rows
+                    .iter()
+                    .position(|row| row.key == key)
+                    .ok_or_else(|| DaemonError::InvalidParam(MANAGER_TREE_STALE_CURSOR.into()))?
+                    + 1
+            }
+        };
+        let end = (start + usize::from(params.limit)).min(snapshot.rows.len());
+        let rows = snapshot.rows[start..end].to_vec();
+        let next_after = (end < snapshot.rows.len())
+            .then(|| rows.last().map(|r| r.key.clone()))
+            .flatten();
+        Ok(serde_json::to_value(GetManagerTreeResultV1 {
+            rows,
+            next_after,
+            total_rows,
+            complete,
+            global_grant_version: snapshot.global_grant_version,
+        })?)
     }
 
     pub(super) async fn handle_get_manager_node(

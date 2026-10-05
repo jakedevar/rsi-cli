@@ -1638,8 +1638,8 @@ pub(super) async fn blob(root: &Path, commit: &str, path: &str) -> Result<Vec<u8
     }
     read(root, &["cat-file", "blob", &entry]).await
 }
-const STORE_MOD_PATH: &str = "crates/rsid/src/store/mod.rs";
-const MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
+const STORE_MOD_PATH: &str = "crates/rsid-store/src/store/mod.rs";
+const MIGRATION_DIR: &str = "crates/rsid-store/src/store/migrations";
 
 fn migration_file_path(version: u32) -> String {
     format!("{MIGRATION_DIR}/v{version:03}.rs")

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/rsid",
     "crates/rsid-core",
+    "crates/rsid-store",
     "crates/rsi",
     "crates/rsi-common",
     "crates/rsi-signal",

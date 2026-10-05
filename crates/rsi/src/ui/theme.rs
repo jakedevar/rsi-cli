@@ -693,6 +693,221 @@ const DAMON_PALETTE: CustomPalette = CustomPalette {
     raw_session_magenta: rgb(255, 95, 154),
 };
 
+// Loader spectra: hand-tuned, hue-ordered gradient stops that each theme's
+// rainbow activity indicators interpolate (in OKLab) around a closed loop.
+// They need not reuse the theme's accents, but they are tuned to its canvas
+// and mood: adjacent stops stay perceptually close so the loop never jumps,
+// and every stop keeps a clear lightness gap from the theme's canvas. Arc
+// spectra (gems, Goth, Daemon) walk out and back so the loop stays seamless.
+
+// Fallback for a theme that declares no spectrum: a balanced full wheel.
+const DEFAULT_LOADER: [Color; 8] = [
+    rgb(232, 98, 109),
+    rgb(240, 165, 92),
+    rgb(240, 214, 92),
+    rgb(112, 214, 132),
+    rgb(76, 205, 214),
+    rgb(98, 150, 240),
+    rgb(166, 124, 232),
+    rgb(226, 108, 190),
+];
+
+// Goth: a nightshade arc (blood crimson, rose, orchid, amethyst, indigo,
+// midnight blue) and back, so the loader stays in the theme's gothic register.
+const GOTH_LOADER: [Color; 10] = [
+    rgb(203, 68, 83),
+    rgb(217, 99, 156),
+    rgb(199, 127, 210),
+    rgb(180, 154, 237),
+    rgb(101, 134, 231),
+    rgb(60, 126, 190),
+    rgb(101, 134, 231),
+    rgb(180, 154, 237),
+    rgb(199, 127, 210),
+    rgb(217, 99, 156),
+];
+
+// Junk Yard: an oil-slick full wheel (rust, amber, hazard yellow, toxic green,
+// teal, cyan, electric blue, violet, hot pink).
+const JUNK_YARD_LOADER: [Color; 9] = [
+    rgb(229, 86, 74),
+    rgb(250, 164, 83),
+    rgb(238, 208, 76),
+    rgb(94, 212, 118),
+    rgb(13, 195, 158),
+    rgb(82, 202, 224),
+    rgb(71, 116, 246),
+    rgb(173, 123, 238),
+    rgb(225, 97, 188),
+];
+
+// Transparent: a soft full wheel that survives wallpaper blending.
+const TRANSPARENT_LOADER: [Color; 9] = [
+    rgb(222, 126, 136),
+    rgb(238, 164, 113),
+    rgb(244, 204, 100),
+    rgb(143, 201, 144),
+    rgb(108, 202, 196),
+    rgb(115, 187, 225),
+    rgb(135, 162, 234),
+    rgb(184, 154, 229),
+    rgb(212, 136, 184),
+];
+
+// Gruvbox Warm: the canonical gruvbox brights in hue order, bridged back to
+// red through its faded blue and purple.
+const GRUVBOX_WARM_LOADER: [Color; 9] = [
+    rgb(244, 83, 64),
+    rgb(248, 132, 45),
+    rgb(243, 186, 60),
+    rgb(185, 188, 55),
+    rgb(139, 191, 121),
+    rgb(108, 165, 159),
+    rgb(111, 144, 175),
+    rgb(160, 120, 173),
+    rgb(210, 132, 153),
+];
+
+// High Contrast: a saturated, high-luminance full wheel for the black canvas.
+const HIGH_CONTRAST_LOADER: [Color; 9] = [
+    rgb(255, 65, 60),
+    rgb(255, 156, 63),
+    rgb(255, 231, 54),
+    rgb(71, 255, 120),
+    rgb(18, 252, 223),
+    rgb(63, 207, 255),
+    rgb(64, 125, 255),
+    rgb(173, 102, 255),
+    rgb(254, 65, 208),
+];
+
+// Light: deep ink tones that keep contrast on a white canvas.
+const LIGHT_LOADER: [Color; 9] = [
+    rgb(204, 40, 39),
+    rgb(205, 107, 23),
+    rgb(188, 136, 0),
+    rgb(39, 142, 61),
+    rgb(0, 134, 129),
+    rgb(0, 119, 188),
+    rgb(77, 87, 183),
+    rgb(125, 77, 173),
+    rgb(187, 59, 135),
+];
+
+// RAAAAINNNNNNBOOOZZZZZZZZ: the theme's own neon accents in true hue order.
+const RAINBOW_LOADER: [Color; 10] = [
+    rgb(255, 77, 90),
+    rgb(255, 159, 67),
+    rgb(255, 225, 77),
+    rgb(92, 255, 136),
+    rgb(46, 242, 208),
+    rgb(86, 217, 255),
+    rgb(47, 167, 255),
+    rgb(95, 124, 255),
+    rgb(199, 125, 255),
+    rgb(255, 79, 216),
+];
+
+// Truly Transparent: a bright, soft wheel that reads over unknown terminal
+// backgrounds (the theme's ANSI accents cannot be blended or faded).
+const TRULY_TRANSPARENT_LOADER: [Color; 8] = [
+    rgb(248, 118, 122),
+    rgb(255, 166, 89),
+    rgb(246, 214, 83),
+    rgb(124, 223, 129),
+    rgb(77, 220, 220),
+    rgb(89, 170, 248),
+    rgb(172, 143, 248),
+    rgb(236, 127, 202),
+];
+
+// Cup`a Joe: a sun-faded vintage wheel; warm hues carry the colour, cool hues
+// stay dusty.
+const CUP_A_JOE_LOADER: [Color; 8] = [
+    rgb(212, 101, 101),
+    rgb(237, 156, 85),
+    rgb(235, 198, 105),
+    rgb(152, 190, 132),
+    rgb(113, 179, 168),
+    rgb(118, 165, 198),
+    rgb(174, 145, 196),
+    rgb(212, 129, 162),
+];
+
+// Emerald: a gem arc (gold, lime, emerald, jade, aqua, teal-blue) and back.
+const EMERALD_LOADER: [Color; 10] = [
+    rgb(238, 208, 89),
+    rgb(177, 221, 84),
+    rgb(65, 214, 134),
+    rgb(40, 205, 167),
+    rgb(68, 214, 214),
+    rgb(69, 180, 214),
+    rgb(68, 214, 214),
+    rgb(40, 205, 167),
+    rgb(65, 214, 134),
+    rgb(177, 221, 84),
+];
+
+// Diamond: prismatic fire, pastel flashes interleaved with ice.
+const DIAMOND_LOADER: [Color; 8] = [
+    rgb(168, 235, 249),
+    rgb(255, 168, 181),
+    rgb(168, 235, 249),
+    rgb(246, 212, 118),
+    rgb(168, 235, 249),
+    rgb(133, 233, 182),
+    rgb(168, 235, 249),
+    rgb(195, 175, 255),
+];
+
+// Ruby: a gem arc (gold, amber, coral, ruby, crimson, magenta, orchid) and back.
+const RUBY_LOADER: [Color; 12] = [
+    rgb(248, 202, 101),
+    rgb(252, 158, 71),
+    rgb(252, 119, 86),
+    rgb(240, 65, 98),
+    rgb(219, 66, 140),
+    rgb(206, 80, 199),
+    rgb(191, 124, 236),
+    rgb(206, 80, 199),
+    rgb(219, 66, 140),
+    rgb(240, 65, 98),
+    rgb(252, 119, 86),
+    rgb(252, 158, 71),
+];
+
+// Saphire: a gem arc (aqua, sky, azure, sapphire, indigo, violet, orchid) and
+// back.
+const SAPHIRE_LOADER: [Color; 12] = [
+    rgb(103, 226, 218),
+    rgb(82, 207, 243),
+    rgb(45, 166, 250),
+    rgb(60, 121, 240),
+    rgb(105, 103, 225),
+    rgb(163, 118, 233),
+    rgb(206, 131, 222),
+    rgb(163, 118, 233),
+    rgb(105, 103, 225),
+    rgb(60, 121, 240),
+    rgb(45, 166, 250),
+    rgb(82, 207, 243),
+];
+
+// D. is for Daemon: a hellfire arc (ember gold, flame, blood red, crimson,
+// dark wine) and back.
+const DAMON_LOADER: [Color; 10] = [
+    rgb(244, 195, 82),
+    rgb(254, 134, 15),
+    rgb(247, 81, 37),
+    rgb(238, 11, 42),
+    rgb(191, 18, 78),
+    rgb(145, 32, 97),
+    rgb(191, 18, 78),
+    rgb(238, 11, 42),
+    rgb(247, 81, 37),
+    rgb(254, 134, 15),
+];
+
 /// How a theme treats passive structural backgrounds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TransparencyPolicy {
@@ -731,6 +946,8 @@ struct ThemeDefinition {
     primary: Color,
     border_policy: BorderPolicy,
     transparency_policy: TransparencyPolicy,
+    /// Closed-loop gradient stops for the rainbow activity indicators.
+    loader: &'static [Color],
 }
 
 impl ThemeDefinition {
@@ -751,7 +968,13 @@ impl ThemeDefinition {
             primary,
             border_policy,
             transparency_policy,
+            loader: &DEFAULT_LOADER,
         }
+    }
+
+    /// Declare the theme's loader spectrum (see the `*_LOADER` stops).
+    const fn with_loader(self, loader: &'static [Color]) -> Self {
+        Self { loader, ..self }
     }
 }
 
@@ -764,7 +987,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(181, 138, 215),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&GOTH_LOADER),
     ThemeDefinition::new(
         "junkyard",
         "Junk Yard",
@@ -773,7 +997,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(30, 185, 128),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&JUNK_YARD_LOADER),
     ThemeDefinition::new(
         "transparent",
         "Transparent",
@@ -782,7 +1007,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(137, 180, 250),
         BorderPolicy::FullBorders,
         TransparencyPolicy::Scrimmed,
-    ),
+    )
+    .with_loader(&TRANSPARENT_LOADER),
     ThemeDefinition::new(
         "gruvbox-warm",
         "Gruvbox Warm",
@@ -791,7 +1017,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(254, 128, 25),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&GRUVBOX_WARM_LOADER),
     ThemeDefinition::new(
         "high-contrast",
         "High Contrast",
@@ -800,7 +1027,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(0, 215, 255),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&HIGH_CONTRAST_LOADER),
     ThemeDefinition::new(
         "light",
         "Light",
@@ -809,7 +1037,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(28, 102, 181),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&LIGHT_LOADER),
     ThemeDefinition::new(
         "raaaainnnnnnbooozzzzzzzz",
         "RAAAAINNNNNNBOOOZZZZZZZZ",
@@ -818,7 +1047,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(46, 242, 208),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&RAINBOW_LOADER),
     ThemeDefinition::new(
         "truly-transparent",
         "Truly Transparent",
@@ -827,7 +1057,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         Color::LightCyan,
         BorderPolicy::FullBorders,
         TransparencyPolicy::TerminalDefault,
-    ),
+    )
+    .with_loader(&TRULY_TRANSPARENT_LOADER),
     ThemeDefinition::new(
         "cup-a-joe",
         "Cup`a Joe",
@@ -836,7 +1067,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(214, 154, 85),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&CUP_A_JOE_LOADER),
     ThemeDefinition::new(
         "emerald",
         "Emerald",
@@ -845,7 +1077,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(40, 209, 124),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&EMERALD_LOADER),
     ThemeDefinition::new(
         "diamond",
         "Diamond",
@@ -854,7 +1087,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(141, 235, 255),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&DIAMOND_LOADER),
     ThemeDefinition::new(
         "ruby",
         "Ruby",
@@ -863,7 +1097,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(255, 71, 112),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&RUBY_LOADER),
     ThemeDefinition::new(
         "saphire",
         "Saphire",
@@ -872,7 +1107,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(97, 160, 255),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&SAPHIRE_LOADER),
     ThemeDefinition::new(
         "d-is-for-devil",
         "D. is for Daemon",
@@ -881,7 +1117,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         rgb(255, 30, 48),
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
-    ),
+    )
+    .with_loader(&DAMON_LOADER),
 ];
 
 pub const THEME_COUNT: usize = THEME_DEFINITIONS.len();
@@ -1927,24 +2164,140 @@ pub fn bracket_match_bg() -> Color {
     overlay0()
 }
 
-// Rainbow palette for animated elements
+/// Colours `rainbow_palette` samples from the loader spectrum: one per column
+/// of the classic strip's repeat, so its period and pace stay unchanged.
+pub const RAINBOW_PALETTE_LEN: usize = 14;
+
+/// Rainbow palette for the classic and compact loaders: the active theme's
+/// loader spectrum sampled at evenly spaced points around its loop, so the
+/// colours flow in hue order and stay tuned to the theme.
 pub fn rainbow_palette() -> Vec<Color> {
-    vec![
-        red(),
-        peach(),
-        yellow(),
-        green(),
-        teal(),
-        sapphire(),
-        blue(),
-        mauve(),
-        pink(),
-        flamingo(),
-        rosewater(),
-        lavender(),
-        sky(),
-        maroon(),
+    let spectrum = loader_spectrum();
+    (0..RAINBOW_PALETTE_LEN)
+        .map(|index| spectrum.sample(index as f32 / RAINBOW_PALETTE_LEN as f32))
+        .collect()
+}
+
+/// The active theme's loader spectrum.
+pub fn loader_spectrum() -> LoaderSpectrum {
+    LoaderSpectrum::new(active_theme_definition().loader)
+}
+
+/// A colour in the OKLab perceptual space (`[L, a, b]`).
+type Oklab = [f64; 3];
+
+/// A closed loop of gradient stops sampled with perceptual (OKLab)
+/// interpolation, so blends between stops keep their brightness instead of
+/// muddying the way a channel-wise RGB blend does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoaderSpectrum {
+    stops: Vec<Oklab>,
+}
+
+impl LoaderSpectrum {
+    /// Build a spectrum from `stops`; colours without a resolvable RGB value
+    /// are skipped, and an empty result falls back to the default wheel.
+    pub fn new(stops: &[Color]) -> Self {
+        let resolved: Vec<Oklab> = stops
+            .iter()
+            .filter_map(|&color| to_rgb(color))
+            .map(rgb_to_oklab)
+            .collect();
+        if resolved.is_empty() {
+            return Self::new(&DEFAULT_LOADER);
+        }
+        Self { stops: resolved }
+    }
+
+    /// Colour at `position` around the loop; whole turns wrap, so `0.0`,
+    /// `1.0` and `-1.0` all land on the first stop.
+    pub fn sample(&self, position: f32) -> Color {
+        let (r, g, b) = self.sample_rgb(position);
+        Color::Rgb(r, g, b)
+    }
+
+    /// RGB channels of [`Self::sample`].
+    pub fn sample_rgb(&self, position: f32) -> (u8, u8, u8) {
+        let count = self.stops.len();
+        let scaled = f64::from(position).rem_euclid(1.0) * count as f64;
+        let index = (scaled.floor() as usize).min(count - 1);
+        let fraction = scaled - index as f64;
+        let from = self.stops[index];
+        let to = self.stops[(index + 1) % count];
+        oklab_to_rgb([
+            from[0] + (to[0] - from[0]) * fraction,
+            from[1] + (to[1] - from[1]) * fraction,
+            from[2] + (to[2] - from[2]) * fraction,
+        ])
+    }
+}
+
+/// Resolve a colour to sRGB channels when it has a known value (RGB or a
+/// basic named colour); `None` for `Reset`, indexed and other terminal-owned
+/// colours.
+pub fn resolve_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    to_rgb(color)
+}
+
+/// Perceptual (OKLab) distance between two colours, or `None` when either
+/// has no resolvable RGB value.
+pub fn perceptual_distance(a: Color, b: Color) -> Option<f64> {
+    let a = rgb_to_oklab(to_rgb(a)?);
+    let b = rgb_to_oklab(to_rgb(b)?);
+    Some(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt())
+}
+
+/// OKLab lightness (`0.0` black to `1.0` white), or `None` when the colour
+/// has no resolvable RGB value.
+pub fn perceptual_lightness(color: Color) -> Option<f64> {
+    to_rgb(color).map(|rgb| rgb_to_oklab(rgb)[0])
+}
+
+fn srgb_channel_to_linear(channel: u8) -> f64 {
+    let c = f64::from(channel) / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_channel_to_srgb(channel: f64) -> u8 {
+    let c = channel.clamp(0.0, 1.0);
+    let encoded = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn rgb_to_oklab((r, g, b): (u8, u8, u8)) -> Oklab {
+    let (r, g, b) = (
+        srgb_channel_to_linear(r),
+        srgb_channel_to_linear(g),
+        srgb_channel_to_linear(b),
+    );
+    let l = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
+    let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
+    let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
+    [
+        0.210_454_255_3 * l + 0.793_617_785_0 * m - 0.004_072_046_8 * s,
+        1.977_998_495_1 * l - 2.428_592_205_0 * m + 0.450_593_709_9 * s,
+        0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766_0 * s,
     ]
+}
+
+fn oklab_to_rgb([lightness, a, b]: Oklab) -> (u8, u8, u8) {
+    let l = lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m = lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s = lightness - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
+    let (l, m, s) = (l * l * l, m * m * m, s * s * s);
+    (
+        linear_channel_to_srgb(4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s),
+        linear_channel_to_srgb(-1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s),
+        linear_channel_to_srgb(-0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701_0 * s),
+    )
 }
 
 /// Resolve a colour to sRGB when it has a known value (RGB or basic named).
@@ -2943,6 +3296,116 @@ mod tests {
         with_theme_state(|| {
             set_theme_role_override(ThemeRole::Panel, Some([12, 34, 56]));
             assert_eq!(tier_panel(), Color::Rgb(12, 34, 56));
+        });
+    }
+
+    #[test]
+    fn every_theme_declares_its_own_loader_spectrum() {
+        for definition in &THEME_DEFINITIONS {
+            assert_ne!(
+                definition.loader,
+                DEFAULT_LOADER.as_slice(),
+                "{} uses the fallback loader spectrum",
+                definition.key
+            );
+            assert!(
+                definition.loader.len() >= 6,
+                "{} spectrum needs enough stops for a rainbow",
+                definition.key
+            );
+        }
+        for (index, definition) in THEME_DEFINITIONS.iter().enumerate() {
+            for other in &THEME_DEFINITIONS[index + 1..] {
+                assert_ne!(
+                    definition.loader, other.loader,
+                    "{} and {} share a loader spectrum",
+                    definition.key, other.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loader_spectra_flow_around_their_loop_without_jumps() {
+        const SAMPLES: usize = 256;
+        for definition in &THEME_DEFINITIONS {
+            let spectrum = LoaderSpectrum::new(definition.loader);
+            let colors: Vec<Color> = (0..SAMPLES)
+                .map(|step| spectrum.sample(step as f32 / SAMPLES as f32))
+                .collect();
+            for step in 0..SAMPLES {
+                let next = colors[(step + 1) % SAMPLES];
+                let distance = perceptual_distance(colors[step], next).expect("rgb samples");
+                assert!(
+                    distance < 0.03,
+                    "{} jumps {distance:.3} at sample {step}",
+                    definition.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loader_spectra_stand_out_from_their_theme_canvas() {
+        for definition in &THEME_DEFINITIONS {
+            let canvas = perceptual_lightness(definition.palette.base).expect("rgb canvas");
+            let spectrum = LoaderSpectrum::new(definition.loader);
+            for step in 0..128 {
+                let color = spectrum.sample(step as f32 / 128.0);
+                let lightness = perceptual_lightness(color).expect("rgb sample");
+                assert!(
+                    (lightness - canvas).abs() >= 0.25,
+                    "{} sample {step} ({color:?}) blends into its canvas",
+                    definition.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loader_spectrum_wraps_whole_turns_and_lands_on_its_stops() {
+        let spectrum = LoaderSpectrum::new(&EMERALD_LOADER);
+        let start = spectrum.sample(0.0);
+        for position in [1.0, -1.0, 3.0] {
+            assert_eq!(spectrum.sample(position), start);
+        }
+        assert_eq!(spectrum.sample(0.25), spectrum.sample(-0.75));
+        for (index, stop) in EMERALD_LOADER.iter().enumerate() {
+            let at_stop = spectrum.sample(index as f32 / EMERALD_LOADER.len() as f32);
+            let distance = perceptual_distance(at_stop, *stop).expect("rgb stop");
+            assert!(distance < 0.005, "stop {index} drifted {distance}");
+        }
+    }
+
+    #[test]
+    fn loader_spectrum_skips_terminal_owned_stops() {
+        assert_eq!(
+            LoaderSpectrum::new(&[Color::Reset]),
+            LoaderSpectrum::new(&DEFAULT_LOADER)
+        );
+        let single = LoaderSpectrum::new(&[Color::Reset, rgb(40, 200, 120)]);
+        for step in 0..8 {
+            assert_eq!(single.sample(step as f32 / 8.0), rgb(40, 200, 120));
+        }
+    }
+
+    #[test]
+    fn rainbow_palette_samples_the_active_theme_spectrum() {
+        with_theme_state(|| {
+            assert!(set_theme_by_name("emerald"));
+            let spectrum = loader_spectrum();
+            let emerald = rainbow_palette();
+            assert_eq!(emerald.len(), RAINBOW_PALETTE_LEN);
+            for (index, color) in emerald.iter().enumerate() {
+                assert_eq!(
+                    *color,
+                    spectrum.sample(index as f32 / RAINBOW_PALETTE_LEN as f32)
+                );
+            }
+
+            assert!(set_theme_by_name("ruby"));
+            let ruby = rainbow_palette();
+            assert_ne!(emerald, ruby, "each theme gets its own rainbow");
         });
     }
 }

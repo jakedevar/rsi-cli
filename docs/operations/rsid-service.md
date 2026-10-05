@@ -28,7 +28,28 @@ The example contains
 names only; the operator supplies values. Use `systemctl --user status
 rsid.service` and `rsi-rpc GetHealthStatus` to check readiness.
 
-`make release-install` relinks the release binaries and, when this unit is
+`make release-install` builds, relinks the release binaries and, by default,
+asks the running daemon for a quiet-point restart (`RequestOperatorRestart`,
+#1122): the daemon stages and verifies the build, holds new worker starts, waits
+until no landing, job, worker or manager is mid-turn (bounded by the printed
+`release by` time), swaps the binaries in and restarts under
+`rsid-supervisor.sh`, then verifies the running build. The TUI shows
+`restart pending: waiting for N turns` in the RSID pane; `:manager restart now`
+forces it and `:manager restart cancel` cancels it (the same as
+`rsi-rpc ForceOperatorRestart` / `CancelOperatorRestart`). `make release-install
+NOW=1` (or `--now`) restarts immediately. A daemon that is positively down
+(socket absent or refusing and no rsid process) or answers that it is not under
+the supervisor is restarted directly, as below; a timeout, malformed reply or a
+socket that is down while an rsid process lives fails the install without
+restarting anything and names `NOW=1`. Before building, the installer copies
+any installed executable that points into Cargo's output directory to
+`~/.rsi/install/`, and on the quiet-point path it does not relink: the daemon's
+`.prev` rollback copy is therefore the previous working build, and the new set
+is installed by the daemon at the quiet point. Re-running `make release-install`
+while a restart is pending replaces the pending build with the newer one.
+
+When the quiet-point path is skipped, `make release-install` relinks the
+binaries and, when this unit is
 installed, restarts it through systemd. It waits up to 90 seconds for a valid
 `GetHealthStatus` response and reports startup progress. An installed but
 inactive service starts on deploy; a live legacy daemon causes a refusal until

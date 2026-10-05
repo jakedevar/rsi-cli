@@ -9,7 +9,8 @@ use crate::claude::LaunchConfig;
 use crate::error::{DaemonError, Result};
 use crate::store::harness_manager_v2::refused;
 use crate::store::manager_actions::{
-    ManagerActionClaimV2, ManagerActionOriginV2, action_epic, action_fence,
+    MANAGER_LAUNCH_DRAIN_PENDING, ManagerActionClaimV2, ManagerActionOriginV2, action_epic,
+    action_fence,
 };
 use rsi_common::harness_manager_v2::*;
 use rsi_common::types::{Session, SessionProvider, SessionStatus};
@@ -19,6 +20,109 @@ use uuid::Uuid;
 mod recovery;
 
 const BATCH: usize = 4;
+/// #1118: actions in flight at once within one reconcile pass. The store's
+/// claim query decides which actions may overlap (independent create_session
+/// launches); everything else stays one active command per project.
+const MAX_PARALLEL_ACTIONS: usize =
+    crate::store::manager_actions::MANAGER_CREATE_PARALLELISM as usize;
+/// While a launch is slow, re-attempt claims this often so a later independent
+/// launch does not wait for the slow one's pass to end.
+const CLAIM_REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// #1118: a launch step that makes no progress for this long settles the
+/// action as `blocked` with the named step (or `uncertain` once a provider
+/// effect started), never as an indefinite `running`.
+pub(crate) const MANAGER_LAUNCH_STEP_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// #1166: how long the lead-assignment commit keeps retrying a busy candidate
+/// custody stripe (releasing the Store and the active map between attempts)
+/// before surrendering with the typed retryable `root_busy`.
+const MANAGER_ASSIGNMENT_STRIPE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const MANAGER_ASSIGNMENT_STRIPE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// #1143: runtime guard matching the transactional same-parent fence in
+/// `claim_manager_action_holding`. A distinct key space, so it conflicts only
+/// with other `create_session` launches under the same parent and never with
+/// spawn guards taken on the parent session itself.
+fn manager_create_parent_guard_key(parent_id: Uuid) -> Uuid {
+    const NAMESPACE: Uuid = Uuid::from_u128(0x6d61_6e61_6765_725f_6372_6561_7465_0001);
+    Uuid::new_v5(&NAMESPACE, parent_id.as_bytes())
+}
+
+tokio::task_local! {
+    /// The launch step the current manager action is in (empty = untracked).
+    static LAUNCH_STEP: std::sync::Arc<std::sync::Mutex<&'static str>>;
+}
+
+/// Record the launch step the current action entered. No-op outside a
+/// bounded action.
+fn note_launch_step(step: &'static str) {
+    let _ = LAUNCH_STEP.try_with(|s| *s.lock().unwrap() = step);
+}
+
+/// Drive `run` with a per-step deadline (#1118). Only code that calls
+/// [`note_launch_step`] is bounded; the deadline restarts whenever the step
+/// changes. On expiry `run` is dropped and the typed
+/// `manager_v2_launch_timeout_<step>` refusal is returned.
+pub(super) async fn bound_launch_steps<T>(
+    deadline: std::time::Duration,
+    operation_id: Uuid,
+    run: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let step = std::sync::Arc::new(std::sync::Mutex::new(""));
+    let mut run = Box::pin(LAUNCH_STEP.scope(std::sync::Arc::clone(&step), run));
+    let mut seen = "";
+    loop {
+        let wait = if seen.is_empty() {
+            std::time::Duration::from_millis(250)
+        } else {
+            deadline
+        };
+        if let Ok(result) = tokio::time::timeout(wait, &mut run).await {
+            return result;
+        }
+        let now = *step.lock().unwrap();
+        if now.is_empty() || now != seen {
+            seen = now;
+            continue;
+        }
+        tracing::warn!(%operation_id, step = now, "manager launch step deadline expired");
+        return Err(refused(launch_timeout_code(now)));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn note_launch_step_for_tests(step: &'static str) {
+    note_launch_step(step);
+}
+
+/// Poll until a spawned task has exited; `false` when `wait` elapses first.
+async fn wait_task_exit(task: &tokio::task::AbortHandle, wait: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    while !task.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    true
+}
+
+fn is_launch_timeout_error(error: &DaemonError) -> bool {
+    safe_action_error(error).starts_with("manager_v2_launch_timeout")
+}
+
+fn launch_timeout_code(step: &str) -> &'static str {
+    match step {
+        "predecessor_guard" => "manager_v2_launch_timeout_predecessor_guard",
+        "runtime_check" => "manager_v2_launch_timeout_runtime_check",
+        "settle_predecessor" => "manager_v2_launch_timeout_settle_predecessor",
+        "prepare_fork" => "manager_v2_launch_timeout_prepare_fork",
+        "launch_candidate" => "manager_v2_launch_timeout_launch_candidate",
+        "confirm_candidate" => "manager_v2_launch_timeout_confirm_candidate",
+        _ => "manager_v2_launch_timeout",
+    }
+}
 
 impl AgentControlHandle {
     pub async fn agent_manager_prepare_control(
@@ -88,6 +192,9 @@ impl SessionManager {
         let Ok(_flight) = self.manager_action_reconcile.try_lock() else {
             return Ok(0);
         };
+        // #1166: the coordinator breadcrumb lives exactly as long as this
+        // single-flight pass; every exit (success, error, cancellation) clears it.
+        let _phase = crate::launch_breadcrumbs::PhaseGuard::new(Uuid::nil(), "manager_actions");
         let mut count = self
             .store
             .lock()
@@ -114,118 +221,73 @@ impl SessionManager {
             self.event_bus
                 .publish(DaemonEvent::ManagerNoticeQueued { job_id });
         }
-        for _ in 0..BATCH {
-            let claim = self.store.lock().await.claim_manager_action_holding(
-                self.program_run_boot_id,
-                self.deploy_drain.is_draining(),
-            )?;
-            let Some(claim) = claim else { break };
-            if let Err(error) = self.execute_manager_action(&claim).await {
-                // #1073: the deploy drain engaged after the claim and before
-                // any provider effect. Hand the action back to the queue so it
-                // runs after the deploy settles (or is re-admitted by a
-                // restart); it is never blocked or made uncertain.
-                if crate::deploy_drain::is_draining_error(&error)
-                    && self
-                        .store
-                        .lock()
-                        .await
-                        .requeue_held_manager_action(&claim)?
-                {
-                    self.deploy_drain.note_manager_action_held();
-                    continue;
-                }
-                let code = safe_action_error(&error);
-                let is_integrate = matches!(claim.action(), ManagerActionV2::Integrate { .. });
-                // RME-S2A-003: For integrate actions with effect_started,
-                // reconcile against actual refs after dropping the store
-                // lock (git_ref is async). For all other actions, finish
-                // immediately inside the store lock.
-                let needs_integrate_reconcile = {
-                    let store = self.store.lock().await;
-                    let op = store.manager_action_operation(claim.id())?;
-                    let Some(op) = op else {
-                        tracing::warn!(operation_id=%claim.id(),error=%error,
-                            "manager action vanished during error handling");
-                        continue;
+        let mut inflight = futures::stream::FuturesUnordered::new();
+        let mut completed = 0usize;
+        let mut drained = false;
+        let mut first_error = None;
+        loop {
+            // #1118: independent launches proceed while another is slow or
+            // stuck. The store's claim query enforces which actions may be
+            // `running` together (create_session pairs, bounded); this loop
+            // just keeps up to MAX_PARALLEL_ACTIONS in flight.
+            while !drained && completed < BATCH && inflight.len() < MAX_PARALLEL_ACTIONS {
+                // #1166: the in-flight launches are polled only by the `select!`
+                // below, never while this loop awaits. Awaiting the Store here
+                // queues behind (or behind a grant to) an in-flight launch that
+                // is itself waiting for or holding the Store; that launch cannot
+                // run until this await returns, so the pass and the Store wedge
+                // together. With launches in flight, take the Store only if it
+                // is free and otherwise retry after the refill interval.
+                crate::launch_breadcrumbs::note_phase(Uuid::nil(), "manager_actions:claim");
+                let claim = if inflight.is_empty() {
+                    self.store.lock().await.claim_manager_action_holding(
+                        self.program_run_boot_id,
+                        self.deploy_drain.is_draining(),
+                    )?
+                } else {
+                    let Ok(store) = self.store.try_lock() else {
+                        drained = true;
+                        break;
                     };
-                    let effect_started = op.effect_started;
-                    let needs_reconcile = is_integrate
-                        && effect_started
-                        && op.receipt.state == ManagerActionStateV2::Running;
-                    if !needs_reconcile {
-                        if op.receipt.state == ManagerActionStateV2::Running {
-                            let state = if effect_started {
-                                ManagerActionStateV2::Uncertain
-                            } else if matches!(
-                                code,
-                                "manager_v2_scope_changed"
-                                    | "manager_review_assignment_terminal"
-                                    | "manager_v2_policy_changed"
-                                    | "manager_v2_capability_denied"
-                                    | "manager_v2_epic_out_of_scope"
-                                    | "manager_v2_container_out_of_scope"
-                            ) {
-                                ManagerActionStateV2::Revoked
-                            } else {
-                                ManagerActionStateV2::Blocked
-                            };
-                            store.finish_manager_action(&claim, state, code)?;
-                        }
-                    }
-                    needs_reconcile
+                    store.claim_manager_action_holding(
+                        self.program_run_boot_id,
+                        self.deploy_drain.is_draining(),
+                    )?
                 };
-                if needs_integrate_reconcile {
-                    // Same-boot path: the claim is still Running with the
-                    // original boot_id, so finish_manager_action works.
-                    // Use settle_integrate_claim only for lost-boot
-                    // recovery where the row is already terminal Uncertain.
-                    let target_ref: String = match claim.action() {
-                        ManagerActionV2::Integrate { target_ref, .. } => target_ref.clone(),
-                        _ => unreachable!("checked above"),
-                    };
-                    let repo = self
-                        .resolve_project_working_dir(claim.operation.project_id)
-                        .await
-                        .ok();
-                    let resolved = if let Some(r) = repo {
-                        git_ref(&r, &target_ref).await
-                    } else {
-                        None
-                    };
-                    let store = self.store.lock().await;
-                    let state = if let Some(ref_oid) = resolved {
-                        match store.reconcile_integrate_claim(&claim, &ref_oid)? {
-                            ManagerActionStateV2::Succeeded => ManagerActionStateV2::Succeeded,
-                            ManagerActionStateV2::Failed => ManagerActionStateV2::Failed,
-                            _ => ManagerActionStateV2::Uncertain,
-                        }
-                    } else {
-                        ManagerActionStateV2::Uncertain
-                    };
-                    let outcome = match state {
-                        ManagerActionStateV2::Succeeded => "integrated_crash_reconciled",
-                        ManagerActionStateV2::Failed => "not_integrated_crash_reconciled",
-                        _ => "execution_owner_lost_unconfirmed",
-                    };
-                    store.finish_manager_action(&claim, state, outcome)?;
+                match claim {
+                    None => drained = true,
+                    Some(claim) => inflight.push(Box::pin(self.run_claimed_manager_action(claim))),
                 }
-                tracing::warn!(operation_id=%claim.id(),error=%error,"manager lifecycle action did not establish a confirmed result");
             }
-            match self
-                .store
-                .lock()
-                .await
-                .reconcile_manager_action_notice(claim.id())
-            {
-                Ok(Some(job_id)) => self
-                    .event_bus
-                    .publish(DaemonEvent::ManagerNoticeQueued { job_id }),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(operation_id=%claim.id(),%error,
-                    "manager action notice reconciliation deferred"),
+            if inflight.is_empty() {
+                break;
             }
-            count += 1;
+            crate::launch_breadcrumbs::note_phase(Uuid::nil(), "manager_actions:select");
+            tokio::select! {
+                done = futures::StreamExt::next(&mut inflight) => {
+                    match done {
+                        Some(Ok(true)) => {
+                            count += 1;
+                            completed += 1;
+                            drained = false;
+                        }
+                        Some(Ok(false)) => drained = false,
+                        // Never cancel the other in-flight launches: stop
+                        // claiming, drain them, then surface the error.
+                        Some(Err(error)) => {
+                            first_error.get_or_insert(error);
+                            completed = BATCH;
+                        }
+                        None => {}
+                    }
+                }
+                () = tokio::time::sleep(CLAIM_REFILL_INTERVAL), if drained => {
+                    drained = false;
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         let (reviews_changed, review_notice_jobs) = self
             .store
@@ -241,9 +303,160 @@ impl SessionManager {
         // non-async helper so neither its state nor a poll-frame temporary
         // grows this reconcile future (debug test threads have 2 MiB stacks).
         count += self.boxed_halt_orphaned_manager_reviewers().await?;
+        count += self.reconcile_manager_launch_drain_debt().await;
         count += self.reconcile_failed_manager_launch_cleanup().await;
+        count += self.reconcile_issue_worker_watches().await;
         count += self.reconcile_manager_succession_cleanup().await?;
         Ok(count)
+    }
+
+    /// Settle one claimed action: execute it under its launch deadline, map a
+    /// failure to the receipt state the at-most-once rules allow, and queue
+    /// the notice. `Ok(false)` means the action was handed back or vanished
+    /// and does not count as completed work.
+    pub(super) async fn run_claimed_manager_action(
+        &self,
+        claim: ManagerActionClaimV2,
+    ) -> Result<bool> {
+        if let Err(error) = self.execute_manager_action_bounded(&claim).await {
+            // #1143: the deadline dropped the launch future, so its in-band
+            // candidate cleanup never ran. Cancel and drain here, before the
+            // action settles.
+            let drain_pending = is_launch_timeout_error(&error)
+                && !self.boxed_drain_timed_out_manager_launch(&claim).await;
+            // #1073: the deploy drain engaged after the claim and before
+            // any provider effect. Hand the action back to the queue so it
+            // runs after the deploy settles (or is re-admitted by a
+            // restart); it is never blocked or made uncertain.
+            if crate::deploy_drain::is_draining_error(&error)
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .requeue_held_manager_action(&claim)?
+            {
+                self.deploy_drain.note_manager_action_held();
+                return Ok(false);
+            }
+            let code = if drain_pending {
+                MANAGER_LAUNCH_DRAIN_PENDING
+            } else {
+                safe_action_error(&error)
+            };
+            let is_integrate = matches!(claim.action(), ManagerActionV2::Integrate { .. });
+            // RME-S2A-003: For integrate actions with effect_started,
+            // reconcile against actual refs after dropping the store
+            // lock (git_ref is async). For all other actions, finish
+            // immediately inside the store lock.
+            let needs_integrate_reconcile = {
+                let store = self.store.lock().await;
+                let op = store.manager_action_operation(claim.id())?;
+                let Some(op) = op else {
+                    tracing::warn!(operation_id=%claim.id(),error=%error,
+                        "manager action vanished during error handling");
+                    return Ok(false);
+                };
+                let effect_started = op.effect_started;
+                let needs_reconcile = is_integrate
+                    && effect_started
+                    && op.receipt.state == ManagerActionStateV2::Running;
+                if !needs_reconcile {
+                    if op.receipt.state == ManagerActionStateV2::Running {
+                        let state = if effect_started || drain_pending {
+                            ManagerActionStateV2::Uncertain
+                        } else if matches!(
+                            code,
+                            "manager_v2_scope_changed"
+                                | "manager_review_assignment_terminal"
+                                | "manager_v2_policy_changed"
+                                | "manager_v2_capability_denied"
+                                | "manager_v2_epic_out_of_scope"
+                                | "manager_v2_container_out_of_scope"
+                        ) {
+                            ManagerActionStateV2::Revoked
+                        } else {
+                            ManagerActionStateV2::Blocked
+                        };
+                        store.finish_manager_action(&claim, state, code)?;
+                    }
+                }
+                needs_reconcile
+            };
+            if needs_integrate_reconcile {
+                // Same-boot path: the claim is still Running with the
+                // original boot_id, so finish_manager_action works.
+                // Use settle_integrate_claim only for lost-boot
+                // recovery where the row is already terminal Uncertain.
+                let target_ref: String = match claim.action() {
+                    ManagerActionV2::Integrate { target_ref, .. } => target_ref.clone(),
+                    _ => unreachable!("checked above"),
+                };
+                let repo = self
+                    .resolve_project_working_dir(claim.operation.project_id)
+                    .await
+                    .ok();
+                let resolved = if let Some(r) = repo {
+                    git_ref(&r, &target_ref).await
+                } else {
+                    None
+                };
+                let store = self.store.lock().await;
+                let state = if let Some(ref_oid) = resolved {
+                    match store.reconcile_integrate_claim(&claim, &ref_oid)? {
+                        ManagerActionStateV2::Succeeded => ManagerActionStateV2::Succeeded,
+                        ManagerActionStateV2::Failed => ManagerActionStateV2::Failed,
+                        _ => ManagerActionStateV2::Uncertain,
+                    }
+                } else {
+                    ManagerActionStateV2::Uncertain
+                };
+                let outcome = match state {
+                    ManagerActionStateV2::Succeeded => "integrated_crash_reconciled",
+                    ManagerActionStateV2::Failed => "not_integrated_crash_reconciled",
+                    _ => "execution_owner_lost_unconfirmed",
+                };
+                store.finish_manager_action(&claim, state, outcome)?;
+            }
+            tracing::warn!(operation_id=%claim.id(),error=%error,"manager lifecycle action did not establish a confirmed result");
+        }
+        match self
+            .store
+            .lock()
+            .await
+            .reconcile_manager_action_notice(claim.id())
+        {
+            Ok(Some(job_id)) => self
+                .event_bus
+                .publish(DaemonEvent::ManagerNoticeQueued { job_id }),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(operation_id=%claim.id(),%error,
+                "manager action notice reconciliation deferred"),
+        }
+        Ok(true)
+    }
+
+    /// Run an action with a per-step launch deadline (#1118). Only actions
+    /// that record a launch step are bounded; the deadline restarts whenever
+    /// the step changes. On expiry the in-flight future is dropped and the
+    /// caller settles the action from its durable `effect_started` flag, so a
+    /// pre-effect stall becomes `blocked` with the named step and an uncertain
+    /// effect stays `uncertain` for reconciliation.
+    pub(crate) fn manager_launch_step_deadline(&self) -> std::time::Duration {
+        *self.manager_launch_step_deadline.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_manager_launch_step_deadline(&self, deadline: std::time::Duration) {
+        *self.manager_launch_step_deadline.lock().unwrap() = deadline;
+    }
+
+    async fn execute_manager_action_bounded(&self, claim: &ManagerActionClaimV2) -> Result<()> {
+        bound_launch_steps(
+            self.manager_launch_step_deadline(),
+            claim.id(),
+            self.execute_manager_action(claim),
+        )
+        .await
     }
 
     pub(super) async fn execute_manager_action(&self, claim: &ManagerActionClaimV2) -> Result<()> {
@@ -366,6 +579,18 @@ impl SessionManager {
                 // predecessor guard, fork or any other effect.
                 self.deploy_drain
                     .refuse_if_draining(claim.operation.context.target_session_id, true)?;
+                note_launch_step("predecessor_guard");
+                // #1143: same-parent creates serialize at runtime too (the
+                // claim predicate already fences them transactionally).
+                let _parent_guard = match claim.action() {
+                    CreateSession { parent_id, .. } => Some(
+                        super::spawn_single_flight::acquire_spawn_guard(
+                            manager_create_parent_guard_key(*parent_id),
+                        )
+                        .await,
+                    ),
+                    _ => None,
+                };
                 let predecessor = action_fence(claim.action()).and_then(|f| f.lead_session_id);
                 // Held until CAS: an operator/worker continuation cannot restart
                 // the old process between quiescence and assignment.
@@ -374,7 +599,9 @@ impl SessionManager {
                 } else {
                     None
                 };
+                note_launch_step("runtime_check");
                 self.check_manager_action_runtime(claim, false).await?;
+                note_launch_step("settle_predecessor");
                 if let Some(id) = predecessor {
                     self.settle_manager_predecessor(claim, id).await?;
                 }
@@ -390,13 +617,20 @@ impl SessionManager {
                     .await
                     .get_session(frozen.session_id)?
                     .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+                note_launch_step("prepare_fork");
                 let runtime = self.custody_execution_runtime();
                 let fork = if frozen.historical_commit {
                     runtime
                         .prepare_manager_action_fork_at(&source, &frozen.commit)
                         .await?
                 } else {
-                    runtime.prepare_manager_action_fork(&source).await?
+                    runtime
+                        .prepare_manager_action_fork_pinned(
+                            &source,
+                            &frozen.commit,
+                            frozen.branch.as_deref(),
+                        )
+                        .await?
                 };
                 if source.working_dir != frozen.working_dir
                     || source.sandbox_root != frozen.sandbox_root
@@ -404,6 +638,7 @@ impl SessionManager {
                 {
                     return Err(refused("manager_v2_source_changed"));
                 }
+                note_launch_step("launch_candidate");
                 let config = manager_launch_config(claim, &source)?;
                 let target = claim
                     .operation
@@ -421,17 +656,27 @@ impl SessionManager {
                 )
                 .await?;
                 let generation = generation.load(Ordering::Acquire);
+                note_launch_step("confirm_candidate");
                 let result = async {
+                    #[cfg(test)]
+                    super::launch::pause_controller_candidate_test(
+                        target,
+                        super::launch::ControllerCandidateTestPhase::ManagerActionConfirming,
+                    )
+                    .await;
                     self.confirm_manager_candidate(claim, target, generation)
                         .await?;
                     if predecessor.is_some() {
                         self.commit_manager_assignment(claim, Some(generation))
                             .await
                     } else {
+                        // #1115: the caller's terminal watch commits with the
+                        // launch success, never after it.
+                        let watch = self.issue_worker_watch_candidate(claim).await;
                         self.store
                             .lock()
                             .await
-                            .commit_manager_created_session(claim)
+                            .commit_manager_created_session_with_watch(claim, watch.as_ref())
                     }
                 }
                 .await;
@@ -913,6 +1158,187 @@ impl SessionManager {
         Ok(halted)
     }
 
+    /// #1143: heap future for [`Self::drain_timed_out_manager_launch`].
+    #[inline(never)]
+    fn boxed_drain_timed_out_manager_launch<'a>(
+        &'a self,
+        claim: &'a ManagerActionClaimV2,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(self.drain_timed_out_manager_launch(claim))
+    }
+
+    /// #1143: a launch-step deadline drops the in-flight launch, so the
+    /// candidate it may have started is cancelled, drained and settled here.
+    /// Returns `true` only when the drain was VERIFIED (monitor task exited,
+    /// process cohort reaped, nothing of this incarnation left in `active`) and
+    /// the candidate rows settled. `false` keeps the durable cleanup debt: the
+    /// row and invocation stay open, the action settles `uncertain` with
+    /// [`MANAGER_LAUNCH_DRAIN_PENDING`] and the sweep retries until proved.
+    async fn drain_timed_out_manager_launch(&self, claim: &ManagerActionClaimV2) -> bool {
+        if !matches!(
+            claim.action(),
+            ManagerActionV2::CreateSession { .. }
+                | ManagerActionV2::ReplaceLead { .. }
+                | ManagerActionV2::RetryLead { .. }
+        ) {
+            return true;
+        }
+        let Some(target) = claim.operation.context.target_session_id else {
+            return true;
+        };
+        let generation = self
+            .active
+            .read()
+            .await
+            .get(&target)
+            .map(|s| s.spawn_generation);
+        if let Err(error) = self
+            .drain_manager_launch_candidate(target, generation)
+            .await
+        {
+            tracing::warn!(session_id = %target, %error,
+                "timed-out manager launch is not proved drained; cleanup stays owed");
+            return false;
+        }
+        if let Err(error) = self.settle_failed_manager_launch_target(target).await {
+            tracing::warn!(session_id = %target, %error,
+                "timed-out manager launch cleanup incomplete; the sweep will retry");
+        }
+        true
+    }
+
+    /// Cooperative-stop budget before the runner cancels the launch task itself.
+    #[cfg(not(test))]
+    const MANAGER_DRAIN_COOPERATIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    #[cfg(test)]
+    const MANAGER_DRAIN_COOPERATIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+    const MANAGER_DRAIN_TASK_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// #1143: cancel and drain one manager-action candidate until its exit is
+    /// proved, or return the typed drain-pending refusal.
+    ///
+    /// `generation` is the exact `active` incarnation owned by the caller
+    /// (`None`: none is, so a live entry is never stopped or removed: the
+    /// sweep must not stop an operator continuation). Order:
+    /// 1. a bounded cooperative stop (the monitor finalizes the session); it
+    ///    can wait behind the deferred launch's start gate, so it is only a
+    ///    grace period, never the sole route;
+    /// 2. the runner-owned abort handle of the launch task cancels it directly,
+    ///    independent of that gate, and its exit is awaited;
+    /// 3. the (now unmonitored) entry of this incarnation is forced out;
+    /// 4. the session's exact process cohort is reaped to a fixed point.
+    async fn drain_manager_launch_candidate(
+        &self,
+        target: Uuid,
+        generation: Option<u64>,
+    ) -> Result<()> {
+        let mut cooperative = generation.is_none();
+        if let Some(generation) = generation {
+            cooperative = matches!(
+                tokio::time::timeout(
+                    Self::MANAGER_DRAIN_COOPERATIVE_WAIT,
+                    self.stop_manager_candidate(target, generation),
+                )
+                .await,
+                Ok(Ok(()))
+            );
+        }
+        if let Some(task) = super::launch::take_manager_launch_task(target) {
+            if cooperative && generation.is_some() {
+                // Let the monitor's own finalizer run before cancelling it.
+                wait_task_exit(&task, Self::MANAGER_DRAIN_COOPERATIVE_WAIT).await;
+            }
+            if !task.is_finished() {
+                task.abort();
+            }
+            if !wait_task_exit(&task, Self::MANAGER_DRAIN_TASK_EXIT_WAIT).await {
+                super::launch::register_manager_launch_task(target, task);
+                return Err(refused(MANAGER_LAUNCH_DRAIN_PENDING));
+            }
+        }
+        if let Some(generation) = generation {
+            let removed = {
+                let mut active = self.active.write().await;
+                if active
+                    .get(&target)
+                    .is_some_and(|s| s.spawn_generation == generation)
+                {
+                    active.remove(&target)
+                } else {
+                    None
+                }
+            };
+            if let Some(process) = removed.as_ref().and_then(|t| t.process.as_ref()) {
+                let _ = process.interrupt();
+            }
+        }
+        match tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(target))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(session_id = %target, %error, "manager launch process reap failed");
+                return Err(refused(MANAGER_LAUNCH_DRAIN_PENDING));
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %target, %error, "manager launch process reap did not run");
+                return Err(refused(MANAGER_LAUNCH_DRAIN_PENDING));
+            }
+        }
+        let still_active =
+            self.active.read().await.get(&target).is_some_and(|s| {
+                generation.is_none_or(|generation| s.spawn_generation == generation)
+            });
+        if still_active {
+            return Err(refused(MANAGER_LAUNCH_DRAIN_PENDING));
+        }
+        Ok(())
+    }
+
+    /// #1143: retry owed drains. Exit is proved again (task joined, cohort
+    /// reaped) before the candidate rows settle and the debt clears. A target
+    /// back in `active` (an operator continuation) is never touched.
+    async fn reconcile_manager_launch_drain_debt(&self) -> usize {
+        let targets = match self
+            .store
+            .lock()
+            .await
+            .manager_launch_drain_pending_targets(32)
+        {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(%error, "manager launch drain-debt scan failed");
+                return 0;
+            }
+        };
+        let mut cleared = 0;
+        for target in targets {
+            if self.active.read().await.contains_key(&target) {
+                continue;
+            }
+            if let Err(error) = self.drain_manager_launch_candidate(target, None).await {
+                tracing::warn!(session_id = %target, %error, "manager launch drain remains owed");
+                continue;
+            }
+            if let Err(error) = self.settle_failed_manager_launch_target(target).await {
+                tracing::warn!(session_id = %target, %error, "manager launch drain settlement remains owed");
+                continue;
+            }
+            match self
+                .store
+                .lock()
+                .await
+                .clear_manager_launch_drain_pending(target)
+            {
+                Ok(_) => cleared += 1,
+                Err(error) => {
+                    tracing::warn!(session_id = %target, %error, "manager launch drain debt not cleared");
+                }
+            }
+        }
+        cleared
+    }
+
     /// #985: heap future for [`Self::stop_manager_candidate`], which awaits
     /// interrupt, guarded quiescence and spawn-blocking reaping.
     #[inline(never)]
@@ -1222,7 +1648,32 @@ impl SessionManager {
         }
     }
 
+    /// The lead-assignment commit. Its critical section holds the active map and
+    /// the Store while it authenticates the candidate's custody, so it must never
+    /// wait for the candidate's custody stripe there: a maintenance proof on that
+    /// stripe would pin the Store and every RPC (#1166). A busy stripe releases
+    /// everything, backs off asynchronously and retries the whole (idempotent,
+    /// pre-write) critical section.
     async fn commit_manager_assignment(
+        &self,
+        claim: &ManagerActionClaimV2,
+        generation: Option<u64>,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + MANAGER_ASSIGNMENT_STRIPE_BUDGET;
+        loop {
+            match self.commit_manager_assignment_once(claim, generation).await {
+                Err(error)
+                    if crate::store::custody_lock_order::is_lock_order_busy_error(&error)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(MANAGER_ASSIGNMENT_STRIPE_BACKOFF).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn commit_manager_assignment_once(
         &self,
         claim: &ManagerActionClaimV2,
         generation: Option<u64>,
@@ -1301,7 +1752,7 @@ impl SessionManager {
                     crate::sandbox::custody::CustodyService::authorize_ordinary(&candidate)?;
                 }
                 crate::sandbox::custody::CustodyClassification::RequiresPersistedAuthentication => {
-                    crate::sandbox::custody::CustodyService::authorize_live(
+                    crate::sandbox::custody::CustodyService::authorize_live_try(
                         &candidate,
                         &mut store,
                         self.sandbox_allocator.base_dir(),
@@ -1353,7 +1804,9 @@ pub(super) async fn manager_action_source_gate(
             .prepare_manager_action_fork_at(&source, &frozen.commit)
             .await?
     } else {
-        runtime.prepare_manager_action_fork(&source).await?
+        runtime
+            .prepare_manager_action_fork_pinned(&source, &frozen.commit, frozen.branch.as_deref())
+            .await?
     };
     if source.working_dir != frozen.working_dir
         || source.sandbox_root != frozen.sandbox_root
@@ -1449,6 +1902,14 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_v2_epic_out_of_scope",
     "manager_v2_container_out_of_scope",
     "manager_v2_lead_changed",
+    "manager_v2_launch_timeout_predecessor_guard",
+    "manager_v2_launch_timeout_runtime_check",
+    "manager_v2_launch_timeout_settle_predecessor",
+    "manager_v2_launch_timeout_prepare_fork",
+    "manager_v2_launch_timeout_launch_candidate",
+    "manager_v2_launch_timeout_confirm_candidate",
+    "manager_v2_launch_timeout",
+    "manager_v2_launch_drain_pending",
     "container_not_empty",
     "manager_v2_container_changed",
     "manager_v2_container_state_changed",

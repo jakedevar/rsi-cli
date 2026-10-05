@@ -11,7 +11,7 @@ use crate::error::{DaemonError, Result};
 use crate::store::rolling_queue::NewQueueEntry;
 use rsi_common::rolling_queue::{
     AgentEnqueueLandingSourceReceiptV1, AgentEnqueueLandingSourceRequestV1, QUEUE_DISABLED,
-    QUEUE_NOT_AUTHORIZED, QUEUE_SOURCE_INVALID, RollingQueueBinding,
+    QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_NOT_AUTHORIZED, QUEUE_SOURCE_INVALID, RollingQueueBinding,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -50,13 +50,23 @@ impl AgentControlHandle {
             .unwrap_or_else(|| session.working_dir.clone());
         let source = request.source_commit.clone();
         let probe_repo = repo.clone();
-        let facts = tokio::task::spawn_blocking(move || {
-            crate::rolling_queue::source_commit_exists(&probe_repo, &source)
-                .then(|| crate::rolling_queue::derive_source_facts(&probe_repo, &source))
+        let filters = request.test_filters.clone();
+        let (facts, empty_filter) = tokio::task::spawn_blocking(move || {
+            crate::rolling_queue::source_commit_exists(&probe_repo, &source).then(|| {
+                (
+                    crate::rolling_queue::derive_source_facts(&probe_repo, &source),
+                    crate::rolling_queue::filter_selecting_no_tests(&probe_repo, &source, &filters),
+                )
+            })
         })
         .await
         .map_err(|error| DaemonError::Process(format!("enqueue source probe: {error}")))?
         .ok_or_else(|| DaemonError::InvalidParam(QUEUE_SOURCE_INVALID.into()))?;
+        if let Some(filter) = empty_filter {
+            return Err(DaemonError::InvalidParam(format!(
+                "{QUEUE_FILTER_MATCHES_NO_TESTS}: {filter}"
+            )));
+        }
         let new = NewQueueEntry {
             project_id: session.project_id,
             repo_path: repo.display().to_string(),

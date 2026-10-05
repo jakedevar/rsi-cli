@@ -62,9 +62,13 @@ pub fn walk_files_scoped(root: &Path, show_hidden: bool, max_depth: Option<usize
     paths
 }
 
-/// Returns true if `target` is within `scope_root` and no more than 2 path
-/// components deep relative to `scope_root` (file in root = 1 component,
-/// file in immediate child dir = 2 components). Canonicalizes both paths.
+/// Returns true if `target` resolves (following symlinks) to a path inside
+/// `scope_root`, at any depth. Canonicalizes both paths, so a symlink inside
+/// the project that points outside it is out of scope.
+///
+/// The explorer tree expands to any depth, so files it shows must open; the
+/// earlier two-component cap made every nested file (`src/app/mod.rs`)
+/// unopenable from the explorer, its finder and telescope.
 pub fn is_within_project_scope(scope_root: &Path, target: &Path) -> bool {
     let Ok(canon_root) = scope_root.canonicalize() else {
         return false;
@@ -72,10 +76,7 @@ pub fn is_within_project_scope(scope_root: &Path, target: &Path) -> bool {
     let Ok(canon_target) = target.canonicalize() else {
         return false;
     };
-    let Ok(rel) = canon_target.strip_prefix(&canon_root) else {
-        return false;
-    };
-    rel.components().count() <= 2
+    canon_target.starts_with(&canon_root)
 }
 
 /// Search a project directory for a file matching a partial path suffix.
@@ -128,4 +129,68 @@ pub fn find_file_by_suffix(working_dir: &Path, partial_path: &str) -> Option<Pat
     // Prefer the shortest relative path (most specific match).
     matches.sort_by_key(|p| p.components().count());
     matches.into_iter().next()
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn nested_project_files_are_in_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("crates/rsi/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        assert!(is_within_project_scope(root.path(), &file));
+        assert!(is_within_project_scope(
+            root.path(),
+            &root.path().join("crates/./rsi/../rsi/src/main.rs")
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn paths_outside_the_project_are_out_of_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("secret.txt");
+        std::fs::write(&outside, "x").unwrap();
+
+        assert!(!is_within_project_scope(root.path(), &outside));
+        assert!(!is_within_project_scope(
+            root.path(),
+            &root.path().join("missing.rs")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn symlinks_escaping_the_project_are_out_of_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("secret.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let link = root.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert!(!is_within_project_scope(root.path(), &link));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn unbounded_walk_finds_deep_files() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.rs"), "").unwrap();
+        std::fs::write(root.path().join("top.rs"), "").unwrap();
+
+        let files = walk_files_scoped(root.path(), false, None);
+        assert!(files.contains(&PathBuf::from("a/b/c/deep.rs")));
+        assert!(files.contains(&PathBuf::from("top.rs")));
+    }
 }

@@ -21,7 +21,7 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
         }
 
         LcAction::ToggleFileExplorer => {
-            if matches!(app.overlay, OverlayState::FileExplorer { .. }) {
+            if matches!(app.overlay, OverlayState::FileExplorer(..)) {
                 app.overlay = OverlayState::None;
             } else {
                 crate::overlay::file_explorer::open_file_explorer(app);

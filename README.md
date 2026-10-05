@@ -1,5 +1,7 @@
 # rsi
 
+![rsi splash screen](Images/rsi_splash.png)
+
 A vim-native terminal UI for running many AI coding agents at once (Claude
 Code, Codex, Antigravity, local models, or a direct API harness) from one
 keyboard-driven screen.

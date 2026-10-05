@@ -10,11 +10,20 @@ work and normal worker controls.
 
 ## Create and appoint a manager
 
-> **Order matters, and saves are not idempotent (Issue eac83cfd).** Appoint
-> once, then save the policy, then leave appointment alone. Every
-> `:manager appoint` / `:manager scope` save, even an identical one, bumps the
-> scope version and revokes the saved policy and all in-flight manager mail, so
-> a re-appoint after a policy save silently undoes the grant. There is one
+> **A scope change never carries the policy (Issues #1102, #1145).** An
+> identical `:manager appoint` / `:manager scope` save (same seat, same
+> normalized scope) changes nothing and the grant stands. Any save that
+> changes the scope, the seat or clears the appointment bumps the scope
+> version and revokes the saved policy and in-flight manager mail: capabilities
+> are never granted over new scope by side effect. The saved values stay as the
+> draft in `:manager policy`, where an explicit save re-grants them (paused
+> Epics stay paused, even across removing and re-adding the Epic). The scope
+> save reports what happened ("Policy kept unchanged" or "Policy revoked,
+> nothing carried") in the TUI and in the `ConfigureHarnessManager` result
+> (`policy.kind`, `capability_count`, `paused_epic_ids`). The appointed
+> manager gets a daemon notice (`manager-policy`) to ask the operator to
+> re-save.
+> There is one
 > legacy root seat per project: appointing a new root session displaces the current
 > root. Area nodes have separate seats and explicit narrower grants. A policy
 > save does not state what it granted, and Enter/Space cycles
@@ -104,6 +113,38 @@ current node's addressed and sent records. `AgentManagerResolveEscalation`
 records a ruling or forwards to its parent. The record and event history survive seat
 succession. Stale grants, custody or revoked ancestors refuse new effects;
 manager rulings never answer an operator approval.
+
+## Global manager
+
+The global manager (#872 Slice B) is one operator-appointed session that keeps a
+healthy project manager (PM) in each granted project, routes requests to them
+and reports back; its playbook is `.claude/skills/rsi-global-manager/SKILL.md`.
+The operator grants it an explicit project list, a launch allowlist for the PMs
+it appoints, and the V2 policy it saves for them. The seat cannot widen any of
+them, and every call is daemon-checked against the active grant.
+
+- `:manager global` shows the active grant.
+- `:manager global appoint [project names...]` appoints the focused session over
+  the named projects (comma-separated for names with spaces; default: every
+  project). The allowlist defaults to Claude `claude-opus-5-5` at `high` effort
+  and the PM policy to the Execute preset. A new appoint replaces the previous
+  seat in one transaction.
+- `:manager global revoke` revokes the active grant.
+- `:manager global configure <JSON>` sends a full `ConfigureGlobalManager`
+  request (`session_id`, `project_ids`, `allowed_launches`, `project_policy`,
+  `expected_grant_version`, `idempotency_key`).
+
+The operator-only RPCs are `ConfigureGlobalManager`, `GetGlobalManager` and
+`RevokeGlobalManager`. The seat uses `AgentGlobalOverview`, `AgentGlobalSend`
+and `AgentGlobalAppointManager`, and may read status and session events and arm
+`on_terminal` watches on each granted PM seat. A PM of a granted project reports
+up with `AgentReportToGlobal`. Messages in both directions are durable one-shot
+resume wakes, so they reach an idle recipient. A queued message is retired undelivered
+when the grant is replaced or revoked, or when its PM is displaced or cleared.
+Authority belongs to the exact appointed seat: a rotated or replaced seat has
+none until the operator re-appoints. `AgentGlobalAppointManager`
+launches, appoints and saves the policy in one call, so the policy is not left
+revoked after a re-appoint. Grants are retained; only their state changes.
 
 ## Policy (`:manager policy`)
 
@@ -550,6 +591,7 @@ including inside nested operations. Daemon checks remain authoritative.
 | `AgentManagerPrepareControl` | `rsi_control_manager_prepare_control` | semantic `operation` (the six lead-lifecycle actions only: `resume_lead`, `pause_lead`, `retry_lead`, `replace_lead`, `create_session`, `assign_lead`); daemon derives live fences and returns a prepared ID/digest without queueing an effect |
 | `AgentManagerCommitPreparedControl` | `rsi_control_manager_commit_prepared_control` | exact `prepared_id`, `target_digest`, `idempotency_key`; daemon atomically rechecks and queues the prepared action |
 | `AgentManagerGetAction` | `rsi_control_manager_get_action` | `operation_id`; reads one durable action receipt in the current manager scope |
+| `AgentManagerLaunchIssueWorker` | `rsi_control_manager_launch_issue_worker` | `{issue, brief, launch, parent_epic_id?, idempotency_key}`; one call launches an Issue-bound worker (create_session + Issue note + InProgress + caller's terminal watch, #1100); needs `SessionCreate` and `IssueCoordinate` |
 | `AgentManagerWorkView` | `rsi_control_manager_work_view` | `{}` or `work_key`/`after_work_key`, `limit` (1–32, default 32); read-only projection for a session the current manager created: live work, active ownership, pause, unanswered-request delivery state (no bodies); follow `next_after_work_key` until null |
 
 The `archive` inspect section pages archived and deleted Groups and Epics within the appointed manager's scope. Each row carries its current `expected_updated_at` restore fence, `restorable` boolean, and nullable `restore_blocker` admission code. Manager-created containers remain in scope only for the appointment version that created them. Overview also includes the manager's project metadata.

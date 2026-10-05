@@ -106,6 +106,7 @@ mod tests {
             tools: vec![],
             stream: false,
             reasoning_effort: None,
+            context_editing: false,
         };
         let execution =
             || ModelExecutionCapability::for_test(RuntimeExecutionRoute::SessionHarnessOpenAiHttp);

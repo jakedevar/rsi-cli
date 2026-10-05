@@ -64,6 +64,9 @@ if [[ "$(uname -s)" == Linux ]]; then
   esac
 fi
 
+# The test seam must never ship in a release bundle (#1021 S4).
+"$(dirname "${BASH_SOURCE[0]}")/check-release-seam.sh"
+
 for architecture in "${architectures[@]}"; do
   case "$architecture" in
     x86_64) target=x86_64-unknown-linux-gnu ;;

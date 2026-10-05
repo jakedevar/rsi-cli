@@ -107,7 +107,7 @@
 <table>
 <thead><tr><th>Keys</th><th>Command</th><th>Action</th><th>What it does</th></tr></thead>
 <tbody>
-<tr><td><code>Enter</code> <code>L</code> · Settings: <code>Enter</code></td><td></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting.</td></tr>
+<tr><td><code>Enter</code> <code>L</code> · Settings: <code>Enter</code></td><td></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.</td></tr>
 <tr><td>Settings: <code>q</code> <code>Esc</code> · Issues: <code>q</code> <code>Esc</code> · Scheduled jobs: <code>q</code> <code>Esc</code> · Theme role editor: <code>Esc</code></td><td></td><td>Close or cancel</td><td>Closes the current view or cancels the pending action.</td></tr>
 </tbody>
 </table>
@@ -400,7 +400,7 @@
 <tr><td>Background color</td><td>Sets the hex color used when the text area background is on.</td><td>edit</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Formulation animation</td><td>Reveals each new live message with a top-to-bottom wipe. Off by default.</td><td>toggle</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Formulation speed</td><td>Sets how long the formulation reveal runs when the animation is on.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
-<tr><td>Activity indicator</td><td>Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
+<tr><td>Activity indicator</td><td>Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight; rainbow colours are tuned to each theme.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 <tr><td>Detail column</td><td>Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned.</td><td>choice</td><td>TUI (state.json)</td><td>immediately</td></tr>
 </tbody>
 </table>
@@ -518,6 +518,7 @@
 <tr><td>Context rotation threshold (global)</td><td>Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_global_pct</code></td><td>immediately</td></tr>
 <tr><td>Context rotation threshold (Claude Code)</td><td>Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_claude_pct</code></td><td>immediately</td></tr>
 <tr><td>Context rotation threshold (Codex)</td><td>Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_codex_pct</code></td><td>immediately</td></tr>
+<tr><td>Coordinator context cap (0 off)</td><td>Live-context tokens at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff; workers are never capped. Read or set a provider or model override with :context-cap &lt;Provider[/model]&gt; [tokens|default]. Default 0 (off until #1156); 200000 is the suggested value. Needs context rotation on.</td><td>choice</td><td>daemon field <code>coordinator_context_cap_tokens</code></td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>Stall Detection</h4>
@@ -588,6 +589,7 @@
 <tr><td>Governor max workers-slice memory (GB)</td><td>Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30.</td><td>choice</td><td>daemon field <code>governor_max_workers_slice_gb</code></td><td>immediately</td></tr>
 <tr><td>Harness web access</td><td>Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it.</td><td>choice</td><td>daemon field <code>harness_web_access</code></td><td>next spawn</td></tr>
 <tr><td>Harness network egress</td><td>Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it.</td><td>choice</td><td>daemon field <code>harness_egress_mode</code></td><td>next spawn</td></tr>
+<tr><td>Harness context editing</td><td>Default for Harness context editing: when on, direct-Anthropic Claude Harness sessions let the provider clear stale tool results server-side to save context. A session's own tool policy (context_editing) overrides it. Read at launch, so running sessions keep the value they started with (#1111).</td><td>toggle</td><td>daemon field <code>harness_context_editing</code></td><td>next spawn</td></tr>
 <tr><td>Harness search call cap</td><td>Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues.</td><td>choice</td><td>daemon field <code>harness_max_search_calls</code></td><td>next spawn</td></tr>
 <tr><td>Harness fetch call cap</td><td>Default cap on hosted web fetches per Harness session; 0 is unlimited.</td><td>choice</td><td>daemon field <code>harness_max_fetch_calls</code></td><td>next spawn</td></tr>
 <tr><td>Harness completion gates</td><td>Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794).</td><td>toggle</td><td>daemon field <code>completion_gates_enabled</code></td><td>next spawn</td></tr>
@@ -644,6 +646,7 @@
 <tr><td>Preview cache reclaim</td><td>Runs a dry-run reclaim pass and reports what it would free.</td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Reclaim sandbox caches now</td><td>Runs a real reclaim pass now and reports the result. <strong>Destructive.</strong></td><td>action</td><td>daemon (sandbox storage)</td><td>immediately</td></tr>
 <tr><td>Source-worktree settlement</td><td>Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. <strong>Destructive.</strong></td><td>action</td><td>daemon (source-worktree settlement)</td><td>immediately</td></tr>
+<tr><td>Legacy scratch adoption</td><td>Lists unrecorded scratch directories (worker TMPDIRs, /var/tmp/rsi-*, lander workspaces) and records chosen ones so scratch reclaim, which is enabled, deletes them automatically once old and unheld. Adopting asks you to confirm every full path first. Each adoption re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and refuses what fails it. <strong>Destructive.</strong></td><td>action</td><td>daemon (legacy scratch adoption)</td><td>immediately</td></tr>
 <tr><td>Maximum sandbox roots</td><td>Maximum direct source roots under the sandbox base before a new allocation is refused.</td><td>choice</td><td>daemon field <code>sandbox_max_source_roots</code></td><td>immediately</td></tr>
 <tr><td>Minimum free space (GiB)</td><td>Free filesystem space required before a new sandbox is allocated.</td><td>choice</td><td>daemon field <code>sandbox_min_free_gib</code></td><td>immediately</td></tr>
 <tr><td>Purge archived sandboxes</td><td>Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. <strong>Destructive.</strong></td><td>toggle</td><td>daemon field <code>archived_sandbox_purge_enabled</code></td><td>immediately</td></tr>
@@ -682,6 +685,14 @@
 <tbody>
 <tr><td>Satellite registry</td><td>Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads.</td><td>action</td><td>daemon (satellite_registry)</td><td>immediately</td></tr>
 <tr><td>Satellite polling</td><td>Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on.</td><td>toggle</td><td>daemon field <code>satellite_polling_enabled</code></td><td>immediately</td></tr>
+</tbody>
+</table>
+<h4>Remote</h4>
+<p>Read-only phone view over your tailnet: enable, devices, projects.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>Remote access</td><td>Enable the read-only phone view, pick allowed devices and exposed projects, and see the URL. Starts a managed gateway (systemd user unit) and a tailscale serve route; never Funnel. Needs one privilege step, <code>sudo tailscale set --operator=$USER</code>, shown here when pending. Disabling stops serving on the next request.</td><td>action</td><td>daemon (remote_access)</td><td>immediately</td></tr>
 </tbody>
 </table>
 <h4>MCP Servers</h4>
@@ -784,8 +795,8 @@
 <tr><td><code>k</code></td><td>Move selection or scroll up</td><td>Moves the selection up one row, or scrolls the focused view up.</td></tr>
 <tr><td><code>gg</code></td><td>Jump to first item</td><td>Jumps the session-list selection to the first row.</td></tr>
 <tr><td><code>G</code></td><td>Jump to last item</td><td>Jumps the session-list selection to the last row.</td></tr>
-<tr><td><code>Enter</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting.</td></tr>
-<tr><td><code>L</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting.</td></tr>
+<tr><td><code>Enter</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.</td></tr>
+<tr><td><code>L</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.</td></tr>
 <tr><td><code>/</code></td><td>Filter sessions</td><td>Starts an incremental <code>/</code> filter over the session list; Enter keeps the filter, Esc clears it.</td></tr>
 <tr><td><code>r</code></td><td>Refresh navigation</td><td>Re-fetches sessions, projects and labels from the daemon.</td></tr>
 <tr><td><code>T</code></td><td>Choose built-in theme</td><td>Opens the built-in theme picker; <code>:theme &lt;name&gt;</code> applies a theme directly.</td></tr>
@@ -935,7 +946,7 @@
 <tr><td><code>?</code></td><td>Contextual help</td><td>Opens contextual help listing the keys and commands available in the current view; Ctrl-Alt-G works even while typing.</td></tr>
 <tr><td><code>j</code></td><td>Move selection or scroll down</td><td>Moves the selection down one row, or scrolls the focused view down.</td></tr>
 <tr><td><code>k</code></td><td>Move selection or scroll up</td><td>Moves the selection up one row, or scrolls the focused view up.</td></tr>
-<tr><td><code>Enter</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting.</td></tr>
+<tr><td><code>Enter</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.</td></tr>
 <tr><td><code>Delete</code></td><td>Reset selected role</td><td>Resets the selected theme role to the active theme's default color.</td></tr>
 <tr><td><code>h</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail.</td></tr>
 <tr><td><code>Left</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail.</td></tr>
@@ -1109,8 +1120,8 @@
 <tbody>
 <tr><td><code>Left</code></td><td>session list or detail focused, not inserting</td><td>previous session in the list</td></tr>
 <tr><td><code>Right</code></td><td>session list or detail focused, not inserting</td><td>next session in the list</td></tr>
-<tr><td><code>Shift-Left</code></td><td>session list or detail focused, not inserting</td><td>previous session and open its detail</td></tr>
-<tr><td><code>Shift-Right</code></td><td>session list or detail focused, not inserting</td><td>next session and open its detail</td></tr>
+<tr><td><code>Shift-Left</code></td><td>session list or detail focused, not inserting</td><td>previous session and open it; in detail a Group or Epic unfolds instead</td></tr>
+<tr><td><code>Shift-Right</code></td><td>session list or detail focused, not inserting</td><td>next session and open it; in detail a Group or Epic unfolds instead</td></tr>
 <tr><td><code>Ctrl-Tab</code></td><td>session list or detail focused, not inserting</td><td>previous session in the list</td></tr>
 <tr><td><code>Ctrl-Shift-Tab</code></td><td>session list or detail focused, not inserting</td><td>next session in the list</td></tr>
 </tbody>
@@ -1370,15 +1381,30 @@
 <tbody>
 <tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
 <tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
-<tr><td><code>Enter / l</code></td><td>Open file or directory</td></tr>
-<tr><td><code>h</code></td><td>Go to parent directory</td></tr>
-<tr><td><code>yy / yn</code></td><td>Copy path / file name</td></tr>
-<tr><td><code>dd</code></td><td>Delete file to trash buffer</td></tr>
-<tr><td><code>u</code></td><td>Restore last deleted file</td></tr>
-<tr><td><code>.</code></td><td>Toggle hidden files</td></tr>
+<tr><td><code>Ctrl-D / Ctrl-U, PageDown / PageUp</code></td><td>Move half / a full page</td></tr>
+<tr><td><code>Enter / o</code></td><td>Open file in the viewer, or toggle directory</td></tr>
+<tr><td><code>l / Right</code></td><td>Expand directory or open file</td></tr>
+<tr><td><code>h / Left</code></td><td>Collapse directory or go to parent</td></tr>
+<tr><td><code>Tab</code></td><td>Preview file without leaving the tree</td></tr>
+<tr><td><code>P</code></td><td>Toggle follow preview</td></tr>
+<tr><td><code>z</code></td><td>Collapse all directories</td></tr>
+<tr><td><code>R</code></td><td>Refresh the tree from disk</td></tr>
+<tr><td><code>a</code></td><td>Add file (end with / for a directory)</td></tr>
+<tr><td><code>A</code></td><td>Add directory</td></tr>
+<tr><td><code>r</code></td><td>Rename</td></tr>
+<tr><td><code>m</code></td><td>Move to a project path</td></tr>
+<tr><td><code>c</code></td><td>Copy to a project path</td></tr>
+<tr><td><code>d</code></td><td>Delete to trash (confirm with y)</td></tr>
+<tr><td><code>u</code></td><td>Undo last file operation</td></tr>
+<tr><td><code>yy / yn / yr</code></td><td>Copy absolute path / name / relative path</td></tr>
+<tr><td><code>i</code></td><td>Show size, modified time and mode</td></tr>
+<tr><td><code>. / H</code></td><td>Toggle hidden files</td></tr>
 <tr><td><code>/</code></td><td>Open fuzzy finder</td></tr>
+<tr><td><code>Ctrl-Shift-Left / Right, &lt; / &gt;</code></td><td>Narrow / widen the drawer</td></tr>
+<tr><td><code>Ctrl-0 / =</code></td><td>Reset drawer width</td></tr>
 <tr><td><code>Ctrl-L</code></td><td>Focus file viewer</td></tr>
-<tr><td><code>Esc / q, Space / Space Space</code></td><td>Close explorer</td></tr>
+<tr><td><code>?</code></td><td>Show explorer help</td></tr>
+<tr><td><code>Esc / q, Space</code></td><td>Close explorer</td></tr>
 </tbody>
 </table>
 </div>
@@ -1388,7 +1414,8 @@
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
 <tr><td><code>Type, Backspace</code></td><td>Filter files</td></tr>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
+<tr><td><code>Ctrl-U / Ctrl-W</code></td><td>Clear query / delete last segment</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
 <tr><td><code>Enter</code></td><td>Open selected file</td></tr>
 <tr><td><code>Esc</code></td><td>Return to explorer tree</td></tr>
 <tr><td><code>Esc Esc</code></td><td>Return to tree, then close explorer</td></tr>
@@ -1402,7 +1429,7 @@
 <tbody>
 <tr><td><code>Ctrl-H</code></td><td>Focus explorer tree</td></tr>
 <tr><td><code>Other keys</code></td><td>Go to the file viewer</td></tr>
-<tr><td><code>Esc / q</code></td><td>Close explorer</td></tr>
+<tr><td><code>Space e</code></td><td>Close explorer (viewer normal mode)</td></tr>
 </tbody>
 </table>
 </div>
@@ -1414,6 +1441,7 @@
 <tr><td><code>q, Space q</code></td><td>Close viewer (normal mode)</td></tr>
 <tr><td><code>Space m</code></td><td>Toggle markdown preview</td></tr>
 <tr><td><code>Space Space</code></td><td>Open telescope file picker</td></tr>
+<tr><td><code>Space e</code></td><td>Toggle the file explorer</td></tr>
 <tr><td><code>Ctrl-S</code></td><td>Save file</td></tr>
 <tr><td><code>:</code></td><td>Command mode (:w, :wq, :q, :q!, :e!, :N)</td></tr>
 <tr><td><code>/ / ?</code></td><td>Search forward / backward</td></tr>
@@ -1435,7 +1463,8 @@
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
 <tr><td><code>Type, Backspace</code></td><td>Filter files</td></tr>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
+<tr><td><code>Ctrl-U</code></td><td>Clear query</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
 <tr><td><code>Enter</code></td><td>Open file in viewer</td></tr>
 <tr><td><code>Esc</code></td><td>Close telescope</td></tr>
 <tr><td><code>Space o</code></td><td>Close and open a TaskRabbit session prompt</td></tr>
@@ -2143,6 +2172,9 @@
 <tr><td>Source-worktree settlement: authorization</td><td>A confirmation sub-mode of the settlement browser with its own key handling.</td><td>keybindings.md § Source-Worktree Settlement Authorization</td></tr>
 <tr><td>Graph review: info dashboard focused</td><td>The dashboard panel owns keys while focused, separate from graph editing.</td><td>keybindings.md § Graph Review Overlay (<code>&lt;Space&gt;v</code> or <code>:graph</code>)</td></tr>
 <tr><td>Satellite registry browser</td><td>The browser owns its peer, link and cached session keys.</td><td>keybindings.md § Satellite Registry Browser</td></tr>
+<tr><td>Remote settings</td><td>The page owns its enable, device and project keys.</td><td>keybindings.md § Remote Settings</td></tr>
+<tr><td>Manager tree (:manager tree)</td><td>The read-only tree owns its fold, paging and jump keys.</td><td>keybindings.md § Manager Tree</td></tr>
+<tr><td>Legacy scratch adoption</td><td>The browser owns its select, adopt and refresh keys.</td><td>keybindings.md § Legacy Scratch Adoption</td></tr>
 </tbody>
 </table>
 </div>

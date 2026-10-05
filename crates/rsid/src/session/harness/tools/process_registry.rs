@@ -200,7 +200,7 @@ impl ProcessWakeController for ScheduledProcessWakeController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::tests::make_test_session;
+    use rsid_store::test_support::make_test_session;
 
     fn process_wake(session_id: Uuid) -> ScheduledJob {
         let now = chrono::Utc::now();

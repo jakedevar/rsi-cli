@@ -303,6 +303,47 @@ pub struct HarnessManagerConfigV1 {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What a scope save did to the saved manager policy (#1145). Authority never
+/// follows a changed scope by side effect: an identical save leaves the policy
+/// untouched, any other save leaves the previous policy as an unconfirmed
+/// draft that only an explicit policy save re-grants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessManagerPolicyOutcomeKindV1 {
+    /// No saved policy existed; nothing to carry or revoke.
+    #[default]
+    NoPolicy,
+    /// Identical project, seat and scope: nothing changed, the grant stands.
+    Unchanged,
+    /// The scope changed: the grant is revoked and no capability was carried.
+    /// The previous values stay as the draft the operator must re-save.
+    RevokedNeedsConfirmation,
+}
+
+/// Additive outcome of a scope save, for the operator surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessManagerPolicyOutcomeV1 {
+    #[serde(default)]
+    pub kind: HarnessManagerPolicyOutcomeKindV1,
+    /// Capabilities of the previous saved policy (granted only if `Unchanged`).
+    #[serde(default)]
+    pub capability_count: usize,
+    /// Paused Epics the previous policy holds; they stay paused in the draft,
+    /// even across removing and re-adding the Epic.
+    #[serde(default)]
+    pub paused_epic_ids: Vec<Uuid>,
+}
+
+/// `ConfigureHarnessManager` result: the config plus the policy outcome.
+/// Flattened, so older clients still read a plain config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureHarnessManagerResultV1 {
+    #[serde(flatten)]
+    pub config: HarnessManagerConfigV1,
+    #[serde(default)]
+    pub policy: HarnessManagerPolicyOutcomeV1,
+}
+
 impl HarnessManagerConfigV1 {
     pub fn explicit_epic_ids(&self) -> &[Uuid] {
         self.selected_epic_ids.as_deref().unwrap_or(&self.epic_ids)
@@ -963,5 +1004,47 @@ mod tests {
             expected_row_version: 0,
         };
         assert_eq!(config.validate(), Err("manager_duplicate_epic"));
+    }
+
+    #[test]
+    fn scope_save_result_is_a_config_with_an_additive_policy_outcome() {
+        let config = HarnessManagerConfigV1 {
+            project_id: Uuid::new_v4(),
+            manager_session_id: Uuid::new_v4(),
+            current_session_id: None,
+            epic_ids: Vec::new(),
+            scope_mode: HarnessManagerScopeModeV1::Selected,
+            selected_epic_ids: None,
+            group_ids: Vec::new(),
+            row_version: 2,
+            updated_at: chrono::Utc::now(),
+        };
+        // A legacy daemon's bare config reads as "no policy outcome".
+        let legacy = serde_json::to_value(&config).unwrap();
+        let read: ConfigureHarnessManagerResultV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(read.config, config);
+        assert_eq!(
+            read.policy.kind,
+            HarnessManagerPolicyOutcomeKindV1::NoPolicy
+        );
+        // A new result still reads as a plain config for older clients.
+        let result = ConfigureHarnessManagerResultV1 {
+            config: config.clone(),
+            policy: HarnessManagerPolicyOutcomeV1 {
+                kind: HarnessManagerPolicyOutcomeKindV1::RevokedNeedsConfirmation,
+                capability_count: 2,
+                paused_epic_ids: vec![Uuid::new_v4()],
+            },
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["policy"]["kind"], "revoked_needs_confirmation");
+        assert_eq!(
+            serde_json::from_value::<HarnessManagerConfigV1>(wire.clone()).unwrap(),
+            config
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigureHarnessManagerResultV1>(wire).unwrap(),
+            result
+        );
     }
 }

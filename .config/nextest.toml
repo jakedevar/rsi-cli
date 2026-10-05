@@ -13,7 +13,7 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 # refused whole landing gates on load alone, so they get a bounded 600 s.
 # Default-profile overrides also apply to every profile that inherits it.
 [[profile.default.overrides]]
-filter = 'package(rsid) & test(/^store::tests::(h1_|d05_)/)'
+filter = 'package(rsid-store) & test(/^store::tests::(h1_|d05_)/)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [profile.rsid-fast]

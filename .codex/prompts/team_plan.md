@@ -96,7 +96,7 @@ Typical domain breakdown for this codebase:
 | Domain | Scope | Typical model |
 |---|---|---|
 | Shared types / RPC protocol | `crates/rsi-common/` | `opus` — type changes are foundational |
-| Database / store | `crates/rsid/src/store.rs`, migrations | `opus` — schema changes are foundational |
+| Database / store | `crates/rsid-store/src/store.rs`, migrations | `opus` — schema changes are foundational |
 | Daemon session logic | `session.rs`, `monitor.rs`, provider files | `sonnet` |
 | Daemon RPC handlers | `rpc.rs` | `sonnet` |
 | TUI action dispatch | `action_handler/`, `modalkit_types.rs`, `keybindings.rs` | `sonnet` |

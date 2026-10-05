@@ -335,3 +335,115 @@ new candidates, verify the journaled identity again, persist `Deleting` before
 bounded deletion, and retain the terminal event only after durable namespace
 absence. Invalid, symlinked, identity-drifted, mounted, or foreign-device queue
 entries remain untouched for diagnosis.
+
+## Agent scratch outside sandboxes (#999, #932, #1140)
+
+Agents, reviewers, tests and landers leave temp trees under `/var/tmp`, worker
+`TMPDIR`s under `~/.cache/rsi-*-tmp`, and lander workspaces
+(`rsi-rolling-land-*`) under the queue's cargo target or a repository's
+`worktrees/<sandbox>` admin directory. The daemon reclaims them hourly (first
+pass ten minutes after start) and each lander sweeps its own parent at startup,
+with a fixed policy and no setting. **Deletion is ON** (#1150 re-enabled it:
+the daemon pass is `run_and_log(false, "periodic")` in `crates/rsid/src/main.rs`
+and the lander startup sweep is `LANDER_STARTUP_SWEEP_ENABLED = true` in
+`crates/rsid/src/bin/rsi-rolling-land.rs`); allocation and recording stay on so
+new scratch is registered. The rule is **when unsure, retain**:
+a top-level directory is deleted only when all of these hold.
+
+- **RSI allocated it.** Creating a scratch directory registers it in the
+  private registry `~/.rsi/scratch-registry` (mode 0700): an entry binding its
+  kind, owner, device, inode, filesystem birth time (to the nanosecond) and parent
+  directory. The
+  directory's `.rsi-scratch-record` names that entry by nonce. Allocation
+  (`create_scratch_dir`, `register_lander_owner`, `scripts/rsi-scratch-mkdir`)
+  only accepts a fresh, empty directory made just now; no agent or script can
+  adopt an existing directory. Worker `TMPDIR`s are made with
+  `scripts/rsi-scratch-mkdir worker NAME` for that reason. The one exception is
+  the operator action below (#1147). A copied tree, a tree moved to another root, a record
+  replayed after inode reuse, a synthesized record, a legacy or hand-made
+  directory, or a filesystem with no birth time never binds and is retained
+  (`kept_unrecorded`). Trust boundary: the registry is writable only by the
+  daemon user, so this defends against accidents and everything but a process
+  running as that user that sets out to forge it.
+- **It is where we think it is.** The root is opened one component at a time
+  with `O_NOFOLLOW`; every ancestor is owned by root or the daemon user and
+  closed to group and other writes (or sticky); a symlink or an open ancestor
+  refuses the root (`refused_roots`). The candidate is on the root's device and
+  `statx` mount, with no mount at or under it per `/proc/self/mountinfo`,
+  including same-device binds; a kernel that cannot report mount ids, or a mount
+  table this reader does not wholly understand, retains. Identity is checked
+  after enumeration and after the rename-aside, and the removal works
+  descriptor-relative.
+- **It is old, or its owner is gone.** Nothing under it was written for 72 hours.
+  A lander workspace is reclaimed when its registered owner is gone, read in the
+  PID namespace and boot it was recorded in; an owner from another namespace, or
+  an unreadable or malformed owner file, is ambiguous and kept, and a recorded
+  workspace with no owner file waits an hour.
+- **Nothing holds it.** A complete `/proc` proof of every same-user process and
+  thread (a thread is skipped only when `kcmp` proves it shares cwd/root, exe and
+  mappings, or descriptors with its leader) finds nothing inside it by path or
+  inode: cwd, root, exe, open descriptors and file mappings. An unexplained read
+  error keeps the directory; only the systemd user manager (authenticated by
+  process name and cgroup) is exempt.
+- **No work is lost.** A complete walk (build output, `node_modules` and a
+  repository's own `.git` included; a depth, entry or budget limit means
+  "unproven") finds every git repository below it. Each has a clean tree and no
+  commit, tag, stash or detached HEAD that no remote-tracking ref has
+  (`kept_dirty`, `kept_unpublished`). The one exemption is a lander's exact
+  private clone: the empty `repo/` directory the lander registered by inode
+  before cloning into it, still borrowing objects (`alternates`). Any other
+  repository, even inside a lander workspace, is checked in full.
+- **It did not change.** After the rename the tree is walked again and its
+  per-entry manifest (relative path, inode, type, size, mtime) must equal the
+  proof's, and the holder and git proofs run again on the renamed tree
+  (`kept_changed`).
+
+**Adopting legacy scratch (#1147).** Directories made by hand or by pre-#1140
+binaries (worker `TMPDIR`s, `/var/tmp/rsi-*`, existing lander workspaces) have no
+record and are retained (`kept_unrecorded`). The operator-only RPCs
+`ListLegacyScratch` and `AdoptLegacyScratch` (Settings > Sandbox Storage >
+Legacy scratch adoption; not an agent verb, native tool or CLI-catalog entry)
+list them and record chosen ones. An adoption runs the same proof as a reclaim
+pass with only the provenance step replaced: the root and its ancestors
+authenticate, the final component is a real directory (a symlink is refused)
+with an allowlisted name directly under a configured scratch root on the root's
+mount, nothing holds it (the `/proc` proof covers every thread), it is old
+enough (or its lander owner is gone) and every git repository below it is clean
+and published. The proof then runs a second time from the opened root with a
+fresh process inventory, and the record is written only if that run passes on
+the same directory and tree as the first. A clean repository at the candidate
+root stays clean: its untracked `.rsi-scratch-record` (that exact line, at the
+candidate root only) is excused from the dirtiness check. Writing the record
+bumps the directory's mtime; it is put back (so adoption does not restart the
+age clock) only if the tree afterwards is exactly the proved tree plus the
+record, otherwise the directory is marked written now and waits the full age
+again. **Adoption deletes nothing**: the reclaim pass re-proves everything
+before it deletes, and **deletion is enabled**: an adopted directory that is old
+enough and unheld WILL be deleted automatically. Adopting therefore needs an
+explicit confirmation in the TUI naming every full path. Refusals are
+typed (`outside_roots`, `missing`, `symlink`, `not_directory`, `held`, `young`,
+`dirty_worktree`, `unpublished`, `unproven`, `already_recorded`, `changed`,
+`failed`).
+
+The pass renames the entry aside (`.rsi-reclaiming-<name>-<pid>`), re-proves,
+persists the proved manifest in the registry (outside the tree) and deletes
+only entries the manifest names. An entry that is new, replaced or edited stops
+the deletion and keeps the rest. An interrupted delete resumes from the
+persisted manifest: every survivor must be in it, otherwise the tree is kept,
+and a manifest that exists but cannot be read, is not ours, is group-writable or
+does not parse keeps the tree rather than counting as no manifest. Before each
+directory is unlinked, and before the aside name itself is removed, the name is
+checked to still be the directory that was emptied or proved; a replacement
+observed by that final check is left alone. Limits: this is not protection
+against arbitrary concurrent same-user mutation. A file (or a provenance file)
+renamed onto a checked name between its check and its unlink is unlinked, and a
+directory swapped in between the final check and rmdir is removed only if it is
+empty. Registry pruning is off (#1150): allocation entries are kept, a few
+hundred bytes each.
+One time and entry budget (120 seconds, 32 reclaims, 2 million directory
+entries) is charged as each entry is read, so enumeration, proofs and removal
+are all bounded and a large tree ends as `partial` rather than overrunning.
+`GetHealthStatus` reports `launch_floor` (available bytes, floor, and
+`margin_bytes` above the `sandbox_min_free_gib` launch floor) and
+`agent_scratch_reclaim` (the last pass). Workers should still remove their own
+scratch before they finish.

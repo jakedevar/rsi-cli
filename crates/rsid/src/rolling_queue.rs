@@ -6,10 +6,13 @@
 //! provisional migrations in that order, gates the candidate once with the
 //! union of the members' test filters and publishes it with one fast-forward)
 //! and settles each entry exactly once after verifying its ancestry. A batch
-//! that is not green (red gate, merge conflict, policy refusal) is bisected: the
+//! that is not green (red gate) is bisected: the
 //! first half of the suspect window is gated against the tip it would publish
 //! onto and published when green, narrowed when red, so each failure is
-//! attributed to exactly one source and the innocent sources still publish.
+//! attributed to exactly one source and the innocent sources still publish. An
+//! integration conflict is attributed the same way without a gate: the lander
+//! names the conflicting source, only that entry is refused
+//! (`queue_batch_merge_conflict`) and the batch is re-run without it (#1119).
 //!
 //! Restart reconcile runs once at boot: a `gating` entry whose source is
 //! already an ancestor of `origin/rolling` settles as published; any other is
@@ -22,8 +25,9 @@ use crate::store::Store;
 use chrono::Utc;
 use rsi_common::rolling_queue::{
     QUEUE_BATCH_ANCESTRY_UNVERIFIED, QUEUE_BATCH_MERGE_CONFLICT, QUEUE_BATCH_POLICY_REFUSED,
-    QUEUE_BISECT_NO_PROGRESS, QUEUE_MIGRATION_OUT_OF_ORDER, QUEUE_REGATE_EXHAUSTED,
-    ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState, RollingQueueEntryV1, RollingQueueOutcome,
+    QUEUE_BISECT_NO_PROGRESS, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_MIGRATION_OUT_OF_ORDER,
+    QUEUE_REGATE_EXHAUSTED, ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState,
+    RollingQueueEntryV1, RollingQueueOutcome,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -45,10 +49,18 @@ const MAX_REGATES: usize = 1;
 const EXACT_GATE_ENV: &str = "RSI_LANDER_EXACT_GATE";
 const OUTCOME_TAIL_BYTES: usize = 2000;
 const MAX_FAILING_TESTS: usize = 32;
+/// Per-run lander logs (#1135): each stream keeps its newest bytes, and only the
+/// newest files stay in the log directory.
+const RUN_LOG_STREAM_BYTES: usize = 1 << 20;
+const RUN_LOG_KEEP_FILES: usize = 40;
+/// Failing tests named in an event's cause (the log has the rest).
+const CAUSE_TESTS: usize = 5;
 
 /// Files that many concurrent sources touch. Informational only: the queue
 /// never waits on, claims or seals them (operator directive 2026-09-29).
 const HOT_FILES: &[&str] = &[
+    "crates/rsid-store/src/config.rs",
+    // Before the #1021 S4 crate split (stale sources still touch it).
     "crates/rsid/src/config.rs",
     "crates/rsi-common/src/rpc.rs",
     "crates/rsi-common/src/agent_control_schema.rs",
@@ -58,12 +70,18 @@ const HOT_FILES: &[&str] = &[
 ];
 /// Each schema version is its own file (`vNNN.rs`) here; the head is the
 /// highest one, so adding a migration never edits a shared file.
-const MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
+const MIGRATION_DIR: &str = "crates/rsid-store/src/store/migrations";
+/// The layout before the #1021 S4 crate split (the store lived in `crates/rsid`):
+/// a rolling base or a stale source cut before it is still read.
+const PRE_SPLIT_MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
 /// A source that declares a provisional migration is renumbered by the lander
 /// at landing, so its number is assigned in queue order.
 const PROVISIONAL_DIR: &str = "tools/provisional-migrations/";
 /// Older revisions declared the head as a constant in this file.
-const LEGACY_MIGRATION_FILE: &str = "crates/rsid/src/store/mod.rs";
+const LEGACY_MIGRATION_FILES: [&str; 2] = [
+    "crates/rsid-store/src/store/mod.rs",
+    "crates/rsid/src/store/mod.rs",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SourceFacts {
@@ -71,8 +89,61 @@ pub(crate) struct SourceFacts {
     pub hot_files: Vec<String>,
 }
 
+/// Environment an UNFENCED queue git inherits from the daemon: locale, the
+/// user's identity and home, and the transport settings a fetch needs. Every
+/// other name (above all `GIT_TRACE*`, which git opens for append wherever it
+/// points, and the `GIT_*` knobs that reconfigure it) is dropped (#1160).
+fn inherited_git_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const KEEP: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_TERMINAL_PROMPT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+    ];
+    vars.into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            KEEP.contains(&name.as_ref()) || name.starts_with("LC_")
+        })
+        .collect()
+}
+
+/// A `git` command with the daemon's environment reduced to the allowlist.
+fn git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .env_clear()
+        .envs(inherited_git_env(std::env::vars_os()));
+    command
+}
+
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -90,30 +161,196 @@ pub(crate) fn source_commit_exists(repo: &Path, source: &str) -> bool {
     git(repo, &["cat-file", "-e", &format!("{source}^{{commit}}")]).is_some()
 }
 
+/// Exit status of `git grep` run in `repo`: `Some(true)` on a match,
+/// `Some(false)` on none, `None` when git itself failed.
+fn git_grep_hits(repo: &Path, args: &[&str]) -> Option<(bool, String)> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo)
+        .arg("grep")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some((true, String::from_utf8_lossy(&output.stdout).into_owned())),
+        Some(1) => Some((false, String::new())),
+        _ => None,
+    }
+}
+
+/// First test filter in `filters` that provably selects no test at `commit`
+/// (#1129), or `None`. A cheap static necessary condition, never a refusal on
+/// doubt: every `::`-separated segment of the filter's test-name pattern must
+/// occur in the source of the package (for `rsid=shard:S:test(N)`, of the
+/// files carrying shard S's gate). Forms the check cannot reason about
+/// (`bin:`/`test:` targets, filtersets other than `test(...)`) are accepted.
+pub(crate) fn filter_selecting_no_tests(
+    repo: &Path,
+    commit: &str,
+    filters: &[String],
+) -> Option<String> {
+    filters
+        .iter()
+        .find(|filter| filter_provably_empty(repo, commit, filter))
+        .cloned()
+}
+
+fn filter_provably_empty(repo: &Path, commit: &str, filter: &str) -> bool {
+    let Some((package, value)) = filter.split_once('=') else {
+        return false;
+    };
+    let (shard, pattern) = match value.strip_prefix("shard:") {
+        Some(rest) => match rest.split_once(':') {
+            Some((shard, filterset)) => match filterset
+                .strip_prefix("test(")
+                .and_then(|inner| inner.strip_suffix(')'))
+            {
+                Some(name) => (Some(shard), name),
+                None => return false,
+            },
+            // A whole shard always has tests.
+            None => return false,
+        },
+        None => (None, value),
+    };
+    if pattern.is_empty()
+        || pattern.starts_with("bin:")
+        || pattern.starts_with("test:")
+        || !pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+    {
+        return false;
+    }
+    let dir = format!("crates/{package}");
+    // A tree without the package (a fixture, a foreign repo) cannot be reasoned about.
+    if git(repo, &["ls-tree", "--name-only", commit, &dir]).is_none_or(|out| out.trim().is_empty())
+    {
+        return false;
+    }
+    let mut scope: Vec<String> = vec![dir.clone()];
+    let mut package_dirs: Vec<String> = vec![dir];
+    if let Some(shard) = shard {
+        // A shard spans every package that declares its feature (rsid and
+        // rsid-store since the #1021 S4 crate split), so the gate lookup covers
+        // all of them at this commit; with no manifest declaring it (a fixture,
+        // an older layout) it stays in the named package.
+        let declaring = shard_declaring_package_dirs(repo, commit, shard);
+        let search_dirs = if declaring.is_empty() {
+            scope.clone()
+        } else {
+            declaring
+        };
+        let gate = format!("test-shard-{shard}\"");
+        let mut grep_args = vec!["-l", "-F", "-e", &gate, commit, "--"];
+        grep_args.extend(search_dirs.iter().map(String::as_str));
+        let Some((hit, listing)) = git_grep_hits(repo, &grep_args) else {
+            return false;
+        };
+        if !hit {
+            return true;
+        }
+        scope = listing
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(_, path)| path.to_string()))
+            .collect();
+        package_dirs = search_dirs;
+    }
+    pattern
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment_provably_absent(repo, commit, segment, &scope, &package_dirs))
+}
+
+/// Whether the test-name `segment` provably names nothing at `commit` (#1169).
+/// A nextest test path is `<module path>::<fn>`: a segment is present when it
+/// occurs in the text of a gated file in `scope`, or names a module the way
+/// the file tree does (a path component or stem of a `scope` file:
+/// `thread_stacks.rs` carries `thread_stacks::tests::...` without ever
+/// spelling the name), or is declared `mod <segment>` anywhere in
+/// `package_dirs` (a `#[path]`/inline module). Git failing is not a miss.
+fn segment_provably_absent(
+    repo: &Path,
+    commit: &str,
+    segment: &str,
+    scope: &[String],
+    package_dirs: &[String],
+) -> bool {
+    let mut args = vec!["-q", "-F", "-e", segment, commit, "--"];
+    args.extend(scope.iter().map(String::as_str));
+    if !matches!(git_grep_hits(repo, &args), Some((false, _))) {
+        return false;
+    }
+    let names_a_module = |path: &str| {
+        path.split('/')
+            .any(|component| component.strip_suffix(".rs").unwrap_or(component) == segment)
+    };
+    if scope.iter().any(|path| names_a_module(path)) {
+        return false;
+    }
+    let declaration = format!(r"\bmod[[:space:]]+{segment}\b");
+    let mut args = vec!["-q", "-E", "-e", declaration.as_str(), commit, "--"];
+    args.extend(package_dirs.iter().map(String::as_str));
+    matches!(git_grep_hits(repo, &args), Some((false, _)))
+}
+
+/// `crates/<package>` for every workspace package whose manifest at `commit`
+/// declares the `test-shard-<shard>` feature (empty when none does).
+fn shard_declaring_package_dirs(repo: &Path, commit: &str, shard: &str) -> Vec<String> {
+    let declaration = format!("test-shard-{shard} = ");
+    let Some((true, listing)) = git_grep_hits(
+        repo,
+        &[
+            "-l",
+            "-F",
+            "-e",
+            &declaration,
+            commit,
+            "--",
+            ":(glob)crates/*/Cargo.toml",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<String> = listing
+        .lines()
+        .filter_map(|line| {
+            let (_, path) = line.split_once(':')?;
+            Some(path.strip_suffix("/Cargo.toml")?.to_string())
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// The schema head at `revision`: the highest `migrations/vNNN.rs`, else the
 /// legacy constant in `store/mod.rs`.
 fn schema_version_at(repo: &Path, revision: &str) -> Option<u32> {
-    let listing = git(
-        repo,
-        &[
-            "ls-tree",
-            "--name-only",
-            revision,
-            &format!("{MIGRATION_DIR}/"),
-        ],
-    )?;
-    let from_files = listing
-        .lines()
-        .filter_map(|path| {
-            let name = path.rsplit('/').next()?;
-            name.strip_prefix('v')?.strip_suffix(".rs")?.parse().ok()
-        })
-        .max();
-    from_files.or_else(|| {
-        let text = git(
+    // The head comes from the directory the revision's store build consumes:
+    // the rsid-store one when populated, else the pre-split one (#1021 S4). A
+    // unit in the other directory never runs, so it must not count.
+    let head_in = |directory: &str| {
+        git(
             repo,
-            &["show", &format!("{revision}:{LEGACY_MIGRATION_FILE}")],
-        )?;
+            &["ls-tree", "--name-only", revision, &format!("{directory}/")],
+        )
+        .and_then(|listing| {
+            listing
+                .lines()
+                .filter_map(|path| {
+                    let name = path.rsplit('/').next()?;
+                    name.strip_prefix('v')?.strip_suffix(".rs")?.parse().ok()
+                })
+                .max()
+        })
+    };
+    let from_files = head_in(MIGRATION_DIR).or_else(|| head_in(PRE_SPLIT_MIGRATION_DIR));
+    from_files.or_else(|| {
+        let text = LEGACY_MIGRATION_FILES
+            .iter()
+            .find_map(|file| git(repo, &["show", &format!("{revision}:{file}")]))?;
         let marker = "pub const LATEST_SCHEMA_VERSION: i32 = ";
         text.split(marker)
             .nth(1)?
@@ -160,7 +397,7 @@ pub(crate) fn derive_source_facts(repo: &Path, source: &str) -> SourceFacts {
 /// After a fetch, the published tip when `source` is an ancestor of
 /// `origin/rolling`. `None` when it is not (or git cannot say).
 pub(crate) fn landed_tip(repo: &Path, source: &str) -> Option<String> {
-    let _ = git(repo, &["fetch", "--quiet", "origin", "rolling"]);
+    let _ = fetch_rolling(repo);
     let tip = git(repo, &["rev-parse", "--verify", "origin/rolling^{commit}"])?
         .trim()
         .to_string();
@@ -202,6 +439,7 @@ pub(crate) fn published_migration_number(repo: &Path, source: &str) -> Option<u3
             &commit,
             "--",
             &format!("{MIGRATION_DIR}/"),
+            &format!("{PRE_SPLIT_MIGRATION_DIR}/"),
         ],
     )?;
     added
@@ -280,12 +518,43 @@ pub(crate) fn plan_migration_order(tip_version: u32, members: &[MigrationMember]
 #[derive(Debug, Clone)]
 pub struct LanderLauncher {
     binary: PathBuf,
+    /// The daemon-owned queue directory (`~/.rsi/queue`): the persistent cargo
+    /// target and the detached landing worktrees live under it (#1108). `None`
+    /// runs the lander in the entry's own checkout with the daemon's env.
+    workspace: Option<PathBuf>,
+    /// How the host's Landlock ABI is read before the queue worktree is reset;
+    /// replaced only by tests.
+    fence_abi: write_fence::AbiProbe,
 }
 
 impl LanderLauncher {
     #[must_use]
     pub fn new(binary: PathBuf) -> Self {
-        Self { binary }
+        Self {
+            binary,
+            workspace: None,
+            fence_abi: WriteFence::kernel_abi,
+        }
+    }
+
+    /// Run landings in daemon-owned worktrees and a dedicated cargo target
+    /// under `root`, never in the entry's checkout (#1108).
+    #[must_use]
+    pub fn with_workspace(mut self, root: PathBuf) -> Self {
+        self.workspace = Some(root);
+        self
+    }
+
+    /// The persistent cargo target the lander is given, when workspace-owned.
+    #[must_use]
+    pub fn target_dir(&self) -> Option<PathBuf> {
+        self.workspace.as_ref().map(|root| root.join("target"))
+    }
+
+    /// Where each lander run's stdout and stderr are kept, when workspace-owned.
+    #[must_use]
+    pub fn log_dir(&self) -> Option<PathBuf> {
+        self.workspace.as_ref().map(|root| root.join("logs"))
     }
 
     /// The lander executable this launcher runs.
@@ -295,9 +564,13 @@ impl LanderLauncher {
     }
 
     /// `RSI_ROLLING_LAND_BIN`, the daemon's sibling binary, the shared debug
-    /// build, then `PATH`.
+    /// build, then `PATH`; always with the daemon-owned queue workspace.
     #[must_use]
     pub fn discover() -> Self {
+        Self::discover_binary().with_workspace(rsi_common::identity::data_dir().join("queue"))
+    }
+
+    fn discover_binary() -> Self {
         if let Some(path) = std::env::var_os("RSI_ROLLING_LAND_BIN") {
             return Self::new(PathBuf::from(path));
         }
@@ -312,6 +585,677 @@ impl LanderLauncher {
             .map(|home| PathBuf::from(home).join(".cargo/shared-target/debug/rsi-rolling-land"))
             .filter(|path| path.is_file());
         Self::new(shared.unwrap_or_else(|| PathBuf::from("rsi-rolling-land")))
+    }
+}
+
+/// FNV-1a: a stable, dependency-free key for a repository's git directory.
+fn stable_key(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn git_ok(repo: &Path, args: &[&str]) -> std::result::Result<String, String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot run git: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// The queue's one fetch of the source repository's `origin/rolling`.
+///
+/// The source (an operator checkout or a session sandbox) is only read by the
+/// queue, but a fetch necessarily writes its object store and its
+/// `refs/remotes/origin/rolling`. It is NOT run under the write fence (#1170):
+/// the transport children (`ssh`, credential helpers, `git-remote-https`) write
+/// their own state (`known_hosts`, control sockets, credential caches) and
+/// inherit a fence, and a ref update needs the `packed-refs` lock in the common
+/// directory root, which a directory grant cannot give without also granting
+/// `config` and `hooks`. A read-only copy (fetching into a private directory
+/// with the source's objects as an alternate) would leave the fetched commits
+/// out of the shared store the lander and the queue worktree read, so it is not
+/// done either. What is done instead is to remove every way the SOURCE's own
+/// configuration can make this fetch run a program or write elsewhere:
+/// hooks (`reference-transaction`, `pre-auto-gc`), `fsmonitor`, automatic
+/// `gc`/maintenance (which can repack the operator's store in the background)
+/// and the commit-graph, submodule recursion, tag following, `FETCH_HEAD` (no
+/// reader needs it: the tip is read from `origin/rolling`) and the `ext::`
+/// transport are all off on the command line, which wins over every config
+/// file. The daemon's environment is already reduced to the allowlist. The
+/// source's transport settings (`core.sshCommand`, `core.gitProxy`,
+/// `remote.origin.uploadpack`, credential helpers, `url.*.insteadOf`) are left
+/// alone on purpose: they carry the operator's authentication (see
+/// `write_fence.rs` for the full trade-off).
+const FETCH_ROLLING: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "fetch.writeCommitGraph=false",
+    "-c",
+    "fetch.recurseSubmodules=false",
+    "-c",
+    "protocol.ext.allow=never",
+    "fetch",
+    "--quiet",
+    "--no-write-fetch-head",
+    "--no-recurse-submodules",
+    "--no-auto-maintenance",
+    "--no-auto-gc",
+    "--no-tags",
+    "origin",
+    "rolling",
+];
+
+fn fetch_rolling(repo: &Path) -> std::result::Result<String, String> {
+    git_ok(repo, FETCH_ROLLING)
+}
+
+/// The daemon-owned landing worktree for the repository `source` belongs to: a
+/// detached checkout of the fetched `origin/rolling`, created once and
+/// refreshed on every call so builds stay warm. `source` (an operator checkout
+/// or a session sandbox) is only read: the worktree shares its object store and
+/// remotes, so any accepted source commit is reachable here, but no file in
+/// `source` is ever touched. Callers serialize use (the queue runs one batch at
+/// a time).
+pub(crate) fn ensure_queue_worktree(
+    root: &Path,
+    source: &Path,
+) -> std::result::Result<PathBuf, String> {
+    ensure_queue_worktree_with(root, source, WriteFence::kernel_abi)
+}
+
+/// [`ensure_queue_worktree`] with the Landlock ABI probe injected (tests).
+fn ensure_queue_worktree_with(
+    root: &Path,
+    source: &Path,
+    fence_abi: write_fence::AbiProbe,
+) -> std::result::Result<PathBuf, String> {
+    let common = git_ok(
+        source,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    // Fail closed before any git command runs in (or deletes) a queue path:
+    // the workspace, its worktrees directory and the worktree are real,
+    // owned directories, never symlinks or aliases (#1113).
+    prepare_queue_workspace(root)?;
+    // The fence guards every reset; a host that cannot enforce it is refused
+    // before any worktree is created or touched (#1160).
+    write_fence::require_abi(fence_abi())?;
+    let path = root.join("worktrees").join(stable_key(&common));
+    let rolling = match fetch_rolling(source) {
+        Ok(_) => "origin/rolling^{commit}",
+        // Offline or no remote: the lander reports the real error; keep the
+        // last fetched tip (or the source HEAD) so the worktree still exists.
+        Err(_) => "HEAD",
+    };
+    let rev = match git_ok(source, &["rev-parse", "--verify", rolling]) {
+        Ok(rev) => rev,
+        Err(_) => git_ok(source, &["rev-parse", "--verify", "HEAD"])?,
+    };
+    if path.symlink_metadata().is_ok() {
+        match pin_queue_worktree(root, &path, &common) {
+            Ok(mut pinned) => {
+                pinned.fence_abi = fence_abi;
+                reset_pinned_worktree(&pinned, &rev)?;
+                return Ok(path);
+            }
+            // An empty directory (a crashed `worktree add`) is safe to
+            // retire; anything else is refused with nothing touched.
+            Err(refusal) => remove_empty_queue_dir(root, &path).map_err(|_| refusal)?,
+        }
+    }
+    // `git worktree add` registers by path (R1 residual of #1170, see
+    // `write_fence.rs`); it runs with hooks, fsmonitor and attributes off on
+    // the command line and checks nothing out, and the population below is the
+    // fenced, pinned runner.
+    let _ = git_ok(source, &["worktree", "prune"]);
+    create_queue_registration(source, &path, &rev)?;
+    // The registration exists but nothing is checked out: populate it exactly
+    // like every later reset, through the pinned, fenced runner (#1160).
+    let mut pinned = pin_queue_worktree(root, &path, &common)?;
+    pinned.fence_abi = fence_abi;
+    reset_pinned_worktree(&pinned, &rev)?;
+    Ok(path)
+}
+
+/// Register a detached worktree at `path` without checking anything out: git
+/// then creates only the registration and the `.git` pointer, and runs no
+/// checkout, hook or filter. The hook and filter settings are also disabled on
+/// the command line, so nothing the repository configures can run here.
+fn create_queue_registration(
+    source: &Path,
+    path: &Path,
+    rev: &str,
+) -> std::result::Result<(), String> {
+    let path_arg = path.display().to_string();
+    git_ok(
+        source,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "worktree",
+            "add",
+            "--quiet",
+            "--no-checkout",
+            "--detach",
+            "--force",
+            &path_arg,
+            rev,
+        ],
+    )
+    .map(drop)
+}
+
+/// Retire an empty queue slot without trusting any path: open the vetted
+/// `worktrees` directory without following symlinks, check the slot through
+/// that handle (`fstatat`, no-follow) and remove it with `unlinkat` relative to
+/// the same handle. `AT_REMOVEDIR` never removes a symlink or a non-empty
+/// directory, so a swap of the slot or of `worktrees` after the check cannot
+/// redirect the removal (#1141).
+fn remove_empty_queue_dir(root: &Path, path: &Path) -> std::result::Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let refuse = |why: &str| {
+        Err(format!(
+            "cannot retire queue slot {}: {why}",
+            path.display()
+        ))
+    };
+    let Some(name) = path.file_name() else {
+        return refuse("no file name");
+    };
+    let parent_path = root.join("worktrees");
+    if path.parent() != Some(parent_path.as_path()) {
+        return refuse("not directly inside the worktrees directory");
+    }
+    let parent = open_queue_dir(&parent_path)?;
+    let parent_meta = parent
+        .metadata()
+        .map_err(|error| format!("cannot stat {}: {error}", parent_path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    let uid = unsafe { nix::libc::geteuid() };
+    if parent_meta.uid() != uid {
+        return refuse("the worktrees directory is not owned by the daemon user");
+    }
+    let real_parent = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", parent_path.display()))?;
+    let real_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
+    if real_parent != real_root.join("worktrees") {
+        return refuse("the worktrees directory is not the queue's");
+    }
+    let name = CString::new(name.as_bytes()).map_err(|_| "slot name has a NUL".to_string())?;
+    // SAFETY: `stat` is plain old data, `name` is NUL-terminated and the parent
+    // handle stays open for both calls.
+    let removed = unsafe {
+        let mut stat: nix::libc::stat = std::mem::zeroed();
+        if nix::libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            nix::libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+        {
+            return refuse("the slot is unreadable");
+        }
+        if stat.st_mode & nix::libc::S_IFMT != nix::libc::S_IFDIR || stat.st_uid != uid {
+            return refuse("the slot is not an owned directory");
+        }
+        nix::libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), nix::libc::AT_REMOVEDIR)
+    };
+    if removed != 0 {
+        return refuse(&std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// `path` is a real directory (no-follow metadata) owned by this process.
+fn vet_queue_dir(path: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = path
+        .symlink_metadata()
+        .map_err(|error| format!("queue path {} unreadable: {error}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "queue path {} is a symlink or not a directory; refusing to use it",
+            path.display()
+        ));
+    }
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    let uid = unsafe { nix::libc::geteuid() };
+    if meta.uid() != uid {
+        return Err(format!(
+            "queue path {} is not owned by the daemon user; refusing to use it",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Create (when absent) and vet the queue workspace: the root, its `worktrees`
+/// directory and its `target` directory. Parents of the root belong to the
+/// daemon's data directory and are not inspected.
+pub(crate) fn prepare_queue_workspace(root: &Path) -> std::result::Result<(), String> {
+    if root.symlink_metadata().is_err() {
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("cannot create the queue workspace: {error}"))?;
+    }
+    vet_queue_dir(root)?;
+    for name in ["worktrees", "target"] {
+        let child = root.join(name);
+        if child.symlink_metadata().is_err() {
+            std::fs::create_dir(&child)
+                .map_err(|error| format!("cannot create the queue workspace: {error}"))?;
+        }
+        vet_queue_dir(&child)?;
+    }
+    Ok(())
+}
+
+mod private_git_dir;
+mod write_fence;
+use private_git_dir::PrivateGitDir;
+use write_fence::WriteFence;
+
+/// A queue worktree validated once and then held by open directory handles.
+/// Destructive git commands run from the handles, never from mutable paths, so a
+/// slot or a registration swapped for a symlink after validation cannot
+/// redirect them (#1126, #1141).
+pub(crate) struct PinnedWorktree {
+    dir: std::fs::File,
+    /// The worktree registration (`<common>/worktrees/<name>`) opened without
+    /// following a symlink. Git is pointed at the handle (`GIT_DIR=/proc/self/fd/N`),
+    /// so the registration is never resolved by path again.
+    admin_dir: std::fs::File,
+    /// Where the registration was validated; the path is only used to detect a
+    /// swap, never to run git.
+    admin: PathBuf,
+    admin_id: (u64, u64),
+    /// The shared object store (`<common>/objects`), read by the private git
+    /// directory's git through `GIT_OBJECT_DIRECTORY`.
+    objects: PathBuf,
+    /// How the kernel's Landlock ABI is read; replaced only by tests.
+    fence_abi: write_fence::AbiProbe,
+    /// The environment the fenced git is filtered from instead of the daemon's
+    /// own (`None` in production); tests use it to prove an inherited
+    /// `GIT_TRACE` is never honored.
+    inherited_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+}
+
+impl PinnedWorktree {
+    /// `/proc/self/fd/N` names the pinned inode, not whatever `path` now is.
+    fn handle_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd()))
+    }
+
+    fn admin_handle_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.admin_dir.as_raw_fd()))
+    }
+
+    /// The registration path still names the pinned inode: same device and
+    /// inode, not a symlink, not moved. Fail closed otherwise.
+    fn ensure_admin_unchanged(&self) -> std::result::Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let swapped = |why: &str| {
+            Err(format!(
+                "queue worktree registration {} changed under the queue ({why}); refusing to run git",
+                self.admin.display()
+            ))
+        };
+        let Ok(meta) = self.admin.symlink_metadata() else {
+            return swapped("missing");
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return swapped("symlink or not a directory");
+        }
+        if (meta.dev(), meta.ino()) != self.admin_id {
+            return swapped("identity changed");
+        }
+        match self.admin_handle_path().canonicalize() {
+            Ok(real) if real == self.admin => Ok(()),
+            _ => swapped("moved"),
+        }
+    }
+}
+
+/// Open `path` as a directory without following a final symlink.
+fn open_queue_dir(path: &Path) -> std::result::Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "queue path {} is a symlink or not a directory ({error}); refusing to use it",
+                path.display()
+            )
+        })
+}
+
+/// `path` is a worktree this queue created: a real owned directory inside the
+/// workspace whose `.git` file points at a registered worktree of `common`,
+/// and whose registration points back at `path`. Every check runs against one
+/// no-follow directory handle, which is returned so the caller keeps using
+/// exactly the inode that was validated.
+fn pin_queue_worktree(
+    root: &Path,
+    path: &Path,
+    common: &str,
+) -> std::result::Result<PinnedWorktree, String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = open_queue_dir(path)?;
+    let meta = dir
+        .metadata()
+        .map_err(|error| format!("queue path {} unreadable: {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    if meta.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(format!(
+            "queue path {} is not owned by the daemon user; refusing to use it",
+            path.display()
+        ));
+    }
+    let handle = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+    };
+    let refuse = |why: &str| {
+        Err(format!(
+            "queue worktree {} is not a registered worktree of this queue ({why}); refusing to reset it",
+            path.display()
+        ))
+    };
+    // The handle resolves to the pinned inode's real location.
+    let real = handle
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    let real_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
+    if !real.starts_with(real_root.join("worktrees")) {
+        return refuse("outside the queue workspace");
+    }
+    let dot_git = handle.join(".git");
+    match dot_git.symlink_metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return refuse("no regular .git file"),
+    }
+    let pointer = std::fs::read_to_string(&dot_git)
+        .map_err(|error| format!("cannot read {}: {error}", dot_git.display()))?;
+    let Some(admin) = pointer.trim().strip_prefix("gitdir:").map(str::trim) else {
+        return refuse("malformed .git file");
+    };
+    // Pin the registration itself: opened without following a final symlink,
+    // then every check below reads through the handle, so a swap of the
+    // registration path after this point cannot change what is validated or
+    // what git later uses.
+    let Ok(admin_dir) = open_queue_dir(Path::new(admin)) else {
+        return refuse("registration is missing or is a symlink");
+    };
+    let admin_meta = admin_dir.metadata().map_err(|error| {
+        format!(
+            "cannot stat the registration of {}: {error}",
+            path.display()
+        )
+    })?;
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    if admin_meta.uid() != unsafe { nix::libc::geteuid() } {
+        return refuse("registration is not owned by the daemon user");
+    }
+    let admin_handle = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", admin_dir.as_raw_fd()))
+    };
+    let (Ok(admin_real), Ok(common)) = (
+        admin_handle.canonicalize(),
+        Path::new(common).canonicalize(),
+    ) else {
+        return refuse("registration is missing");
+    };
+    if admin_real.parent() != Some(common.join("worktrees").as_path()) {
+        return refuse("gitdir is not a worktree registration of the source repository");
+    }
+    let back = std::fs::read_to_string(admin_handle.join("gitdir")).unwrap_or_default();
+    if Path::new(back.trim()).canonicalize().ok().as_deref() != Some(real.join(".git").as_path()) {
+        return refuse("registration does not point back at the worktree");
+    }
+    let pinned = PinnedWorktree {
+        dir,
+        admin_dir,
+        admin: admin_real,
+        admin_id: (admin_meta.dev(), admin_meta.ino()),
+        objects: common.join("objects"),
+        fence_abi: WriteFence::kernel_abi,
+        inherited_env: None,
+    };
+    pinned.ensure_admin_unchanged()?;
+    Ok(pinned)
+}
+
+/// Run git inside the pinned worktree against the private git directory: the
+/// child's current directory comes from the inherited worktree handle and
+/// `GIT_DIR` names the inherited private-directory handle, so neither the
+/// worktree path nor any registration path is resolved again. The child gets no
+/// operator config, hooks or filters (the private directory has its own config
+/// and no hooks; global and system config are off) and runs under a kernel
+/// write fence that permits writes only beneath those two handles (#1160). The
+/// registration identity is also checked before and after, failing closed on a
+/// swap. `env` is extra environment for the child (tests park git between its
+/// work-tree normalization and its `chdir`).
+fn git_private(
+    pinned: &PinnedWorktree,
+    private: &PrivateGitDir,
+    args: &[&str],
+    env: &[(String, String)],
+) -> std::result::Result<String, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    pinned.ensure_admin_unchanged()?;
+    let fence = WriteFence::new(&[&pinned.dir, &private.dir], pinned.fence_abi)?;
+    let private_fd = private.dir.as_raw_fd();
+    let mut command = std::process::Command::new("git");
+    // A clean environment: only what git needs to start, the inherited names
+    // the test seam names (production inherits none), and what is set below.
+    command.env_clear();
+    let raw = pinned
+        .inherited_env
+        .clone()
+        .unwrap_or_else(|| std::env::vars_os().collect());
+    command.envs(inherited_git_env(raw).into_iter().filter(|(name, _)| {
+        let name = name.to_string_lossy();
+        name == "PATH" || name == "LANG" || name == "TZ" || name.starts_with("LC_")
+    }));
+    // The settings that stop an external program or an append-in-place from
+    // being configured are on the command line, which wins over the private
+    // directory's own config file.
+    command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.logAllRefUpdates=false",
+            "-c",
+            "core.sharedRepository=false",
+        ])
+        .args(args)
+        .current_dir(pinned.handle_path());
+    command
+        .env("HOME", "/dev/null")
+        .env("GIT_DIR", private.handle_path())
+        // Naming the common directory stops git from honoring a `commondir`
+        // file planted in the private directory, which would redirect config,
+        // refs and `info/` to wherever it points; replace refs are ignored for
+        // the same reason (#1170).
+        .env("GIT_COMMON_DIR", private.handle_path())
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_WORK_TREE", ".")
+        .env("GIT_OBJECT_DIRECTORY", &pinned.objects)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .envs(
+            env.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .stdin(Stdio::null());
+    // SAFETY: the closure runs between fork and exec and only calls `fcntl`,
+    // which is async-signal-safe. It lets the child (and git's own children)
+    // inherit the private-directory handle that `GIT_DIR` names; the parent's
+    // copy stays close-on-exec so no unrelated process inherits it.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = nix::libc::fcntl(private_fd, nix::libc::F_GETFD);
+            if flags < 0
+                || nix::libc::fcntl(
+                    private_fd,
+                    nix::libc::F_SETFD,
+                    flags & !nix::libc::FD_CLOEXEC,
+                ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    fence.confine_on_exec(&mut command);
+    let output = command.output().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("cannot run git: {error}"),
+        // `pre_exec` (no-new-privs, `landlock_restrict_self`) or exec failed:
+        // git did not run, and the fence is what could not be applied.
+        _ => format!(
+            "{}: cannot start git under the write fence: {error}",
+            write_fence::UNSUPPORTED_CODE
+        ),
+    })?;
+    pinned.ensure_admin_unchanged()?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    Err(format!(
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Reset the pinned queue worktree to `rev` and drop untracked files.
+///
+/// git never touches the registration: it works in a fresh private git
+/// directory seeded with a copy of the registration's index, and the resulting
+/// `HEAD` and index are published back by exclusive create plus rename relative
+/// to the pinned registration handle. So nothing in the registration, nor any
+/// operator file a link there aliases, is ever written in place.
+fn reset_pinned_worktree(pinned: &PinnedWorktree, rev: &str) -> std::result::Result<(), String> {
+    reset_pinned_worktree_with_env(pinned, rev, &|_| Vec::new(), &|_, _| {})
+}
+
+/// [`reset_pinned_worktree`] with test seams: extra child environment per git
+/// subcommand, and a callback run just before each subcommand with the private
+/// directory's path (tests plant files in it, as a racing same-uid process
+/// would).
+fn reset_pinned_worktree_with_env(
+    pinned: &PinnedWorktree,
+    rev: &str,
+    env_for: &dyn Fn(&str) -> Vec<(String, String)>,
+    before_git: &dyn Fn(&str, &Path),
+) -> std::result::Result<(), String> {
+    pinned.ensure_admin_unchanged()?;
+    private_git_dir::retire_stale_scratch(&pinned.admin_dir);
+    let private = PrivateGitDir::create(&pinned.admin_dir)?;
+    let outcome = reset_in_private_dir(pinned, &private, rev, env_for, before_git);
+    let removed = private.remove(&pinned.admin_dir);
+    outcome?;
+    removed
+}
+
+fn reset_in_private_dir(
+    pinned: &PinnedWorktree,
+    private: &PrivateGitDir,
+    rev: &str,
+    env_for: &dyn Fn(&str) -> Vec<(String, String)>,
+    before_git: &dyn Fn(&str, &Path),
+) -> std::result::Result<(), String> {
+    let run = |args: &[&str]| {
+        before_git(args[0], &private.handle_path());
+        git_private(pinned, private, args, &env_for(args[0]))
+    };
+    let commit = run(&["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
+    // `read-tree` updates the index and the worktree and touches no ref, so no
+    // reflog is ever opened (`reset --hard` would append to `logs/HEAD`).
+    run(&["read-tree", "--reset", "-u", &commit])?;
+    run(&["clean", "--quiet", "-fd"])?;
+    pinned.ensure_admin_unchanged()?;
+    private_git_dir::replace_file_at(&pinned.admin_dir, "index", &private.index()?, 0o644)?;
+    private_git_dir::replace_file_at(
+        &pinned.admin_dir,
+        "HEAD",
+        format!("{commit}\n").as_bytes(),
+        0o644,
+    )
+}
+
+/// The repository checkout a claimed batch runs in: the daemon-owned worktree
+/// when the launcher owns a workspace, else the entry's own checkout.
+async fn queue_repo(
+    launcher: &LanderLauncher,
+    repo_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    let Some(root) = launcher.workspace.clone() else {
+        return Ok(PathBuf::from(repo_path));
+    };
+    let source = PathBuf::from(repo_path);
+    let fence_abi = launcher.fence_abi;
+    tokio::task::spawn_blocking(move || {
+        prepare_queue_workspace(&root)?;
+        ensure_queue_worktree_with(&root, &source, fence_abi)
+    })
+    .await
+    .map_err(|error| format!("queue workspace task: {error}"))?
+}
+
+/// The refusal code a failed queue workspace settles with: a host that cannot
+/// enforce the write fence gets its own typed code (#1160), anything else is
+/// the generic `lander_unavailable`.
+fn workspace_refusal_code(message: &str) -> &'static str {
+    match message.starts_with(write_fence::UNSUPPORTED_CODE) {
+        true => write_fence::UNSUPPORTED_CODE,
+        false => "lander_unavailable",
     }
 }
 
@@ -334,10 +1278,47 @@ pub(crate) fn tail(text: &str) -> String {
     trimmed[start..].to_string()
 }
 
+/// The last `key=value` line's value: a gate re-run after a stale advance
+/// prints its timing again, and the final line is the one that decided the run.
+pub(crate) fn last_line_value<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+}
+
 pub(crate) fn line_value<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
     stdout
         .lines()
         .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// The marker the lander appends to an integration conflict message: the one
+/// accepted source whose merge conflicted with the target plus the sources
+/// merged before it. A batch refuses only that member (#1119).
+pub const CONFLICT_SOURCE_KEY: &str = "conflict_source";
+
+/// Append the conflicting source to a lander `error` that is an integration
+/// conflict; any other error is returned unchanged.
+#[must_use]
+pub fn mark_conflict_source(error: String, source: &str) -> String {
+    if !error.contains("Conflict {") {
+        return error;
+    }
+    format!("{error}; {CONFLICT_SOURCE_KEY}={source}")
+}
+
+/// The source a lander conflict message names (`None`: an older lander, or
+/// not a conflict).
+#[must_use]
+pub fn conflict_source(stderr: &str) -> Option<String> {
+    let marker = format!("{CONFLICT_SOURCE_KEY}=");
+    let (_, rest) = stderr.rsplit_once(&marker)?;
+    let source: String = rest
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    Some(source).filter(|source| !source.is_empty())
 }
 
 /// The receipt key for one failing test: the lander prints one
@@ -386,14 +1367,23 @@ pub(crate) fn classify_run(
     stderr: &str,
     landed: impl FnOnce() -> Option<String>,
 ) -> RunResult {
+    // The lander's gate timing (#1132): shards, base cache hits and runs,
+    // prebuild and wall seconds. Kept in the outcome detail so the manager can
+    // read the queue ETA from the entry row.
+    let timing = last_line_value(stdout, "gate_timing").map(|value| format!("gate_timing={value}"));
     let published = |sha: String| RunResult {
         state: RollingQueueEntryState::Published,
         outcome: RollingQueueOutcome {
             landed_sha: Some(sha),
+            detail: timing.clone(),
             ..RollingQueueOutcome::default()
         },
     };
-    let detail = Some(tail(stderr)).filter(|text| !text.is_empty());
+    let detail = match (Some(tail(stderr)).filter(|text| !text.is_empty()), &timing) {
+        (Some(text), Some(timing)) => Some(format!("{timing}\n{text}")),
+        (Some(text), None) => Some(text),
+        (None, timing) => timing.clone(),
+    };
     let refuse = |code: &str, state: RollingQueueEntryState| RunResult {
         state,
         outcome: RollingQueueOutcome {
@@ -423,6 +1413,12 @@ pub(crate) fn classify_run(
     if stderr.contains("Conflict {") {
         return refuse(QUEUE_BATCH_MERGE_CONFLICT, RollingQueueEntryState::Refused);
     }
+    if stderr.contains("error: no tests to run") {
+        return refuse(
+            QUEUE_FILTER_MATCHES_NO_TESTS,
+            RollingQueueEntryState::Refused,
+        );
+    }
     if exit == Some(8) {
         let fence = line_value(stdout, "policy_fence").unwrap_or("unknown");
         return refuse(
@@ -446,6 +1442,104 @@ pub(crate) fn union_filters(entries: &[RollingQueueEntryV1]) -> Vec<String> {
         }
     }
     union
+}
+
+/// Keep the newest `max` bytes of `text`.
+fn newest_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// Delete all but the newest `keep` regular files in `dir`.
+fn prune_logs(dir: &Path, keep: usize) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = read
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            meta.is_file().then(|| {
+                (
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    entry.path(),
+                )
+            })
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let excess = files.len() - keep;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+static RUN_LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write one lander run's output to `<dir>/<batch>-<run>.log` (bounded, the
+/// directory rotated) and return its path. Best effort: `None` on an I/O error.
+fn write_run_log(
+    dir: &Path,
+    batch_id: Uuid,
+    header: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    let seq = RUN_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{batch_id}-{}-{seq}.log",
+        Utc::now().timestamp_millis()
+    ));
+    let body = format!(
+        "{header}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+        newest_bytes(stdout, RUN_LOG_STREAM_BYTES),
+        newest_bytes(stderr, RUN_LOG_STREAM_BYTES),
+    );
+    std::fs::write(&path, body).ok()?;
+    prune_logs(dir, RUN_LOG_KEEP_FILES);
+    Some(path)
+}
+
+/// The conflicting paths a lander conflict message names
+/// (`Conflict { paths: ["a", "b"] }`).
+fn conflict_paths(stderr: &str) -> Option<String> {
+    let (_, rest) = stderr.split_once("Conflict { paths: [")?;
+    let (list, _) = rest.split_once(']')?;
+    let paths: Vec<&str> = list
+        .split(',')
+        .map(|path| path.trim().trim_matches('"'))
+        .filter(|path| !path.is_empty())
+        .collect();
+    (!paths.is_empty()).then(|| paths.join(","))
+}
+
+/// A short, human-readable cause for a non-green run: the refusal code, the
+/// conflicting paths or the first failing tests (#1135).
+fn run_cause(result: &RunResult, stderr: &str) -> Option<String> {
+    let refusal = result.outcome.refusal.as_deref()?;
+    let mut cause = refusal.to_string();
+    if let Some(paths) = conflict_paths(stderr) {
+        cause.push_str(&format!("; conflict_paths={paths}"));
+    }
+    let tests = &result.outcome.failing_tests;
+    if !tests.is_empty() {
+        let shown: Vec<&str> = tests.iter().take(CAUSE_TESTS).map(String::as_str).collect();
+        cause.push_str(&format!("; failing_tests={}", shown.join(",")));
+        if tests.len() > CAUSE_TESTS {
+            cause.push_str(&format!(" (+{} more)", tests.len() - CAUSE_TESTS));
+        }
+    }
+    Some(cause)
 }
 
 async fn run_lander(
@@ -480,6 +1574,12 @@ async fn run_lander(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(target) = launcher.target_dir() {
+        // The queue owns its build directory: no per-session environment.
+        std::fs::create_dir_all(&target)
+            .map_err(|error| format!("cannot create the queue target: {error}"))?;
+        command.env("CARGO_TARGET_DIR", target);
+    }
     let child = command
         .spawn()
         .map_err(|error| format!("cannot start the lander: {error}"))?;
@@ -513,6 +1613,24 @@ struct GroupRun {
     /// observed remote head in `result.outcome.landed_sha` can be a later
     /// external descendant. `None` when the run reported no published commit.
     own_tip: Option<String>,
+    /// The member an integration conflict is attributable to, when the lander
+    /// named it.
+    conflict_source: Option<String>,
+    /// The per-run log of the lander's stdout and stderr (#1135).
+    log_path: Option<PathBuf>,
+    /// Short cause of a non-green run: refusal code, conflict paths or the
+    /// first failing tests.
+    cause: Option<String>,
+}
+
+impl GroupRun {
+    /// The event detail fields every gate event carries: the cause and the log.
+    fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cause": self.cause,
+            "log": self.log_path.as_ref().map(|path| path.display().to_string()),
+        })
+    }
 }
 
 fn own_published_tip(stdout: &str) -> Option<String> {
@@ -533,6 +1651,7 @@ fn regates_used(stdout: &str) -> usize {
 
 async fn run_group(
     launcher: &LanderLauncher,
+    batch_id: Uuid,
     repo: &Path,
     entries: &[RollingQueueEntryV1],
     regates_left: usize,
@@ -558,17 +1677,41 @@ async fn run_group(
             } else {
                 None
             };
-            let result = classify_run(output.status.code(), &stdout, &stderr, || landed);
+            let mut result = classify_run(output.status.code(), &stdout, &stderr, || landed);
+            let log_path = launcher.log_dir().and_then(|dir| {
+                let header = format!(
+                    "lander exit={:?} sources={}",
+                    output.status.code(),
+                    entries
+                        .iter()
+                        .map(|entry| entry.source_commit.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                write_run_log(&dir, batch_id, &header, &stdout, &stderr)
+            });
+            let cause = run_cause(&result, &stderr);
+            if let Some(path) = &log_path {
+                let line = format!("lander_log={}", path.display());
+                result.outcome.detail = Some(match result.outcome.detail.take() {
+                    Some(detail) => format!("{detail}\n{line}"),
+                    None => line,
+                });
+            }
             let mut regates_used = regates_used(&stdout);
             if result.outcome.refusal.as_deref() == Some(QUEUE_REGATE_EXHAUSTED) {
                 regates_used = regates_used.max(regates_left);
             }
             let own_tip = own_published_tip(&stdout);
+            let conflict_source = conflict_source(&stderr);
             GroupRun {
                 result,
                 stdout,
                 regates_used,
                 own_tip,
+                conflict_source,
+                log_path,
+                cause,
             }
         }
         Err(message) => GroupRun {
@@ -583,8 +1726,31 @@ async fn run_group(
             stdout: String::new(),
             regates_used: 0,
             own_tip: None,
+            conflict_source: None,
+            log_path: None,
+            cause: Some("lander_unavailable".into()),
         },
     }
+}
+
+/// Remove and return the member a conflicting multi-member run names, so only
+/// that entry is refused and the rest go on. `None` when the run is not a
+/// conflict, the lander named no member of `members`, or the group is a single
+/// entry (then the ordinary settlement refuses it).
+fn take_conflict_culprit(
+    members: &mut Vec<RollingQueueEntryV1>,
+    run: &GroupRun,
+) -> Option<RollingQueueEntryV1> {
+    if members.len() < 2
+        || run.result.outcome.refusal.as_deref() != Some(QUEUE_BATCH_MERGE_CONFLICT)
+    {
+        return None;
+    }
+    let source = run.conflict_source.as_deref()?;
+    let index = members
+        .iter()
+        .position(|entry| entry.source_commit == source)?;
+    Some(members.remove(index))
 }
 
 /// Batch members share one candidate, so a lander policy refusal is reported
@@ -604,11 +1770,15 @@ fn as_batch_result(mut result: RunResult) -> RunResult {
 }
 
 /// Whether a non-green gate is a red gate: only that is attributable to one
-/// member by bisecting. A merge conflict or a policy refusal is a property of
-/// the batch as a whole and settles every member with its typed refusal.
+/// member by bisecting. A policy refusal is a property of the batch as a whole
+/// and settles every member with its typed refusal; a merge conflict is
+/// attributed by the lander (`take_conflict_culprit`), not by bisecting.
 fn is_bisectable(result: &RunResult) -> bool {
     result.state == RollingQueueEntryState::Refused
-        && result.outcome.refusal.as_deref() == Some("gate_failed")
+        && matches!(
+            result.outcome.refusal.as_deref(),
+            Some("gate_failed" | QUEUE_FILTER_MATCHES_NO_TESTS)
+        )
 }
 
 async fn settle(
@@ -624,12 +1794,30 @@ async fn settle(
     Ok(())
 }
 
+/// Settle `members` with their results in one transaction: each entry keeps
+/// its own outcome row, and each resolved owner gets ONE wake naming every
+/// entry settled here (#1146). Separate calls still wake separately.
+async fn settle_group(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    members: &[(Uuid, RunResult)],
+) -> Result<()> {
+    let items: Vec<(Uuid, RollingQueueEntryState, RollingQueueOutcome)> = members
+        .iter()
+        .map(|(id, result)| (*id, result.state, result.outcome.clone()))
+        .collect();
+    with_store(store, move |s| {
+        s.settle_rolling_queue_entries(&items, Utc::now())
+    })
+    .await?;
+    Ok(())
+}
+
 /// Ancestry of each source in the published tip: after one fetch, a source is
 /// verified only when it is an ancestor of `origin/rolling`. Migration
 /// evidence in the lander's report never substitutes for the probe: the
 /// provisional commit the lander writes keeps the original source as a parent.
 fn verify_ancestry(repo: &Path, sources: &[String]) -> Vec<bool> {
-    let _ = git(repo, &["fetch", "--quiet", "origin", "rolling"]);
+    let _ = fetch_rolling(repo);
     sources
         .iter()
         .map(|source| {
@@ -678,7 +1866,7 @@ async fn order_migrations(
     let probe_repo = repo.to_path_buf();
     let probe_members = members.clone();
     let plan = tokio::task::spawn_blocking(move || {
-        let _ = git(&probe_repo, &["fetch", "--quiet", "origin", "rolling"]);
+        let _ = fetch_rolling(&probe_repo);
         let tip = schema_version_at(&probe_repo, "origin/rolling")?;
         let facts: Vec<MigrationMember> = probe_members
             .iter()
@@ -703,6 +1891,7 @@ async fn order_migrations(
         .await?;
     }
     let mut kept = Vec::new();
+    let mut refused = Vec::new();
     for entry in members {
         if plan.out_of_order.contains(&entry.id) {
             let result = RunResult {
@@ -717,12 +1906,13 @@ async fn order_migrations(
                     ..RollingQueueOutcome::default()
                 },
             };
-            settle(store, entry.id, &result).await?;
-            settled.push((entry.id, result));
+            refused.push((entry.id, result));
         } else {
             kept.push(entry);
         }
     }
+    settle_group(store, &refused).await?;
+    settled.extend(refused);
     Ok(kept)
 }
 
@@ -751,18 +1941,52 @@ pub(crate) async fn run_next_batch(
     else {
         return Ok(Vec::new());
     };
-    let repo = PathBuf::from(&claimed.repo_path);
     let batch_id = claimed.batch_id;
     let mut settled = Vec::new();
     let mut members = claimed.entries;
+    let repo = match queue_repo(launcher, &claimed.repo_path).await {
+        Ok(repo) => repo,
+        Err(message) => {
+            let result = RunResult {
+                state: RollingQueueEntryState::Failed,
+                outcome: RollingQueueOutcome {
+                    refusal: Some(workspace_refusal_code(&message).into()),
+                    detail: Some(format!("queue workspace unavailable: {message}")),
+                    ..RollingQueueOutcome::default()
+                },
+            };
+            let group: Vec<(Uuid, RunResult)> = members
+                .iter()
+                .map(|entry| (entry.id, result.clone()))
+                .collect();
+            settle_group(store, &group).await?;
+            settled.extend(group);
+            return Ok(settled);
+        }
+    };
     if members.len() > 1 {
         members = order_migrations(store, &repo, members, &mut settled).await?;
     }
     if members.is_empty() {
         return Ok(settled);
     }
+    let mut run = run_group(launcher, batch_id, &repo, &members, MAX_REGATES, None).await;
+    // An integration conflict belongs to one member: refuse that entry with its
+    // conflict path and gate the rest as if it had never been in the batch.
+    while let Some(culprit) = take_conflict_culprit(&mut members, &run) {
+        bisect_event(
+            store,
+            batch_id,
+            "conflict_isolated",
+            Some(culprit.id),
+            run.evidence(),
+        )
+        .await?;
+        settle(store, culprit.id, &run.result).await?;
+        settled.push((culprit.id, run.result.clone()));
+        run = run_group(launcher, batch_id, &repo, &members, MAX_REGATES, None).await;
+    }
     let in_batch = members.len() > 1;
-    let run = run_group(launcher, &repo, &members, MAX_REGATES, None).await;
     let regates_left = MAX_REGATES.saturating_sub(run.regates_used);
     let result = if in_batch {
         as_batch_result(run.result.clone())
@@ -784,8 +2008,10 @@ pub(crate) async fn run_next_batch(
     }
     if in_batch && is_bisectable(&result) {
         let reason = result.outcome.refusal.clone().unwrap_or_default();
+        let mut detail = run.evidence();
+        detail["reason"] = serde_json::json!(reason);
         with_store(store, move |s| {
-            s.begin_rolling_queue_bisect(batch_id, &reason, Utc::now())
+            s.begin_rolling_queue_bisect_with(batch_id, detail, Utc::now())
         })
         .await?;
         let first_base = match line_value(&run.stdout, "fetched_target_id") {
@@ -806,10 +2032,12 @@ pub(crate) async fn run_next_batch(
         .await?;
         return Ok(settled);
     }
-    for entry in &members {
-        settle(store, entry.id, &result).await?;
-        settled.push((entry.id, result.clone()));
-    }
+    let group: Vec<(Uuid, RunResult)> = members
+        .iter()
+        .map(|entry| (entry.id, result.clone()))
+        .collect();
+    settle_group(store, &group).await?;
+    settled.extend(group);
     Ok(settled)
 }
 
@@ -865,6 +2093,7 @@ async fn publish_group(
         .await?;
     }
     let versions = migration_evidence(&run.stdout);
+    let mut member_results = Vec::with_capacity(group.len());
     for (entry, ok) in group.iter().zip(verified) {
         let member_result = if ok {
             if let Some((_, version)) = versions
@@ -902,15 +2131,16 @@ async fn publish_group(
                 },
             }
         };
-        settle(store, entry.id, &member_result).await?;
-        settled.push((entry.id, member_result));
+        member_results.push((entry.id, member_result));
     }
+    settle_group(store, &member_results).await?;
+    settled.extend(member_results);
     Ok(())
 }
 
 /// `origin/rolling` after one fetch (`None` when git cannot say).
 fn fetch_tip(repo: &Path) -> Option<String> {
-    let _ = git(repo, &["fetch", "--quiet", "origin", "rolling"]);
+    let _ = fetch_rolling(repo);
     git(repo, &["rev-parse", "--verify", "origin/rolling^{commit}"])
         .map(|tip| tip.trim().to_string())
         .filter(|tip| !tip.is_empty())
@@ -940,7 +2170,7 @@ async fn record_migration_plan(
     let probe_repo = repo.to_path_buf();
     let members = group.to_vec();
     let planned = tokio::task::spawn_blocking(move || {
-        let _ = git(&probe_repo, &["fetch", "--quiet", "origin", "rolling"]);
+        let _ = fetch_rolling(&probe_repo);
         let tip = schema_version_at(&probe_repo, "origin/rolling")?;
         let facts: Vec<MigrationMember> = members
             .iter()
@@ -1061,10 +2291,12 @@ async fn bisect_batch(
                 serde_json::json!({ "pending": pending.len() }),
             )
             .await?;
-            for entry in pending.drain(..) {
-                settle(store, entry.id, &result).await?;
-                settled.push((entry.id, result.clone()));
-            }
+            let rest: Vec<(Uuid, RunResult)> = pending
+                .drain(..)
+                .map(|entry| (entry.id, result.clone()))
+                .collect();
+            settle_group(store, &rest).await?;
+            settled.extend(rest);
             break;
         }
         budget -= 1;
@@ -1092,10 +2324,12 @@ async fn bisect_batch(
                         serde_json::json!({ "expected": expected_tip, "observed": current }),
                     )
                     .await?;
-                    for entry in pending.drain(..) {
-                        settle(store, entry.id, &result).await?;
-                        settled.push((entry.id, result.clone()));
-                    }
+                    let rest: Vec<(Uuid, RunResult)> = pending
+                        .drain(..)
+                        .map(|entry| (entry.id, result.clone()))
+                        .collect();
+                    settle_group(store, &rest).await?;
+                    settled.extend(rest);
                     break;
                 }
                 regates_left -= 1;
@@ -1146,6 +2380,7 @@ async fn bisect_batch(
         record_migration_plan(store, repo, batch_id, &group).await?;
         let run = run_group(
             launcher,
+            batch_id,
             repo,
             &group,
             regates_left,
@@ -1172,6 +2407,8 @@ async fn bisect_batch(
                 "window": window,
                 "outcome": outcome,
                 "base": base,
+                "cause": run.cause,
+                "log": run.log_path.as_ref().map(|path| path.display().to_string()),
             }),
         )
         .await?;
@@ -1222,10 +2459,24 @@ async fn bisect_batch(
                 expected_tip = base.or(expected_tip);
             }
             _ => {
-                for entry in &group {
-                    settle(store, entry.id, &result).await?;
-                    settled.push((entry.id, result.clone()));
+                let mut rest = group.clone();
+                if let Some(culprit) = take_conflict_culprit(&mut rest, &run) {
+                    // Only the conflicting member is refused; the group is
+                    // gated again without it.
+                    settle(store, culprit.id, &result).await?;
+                    settled.push((culprit.id, result.clone()));
+                    pending.retain(|entry| entry.id != culprit.id);
+                    window = None;
+                    red_base = None;
+                    expected_tip = base.or(expected_tip);
+                    continue;
                 }
+                let refused: Vec<(Uuid, RunResult)> = group
+                    .iter()
+                    .map(|entry| (entry.id, result.clone()))
+                    .collect();
+                settle_group(store, &refused).await?;
+                settled.extend(refused);
                 pending.drain(..take);
                 if window.is_some() {
                     // The remaining window's red was observed with this group
@@ -1319,12 +2570,38 @@ pub(crate) async fn reconcile_gating(
     Ok((settled, requeued))
 }
 
+/// One queue tick that respects the deploy drain (#1128): while a deploy is
+/// draining no new batch is admitted (queued entries wait; the caller already
+/// finished any running batch, as the loop is sequential), so the deploy's
+/// `landing_in_progress` quiet-point blocker can clear. The held queue is
+/// reported in `deploy_drain.held`.
+pub(crate) async fn run_drain_aware_batch(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    launcher: &LanderLauncher,
+    size: usize,
+    drain: &crate::deploy_drain::DeployDrain,
+) -> Result<Vec<(Uuid, RunResult)>> {
+    if drain.is_draining() {
+        let queued = with_store(store, |s| {
+            s.list_rolling_queue_entries(Some(RollingQueueEntryState::Queued), 1)
+        })
+        .await?;
+        if drain.hold_queue_admission(!queued.is_empty()) {
+            return Ok(Vec::new());
+        }
+    } else {
+        drain.hold_queue_admission(false);
+    }
+    run_next_batch(store, launcher, size).await
+}
+
 /// The daemon task: reconcile once, then run the FIFO head whenever the
 /// operator has the queue enabled.
 pub async fn run_rolling_queue_loop(
     store: Arc<tokio::sync::Mutex<Store>>,
     config: Arc<RuntimeConfig>,
     launcher: LanderLauncher,
+    drain: Arc<crate::deploy_drain::DeployDrain>,
 ) {
     match reconcile_gating(&store).await {
         Ok((settled, requeued)) if settled + requeued > 0 => {
@@ -1342,7 +2619,7 @@ pub async fn run_rolling_queue_loop(
         }
         let size = (config.rolling_queue_batch_size.load(Ordering::Relaxed) as usize)
             .clamp(1, ROLLING_QUEUE_MAX_BATCH_SIZE as usize);
-        match run_next_batch(&store, &launcher, size).await {
+        match run_drain_aware_batch(&store, &launcher, size, &drain).await {
             Ok(results) => {
                 for (id, result) in results {
                     tracing::info!(%id, state = result.state.as_str(), "rolling queue entry settled");
@@ -1373,6 +2650,21 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn the_lander_gate_timing_is_kept_in_the_outcome_detail() {
+        let timing = "gate_timing=shards=2 base_hits=1 base_runs=1 prebuild_secs=9 wall_secs=30";
+        let published = ok_run(&format!(
+            "gate_timing=shards=9 base_hits=0 base_runs=9 prebuild_secs=1 wall_secs=1\n{timing}\npublished_target_id=abc123\n"
+        ));
+        assert_eq!(published.outcome.detail.as_deref(), Some(timing));
+        let refused = classify_run(Some(1), &format!("{timing}\n"), "gate red", || None);
+        assert_eq!(
+            refused.outcome.detail.as_deref(),
+            Some(format!("{timing}\ngate red").as_str())
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn policy_refusal_and_gate_failure_are_typed_with_failing_tests() {
         let policy = classify_run(
             Some(8),
@@ -1394,6 +2686,168 @@ mod tests {
         );
         assert_eq!(gate.outcome.refusal.as_deref(), Some("gate_failed"));
         assert_eq!(gate.outcome.failing_tests, vec!["rolling_queue::red"]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_gate_that_ran_no_tests_is_its_own_refusal_and_stays_bisectable() {
+        let result = classify_run(
+            Some(1),
+            "publication_status=not_published\n",
+            "affected-crate guard failed (Failed { code: Some(4) }) running scripts/run-rsid-test-shards.sh [\"shard\", \"session-05\", \"--filterset\", \"test(rolling_land)\"]: error: no tests to run",
+            || None,
+        );
+        assert_eq!(result.state, RollingQueueEntryState::Refused);
+        assert_eq!(
+            result.outcome.refusal.as_deref(),
+            Some(QUEUE_FILTER_MATCHES_NO_TESTS)
+        );
+        assert!(
+            result
+                .outcome
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("test(rolling_land)"))
+        );
+        assert!(is_bisectable(&result));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_filter_that_selects_no_test_is_found_statically_and_real_filters_pass() {
+        let (_dir, _origin, work) = repos();
+        sh(
+            &work,
+            "mkdir -p crates/rsid/src && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-01\"))]' \
+               '#[test]' 'fn queue_lands_things() {}' > crates/rsid/src/q.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-session-05\"))]' \
+               '#[test]' 'fn other_tests() {}' > crates/rsid/src/s.rs \
+             && git add -A && git commit -qm tests",
+        );
+        let commit = head(&work);
+        let find = |filters: &[&str]| {
+            let filters: Vec<String> = filters.iter().map(|f| (*f).to_string()).collect();
+            filter_selecting_no_tests(&work, &commit, &filters)
+        };
+        // The #1129 shape: the name exists in the repo but not in that shard.
+        assert_eq!(
+            find(&["rsid=shard:session-05:test(queue_lands)"]).as_deref(),
+            Some("rsid=shard:session-05:test(queue_lands)")
+        );
+        assert_eq!(find(&["rsid=shard:other-01:test(queue_lands)"]), None);
+        assert_eq!(find(&["rsid=shard:other-01"]), None);
+        assert_eq!(
+            find(&["rsid=shard:other-99:test(queue_lands)"]).is_some(),
+            true
+        );
+        assert_eq!(find(&["rsid=queue_lands"]), None);
+        assert_eq!(
+            find(&["rsid=queue_lands", "rsid=nowhere_to_be_found"]).as_deref(),
+            Some("rsid=nowhere_to_be_found")
+        );
+        // Forms the check cannot reason about are accepted.
+        assert_eq!(
+            find(&["rsid=bin:rsi-rolling-land", "rsid=test:anything"]),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_filter_naming_a_module_the_source_adds_is_accepted_by_file_or_mod_declaration() {
+        // #1169: `thread_stacks.rs` holds the tests of `thread_stacks::tests`
+        // but never spells the module name; `lib.rs` declares it.
+        let (_dir, _origin, work) = repos();
+        sh(
+            &work,
+            "mkdir -p crates/rsid/src \
+             && printf '%s\\n' 'pub mod thread_stacks;' 'pub mod renamed;' > crates/rsid/src/lib.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-05\"))]' \
+               'mod tests {' '#[test]' 'fn a_collector_never_returns() {}' '}' > crates/rsid/src/thread_stacks.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-05\"))]' \
+               '#[test]' 'fn kept() {}' > crates/rsid/src/other_name.rs \
+             && git add -A && git commit -qm adds-module",
+        );
+        let commit = head(&work);
+        let find = |filters: &[&str]| {
+            let filters: Vec<String> = filters.iter().map(|f| (*f).to_string()).collect();
+            filter_selecting_no_tests(&work, &commit, &filters)
+        };
+        // The module name is only the file's name.
+        assert_eq!(find(&["rsid=shard:other-05:test(thread_stacks)"]), None);
+        assert_eq!(
+            find(&["rsid=shard:other-05:test(thread_stacks::tests::a_collector_never_returns)"]),
+            None
+        );
+        // A truly absent module or function is still refused.
+        assert_eq!(
+            find(&["rsid=shard:other-05:test(no_such_module)"]).as_deref(),
+            Some("rsid=shard:other-05:test(no_such_module)")
+        );
+        assert_eq!(
+            find(&["rsid=shard:other-05:test(thread_stacks::tests::no_such_fn)"]).as_deref(),
+            Some("rsid=shard:other-05:test(thread_stacks::tests::no_such_fn)")
+        );
+        // A module declared in a lib.rs that carries no gate is accepted even
+        // when no gated file is named after it (a `#[path]` module).
+        assert_eq!(find(&["rsid=shard:other-05:test(renamed)"]), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_shard_filter_searches_every_package_that_declares_the_shard() {
+        // #1021 S4: the store tests live in crates/rsid-store while the
+        // filter keeps its `rsid=shard:...` spelling.
+        let (_dir, _origin, work) = repos();
+        sh(
+            &work,
+            "mkdir -p crates/rsid/src crates/rsid-store/src/store \
+             && printf '%s\\n' '[features]' 'test-shard-mode = []' \
+                'test-shard-store-04 = [\"test-shard-mode\"]' \
+                'test-shard-session-01 = [\"test-shard-mode\"]' > crates/rsid/Cargo.toml \
+             && printf '%s\\n' '[features]' 'test-shard-mode = []' \
+                'test-shard-store-01 = [\"test-shard-mode\"]' \
+                'test-shard-store-04 = [\"test-shard-mode\"]' > crates/rsid-store/Cargo.toml \
+             && printf '%s\\n' '// module store::tests' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-store-01\"))]' \
+               '#[test]' 'fn h1_store_only_keysets() {}' > crates/rsid-store/src/store/tests.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-store-04\"))]' \
+               '#[test]' 'fn remote_read_page() {}' > crates/rsid/src/remote.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-store-04\"))]' \
+               '#[test]' 'fn store_page_cursor() {}' > crates/rsid-store/src/store/cursor.rs \
+             && printf '%s\\n' \
+               '#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-session-01\"))]' \
+               '#[test]' 'fn session_only() {}' > crates/rsid/src/session.rs \
+             && git add -A && git commit -qm split-tests",
+        );
+        let commit = head(&work);
+        let find = |filters: &[&str]| {
+            let filters: Vec<String> = filters.iter().map(|f| (*f).to_string()).collect();
+            filter_selecting_no_tests(&work, &commit, &filters)
+        };
+        // A store-only test, named through the unchanged `rsid=` spelling.
+        assert_eq!(
+            find(&["rsid=shard:store-01:test(store::tests::h1_store_only_keysets)"]),
+            None
+        );
+        // A shard shared by both packages finds a test in either of them.
+        assert_eq!(find(&["rsid=shard:store-04:test(remote_read_page)"]), None);
+        assert_eq!(find(&["rsid=shard:store-04:test(store_page_cursor)"]), None);
+        // The #1129 shape still refuses: the name exists, but not in that shard.
+        assert_eq!(
+            find(&["rsid=shard:session-01:test(h1_store_only_keysets)"]).as_deref(),
+            Some("rsid=shard:session-01:test(h1_store_only_keysets)")
+        );
+        assert_eq!(
+            find(&["rsid=shard:store-01:test(no_such_store_test)"]).as_deref(),
+            Some("rsid=shard:store-01:test(no_such_store_test)")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1448,8 +2902,8 @@ mod tests {
         sh(
             &work,
             "git config user.email t@t && git config user.name t && git checkout -q -b rolling \
-             && mkdir -p crates/rsid/src/store \
-             && printf 'pub const LATEST_SCHEMA_VERSION: i32 = 900;\\n' > crates/rsid/src/store/mod.rs \
+             && mkdir -p crates/rsid-store/src/store \
+             && printf 'pub const LATEST_SCHEMA_VERSION: i32 = 900;\\n' > crates/rsid-store/src/store/mod.rs \
              && git add -A && git commit -qm base && git push -q origin rolling",
         );
         (dir, origin, work)
@@ -1469,9 +2923,9 @@ mod tests {
         sh(
             &work,
             "git checkout -q -b feature \
-             && mkdir -p crates/rsid/src/store/migrations \
-             && printf 'impl Store {}\\n' > crates/rsid/src/store/migrations/v901.rs \
-             && printf '// hot\\n' > crates/rsid/src/config.rs \
+             && mkdir -p crates/rsid-store/src/store/migrations crates/rsid/src \
+             && printf 'impl Store {}\\n' > crates/rsid-store/src/store/migrations/v901.rs \
+             && printf '// hot\\n' > crates/rsid-store/src/config.rs \
              && printf '// router\\n' > crates/rsid/src/rpc.rs \
              && git add -A && git commit -qm feature",
         );
@@ -1482,7 +2936,7 @@ mod tests {
         assert_eq!(facts.migration_version, Some(901));
         assert_eq!(
             facts.hot_files,
-            vec!["crates/rsid/src/config.rs".to_string()]
+            vec!["crates/rsid-store/src/config.rs".to_string()]
         );
     }
 
@@ -1512,7 +2966,16 @@ mod tests {
         commit: &str,
         key: &str,
     ) -> Uuid {
-        let session = Uuid::new_v4();
+        queued_by(store, repo, commit, key, Uuid::new_v4()).await
+    }
+
+    async fn queued_by(
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        repo: &Path,
+        commit: &str,
+        key: &str,
+        session: Uuid,
+    ) -> Uuid {
         let new = crate::store::rolling_queue::NewQueueEntry {
             project_id: None,
             repo_path: repo.display().to_string(),
@@ -1552,6 +3015,1347 @@ mod tests {
         assert_eq!(landed.as_deref(), Some(head(&work).as_str()));
         assert!(is_ancestor_of_origin(&work, &sha));
         assert_eq!(wake_count(&store).await, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_draining_deploy_admits_no_new_batch_and_the_running_one_finishes() {
+        let (dir, _origin, work) = repos();
+        let first = commit_file(&work, "a", "a", "a");
+        let second = commit_file(&work, "b", "b", "b");
+        let log = dir.path().join("lander.log");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let a = queued(&store, &work, &first, "a").await;
+        let b = queued(&store, &work, &second, "b").await;
+        let drain = crate::deploy_drain::DeployDrain::new();
+
+        // No deploy: the head batch (size 1) runs to settlement.
+        let ran = run_drain_aware_batch(&store, &launcher, 1, &drain)
+            .await
+            .unwrap();
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].0, a);
+        assert_eq!(
+            entry_of(&store, a).await.state,
+            RollingQueueEntryState::Published
+        );
+
+        // A deploy is requested while `b` is still queued.
+        let now = Utc::now();
+        drain.sync(
+            Some(&crate::store::agent_deploys::DeployRow {
+                id: Uuid::new_v4(),
+                owner_session_id: Some(Uuid::new_v4()),
+                sha: "0".repeat(40),
+                manifest: Vec::new(),
+                state: rsi_common::agent_deploy::DeployState::Staged,
+                reason: None,
+                deadline_at: now + chrono::Duration::minutes(5),
+                operator: false,
+                forced: false,
+            }),
+            true,
+            now,
+        );
+        let held = run_drain_aware_batch(&store, &launcher, 1, &drain)
+            .await
+            .unwrap();
+        assert!(held.is_empty(), "no batch is admitted while draining");
+        assert_eq!(
+            entry_of(&store, b).await.state,
+            RollingQueueEntryState::Queued
+        );
+        assert_eq!(drain.status().held.len(), 1);
+        assert_eq!(drain.status().held[0].kind, "queue_batch");
+        // The queued-but-unadmitted entry is not a quiet-point blocker.
+        let blockers = store
+            .lock()
+            .await
+            .deploy_quiet_blockers(Uuid::new_v4())
+            .unwrap();
+        assert!(!blockers.contains(&"landing_in_progress"), "{blockers:?}");
+
+        // The deploy settles; the queue resumes and lands `b`.
+        drain.sync(None, true, Utc::now());
+        let ran = run_drain_aware_batch(&store, &launcher, 1, &drain)
+            .await
+            .unwrap();
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].0, b);
+        assert_eq!(
+            entry_of(&store, b).await.state,
+            RollingQueueEntryState::Published
+        );
+        assert!(drain.status().held.is_empty());
+    }
+
+    /// A workspace lander that records where and with what build directory it
+    /// ran, then reports an unpublished refusal (the settlement is not under
+    /// test).
+    fn recording_lander(dir: &Path, log: &Path, source: &str, workspace: &Path) -> LanderLauncher {
+        let body = r#"
+echo "cwd $(pwd -P)" >> @LOG@
+echo "target ${CARGO_TARGET_DIR:-unset}" >> @LOG@
+echo "args $*" >> @LOG@
+echo "head $(git rev-parse HEAD)" >> @LOG@
+git cat-file -e @SRC@^{commit} && echo "reachable yes" >> @LOG@
+echo publication_status=not_published
+exit 1
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@SRC@", source);
+        fake_lander(dir, &body).with_workspace(workspace.to_path_buf())
+    }
+
+    fn logged(log: &Path, key: &str) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{key} ")).map(str::to_string))
+            .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn the_queue_lands_in_its_own_worktree_with_its_own_cargo_target() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        // The operator's checkout is on `a` with a dirty file; it must not move.
+        sh(&work, "echo scratch > operator-note.txt");
+        let operator_head = head(&work);
+        let log = dir.path().join("lander.log");
+        let workspace = dir.path().join("queue");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = recording_lander(dir.path(), &log, &sha, &workspace);
+        queued(&store, &work, &sha, "k").await;
+        run_next(&store, &launcher).await.unwrap().unwrap();
+
+        let target = workspace.join("target");
+        assert!(target.is_dir(), "the queue creates its persistent target");
+        assert_eq!(
+            logged(&log, "target"),
+            vec![target.display().to_string()],
+            "the lander gets the queue's own CARGO_TARGET_DIR"
+        );
+        let cwd = PathBuf::from(&logged(&log, "cwd")[0]);
+        assert!(cwd.starts_with(workspace.join("worktrees").canonicalize().unwrap()));
+        assert_ne!(cwd, work.canonicalize().unwrap());
+        assert_eq!(
+            logged(&log, "args")[0]
+                .split_whitespace()
+                .nth(1)
+                .map(PathBuf::from),
+            Some(cwd.clone()),
+            "--repo is the queue worktree"
+        );
+        assert_eq!(logged(&log, "reachable"), vec!["yes".to_string()]);
+        // Detached at the fetched rolling tip, not at the operator's HEAD.
+        let rolling = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        assert_eq!(logged(&log, "head"), vec![rolling.trim().to_string()]);
+        assert_ne!(rolling.trim(), operator_head);
+        // The operator checkout is untouched.
+        assert_eq!(head(&work), operator_head);
+        assert!(work.join("operator-note.txt").is_file());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn the_queue_worktree_is_reused_and_refreshed_between_landings() {
+        let (dir, _origin, work) = repos();
+        let first = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let workspace = dir.path().join("queue");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = recording_lander(dir.path(), &log, &first, &workspace);
+        queued(&store, &work, &first, "k1").await;
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        // rolling moves; the next landing sees the new tip in the same place.
+        sh(
+            &work,
+            "git checkout -q rolling && echo more > more.txt && git add more.txt \
+             && git commit -qm more && git push -q origin rolling",
+        );
+        let advanced = head(&work);
+        let second = commit_file(&work, "b", "b", "b");
+        queued(&store, &work, &second, "k2").await;
+        run_next(&store, &launcher).await.unwrap().unwrap();
+
+        let cwds = logged(&log, "cwd");
+        assert_eq!(cwds.len(), 2);
+        assert_eq!(cwds[0], cwds[1], "one reusable worktree");
+        assert_eq!(logged(&log, "head")[1], advanced);
+    }
+
+    /// The operator checkout with a dirty tracked file and an untracked file:
+    /// a refused queue must leave both exactly as they are.
+    fn dirty_operator(work: &Path) -> (String, PathBuf) {
+        sh(work, "echo scratch > operator-note.txt");
+        sh(work, "echo changed >> crates/rsid-store/src/store/mod.rs");
+        (head(work), work.join("operator-note.txt"))
+    }
+
+    fn assert_operator_untouched(work: &Path, head_before: &str, note: &Path) {
+        assert_eq!(head(work), head_before);
+        assert!(note.is_file(), "untracked operator file survives `clean`");
+        let dirty =
+            std::fs::read_to_string(work.join("crates/rsid-store/src/store/mod.rs")).unwrap();
+        assert!(
+            dirty.ends_with("changed\n"),
+            "tracked edit survives `checkout --force`"
+        );
+    }
+
+    fn worktree_dir(workspace: &Path, work: &Path) -> PathBuf {
+        let common = git(
+            work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        workspace.join("worktrees").join(stable_key(&common))
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_symlinked_worktree_dir_is_refused_and_the_operator_checkout_is_untouched() {
+        let (dir, _origin, work) = repos();
+        let (before, note) = dirty_operator(&work);
+        let workspace = dir.path().join("queue");
+        prepare_queue_workspace(&workspace).unwrap();
+        // An attacker (or a bad config) aims the worktree slot at the operator
+        // checkout, whose common dir matches: the old health check accepted it.
+        let slot = worktree_dir(&workspace, &work);
+        std::os::unix::fs::symlink(&work, &slot).unwrap();
+        let error = ensure_queue_worktree(&workspace, &work).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(slot.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_operator_untouched(&work, &before, &note);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_slot_swapped_for_a_symlink_after_validation_cannot_redirect_the_reset() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
+        let (before, note) = dirty_operator(&work);
+        let common = git(
+            &work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Validation passes against the real queue worktree...
+        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
+        // ...then the slot is swapped for a symlink to the operator checkout.
+        let moved = dir.path().join("moved-queue-worktree");
+        std::fs::rename(&slot, &moved).unwrap();
+        std::os::unix::fs::symlink(&work, &slot).unwrap();
+        reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+        // The symlink target keeps its tracked and untracked edits.
+        assert_operator_untouched(&work, &before, &note);
+        // The command ran in the validated worktree instead.
+        assert!(!moved.join("queue-scratch.txt").exists());
+        assert!(moved.join(".git").is_file());
+        // A slot that is already a symlink is refused at validation.
+        assert!(pin_queue_worktree(&workspace, &slot, &common).is_err());
+    }
+
+    /// #1141 (#1126 F9): the registration (git admin dir) is swapped for a
+    /// symlink to the operator checkout's git dir between validation and the
+    /// destructive `checkout --force` / `clean`. Git must not follow it: the
+    /// command is refused and the operator checkout (HEAD, index, tracked and
+    /// untracked edits) is exactly as it was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_registration_swapped_for_a_symlink_cannot_redirect_the_reset() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
+        // The operator checkout moves ahead of the queue worktree's commit.
+        sh(
+            &work,
+            "echo ahead > ahead.txt && git add ahead.txt && git commit -qm ahead",
+        );
+        let (before, note) = dirty_operator(&work);
+        let operator_index = std::fs::read(work.join(".git/index")).unwrap();
+        let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
+        let common = git(
+            &work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
+        // Between the back-pointer check and the destructive command the
+        // registration is replaced by a symlink to the operator's git dir.
+        let registration = pinned.admin.clone();
+        let moved = dir.path().join("moved-registration");
+        std::fs::rename(&registration, &moved).unwrap();
+        std::os::unix::fs::symlink(work.join(".git"), &registration).unwrap();
+        // The queue worktree is not at the tip the operator checkout is at, so a
+        // redirected `checkout --force` would rewrite the operator's HEAD/index.
+        let rev = git(&work, &["rev-parse", "HEAD~1"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let error = reset_pinned_worktree(&pinned, &rev).unwrap_err();
+        assert!(error.contains("registration"), "{error}");
+        assert_operator_untouched(&work, &before, &note);
+        assert_eq!(
+            std::fs::read(work.join(".git/index")).unwrap(),
+            operator_index
+        );
+        assert_eq!(
+            std::fs::read(work.join(".git/HEAD")).unwrap(),
+            operator_head
+        );
+        // The queue worktree was not reset either: the refusal came first.
+        assert!(slot.join("queue-scratch.txt").exists());
+        // A fresh validation refuses the swapped registration too.
+        assert!(pin_queue_worktree(&workspace, &slot, &common).is_err());
+    }
+
+    /// #1141: a registration that is moved (not replaced) is also refused, and
+    /// git is never run against the moved copy.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_moved_registration_is_refused_before_git_runs() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
+        let common = git(
+            &work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
+        std::fs::rename(&pinned.admin, dir.path().join("moved-registration")).unwrap();
+        let error = reset_pinned_worktree(&pinned, &head(&work)).unwrap_err();
+        assert!(error.contains("registration"), "{error}");
+        assert!(slot.join("queue-scratch.txt").exists());
+    }
+
+    fn common_dir(work: &Path) -> String {
+        git(
+            work,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    /// `(asleep, voluntary context switches)` of the process whose environment
+    /// carries `marker`.
+    fn probe_marked_process(marker: &str) -> Option<(bool, u64)> {
+        let entries = std::fs::read_dir("/proc").ok()?;
+        entries.flatten().find_map(|entry| {
+            let dir = entry.path();
+            let environ = std::fs::read(dir.join("environ")).ok()?;
+            if !String::from_utf8_lossy(&environ).contains(marker) {
+                return None;
+            }
+            let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+            let asleep = stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                == Some("S");
+            let status = std::fs::read_to_string(dir.join("status")).ok()?;
+            let switches = status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((asleep, switches))
+        })
+    }
+
+    /// Reset `pinned` to `rev` and park the `target` git subcommand on a FIFO
+    /// that is its global config (git reads it before it looks at its cwd, again
+    /// after it has normalized the work tree to an absolute path and before it
+    /// enters that path, and again after). At the second read the queue slot is
+    /// renamed away and replaced by a symlink to `decoy`, so git's `chdir` by
+    /// pathname lands in `decoy` (#1160).
+    fn reset_with_slot_swapped_in_flight(
+        pinned: &PinnedWorktree,
+        rev: &str,
+        target: &str,
+        slot: &Path,
+        moved: &Path,
+        decoy: &Path,
+    ) -> std::result::Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let fifo = moved.with_file_name(format!("config-{}.fifo", Uuid::new_v4()));
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let marker = fifo.display().to_string();
+        // A write open succeeds only while git has the FIFO open (or is blocked
+        // opening it) for reading; closing it again hands git an empty config.
+        let release = || {
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&fifo);
+            opened.is_ok()
+        };
+        // Asleep in a blocking read-open for several polls, past `after`.
+        let park = |after: u64| -> u64 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut stable = 0;
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "git never parked on the config fifo"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                match probe_marked_process(&marker) {
+                    Some((true, switches)) if switches > after => stable += 1,
+                    _ => stable = 0,
+                }
+                if stable >= 5 {
+                    return probe_marked_process(&marker).map_or(after, |probed| probed.1);
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            let runner = scope.spawn(|| {
+                reset_pinned_worktree_with_env(
+                    pinned,
+                    rev,
+                    &|command| match command == target {
+                        true => vec![("GIT_CONFIG_GLOBAL".to_string(), marker.clone())],
+                        false => Vec::new(),
+                    },
+                    &|_, _| {},
+                )
+            });
+            let first = park(0);
+            while !release() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            park(first);
+            std::fs::rename(slot, moved).unwrap();
+            std::os::unix::fs::symlink(decoy, slot).unwrap();
+            while !runner.is_finished() {
+                release();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            runner.join().unwrap()
+        })
+    }
+
+    /// Mode and modification time: what a hook, a filter or a redirected git
+    /// could change without touching a file's bytes.
+    fn mode_and_mtime(path: &Path) -> (u32, std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+        let meta =
+            std::fs::metadata(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        (meta.mode(), meta.modified().unwrap())
+    }
+
+    /// #1160 major 1: git normalizes its work tree to an absolute path and later
+    /// enters it by that pathname, so a slot swapped for the operator checkout
+    /// inside git's own process redirects the destructive step. Whichever step
+    /// is redirected (the worktree rewrite or `clean`), the operator checkout's
+    /// tracked edits, untracked files, index, HEAD, modes and timestamps must be
+    /// exactly as they were, and the reset must fail closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_slot_swapped_inside_gits_own_process_cannot_redirect_the_reset() {
+        for target in ["read-tree", "clean"] {
+            let (dir, _origin, work) = repos();
+            let workspace = dir.path().join("queue");
+            let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+            let (before, note) = dirty_operator(&work);
+            let tracked = work.join("crates/rsid-store/src/store/mod.rs");
+            let operator_index = std::fs::read(work.join(".git/index")).unwrap();
+            let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
+            let metadata = (mode_and_mtime(&tracked), mode_and_mtime(&note));
+            let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+            let moved = dir.path().join("moved-queue-worktree");
+            let outcome =
+                reset_with_slot_swapped_in_flight(&pinned, &before, target, &slot, &moved, &work);
+            assert_operator_untouched(&work, &before, &note);
+            assert!(
+                std::fs::read(work.join(".git/index")).unwrap() == operator_index,
+                "the operator index was rewritten"
+            );
+            assert!(
+                std::fs::read(work.join(".git/HEAD")).unwrap() == operator_head,
+                "the operator HEAD was rewritten"
+            );
+            assert!(
+                (mode_and_mtime(&tracked), mode_and_mtime(&note)) == metadata,
+                "an operator file's mode or timestamp changed"
+            );
+            assert!(outcome.is_err(), "{target} must fail closed: {outcome:?}");
+        }
+    }
+
+    /// #1160 major 2: the registration directory keeps its identity when one of
+    /// its entries is replaced by a symlink. The reset never follows it: it
+    /// fails closed and the operator's index stays byte-identical.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_registration_entry_swapped_for_a_symlink_cannot_rewrite_the_operator_index() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
+        sh(
+            &work,
+            "echo ahead > ahead.txt && git add ahead.txt && git commit -qm ahead",
+        );
+        let (before, note) = dirty_operator(&work);
+        let operator_index = std::fs::read(work.join(".git/index")).unwrap();
+        let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        // The directory (device, inode, location) is unchanged; only its index
+        // entry now names the operator's index.
+        let index = pinned.admin.join("index");
+        std::fs::remove_file(&index).unwrap();
+        std::os::unix::fs::symlink(work.join(".git/index"), &index).unwrap();
+        let rev = git(&work, &["rev-parse", "HEAD~1"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let outcome = reset_pinned_worktree(&pinned, &rev);
+        assert!(
+            std::fs::read(work.join(".git/index")).unwrap() == operator_index,
+            "the operator index was rewritten"
+        );
+        assert!(
+            std::fs::read(work.join(".git/HEAD")).unwrap() == operator_head,
+            "the operator HEAD was rewritten"
+        );
+        assert_operator_untouched(&work, &before, &note);
+        assert!(outcome.is_err(), "must fail closed: {outcome:?}");
+    }
+
+    /// #1160 blocker: a directory grant covers a hard link planted under it, so
+    /// the reset must never write in place to a pre-existing file there. The
+    /// registration's `logs/HEAD` (which git appends to), `index` and `ORIG_HEAD`
+    /// are hard links to operator files, and so are a tracked and an untracked
+    /// file in the queue worktree. The reset succeeds and every operator file
+    /// keeps its bytes, mode and modification time.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn hard_links_to_operator_files_are_never_written_through() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        sh(
+            &work,
+            "echo ahead > ahead.txt && git add ahead.txt && git commit -qm ahead \
+             && echo secret-a > operator-a.txt && echo secret-b > operator-b.txt",
+        );
+        let ahead = head(&work);
+        let operator_files = [
+            work.join(".git/index"),
+            work.join(".git/config"),
+            work.join(".git/description"),
+            work.join("operator-a.txt"),
+            work.join("operator-b.txt"),
+        ];
+        let before: Vec<_> = operator_files
+            .iter()
+            .map(|file| (std::fs::read(file).unwrap(), mode_and_mtime(file)))
+            .collect();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let alias = |operator: &Path, name: &Path| {
+            let _ = std::fs::remove_file(name);
+            std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+            std::fs::hard_link(operator, name).unwrap();
+        };
+        alias(&operator_files[0], &pinned.admin.join("logs/HEAD"));
+        alias(&operator_files[1], &pinned.admin.join("index"));
+        alias(&operator_files[2], &pinned.admin.join("ORIG_HEAD"));
+        // A tracked file the reset rewrites, and an untracked file `clean` removes.
+        alias(
+            &operator_files[3],
+            &slot.join("crates/rsid-store/src/store/mod.rs"),
+        );
+        alias(&operator_files[4], &slot.join("untracked-link.txt"));
+        reset_pinned_worktree(&pinned, &ahead).unwrap();
+        for (file, (bytes, metadata)) in operator_files.iter().zip(&before) {
+            assert!(
+                &std::fs::read(file).unwrap() == bytes,
+                "{} was written through a hard link",
+                file.display()
+            );
+            assert!(
+                &mode_and_mtime(file) == metadata,
+                "{} changed mode or timestamp",
+                file.display()
+            );
+        }
+        // The reset itself worked: the slot is at the requested commit.
+        assert_eq!(
+            std::fs::read_to_string(pinned.admin.join("HEAD"))
+                .unwrap()
+                .trim(),
+            ahead
+        );
+        assert_eq!(
+            std::fs::read_to_string(slot.join("crates/rsid-store/src/store/mod.rs")).unwrap(),
+            "pub const LATEST_SCHEMA_VERSION: i32 = 900;\n"
+        );
+        assert!(slot.join("ahead.txt").is_file());
+        assert!(slot.join("untracked-link.txt").symlink_metadata().is_err());
+    }
+
+    /// #1160 major 3: Landlock does not stop chmod or utimes, so no program the
+    /// operator's repository configures may run during the reset. A smudge
+    /// filter and a `post-index-change` hook in the operator repo each chmod an
+    /// operator file; neither may run, and the checked-out bytes are unfiltered.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_operators_hooks_and_filters_do_not_run_during_the_reset() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        let victim = work.join("operator-victim.txt");
+        std::fs::write(&victim, "victim\n").unwrap();
+        let metadata = mode_and_mtime(&victim);
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let chmod = format!("chmod 000 {}", victim.display());
+        let smudge = script("smudge.sh", &format!("{chmod}\nsed 's/^/FILTERED:/'"));
+        let hook = script("hook.sh", &chmod);
+        sh(
+            &work,
+            "printf '*.evil filter=evil\\n' > .gitattributes && echo payload > a.evil \
+             && git add .gitattributes a.evil && git commit -qm filtered",
+        );
+        // Armed after the operator's own commit, so only the queue triggers them.
+        std::fs::copy(&hook, work.join(".git/hooks/post-index-change")).unwrap();
+        sh(
+            &work,
+            &format!("git config filter.evil.smudge {}", smudge.display()),
+        );
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(slot.join("a.evil")).unwrap(),
+            "payload\n"
+        );
+        assert_eq!(mode_and_mtime(&victim), metadata);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "victim\n");
+    }
+
+    /// #1160: ABI 1 and 2 cannot deny truncation, so the version policy refuses
+    /// them (and a missing Landlock) with the typed unsupported-fence code.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_fence_version_policy_requires_truncation_control() {
+        for abi in [0, 1, 2] {
+            let error = write_fence::require_abi(Ok(abi)).unwrap_err();
+            assert!(error.starts_with(write_fence::UNSUPPORTED_CODE), "{error}");
+        }
+        let missing = std::io::Error::from_raw_os_error(nix::libc::ENOSYS);
+        let error = write_fence::require_abi(Err(missing)).unwrap_err();
+        assert!(error.starts_with(write_fence::UNSUPPORTED_CODE), "{error}");
+        assert_eq!(write_fence::require_abi(Ok(3)).unwrap(), 3);
+        assert_eq!(write_fence::require_abi(Ok(7)).unwrap(), 7);
+    }
+
+    /// #1160: a host whose Landlock is too old settles the batch with the typed
+    /// refusal before any worktree is created or reset; the operator checkout is
+    /// untouched.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_host_without_the_write_fence_settles_with_the_typed_refusal() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        let (before, note) = dirty_operator(&work);
+        let log = dir.path().join("lander.log");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let mut launcher = recording_lander(dir.path(), &log, &sha, &dir.path().join("queue"));
+        launcher.fence_abi = || Ok(2);
+        queued(&store, &work, &sha, "k").await;
+        let (_, result) = run_next(&store, &launcher).await.unwrap().unwrap();
+        assert_eq!(result.state, RollingQueueEntryState::Failed);
+        assert_eq!(
+            result.outcome.refusal.as_deref(),
+            Some(write_fence::UNSUPPORTED_CODE)
+        );
+        let detail = result.outcome.detail.unwrap_or_default();
+        assert!(detail.contains("ABI 2"), "{detail}");
+        assert!(
+            !dir.path()
+                .join("queue/worktrees")
+                .read_dir()
+                .unwrap()
+                .any(|_| true)
+        );
+        assert_operator_untouched(&work, &before, &note);
+    }
+
+    /// A hard link to `operator` named `link` (an alias a granted directory
+    /// would let a write pass through).
+    fn alias_file(operator: &Path, link: &Path) {
+        let _ = std::fs::remove_file(link);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::hard_link(operator, link).unwrap();
+    }
+
+    /// Operator state whose bytes, mode and timestamps a test pins.
+    fn pin_files(files: &[PathBuf]) -> Vec<(Vec<u8>, (u32, std::time::SystemTime))> {
+        files
+            .iter()
+            .map(|file| (std::fs::read(file).unwrap(), mode_and_mtime(file)))
+            .collect()
+    }
+
+    fn assert_files_unchanged(
+        files: &[PathBuf],
+        pinned: &[(Vec<u8>, (u32, std::time::SystemTime))],
+    ) {
+        for (file, (bytes, metadata)) in files.iter().zip(pinned) {
+            assert!(
+                &std::fs::read(file).unwrap() == bytes,
+                "{} was written",
+                file.display()
+            );
+            assert!(
+                &mode_and_mtime(file) == metadata,
+                "{} changed mode or timestamp",
+                file.display()
+            );
+        }
+    }
+
+    /// A `#!/bin/sh` script under `dir` that chmods `victim` to 000.
+    fn chmod_script(dir: &Path, name: &str, victim: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nchmod 000 {}\n", victim.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// #1160 (first use): the queue worktree is first populated through the
+    /// same pinned, fenced runner as every later reset. A slot swapped for the
+    /// operator checkout while the FIRST population's git is in flight is
+    /// refused and leaves the operator checkout untouched.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_slot_swapped_during_the_first_population_cannot_redirect_it() {
+        for target in ["read-tree", "clean"] {
+            let (dir, _origin, work) = repos();
+            let (before, note) = dirty_operator(&work);
+            let tracked = work.join("crates/rsid-store/src/store/mod.rs");
+            let operator_index = std::fs::read(work.join(".git/index")).unwrap();
+            let metadata = (mode_and_mtime(&tracked), mode_and_mtime(&note));
+            let workspace = dir.path().join("queue");
+            prepare_queue_workspace(&workspace).unwrap();
+            let slot = worktree_dir(&workspace, &work);
+            // The registration exists, nothing is checked out yet.
+            create_queue_registration(&work, &slot, &before).unwrap();
+            assert!(
+                slot.join("crates").symlink_metadata().is_err(),
+                "the registration step must not check anything out"
+            );
+            let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+            let moved = dir.path().join("moved-queue-worktree");
+            let outcome =
+                reset_with_slot_swapped_in_flight(&pinned, &before, target, &slot, &moved, &work);
+            assert_operator_untouched(&work, &before, &note);
+            assert!(
+                std::fs::read(work.join(".git/index")).unwrap() == operator_index,
+                "the operator index was rewritten"
+            );
+            assert!(
+                (mode_and_mtime(&tracked), mode_and_mtime(&note)) == metadata,
+                "an operator file's mode or timestamp changed"
+            );
+            assert!(outcome.is_err(), "{target} must fail closed: {outcome:?}");
+        }
+    }
+
+    /// #1160 (first use): creating the worktree must not run the operator's
+    /// hooks or filters either (`git worktree add` would run a checkout, its
+    /// filters and `post-checkout`).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_first_creation_runs_no_operator_hook_or_filter() {
+        let (dir, _origin, work) = repos();
+        let victim = work.join("operator-victim.txt");
+        std::fs::write(&victim, "victim\n").unwrap();
+        let metadata = mode_and_mtime(&victim);
+        let smudge = dir.path().join("smudge.sh");
+        std::fs::write(
+            &smudge,
+            format!(
+                "#!/bin/sh\nchmod 000 {}\nsed 's/^/FILTERED:/'\n",
+                victim.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&smudge, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        sh(
+            &work,
+            "printf '*.evil filter=evil\\n' > .gitattributes && echo payload > a.evil \
+             && git add .gitattributes a.evil && git commit -qm filtered && git push -q origin rolling",
+        );
+        let hook = chmod_script(dir.path(), "hook.sh", &victim);
+        for name in ["post-checkout", "post-index-change"] {
+            std::fs::copy(&hook, work.join(".git/hooks").join(name)).unwrap();
+        }
+        sh(
+            &work,
+            &format!("git config filter.evil.smudge {}", smudge.display()),
+        );
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(slot.join("a.evil")).unwrap(),
+            "payload\n"
+        );
+        assert_eq!(mode_and_mtime(&victim), metadata);
+    }
+
+    /// #1170 (R2): the source fetch runs no hook of the source repository, no
+    /// automatic gc or maintenance and writes no FETCH_HEAD, while still
+    /// advancing `origin/rolling`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_source_fetch_runs_no_hook_or_maintenance_and_writes_no_fetch_head() {
+        let (dir, origin, work) = repos();
+        let marker = dir.path().join("hook-ran");
+        let hook = work.join(".git/hooks/reference-transaction");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho ran >> {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        // Automatic gc would run (and pack the loose objects) after any fetch.
+        sh(
+            &work,
+            "git config gc.auto 1 && git config gc.autoDetach false",
+        );
+        sh(&work, "git config maintenance.autoDetach false");
+        // Origin moves ahead through a second clone.
+        let other = dir.path().join("other");
+        sh(
+            dir.path(),
+            &format!(
+                "git clone -q {} {} && cd {} && echo n > n.txt && git add n.txt \
+                 && git commit -qm n && git push -q origin HEAD:rolling",
+                origin.display(),
+                other.display(),
+                other.display()
+            ),
+        );
+        let packs = || {
+            let mut names: Vec<_> = std::fs::read_dir(work.join(".git/objects/pack"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let fetch_head = || std::fs::read(work.join(".git/FETCH_HEAD")).ok();
+        let (packs_before, fetch_head_before) = (packs(), fetch_head());
+        fetch_rolling(&work).unwrap();
+        assert_eq!(
+            git(&work, &["rev-parse", "origin/rolling"]).unwrap(),
+            head(&other) + "\n",
+            "the fetch itself still happens"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).ok(), None, "no hook ran");
+        assert_eq!(packs(), packs_before, "no automatic gc repacked the store");
+        assert_eq!(fetch_head(), fetch_head_before, "FETCH_HEAD untouched");
+    }
+
+    /// The first population, with `plant` run just before git subcommand
+    /// `target` with the private git directory's path (as a racing same-uid
+    /// process would). Returns the slot.
+    fn populate_with_plant(
+        dir: &Path,
+        work: &Path,
+        target: &str,
+        plant: &dyn Fn(&Path),
+    ) -> PathBuf {
+        let workspace = dir.join("queue");
+        let slot = ensure_queue_worktree(&workspace, work).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(work)).unwrap();
+        let rev = git(work, &["rev-parse", "origin/rolling"]).unwrap();
+        reset_pinned_worktree_with_env(
+            &pinned,
+            rev.trim(),
+            &|_| Vec::new(),
+            &|command, private| {
+                if command == target {
+                    plant(private);
+                }
+            },
+        )
+        .unwrap();
+        slot
+    }
+
+    /// #1170 (R3): a `commondir` file planted in the private git directory does
+    /// not redirect git's common directory (and with it `info/exclude`) to a
+    /// directory of the planter's choosing: `clean` still removes the file a
+    /// planted exclude would have protected.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_commondir_planted_in_the_private_git_dir_is_ignored() {
+        let (dir, _origin, work) = repos();
+        let decoy = dir.path().join("decoy-common");
+        sh(
+            dir.path(),
+            &format!("git init -q --bare {}", decoy.display()),
+        );
+        std::fs::create_dir_all(decoy.join("info")).unwrap();
+        std::fs::write(decoy.join("info/exclude"), "junk.txt\n").unwrap();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(slot.join("junk.txt"), "junk").unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let rev = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        reset_pinned_worktree_with_env(
+            &pinned,
+            rev.trim(),
+            &|_| Vec::new(),
+            &|command, private| {
+                if command == "clean" {
+                    std::fs::write(private.join("commondir"), format!("{}\n", decoy.display()))
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            slot.join("junk.txt").symlink_metadata().is_err(),
+            "clean honored an exclude from the planted common directory"
+        );
+    }
+
+    /// #1170 (R3): a replace ref planted in the private git directory does not
+    /// substitute the tree the reset checks out.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_replace_ref_planted_in_the_private_git_dir_is_ignored() {
+        let (dir, _origin, work) = repos();
+        // A commit with an empty tree: what a planted replace ref would
+        // substitute for the real tip.
+        let empty = git(&work, &["hash-object", "-t", "tree", "-w", "--stdin"]).unwrap();
+        let alt = git(&work, &["commit-tree", empty.trim(), "-m", "alt"]).unwrap();
+        let rev = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        let slot = populate_with_plant(dir.path(), &work, "read-tree", &|private| {
+            std::fs::create_dir_all(private.join("refs/replace")).unwrap();
+            std::fs::write(
+                private.join("refs/replace").join(rev.trim()),
+                format!("{}\n", alt.trim()),
+            )
+            .unwrap();
+        });
+        assert!(
+            slot.join("crates/rsid-store/src/store/mod.rs").is_file(),
+            "the checked-out tree was replaced by a planted replace ref"
+        );
+    }
+
+    /// #1170 (R3): `info` is a regular file, so a directory of that name (where
+    /// `attributes` would name a filter driver) cannot be added beside the files
+    /// the daemon creates exclusively.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_info_directory_cannot_be_planted_in_the_private_git_dir() {
+        let (dir, _origin, work) = repos();
+        let refused = std::cell::Cell::new(false);
+        populate_with_plant(dir.path(), &work, "rev-parse", &|private| {
+            refused.set(std::fs::create_dir(private.join("info")).is_err());
+        });
+        assert!(refused.get(), "an info directory was planted");
+    }
+
+    /// #1160: the child gets a clean environment. An inherited `GIT_TRACE`,
+    /// `GIT_TRACE2_EVENT` or `GIT_TRACE_SETUP` naming a hard link to an operator
+    /// file is never opened for append, and the unfenced runners drop them too.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_inherited_git_trace_cannot_write_through_a_hard_link() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        let operator = work.join("operator-trace-target.txt");
+        std::fs::write(&operator, "operator\n").unwrap();
+        let files = [operator.clone()];
+        let pinned_state = pin_files(&files);
+        let trace = slot.join("trace-alias.log");
+        alias_file(&operator, &trace);
+        let mut pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let var = |name: &str, value: &Path| {
+            (
+                std::ffi::OsString::from(name),
+                std::ffi::OsString::from(value),
+            )
+        };
+        pinned.inherited_env = Some(vec![
+            var("PATH", Path::new(&std::env::var_os("PATH").unwrap())),
+            var("GIT_TRACE", &trace),
+            var("GIT_TRACE_SETUP", &trace),
+            var("GIT_TRACE_PERFORMANCE", &trace),
+            var("GIT_TRACE2", &trace),
+            var("GIT_TRACE2_EVENT", &trace),
+        ]);
+        reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+        assert_files_unchanged(&files, &pinned_state);
+        // The unfenced runners keep transport settings and drop the rest.
+        let kept = inherited_git_env([
+            (
+                std::ffi::OsString::from("SSH_AUTH_SOCK"),
+                std::ffi::OsString::from("/sock"),
+            ),
+            (
+                std::ffi::OsString::from("LC_ALL"),
+                std::ffi::OsString::from("C"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TRACE"),
+                std::ffi::OsString::from("/x"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_TEST_SPLIT_INDEX"),
+                std::ffi::OsString::from("1"),
+            ),
+            (
+                std::ffi::OsString::from("GIT_INDEX_FILE"),
+                std::ffi::OsString::from("/x"),
+            ),
+        ]);
+        let names: Vec<String> = kept
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["SSH_AUTH_SOCK", "LC_ALL"]);
+    }
+
+    /// #1160: a split registration index (its shared half beside it) is not
+    /// copied as a broken half; the reset publishes a full index, and a second
+    /// and third reset (each refreshing it) keep working.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_split_registration_index_is_normalized_and_survives_repeated_resets() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        sh(&slot, "git update-index --split-index");
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let shared = std::fs::read_dir(&pinned.admin)
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sharedindex.")
+            });
+        assert!(shared, "the fixture must hold a split index");
+        for _ in 0..3 {
+            std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
+            reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+            assert!(slot.join("queue-scratch.txt").symlink_metadata().is_err());
+            // The lander's own git, run in the slot by path, reads the index.
+            sh(&slot, "git status --porcelain > /dev/null");
+        }
+    }
+
+    /// #1160: a registration index replaced by a FIFO cannot block the reset.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_registration_index_fifo_is_refused_without_blocking() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let index = pinned.admin.join("index");
+        std::fs::remove_file(&index).unwrap();
+        nix::unistd::mkfifo(&index, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let rev = head(&work);
+        let pinned = std::sync::Arc::new(pinned);
+        // Unscoped, so a regression that blocks leaves this thread behind and
+        // the timeout below fails the test instead of hanging it.
+        std::thread::spawn(move || {
+            let _ = sender.send(reset_pinned_worktree(&pinned, &rev));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the reset blocked on the FIFO");
+        assert!(outcome.is_err(), "{outcome:?}");
+    }
+
+    /// Documented behaviour change (#1160): the queue's `clean -fd` no longer
+    /// reads the operator's `.git/info/exclude`, so a file ignored only there
+    /// is removed from the queue worktree like any other untracked file.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn clean_ignores_the_operators_private_excludes() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(
+            work.join(".git/info/exclude"),
+            "excluded-only-by-operator.tmp\n",
+        )
+        .unwrap();
+        std::fs::write(slot.join("excluded-only-by-operator.tmp"), "x").unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+        assert!(
+            slot.join("excluded-only-by-operator.tmp")
+                .symlink_metadata()
+                .is_err()
+        );
+    }
+
+    /// #1160: a same-uid writer that plants files in the fresh private git dir
+    /// after it exists and before git runs cannot enable a hook, replace the
+    /// config to turn one on, or redirect an append: the settings that matter
+    /// are on git's command line, `logs` is a file, and no ref is updated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn files_planted_in_the_private_git_dir_in_flight_are_not_honored() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        sh(
+            &work,
+            "echo ahead > ahead.txt && git add ahead.txt && git commit -qm ahead",
+        );
+        let victim = work.join("operator-victim.txt");
+        std::fs::write(&victim, "victim\n").unwrap();
+        let files = [
+            victim.clone(),
+            work.join(".git/index"),
+            work.join(".git/HEAD"),
+        ];
+        let pinned_state = pin_files(&files);
+        let hook = chmod_script(dir.path(), "plant.sh", &victim);
+        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let planted = std::sync::atomic::AtomicBool::new(false);
+        let plant = |_command: &str, scratch: &Path| {
+            if planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let hooks = scratch.join("hooks");
+            std::fs::create_dir(&hooks).unwrap();
+            for name in [
+                "post-index-change",
+                "post-checkout",
+                "reference-transaction",
+            ] {
+                std::fs::copy(&hook, hooks.join(name)).unwrap();
+            }
+            // A replacement config that turns hooks, reflogs and a filter on.
+            std::fs::remove_file(scratch.join("config")).unwrap();
+            std::fs::write(
+                scratch.join("config"),
+                format!(
+                    "[core]\n\trepositoryformatversion = 0\n\thooksPath = {}\n\tlogAllRefUpdates = true\n\
+                     \tfsmonitor = {}\n[filter \"evil\"]\n\tsmudge = {}\n",
+                    hooks.display(),
+                    hook.display(),
+                    hook.display()
+                ),
+            )
+            .unwrap();
+            // `logs` replaced by a directory whose HEAD aliases the operator index.
+            let _ = std::fs::remove_file(scratch.join("logs"));
+            alias_file(&work.join(".git/index"), &scratch.join("logs/HEAD"));
+        };
+        reset_pinned_worktree_with_env(&pinned, &head(&work), &|_| Vec::new(), &plant).unwrap();
+        assert!(planted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_files_unchanged(&files, &pinned_state);
+        assert!(slot.join("ahead.txt").is_file());
+    }
+
+    /// #1160: the fence permits writes beneath the handles it was built from
+    /// and nothing else, including through a symlink aimed outside them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_write_fence_allows_its_handles_and_refuses_every_other_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.join("keep"), allowed.join("link")).unwrap();
+        let handle = std::fs::File::open(&allowed).unwrap();
+        let fence = WriteFence::new(&[&handle], WriteFence::kernel_abi).unwrap();
+        let run = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            fence.confine_on_exec(&mut command);
+            command.status().unwrap().success()
+        };
+        assert!(run(
+            "echo ok > allowed/new && mv allowed/new allowed/moved && rm allowed/moved"
+        ));
+        assert!(!run("echo no > outside/new"));
+        assert!(!run("echo no > allowed/link"));
+        assert!(!run("rm outside/keep"));
+        assert!(!run("ln -s allowed outside/link"));
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "keep"
+        );
+        assert!(!outside.join("new").exists() && !outside.join("link").exists());
+    }
+
+    /// #1141: the empty-slot fallback deletes relative to the pinned
+    /// `worktrees` handle, so neither a symlinked slot nor a `worktrees`
+    /// directory swapped for a symlink to a same-named empty directory
+    /// elsewhere can redirect the removal.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_empty_slot_fallback_deletes_fd_relative_and_never_follows_a_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("queue");
+        prepare_queue_workspace(&workspace).unwrap();
+        let slot = workspace.join("worktrees").join("slot");
+        // A real empty slot is retired.
+        std::fs::create_dir(&slot).unwrap();
+        remove_empty_queue_dir(&workspace, &slot).unwrap();
+        assert!(slot.symlink_metadata().is_err());
+        // A non-empty slot is refused and kept.
+        std::fs::create_dir(&slot).unwrap();
+        std::fs::write(slot.join("keep"), "x").unwrap();
+        assert!(remove_empty_queue_dir(&workspace, &slot).is_err());
+        assert!(slot.join("keep").exists());
+        std::fs::remove_file(slot.join("keep")).unwrap();
+        std::fs::remove_dir(&slot).unwrap();
+        // A slot swapped for a symlink to an empty directory is refused.
+        let decoy = dir.path().join("decoy");
+        std::fs::create_dir(&decoy).unwrap();
+        std::os::unix::fs::symlink(&decoy, &slot).unwrap();
+        assert!(remove_empty_queue_dir(&workspace, &slot).is_err());
+        assert!(decoy.is_dir());
+        std::fs::remove_file(&slot).unwrap();
+        // `worktrees` swapped for a symlink to a directory holding an empty
+        // same-named slot: the decoy slot survives.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("slot")).unwrap();
+        std::fs::remove_dir(workspace.join("worktrees")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, workspace.join("worktrees")).unwrap();
+        assert!(remove_empty_queue_dir(&workspace, &slot).is_err());
+        assert!(elsewhere.join("slot").is_dir());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_symlinked_workspace_root_is_refused_and_nothing_is_created_through_it() {
+        let (dir, _origin, work) = repos();
+        let (before, note) = dirty_operator(&work);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let workspace = dir.path().join("queue");
+        std::os::unix::fs::symlink(&elsewhere, &workspace).unwrap();
+        let error = ensure_queue_worktree(&workspace, &work).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        // A symlinked `worktrees` directory is refused the same way.
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, workspace.join("worktrees")).unwrap();
+        assert!(ensure_queue_worktree(&workspace, &work).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_operator_untouched(&work, &before, &note);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_plain_non_worktree_directory_is_refused_and_kept() {
+        let (dir, _origin, work) = repos();
+        let (before, note) = dirty_operator(&work);
+        let workspace = dir.path().join("queue");
+        prepare_queue_workspace(&workspace).unwrap();
+        let slot = worktree_dir(&workspace, &work);
+        std::fs::create_dir(&slot).unwrap();
+        std::fs::write(slot.join("precious.txt"), "keep").unwrap();
+        let error = ensure_queue_worktree(&workspace, &work).unwrap_err();
+        assert!(error.contains("not a registered worktree"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(slot.join("precious.txt")).unwrap(),
+            "keep"
+        );
+        // A directory whose `.git` is a copy of the operator's pointer, or a
+        // worktree registered elsewhere, is refused too.
+        std::fs::write(
+            slot.join(".git"),
+            format!("gitdir: {}/.git\n", work.display()),
+        )
+        .unwrap();
+        assert!(ensure_queue_worktree(&workspace, &work).is_err());
+        assert!(slot.join("precious.txt").is_file());
+        assert_operator_untouched(&work, &before, &note);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_empty_leftover_directory_is_recovered_into_a_real_worktree() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        prepare_queue_workspace(&workspace).unwrap();
+        let slot = worktree_dir(&workspace, &work);
+        std::fs::create_dir(&slot).unwrap();
+        let path = ensure_queue_worktree(&workspace, &work).unwrap();
+        assert_eq!(path, slot);
+        assert!(slot.join(".git").is_file());
+        // And the healthy worktree is reused on the next call.
+        assert_eq!(ensure_queue_worktree(&workspace, &work).unwrap(), slot);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_launcher_without_a_workspace_keeps_the_entry_checkout() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = recording_lander(dir.path(), &log, &sha, dir.path());
+        let launcher = LanderLauncher::new(launcher.binary().to_path_buf());
+        queued(&store, &work, &sha, "k").await;
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        assert_eq!(
+            logged(&log, "cwd"),
+            vec![work.canonicalize().unwrap().display().to_string()]
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1790,7 +4594,7 @@ fetched=$(git rev-parse HEAD)
 while [ $# -gt 0 ]; do
   if [ "$1" = --accepted ]; then
     if [ "$2" != "$SKIP" ]; then
-      git merge -q --no-edit "$2" >/dev/null 2>&1 || { git merge --abort; echo 'integration refused: Conflict { paths: ["f"] }' >&2; echo publication_status=not_published; exit 1; }
+      git merge -q --no-edit "$2" >/dev/null 2>&1 || { git merge --abort; echo "integration refused: Conflict { paths: [\"f\"] }; conflict_source=$2" >&2; echo publication_status=not_published; exit 1; }
     fi
     shift
   fi
@@ -1925,6 +4729,44 @@ echo published_target_id=$(git rev-parse HEAD)
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
+    async fn a_green_batch_from_one_owner_wakes_that_owner_once_naming_every_entry() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let owner = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for (index, sha) in shas.iter().enumerate() {
+            ids.push(queued_by(&store, &work, sha, &format!("k{index}"), owner).await);
+        }
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3);
+        let wakes: Vec<_> = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name.starts_with("merge-queue-"))
+            .collect();
+        assert_eq!(wakes.len(), 1, "one owner, one batch, one wake");
+        assert_eq!(wakes[0].wake_session_id, Some(owner));
+        for (sha, id) in shas.iter().zip(&ids) {
+            assert!(wakes[0].message.contains(sha), "{}", wakes[0].message);
+            assert!(wakes[0].message.contains(&id.to_string()));
+            assert_eq!(
+                entry_of(&store, *id).await.state,
+                RollingQueueEntryState::Published
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
     async fn a_reported_source_missing_from_the_published_tip_fails_alone() {
         let (dir, _origin, work) = repos();
         let shas: Vec<String> = ["a", "b", "c"]
@@ -1955,7 +4797,7 @@ echo published_target_id=$(git rev-parse HEAD)
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_merge_conflict_refuses_the_whole_batch_and_publishes_nothing() {
+    async fn a_merge_conflict_refuses_only_the_conflicting_entry() {
         let (dir, _origin, work) = repos();
         let a = commit_file(&work, "a", "shared", "one");
         let b = commit_file(&work, "b", "shared", "two");
@@ -1966,21 +4808,40 @@ echo published_target_id=$(git rev-parse HEAD)
         let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
-        // A conflict belongs to the batch: one run, no split, no partial publish.
-        assert_eq!(lander_runs(&log).len(), 1);
-        assert_eq!(log_lines(&log).iter().filter(|l| *l == "push").count(), 0);
-        for id in ids {
-            let entry = entry_of(&store, id).await;
-            assert_eq!(entry.state, RollingQueueEntryState::Refused);
+        // The conflicting middle entry is refused; the batch retries without it
+        // and publishes the other two with one push.
+        assert_eq!(lander_runs(&log).len(), 2);
+        assert_eq!(log_lines(&log).iter().filter(|l| *l == "push").count(), 1);
+        let retry = lander_runs(&log).pop().unwrap();
+        assert!(retry.contains(&a) && retry.contains(&c) && !retry.contains(&b));
+        for id in [ids[0], ids[2]] {
             assert_eq!(
-                entry.outcome.unwrap().refusal.as_deref(),
-                Some(QUEUE_BATCH_MERGE_CONFLICT)
+                entry_of(&store, id).await.state,
+                RollingQueueEntryState::Published
             );
         }
-        for sha in &shas {
-            assert!(!is_ancestor_of_origin(&work, sha));
-        }
+        let refused = entry_of(&store, ids[1]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let outcome = refused.outcome.unwrap();
+        assert_eq!(outcome.refusal.as_deref(), Some(QUEUE_BATCH_MERGE_CONFLICT));
+        assert!(outcome.detail.unwrap().contains("paths: [\"f\"]"));
+        assert!(is_ancestor_of_origin(&work, &a));
+        assert!(!is_ancestor_of_origin(&work, &b));
+        assert!(is_ancestor_of_origin(&work, &c));
         assert_eq!(wake_count(&store).await, 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_lander_names_the_conflicting_source() {
+        let marked = mark_conflict_source(
+            "integration refused: Conflict { paths: [\"f\"] }".to_string(),
+            "abc123",
+        );
+        assert_eq!(conflict_source(&marked).as_deref(), Some("abc123"));
+        let other = mark_conflict_source("gate failed".to_string(), "abc123");
+        assert_eq!(other, "gate failed");
+        assert_eq!(conflict_source(&other), None);
     }
 
     /// Guard shell for the merging fake lander: any run whose `--accepted`
@@ -2068,6 +4929,106 @@ echo published_target_id=$(git rev-parse HEAD)
         let landed = entry.outcome.unwrap().landed_sha.unwrap();
         assert_eq!(landed.len(), 40);
         assert!(is_ancestor_of_origin(work, sha));
+    }
+
+    fn events_of(store: &Store, kind: &str) -> Vec<serde_json::Value> {
+        store
+            .conn
+            .prepare("SELECT detail_json FROM rolling_queue_events WHERE kind=?1 ORDER BY id")
+            .unwrap()
+            .query_map([kind], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(|detail| serde_json::from_str(&detail.unwrap().unwrap()).unwrap())
+            .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_red_gate_event_names_the_failing_tests_and_a_log_that_exists() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(
+            dir.path(),
+            &work,
+            &log,
+            &red_when_any(&[(shas[1].as_str(), "q::red_b")]),
+        )
+        .with_workspace(dir.path().join("queue"));
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        queue_all(&store, &work, &shas, None).await;
+        run_next_batch(&store, &launcher, 3).await.unwrap();
+        let guard = store.lock().await;
+        let mut details = events_of(&guard, "bisect_started");
+        details.extend(events_of(&guard, "bisect_gate"));
+        let red: Vec<&serde_json::Value> = details
+            .iter()
+            .filter(|detail| detail["outcome"] != "green")
+            .collect();
+        assert!(!red.is_empty(), "{details:?}");
+        for detail in red {
+            let cause = detail["cause"].as_str().unwrap();
+            assert!(cause.contains("gate_failed"), "{cause}");
+            assert!(cause.contains("failing_tests=q::red_b"), "{cause}");
+            let path = detail["log"].as_str().unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("q::red_b ... FAILED"), "{text}");
+        }
+        // The settled entry points at a log too.
+        let red_entry = guard
+            .conn
+            .query_row(
+                "SELECT outcome_json FROM rolling_queue_entries WHERE state='refused'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(red_entry.contains("lander_log="), "{red_entry}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_conflict_refusal_event_names_the_conflicting_path() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let body = format!(
+            "case \" $* \" in *\" {} \"*) echo 'integration refused: Conflict {{ paths: [\"src/x.rs\", \"y.rs\"] }}; conflict_source={}' >&2; exit 1;; esac\nexit 1",
+            shas[0], shas[0]
+        );
+        let launcher = fake_lander(dir.path(), &body).with_workspace(dir.path().join("queue"));
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        queue_all(&store, &work, &shas, None).await;
+        run_next_batch(&store, &launcher, 2).await.unwrap();
+        let guard = store.lock().await;
+        let events = events_of(&guard, "conflict_isolated");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let cause = events[0]["cause"].as_str().unwrap();
+        assert!(cause.contains("conflict_paths=src/x.rs,y.rs"), "{cause}");
+        assert!(std::path::Path::new(events[0]["log"].as_str().unwrap()).exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_run_log_directory_keeps_only_the_newest_bounded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(RUN_LOG_STREAM_BYTES + 4096);
+        let batch = Uuid::new_v4();
+        let mut last = None;
+        for _ in 0..(RUN_LOG_KEEP_FILES + 7) {
+            last = write_run_log(dir.path(), batch, "hdr", &big, "err");
+        }
+        let count = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(count, RUN_LOG_KEEP_FILES);
+        let last = last.unwrap();
+        assert!(last.exists(), "the newest log survives rotation");
+        let size = std::fs::metadata(&last).unwrap().len() as usize;
+        assert!(size < RUN_LOG_STREAM_BYTES + 512, "{size}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -2940,11 +5901,11 @@ exit 0
         sh(
             work,
             &format!(
-                "git checkout -q -B ext origin/rolling && mkdir -p crates/rsid/src/store/migrations \
-                 && printf 'impl Store {{}}\\n' > crates/rsid/src/store/migrations/v901.rs \
+                "git checkout -q -B ext origin/rolling && mkdir -p crates/rsid-store/src/store/migrations \
+                 && printf 'impl Store {{}}\\n' > crates/rsid-store/src/store/migrations/v901.rs \
                  && git add -A && git commit -qm ext901 && git push -q origin HEAD:rolling \
                  && git checkout -q -B land origin/rolling && git merge -q --no-commit --no-ff {b} \
-                 && printf 'impl Store {{}}\\n' > crates/rsid/src/store/migrations/v902.rs \
+                 && printf 'impl Store {{}}\\n' > crates/rsid-store/src/store/migrations/v902.rs \
                  && git add -A && git commit -qm provisional && git push -q origin HEAD:rolling"
             ),
         );

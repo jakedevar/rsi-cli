@@ -3137,7 +3137,7 @@ async fn migration_scratch(f: &Fixture) -> MigrationScratch {
     let migration_dir = inventory["migration_dir"].as_str().unwrap().to_string();
     let mut paths = std::collections::BTreeSet::from([
         "tools/released-migrations.json".to_string(),
-        "crates/rsid/src/store/mod.rs".to_string(),
+        "crates/rsid-store/src/store/mod.rs".to_string(),
     ]);
     for entry in std::fs::read_dir(repo.join(&migration_dir)).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
@@ -3291,9 +3291,12 @@ async fn the_schema_head_follows_the_store_layout_of_the_revision() {
         &dir.path().join("per-file"),
         &[
             ("tools/released-migrations.json", &manifest(7)),
-            ("crates/rsid/src/store/mod.rs", "// no declaration here\n"),
-            ("crates/rsid/src/store/migrations/v000.rs", "// v0\n"),
-            ("crates/rsid/src/store/migrations/v007.rs", "// v7\n"),
+            (
+                "crates/rsid-store/src/store/mod.rs",
+                "// no declaration here\n",
+            ),
+            ("crates/rsid-store/src/store/migrations/v000.rs", "// v0\n"),
+            ("crates/rsid-store/src/store/migrations/v007.rs", "// v7\n"),
         ],
     );
     let legacy = scratch_store_repo(
@@ -3301,7 +3304,7 @@ async fn the_schema_head_follows_the_store_layout_of_the_revision() {
         &[
             ("tools/released-migrations.json", &manifest(7)),
             (
-                "crates/rsid/src/store/mod.rs",
+                "crates/rsid-store/src/store/mod.rs",
                 "pub const LATEST_SCHEMA_VERSION: i32 = 7;\n",
             ),
         ],
@@ -3310,8 +3313,11 @@ async fn the_schema_head_follows_the_store_layout_of_the_revision() {
         &dir.path().join("stale"),
         &[
             ("tools/released-migrations.json", &manifest(8)),
-            ("crates/rsid/src/store/mod.rs", "// no declaration here\n"),
-            ("crates/rsid/src/store/migrations/v007.rs", "// v7\n"),
+            (
+                "crates/rsid-store/src/store/mod.rs",
+                "// no declaration here\n",
+            ),
+            ("crates/rsid-store/src/store/migrations/v007.rs", "// v7\n"),
         ],
     );
     // A per-file tip takes its head from the highest vNNN.rs file.

@@ -83,6 +83,7 @@ fn satellite_operator_methods_stay_out_of_agent_catalogs() {
         "GetSatelliteInboundPolicy",
         "PutSatelliteInboundPolicy",
         "DeliverHubMessage",
+        "FetchHubReports",
         "RequestHubDeploy",
     ] {
         assert!(!agent_gate::AGENT_VERBS.contains(&method));
@@ -106,6 +107,33 @@ fn satellite_operator_methods_stay_out_of_agent_catalogs() {
             "putsatellitelink",
             "probesatellitelink",
             "listhubsatellitesessions",
+        ] {
+            assert!(!catalog.contains(forbidden));
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn remote_operator_methods_stay_out_of_agent_catalogs() {
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in ["RemoteGetStatus", "RemoteSetConfig"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method));
+        assert!(!agent_gate::READ_VERBS.contains(&method));
+        assert!(!agent_gate::UNSCOPED_READ_VERBS.contains(&method));
+        assert!(!agent_gate::is_allowed_for_attributed_caller(method));
+        assert!(!catalog.iter().any(|entry| entry.method == method));
+    }
+    for source in [
+        include_str!("../tool_registry.rs"),
+        include_str!("../session/harness/tools/rsi_control.rs"),
+    ] {
+        let catalog = source.to_ascii_lowercase();
+        for forbidden in [
+            "remotegetstatus",
+            "remotesetconfig",
+            "remote_set_config",
+            "remote_get_status",
         ] {
             assert!(!catalog.contains(forbidden));
         }
@@ -377,7 +405,9 @@ fn agent_schema_catalog_matches_the_independent_authorization_allowlist() {
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(catalog.len(), 53);
+    // No hand-pinned count (#1116): the set equality is the intent, and a
+    // new verb must be declared in the descriptor table and the verb registry.
+    assert!(!catalog.is_empty());
     assert_eq!(catalog, authorization);
 }
 
@@ -4619,6 +4649,16 @@ async fn manager_rpc_appointment_is_operator_only() {
         "ConfigureHarnessManagerPolicy",
         "GetHarnessManagerState",
         "AnswerHarnessManagerDecision",
+        "ConfigureGlobalManager",
+        "GetGlobalManager",
+        "RevokeGlobalManager",
+        "RequestOperatorRestart",
+        "GetOperatorRestart",
+        "CancelOperatorRestart",
+        "ForceOperatorRestart",
+        "ListLegacyScratch",
+        "AdoptLegacyScratch",
+        "GetManagerTree",
     ] {
         assert!(!agent_gate::AGENT_VERBS.contains(&method));
         assert!(!agent_gate::READ_VERBS.contains(&method));
@@ -6371,7 +6411,12 @@ async fn efficiency_metrics_rpc_is_operator_only_and_not_agent_cataloged() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn agent_job_verbs_are_agent_cataloged_and_not_read_verbs() {
-    for verb in ["AgentSubmitJob", "AgentGetJob", "AgentListJobs"] {
+    for verb in [
+        "AgentSubmitJob",
+        "AgentGetJob",
+        "AgentListJobs",
+        "AgentCancelJob",
+    ] {
         assert!(agent_gate::AGENT_VERBS.contains(&verb), "{verb}");
         assert!(!agent_gate::READ_VERBS.contains(&verb), "{verb}");
     }
@@ -18120,4 +18165,242 @@ fn verb_declarations_and_dispatch_arms_agree() {
         assert_eq!(audience_of(method), None, "{method}");
         assert!(!agent_gate::is_allowed_for_attributed_caller(method));
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_rpc_manager_tree_snapshots_pages_and_reports_counts() {
+    use rsi_common::harness_manager_v2::{
+        ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerLaunchChoiceV2,
+        ManagerOperatingModeV2, ManagerPolicyV2,
+    };
+    use rsi_common::manager_nodes::{
+        ConfigureManagerNodeRequestV1, ManagerNodeAllowanceV1, ManagerNodeGrantV1,
+        ManagerNodeSelectorV1,
+    };
+    use rsi_common::manager_tree::{GetManagerTreeResultV1, ManagerTreeKindV1};
+    use rsi_common::types::{Project, SessionKind, SessionProvider};
+    let fixture = recursive_dag_rpc_fixture();
+    let project = issue_rpc_project_id();
+    let project2 = Uuid::new_v4();
+    let (owner, owner2, area_seat, group, epic, global_seat) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    {
+        let store = fixture.manager.store().lock().await;
+        store
+            .insert_project(&Project {
+                id: project2,
+                name: "Second project".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.to_string(),
+                context_files: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        for (id, kind, parent, lead, in_project) in [
+            (owner, SessionKind::Standard, None, None, Some(project)),
+            (owner2, SessionKind::Standard, None, None, Some(project2)),
+            (area_seat, SessionKind::Standard, None, None, Some(project)),
+            (global_seat, SessionKind::Standard, None, None, None),
+            (group, SessionKind::Group, None, None, Some(project)),
+            (
+                epic,
+                SessionKind::Epic,
+                Some(group),
+                Some(area_seat),
+                Some(project),
+            ),
+        ] {
+            let mut session = mk_agent_test_session(id, kind, parent, lead);
+            session.project_id = in_project;
+            store.insert_session(&session).unwrap();
+        }
+    }
+    for (p, s) in [(project, owner), (project2, owner2)] {
+        let appointed = call_rpc(&fixture.server, "ConfigureHarnessManager", serde_json::json!({
+            "project_id":p,"session_id":s,"epic_ids":null,"group_ids":[],"expected_row_version":0
+        })).await;
+        assert!(appointed.error.is_none(), "{:?}", appointed.error);
+    }
+    let root_policy = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerPolicy",
+        serde_json::json!(ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: project,
+            expected_scope_version: 1,
+            expected_policy_version: 0,
+            idempotency_key: "root-grant".into(),
+            policy: ManagerPolicyV2 {
+                mode: ManagerOperatingModeV2::Execute,
+                capabilities: vec![
+                    ManagerCapabilityV2::WorkPlan,
+                    ManagerCapabilityV2::LeadControl
+                ],
+                max_active_sessions: 8,
+                ..Default::default()
+            },
+        }),
+    )
+    .await;
+    assert!(root_policy.error.is_none(), "{:?}", root_policy.error);
+    let listed = call_rpc(
+        &fixture.server,
+        "ListManagerNodes",
+        serde_json::json!({"project_id":project,"limit":64}),
+    )
+    .await;
+    let root = &listed.result.as_ref().unwrap()["rows"][0];
+    let root_id: Uuid = serde_json::from_value(root["node_id"].clone()).unwrap();
+    let created = call_rpc(
+        &fixture.server,
+        "ConfigureManagerNode",
+        serde_json::json!(ConfigureManagerNodeRequestV1 {
+            node_id: None,
+            parent_node_id: root_id,
+            project_id: project,
+            seat_root_session_id: area_seat,
+            selector: ManagerNodeSelectorV1::Selected {
+                group_ids: vec![],
+                epic_ids: vec![epic],
+            },
+            grant: ManagerNodeGrantV1 {
+                capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                allowed_launches: vec![],
+                allowance: ManagerNodeAllowanceV1 {
+                    max_created_containers: 0,
+                    max_created_sessions: 0,
+                    max_active_sessions: 3,
+                    max_build_slots: 0,
+                    max_disk_gib: 0,
+                    provider_limits: vec![],
+                    max_spend_usd: None,
+                },
+                max_direct_reports: 4,
+            },
+            policy: ManagerPolicyV2 {
+                mode: ManagerOperatingModeV2::Monitor,
+                capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                max_active_sessions: 3,
+                ..Default::default()
+            },
+            expected_parent_grant_version: root["grant_version"].as_i64().unwrap(),
+            expected_parent_policy_version: root["policy_version"].as_i64().unwrap(),
+            expected_parent_authority_epoch: root["authority_epoch"].as_i64().unwrap(),
+            expected_node_grant_version: 0,
+            idempotency_key: "tree-area".into(),
+        }),
+    )
+    .await;
+    assert!(created.error.is_none(), "{:?}", created.error);
+    let area_id: Uuid = serde_json::from_value(created.result.unwrap()["node_id"].clone()).unwrap();
+    let granted = call_rpc(
+        &fixture.server,
+        "ConfigureGlobalManager",
+        serde_json::json!({
+            "session_id": global_seat,
+            "project_ids": [project, project2],
+            "allowed_launches": [ManagerLaunchChoiceV2 {
+                provider: SessionProvider::Claude,
+                model: "claude-opus-5-5".into(),
+                effort: Some("high".into()),
+            }],
+            "project_policy": ManagerPolicyV2::default(),
+            "expected_grant_version": 0,
+            "idempotency_key": "tree-global",
+        }),
+    )
+    .await;
+    assert!(granted.error.is_none(), "{:?}", granted.error);
+
+    let page = |after: Option<String>, limit: u16| {
+        let server = &fixture.server;
+        async move {
+            let response = call_rpc(
+                server,
+                "GetManagerTree",
+                serde_json::json!({"after": after, "limit": limit}),
+            )
+            .await;
+            (
+                response.error.clone(),
+                response
+                    .result
+                    .map(|value| serde_json::from_value::<GetManagerTreeResultV1>(value).unwrap()),
+            )
+        }
+    };
+    let (error, full) = page(None, 200).await;
+    assert!(error.is_none(), "{error:?}");
+    let full = full.unwrap();
+    let kinds: Vec<_> = full.rows.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds[0], ManagerTreeKindV1::Global);
+    assert_eq!(full.total_rows, full.rows.len() as u64);
+    assert_eq!(full.global_grant_version, Some(1));
+    assert!(full.complete);
+    let area = full
+        .rows
+        .iter()
+        .find(|r| r.node_id == Some(area_id))
+        .expect("area row");
+    assert_eq!(area.kind, ManagerTreeKindV1::Area);
+    assert_eq!(area.scope.as_deref(), Some("0 groups, 1 epic"));
+    assert_eq!(
+        area.parent_key.as_deref(),
+        Some(format!("project:{project}").as_str())
+    );
+    assert_eq!(area.grant.as_ref().unwrap().max_active_sessions, 3);
+    assert_eq!(area.load.pending_escalations, Some(0));
+    assert_eq!(area.focus_session_id, Some(area_seat));
+    let epic_row = full
+        .rows
+        .iter()
+        .find(|r| r.epic_id == Some(epic))
+        .expect("epic row");
+    assert_eq!(epic_row.parent_key.as_deref(), Some(area.key.as_str()));
+    assert_eq!(epic_row.focus_session_id, Some(area_seat));
+    assert_eq!(epic_row.depth, area.depth + 1);
+    let pm_rows: Vec<_> = full
+        .rows
+        .iter()
+        .filter(|r| r.kind == ManagerTreeKindV1::Project)
+        .collect();
+    assert_eq!(pm_rows.len(), 2);
+    assert!(pm_rows.iter().any(|r| r.focus_session_id == Some(owner)));
+    assert!(pm_rows.iter().any(|r| r.focus_session_id == Some(owner2)));
+    assert_eq!(full.rows[0].load.direct_reports, Some(2));
+
+    // Paging walks every row exactly once and total_rows never shrinks.
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let (error, page) = page(after.clone(), 2).await;
+        assert!(error.is_none(), "{error:?}");
+        let page = page.unwrap();
+        assert_eq!(page.total_rows, full.total_rows);
+        assert!(page.rows.len() <= 2);
+        seen.extend(page.rows.iter().map(|r| r.key.clone()));
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let all: Vec<_> = full.rows.iter().map(|r| r.key.clone()).collect();
+    assert_eq!(seen, all);
+    let (error, _) = page(Some("area:missing".into()), 5).await;
+    assert!(error.unwrap().message.contains("manager_tree_stale_cursor"));
+    let (error, _) = page(None, 0).await;
+    assert!(
+        error
+            .unwrap()
+            .message
+            .contains("manager_tree_invalid_request")
+    );
 }

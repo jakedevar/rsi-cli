@@ -53,6 +53,12 @@ impl std::fmt::Debug for ManagerSuccessionLaunchContext {
     }
 }
 
+/// #1166: how long the succession publication keeps retrying a busy custody
+/// stripe (releasing every lock between attempts) before surrendering with the
+/// typed retryable `root_busy`.
+const PUBLICATION_STRIPE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const PUBLICATION_STRIPE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
 impl AgentControlHandle {
     pub(super) async fn enqueue_root_manager_succession(
         &self,
@@ -309,6 +315,51 @@ impl ManagerSuccessionLaunchContext {
             .current_token()
             .await
             .ok_or_else(|| refused("manager_succession_token_changed"))?;
+        // The commit authenticates and writes under the active map, the Store and
+        // the token registry, so it must never wait for a custody stripe there: a
+        // busy stripe returns the typed retryable `root_busy` with everything
+        // released and the whole (pre-write) critical section is retried after an
+        // asynchronous back-off (#1166).
+        let deadline = tokio::time::Instant::now() + PUBLICATION_STRIPE_BUDGET;
+        let (predecessor, receipt) = loop {
+            match self.commit_publication(&claim, generation, &token).await {
+                Err(error)
+                    if crate::store::custody_lock_order::is_lock_order_busy_error(&error)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(PUBLICATION_STRIPE_BACKOFF).await;
+                }
+                result => break result?,
+            }
+        };
+        let old_id = predecessor.id;
+        self.runtime
+            .completed
+            .write()
+            .await
+            .entry(old_id)
+            .and_modify(|old| old.session = predecessor.clone())
+            .or_insert_with(|| completed_row(predecessor));
+        self.runtime.bus.publish(DaemonEvent::SessionArchived {
+            session_id: old_id,
+            projection_id: None,
+        });
+        self.predecessor_guard.lock().await.take();
+        if let Some(tx) = self.confirmation.lock().await.take() {
+            let _ = tx.send(Ok(receipt));
+        }
+        Ok(())
+    }
+
+    /// The publication's critical section: candidate liveness, token and the
+    /// durable commit, under the active map, the Store and the token registry.
+    /// Returns the archived predecessor row and the receipt.
+    async fn commit_publication(
+        &self,
+        claim: &ManagerSuccessionClaim,
+        generation: u64,
+        token: &str,
+    ) -> Result<(rsi_common::types::Session, ManagerActionReceiptV2)> {
         let mut active = self.runtime.active.write().await;
         let tracked = active
             .get_mut(&self.candidate)
@@ -334,7 +385,7 @@ impl ManagerSuccessionLaunchContext {
         }
         let store = self.runtime.store.lock().await;
         let mut tokens = self.runtime.tokens.write().await;
-        if tokens.get(&token).copied() != Some(self.candidate) {
+        if tokens.get(token).copied() != Some(self.candidate) {
             return Err(refused("manager_succession_token_changed"));
         }
         let proof = ManagerSuccessionPublicationWitness::after_provider_established(
@@ -343,12 +394,13 @@ impl ManagerSuccessionLaunchContext {
             claim.reservation.launch_attempt_id,
             claim.action.boot_id,
         )?;
-        // Store acquires distinct sorted custody shards itself. Runtime retains
-        // only spawn/cwd/process/token witnesses here, never those shard locks.
+        // Store takes the distinct sorted custody shards itself, without waiting.
+        // Runtime retains only spawn/cwd/process/token witnesses here, never
+        // those shard locks.
         let mut predecessor = store
             .get_session(claim.reservation.predecessor_session_id)?
             .ok_or_else(|| refused("manager_session_unavailable"))?;
-        let receipt = store.commit_manager_succession(&claim, &proof)?;
+        let receipt = store.commit_manager_succession(claim, &proof)?;
         // No fallible post-commit read may abandon the established writer before
         // its monitor takes ownership. This is the exact metadata-only mutation
         // committed above; candidate runtime counters remain intact.
@@ -358,23 +410,7 @@ impl ManagerSuccessionLaunchContext {
         drop(tokens);
         drop(store);
         drop(active);
-        let old_id = predecessor.id;
-        self.runtime
-            .completed
-            .write()
-            .await
-            .entry(old_id)
-            .and_modify(|old| old.session = predecessor.clone())
-            .or_insert_with(|| completed_row(predecessor));
-        self.runtime.bus.publish(DaemonEvent::SessionArchived {
-            session_id: old_id,
-            projection_id: None,
-        });
-        self.predecessor_guard.lock().await.take();
-        if let Some(tx) = self.confirmation.lock().await.take() {
-            let _ = tx.send(Ok(receipt));
-        }
-        Ok(())
+        Ok((predecessor, receipt))
     }
     /// Also used by the deferred task's exit guard. An unknown process keeps a
     /// CleanupRequired record and admitted capacity; it never triggers resend.

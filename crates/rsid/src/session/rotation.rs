@@ -12,9 +12,19 @@ mod recovery;
     test,
     any(not(feature = "test-shard-mode"), feature = "test-shard-session-04")
 ))]
+mod context_cap_tests;
+#[cfg(all(
+    test,
+    any(not(feature = "test-shard-mode"), feature = "test-shard-session-04")
+))]
 mod context_succession_tests;
 #[cfg(test)]
 mod fence_tests;
+#[cfg(all(
+    test,
+    any(not(feature = "test-shard-mode"), feature = "test-shard-session-04")
+))]
+mod stripe_liveness_tests;
 use super::types::{
     CompletedSession, ROTATION_HANDOFF_PROMPT, TrackedSession, install_context_budget,
 };
@@ -2653,6 +2663,32 @@ impl SessionManager {
                 refuse!("event_lookup_failed");
             }
         }
+        // #1142 F1/R1: an automatic coordinator-cap rotation runs only against
+        // the exact idle incarnation it was planned for and only while the
+        // operator's pause, rotation-disable and review protection allow it.
+        // Under the predecessor's spawn guard, a seat that resumed, changed or
+        // was stopped is deferred back to due: no refusal, no interrupt,
+        // nothing removed.
+        match super::context_cap::check_execution_fence(
+            &store,
+            &active,
+            &completed,
+            &runtime_config,
+            session_id,
+            rotation_id_for_log.as_deref(),
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                tracing::info!(%session_id, reason, "Coordinator cap rotation deferred: the seat is not the idle incarnation it was planned for");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "Coordinator cap fence check failed closed");
+                refuse!("cap_fence_error");
+            }
+        }
         let settlement_fence = {
             store
                 .lock()
@@ -2800,12 +2836,14 @@ impl SessionManager {
         let child_query = if let Some(ref path) = handoff_filepath {
             format!("/resume_handoff {}", path)
         } else {
+            // #1005: a seat rotated at its coordinator context cap starts
+            // from the daemon-written handoff (typed state), not the task.
             let task_result = {
                 let store_guard = store.lock().await;
-                resolve_rotation_task_query(&store_guard, &parent_completed.session)
+                super::context_cap::cap_handoff_or_task(&store_guard, &parent_completed.session)
             };
-            let task = match task_result {
-                Ok(Some((_, task))) => task,
+            let (task, from_cap_handoff) = match task_result {
+                Ok(Some(task)) => task,
                 Ok(None) => {
                     completed.write().await.insert(session_id, parent_completed);
                     refuse!("no_task");
@@ -2816,10 +2854,14 @@ impl SessionManager {
                     refuse!("task_lookup_failed");
                 }
             };
-            format!(
-                "{task}\n\n{}",
-                rotation_task_pointer(&parent_completed.session, PointerKind::Rotation).await
-            )
+            if from_cap_handoff {
+                task
+            } else {
+                format!(
+                    "{task}\n\n{}",
+                    rotation_task_pointer(&parent_completed.session, PointerKind::Rotation).await
+                )
+            }
         };
         let parent_rotation_depth = parent_completed.session.rotation_depth;
         let child_budget = crate::provider_capabilities::resolve_new_incarnation_context_budget(
@@ -2964,7 +3006,9 @@ impl SessionManager {
         // Parent archival is deferred into spawn_rotation_child (Phase 4 saga):
         // the parent is archived ONLY after the child is confirmed launched.
         // If child launch fails, the parent is rolled back into the completed map.
-        Self::spawn_rotation_child(
+        // #1148: boxed so the ~24 KiB spawn state lives on the heap, not inline
+        // in this future (and in every caller of it).
+        Box::pin(Self::spawn_rotation_child(
             session_id,
             None,
             child_query,
@@ -2993,7 +3037,7 @@ impl SessionManager {
             custody_runtime,
             Some(cwd_admission_guard),
             Some(predecessor_spawn_guard),
-        )
+        ))
         .await;
         // The launch path records `completed` at the publication point, or
         // its own `refused:lead_transfer` when publication is refused (C4).
@@ -4656,7 +4700,9 @@ impl SessionManager {
         let monitor_result = std::panic::AssertUnwindSafe(Box::pin(async move {
             #[cfg(test)]
             panic_rotation_monitor_for_test(child_id);
-            Self::monitor_session(
+            // #1148: the monitor loop's state is the largest future in the
+            // rotation path; box it so it is not copied through this block.
+            Box::pin(Self::monitor_session(
                 child_id,
                 spawn_generation,
                 child_provider_session,
@@ -4682,7 +4728,7 @@ impl SessionManager {
                 agent_message_arbiter,
                 monitor_codegraph_handle,
                 monitor_custody_runtime,
-            )
+            ))
             .await;
         }));
         match futures::FutureExt::catch_unwind(monitor_result).await {
@@ -4884,6 +4930,30 @@ impl SessionManager {
             }
         }
 
+        self.spawn_completed_rotation(
+            session_id,
+            Uuid::new_v4().to_string(),
+            "manual_triggered",
+            Some((
+                "manual_triggered",
+                serde_json::json!({ "manual": true }).to_string(),
+            )),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Log the rotation's trigger event (`trigger` = event type and metadata;
+    /// `None` for a replay whose trigger is already on record) and spawn the
+    /// completed-session rotation as a background task under `rotation_id`.
+    async fn spawn_completed_rotation(
+        &self,
+        session_id: Uuid,
+        rotation_id: String,
+        intent_trigger: &str,
+        trigger: Option<(&str, String)>,
+    ) -> Result<()> {
         // Spawn rotation for completed session as background task
         let active = self.active.clone();
         let completed = self.completed.clone();
@@ -4903,18 +4973,28 @@ impl SessionManager {
         let codegraph_handle = self.codegraph_handle.clone();
         let custody_runtime = self.custody_execution_runtime();
         let model_call_settlements = self.model_call_settlements.handle()?;
-        let rotation_id = Uuid::new_v4().to_string();
-        let metadata = serde_json::json!({ "manual": true }).to_string();
-        let _ = self
-            .persistence
-            .log_rotation_event(
-                session_id,
-                &rotation_id,
-                "completed",
-                "manual_triggered",
-                Some(metadata),
-            )
-            .await;
+        // #1149: every rotation of an idle seat (the manual trigger and the
+        // cap pass alike) is a durable open intent before its decider can
+        // reserve a successor, so a crash anywhere up to the publication
+        // leaves an intent restart recovery owns. Fail closed: no intent, no
+        // rotation.
+        self.store.lock().await.record_completed_trigger_intent(
+            session_id,
+            &rotation_id,
+            intent_trigger,
+        )?;
+        if let Some((event_type, metadata)) = trigger {
+            let _ = self
+                .persistence
+                .log_rotation_event(
+                    session_id,
+                    &rotation_id,
+                    "completed",
+                    event_type,
+                    Some(metadata),
+                )
+                .await;
+        }
         tokio::spawn(async move {
             Self::rotate_completed_session(
                 session_id,
@@ -4943,6 +5023,69 @@ impl SessionManager {
         });
 
         Ok(())
+    }
+
+    /// #1142 F1: the automatic coordinator-cap trigger. It rotates only an
+    /// idle (`Completed`, not active) seat and never takes the running-session
+    /// branch of [`Self::trigger_rotation`], so it can never interrupt a turn
+    /// or tool call. A seat that resumed is `Deferred`. The decider repeats
+    /// the exact-incarnation check under the predecessor's spawn guard
+    /// (`context_cap::check_idle_fence`); this entry only filters and logs.
+    ///
+    /// `rotation_id` is the request's stable operation identity: a replay
+    /// (for instance after a restart) logs its trigger once and reaches the
+    /// decider's replay guard.
+    pub(super) async fn trigger_cap_rotation(
+        &self,
+        session_id: Uuid,
+        rotation_id: &str,
+    ) -> Result<super::context_cap::CapDispatch> {
+        use super::context_cap::CapDispatch;
+        if !self.context_rotation_enabled {
+            return Err(DaemonError::Rpc(
+                "Context rotation is disabled (set RSI_CONTEXT_ROTATION_ENABLED=1 to enable)"
+                    .to_string(),
+            ));
+        }
+        if self.active.read().await.contains_key(&session_id) {
+            return Ok(CapDispatch::Deferred("seat_resumed"));
+        }
+        {
+            let completed = self.completed.read().await;
+            let Some(cs) = completed.get(&session_id) else {
+                return Ok(CapDispatch::Deferred("seat_not_idle"));
+            };
+            if cs.session.status != SessionStatus::Completed {
+                return Ok(CapDispatch::Deferred("seat_not_idle"));
+            }
+            if cs.session.claude_session_id.is_none() {
+                return Err(DaemonError::Rpc(
+                    "Cannot rotate: no provider session ID captured".to_string(),
+                ));
+            }
+        }
+        let triggered: bool = self.store.lock().await.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rotation_events WHERE session_id=?1 AND rotation_id=?2
+               AND event_type='cap_triggered')",
+            rusqlite::params![session_id.to_string(), rotation_id],
+            |row| row.get(0),
+        )?;
+        // A replay's trigger is already on record; the decider's
+        // terminal-event guard makes a second dispatch a no-op.
+        let trigger = (!triggered).then(|| {
+            (
+                "cap_triggered",
+                serde_json::json!({ "manual": false, "context_cap": true }).to_string(),
+            )
+        });
+        self.spawn_completed_rotation(
+            session_id,
+            rotation_id.to_string(),
+            super::context_cap::CAP_TRIGGER,
+            trigger,
+        )
+        .await?;
+        Ok(CapDispatch::Started)
     }
 }
 
@@ -5221,7 +5364,7 @@ mod tests {
     /// Manager fixture for driving the rotation statics directly (mirrors
     /// `session::tests::manager`, which is private to that module).
     #[allow(clippy::expect_used)]
-    fn rotation_manager_with_context_rotation(
+    pub(super) fn rotation_manager_with_context_rotation(
         context_rotation_enabled: bool,
     ) -> (SessionManager, tempfile::TempDir) {
         // Live sandbox fixtures need a disk-backed root: execution scratch
@@ -5378,15 +5521,55 @@ mod tests {
         repo
     }
 
-    struct LiveRotationFixture {
-        parent: Session,
-        repo: std::path::PathBuf,
-        root: std::path::PathBuf,
-        branch: String,
-        custody_id: Uuid,
+    pub(super) struct LiveRotationFixture {
+        pub(super) parent: Session,
+        pub(super) repo: std::path::PathBuf,
+        pub(super) root: std::path::PathBuf,
+        pub(super) branch: String,
+        pub(super) custody_id: Uuid,
     }
 
-    async fn persist_live_rotation_parent(
+    /// #1156 fixture: reserve a rotation successor of the live sandboxed
+    /// `fixture.parent` under `rotation_id` and bind it to the parent's
+    /// transferred sandbox custody, exactly as the decider does before the
+    /// child's first turn. The parent has not been archived or published.
+    pub(super) async fn reserve_and_bind_live_successor_for_test(
+        manager: &SessionManager,
+        fixture: &LiveRotationFixture,
+        rotation_id: &str,
+    ) -> anyhow::Result<Session> {
+        let runtime = manager.custody_execution_runtime();
+        let candidate = runtime.prepare_rotation_successor(&fixture.parent).await?;
+        let mut child = test_session(Uuid::new_v4(), SessionStatus::Starting);
+        child.provider = SessionProvider::Claude;
+        child.working_dir = fixture.repo.clone();
+        child.project_id = fixture.parent.project_id;
+        child.continued_from = Some(fixture.parent.id);
+        child.rotation_depth = 1;
+        child.query = "bound rotation successor".into();
+        crate::sandbox::custody::CustodyExecutionRuntime::apply_rotation_successor_tuple(
+            &candidate,
+            &fixture.parent,
+            &mut child,
+        )?;
+        let invocation_id = Uuid::new_v4();
+        {
+            let mut store = manager.store.lock().await;
+            insert_rotation_invocation_fixture(&store, child.id, invocation_id, "running");
+            store.insert_reserved_rotation_session_with_invocation(
+                &child,
+                invocation_id,
+                rotation_id,
+            )?;
+        }
+        runtime
+            .bind_rotation_successor(candidate, &fixture.parent, &child)
+            .await
+            .map_err(|_| anyhow::anyhow!("bind the live rotation successor"))?;
+        Ok(child)
+    }
+
+    pub(super) async fn persist_live_rotation_parent(
         manager: &SessionManager,
         fixture_root: &std::path::Path,
         project_id: Option<Uuid>,
@@ -5462,7 +5645,92 @@ mod tests {
         }
     }
 
-    fn insert_rotation_invocation_fixture(
+    /// A sandboxed coordinator seat (#1158): the live parent holds the Epic's
+    /// lead pointer and the global manager grant.
+    pub(super) struct SeatedParent {
+        pub(super) fixture: LiveRotationFixture,
+        pub(super) epic: Uuid,
+    }
+
+    pub(super) async fn seated_live_parent(
+        manager: &SessionManager,
+        root: &std::path::Path,
+    ) -> anyhow::Result<SeatedParent> {
+        use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ManagerCapabilityV2, ManagerLaunchChoiceV2, ManagerOperatingModeV2, ManagerPolicyV2,
+        };
+        use rsi_common::types::{Project, SessionKind, SessionProvider};
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "blocked rotation seat".into(),
+            path: None,
+            description: None,
+            color: Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        manager.store.lock().await.insert_project(&project)?;
+        let mut fixture = persist_live_rotation_parent(manager, root, Some(project.id)).await;
+        let mut group = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        group.session_kind = rsi_common::types::SessionKind::Group;
+        let mut epic = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        epic.session_kind = SessionKind::Epic;
+        epic.parent_id = Some(group.id);
+        fixture.parent.parent_id = Some(epic.id);
+        let store = manager.store.lock().await;
+        store.insert_session(&group)?;
+        store.insert_session(&epic)?;
+        store.conn.execute(
+            "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+            rusqlite::params![fixture.parent.id.to_string(), epic.id.to_string()],
+        )?;
+        store.set_lead_session(epic.id, Some(fixture.parent.id))?;
+        store.configure_global_manager(
+            &ConfigureGlobalManagerRequestV1 {
+                session_id: fixture.parent.id,
+                project_ids: vec![project.id],
+                allowed_launches: vec![ManagerLaunchChoiceV2 {
+                    provider: SessionProvider::Claude,
+                    model: "claude-opus-5-5".into(),
+                    effort: Some("high".into()),
+                }],
+                project_policy: ManagerPolicyV2 {
+                    mode: ManagerOperatingModeV2::Execute,
+                    capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                    ..ManagerPolicyV2::default()
+                },
+                expected_grant_version: 0,
+                idempotency_key: "grant-1158".into(),
+            },
+            "operator:test",
+        )?;
+        drop(store);
+        Ok(SeatedParent {
+            fixture,
+            epic: epic.id,
+        })
+    }
+
+    /// Who holds the seat: the Epic's lead pointer and the global grant.
+    pub(super) fn seat_holders(
+        store: &crate::store::Store,
+        epic: Uuid,
+    ) -> (Option<Uuid>, Option<Uuid>) {
+        (
+            store
+                .get_session(epic)
+                .expect("epic read")
+                .and_then(|row| row.lead_session_id),
+            store
+                .active_global_grant()
+                .expect("grant read")
+                .map(|grant| grant.seat_session_id),
+        )
+    }
+
+    pub(super) fn insert_rotation_invocation_fixture(
         store: &Store,
         session_id: Uuid,
         invocation_id: Uuid,
@@ -5477,7 +5745,7 @@ mod tests {
                      admission_status, status, trigger_source, session_id,
                      policy_snapshot_json, created_at, started_at
                  ) VALUES (
-                     ?1, 'session.rotate.child', 'model', 'foreground', 'paid_capable',
+                     ?1, 'session.rotate.child', 'session_lifecycle', 'foreground', 'paid_capable',
                      'admitted', ?3, 'h1_v83_rotation_custody_test', ?2,
                      '{}', ?4, ?4
                  )",
@@ -5503,6 +5771,50 @@ mod tests {
             .expect("rotation child settles within bounded timeout");
     }
 
+    /// The not-yet-polled rotation spawn future, so a test can measure its
+    /// size before it is driven.
+    fn rotation_child_future_for_test(
+        manager: &SessionManager,
+        parent: CompletedSession,
+        child: Session,
+        candidate: crate::sandbox::custody::RotationCustodyCandidate,
+        rotation_id: Option<String>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+        Box::pin(SessionManager::spawn_rotation_child(
+            parent.session.id,
+            None,
+            child.query.clone(),
+            child,
+            candidate,
+            Some(parent),
+            rotation_id,
+            None,
+            Arc::clone(&manager.active),
+            Arc::clone(&manager.completed),
+            Arc::clone(&manager.event_bus),
+            Arc::clone(&manager.store),
+            manager
+                .model_call_settlements
+                .handle()
+                .expect("settlement producer"),
+            manager.persistence.clone(),
+            false,
+            manager.socket_path.clone(),
+            Arc::clone(&manager.token_counter),
+            None,
+            manager.retry_tx.clone(),
+            Arc::clone(&manager.runtime_config),
+            Arc::clone(&manager.spawn_coordinator),
+            Arc::clone(&manager.agent_tokens),
+            Arc::clone(&manager.spawn_epoch),
+            Arc::clone(&manager.agent_message_arbiter),
+            manager.codegraph_handle.clone(),
+            manager.custody_execution_runtime(),
+            None,
+            None,
+        ))
+    }
+
     /// A rotation that is *expected* to be fenced settles immediately. Callers
     /// that assert on the resulting lineage use this variant so a rotation
     /// which wrongly proceeds fails on the lineage assertion, with a message
@@ -5516,41 +5828,99 @@ mod tests {
     ) -> std::result::Result<(), tokio::time::error::Elapsed> {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            SessionManager::spawn_rotation_child(
-                parent.session.id,
-                None,
-                child.query.clone(),
-                child,
-                candidate,
-                Some(parent),
-                rotation_id,
-                None,
-                Arc::clone(&manager.active),
-                Arc::clone(&manager.completed),
-                Arc::clone(&manager.event_bus),
-                Arc::clone(&manager.store),
-                manager
-                    .model_call_settlements
-                    .handle()
-                    .expect("settlement producer"),
-                manager.persistence.clone(),
-                false,
-                manager.socket_path.clone(),
-                Arc::clone(&manager.token_counter),
-                None,
-                manager.retry_tx.clone(),
-                Arc::clone(&manager.runtime_config),
-                Arc::clone(&manager.spawn_coordinator),
-                Arc::clone(&manager.agent_tokens),
-                Arc::clone(&manager.spawn_epoch),
-                Arc::clone(&manager.agent_message_arbiter),
-                manager.codegraph_handle.clone(),
-                manager.custody_execution_runtime(),
-                None,
-                None,
-            ),
+            rotation_child_future_for_test(manager, parent, child, candidate, rotation_id),
         )
         .await
+    }
+
+    /// #1148: the rotation futures are driven inline by tests on the default
+    /// 2 MiB test-thread stack, so their size is bounded here.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn rotation_futures_stay_within_the_test_thread_stack_budget() -> anyhow::Result<()> {
+        let (manager, directory) = rotation_manager();
+        let parent_id = Uuid::new_v4();
+        let mut parent = test_session(parent_id, SessionStatus::Completed);
+        parent.working_dir = directory.path().to_path_buf();
+        manager.store.lock().await.insert_session(&parent)?;
+        let candidate = manager
+            .custody_execution_runtime()
+            .prepare_rotation_successor(&parent)
+            .await?;
+        let mut child = test_session(Uuid::new_v4(), SessionStatus::Starting);
+        child.working_dir = directory.path().to_path_buf();
+        let spawn = rotation_child_future_for_test(
+            &manager,
+            CompletedSession::for_test(parent.clone()),
+            child.clone(),
+            candidate,
+            None,
+        );
+        let spawn_size = std::mem::size_of_val(&*spawn);
+        drop(spawn);
+        let candidate = manager
+            .custody_execution_runtime()
+            .prepare_rotation_successor(&parent)
+            .await?;
+        let drive = drive_successful_rotation_to_authority_boundary(
+            &manager,
+            parent,
+            child,
+            candidate,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "size-probe",
+        );
+        let drive_size = std::mem::size_of_val(&drive);
+        drop(drive);
+        let decide = SessionManager::decide_rotation_successor(
+            parent_id,
+            None,
+            None,
+            Arc::clone(&manager.active),
+            Arc::clone(&manager.completed),
+            Arc::clone(&manager.event_bus),
+            Arc::clone(&manager.store),
+            manager
+                .model_call_settlements
+                .handle()
+                .expect("settlement producer"),
+            manager.persistence.clone(),
+            false,
+            manager.socket_path.clone(),
+            Arc::clone(&manager.token_counter),
+            None,
+            manager.retry_tx.clone(),
+            Arc::clone(&manager.runtime_config),
+            Arc::clone(&manager.spawn_coordinator),
+            Arc::clone(&manager.agent_tokens),
+            Arc::clone(&manager.spawn_epoch),
+            Arc::clone(&manager.agent_message_arbiter),
+            manager.codegraph_handle.clone(),
+            manager.custody_execution_runtime(),
+            RotationPredecessorSource::Completed,
+        );
+        let decide_size = std::mem::size_of_val(&decide);
+        drop(decide);
+        // Measured on 1a79577d0 (debug build): the driven future was 66960 B
+        // before the spawn future was boxed and 18048 B after; the decide
+        // future 29776 B before, 13120 B after; the spawn state is 24464 B.
+        // The bounds sit between the boxed and unboxed figures: loose enough
+        // not to flake on a field added, tight enough to catch the large
+        // state being inlined again.
+        assert!(
+            spawn_size <= 48 * 1024,
+            "rotation spawn future grew to {spawn_size} bytes"
+        );
+        assert!(
+            drive_size <= 36 * 1024,
+            "driven rotation future grew to {drive_size} bytes; Box::pin the spawn future"
+        );
+        assert!(
+            decide_size <= 24 * 1024,
+            "rotation decide future grew to {decide_size} bytes; Box::pin the spawn future"
+        );
+        Ok(())
     }
 
     async fn rotate_completed_session_for_test(manager: &SessionManager, session_id: Uuid) {

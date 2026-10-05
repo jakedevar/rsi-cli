@@ -4,7 +4,7 @@ NEXTEST_JOBS ?= 8
 TEST_BENCHMARK_REPEAT ?= 3
 TEST_BENCHMARK_OUT ?= target/test-suite-benchmark/local-nextest-full.json
 
-.PHONY: help release release-install release-install-no-restart release-install-tui relink-release codex-prompts codex-prompts-check claude-commands claude-commands-check \
+.PHONY: help release release-install release-install-no-restart desktop desktop-install release-install-tui relink-release codex-prompts codex-prompts-check claude-commands claude-commands-check \
 	test-fast test-full test-serial test-benchmark \
 	recursive-dag-live-dogfood-setup recursive-dag-live-dogfood-env \
 	recursive-dag-live-dogfood-daemon recursive-dag-live-dogfood-gate \
@@ -17,7 +17,9 @@ TEST_BENCHMARK_OUT ?= target/test-suite-benchmark/local-nextest-full.json
 help:
 	@printf '%s\n' \
 		'make release          - build release rsi + rsid binaries' \
-		'make release-install  - build release binaries, refresh ~/.local/bin symlinks, and restart a running rsid' \
+		'make release-install  - build release binaries, refresh ~/.local/bin symlinks, and restart a running rsid at a quiet point (NOW=1 restarts immediately)' \
+		'make desktop          - build the desktop UI (frontend + release Tauri binary); fails if node/webkit2gtk are missing' \
+		'make desktop-install  - build the desktop UI and install rsi-desktop + app menu entry + icons' \
 		'make release-install-no-restart - same, but leave any running rsid alone' \
 		'make release-install-tui - build + relink only the rsi TUI binary; rsid untouched, no restart' \
 		'make relink-release   - refresh ~/.local/bin symlinks (and restart rsid) without rebuilding' \
@@ -83,13 +85,24 @@ clean-shared:
 	@echo 'Scratch targets: removed'
 
 release:
+	./scripts/check-release-seam.sh
 	cargo build --release --bin rsi --bin rsid --bin rsi-build-rustc
 
+# The desktop UI is optional: a missing toolchain only warns (install-desktop.sh
+# exits 0) and a failed desktop build never fails the rsid install.
 release-install:
 	./scripts/install-release.sh
+	./scripts/install-desktop.sh || echo 'warning: desktop UI build/install failed; rsid install is unaffected' >&2
 
 release-install-no-restart:
 	./scripts/install-release.sh --no-restart
+	./scripts/install-desktop.sh || echo 'warning: desktop UI build/install failed; rsid install is unaffected' >&2
+
+desktop:
+	./scripts/install-desktop.sh --build-only
+
+desktop-install:
+	./scripts/install-desktop.sh --required
 
 release-install-tui:
 	./scripts/install-release.sh --tui-only

@@ -9,6 +9,7 @@ mod diagnostics;
 pub(crate) mod dialectic;
 mod esp_square;
 pub mod file_explorer;
+pub mod global_manager_command;
 pub mod graph;
 pub mod harness_manager;
 pub mod hook_form;
@@ -21,11 +22,14 @@ pub mod manager_v2;
 pub(crate) mod mcp_server_form;
 pub mod memory_search;
 pub mod message_bridge_form;
+pub mod operator_restart_command;
 pub mod parent_picker;
 // Model selection handled by widget::model_dropdown (inline dropdown, not an overlay)
 pub mod cohort_settlement;
 pub mod color_customizer;
 pub mod command_palette;
+pub mod legacy_scratch;
+pub mod manager_tree;
 mod notification_browser;
 pub mod project_form;
 pub mod project_picker;
@@ -37,6 +41,7 @@ pub mod question_modal;
 pub mod rating;
 mod recent_completions;
 pub mod recursive_dag;
+pub mod remote;
 mod rename_session;
 pub mod satellite_registry;
 pub mod schedule_browser;
@@ -178,8 +183,10 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
             | OverlayState::HarnessManagerScope(..)
             | OverlayState::HarnessManagerV2(..)
             | OverlayState::ScheduleBrowser { .. }
-            | OverlayState::FileExplorer { .. }
+            | OverlayState::FileExplorer(..)
             | OverlayState::SatelliteRegistry(..)
+            | OverlayState::Remote(..)
+            | OverlayState::ManagerTree(..)
     ) {
         app.overlay_leader_pending = false;
         return false;
@@ -500,8 +507,20 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             cohort_settlement::handle_source_worktree_settlement_key(app, key).await;
             return true;
         }
+        OverlayState::LegacyScratch(..) => {
+            legacy_scratch::handle_key(app, key).await;
+            return true;
+        }
         OverlayState::SatelliteRegistry(..) => {
             satellite_registry::handle_key(app, key).await;
+            return true;
+        }
+        OverlayState::Remote(..) => {
+            remote::handle_key(app, key).await;
+            return true;
+        }
+        OverlayState::ManagerTree(..) => {
+            manager_tree::handle_key(app, key).await;
             return true;
         }
         OverlayState::HarnessManagerV2(..) => {
@@ -523,39 +542,11 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             notification_browser::handle_notification_browser_key(app, key).await;
             return true;
         }
-        OverlayState::FileExplorer {
-            explorer_focused,
-            finder_active,
-            ..
-        } => {
-            // Finder input takes priority over the tree's close bindings.
-            if *finder_active {
-                file_explorer::handle_file_explorer_key(app, key);
-                return true;
-            }
-
-            // The tree and viewer-focus shell retain their close bindings.
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | ' ')) {
-                app.overlay = OverlayState::None;
-                return true;
-            }
-
-            if *explorer_focused {
-                file_explorer::handle_file_explorer_key(app, key);
-                return true;
-            }
-            // Explorer is open but viewer has focus — only intercept Ctrl+H to refocus
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
-                if let OverlayState::FileExplorer {
-                    explorer_focused, ..
-                } = &mut app.overlay
-                {
-                    *explorer_focused = true;
-                }
-                return true;
-            }
-            // All other keys pass through to the file viewer / normal dispatch
-            return false;
+        OverlayState::FileExplorer(..) => {
+            // The tree, its finder and prompts own their keys; with the
+            // viewer focused only Ctrl-H is intercepted and everything else
+            // (Esc, q, Space, typing) reaches the file viewer.
+            return file_explorer::route_key(app, key);
         }
         OverlayState::Diagnostics => {
             diagnostics::handle_diagnostics_key(app, key);
@@ -1872,7 +1863,7 @@ pub fn try_paste_overlay(app: &mut App) -> bool {
         telescope::paste_clipboard_telescope(app);
         return true;
     }
-    if matches!(app.overlay, OverlayState::FileExplorer { .. }) {
+    if matches!(app.overlay, OverlayState::FileExplorer(..)) {
         return file_explorer::paste_clipboard(app);
     }
     paste_into_overlay(app);
@@ -1891,7 +1882,7 @@ pub fn try_paste_text_overlay(app: &mut App, text: &str) -> bool {
         telescope::paste_text_telescope(app, text);
         return true;
     }
-    if matches!(app.overlay, OverlayState::FileExplorer { .. }) {
+    if matches!(app.overlay, OverlayState::FileExplorer(..)) {
         return file_explorer::paste_text(app, text);
     }
     paste_text_into_overlay(app, text);
@@ -2205,23 +2196,23 @@ mod file_explorer_paste_tests {
 
     fn explorer_app(finder_active: bool, explorer_focused: bool) -> App {
         let mut app = App::new(DaemonClient::new(PathBuf::from("/tmp/test.sock")));
-        app.overlay = OverlayState::FileExplorer {
-            root: PathBuf::from("/tmp"),
-            entries: Vec::new(),
-            selected_index: 0,
-            scroll_offset: 0,
-            show_hidden: false,
-            trash: Vec::new(),
-            pending_yank: false,
-            pending_delete: false,
-            finder_active,
-            finder_query: String::new(),
-            finder_cache: vec![PathBuf::from("src/file_explorer.rs")],
-            finder_results: Vec::new(),
-            finder_selected: 0,
-            explorer_focused,
-        };
+        let mut state = file_explorer::FileExplorerState::with_entries(
+            PathBuf::from("/tmp"),
+            Vec::new(),
+            std::env::temp_dir(),
+        );
+        state.finder.active = finder_active;
+        state.finder.cache = vec![PathBuf::from("src/file_explorer.rs")];
+        state.explorer_focused = explorer_focused;
+        app.overlay = OverlayState::FileExplorer(Box::new(state));
         app
+    }
+
+    fn finder(app: &App) -> &file_explorer::ExplorerFinder {
+        let OverlayState::FileExplorer(state) = &app.overlay else {
+            panic!("expected file explorer overlay");
+        };
+        &state.finder
     }
 
     #[test]
@@ -2230,16 +2221,8 @@ mod file_explorer_paste_tests {
 
         assert!(try_paste_text_overlay(&mut app, "file\nexplorer"));
 
-        let OverlayState::FileExplorer {
-            finder_query,
-            finder_results,
-            ..
-        } = &app.overlay
-        else {
-            panic!("expected file explorer overlay");
-        };
-        assert_eq!(finder_query, "fileexplorer");
-        assert_eq!(finder_results, &vec![0]);
+        assert_eq!(finder(&app).query, "fileexplorer");
+        assert_eq!(finder(&app).results, vec![0]);
     }
 
     #[test]
@@ -2248,10 +2231,7 @@ mod file_explorer_paste_tests {
 
         assert!(try_paste_text_overlay(&mut app, "hidden prompt text"));
 
-        let OverlayState::FileExplorer { finder_query, .. } = &app.overlay else {
-            panic!("expected file explorer overlay");
-        };
-        assert!(finder_query.is_empty());
+        assert!(finder(&app).query.is_empty());
         assert_eq!(
             app.notifications
                 .back()
@@ -2266,10 +2246,7 @@ mod file_explorer_paste_tests {
 
         assert!(!try_paste_text_overlay(&mut app, "viewer text"));
 
-        let OverlayState::FileExplorer { finder_query, .. } = &app.overlay else {
-            panic!("expected file explorer overlay");
-        };
-        assert!(finder_query.is_empty());
+        assert!(finder(&app).query.is_empty());
         assert!(app.notifications.is_empty());
     }
 }

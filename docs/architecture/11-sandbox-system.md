@@ -65,6 +65,8 @@ All shell/git/file tools operate in the worktree — canonical repo is clean.
 
 All default to `NULL`. Pre-V39 rows carry `NULL` → deserializes to `None`.
 
+`sandbox_branch` is branch-at-creation (the assigned `rsi/<short>`), not a live view of the worktree's checked-out branch. To find a child's work tip read HEAD from `sandbox_root` or use `git worktree list`; see `docs/agent-sandbox.md` § "Resolving a sandbox's work tip".
+
 ### Retained execution projections (V83, detached in V90)
 
 `session_execution_projections` is custody/audit history, not ordinary

@@ -524,13 +524,13 @@ pub static SESSION_LIST_NAV_KEYS: &[KeyEntry<SessionListNavGuard, SessionListNav
         chord: code(KeyCode::Left, ModMatch::Exact(SHIFT), "Shift-Left"),
         guard: SessionListNavGuard::ListOrDetail,
         effect: SessionListNavEffect::PrevAndOpen,
-        label: "previous session and open its detail",
+        label: "previous session and open it; in detail a Group or Epic unfolds instead",
     },
     KeyEntry {
         chord: code(KeyCode::Right, ModMatch::Exact(SHIFT), "Shift-Right"),
         guard: SessionListNavGuard::ListOrDetail,
         effect: SessionListNavEffect::NextAndOpen,
-        label: "next session and open its detail",
+        label: "next session and open it; in detail a Group or Epic unfolds instead",
     },
     KeyEntry {
         chord: code(KeyCode::Tab, ModMatch::Exact(CTRL), "Ctrl-Tab"),

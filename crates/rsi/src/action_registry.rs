@@ -657,6 +657,10 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.exists = index < 2;
             facts.editable = facts.exists;
         }
+        SettingsSection::Remote => {
+            facts.exists = index == 0;
+            facts.editable = facts.exists;
+        }
         SettingsSection::SystemPrompt => {
             facts.exists = index == 0;
             facts.editable = facts.exists && app.authoritative_config_ready();
@@ -1527,7 +1531,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::Open,
         label: "Open or activate selection",
-        summary: "Opens the selected row: drills into a Group or Epic in place, opens a leaf session's detail, or activates the selected setting.",
+        summary: "Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.",
         category: "CURRENT VIEW",
         bindings: OPEN,
         command_aliases: &[],
@@ -4788,15 +4792,40 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             LIST_NAV,
             &[
-                act("Enter / l", "Open file or directory"),
-                nav("h", "Go to parent directory"),
-                act("yy / yn", "Copy path / file name"),
-                act("dd", "Delete file to trash buffer"),
-                act("u", "Restore last deleted file"),
-                act(".", "Toggle hidden files"),
+                nav(
+                    "Ctrl-D / Ctrl-U, PageDown / PageUp",
+                    "Move half / a full page",
+                ),
+                act("Enter / o", "Open file in the viewer, or toggle directory"),
+                act("l / Right", "Expand directory or open file"),
+                nav("h / Left", "Collapse directory or go to parent"),
+                act("Tab", "Preview file without leaving the tree"),
+                act("P", "Toggle follow preview"),
+                act("z", "Collapse all directories"),
+                act("R", "Refresh the tree from disk"),
+            ],
+            &[
+                act("a", "Add file (end with / for a directory)"),
+                act("A", "Add directory"),
+                act("r", "Rename"),
+                act("m", "Move to a project path"),
+                act("c", "Copy to a project path"),
+                act("d", "Delete to trash (confirm with y)"),
+                act("u", "Undo last file operation"),
+                act("yy / yn / yr", "Copy absolute path / name / relative path"),
+                act("i", "Show size, modified time and mode"),
+            ],
+            &[
+                act(". / H", "Toggle hidden files"),
                 act("/", "Open fuzzy finder"),
+                act(
+                    "Ctrl-Shift-Left / Right, < / >",
+                    "Narrow / widen the drawer",
+                ),
+                act("Ctrl-0 / =", "Reset drawer width"),
                 nav("Ctrl-L", "Focus file viewer"),
-                close("Esc / q, Space / Space Space", "Close explorer"),
+                act("?", "Show explorer help"),
+                close("Esc / q, Space", "Close explorer"),
             ],
         ],
     },
@@ -4805,7 +4834,8 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         title: "File Explorer / Finder",
         groups: &[&[
             edit("Type, Backspace", "Filter files"),
-            nav("j / k, Down / Up", "Move selection"),
+            edit("Ctrl-U / Ctrl-W", "Clear query / delete last segment"),
+            nav("Down / Up, Ctrl-J / Ctrl-K", "Move selection"),
             act("Enter", "Open selected file"),
             nav("Esc", "Return to explorer tree"),
             close("Esc Esc", "Return to tree, then close explorer"),
@@ -4817,7 +4847,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[&[
             nav("Ctrl-H", "Focus explorer tree"),
             act("Other keys", "Go to the file viewer"),
-            close("Esc / q", "Close explorer"),
+            close("Space e", "Close explorer (viewer normal mode)"),
         ]],
     },
     OverlayHelpRoute {
@@ -4828,6 +4858,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 close("q, Space q", "Close viewer (normal mode)"),
                 act("Space m", "Toggle markdown preview"),
                 act("Space Space", "Open telescope file picker"),
+                act("Space e", "Toggle the file explorer"),
                 act("Ctrl-S", "Save file"),
                 act(":", "Command mode (:w, :wq, :q, :q!, :e!, :N)"),
                 act("/ / ?", "Search forward / backward"),
@@ -4847,7 +4878,8 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             &[
                 edit("Type, Backspace", "Filter files"),
-                nav("j / k, Down / Up", "Move selection"),
+                edit("Ctrl-U", "Clear query"),
+                nav("Down / Up, Ctrl-J / Ctrl-K", "Move selection"),
                 act("Enter", "Open file in viewer"),
                 close("Esc", "Close telescope"),
             ],
@@ -5536,6 +5568,12 @@ pub enum OverlayHelpExemption {
     GraphDashboardFocus,
     /// Operator satellite browser owns its own read-only and edit keys.
     SatelliteBrowser,
+    /// Operator RSI Remote settings page owns its device and project keys.
+    RemoteSettings,
+    /// Read-only manager tree owns its navigation keys.
+    ManagerTree,
+    /// Operator legacy-scratch adoption owns its select, adopt and refresh keys.
+    LegacyScratchBrowser,
 }
 
 impl OverlayHelpExemption {
@@ -5550,6 +5588,9 @@ impl OverlayHelpExemption {
         Self::SettlementAuthorization,
         Self::GraphDashboardFocus,
         Self::SatelliteBrowser,
+        Self::RemoteSettings,
+        Self::ManagerTree,
+        Self::LegacyScratchBrowser,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -5565,6 +5606,9 @@ impl OverlayHelpExemption {
             Self::SettlementAuthorization => 6,
             Self::GraphDashboardFocus => 7,
             Self::SatelliteBrowser => 8,
+            Self::RemoteSettings => 9,
+            Self::ManagerTree => 10,
+            Self::LegacyScratchBrowser => 11,
         }
     }
 
@@ -5581,6 +5625,9 @@ impl OverlayHelpExemption {
             Self::SettlementAuthorization => "Source-worktree settlement: authorization",
             Self::GraphDashboardFocus => "Graph review: info dashboard focused",
             Self::SatelliteBrowser => "Satellite registry browser",
+            Self::RemoteSettings => "Remote settings",
+            Self::ManagerTree => "Manager tree (:manager tree)",
+            Self::LegacyScratchBrowser => "Legacy scratch adoption",
         }
     }
 
@@ -5603,6 +5650,9 @@ impl OverlayHelpExemption {
                 "The dashboard panel owns keys while focused, separate from graph editing."
             }
             Self::SatelliteBrowser => "The browser owns its peer, link and cached session keys.",
+            Self::RemoteSettings => "The page owns its enable, device and project keys.",
+            Self::ManagerTree => "The read-only tree owns its fold, paging and jump keys.",
+            Self::LegacyScratchBrowser => "The browser owns its select, adopt and refresh keys.",
         }
     }
 
@@ -5628,6 +5678,9 @@ impl OverlayHelpExemption {
                 DocAnchor::Narrative("Graph Review Overlay (`<Space>v` or `:graph`)")
             }
             Self::SatelliteBrowser => DocAnchor::Narrative("Satellite Registry Browser"),
+            Self::RemoteSettings => DocAnchor::Narrative("Remote Settings"),
+            Self::ManagerTree => DocAnchor::Narrative("Manager Tree"),
+            Self::LegacyScratchBrowser => DocAnchor::Narrative("Legacy Scratch Adoption"),
         }
     }
 }
@@ -5728,15 +5781,15 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::ProjectPicker { .. } => Routed(C::ProjectPicker),
         OverlayState::LabelPicker { .. } => Routed(C::LabelPicker),
         OverlayState::ParentPicker { .. } => Routed(C::ParentPicker),
-        OverlayState::FileExplorer {
-            explorer_focused: false,
-            ..
-        } => Routed(C::FileExplorerViewerFocus),
-        OverlayState::FileExplorer {
-            finder_active: true,
-            ..
-        } => Routed(C::FileExplorerFinder),
-        OverlayState::FileExplorer { .. } => Routed(C::FileExplorer),
+        OverlayState::FileExplorer(explorer) if explorer.finder.active => {
+            Routed(C::FileExplorerFinder)
+        }
+        OverlayState::FileExplorer(explorer)
+            if !explorer.explorer_focused && explorer.prompt.is_none() =>
+        {
+            Routed(C::FileExplorerViewerFocus)
+        }
+        OverlayState::FileExplorer(..) => Routed(C::FileExplorer),
         OverlayState::Telescope { .. } => Routed(C::Telescope),
         OverlayState::CommandPalette { .. } => Routed(C::CommandPalette),
         OverlayState::HarnessManagerScope(..) => Routed(C::ManagerScope),
@@ -5758,7 +5811,10 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
                 Routed(C::SettlementBrowser)
             }
         }
+        OverlayState::LegacyScratch(..) => Exempt(X::LegacyScratchBrowser),
         OverlayState::SatelliteRegistry(..) => Exempt(X::SatelliteBrowser),
+        OverlayState::Remote(..) => Exempt(X::RemoteSettings),
+        OverlayState::ManagerTree(..) => Exempt(X::ManagerTree),
         OverlayState::GraphReview {
             dashboard_focused: true,
             ..
@@ -7442,12 +7498,15 @@ mod tests {
             OverlayState::SortPicker { .. } => "SortPicker",
             OverlayState::PromptPreview { .. } => "PromptPreview",
             OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
+            OverlayState::LegacyScratch(..) => "LegacyScratch",
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
+            OverlayState::Remote(..) => "Remote",
+            OverlayState::ManagerTree(..) => "ManagerTree",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
             OverlayState::NotificationBrowser { .. } => "NotificationBrowser",
             OverlayState::RecentCompletions { .. } => "RecentCompletions",
             OverlayState::ProjectForm { .. } => "ProjectForm",
-            OverlayState::FileExplorer { .. } => "FileExplorer",
+            OverlayState::FileExplorer(..) => "FileExplorer",
             OverlayState::ProviderForm { .. } => "ProviderForm",
             OverlayState::ProviderCredentialForm { .. } => "ProviderCredentialForm",
             OverlayState::McpServerForm { .. } => "McpServerForm",
@@ -7556,22 +7615,14 @@ mod tests {
     }
 
     fn file_explorer(explorer_focused: bool, finder_active: bool) -> OverlayState {
-        OverlayState::FileExplorer {
-            root: std::path::PathBuf::from("/tmp"),
-            entries: Vec::new(),
-            selected_index: 0,
-            scroll_offset: 0,
-            show_hidden: false,
-            trash: Vec::new(),
-            pending_yank: false,
-            pending_delete: false,
-            finder_active,
-            finder_query: String::new(),
-            finder_cache: Vec::new(),
-            finder_results: Vec::new(),
-            finder_selected: 0,
-            explorer_focused,
-        }
+        let mut state = crate::overlay::file_explorer::FileExplorerState::with_entries(
+            std::path::PathBuf::from("/tmp"),
+            Vec::new(),
+            std::env::temp_dir(),
+        );
+        state.explorer_focused = explorer_focused;
+        state.finder.active = finder_active;
+        OverlayState::FileExplorer(Box::new(state))
     }
 
     fn settlement(authorization_active: bool) -> OverlayState {
@@ -7899,6 +7950,12 @@ mod tests {
             Exempt(X::SettlementAuthorization),
         );
         push(
+            "LegacyScratch browser",
+            &app,
+            OverlayState::LegacyScratch(Box::default()),
+            Exempt(X::LegacyScratchBrowser),
+        );
+        push(
             "SatelliteRegistry browser",
             &app,
             OverlayState::SatelliteRegistry(Box::new(
@@ -7918,6 +7975,24 @@ mod tests {
                 },
             )),
             Exempt(X::SatelliteBrowser),
+        );
+        push(
+            "Remote settings",
+            &app,
+            OverlayState::Remote(Box::new(crate::types::RemoteOverlayState {
+                status: rsi_common::remote_control::RemoteStatusV1::default(),
+                focus: crate::types::RemoteFocus::Devices,
+                selected_device: 0,
+                selected_project: 0,
+                last_error: None,
+            })),
+            Exempt(X::RemoteSettings),
+        );
+        push(
+            "Manager tree",
+            &app,
+            OverlayState::ManagerTree(Box::default()),
+            Exempt(X::ManagerTree),
         );
     }
 

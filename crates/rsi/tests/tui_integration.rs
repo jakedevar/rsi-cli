@@ -1770,13 +1770,13 @@ async fn test_file_explorer_enter_opens_viewer_and_focuses_it() {
     assert_eq!(viewer.file_path, file_path);
     assert_eq!(viewer.surface.content(), "# Notes\n\nOpened from explorer.");
 
-    let OverlayState::FileExplorer {
-        explorer_focused, ..
-    } = app.overlay
-    else {
+    let OverlayState::FileExplorer(explorer) = &app.overlay else {
         panic!("file explorer should stay open as a drawer");
     };
-    assert!(!explorer_focused, "viewer should receive focus after open");
+    assert!(
+        !explorer.explorer_focused,
+        "viewer should receive focus after open"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1888,13 +1888,10 @@ async fn test_file_explorer_viewer_wraps_to_visible_drawer_width() {
         "viewer should scroll through wrapped visual rows beside the drawer"
     );
 
-    let OverlayState::FileExplorer {
-        explorer_focused, ..
-    } = app.overlay
-    else {
+    let OverlayState::FileExplorer(explorer) = &app.overlay else {
         panic!("file explorer drawer should remain open");
     };
-    assert!(!explorer_focused, "viewer should keep focus");
+    assert!(!explorer.explorer_focused, "viewer should keep focus");
 
     let _ = fs::remove_dir_all(root);
 }

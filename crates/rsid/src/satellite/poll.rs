@@ -26,8 +26,9 @@ use rsi_common::satellite::{
     SatelliteSessionPageRequestV1, SatelliteSessionPageV1,
 };
 use rsi_common::satellite_dispatch::{
-    DELIVER_HUB_MESSAGE_METHOD, REQUEST_HUB_DEPLOY_METHOD, SatelliteDeliverRequestV1,
-    SatelliteDeliverResultV1, SatelliteDeployRequestV1,
+    DELIVER_HUB_MESSAGE_METHOD, FETCH_HUB_REPORTS_METHOD, REQUEST_HUB_DEPLOY_METHOD,
+    SatelliteDeliverRequestV1, SatelliteDeliverResultV1, SatelliteDeployRequestV1,
+    SatelliteFetchReportsReplyV1, SatelliteFetchReportsRequestV1,
 };
 
 pub(crate) const MAX_IN_FLIGHT: usize = 4;
@@ -150,6 +151,41 @@ pub(crate) async fn call_deliver_rpc(
         return Err(protocol_error("satellite acknowledged a different message"));
     }
     Ok(DeliverReply::Accepted(result))
+}
+
+/// What the satellite answered to a report fetch (#1103).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FetchReportsReply {
+    Accepted(SatelliteFetchReportsReplyV1),
+    /// The satellite refused; the hub keeps nothing and tries again later.
+    Refused(String),
+}
+
+/// The one report-fetch method the hub may call (own one-method allowlist, so
+/// the read allowlist never widens).
+pub(crate) async fn call_fetch_reports_rpc(
+    reader: &mut BufReader<UnixStream>,
+    request: &SatelliteFetchReportsRequestV1,
+    deadline: Duration,
+) -> io::Result<FetchReportsReply> {
+    let params = serde_json::to_value(request).map_err(io::Error::other)?;
+    let response = exchange(
+        reader,
+        FETCH_HUB_REPORTS_METHOD,
+        params,
+        MAX_RPC_ENVELOPE_BYTES,
+        deadline,
+    )
+    .await?;
+    if let Some(error) = response.error {
+        return Ok(FetchReportsReply::Refused(error.message));
+    }
+    let value = response
+        .result
+        .ok_or_else(|| protocol_error("invalid satellite RPC envelope"))?;
+    let reply: SatelliteFetchReportsReplyV1 =
+        serde_json::from_value(value).map_err(io::Error::other)?;
+    Ok(FetchReportsReply::Accepted(reply))
 }
 
 /// What the satellite answered to a hub deploy request.

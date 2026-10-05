@@ -3680,7 +3680,7 @@ mod tests {
             })
             .expect("observe repository target");
             let mut store = crate::store::Store::open_in_memory().expect("settlement Store");
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = session_id;
             session.status = SessionStatus::Completed;
             session.working_dir = target.canonical_repo_dir.clone();
@@ -3765,7 +3765,7 @@ mod tests {
             let custody_id = Uuid::new_v4();
             let root = self.sandbox_base.join(session_id.to_string());
             let branch = format!("rsi/{label}/{session_id}");
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = session_id;
             session.status = SessionStatus::Completed;
             session.working_dir = PathBuf::from(&canonical_repo_dir);
@@ -3858,8 +3858,25 @@ mod tests {
         /// A second Live custody-backed root of the same repository, integrated
         /// like the first, so one settlement run carries two items.
         fn add_second_root(&mut self, label: &str) {
+            self.add_second_root_with_custody(label, Uuid::new_v4());
+        }
+
+        /// Like `add_second_root`, but the second custody id is drawn so its
+        /// custody-root lock stripe differs from the primary root's. A test that
+        /// holds one root's stripe then contends only that root (Issue #606).
+        fn add_second_root_in_other_stripe(&mut self, label: &str) {
+            let primary_shard =
+                crate::store::sandbox_custody::custody_root_lock_shard(self.custody_id);
+            let custody_id = std::iter::repeat_with(Uuid::new_v4)
+                .find(|id| {
+                    crate::store::sandbox_custody::custody_root_lock_shard(*id) != primary_shard
+                })
+                .expect("a custody id in a different lock stripe");
+            self.add_second_root_with_custody(label, custody_id);
+        }
+
+        fn add_second_root_with_custody(&mut self, label: &str, custody_id: Uuid) {
             let session_id = Uuid::new_v4();
-            let custody_id = Uuid::new_v4();
             let branch = format!("rsi/{label}/{session_id}");
             let allocation = git_worktree::allocate(
                 &self.sandbox_base,
@@ -3869,7 +3886,7 @@ mod tests {
                 Some(&branch),
             )
             .expect("allocate second candidate worktree");
-            let mut session = crate::store::tests::make_test_session();
+            let mut session = rsid_store::test_support::make_test_session();
             session.id = session_id;
             session.status = SessionStatus::Completed;
             session.working_dir = self.target.canonical_repo_dir.clone();
@@ -4687,7 +4704,7 @@ mod tests {
             .join("outside-alias");
         std::fs::create_dir_all(&inside).expect("inside durable alias path");
         std::fs::create_dir_all(&outside).expect("outside durable alias path");
-        let mut alias = crate::store::tests::make_test_session();
+        let mut alias = rsid_store::test_support::make_test_session();
         alias.id = alias_id;
         alias.status = SessionStatus::Completed;
         alias.working_dir = inside.clone();
@@ -4860,7 +4877,7 @@ mod tests {
             .join("malformed-session-outside");
         std::fs::create_dir_all(&outside).expect("create outside path");
         let alias_id = Uuid::new_v4();
-        let mut alias = crate::store::tests::make_test_session();
+        let mut alias = rsid_store::test_support::make_test_session();
         alias.id = alias_id;
         alias.status = SessionStatus::Completed;
         alias.working_dir = outside;
@@ -4959,7 +4976,7 @@ mod tests {
         let inside = fixture.allocation.root.join("historical-provider-cwd");
         std::fs::create_dir_all(&inside).expect("create historical provider cwd");
 
-        let mut rootless_failed = crate::store::tests::make_test_session();
+        let mut rootless_failed = rsid_store::test_support::make_test_session();
         rootless_failed.id = Uuid::new_v4();
         rootless_failed.status = SessionStatus::Failed;
         rootless_failed.working_dir = inside.clone();
@@ -4974,7 +4991,7 @@ mod tests {
             .publish_startup_rootless_failed(rootless_failed.id)
             .expect("publish verified rootless cleanup-failed projection");
 
-        let mut rootless_purged = crate::store::tests::make_test_session();
+        let mut rootless_purged = rsid_store::test_support::make_test_session();
         rootless_purged.id = Uuid::new_v4();
         rootless_purged.status = SessionStatus::Completed;
         rootless_purged.working_dir = inside.clone();
@@ -5258,7 +5275,7 @@ mod tests {
                 .expect("insert startup journal before hostile Session key");
 
             let alias_id = Uuid::new_v4();
-            let mut alias = crate::store::tests::make_test_session();
+            let mut alias = rsid_store::test_support::make_test_session();
             alias.id = alias_id;
             alias.status = SessionStatus::Starting;
             alias.working_dir = fixture
@@ -5386,7 +5403,7 @@ mod tests {
         std::os::unix::fs::symlink(&descendant, &symlink).expect("startup orphan symlink path");
 
         let exact_id = Uuid::new_v4();
-        let mut exact = crate::store::tests::make_test_session();
+        let mut exact = rsid_store::test_support::make_test_session();
         exact.id = exact_id;
         exact.status = SessionStatus::Starting;
         exact.working_dir = fixture.allocation.root.clone();
@@ -5396,7 +5413,7 @@ mod tests {
             .expect("insert exact startup alias");
 
         let sandbox_id = Uuid::new_v4();
-        let mut sandbox_alias = crate::store::tests::make_test_session();
+        let mut sandbox_alias = rsid_store::test_support::make_test_session();
         sandbox_alias.id = sandbox_id;
         sandbox_alias.status = SessionStatus::Running;
         sandbox_alias.working_dir = outside.clone();
@@ -5417,7 +5434,7 @@ mod tests {
             .expect("bind sandbox-root startup alias");
 
         let projection_id = Uuid::new_v4();
-        let mut projection_alias = crate::store::tests::make_test_session();
+        let mut projection_alias = rsid_store::test_support::make_test_session();
         projection_alias.id = projection_id;
         projection_alias.status = SessionStatus::Starting;
         projection_alias.working_dir = outside.clone();
@@ -5443,7 +5460,7 @@ mod tests {
             .expect("bind canonical projection startup alias");
 
         let unrelated_id = Uuid::new_v4();
-        let mut unrelated = crate::store::tests::make_test_session();
+        let mut unrelated = rsid_store::test_support::make_test_session();
         unrelated.id = unrelated_id;
         unrelated.status = SessionStatus::Starting;
         unrelated.working_dir = outside;
@@ -6111,7 +6128,7 @@ mod tests {
 
         let mut store = crate::store::Store::open_in_memory().expect("settlement Store");
         let custody_id = Uuid::new_v4();
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.id = session_id;
         session.status = SessionStatus::Completed;
         session.working_dir = target.canonical_repo_dir.clone();
@@ -6430,7 +6447,7 @@ mod tests {
         .expect("observe retained repository");
 
         let mut store = crate::store::Store::open_in_memory().expect("retained Store");
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.id = session_id;
         session.status = SessionStatus::Completed;
         session.working_dir = target.canonical_repo_dir.clone();
@@ -6519,7 +6536,7 @@ mod tests {
             .insert_source_worktree_settlement_run(&run)
             .expect("insert alias-protected settlement intent");
         let alias_id = Uuid::new_v4();
-        let mut scheduled_alias = crate::store::tests::make_test_session();
+        let mut scheduled_alias = rsid_store::test_support::make_test_session();
         scheduled_alias.id = alias_id;
         scheduled_alias.status = SessionStatus::Starting;
         scheduled_alias.working_dir = fixture.allocation.root.join("scheduled-fresh-alias");
@@ -7550,7 +7567,7 @@ mod tests {
     #[test]
     fn stripe_timeout_on_first_item_leaves_every_item_replayable() {
         let mut fixture = IntegratedFixture::new("stripe-timeout-first-item");
-        fixture.add_second_root("stripe-timeout-second-item");
+        fixture.add_second_root_in_other_stripe("stripe-timeout-second-item");
         let run = fixture.commit_intent_for_all_eligible("fixture:stripe-timeout-multi");
         let item_count = run.items.len();
         let receipt = fixture
@@ -7558,13 +7575,23 @@ mod tests {
             .get_source_worktree_settlement_run(run.run_id)
             .expect("read fixture receipt")
             .expect("fixture receipt");
-        let first_custody = fixture
+        let journal_custodies = fixture
             .store
             .list_source_worktree_settlement_journal_items(run.run_id)
             .expect("journal")
-            .first()
-            .expect("first journal item")
-            .custody_id;
+            .iter()
+            .map(|item| item.custody_id)
+            .collect::<Vec<_>>();
+        let first_custody = *journal_custodies.first().expect("first journal item");
+        // Holding the first item's stripe must not also contend the other roots:
+        // the test pins the typed retry on the FIRST item only.
+        let first_shard = crate::store::sandbox_custody::custody_root_lock_shard(first_custody);
+        assert!(
+            journal_custodies[1..].iter().all(|id| {
+                crate::store::sandbox_custody::custody_root_lock_shard(*id) != first_shard
+            }),
+            "fixture roots must use distinct custody lock stripes"
+        );
         let idempotency_key = receipt.idempotency_key.clone();
         let plan_digest = receipt.plan_digest.as_str().to_string();
         let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
@@ -7803,7 +7830,7 @@ mod tests {
 
         let mut store =
             crate::store::Store::open(&directory.path().join("rsi.db")).expect("recovery Store");
-        let mut session = crate::store::tests::make_test_session();
+        let mut session = rsid_store::test_support::make_test_session();
         session.id = session_id;
         session.status = SessionStatus::Completed;
         session.working_dir = target.canonical_repo_dir.clone();

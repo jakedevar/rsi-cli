@@ -168,6 +168,25 @@ time it is reconstructed from `Session.working_dir`.
 
 ---
 
+### Resolving a sandbox's work tip
+
+`sandbox_branch` is **branch-at-creation**: the branch the sandbox was assigned
+when it was allocated (`rsi/<short>`), copied verbatim on rotation. The daemon
+never reconciles it with the worktree's checked-out branch. Sandboxed agents must
+not switch or create branches in their worktree (AGENTS.md hard rule 2), but a
+child that does leaves `sandbox_branch` pointing at the base, with none of its
+work (issue #45: `sandbox_branch=rsi/c86bb20a` at the base while the worktree
+had `review/issue21-phase2-r12` checked out).
+
+To authenticate or review a child's work, never trust the field and never resolve
+a branch by name (a same-named branch in another effort has the wrong tree).
+Use either, both immune to a stale field and needing no database access:
+
+1. `git -C <sandbox_root> branch --show-current` and `git -C <sandbox_root>
+   rev-parse HEAD`, with `sandbox_root` from the session row; or
+2. `git worktree list` and key on the session-UUID directory
+   (`~/.rsi/sandboxes/<session-uuid>`), which binds directory, branch and sha.
+
 ## Lifecycle — Rotation and Continue
 
 **Rotation** (`session/rotation.rs`, `spawn_rotation_child` path):

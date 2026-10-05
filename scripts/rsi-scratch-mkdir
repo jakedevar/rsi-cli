@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Create a scratch directory the daemon's reclaim pass can prove RSI made (#1140).
+#
+#   scripts/rsi-scratch-mkdir worker NAME   -> ~/.cache/rsi-NAME-tmp   (worker TMPDIR)
+#   scripts/rsi-scratch-mkdir var NAME      -> /var/tmp/rsi-NAME
+#
+# Prints the directory path. The directory is a fresh, empty directory that gets
+# an allocation entry in the private registry (~/.rsi/scratch-registry, mode
+# 0700) binding its kind, owner, device, inode, birth time (nanoseconds) and parent, and an
+# in-tree record (.rsi-scratch-record) naming the entry. Without both, the
+# reclaim pass retains the directory forever. A directory that already exists is
+# refused (an existing directory cannot be adopted); re-running for one this
+# script made is a no-op. RSI_SCRATCH_PARENT and RSI_SCRATCH_REGISTRY override
+# the parent and registry directories (tests).
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 worker|var NAME" >&2
+  exit 2
+fi
+case "$2" in
+  '' | */* | .* | *[!A-Za-z0-9._-]*)
+    echo "rsi-scratch-mkdir: NAME must be a plain word (letters, digits, . _ -)" >&2
+    exit 2
+    ;;
+esac
+
+case "$1" in
+  worker)
+    kind=worker_tmp
+    parent=${RSI_SCRATCH_PARENT:-$HOME/.cache}
+    dir=$parent/rsi-$2-tmp
+    ;;
+  var)
+    kind=var_tmp
+    parent=${RSI_SCRATCH_PARENT:-/var/tmp}
+    dir=$parent/rsi-$2
+    ;;
+  *)
+    echo "usage: $0 worker|var NAME" >&2
+    exit 2
+    ;;
+esac
+registry=${RSI_SCRATCH_REGISTRY:-$HOME/.rsi/scratch-registry}
+
+if [ -e "$dir" ] || [ -L "$dir" ]; then
+  if [ -f "$dir/.rsi-scratch-record" ] && grep -qx 'rsi-scratch-record v2' "$dir/.rsi-scratch-record"; then
+    echo "$dir"
+    exit 0
+  fi
+  echo "rsi-scratch-mkdir: $dir exists; an existing directory cannot be adopted" >&2
+  exit 1
+fi
+
+umask 077
+[ -d "$registry" ] || mkdir -m 700 "$registry"
+mkdir -m 700 "$dir"
+# Birth time in nanoseconds ("seconds.nnnnnnnnn" with the dot removed): a reused
+# inode created within the same second is still a different generation.
+birth=$(stat -c %.9W "$dir" | tr -d .)
+case "$birth" in
+  '' | *[!0-9]* | 0*)
+    birth=0
+    ;;
+esac
+if [ "$birth" = "0" ]; then
+  rmdir "$dir"
+  echo "rsi-scratch-mkdir: this filesystem keeps no birth time" >&2
+  exit 1
+fi
+nonce=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+{
+  echo 'rsi-scratch-alloc v1'
+  echo "nonce=$nonce"
+  echo "kind=$kind"
+  echo "uid=$(id -u)"
+  echo "dev=$(stat -c %d "$dir")"
+  echo "ino=$(stat -c %i "$dir")"
+  echo "btime_ns=$birth"
+  echo "parent_dev=$(stat -c %d "$parent")"
+  echo "parent_ino=$(stat -c %i "$parent")"
+  echo "created_unix=$(date +%s)"
+  echo "path=$dir"
+} >"$registry/.tmp-$nonce"
+mv -n "$registry/.tmp-$nonce" "$registry/$nonce"
+{
+  echo 'rsi-scratch-record v2'
+  echo "nonce=$nonce"
+  echo "kind=$kind"
+} >"$dir/.rsi-scratch-record"
+echo "$dir"

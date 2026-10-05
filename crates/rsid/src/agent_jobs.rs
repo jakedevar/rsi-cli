@@ -15,9 +15,9 @@ use crate::store::Store;
 use crate::store::agent_jobs::{AgentJobRow, NewAgentJob};
 use chrono::{DateTime, Utc};
 use rsi_common::agent_jobs::{
-    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_DIR_NOT_ALLOWED,
-    JOB_LAUNCH_FAILED, JobKind, JobParams, JobState, JobWake, LandingJobParams, SWEEP_MAX_FAILURES,
-    SweepVerdict, TestJobParams,
+    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_CANCELLED,
+    JOB_DIR_NOT_ALLOWED, JOB_LAUNCH_FAILED, JOB_NOT_FOUND, JobKind, JobParams, JobState, JobWake,
+    LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict, TestJobParams,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,7 +101,15 @@ fn slot_cargo(tools: &JobTools, cargo_args: Vec<String>) -> Vec<String> {
     argv
 }
 
+/// The line `scripts/candidate-receipt.sh` ends with: the compact JSON receipt.
+const RECEIPT_LINE_PREFIX: &str = "RECEIPT_JSON ";
+
 fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
+    // #1099: the wrapper makes its own temporary worktree and shares the build
+    // slot through `check-touched-shards`, so it runs unwrapped.
+    if let Some(candidate) = &p.candidate_receipt {
+        return vec![s("scripts/candidate-receipt.sh"), candidate.clone()];
+    }
     if let Some(shard) = &p.shard {
         let mut argv = vec![
             tools.cargo_slot.display().to_string(),
@@ -121,8 +129,13 @@ fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
     if p.lib_only {
         args.push(s("--lib"));
     }
-    args.push(s("--"));
-    args.extend(p.filters.iter().cloned());
+    // #1106: one failing binary must not hide the others; every binary runs.
+    args.push(s("--no-fail-fast"));
+    // No filters runs every test of the package (no `--` at all).
+    if !p.filters.is_empty() {
+        args.push(s("--"));
+        args.extend(p.filters.iter().cloned());
+    }
     slot_cargo(tools, args)
 }
 
@@ -510,9 +523,14 @@ pub trait JobRuntime: Send + Sync {
     fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String>;
     /// True while the unit is active, activating or deactivating.
     fn unit_active(&self, unit_name: &str) -> bool;
-    /// Stop a unit that is still running (the scratch quota breach path). The
-    /// default does nothing; the caller settles the job either way.
-    fn stop_unit(&self, _unit_name: &str) {}
+    /// Stop a unit that is still running. `Ok` means the unit is confirmed
+    /// stopped (already inactive or absent counts). The default does nothing.
+    ///
+    /// # Errors
+    /// A message when the stop failed and the unit may still be running.
+    fn stop_unit(&self, _unit_name: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The wrapper that runs inside the unit: redirect output to the log, run the
@@ -633,13 +651,21 @@ impl JobRuntime for SystemdJobRuntime {
             .unwrap_or(false)
     }
 
-    fn stop_unit(&self, unit_name: &str) {
-        let stopped = Command::new(&self.systemctl)
+    fn stop_unit(&self, unit_name: &str) -> std::result::Result<(), String> {
+        let output = Command::new(&self.systemctl)
             .args(["--user", "stop", &format!("{unit_name}.service")])
-            .output();
-        if let Err(error) = stopped {
-            tracing::warn!(unit = unit_name, %error, "cannot stop over-quota agent job unit");
+            .output()
+            .map_err(|error| format!("cannot run systemctl stop: {error}"))?;
+        // An absent or already-inactive unit makes `stop` exit nonzero: that
+        // still counts as stopped. Only a unit that is alive is a failure.
+        if self.unit_active(unit_name) {
+            return Err(format!(
+                "unit {unit_name} is still active after systemctl stop ({}): {}",
+                output.status,
+                tail(&String::from_utf8_lossy(&output.stderr))
+            ));
         }
+        Ok(())
     }
 }
 
@@ -891,20 +917,35 @@ pub(crate) fn parse_sweep_report(report: &str) -> (Vec<String>, Vec<String>, usi
         let Some((issue, tail)) = rest.split_once('`') else {
             continue;
         };
-        let Some((name, _)) = tail.split_once('`') else {
+        let Some((name, after)) = tail.split_once('`') else {
             continue;
         };
         let issue = issue.trim();
-        let entry = if issue.is_empty() {
+        let mut entry = if issue.is_empty() {
             name.to_string()
         } else {
             format!("{issue} {name}")
         };
+        // A crashed or timed-out test carries its class (#1120).
+        if let Some(class) = sweep_failure_class(after) {
+            entry.push_str(&format!(" [{class}]"));
+        }
         if bucket.len() < SWEEP_MAX_FAILURES && !entry.is_empty() {
             bucket.push(entry);
         }
     }
     (new, known, new_count)
+}
+
+/// The `crash` or `timeout` class tag (`[crash]`) right after a verdict line's
+/// backticked test name, when the report writer marked one (#1120).
+fn sweep_failure_class(after_name: &str) -> Option<&'static str> {
+    let tag = after_name.trim_start();
+    ["crash", "timeout"].into_iter().find(|class| {
+        tag.strip_prefix('[')
+            .and_then(|t| t.strip_prefix(class))
+            .is_some_and(|t| t.starts_with(']'))
+    })
 }
 
 /// Largest `QA.md` a GREEN may rest on. A bigger report is never truncated
@@ -923,18 +964,24 @@ const SWEEP_FIXED_LANES: [&str; 7] = [
     "other-doctests",
 ];
 /// Every lane the sweep runs, by label: `rsid-<shard>` for each library shard
-/// (the `test-shard-*` features of this crate's manifest, the same list
-/// `check-rsid-test-shards.py --list-shards` gives the sweep script) plus the
-/// fixed lanes. A GREEN report has each exactly once and no other lane.
+/// (the union of the `test-shard-*` features of the `rsid` and `rsid-store`
+/// manifests, the same list `check-rsid-test-shards.py --list-shards` gives the
+/// sweep script) plus the fixed lanes. A GREEN report has each exactly once and
+/// no other lane.
 fn sweep_expected_lanes() -> Vec<String> {
-    let mut lanes: Vec<String> = include_str!("../Cargo.toml")
-        .lines()
-        .filter_map(|line| {
-            let shard = line.trim().strip_prefix("test-shard-")?;
-            let (name, _) = shard.split_once(" = ")?;
-            (name != "mode").then(|| format!("rsid-{name}"))
-        })
-        .collect();
+    let shards: std::collections::BTreeSet<String> = [
+        include_str!("../Cargo.toml"),
+        include_str!("../../rsid-store/Cargo.toml"),
+    ]
+    .into_iter()
+    .flat_map(str::lines)
+    .filter_map(|line| {
+        let shard = line.trim().strip_prefix("test-shard-")?;
+        let (name, _) = shard.split_once(" = ")?;
+        (name != "mode").then(|| format!("rsid-{name}"))
+    })
+    .collect();
+    let mut lanes: Vec<String> = shards.into_iter().collect();
     lanes.extend(SWEEP_FIXED_LANES.iter().map(|lane| lane.to_string()));
     lanes.sort_unstable();
     lanes
@@ -1114,12 +1161,19 @@ fn sweep_report_lanes(report: &str) -> Option<usize> {
 /// report adds a short ssh-warning-free log tail so the cause is visible.
 fn sweep_detail(
     new_count: usize,
+    (crashed, timed_out): (usize, usize),
     known_count: usize,
     lanes: Option<usize>,
     wall_secs: Option<i64>,
     incomplete_tail: Option<String>,
 ) -> String {
     let mut text = format!("new={new_count}; known={known_count}");
+    if crashed > 0 {
+        text.push_str(&format!("; crash={crashed}"));
+    }
+    if timed_out > 0 {
+        text.push_str(&format!("; timeout={timed_out}"));
+    }
     if let Some(lanes) = lanes {
         text.push_str(&format!("; lanes={lanes}"));
     }
@@ -1186,8 +1240,16 @@ pub(crate) fn classify_cloud_sweep_timed(
     // The wake carries a compact typed summary, never the log or the report.
     let incomplete_tail = (verdict == SweepVerdict::Incomplete).then(|| filtered_log_tail(log));
     result.failing_tests = Vec::new();
+    let class_count = |class: &str| {
+        let suffix = format!(" [{class}]");
+        new_failures
+            .iter()
+            .filter(|name| name.ends_with(&suffix))
+            .count()
+    };
     result.detail = Some(sweep_detail(
         new_count.max(new_failures.len()),
+        (class_count("crash"), class_count("timeout")),
         known_failures.len(),
         sweep_report_lanes(&report_text),
         wall_secs,
@@ -1214,6 +1276,48 @@ fn job_wall_secs(job: &AgentJobV1, now: DateTime<Utc>) -> Option<i64> {
     Some((now - created.with_timezone(&Utc)).num_seconds().max(0))
 }
 
+/// The receipt a `candidate_receipt` job printed: the last `RECEIPT_JSON ` line
+/// of the log, when it is a JSON object.
+pub(crate) fn parse_receipt_line(log: &str) -> Option<serde_json::Value> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.trim_end().strip_prefix(RECEIPT_LINE_PREFIX))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter(serde_json::Value::is_object)
+}
+
+/// A `candidate_receipt` job succeeds only with a clean exit and a receipt
+/// whose `ok` is true. The typed receipt rides in the result either way, and
+/// `detail` is the one summary line (not the log tail).
+fn classify_candidate_receipt(
+    exit_code: Option<i32>,
+    log: &str,
+    mut result: AgentJobResultV1,
+) -> (JobState, AgentJobResultV1) {
+    let receipt = parse_receipt_line(log);
+    let ok = receipt
+        .as_ref()
+        .and_then(|r| r.get("ok"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    result.detail = log
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("check-touched-shards "))
+        .map(str::to_string)
+        .or(result.detail);
+    if receipt.is_none() {
+        result.refusal = Some("candidate_receipt_missing".into());
+    }
+    result.receipt = receipt;
+    let state = if exit_code == Some(0) && ok {
+        JobState::Succeeded
+    } else {
+        JobState::Failed
+    };
+    (state, result)
+}
+
 /// Map a finished job to its terminal state and typed result.
 pub(crate) fn classify(
     job: &AgentJobV1,
@@ -1236,6 +1340,11 @@ pub(crate) fn classify(
             &sweep_results_dir(&p.sha),
             wall,
         );
+    }
+    if let JobParams::Test(p) = &job.params
+        && p.is_candidate_receipt()
+    {
+        return classify_candidate_receipt(exit_code, log, result);
     }
     let landing_source = match &job.params {
         JobParams::Landing(p) | JobParams::CloudGate(p) => Some(p.accepted.clone()),
@@ -1306,7 +1415,9 @@ fn scratch_quota_breach(
     if !scratch_exceeds(&job_tmp_dir(Path::new(&job.log_path)), quota) {
         return None;
     }
-    runtime.stop_unit(&job.unit_name);
+    if let Err(error) = runtime.stop_unit(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, %error, "cannot stop over-quota agent job unit");
+    }
     let result = AgentJobResultV1 {
         refusal: Some(JOB_SCRATCH_QUOTA_EXCEEDED.into()),
         detail: Some(format!(
@@ -1381,6 +1492,7 @@ async fn poll_with_scratch_quota(
                         detail: if is_sweep {
                             Some(sweep_detail(
                                 0,
+                                (0, 0),
                                 0,
                                 None,
                                 job_wall_secs(job, now),
@@ -1432,6 +1544,54 @@ async fn poll_with_scratch_quota(
 /// is deleted, so a crash between the two would otherwise leak that job's
 /// scratch forever. Scratch of a `running` job, or of a directory with no row,
 /// is never touched. Returns the number of scratch directories removed.
+/// `AgentCancelJob` (#1106): stop a running job's unit and settle it `failed`
+/// with the typed refusal `job_cancelled`, silently (the owner made this call,
+/// so no per-job wake). A job that already settled is returned unchanged with
+/// `cancelled: false`. The settle is guarded on `state='running'`, so a poll
+/// that settles the job first wins and the cancel reports what is stored.
+pub(crate) fn cancel_job(
+    store: &Store,
+    runtime: &dyn JobRuntime,
+    job_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(AgentJobV1, bool)> {
+    let not_found = || DaemonError::InvalidParam(JOB_NOT_FOUND.into());
+    let row = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
+    if row.job.state != JobState::Running {
+        return Ok((row.job, false));
+    }
+    // Settle only once the unit is confirmed stopped; a failed stop leaves the
+    // job running with its scratch so a repeat cancel retries.
+    let unstopped = |detail: String| {
+        DaemonError::Process(format!(
+            "job_cancel_unit_not_stopped: unit {} was not stopped, the job is still running; retry the cancel: {detail}",
+            row.job.unit_name
+        ))
+    };
+    runtime.stop_unit(&row.job.unit_name).map_err(unstopped)?;
+    if runtime.unit_active(&row.job.unit_name) {
+        return Err(unstopped("the unit is still active".into()));
+    }
+    let log = read_log_tail(&row.job.log_path);
+    let note = "cancelled by the owner; the unit was stopped";
+    let result = AgentJobResultV1 {
+        refusal: Some(JOB_CANCELLED.into()),
+        failing_tests: failing_test_names(&log),
+        detail: Some(if log.is_empty() {
+            note.to_string()
+        } else {
+            format!("{note}\n{}", tail(&log))
+        }),
+        ..AgentJobResultV1::default()
+    };
+    let settled = store.settle_agent_job_outcome(job_id, JobState::Failed, &result, false, now)?;
+    if matches!(row.job.kind, JobKind::Test | JobKind::Build) {
+        cleanup_job_tmp(Path::new(&row.job.log_path));
+    }
+    let current = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
+    Ok((current.job, settled.is_some()))
+}
+
 pub(crate) async fn sweep_terminal_scratch(
     store: &Arc<tokio::sync::Mutex<Store>>,
     jobs_dir: &Path,
@@ -1543,6 +1703,7 @@ mod tests {
         launched: Mutex<Vec<LaunchSpec>>,
         active: Mutex<bool>,
         fail_launch: Mutex<bool>,
+        stopped: Mutex<Vec<String>>,
     }
 
     impl JobRuntime for FakeRuntime {
@@ -1557,6 +1718,12 @@ mod tests {
 
         fn unit_active(&self, _unit: &str) -> bool {
             *self.active.lock().unwrap()
+        }
+
+        fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+            self.stopped.lock().unwrap().push(unit.to_string());
+            *self.active.lock().unwrap() = false;
+            Ok(())
         }
     }
 
@@ -1877,11 +2044,36 @@ mod tests {
                 "-p",
                 "rsid",
                 "--lib",
+                "--no-fail-fast",
                 "--",
                 "a::b",
                 "c"
             ]
         );
+        // #1106: no filters runs every test of the package, still without
+        // stopping at the first failing binary.
+        let all = job_command(
+            &t,
+            &params(JobKind::Test, serde_json::json!({"package":"rsid"})),
+            cwd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            all.argv[4..],
+            ["cargo", "test", "-p", "rsid", "--no-fail-fast"]
+        );
+        let empty = job_command(
+            &t,
+            &params(
+                JobKind::Test,
+                serde_json::json!({"package":"rsid","filters":[]}),
+            ),
+            cwd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty.argv, all.argv);
         let shard = job_command(
             &t,
             &params(
@@ -2165,6 +2357,45 @@ mod tests {
             sweep_lane_labels().len(),
             sweep_lane_table(&sweep_lane_labels()),
         )
+    }
+
+    /// #1120: a crashed (SIGABRT) or timed-out test is named in
+    /// `new_failures` with its class, the verdict stays RED, and the detail
+    /// says `crash` / `timeout`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn sweep_names_crashed_and_timed_out_tests_with_their_class() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let red_line = format!("VERDICT RED {sha} new=3");
+        let qa = sweep_qa(
+            sha,
+            concat!(
+                "- NEW `rsid session::h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection` [crash]\n",
+                "- NEW `rsid store::tests::slow_one` [timeout] (name-only match #9; signature unverified)\n",
+                "- NEW `rsid b::plain_failure`\n",
+                "- KNOWN #7 `rsid a::known_crash` [crash]\n",
+            ),
+            &red_line,
+        );
+        let (state, result) =
+            sweep_job_result(sha, Some(0), &format!("cat QA.md\n{red_line}\n"), Some(&qa));
+        assert_eq!(state, JobState::Failed);
+        let detail = result.detail.clone().unwrap();
+        let sweep = result.sweep.unwrap();
+        assert_eq!(sweep.verdict, SweepVerdict::Red);
+        assert_eq!(
+            sweep.new_failures,
+            [
+                "rsid session::h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection [crash]",
+                "rsid store::tests::slow_one [timeout]",
+                "rsid b::plain_failure",
+            ]
+        );
+        assert_eq!(sweep.known_failures, ["#7 rsid a::known_crash [crash]"]);
+        assert!(
+            detail.contains("new=3; known=1; crash=1; timeout=1"),
+            "{detail}"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3386,9 +3617,10 @@ mod tests {
             fn unit_active(&self, unit: &str) -> bool {
                 self.inner.unit_active(unit)
             }
-            fn stop_unit(&self, unit: &str) {
+            fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
                 self.stopped.lock().unwrap().push(unit.to_string());
                 *self.inner.active.lock().unwrap() = false;
+                Ok(())
             }
         }
         let (store, dir) = open();
@@ -3590,6 +3822,138 @@ mod tests {
                 .message
                 .contains("failing_tests=")
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn cancelling_a_running_job_stops_its_unit_and_settles_it_cancelled_once() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let mut c = ctx(owner, dir.path(), None);
+        c.params = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[]}),
+        );
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            c,
+            Utc::now(),
+        )
+        .unwrap();
+        std::fs::write(&row.job.log_path, "test a::b ... ok\n").unwrap();
+
+        let guard = store.lock().await;
+        let (job, cancelled) = cancel_job(&guard, &*runtime, row.job.id, Utc::now()).unwrap();
+        assert!(cancelled);
+        assert_eq!(job.state, JobState::Failed);
+        let result = job.result.clone().unwrap();
+        assert_eq!(result.refusal.as_deref(), Some(JOB_CANCELLED));
+        assert!(result.detail.unwrap().contains("cancelled by the owner"));
+        assert_eq!(
+            *runtime.stopped.lock().unwrap(),
+            [row.job.unit_name.clone()]
+        );
+        assert!(!job_tmp_dir(Path::new(&row.job.log_path)).exists());
+        // The owner made the call: no per-job wake is queued.
+        assert!(wakes_for(&guard, owner).is_empty());
+
+        // A repeat cancel changes nothing and stops nothing more.
+        let (again, cancelled_again) =
+            cancel_job(&guard, &*runtime, row.job.id, Utc::now()).unwrap();
+        assert!(!cancelled_again);
+        assert_eq!(again, job);
+        assert_eq!(runtime.stopped.lock().unwrap().len(), 1);
+        drop(guard);
+        // The poll has nothing left to settle for it.
+        assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_cancel_whose_unit_stop_fails_or_stays_active_leaves_the_job_running_and_retries() {
+        /// `stop_unit` fails while `failing`; with `lingers` it reports `Ok`
+        /// yet the unit stays active.
+        struct Stubborn {
+            inner: FakeRuntime,
+            failing: Mutex<bool>,
+            lingers: Mutex<bool>,
+        }
+        impl JobRuntime for Stubborn {
+            fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+                self.inner.launch(spec)
+            }
+            fn unit_active(&self, unit: &str) -> bool {
+                self.inner.unit_active(unit)
+            }
+            fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+                if *self.failing.lock().unwrap() {
+                    return Err("systemctl stop exited 1".into());
+                }
+                if *self.lingers.lock().unwrap() {
+                    return Ok(());
+                }
+                self.inner.stop_unit(unit)
+            }
+        }
+        let (store, dir) = open();
+        let runtime = Stubborn {
+            inner: FakeRuntime::default(),
+            failing: Mutex::new(true),
+            lingers: Mutex::new(false),
+        };
+        let mut c = ctx(Uuid::new_v4(), dir.path(), None);
+        c.params = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[]}),
+        );
+        let (row, _) = submit(
+            &*store.lock().await,
+            &runtime,
+            &tools(),
+            dir.path(),
+            c,
+            Utc::now(),
+        )
+        .unwrap();
+        let tmp = job_tmp_dir(Path::new(&row.job.log_path));
+        assert!(tmp.exists());
+
+        let guard = store.lock().await;
+        for (failing, lingers) in [(true, false), (false, true)] {
+            *runtime.failing.lock().unwrap() = failing;
+            *runtime.lingers.lock().unwrap() = lingers;
+            let error = cancel_job(&guard, &runtime, row.job.id, Utc::now()).unwrap_err();
+            assert!(
+                error.to_string().contains("job_cancel_unit_not_stopped"),
+                "{error}"
+            );
+            let stored = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+            assert_eq!(stored.state, JobState::Running);
+            assert!(tmp.exists(), "scratch kept while the unit may be alive");
+        }
+        // A repeat cancel retries and succeeds once the unit really stops.
+        *runtime.lingers.lock().unwrap() = false;
+        let (job, cancelled) = cancel_job(&guard, &runtime, row.job.id, Utc::now()).unwrap();
+        assert!(cancelled);
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.result.unwrap().refusal.as_deref(), Some(JOB_CANCELLED));
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn cancelling_an_unknown_job_is_job_not_found() {
+        let (store, _dir) = open();
+        let runtime = FakeRuntime::default();
+        let guard = store.blocking_lock();
+        let error = cancel_job(&guard, &runtime, Uuid::new_v4(), Utc::now()).unwrap_err();
+        assert!(error.to_string().contains(JOB_NOT_FOUND), "{error}");
+        assert!(runtime.stopped.lock().unwrap().is_empty());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3796,6 +4160,65 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    /// #1099: a candidate receipt runs the fixed wrapper with the ref only, and
+    /// settles with the typed receipt in the result and the summary line in the
+    /// detail; the wake carries the receipt without the per-file shard map.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_candidate_receipt_job_returns_the_typed_receipt_in_its_result_and_wake() {
+        let p = params(
+            JobKind::Test,
+            serde_json::json!({"candidate_receipt":"rsi/abc-123"}),
+        );
+        let command = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+        assert_eq!(
+            command.argv,
+            ["scripts/candidate-receipt.sh", "rsi/abc-123"]
+        );
+        let receipt = serde_json::json!({
+            "ok": true, "head": "h", "base": "b", "merge_clean": true,
+            "shards": {"compiled_ok": ["store-02"], "map": {"store-02": ["a.rs"]}},
+            "migrations": {"new": [151]},
+        });
+        let summary = "check-touched-shards OK head=h base=b merge_clean=true";
+        let log = format!("noise\n{summary}\nRECEIPT_JSON {receipt}\n");
+        let job = AgentJobV1 {
+            id: Uuid::new_v4(),
+            kind: JobKind::Test,
+            name: None,
+            state: JobState::Running,
+            owner_session_id: Uuid::new_v4(),
+            unit_name: "u".into(),
+            cwd: "/tmp".into(),
+            log_path: "/tmp/job.log".into(),
+            params: p,
+            exit_code: None,
+            result: None,
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            wake: JobWake::Owner,
+        };
+        let (state, result) = classify(&job, Some(0), &log);
+        assert_eq!(state, JobState::Succeeded);
+        assert_eq!(result.receipt.as_ref(), Some(&receipt));
+        assert_eq!(result.detail.as_deref(), Some(summary));
+        let wake = crate::store::agent_jobs::wake_message(&job, state, &result);
+        assert!(wake.contains("\"compiled_ok\":[\"store-02\"]"), "{wake}");
+        assert!(wake.contains("\"migrations\":{\"new\":[151]}"), "{wake}");
+        assert!(!wake.contains("a.rs"), "{wake}");
+
+        // A red receipt still returns the typed receipt but settles failed;
+        // no receipt line is a typed refusal.
+        let red = log.replace("\"ok\":true", "\"ok\":false");
+        let (state, result) = classify(&job, Some(1), &red);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.receipt.unwrap()["ok"], false);
+        let (state, result) = classify(&job, Some(0), "no receipt\n");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.refusal.as_deref(), Some("candidate_receipt_missing"));
+        assert!(result.receipt.is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

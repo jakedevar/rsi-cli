@@ -169,6 +169,47 @@ fn trusted_peer(uid: u32) -> bool {
 
 /// A complete gateway response with the fixed security headers applied at
 /// serialization time.
+/// Fixed body for every 403; never names which check failed.
+const FORBIDDEN_BODY: &[u8] = b"forbidden\n";
+
+/// Minimum spacing between log lines for the same denial code.
+const DENY_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// Per-code rate limiter for denial log lines.
+#[derive(Default)]
+struct DenyLimiter {
+    last: std::collections::HashMap<String, Instant>,
+}
+
+impl DenyLimiter {
+    /// The log line for `code`, unless the same code was logged within
+    /// [`DENY_LOG_EVERY`]. Only the code is ever included.
+    fn line(&mut self, code: &str, now: Instant) -> Option<String> {
+        if self
+            .last
+            .get(code)
+            .is_some_and(|at| now.duration_since(*at) < DENY_LOG_EVERY)
+        {
+            return None;
+        }
+        self.last.insert(code.to_string(), now);
+        Some(format!("rsi-remote: denied: {code}"))
+    }
+}
+
+/// Log a denial code (never tokens, cookies or request content) to stderr.
+fn log_denial(code: &str) {
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<DenyLimiter>> = std::sync::OnceLock::new();
+    let line = LIMITER
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .line(code, Instant::now());
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+}
+
 struct Response {
     status: u16,
     reason: &'static str,
@@ -199,8 +240,28 @@ impl Response {
     }
 
     fn serialize(&self) -> Vec<u8> {
+        self.serialize_for(false)
+    }
+
+    /// `head_only` keeps the headers (including the GET content-length) but
+    /// sends no body bytes, as HTTP requires for a HEAD response.
+    fn serialize_for(&self, head_only: bool) -> Vec<u8> {
         let mut head = format!("HTTP/1.1 {} {}\r\n", self.status, self.reason);
-        if let Some(content_type) = self.content_type {
+        // A typeless empty 403 makes Safari download it. Give every deny the
+        // same fixed, non-informative text body; the reason goes to the host log.
+        let denied_blank =
+            self.status == 403 && self.body.is_empty() && self.content_type.is_none();
+        let content_type = if denied_blank {
+            Some("text/plain; charset=utf-8")
+        } else {
+            self.content_type
+        };
+        let body: &[u8] = if denied_blank {
+            FORBIDDEN_BODY
+        } else {
+            &self.body
+        };
+        if let Some(content_type) = content_type {
             let _ = write!(head, "content-type: {content_type}\r\n");
         }
         if self.csp {
@@ -212,10 +273,12 @@ impl Response {
         let _ = write!(
             head,
             "content-length: {}\r\ncache-control: no-store\r\nx-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\nconnection: close\r\n\r\n",
-            self.body.len()
+            body.len()
         );
         let mut bytes = head.into_bytes();
-        bytes.extend_from_slice(&self.body);
+        if !head_only {
+            bytes.extend_from_slice(body);
+        }
         bytes
     }
 }
@@ -387,6 +450,7 @@ async fn handle<D: ReadDispatch>(
         Vec::new()
     };
     let now = Instant::now();
+    let mut deny: Option<String> = None;
     let response = match (&policy, &request) {
         (Some(policy), Some(request)) => {
             match gate
@@ -394,7 +458,10 @@ async fn handle<D: ReadDispatch>(
                 .await
             {
                 Ok(identity) => match gate.ready(now) {
-                    None => Response::new(403, "Forbidden"),
+                    None => {
+                        deny = Some("not_ready".into());
+                        Response::new(403, "Forbidden")
+                    }
                     Some(server) => {
                         let binding = session::Binding {
                             owner_user_id: policy.owner_user_id,
@@ -406,18 +473,42 @@ async fn handle<D: ReadDispatch>(
                             request.sec_fetch_site.as_deref(),
                             &policy.canonical_host,
                         );
-                        route(
+                        let response = route(
                             request, &body, origin_ok, &binding, sessions, policy, reads, now,
                         )
-                        .await
+                        .await;
+                        if response.status == 403 {
+                            deny = Some("route_forbidden".into());
+                        }
+                        response
                     }
                 },
-                Err(_) => Response::new(403, "Forbidden"),
+                Err(denial) => {
+                    deny = Some(denial.code().into());
+                    Response::new(403, "Forbidden")
+                }
             }
         }
-        _ => Response::new(403, "Forbidden"),
+        (None, _) => {
+            deny = Some("policy_disabled_or_unreadable".into());
+            Response::new(403, "Forbidden")
+        }
+        (Some(policy), None) => {
+            deny = Some(
+                match ingress::parse_request(&raw[..header_end], &policy.canonical_host) {
+                    Err(reason) => format!("bad_request: {reason}"),
+                    Ok(_) => "bad_request".into(),
+                },
+            );
+            Response::new(403, "Forbidden")
+        }
     };
-    stream.write_all(&response.serialize()).await?;
+    if let Some(code) = deny {
+        log_denial(&code);
+    }
+    // HEAD is never an allowed method, but its deny must still carry no body.
+    let head_only = raw.starts_with(b"HEAD ");
+    stream.write_all(&response.serialize_for(head_only)).await?;
     Ok(())
 }
 
@@ -766,11 +857,11 @@ mod tests {
             )
         } else if target.contains(ESERVER_IP) {
             format!(
-                r#"{{"UserProfile":{{"ID":{EOWNER}}},"Node":{{"StableID":"{ESERVER_NODE}","User":{EOWNER},"MachineAuthorized":true,"Expired":false,"KeyExpiry":"{ZERO_EXPIRY}"}}}}"#
+                r#"{{"UserProfile":{{"ID":{EOWNER}}},"Node":{{"StableID":"{ESERVER_NODE}","User":{EOWNER},"MachineAuthorized":null,"Expired":false,"KeyExpiry":"{ZERO_EXPIRY}"}}}}"#
             )
         } else {
             format!(
-                r#"{{"UserProfile":{{"ID":{EOWNER}}},"Node":{{"StableID":"{client_node}","User":{EOWNER},"MachineAuthorized":true,"Expired":false,"KeyExpiry":"{ZERO_EXPIRY}","Addresses":["{ECLIENT_IP}/32"],"Tags":[],"Sharer":0}}}}"#
+                r#"{{"UserProfile":{{"ID":{EOWNER}}},"Node":{{"StableID":"{client_node}","User":{EOWNER},"MachineAuthorized":null,"Expired":false,"KeyExpiry":"{ZERO_EXPIRY}","Addresses":["{ECLIENT_IP}/32"],"Tags":[],"Sharer":0}}}}"#
             )
         }
     }
@@ -1092,6 +1183,54 @@ mod tests {
         assert_eq!(status, 401);
         assert!(body.is_empty());
         assert_eq!(harness.dispatch.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn deny_is_text_plain_not_a_blank_download() {
+        let harness = harness("nOTHER").await;
+        let (status, headers, body) =
+            exchange(&harness, raw("GET", "/", ECLIENT_IP, &[], b"")).await;
+        assert_eq!(status, 403);
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(content_type, Some("text/plain; charset=utf-8"));
+        assert_eq!(body, FORBIDDEN_BODY);
+    }
+
+    #[tokio::test]
+    async fn rejected_head_gets_headers_but_no_body() {
+        let harness = harness(ECLIENT_NODE).await;
+        let (status, headers, body) =
+            exchange(&harness, raw("HEAD", "/", ECLIENT_IP, &[], b"")).await;
+        assert_eq!(status, 403);
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-type"), Some("text/plain; charset=utf-8"));
+        assert_eq!(get("content-length"), Some("10"));
+        assert!(body.is_empty(), "HEAD response carries no body bytes");
+    }
+
+    #[test]
+    fn deny_log_line_has_only_the_code_and_is_rate_limited() {
+        let mut limiter = DenyLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            limiter.line("node_not_allowed", t0).as_deref(),
+            Some("rsi-remote: denied: node_not_allowed")
+        );
+        assert_eq!(limiter.line("node_not_allowed", t0), None);
+        assert!(limiter.line("funnel_on", t0).is_some());
+        assert!(
+            limiter
+                .line("node_not_allowed", t0 + DENY_LOG_EVERY)
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -161,6 +161,23 @@ impl BaseShardSlot {
         })
     }
 
+    /// Whether a valid entry for this key already exists, without taking the
+    /// slot lock or creating directories. A lock-free peek can race a writer;
+    /// it only decides whether a base compile is worth starting early.
+    pub(super) fn peek(root: &Path, rolling_sha: &str, shard: &str, fingerprint: &str) -> bool {
+        let Some(digest) = fingerprint.strip_prefix("sha256:") else {
+            return false;
+        };
+        let path = root
+            .join(rolling_sha)
+            .join(digest)
+            .join(format!("{shard}.json"));
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<BaseShardEntry>(&bytes).ok())
+            .is_some_and(|entry| entry.matches(rolling_sha, shard, fingerprint))
+    }
+
     pub(super) fn read(&self) -> Result<Option<BaseShardEntry>, String> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,

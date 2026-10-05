@@ -13,7 +13,7 @@ You are tasked with interacting with the rsi SQLite database safely and efficien
 | --- | --- | --- |
 | SQLite database | `~/.rsi/rsi.db` | Override with `$RSI_DB` (`${RSI_DB:-$HOME/.rsi/rsi.db}`) |
 | Unix socket | `~/.rsi/daemon.sock` | JSON-RPC endpoint; daemon must be running for RPC |
-| Schema truth (code) | `crates/rsid/src/store/migrations/vNNN.rs` (runner: `store/mod.rs`) | one file per version, head = highest file (`LATEST_SCHEMA_VERSION`) |
+| Schema truth (code) | `crates/rsid-store/src/store/migrations/vNNN.rs` (runner: `store/mod.rs`) | one file per version, head = highest file (`LATEST_SCHEMA_VERSION`) |
 
 ## Discover the schema (do this FIRST — never guess columns)
 
@@ -50,7 +50,7 @@ If `rsi-diag` is not built, `sqlite3 "$RSI_DB" ".schema <table>"` and `sqlite3 "
 
 Only break out raw SQL writes with explicit user consent. When you do:
 
-1. **Never change schema without a versioned migration** in `crates/rsid/src/store/` plus a matching `PRAGMA user_version` bump and the `LATEST_SCHEMA_VERSION` constant.
+1. **Never change schema without a versioned migration** in `crates/rsid-store/src/store/` plus a matching `PRAGMA user_version` bump and the `LATEST_SCHEMA_VERSION` constant.
 2. **Never hard-delete rows without explicit user consent.** Prefer logical delete, archive, or a status transition.
 3. **Timestamps** must be RFC3339 with nanosecond precision.
 4. **UUIDs** must be lowercase canonical strings.

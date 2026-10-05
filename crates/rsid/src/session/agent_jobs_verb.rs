@@ -1,4 +1,4 @@
-//! `AgentSubmitJob` / `AgentGetJob` / `AgentListJobs` (#1002 slice 1): the
+//! `AgentSubmitJob` / `AgentGetJob` / `AgentListJobs` / `AgentCancelJob` (#1002 slice 1, #1106): the
 //! agent-facing side of daemon-owned durable jobs.
 //!
 //! Any live leaf session may submit `test` and `build`; `landing`,
@@ -13,9 +13,10 @@ use super::agent_verbs::AgentControlHandle;
 use crate::agent_jobs::{JobRuntime, JobTools, SubmitContext};
 use crate::error::{DaemonError, Result};
 use rsi_common::agent_jobs::{
-    AgentGetJobRequestV1, AgentJobV1, AgentListJobsRequestV1, AgentListJobsResultV1,
-    AgentSubmitJobReceiptV1, AgentSubmitJobRequestV1, JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS,
-    JOB_KIND_NOT_AUTHORIZED, JOB_NOT_FOUND, JobKind,
+    AgentCancelJobRequestV1, AgentCancelJobResultV1, AgentGetJobRequestV1, AgentJobV1,
+    AgentListJobsRequestV1, AgentListJobsResultV1, AgentSubmitJobReceiptV1,
+    AgentSubmitJobRequestV1, JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_KIND_NOT_AUTHORIZED,
+    JOB_NOT_FOUND, JobKind, JobParams,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -31,6 +32,15 @@ pub(crate) fn job_kind_permitted(kind: JobKind, is_manager: bool, is_lead: bool)
         JobKind::Test | JobKind::Build => true,
         JobKind::Landing | JobKind::CloudGate | JobKind::CloudSweep => is_manager || is_lead,
     }
+}
+
+/// [`job_kind_permitted`] plus #1099: a `test` job with `candidate_receipt`
+/// fetches and builds an arbitrary branch, so it is a manager/Epic-lead job
+/// like landing.
+pub(crate) fn job_permitted(params: &JobParams, is_manager: bool, is_lead: bool) -> bool {
+    let candidate_receipt = matches!(params, JobParams::Test(p) if p.is_candidate_receipt());
+    job_kind_permitted(params.kind(), is_manager, is_lead)
+        && (!candidate_receipt || is_manager || is_lead)
 }
 
 impl AgentControlHandle {
@@ -56,7 +66,7 @@ impl AgentControlHandle {
                 .ok_or_else(|| DaemonError::PolicyDenied(JOB_DIR_NOT_ALLOWED.into()))?;
             (session, projection.is_manager, projection.is_lead)
         };
-        if !job_kind_permitted(params.kind(), is_manager, is_lead) {
+        if !job_permitted(&params, is_manager, is_lead) {
             return Err(DaemonError::PolicyDenied(JOB_KIND_NOT_AUTHORIZED.into()));
         }
         // #1073: a new job would keep a waiting deploy from its quiet point.
@@ -127,6 +137,32 @@ impl AgentControlHandle {
             .ok_or_else(|| DaemonError::InvalidParam(JOB_NOT_FOUND.into()))
     }
 
+    /// `AgentCancelJob` (#1106): the owner stops a running job.
+    ///
+    /// # Errors
+    /// `job_not_found` for an unknown job or one owned by another session.
+    pub async fn agent_cancel_job(
+        &self,
+        caller: Uuid,
+        request: AgentCancelJobRequestV1,
+        runtime: std::sync::Arc<dyn JobRuntime>,
+    ) -> Result<AgentCancelJobResultV1> {
+        let store = std::sync::Arc::clone(&self.store);
+        let (job, cancelled) = tokio::task::spawn_blocking(move || {
+            let store = store.blocking_lock();
+            let owned = store
+                .get_agent_job(request.job_id)?
+                .is_some_and(|row| row.job.owner_session_id == caller);
+            if !owned {
+                return Err(DaemonError::InvalidParam(JOB_NOT_FOUND.into()));
+            }
+            crate::agent_jobs::cancel_job(&store, &*runtime, request.job_id, chrono::Utc::now())
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("job cancel: {error}")))??;
+        Ok(AgentCancelJobResultV1 { job, cancelled })
+    }
+
     /// # Errors
     /// A persistence error.
     pub async fn agent_list_jobs(
@@ -152,6 +188,7 @@ impl AgentControlHandle {
 #[cfg(test)]
 mod tests {
     use super::job_kind_permitted;
+    use super::job_permitted;
     use rsi_common::agent_jobs::JobKind;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -165,5 +202,29 @@ mod tests {
             assert!(job_kind_permitted(kind, true, false), "{kind:?}");
             assert!(job_kind_permitted(kind, false, true), "{kind:?}");
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_candidate_receipt_is_a_manager_or_lead_job_while_plain_tests_stay_open() {
+        use rsi_common::agent_jobs::{AgentSubmitJobRequestV1, JobKind};
+        let params = |value: serde_json::Value| {
+            AgentSubmitJobRequestV1 {
+                kind: JobKind::Test,
+                params: value,
+                name: None,
+                idempotency_key: None,
+                worktree: None,
+                wake: None,
+            }
+            .typed_params()
+            .expect("valid test params")
+        };
+        let receipt = params(serde_json::json!({"candidate_receipt":"rsi/abc-123"}));
+        assert!(!job_permitted(&receipt, false, false));
+        assert!(job_permitted(&receipt, true, false));
+        assert!(job_permitted(&receipt, false, true));
+        let plain = params(serde_json::json!({"package":"rsid","lib_only":true}));
+        assert!(job_permitted(&plain, false, false));
     }
 }

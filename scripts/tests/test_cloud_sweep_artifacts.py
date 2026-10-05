@@ -225,6 +225,62 @@ class CloudSweepArtifactsTest(unittest.TestCase):
             self.assertIn("Classification unavailable: snapshot", qa)
             self.assertIn("VERDICT RED", qa.strip().splitlines()[-1])
 
+    # The nextest line shapes of session-04 in the sweep of 9450c30bb (#1120).
+    CRASH_LOG = (
+        "        PASS [   2.022s] ( 1/409) rsid session::tests::passed\n"
+        "     SIGABRT [   0.512s] (177/409) rsid session::h2_rotation_successor_"
+        "interleaving_matrix_preserves_one_authority_projection\n"
+        "     TIMEOUT [ 244.093s] (178/409) rsid session::tests::timed_out\n"
+        "     Summary [ 300.000s] 409 tests run: 407 passed, 1 timed out, 0 skipped\n"
+        "error: test run failed\n"
+    )
+
+    def test_crashed_and_timed_out_tests_are_named_reds_not_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "status").mkdir()
+            (root / "logs").mkdir()
+            self.write_lane(root, "rsid-session-04", 100, self.CRASH_LOG)
+            self.write_lane(root, "rsid-store-01", 0, "all green\n")
+            report = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/cloud-sweep-report.py"),
+                 "a" * 40, "2026-09-27T00:00:00Z", "2026-09-27T00:01:00Z",
+                 str(root), str(root / "missing-seed.txt")],
+                check=True, capture_output=True, text=True).stdout
+            crashed = "session::h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection"
+            self.assertIn(f"- `{crashed}`\n", report)
+            self.assertIn(f"- `{crashed}` [crash]", report)
+            self.assertIn("- `session::tests::timed_out` [timeout]", report)
+            self.assertNotIn("build_or_harness_failure", report)
+            (root / "QA.md").write_text(report)
+            (root / "failure-logs").mkdir()
+            with gzip.open(root / "failure-logs/rsid-session-04.log.gz", "wt") as handle:
+                handle.write(self.CRASH_LOG)
+            qa, _ = self.run_verdict(root)
+            self.assertIn(f"- NEW `{crashed}` [crash]", qa)
+            self.assertIn("- NEW `session::tests::timed_out` [timeout]", qa)
+            self.assertIn("Crashed or timed out (NEW): 2", qa)
+            self.assertEqual(qa.strip().splitlines()[-1], f"VERDICT RED {'a' * 40} new=2")
+            # The nextest SIGABRT line is a failing name for the JSON report too.
+            self.assertEqual(MODULE.failures(self.CRASH_LOG), sorted([
+                crashed, "session::tests::timed_out"]))
+
+    def test_unnamed_signal_crash_is_a_crash_red_not_a_harness_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "status").mkdir()
+            (root / "logs").mkdir()
+            self.write_lane(root, "other-doctests", 101,
+                            "error: process didn't exit successfully: `x` "
+                            "(signal: 6, SIGABRT: process abort signal)\n")
+            report = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/cloud-sweep-report.py"),
+                 "a" * 40, "2026-09-27T00:00:00Z", "2026-09-27T00:01:00Z",
+                 str(root), str(root / "missing-seed.txt")],
+                check=True, capture_output=True, text=True).stdout
+            self.assertIn("- `other-doctests:crash`", report)
+            self.assertNotIn("build_or_harness_failure", report)
+
 
 if __name__ == "__main__":
     unittest.main()

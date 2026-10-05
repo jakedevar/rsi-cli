@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RSI Desktop
+GenericName=AI Session Manager
+Comment=Manage AI coding sessions with rsid
+Exec=@BIN@
+Icon=rsi-desktop
+Terminal=false
+Categories=Development;
+StartupWMClass=rsi-desktop
+Keywords=rsi;ai;agents;sessions;

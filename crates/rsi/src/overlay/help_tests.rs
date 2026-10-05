@@ -161,29 +161,27 @@ async fn picker_overlays_list_close_and_selection_keys() {
 #[tokio::test]
 async fn file_explorer_finder_and_viewer_help_describe_their_handlers() {
     let mut app = test_app();
-    app.overlay = OverlayState::FileExplorer {
-        root: PathBuf::from("/tmp"),
-        entries: Vec::new(),
-        selected_index: 0,
-        scroll_offset: 0,
-        show_hidden: false,
-        trash: Vec::new(),
-        pending_yank: false,
-        pending_delete: false,
-        finder_active: false,
-        finder_query: String::new(),
-        finder_cache: Vec::new(),
-        finder_results: Vec::new(),
-        finder_selected: 0,
-        explorer_focused: true,
-    };
+    app.overlay = OverlayState::FileExplorer(Box::new(
+        crate::overlay::file_explorer::FileExplorerState::with_entries(
+            PathBuf::from("/tmp"),
+            Vec::new(),
+            std::env::temp_dir(),
+        ),
+    ));
     assert_help(
         &mut app,
         OverlayHelpClass::FileExplorer,
-        &["Close explorer", "Toggle hidden files", "Open fuzzy finder"],
+        &[
+            "Close explorer",
+            "Toggle hidden files",
+            "Open fuzzy finder",
+            "Add file (end with / for a directory)",
+            "Undo last file operation",
+            "Narrow / widen the drawer",
+        ],
     );
-    if let OverlayState::FileExplorer { finder_active, .. } = &mut app.overlay {
-        *finder_active = true;
+    if let OverlayState::FileExplorer(state) = &mut app.overlay {
+        state.finder.active = true;
     }
     assert_help(
         &mut app,

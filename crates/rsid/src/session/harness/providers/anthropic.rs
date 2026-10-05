@@ -37,30 +37,35 @@ enum Transport {
     Bedrock { region: String },
 }
 
+/// Beta header that enables server-side context editing.
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+/// Context editing starts only past this prompt size, so a short session
+/// never pays a cache write for it.
+const CONTEXT_EDIT_TRIGGER_TOKENS: u64 = 100_000;
+/// Recent tool use/result pairs that always stay readable.
+const CONTEXT_EDIT_KEEP_TOOL_USES: u64 = 8;
+/// An edit that clears less than this is skipped: clearing breaks the prompt
+/// cache prefix, so it must free enough to be worth the write (bulk, rarely).
+const CONTEXT_EDIT_CLEAR_AT_LEAST_TOKENS: u64 = 40_000;
+
+/// The `context_management` request field (names verified against the
+/// context-editing docs). Constant for a session, so the request prefix stays
+/// cache-stable until the API actually clears.
+pub(crate) fn context_management_config() -> Value {
+    json!({
+        "edits": [{
+            "type": "clear_tool_uses_20250919",
+            "trigger": {"type": "input_tokens", "value": CONTEXT_EDIT_TRIGGER_TOKENS},
+            "keep": {"type": "tool_uses", "value": CONTEXT_EDIT_KEEP_TOOL_USES},
+            "clear_at_least": {"type": "input_tokens", "value": CONTEXT_EDIT_CLEAR_AT_LEAST_TOKENS},
+        }]
+    })
+}
+
 /// `anthropic_version` Bedrock requires in the Messages body.
 const BEDROCK_ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 
-pub(crate) fn uses_adaptive_thinking(model: &str) -> bool {
-    // Bedrock IDs (`us.anthropic.claude-opus-5-5-v1:0`) name the same models.
-    let model = crate::bedrock::anthropic_model_name(model).unwrap_or(model);
-    // Entries are matched as prefixes, so `claude-fable-5` covers the
-    // offered `claude-fable-5-1` and any later Fable 5.x alongside the
-    // retired bare id — both reject `temperature`/`budget_tokens`.
-    [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-sonnet-5",
-    ]
-    .iter()
-    .any(|prefix| {
-        model == *prefix
-            || model
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with('-'))
-    })
-}
+pub(crate) use crate::store_support::provider_defaults::uses_adaptive_thinking;
 
 impl AnthropicProvider {
     pub fn new(explicit_key: Option<&str>) -> Result<Self> {
@@ -136,6 +141,28 @@ impl AnthropicProvider {
             "No Anthropic API key found. Set it in the RSI key vault or export ANTHROPIC_API_KEY."
                 .into(),
         )
+    }
+
+    /// Whether this request carries server-side context editing. The edit is
+    /// applied by the API to what it is sent; the client never rewrites an
+    /// earlier message. Direct Anthropic API only (not Bedrock).
+    fn context_editing_active(&self, request: &ChatRequest) -> bool {
+        request.context_editing
+            && self.transport == Transport::Direct
+            && request.model.starts_with("claude")
+    }
+
+    /// Extra headers for this request: the context-management beta when the
+    /// request carries `context_management`.
+    fn beta_headers(&self, request: &ChatRequest) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if self.context_editing_active(request) {
+            headers.insert(
+                "anthropic-beta",
+                reqwest::header::HeaderValue::from_static(CONTEXT_MANAGEMENT_BETA),
+            );
+        }
+        headers
     }
 
     /// Build Anthropic-format request body.
@@ -287,6 +314,9 @@ impl AnthropicProvider {
         if request.stream {
             body["stream"] = json!(true);
         }
+        if self.context_editing_active(request) {
+            body["context_management"] = context_management_config();
+        }
 
         // Current Claude models use adaptive thinking and output_config effort.
         if let Some(ref effort) = request.reasoning_effort {
@@ -369,6 +399,7 @@ impl ApiProvider for AnthropicProvider {
             .header(header_name, header_value)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
+            .headers(self.beta_headers(request))
             .json(&req_body);
         let resp = execution
             .bind_http(
@@ -522,6 +553,7 @@ impl ApiProvider for AnthropicProvider {
             .header(header_name, header_value)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
+            .headers(self.beta_headers(request))
             .json(&body);
         let resp = execution
             .bind_http(
@@ -670,6 +702,7 @@ mod tests {
             tools: Vec::new(),
             stream: false,
             reasoning_effort: effort.map(str::to_string),
+            context_editing: false,
         }
     }
 
@@ -925,5 +958,173 @@ mod tests {
             .as_f64()
             .expect("temperature is numeric");
         assert!((temperature - 0.2).abs() < 1e-6);
+    }
+
+    fn editing_request(model: &str, editing: bool) -> ChatRequest {
+        ChatRequest {
+            context_editing: editing,
+            ..request(model, None)
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn context_editing_is_sent_for_claude_on_the_direct_api_only() {
+        let direct = provider_with_key();
+        let on = editing_request("claude-opus-5-5", true);
+        let body = direct.build_request_body(&on);
+        assert_eq!(body["context_management"], context_management_config());
+        let edit = &body["context_management"]["edits"][0];
+        assert_eq!(edit["type"], "clear_tool_uses_20250919");
+        assert_eq!(edit["keep"]["type"], "tool_uses");
+        assert_eq!(edit["trigger"]["type"], "input_tokens");
+        assert_eq!(edit["clear_at_least"]["type"], "input_tokens");
+        let beta = direct.beta_headers(&on);
+        assert_eq!(beta["anthropic-beta"], CONTEXT_MANAGEMENT_BETA);
+
+        // Session setting off: neither the field nor the header.
+        let off = editing_request("claude-opus-5-5", false);
+        assert!(
+            direct
+                .build_request_body(&off)
+                .get("context_management")
+                .is_none()
+        );
+        assert!(direct.beta_headers(&off).is_empty());
+
+        // Bedrock does not offer the beta: nothing is sent.
+        let bedrock = bedrock_provider();
+        let model = "us.anthropic.claude-opus-5-5-v1:0";
+        let bedrock_on = editing_request(model, true);
+        assert!(
+            bedrock
+                .transport_body(&bedrock_on)
+                .get("context_management")
+                .is_none()
+        );
+        assert!(bedrock.beta_headers(&bedrock_on).is_empty());
+
+        // A non-Claude model id never carries it.
+        let other = editing_request("gpt-5", true);
+        assert!(
+            direct
+                .build_request_body(&other)
+                .get("context_management")
+                .is_none()
+        );
+        assert!(direct.beta_headers(&other).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn context_editing_beta_header_and_field_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                        json!({"type":"message_start", "message":{"usage":{"input_tokens":1}}}),
+                        json!({"type":"message_stop"})
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::with_credential(
+            server.uri(),
+            ApiCredential::explicit(Some("test-key")),
+        )
+        .unwrap();
+        for editing in [true, false] {
+            let mut request = editing_request("claude-sonnet-5-5", editing);
+            request.stream = true;
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            provider
+                .stream_chat(
+                    &request,
+                    tx,
+                    &tokio_util::sync::CancellationToken::new(),
+                    execution(),
+                )
+                .await
+                .unwrap();
+        }
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        let sent = |request: &wiremock::Request| -> (Option<String>, Value) {
+            (
+                request
+                    .headers
+                    .get("anthropic-beta")
+                    .map(|value| value.to_str().unwrap().to_string()),
+                serde_json::from_slice(&request.body).unwrap(),
+            )
+        };
+        let (beta, body) = sent(&received[0]);
+        assert_eq!(beta.as_deref(), Some(CONTEXT_MANAGEMENT_BETA));
+        assert_eq!(body["context_management"], context_management_config());
+        let (beta, body) = sent(&received[1]);
+        assert_eq!(beta, None);
+        assert!(body.get("context_management").is_none());
+    }
+
+    /// The transcript is append-only across a spill and a context-edit cycle:
+    /// each request's messages begin with exactly the previous request's
+    /// messages, and `context_management` is the same constant every turn, so
+    /// the cached prefix is never edited client-side.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn transcript_stays_append_only_across_a_spill_and_a_context_edit_cycle() {
+        use crate::session::harness::tools::truncation::spill_or_truncate;
+        let provider = provider_with_key();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = rsi_common::spill::SpillConfig {
+            root: root.path().to_path_buf(),
+            max_bytes: 8 * 1024,
+            max_lines: 200,
+            disabled: false,
+        };
+        let big = (0..4000)
+            .map(|n| format!("test case_{n} ... ok\n"))
+            .chain(["test case_9 ... FAILED\n".to_string()])
+            .collect::<String>();
+        let stub = spill_or_truncate(&cfg, "s4", "shell", Some(101), &big, 1 << 20, false).content;
+        assert!(stub.starts_with("[rsi-spill s4/1]"));
+
+        let call = |id: &str| {
+            let mut assistant = ChatMessage::assistant("");
+            assistant.tool_calls.push(ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                hosted: false,
+                hosted_result: None,
+            });
+            assistant
+        };
+        let mut history = vec![ChatMessage::user("run the tests")];
+        history.extend([call("t1"), ChatMessage::tool_result("t1", &stub)]);
+        history.push(ChatMessage::assistant("one failure, reading it"));
+        let mut turn = |history: &[ChatMessage]| {
+            let mut request = editing_request("claude-opus-5-5", true);
+            request.messages = history.to_vec();
+            provider.build_request_body(&request)
+        };
+        let first = turn(&history);
+
+        // A later turn: a second spilled result, then a user turn.
+        history.push(ChatMessage::user("now the other crate"));
+        history.extend([call("t2"), ChatMessage::tool_result("t2", &stub)]);
+        history.push(ChatMessage::assistant("done"));
+        let second = turn(&history);
+
+        let before = first["messages"].as_array().unwrap();
+        let after = second["messages"].as_array().unwrap();
+        assert!(after.len() > before.len());
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(first["context_management"], second["context_management"]);
+        assert_eq!(first["tools"], second["tools"]);
     }
 }

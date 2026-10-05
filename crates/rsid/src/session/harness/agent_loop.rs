@@ -538,6 +538,7 @@ pub async fn run_harness_loop_with_compact_budget(
             } else {
                 reasoning_effort.clone()
             },
+            context_editing: tools.context_editing_enabled(),
         };
 
         // 4. Call provider (streaming or blocking)

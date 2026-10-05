@@ -102,16 +102,28 @@ pub(crate) async fn deliver_one(
             continue;
         };
         let target = request.remote_session_id.0;
-        let Some(session) = snapshot
+        // #1112: a declared seat that rotated is terminal or absent in the
+        // snapshot, which carries no lineage. Absent and terminal targets are
+        // therefore not judged here: the satellite resolves the declared
+        // seat's current rotation tip (project-bound, unique, bounded) and
+        // answers `busy`, `target_not_authorized` or delivers. Only a seat
+        // the snapshot shows active or interrupted keeps the hub-side wait.
+        let snapshot_blocks = snapshot
             .sessions
             .iter()
             .find(|session| session.session_id.0 == target)
-        else {
-            return DeliveryOutcome::Refused("target_missing");
-        };
+            .is_some_and(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingApproval
+                        | SessionStatus::Interrupted
+                )
+            });
         // Interrupted is not idle: hub mail waits (and may expire) rather
         // than resuming a session the operator or a restart stopped.
-        if !matches!(session.status, SessionStatus::Completed) {
+        if snapshot_blocks {
             return DeliveryOutcome::NotYet;
         }
         let Ok(socket) = connect_owned_socket(root, &link.socket_path, RPC_DEADLINE).await else {
@@ -289,6 +301,8 @@ mod tests {
         delivered: Arc<StdMutex<Vec<Uuid>>>,
         refuse: Arc<StdMutex<Option<&'static str>>>,
         uncertain: Arc<StdMutex<bool>>,
+        /// Whether the snapshot lists the target at all (a rotated seat is not).
+        listed: Arc<StdMutex<bool>>,
     }
 
     struct Rig {
@@ -321,25 +335,28 @@ mod tests {
             delivered: Arc::new(StdMutex::new(Vec::new())),
             refuse: Arc::new(StdMutex::new(None)),
             uncertain: Arc::new(StdMutex::new(false)),
+            listed: Arc::new(StdMutex::new(true)),
         };
-        let (st, calls, delivered, refuse, uncertain) = (
+        let (st, calls, delivered, refuse, uncertain, listed) = (
             Arc::clone(&fake.status),
             Arc::clone(&fake.calls),
             Arc::clone(&fake.delivered),
             Arc::clone(&fake.refuse),
             Arc::clone(&fake.uncertain),
+            Arc::clone(&fake.listed),
         );
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (st, calls, delivered, refuse, uncertain) = (
+                let (st, calls, delivered, refuse, uncertain, listed) = (
                     Arc::clone(&st),
                     Arc::clone(&calls),
                     Arc::clone(&delivered),
                     Arc::clone(&refuse),
                     Arc::clone(&uncertain),
+                    Arc::clone(&listed),
                 );
                 tokio::spawn(async move {
                     let mut stream = tokio::io::BufReader::new(stream);
@@ -362,24 +379,29 @@ mod tests {
                             ),
                             "ListSatelliteSessions" => {
                                 let status = *st.lock().unwrap();
+                                let is_listed = *listed.lock().unwrap();
                                 let now = Utc::now();
                                 let page = SatelliteSessionPageV1 {
                                     wire_version: SATELLITE_WIRE_VERSION_V1,
                                     installation_id: SatelliteUuidV1(installation),
                                     daemon_incarnation_id: SatelliteUuidV1(incarnation),
                                     snapshot_id: SatelliteUuidV1(Uuid::new_v4()),
-                                    snapshot_total_sessions: 1,
+                                    snapshot_total_sessions: u32::from(is_listed),
                                     snapshot_offset: 0,
                                     observed_at: now,
-                                    sessions: vec![SatelliteSessionSummaryV1 {
-                                        session_id: SatelliteUuidV1(remote),
-                                        title: None,
-                                        provider: SessionProvider::Claude,
-                                        status,
-                                        working_dir: None,
-                                        created_at: now,
-                                        updated_at: now,
-                                    }],
+                                    sessions: if is_listed {
+                                        vec![SatelliteSessionSummaryV1 {
+                                            session_id: SatelliteUuidV1(remote),
+                                            title: None,
+                                            provider: SessionProvider::Claude,
+                                            status,
+                                            working_dir: None,
+                                            created_at: now,
+                                            updated_at: now,
+                                        }]
+                                    } else {
+                                        Vec::new()
+                                    },
                                     next_cursor: None,
                                 };
                                 RpcResponse::success(
@@ -425,7 +447,7 @@ mod tests {
             }
         });
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let session = crate::store::tests::make_test_session();
+        let session = rsid_store::test_support::make_test_session();
         let peer = Uuid::new_v4();
         {
             let guard = store.lock().await;
@@ -599,6 +621,88 @@ mod tests {
         dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
         assert_eq!(state(&rig, id).await, "queued");
         assert!(rig.fake.delivered.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_rotated_declared_seat_absent_from_the_snapshot_is_delivered_once() {
+        let rig = rig(true, SessionStatus::Completed).await;
+        *rig.fake.listed.lock().unwrap() = false;
+        let id = queue(&rig, "k1").await;
+        let mut dispatch = DispatchState::default();
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "sent");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(*rig.fake.delivered.lock().unwrap(), vec![id]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_terminal_declared_seat_in_the_snapshot_is_left_to_the_satellite() {
+        for status in [
+            SessionStatus::Failed,
+            SessionStatus::Archived,
+            SessionStatus::Deleted,
+        ] {
+            let rig = rig(true, status).await;
+            let id = queue(&rig, "k1").await;
+            let mut dispatch = DispatchState::default();
+            dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+            assert_eq!(state(&rig, id).await, "sent", "{status:?}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_absent_target_with_a_branched_or_unknown_lineage_settles_failed_with_a_static_class()
+     {
+        let rig = rig(true, SessionStatus::Completed).await;
+        *rig.fake.listed.lock().unwrap() = false;
+        *rig.fake.refuse.lock().unwrap() = Some("target_not_authorized");
+        let id = queue(&rig, "k1").await;
+        let mut dispatch = DispatchState::default();
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "failed");
+        let receipt = rig
+            .store
+            .lock()
+            .await
+            .queue_satellite_message(
+                rig.owner,
+                &AgentSendSatelliteMessageRequestV1 {
+                    peer_id: SatelliteUuidV1(rig.peer),
+                    remote_session_id: SatelliteUuidV1(rig.remote),
+                    message: "please rebase".into(),
+                    idempotency_key: "k1".into(),
+                    expires_at: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(receipt.replayed);
+        assert_eq!(
+            receipt.settled_error_class.as_deref(),
+            Some("target_not_authorized")
+        );
+        assert!(rig.fake.delivered.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_absent_target_whose_tip_is_busy_waits_and_then_delivers() {
+        let rig = rig(true, SessionStatus::Completed).await;
+        *rig.fake.listed.lock().unwrap() = false;
+        *rig.fake.refuse.lock().unwrap() = Some("busy");
+        let id = queue(&rig, "k1").await;
+        let mut dispatch = DispatchState::default();
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "queued");
+        *rig.fake.refuse.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "sent");
+        assert_eq!(*rig.fake.delivered.lock().unwrap(), vec![id]);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

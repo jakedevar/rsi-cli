@@ -114,6 +114,8 @@ pub struct DaemonResourceView {
     /// Percent of one core (may exceed 100 on several cores); `None` until
     /// two samples of one daemon process exist.
     pub cpu_percent: Option<f64>,
+    /// #1122: the operator's pending quiet-point restart, one line.
+    pub restart_pending: Option<String>,
 }
 
 impl DaemonResourceView {
@@ -139,6 +141,7 @@ impl DaemonResourceView {
         Self {
             sample,
             cpu_percent,
+            restart_pending: previous.and_then(|previous| previous.restart_pending.clone()),
         }
     }
 

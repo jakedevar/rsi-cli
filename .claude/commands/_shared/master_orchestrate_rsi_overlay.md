@@ -76,7 +76,7 @@ Use this vocabulary unless a narrower gate pack overrides it:
 - `other`
 
 Schema changes require a new versioned migration file
-`crates/rsid/src/store/migrations/vNNN.rs` with the matching `user_version` bump. Released
+`crates/rsid-store/src/store/migrations/vNNN.rs` with the matching `user_version` bump. Released
 migrations and pins remain immutable.
 
 ## Verification Defaults

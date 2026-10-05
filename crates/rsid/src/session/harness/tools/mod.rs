@@ -15,6 +15,7 @@ pub mod list_files;
 pub mod memory;
 pub mod policy;
 pub(crate) mod process_registry;
+pub mod read_output;
 pub mod rsi_control;
 pub mod schedule_wake;
 pub mod shell;
@@ -154,6 +155,8 @@ pub struct HarnessToolRegistry {
     tools: HashMap<String, Arc<dyn HarnessTool>>,
     order: Vec<String>,
     session_id: Option<uuid::Uuid>,
+    /// #1097: where large tool outputs spill (shared rsi-common store).
+    spill: Arc<rsi_common::spill::SpillConfig>,
     process_registry: Option<Arc<exec::ProcessRegistry>>,
     mcp_clients: Vec<Arc<tokio::sync::Mutex<StdioMcpClient>>>,
     utility_state: Arc<utility::UtilityToolState>,
@@ -196,6 +199,7 @@ impl HarnessToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
             session_id: None,
+            spill: Arc::new(default_spill_config()),
             process_registry: None,
             mcp_clients: Vec::new(),
             utility_state: Arc::new(utility::UtilityToolState::default()),
@@ -220,6 +224,15 @@ impl HarnessToolRegistry {
             .as_ref()
             .map(|policy| policy.egress_policy())
             .unwrap_or_default()
+    }
+
+    /// Server-side context editing is requested for this session (default on;
+    /// only the direct Anthropic provider acts on it).
+    #[must_use]
+    pub fn context_editing_enabled(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_none_or(|policy| policy.policy().context_editing_enabled())
     }
 
     #[must_use]
@@ -401,7 +414,8 @@ impl HarnessToolRegistry {
             return refusal;
         }
         let result = match self.tools.get(name) {
-            Some(tool) => cap_tool_result(
+            Some(tool) => self.finish_result(
+                name,
                 tool.execute_with_context(args, &context).await,
                 context.policy.max_output_bytes,
             ),
@@ -437,7 +451,8 @@ impl HarnessToolRegistry {
             return refusal;
         }
         let result = match self.tools.get(name) {
-            Some(tool) => cap_tool_result(
+            Some(tool) => self.finish_result(
+                name,
                 tool.execute(args, working_dir).await,
                 ToolPolicy::default().max_output_bytes,
             ),
@@ -465,7 +480,8 @@ impl HarnessToolRegistry {
             return refusal;
         }
         let result = match self.tools.get(name) {
-            Some(tool) => cap_tool_result(
+            Some(tool) => self.finish_result(
+                name,
                 tool.execute_cancellable(args, working_dir, cancel).await,
                 ToolPolicy::default().max_output_bytes,
             ),
@@ -613,6 +629,9 @@ impl HarnessToolRegistry {
             launch_invocation_id,
         )));
         registry.register(Arc::new(list_files::ListFilesTool));
+        registry.register(Arc::new(read_output::ReadOutputTool::new(
+            registry.spill_config(),
+        )));
         registry.register(Arc::new(view_image::ViewImageTool::new(
             image_input_supported,
         )));
@@ -660,6 +679,13 @@ impl HarnessToolRegistry {
             registry.register(Arc::new(
                 rsi_control::RsiControlQueryFailureSignaturesTool::new(control.clone(), caller),
             ));
+            for verb in rsi_control::GLOBAL_NATIVE_VERBS {
+                registry.register(Arc::new(rsi_control::RsiControlGlobalTool::new(
+                    control.clone(),
+                    caller,
+                    verb,
+                )));
+            }
             registry.register(Arc::new(rsi_control::RsiControlSendMessageTool::new(
                 control.clone(),
                 caller,
@@ -717,11 +743,95 @@ impl Default for HarnessToolRegistry {
     }
 }
 
-fn cap_tool_result(mut result: ToolResult, max_output_bytes: usize) -> ToolResult {
-    if !result.has_typed_blocks() && result.output.len() > max_output_bytes {
-        result.output = truncation::truncate_text(&result.output, max_output_bytes, false).content;
+/// Production reads the environment; unit tests never write to the real store.
+fn default_spill_config() -> rsi_common::spill::SpillConfig {
+    #[cfg(test)]
+    {
+        let mut config = rsi_common::spill::SpillConfig::from_lookup(&|_| None);
+        config.root = std::env::temp_dir().join("rsid-harness-test-spill");
+        config.disabled = false;
+        config
     }
-    result
+    #[cfg(not(test))]
+    rsi_common::spill::SpillConfig::from_env()
+}
+
+/// Tools whose output the model asked for verbatim: they spill only when the
+/// text would otherwise be cut at the hard cap, never at the 8 KB threshold.
+fn is_deliberate_read(name: &str) -> bool {
+    matches!(name, "read_file" | "view_image")
+}
+
+/// `Exit code: N` from a failed command result, else `0` for a successful
+/// command-shaped tool, else unknown.
+fn result_exit_code(name: &str, result: &ToolResult) -> Option<i32> {
+    if let Some(code) = result
+        .error_msg
+        .as_deref()
+        .and_then(|message| message.strip_prefix("Exit code: "))
+        .and_then(|code| code.trim().parse().ok())
+    {
+        return Some(code);
+    }
+    let command_shaped = matches!(name, "shell" | "git" | "exec_command" | "write_stdin");
+    (command_shaped && result.success).then_some(0)
+}
+
+impl HarnessToolRegistry {
+    /// The spill store for this registry (the `read_output` tool reads it).
+    pub fn spill_config(&self) -> Arc<rsi_common::spill::SpillConfig> {
+        Arc::clone(&self.spill)
+    }
+
+    /// Replace the spill store, before tools are registered (tests, operators).
+    pub fn set_spill_config(&mut self, config: rsi_common::spill::SpillConfig) {
+        self.spill = Arc::new(config);
+    }
+
+    fn spill_key(&self) -> String {
+        match self.session_id {
+            Some(id) => rsi_common::spill::session_key(&id.to_string()),
+            None => rsi_common::spill::current_session_key(None),
+        }
+    }
+
+    /// The shared output contract (#778, #1097): a large result is spilled to
+    /// the store and replaced by one deterministic stub with a handle; it is
+    /// never silently discarded. Applies to this new result only, so the
+    /// transcript stays append-only.
+    fn finish_result(
+        &self,
+        name: &str,
+        mut result: ToolResult,
+        max_output_bytes: usize,
+    ) -> ToolResult {
+        if result.has_typed_blocks() {
+            return result;
+        }
+        if name == "read_output" {
+            // The retrieval tool bounds itself; spilling its output again
+            // would hand back a stub for the thing just asked for.
+            if result.output.len() > max_output_bytes {
+                result.output =
+                    truncation::truncate_text(&result.output, max_output_bytes, false).content;
+            }
+            return result;
+        }
+        let exit = result_exit_code(name, &result);
+        let bounded = truncation::spill_or_truncate(
+            &self.spill,
+            &self.spill_key(),
+            name,
+            exit,
+            &result.output,
+            max_output_bytes,
+            is_deliberate_read(name),
+        );
+        if bounded.truncated {
+            result.output = bounded.content;
+        }
+        result
+    }
 }
 
 /// System blocklist -- these paths are never writable even with wildcard allowed_paths.
@@ -940,6 +1050,7 @@ mod tests {
                 "write_stdin",
                 "git",
                 "list_files",
+                "read_output",
                 "view_image"
             ]
         );
@@ -994,6 +1105,10 @@ mod tests {
         let line = format!("{}\n", "x".repeat(512));
         let output = line.repeat(3000);
         let mut registry = HarnessToolRegistry::new();
+        // With the spill store off the contract falls back to truncation.
+        let mut off = (*registry.spill_config()).clone();
+        off.disabled = true;
+        registry.set_spill_config(off);
         registry.register(Arc::new(OutputTool(Arc::new(std::sync::Mutex::new(
             output,
         )))));
@@ -1246,7 +1361,11 @@ mod tests {
         let rotation: std::collections::BTreeSet<String> = build().tools.keys().cloned().collect();
         assert_eq!(fresh, rotation, "fresh and rotation tool sets must match");
 
-        let expected: std::collections::BTreeSet<String> = [
+        // Non-agent-control tools are pinned by hand; every agent-control
+        // tool is derived from the descriptor table (#1116) so adding a verb
+        // with a native tool can never leave this roster stale. The argument-
+        // free program-guard convenience is the one native-only extra.
+        let mut expected: std::collections::BTreeSet<String> = [
             "update_plan",
             "context_status",
             "compact",
@@ -1259,49 +1378,19 @@ mod tests {
             "write_stdin",
             "git",
             "list_files",
+            "read_output",
             "view_image",
-            "schedule_wake",
-            "rsi_control_spawn",
-            "rsi_control_reserve_successor",
-            "rsi_control_progress",
-            "rsi_control_send_message",
-            "rsi_control_status",
-            "rsi_control_halt",
             "rsi_control_program_guard",
-            "rsi_control_create_issue",
-            "rsi_control_list_issues",
-            "rsi_control_get_issue",
-            "rsi_control_update_issue",
-            "rsi_control_update_issue_status",
-            "rsi_control_archive_issue",
-            "rsi_control_restore_issue",
-            "rsi_control_list_issue_events",
-            "rsi_control_authority_catalog",
-            "rsi_control_manager_progress",
-            "rsi_control_manager_inbox",
-            "rsi_control_manager_send",
-            "rsi_control_manager_reply",
-            "rsi_control_manager_notify",
-            "rsi_control_manager_inspect",
-            "rsi_control_manager_update",
-            "rsi_control_submit_review_receipt",
-            "rsi_control_manager_control",
-            "rsi_control_manager_prepare_control",
-            "rsi_control_manager_commit_prepared_control",
-            "rsi_control_manager_get_action",
-            "rsi_control_manager_work_view",
-            "rsi_control_topology_upsert",
-            "rsi_control_topology_list",
-            "rsi_control_topology_execute",
-            "rsi_control_topology_get_execution",
-            "rsi_control_topology_interrupt",
-            "rsi_control_topology_resolve_attempt",
-            "rsi_control_read_session_events",
-            "rsi_control_query_failure_signatures",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
+        expected.extend(
+            rsi_common::agent_control_schema::agent_control_catalog_v1()
+                .iter()
+                .filter_map(|descriptor| descriptor.native_tool)
+                .map(|native| native.name().to_string()),
+        );
         assert_eq!(fresh, expected, "unified Harness tool roster drifted");
     }
 
@@ -1345,9 +1434,12 @@ mod tests {
                 "AgentSubmitJob",
                 "AgentGetJob",
                 "AgentListJobs",
+                "AgentCancelJob",
                 "AgentSendSatelliteMessage",
+                "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentGlobalAppointManager",
                 // #1028 and #1042 landed both wake verbs as RPC-only by design.
                 "AgentCancelWake",
                 "AgentListWakes",
@@ -1435,5 +1527,189 @@ mod tests {
         );
         let names: Vec<&String> = registry.tools.keys().collect();
         assert!(!names.iter().any(|n| n.starts_with("rsi_control")));
+    }
+
+    fn spill_registry(root: &Path) -> HarnessToolRegistry {
+        let mut registry = HarnessToolRegistry::new();
+        registry.set_spill_config(rsi_common::spill::SpillConfig {
+            root: root.to_path_buf(),
+            max_bytes: 8 * 1024,
+            max_lines: 200,
+            disabled: false,
+        });
+        registry.session_id =
+            Some(uuid::Uuid::parse_str("1a2b3c4d-0000-4000-8000-000000000000").unwrap());
+        registry
+    }
+
+    async fn run(
+        registry: &HarnessToolRegistry,
+        name: &str,
+        args: serde_json::Value,
+    ) -> ToolResult {
+        registry
+            .execute_with_context(
+                name,
+                args,
+                Path::new("/tmp"),
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn large_tool_output_is_spilled_and_read_output_returns_the_exact_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = spill_registry(dir.path());
+        let mut output = String::new();
+        for n in 0..5_000 {
+            output.push_str(&format!("test mod::t{n} ... ok\n"));
+        }
+        output.push_str("test mod::broken ... FAILED\n");
+        registry.register(Arc::new(OutputTool(Arc::new(std::sync::Mutex::new(
+            output.clone(),
+        )))));
+        let handle_tool = read_output::ReadOutputTool::new(registry.spill_config());
+        registry.register(Arc::new(handle_tool));
+
+        let stub = run(&registry, "output_probe", json!({})).await;
+        assert!(stub.success);
+        assert!(stub.output.len() < 2048);
+        assert!(
+            stub.output
+                .starts_with("[rsi-spill 1a2b3c4d/1] output_probe")
+        );
+        assert!(stub.output.contains("mod::broken ... FAILED"));
+
+        let grep = run(
+            &registry,
+            "read_output",
+            json!({"handle": "1a2b3c4d/1", "grep": "broken"}),
+        )
+        .await;
+        assert!(grep.success, "{:?}", grep.error_msg);
+        assert_eq!(grep.output, "5001:test mod::broken ... FAILED\n");
+
+        let range = run(
+            &registry,
+            "read_output",
+            json!({"handle": "1a2b3c4d/1", "range": "1:2"}),
+        )
+        .await;
+        assert_eq!(range.output, "test mod::t0 ... ok\ntest mod::t1 ... ok\n");
+
+        // The retrieval result is never re-spilled into another stub.
+        let all = run(&registry, "read_output", json!({"handle": "1a2b3c4d/1"})).await;
+        assert!(all.output.starts_with("test mod::t0 ... ok"));
+        assert!(all.output.contains("read_output: showing"));
+        assert!(!all.output.contains("[rsi-spill"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn read_output_rejects_bad_handles_and_ranges_and_reports_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = spill_registry(dir.path());
+        registry.register(Arc::new(read_output::ReadOutputTool::new(
+            registry.spill_config(),
+        )));
+        let missing = run(&registry, "read_output", json!({})).await;
+        assert!(!missing.success);
+        let traversal = run(
+            &registry,
+            "read_output",
+            json!({"handle": "../../etc/passwd"}),
+        )
+        .await;
+        assert!(!traversal.success);
+        let unknown = run(&registry, "read_output", json!({"handle": "nope/9"})).await;
+        assert!(!unknown.success);
+
+        rsi_common::spill::store(
+            dir.path(),
+            "zz",
+            &rsi_common::spill::SpillMeta::default(),
+            b"alpha\nbeta\n",
+        )
+        .unwrap();
+        let bad_range = run(
+            &registry,
+            "read_output",
+            json!({"handle": "zz/1", "range": "x:y"}),
+        )
+        .await;
+        assert!(!bad_range.success);
+        let none = run(
+            &registry,
+            "read_output",
+            json!({"handle": "zz/1", "grep": "gamma"}),
+        )
+        .await;
+        assert!(none.success);
+        assert_eq!(none.output, "(no lines matched)");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn a_failing_command_keeps_its_exit_code_in_the_stub() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl HarnessTool for Failing {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "fails loudly"
+            }
+            fn parameters_json(&self) -> &str {
+                "{}"
+            }
+            async fn execute(&self, _args: serde_json::Value, _dir: &Path) -> ToolResult {
+                ToolResult {
+                    success: false,
+                    output: "error[E0308]: mismatched types\n".to_string()
+                        + &"noise\n".repeat(3000),
+                    error_msg: Some("Exit code: 101".into()),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = spill_registry(dir.path());
+        registry.register(Arc::new(Failing));
+        let result = run(&registry, "shell", json!({})).await;
+        assert!(!result.success);
+        assert_eq!(result.error_msg.as_deref(), Some("Exit code: 101"));
+        assert!(result.output.contains("exit=101"));
+        assert!(result.output.contains("error[E0308]"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn context_editing_defaults_on_and_follows_the_session_policy() {
+        assert!(HarnessToolRegistry::new().context_editing_enabled());
+        let (on, _) =
+            policy_registry(rsi_common::harness_tool_policy::HarnessToolPolicy::default());
+        assert!(on.context_editing_enabled());
+        let (off, _) = policy_registry(rsi_common::harness_tool_policy::HarnessToolPolicy {
+            context_editing: Some(false),
+            ..Default::default()
+        });
+        assert!(!off.context_editing_enabled());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn the_default_catalog_offers_read_output() {
+        let registry = HarnessToolRegistry::default_tools(
+            None, None, None, None, None, None, None, None, None, false,
+        );
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "read_output")
+        );
     }
 }

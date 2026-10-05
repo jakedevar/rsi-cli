@@ -415,6 +415,49 @@ fn recursive_artifact_summary_list_params(
 }
 
 impl DaemonClient {
+    /// Operator-only RSI Remote status (#1096).
+    pub async fn remote_get_status(
+        &mut self,
+    ) -> Result<rsi_common::remote_control::RemoteStatusV1> {
+        Ok(serde_json::from_value(
+            self.request("RemoteGetStatus", Value::Null).await?,
+        )?)
+    }
+
+    /// Operator-only RSI Remote edit; also converges gateway and serve route.
+    pub async fn remote_set_config(
+        &mut self,
+        request: rsi_common::remote_control::RemoteSetConfigRequestV1,
+    ) -> Result<rsi_common::remote_control::RemoteStatusV1> {
+        Ok(serde_json::from_value(
+            self.request("RemoteSetConfig", serde_json::to_value(request)?)
+                .await?,
+        )?)
+    }
+
+    /// Operator-only (#1147): unrecorded scratch directories and whether each
+    /// can be adopted now. Read-only.
+    pub async fn list_legacy_scratch(
+        &mut self,
+    ) -> Result<rsi_common::scratch_adopt::ListLegacyScratchResponseV1> {
+        Ok(serde_json::from_value(
+            self.request("ListLegacyScratch", Value::Null).await?,
+        )?)
+    }
+
+    /// Operator-only (#1147): record the chosen scratch directories so the
+    /// daemon's reclaim pass may delete them later. Deletes nothing itself.
+    pub async fn adopt_legacy_scratch(
+        &mut self,
+        paths: Vec<String>,
+    ) -> Result<rsi_common::scratch_adopt::AdoptLegacyScratchResponseV1> {
+        let params = rsi_common::scratch_adopt::AdoptLegacyScratchRequestV1 { paths };
+        Ok(serde_json::from_value(
+            self.request("AdoptLegacyScratch", serde_json::to_value(params)?)
+                .await?,
+        )?)
+    }
+
     /// Read the hub-owned satellite registry. This never connects the TUI to a peer.
     pub async fn list_satellite_peers(&mut self) -> Result<SatelliteRegistryV1> {
         Ok(serde_json::from_value(
@@ -716,6 +759,18 @@ impl DaemonClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// Same call as `configure_harness_manager`, keeping what the save did
+    /// to the saved policy (#1145).
+    pub async fn configure_harness_manager_outcome(
+        &mut self,
+        request: rsi_common::harness_manager::ConfigureHarnessManagerRequestV1,
+    ) -> Result<rsi_common::harness_manager::ConfigureHarnessManagerResultV1> {
+        let result = self
+            .request("ConfigureHarnessManager", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     pub async fn get_harness_manager_policy(
         &mut self,
         project_id: uuid::Uuid,
@@ -758,6 +813,16 @@ impl DaemonClient {
             .await?;
         Ok(serde_json::from_value(result)?)
     }
+    /// #890: operator-only manager tree snapshot page.
+    pub async fn get_manager_tree(
+        &mut self,
+        request: rsi_common::manager_tree::GetManagerTreeRequestV1,
+    ) -> Result<rsi_common::manager_tree::GetManagerTreeResultV1> {
+        let result = self
+            .request("GetManagerTree", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
     pub async fn get_manager_node(
         &mut self,
         request: rsi_common::manager_nodes::GetManagerNodeRequestV1,
@@ -782,6 +847,58 @@ impl DaemonClient {
     ) -> Result<rsi_common::manager_nodes::ManagerNodeViewV1> {
         let result = self
             .request("RevokeManagerNode", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #1122: operator-only quiet-point restart status, force and cancel.
+    pub async fn get_operator_restart(
+        &mut self,
+    ) -> Result<rsi_common::operator_restart::OperatorRestartStatusV1> {
+        let result = self
+            .request("GetOperatorRestart", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn force_operator_restart(
+        &mut self,
+    ) -> Result<rsi_common::operator_restart::OperatorRestartStatusV1> {
+        let result = self
+            .request("ForceOperatorRestart", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn cancel_operator_restart(
+        &mut self,
+    ) -> Result<rsi_common::operator_restart::OperatorRestartStatusV1> {
+        let result = self
+            .request("CancelOperatorRestart", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #872: operator-only global manager grant.
+    pub async fn get_global_manager(
+        &mut self,
+    ) -> Result<Option<rsi_common::global_manager::GlobalManagerGrantV1>> {
+        let result = self
+            .request("GetGlobalManager", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn configure_global_manager(
+        &mut self,
+        request: rsi_common::global_manager::ConfigureGlobalManagerRequestV1,
+    ) -> Result<rsi_common::global_manager::GlobalManagerGrantV1> {
+        let result = self
+            .request("ConfigureGlobalManager", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn revoke_global_manager(
+        &mut self,
+        request: rsi_common::global_manager::RevokeGlobalManagerRequestV1,
+    ) -> Result<rsi_common::global_manager::GlobalManagerGrantV1> {
+        let result = self
+            .request("RevokeGlobalManager", serde_json::to_value(request)?)
             .await?;
         Ok(serde_json::from_value(result)?)
     }

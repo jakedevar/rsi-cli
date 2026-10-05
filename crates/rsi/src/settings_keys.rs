@@ -1,6 +1,6 @@
 //! Key handling for the settings pane.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::App;
 use crate::claude_config;
@@ -54,6 +54,7 @@ pub(crate) fn daemon_feature_field_for(id: SettingId) -> Option<&'static str> {
         SettingId::PreviewReclaim => Some("sandbox_build_cache_dry_run"),
         SettingId::ReclaimNow => Some("sandbox_build_cache_reclaim_now"),
         SettingId::SourceWorktreeSettlement => Some("source_worktree_settlement"),
+        SettingId::LegacyScratchAdoption => Some("legacy_scratch_adoption"),
         // The stall classifier model is edited through the Model Roles
         // dropdown (`agent_actors_dropdown_config` idx 5), never through the
         // generic daemon-feature row path, even though its value is cached
@@ -201,6 +202,13 @@ const fn spec_position_for_ui_row(section: SettingsSection, ui_row: usize) -> us
         | SettingsSection::ClaudeHooks
         | SettingsSection::ClaudeSkills
         | SettingsSection::ProviderKeys => 0,
+        SettingsSection::Usage => {
+            if ui_row == 6 {
+                1
+            } else {
+                0
+            }
+        }
         _ => ui_row,
     }
 }
@@ -221,6 +229,13 @@ const fn ui_row_for_spec_position(section: SettingsSection, spec_position: usize
             1 => 1,
             _ => 1 + crate::types::NavigatorOptionalColumn::ALL.len(),
         },
+        SettingsSection::Usage => {
+            if spec_position == 1 {
+                6
+            } else {
+                0
+            }
+        }
         _ => spec_position,
     }
 }
@@ -723,13 +738,11 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             if app.settings_state.focus == SettingsFocus::Categories =>
         {
             app.settings_state.focus = SettingsFocus::Items;
-            app.settings_state.selected_index = 0;
             refresh_entered_settings_section(app);
             true
         }
         KeyCode::Enter if app.settings_state.focus == SettingsFocus::Categories => {
             app.settings_state.focus = SettingsFocus::Items;
-            app.settings_state.selected_index = 0;
             refresh_entered_settings_section(app);
             true
         }
@@ -752,20 +765,24 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                     app.pending_lc_actions
                         .push(LcAction::ToggleDaemonFeature(vec_idx));
                 }
+            } else if section == SettingsSection::Remote {
+                app.pending_lc_actions.push(LcAction::OpenRemoteSettings);
             } else if section == SettingsSection::ClaudeHooks {
                 open_hook_edit_for_selected_index(app);
             } else if section == SettingsSection::ClaudeSkills {
                 open_skill_preview_for_selected_index(app);
             } else if DAEMON_FEATURE_SECTIONS.contains(&section) {
                 if let Some(vec_idx) = daemon_feature_vec_index(app, section, idx) {
-                    let settlement_row = app
+                    let field = app
                         .daemon_features
                         .get(vec_idx)
-                        .is_some_and(|entry| entry.field == "source_worktree_settlement");
-                    app.pending_lc_actions.push(if settlement_row {
-                        LcAction::OpenSourceWorktreeSettlement
-                    } else {
-                        LcAction::ToggleDaemonFeature(vec_idx)
+                        .map(|entry| entry.field.as_str());
+                    app.pending_lc_actions.push(match field {
+                        Some("source_worktree_settlement") => {
+                            LcAction::OpenSourceWorktreeSettlement
+                        }
+                        Some("legacy_scratch_adoption") => LcAction::OpenLegacyScratch,
+                        _ => LcAction::ToggleDaemonFeature(vec_idx),
                     });
                 }
             } else if section == SettingsSection::Usage {
@@ -1103,6 +1120,10 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
 
         // Section tabs of the selected category: Tab / Shift-Tab, or `]` / `[`
         // (the Issues workspace's tab keys). Works from the rail and the list.
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            cycle_section_tab(app, -1);
+            true
+        }
         KeyCode::Tab | KeyCode::Char(']') => {
             cycle_section_tab(app, 1);
             true
@@ -1136,9 +1157,8 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 /// Move to the next (`step > 0`) or previous section tab of the selected
-/// category, wrapping inside the category. The list cursor resets to the new
-/// tab's first row and the tab's daemon-backed data is refreshed, exactly as
-/// when the section is entered from the rail.
+/// category, wrapping inside the category. Focus follows the selected tab,
+/// its remembered row is restored, and daemon-backed data is refreshed.
 fn cycle_section_tab(app: &mut App, step: isize) {
     let current = app.settings_state.section;
     let tabs: Vec<SettingsSection> = current.group().sections().collect();
@@ -1147,12 +1167,10 @@ fn cycle_section_tab(app: &mut App, step: isize) {
     };
     let count = tabs.len() as isize;
     let next = tabs[(position as isize + step).rem_euclid(count) as usize];
-    if next == current {
-        return;
-    }
     app.settings_state.model_dropdown.close();
     app.settings_state.active_dropdown_item = None;
-    enter_settings_section(app, next, 0);
+    app.settings_state.provider_key_clear_confirmation = None;
+    enter_remembered_settings_section(app, next);
 }
 
 /// Resize the focused Settings panel by one step.
@@ -1205,19 +1223,18 @@ fn resize_settings_panels(app: &mut App, grow: bool) {
 /// Navigate down within settings pane (called from App::nav_down).
 ///
 /// The rail lists categories (`SettingsGroup`), so `j` on the rail selects
-/// the next category and opens it on its first section tab.
+/// the next category and restores its last section tab and row.
 pub fn nav_down(state: &mut SettingsState, settings: &UserSettings) {
     match state.focus {
         SettingsFocus::Categories => {
             let position = state.section.group().position();
             if let Some(next) = SettingsGroup::ALL.get(position + 1) {
-                state.section = next.first_section();
-                state.selected_index = 0;
+                state.select_group(*next);
             }
         }
         SettingsFocus::Items => {
             let max = item_count(state.section, settings);
-            if state.selected_index + 1 < max {
+            if state.selected_index < max.saturating_sub(1) {
                 state.selected_index += 1;
             }
         }
@@ -1233,8 +1250,7 @@ pub fn nav_up(state: &mut SettingsState, _settings: &UserSettings) {
                 .checked_sub(1)
                 .and_then(|previous| SettingsGroup::ALL.get(previous))
             {
-                state.section = previous.first_section();
-                state.selected_index = 0;
+                state.select_group(*previous);
             }
         }
         SettingsFocus::Items => {
@@ -1265,6 +1281,9 @@ pub fn close_settings(app: &mut App) {
             };
         }
     }
+    app.settings_state.remember_position();
+    app.settings_state.clear_transient();
+    crate::state::PersistedState::capture(app).save();
 }
 
 /// Floor row count for a daemon-features-backed section, computed against
@@ -1313,10 +1332,11 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         SettingsSection::ClaudeSkills => 1,
         SettingsSection::MessageBridges => 2,
         SettingsSection::Satellites => 2,
+        SettingsSection::Remote => 1,
         SettingsSection::SystemPrompt => 1,
         // Baseline row floor; live rendering/navigation expands this through
         // `model_control_stats::stats_row_count`.
-        SettingsSection::Usage => 16,
+        SettingsSection::Usage => 14,
         // Baseline row floor (always >= 1 via the synthetic empty-state row);
         // live rendering/navigation expands this through
         // `model_control_budgets::budget_row_count`.
@@ -1430,6 +1450,7 @@ pub(crate) fn refresh_entered_settings_section(app: &mut App) {
     maybe_queue_provider_credentials_refresh(app);
     maybe_queue_mcp_servers_refresh(app);
     ensure_claude_caches_for_category(app);
+    clamp_settings_selection(app);
 }
 
 fn maybe_queue_provider_credentials_refresh(app: &mut App) {
@@ -1446,9 +1467,56 @@ fn maybe_queue_mcp_servers_refresh(app: &mut App) {
 }
 
 fn enter_settings_section(app: &mut App, section: SettingsSection, selected_index: usize) {
-    app.settings_state.section = section;
+    app.settings_state.select_section(section);
     app.settings_state.selected_index = selected_index;
+    app.settings_state.focus = SettingsFocus::Items;
     refresh_entered_settings_section(app);
+}
+
+pub(crate) fn enter_remembered_settings_section(app: &mut App, section: SettingsSection) {
+    app.settings_state.select_section(section);
+    app.settings_state.focus = SettingsFocus::Items;
+    refresh_entered_settings_section(app);
+}
+
+pub(crate) fn reopen_settings(app: &mut App) {
+    app.settings_state.clear_transient();
+    refresh_entered_settings_section(app);
+}
+
+/// Live counts are shared by navigation and restoring a saved cursor.
+pub(crate) fn settings_row_count(app: &mut App) -> usize {
+    match app.settings_state.section {
+        SettingsSection::ClaudeHooks => hook_row_count(app),
+        SettingsSection::ClaudeSkills => skill_row_count(app),
+        SettingsSection::Usage => crate::model_control_stats::stats_row_count(app),
+        SettingsSection::Budgets => crate::model_control_budgets::budget_row_count(app),
+        SettingsSection::McpServers => app
+            .cached_mcp_servers
+            .as_ref()
+            .map_or(1, |list| list.servers.len().max(1)),
+        section if DAEMON_FEATURE_SECTIONS.contains(&section) => {
+            daemon_feature_rows_for_section(app, section).len().max(1)
+        }
+        section => item_count(section, &app.settings),
+    }
+}
+
+pub(crate) fn clamp_settings_selection(app: &mut App) {
+    // A loading placeholder is not the final list. Preserve the remembered
+    // cursor until telemetry arrives, then clamp it before rendering/acting.
+    let ready = match app.settings_state.section {
+        SettingsSection::Usage => {
+            app.cached_usage_stats.is_some() && app.cached_model_control_status.is_some()
+        }
+        SettingsSection::Budgets => app.cached_model_control_status.is_some(),
+        SettingsSection::McpServers => app.cached_mcp_servers.is_some(),
+        _ => true,
+    };
+    if ready {
+        let last = settings_row_count(app).saturating_sub(1);
+        app.settings_state.selected_index = app.settings_state.selected_index.min(last);
+    }
 }
 
 /// If the current section is Usage, Budgets, or daemon-features-backed,
@@ -1785,6 +1853,7 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         // Message bridge rows open an editor form.
         SettingsSection::MessageBridges => {}
         SettingsSection::Satellites => {}
+        SettingsSection::Remote => {}
         // Hooks/Skills mutate ~/.claude/ on disk via dedicated handlers; toggle is a no-op here.
         SettingsSection::ClaudeHooks => {}
         SettingsSection::ClaudeSkills => {}
@@ -1815,6 +1884,18 @@ mod tests {
         assert!(
             app.pending_lc_actions
                 .contains(&LcAction::OpenSatelliteRegistry)
+        );
+    }
+
+    #[test]
+    fn remote_setting_opens_the_operator_remote_page() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::Remote;
+        app.settings_state.focus = SettingsFocus::Items;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert!(
+            app.pending_lc_actions
+                .contains(&LcAction::OpenRemoteSettings)
         );
     }
 
@@ -2040,7 +2121,7 @@ mod tests {
     #[test]
     fn test_settings_category_all_count() {
         // Seven rail groups, including the satellite integration section.
-        assert_eq!(SettingsSection::ALL.len(), 24);
+        assert_eq!(SettingsSection::ALL.len(), 25);
     }
 
     #[test]
@@ -2056,7 +2137,7 @@ mod tests {
             item_count(SettingsSection::RetriesRecovery, &settings),
             daemon_feature_floor_count(SettingsSection::RetriesRecovery)
         );
-        assert_eq!(item_count(SettingsSection::Usage, &settings), 16);
+        assert_eq!(item_count(SettingsSection::Usage, &settings), 14);
         assert_eq!(item_count(SettingsSection::Budgets, &settings), 1);
     }
 
@@ -2127,6 +2208,7 @@ mod tests {
 
         assert!(handle_settings_key(&mut app, key(KeyCode::BackTab)));
         assert_eq!(app.settings_state.section, SettingsSection::StallDetection);
+        assert_eq!(app.settings_state.selected_index, 3);
         assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
         assert_eq!(app.settings_state.section, SettingsSection::RetriesRecovery);
         assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
@@ -2146,7 +2228,7 @@ mod tests {
         app.settings_state.section = SettingsSection::ThemeColors;
         assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
         assert_eq!(app.settings_state.section, SettingsSection::Screen);
-        assert_eq!(app.settings_state.focus, SettingsFocus::Categories);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Items);
     }
 
     /// `>` widens the focused panel and `<` narrows it, stepping from the
@@ -2717,7 +2799,17 @@ mod tests {
             recent_denials: Vec::new(),
             recent_budget_alerts: Vec::new(),
         });
-        app.settings_state.selected_index = crate::model_control_stats::stats_row_count(&app) - 1;
+        app.settings_state.selected_index = crate::model_control_stats::stats_rows(&app)
+            .iter()
+            .position(|row| {
+                row.action
+                    == Some(
+                        crate::model_control_stats::StatsRowAction::CancelInvocation(
+                            uuid::Uuid::from_u128(9),
+                        ),
+                    )
+            })
+            .unwrap();
 
         assert!(handle_settings_key(
             &mut app,
@@ -2976,5 +3068,118 @@ mod tests {
             app.pending_lc_actions.last(),
             Some(&LcAction::OpenSourceWorktreeSettlement)
         );
+    }
+    #[test]
+    fn legacy_scratch_settings_row_queues_the_dedicated_overlay_action() {
+        let mut app = test_app_for_classifier_row();
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.section = SettingsSection::SandboxStorage;
+        let rows = daemon_feature_rows_for_section(&app, SettingsSection::SandboxStorage);
+        app.settings_state.selected_index = rows
+            .iter()
+            .position(|(spec, _)| {
+                daemon_feature_field_for(spec.id) == Some("legacy_scratch_adoption")
+            })
+            .expect("legacy scratch Settings row");
+
+        assert!(handle_settings_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+        ));
+        assert_eq!(
+            app.pending_lc_actions.last(),
+            Some(&LcAction::OpenLegacyScratch)
+        );
+    }
+
+    #[test]
+    fn usage_search_stop_targets_emergency_action_after_redesign() {
+        assert_eq!(ui_row_for_spec_position(SettingsSection::Usage, 1), 6);
+        assert!(search_row_matches(SettingsSection::Usage, 6, "stop"));
+        let app = crate::model_control_stats::tests::named_work_app();
+        assert_eq!(stats_row_action(&app, 6), Some(LcAction::EmergencyStopAll));
+    }
+    #[test]
+    fn settings_tabs_focus_destination_and_restore_each_sections_row() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        *app.focused_pane_mut().unwrap() = Pane::Settings;
+        app.settings_state.selected_index = 4;
+        assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
+        assert_eq!(app.settings_state.section, SettingsSection::Screen);
+        assert_eq!(app.settings_state.focus, SettingsFocus::Items);
+        app.nav_down();
+        assert_eq!(
+            app.settings_state.selected_index, 1,
+            "j moves inside destination, not rail"
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::BackTab)));
+        assert_eq!(app.settings_state.section, SettingsSection::ThemeColors);
+        assert_eq!(app.settings_state.selected_index, 4);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char(']'))));
+        assert_eq!(app.settings_state.section, SettingsSection::Screen);
+        assert_eq!(app.settings_state.selected_index, 1);
+    }
+
+    #[test]
+    fn settings_shift_tab_and_brackets_focus_items_from_category_rail() {
+        for event in [
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            key(KeyCode::BackTab),
+            key(KeyCode::Char('[')),
+        ] {
+            let mut app = crate::app::app_test_helpers::with_session_list(0);
+            assert!(handle_settings_key(&mut app, event));
+            assert_eq!(app.settings_state.section, SettingsSection::Screen);
+            assert_eq!(app.settings_state.focus, SettingsFocus::Items);
+        }
+    }
+
+    #[test]
+    fn settings_category_round_trip_restores_tab_and_row() {
+        let settings = UserSettings::default();
+        let mut state = SettingsState {
+            section: SettingsSection::Screen,
+            selected_index: 1,
+            focus: SettingsFocus::Categories,
+            ..Default::default()
+        };
+        nav_down(&mut state, &settings);
+        assert_eq!(state.section, SettingsSection::SessionList);
+        state.select_section(SettingsSection::InputPrompts);
+        state.selected_index = 2;
+        nav_up(&mut state, &settings);
+        assert_eq!(state.section, SettingsSection::Screen);
+        assert_eq!(state.selected_index, 1);
+        nav_down(&mut state, &settings);
+        assert_eq!(state.section, SettingsSection::InputPrompts);
+        assert_eq!(state.selected_index, 2);
+    }
+
+    #[test]
+    fn settings_restore_clamps_known_rows_and_waits_for_live_data() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::Screen;
+        app.settings_state.selected_index = usize::MAX;
+        reopen_settings(&mut app);
+        assert_eq!(
+            app.settings_state.selected_index,
+            item_count(SettingsSection::Screen, &app.settings) - 1
+        );
+        app.settings_state.section = SettingsSection::Usage;
+        app.settings_state.selected_index = 90;
+        reopen_settings(&mut app);
+        assert_eq!(
+            app.settings_state.selected_index, 90,
+            "loading rows cannot erase remembered cursor"
+        );
+        app.cached_usage_stats = Some(rsi_common::types::UsageStats::default());
+        app.cached_model_control_status =
+            Some(crate::model_control_stats::tests::fixture_control());
+        let last = crate::model_control_stats::stats_row_count(&app) - 1;
+        crate::ui::settings::record_rendered_layout(
+            &mut app,
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+        );
+        assert_eq!(app.settings_state.selected_index, last);
     }
 }

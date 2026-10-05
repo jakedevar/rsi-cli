@@ -20,6 +20,7 @@
 use super::{RotationPredecessorSource, SessionManager};
 use crate::bus::DaemonEvent;
 use crate::error::{DaemonError, Result};
+use crate::store::RotationRequestSuccessor;
 use rsi_common::types::{Session, SessionStatus};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,6 +37,10 @@ pub(in crate::session) enum RecoveredRotation {
     InFlight(Uuid),
     /// No successor existed; the decider was launched.
     DeciderLaunched,
+    /// The existing successor never settled live and holds the predecessor's
+    /// transferred sandbox custody: the intent stays open and the operator is
+    /// told once (#1156); custody is not moved back automatically.
+    Blocked(Uuid),
 }
 
 impl SessionManager {
@@ -56,8 +61,19 @@ impl SessionManager {
             tracing::warn!(%error, "Could not list claimed open rotation intents");
             Vec::new()
         });
+        // #1149: an idle seat's rotation (manual or cap) is an open intent
+        // from its trigger; its `Completed` predecessor is never reconciled
+        // from a live status, so restart recovery takes it on first sight.
+        let triggered = {
+            let store = self.store.lock().await;
+            store.open_completed_trigger_rotation_sessions()
+        }
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Could not list open completed-trigger rotation intents");
+            Vec::new()
+        });
         let mut candidates: Vec<Uuid> = reconciled.to_vec();
-        for predecessor in claimed {
+        for predecessor in claimed.into_iter().chain(triggered) {
             if !candidates.contains(&predecessor) {
                 candidates.push(predecessor);
             }
@@ -92,11 +108,36 @@ impl SessionManager {
             // Single owner: this boot holds guard(P); the durable claim keeps
             // the intent in every later boot's scan until it closes.
             store.claim_open_rotation_intent_for_recovery(predecessor, &intent)?;
-            let successor = intent_successor(&store, predecessor, &intent.entered_at)?;
+            // #1153: the intent's own reservation names its successor; a row
+            // another rotation reserved is never this intent's effect.
+            let entered = chrono::DateTime::parse_from_rfc3339(&intent.entered_at)
+                .map_err(|error| DaemonError::Store(format!("rotation intent timestamp: {error}")))?
+                .with_timezone(&chrono::Utc);
+            let successor = store.rotation_request_successor(
+                predecessor,
+                &intent.rotation_id,
+                Some(entered),
+            )?;
             drop(store);
             (intent, successor)
         };
-        if let Some((successor, status)) = successor {
+        if let RotationRequestSuccessor::Ambiguous { candidates } = successor {
+            tracing::warn!(%predecessor, candidates, "Open rotation intent has several possible successors; refusing it");
+            drop(spawn_guard);
+            self.refuse_recovered_rotation(
+                predecessor,
+                None,
+                &intent.rotation_id,
+                "successor_ambiguous",
+            )
+            .await?;
+            return Ok(Some(RecoveredRotation::Refused("successor_ambiguous")));
+        }
+        if let RotationRequestSuccessor::Found {
+            id: successor,
+            status,
+        } = successor
+        {
             // Publication takes guard(P) and guard(S) in the global order.
             drop(spawn_guard);
             return self
@@ -118,13 +159,49 @@ impl SessionManager {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
-        let handoff = bind_recovered_own_handoff(
-            &snapshot,
-            intent.start_head.as_deref(),
-            &intent.entered_at,
-            &self.store,
-        )
-        .await;
+        // #1149: an automatic cap rotation is recovered only while its cap
+        // request is still the seat's current one. A deferred, failed or
+        // replanned request is superseded, never reinterpreted as a manual
+        // rotation that skips the cap's pause, disable, cap and incarnation
+        // checks.
+        if intent.phase == crate::store::COMPLETED_TRIGGER_PHASE {
+            let store = self.store.lock().await;
+            let automatic = store
+                .rotation_intent_trigger(predecessor, &intent.rotation_id)?
+                .as_deref()
+                == Some(super::super::context_cap::CAP_TRIGGER);
+            if automatic
+                && !super::super::context_cap::cap_request_is_current(
+                    &store,
+                    predecessor,
+                    &intent.rotation_id,
+                )?
+            {
+                store.close_open_rotation_intent(
+                    predecessor,
+                    &intent.rotation_id,
+                    "cap_superseded",
+                )?;
+                drop(store);
+                drop(spawn_guard);
+                return Ok(Some(RecoveredRotation::Refused("cap_superseded")));
+            }
+        }
+        // A completed-trigger intent (#1149) never wrote a handoff turn: its
+        // decider resumes the task (or the cap's daemon-written handoff), and
+        // its predecessor is still `Completed`, not crash-reconciled.
+        let from_idle_seat = intent.phase == crate::store::COMPLETED_TRIGGER_PHASE;
+        let handoff = if from_idle_seat {
+            None
+        } else {
+            bind_recovered_own_handoff(
+                &snapshot,
+                intent.start_head.as_deref(),
+                &intent.entered_at,
+                &self.store,
+            )
+            .await
+        };
         if let Some(ref path) = handoff {
             self.store.lock().await.conn.execute(
                 "UPDATE sessions SET handoff_filepath=?1 WHERE id=?2 AND status='Failed'",
@@ -159,7 +236,11 @@ impl SessionManager {
             Arc::clone(&self.agent_message_arbiter),
             self.codegraph_handle.clone(),
             self.custody_execution_runtime(),
-            RotationPredecessorSource::RecoveredOpenIntent,
+            if from_idle_seat {
+                RotationPredecessorSource::Completed
+            } else {
+                RotationPredecessorSource::RecoveredOpenIntent
+            },
         );
         #[cfg(test)]
         if crash_before_recovery_reservation_for_test(predecessor) {
@@ -170,6 +251,149 @@ impl SessionManager {
         // The decider awaits the child's monitor; it must not block restore.
         tokio::spawn(Box::pin(decider));
         Ok(Some(RecoveredRotation::DeciderLaunched))
+    }
+
+    /// #1142 R3: recover the exact successor of an automatic cap rotation
+    /// request that an earlier daemon process left unsettled. The cap record is
+    /// the request's durable owner (its `Completed` predecessor has no
+    /// `entered` intent for ordinary recovery to find), so the cap pass hands
+    /// the successor row it found, whatever its status, to the same settlement
+    /// ordinary recovery uses: a successor that settled live is published
+    /// once, one that never did is refused (`refused:successor_not_live`),
+    /// and no other successor is ever allocated under the request's identity.
+    /// `None` when the rotation already has its terminal event.
+    pub(in crate::session) async fn recover_cap_successor(
+        &self,
+        predecessor: Uuid,
+        successor: Uuid,
+        status: SessionStatus,
+        rotation_id: &str,
+    ) -> Result<Option<RecoveredRotation>> {
+        let spawn_guard = super::super::spawn_single_flight::acquire_spawn_guard(predecessor).await;
+        let closed: bool = {
+            let store = self.store.lock().await;
+            store.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rotation_events WHERE session_id=?1 AND rotation_id=?2
+                   AND (event_type IN ('completed','suppressed_final_handoff')
+                        OR event_type LIKE 'refused:%'))",
+                rusqlite::params![predecessor.to_string(), rotation_id],
+                |row| row.get(0),
+            )?
+        };
+        // Publication takes guard(P) and guard(S) in the global order.
+        drop(spawn_guard);
+        if closed {
+            return Ok(None);
+        }
+        self.settle_existing_rotation_successor(predecessor, successor, status, rotation_id)
+            .await
+            .map(Some)
+    }
+
+    /// Publish the exact successor `rotation_id` reserved, once: the Epic lead
+    /// pointers and the global manager grant move to it and the terminal
+    /// `completed` event is written in one commit, under both spawn guards.
+    /// The in-memory lead and the bus follow the commit.
+    ///
+    /// # Errors
+    /// The store's refusal (`PolicyDenied` for a lead lock, a settled rotation
+    /// or a row this rotation did not reserve); nothing changes then.
+    async fn publish_exact_rotation_successor(
+        &self,
+        predecessor: Uuid,
+        successor: Uuid,
+        rotation_id: &str,
+    ) -> Result<()> {
+        let query = {
+            let store = self.store.lock().await;
+            store.get_session(successor)?.map(|row| row.query)
+        };
+        let handoff_path = query
+            .as_deref()
+            .and_then(|query| query.strip_prefix("/resume_handoff "));
+        let metadata = serde_json::json!({
+            "handoff_filepath": handoff_path,
+            "successor_id": successor,
+            "query_kind": if handoff_path.is_some() { "resume_handoff" } else { "task" },
+            "recovered": true,
+        })
+        .to_string();
+        let guards =
+            crate::session::RotationPublicationGuards::acquire(predecessor, successor).await;
+        let published = {
+            let store = self.store.lock().await;
+            store.publish_rotation_successor(&guards, rotation_id, &metadata)
+        };
+        drop(guards);
+        for epic_id in published? {
+            self.set_lead_in_memory(epic_id, Some(successor)).await;
+            self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
+                session_id: epic_id,
+                model: None,
+                pinned_at: None,
+                project_id: None,
+                parent_id: None,
+                lead_session_id: Some(Some(successor)),
+                testing_needed_at: None,
+                rotation_disabled_at: None,
+                resolved_context_budget: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// #1158: the operator continued the exact successor a blocked rotation
+    /// reserved (it holds the seat's transferred sandbox custody, so no other
+    /// session can run in it) and its provider is now installed: publish it in
+    /// this boot, moving the Epic lead pointers and the global grant to it.
+    /// A refusal leaves the rotation open for the next recovery pass.
+    ///
+    /// # Errors
+    /// The publication's refusal.
+    pub(in crate::session) async fn publish_continued_blocked_successor(
+        &self,
+        blocked: &crate::store::BlockedRotation,
+    ) -> Result<()> {
+        if let Err(error) = self
+            .publish_exact_rotation_successor(
+                blocked.predecessor,
+                blocked.successor,
+                &blocked.rotation_id,
+            )
+            .await
+        {
+            // #1180: overlapping operator Continues of the same successor both
+            // capture the blocked reservation before either takes the spawn
+            // guard, and both launches succeed. The loser finds the rotation
+            // already completed with this exact successor: that is its own
+            // outcome, not a failure. A refusal, a supersession, or another
+            // published successor stays an error.
+            let settled_here = matches!(
+                &error,
+                DaemonError::PolicyDenied(reason) if reason.starts_with("rotation_already_settled")
+            ) && self.store.lock().await.rotation_published_successor_is(
+                blocked.predecessor,
+                &blocked.rotation_id,
+                blocked.successor,
+            )?;
+            if !settled_here {
+                return Err(error);
+            }
+            tracing::info!(
+                predecessor = %blocked.predecessor,
+                successor = %blocked.successor,
+                rotation_id = %blocked.rotation_id,
+                "Blocked rotation already published by an overlapping Continue"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            predecessor = %blocked.predecessor,
+            successor = %blocked.successor,
+            rotation_id = %blocked.rotation_id,
+            "Blocked rotation published after the operator continued its successor"
+        );
+        Ok(())
     }
 
     async fn settle_existing_rotation_successor(
@@ -186,61 +410,65 @@ impl SessionManager {
                 Ok(RecoveredRotation::InFlight(successor))
             }
             SessionStatus::Completed | SessionStatus::Interrupted => {
-                let query = {
-                    let store = self.store.lock().await;
-                    store.get_session(successor)?.map(|row| row.query)
-                };
-                let handoff_path = query
-                    .as_deref()
-                    .and_then(|query| query.strip_prefix("/resume_handoff "));
-                let metadata = serde_json::json!({
-                    "handoff_filepath": handoff_path,
-                    "successor_id": successor,
-                    "query_kind": if handoff_path.is_some() { "resume_handoff" } else { "task" },
-                    "recovered": true,
-                })
-                .to_string();
-                let guards =
-                    crate::session::RotationPublicationGuards::acquire(predecessor, successor)
-                        .await;
-                let published = {
-                    let store = self.store.lock().await;
-                    store.publish_rotation_successor(&guards, rotation_id, &metadata)
-                };
-                drop(guards);
-                match published {
-                    Ok(epics) => {
-                        for epic_id in epics {
-                            self.set_lead_in_memory(epic_id, Some(successor)).await;
-                            self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
-                                session_id: epic_id,
-                                model: None,
-                                pinned_at: None,
-                                project_id: None,
-                                parent_id: None,
-                                lead_session_id: Some(Some(successor)),
-                                testing_needed_at: None,
-                                rotation_disabled_at: None,
-                                resolved_context_budget: None,
-                            });
-                        }
-                        Ok(RecoveredRotation::Published(successor))
-                    }
+                match self
+                    .publish_exact_rotation_successor(predecessor, successor, rotation_id)
+                    .await
+                {
+                    Ok(()) => Ok(RecoveredRotation::Published(successor)),
                     Err(error) => {
                         tracing::warn!(%predecessor, %successor, %error, "Recovered rotation publication refused");
-                        self.refuse_recovered_rotation(
-                            predecessor,
-                            Some(successor),
-                            rotation_id,
-                            "lead_transfer",
-                        )
-                        .await?;
-                        Ok(RecoveredRotation::Refused("lead_transfer"))
+                        // #1153: a row this rotation did not reserve is not
+                        // failed by its refusal; it belongs to another owner.
+                        let not_ours = matches!(
+                            &error,
+                            DaemonError::PolicyDenied(reason)
+                                if reason.starts_with("rotation_successor_not_reserved")
+                        );
+                        let (settle, code) = if not_ours {
+                            (None, "successor_not_reserved")
+                        } else {
+                            (Some(successor), "lead_transfer")
+                        };
+                        self.refuse_recovered_rotation(predecessor, settle, rotation_id, code)
+                            .await?;
+                        Ok(RecoveredRotation::Refused(code))
                     }
                 }
             }
             // Failed, Archived, Deleted: the successor never settled live.
             _ => {
+                // #1156: a successor that was bound to the predecessor's
+                // sandbox custody before it died owns that custody (transfers
+                // are forward-only) while the seat still sits on the
+                // predecessor. Closing the intent would strand the seat with
+                // nobody owning the recovery, so it stays open: recovery never
+                // allocates another successor, never moves custody back, and
+                // tells the operator once.
+                let blocked = {
+                    let store = self.store.lock().await;
+                    if store.rotation_successor_holds_transferred_custody(predecessor, successor)? {
+                        Some(store.record_rotation_recovery_blocked(
+                            predecessor,
+                            rotation_id,
+                            successor,
+                        )?)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(first) = blocked {
+                    if first {
+                        let message = format!(
+                            "Rotation {rotation_id} of {predecessor} stopped after its sandbox moved to successor {successor}, which never started. The daemon keeps the rotation open and does not move the sandbox back (custody only moves forward). Continue {successor} to start it: it holds the sandbox, and the daemon publishes it as {predecessor}'s successor once it runs."
+                        );
+                        tracing::error!("{message}");
+                        self.event_bus.publish(DaemonEvent::SystemMessage {
+                            level: "error".into(),
+                            message,
+                        });
+                    }
+                    return Ok(RecoveredRotation::Blocked(successor));
+                }
                 self.refuse_recovered_rotation(
                     predecessor,
                     None,
@@ -283,6 +511,12 @@ impl SessionManager {
             &self.store,
         )
         .await;
+        // The refusal is queued behind the persistence worker. Recovery is
+        // only done once it is durable: the cap pass re-checks the rotation's
+        // terminal event right after, and a slow queue must never make it
+        // recover (and refuse) the same rotation twice or wait on a refusal
+        // that is still in flight.
+        self.persistence.barrier().await?;
         Ok(())
     }
 }
@@ -310,41 +544,6 @@ fn crash_before_recovery_reservation_for_test(predecessor: Uuid) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&predecessor)
-}
-
-/// The newest `continued_from = predecessor` row created at or after the
-/// intent was entered. Older rows belong to earlier, already-settled
-/// rotations and are never reused.
-fn intent_successor(
-    store: &crate::store::Store,
-    predecessor: Uuid,
-    entered_at: &str,
-) -> Result<Option<(Uuid, SessionStatus)>> {
-    let entered = chrono::DateTime::parse_from_rfc3339(entered_at)
-        .map_err(|error| DaemonError::Store(format!("rotation intent timestamp: {error}")))?;
-    let mut statement = store.conn.prepare(
-        "SELECT id, status, created_at FROM sessions WHERE continued_from=?1
-         ORDER BY created_at DESC",
-    )?;
-    let rows = statement
-        .query_map([predecessor.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (id, status, created_at) in rows {
-        let created = crate::store::parse_timestamp(&created_at).map_err(DaemonError::Store)?;
-        if created < entered {
-            continue;
-        }
-        let id = Uuid::parse_str(&id).map_err(|error| DaemonError::Store(error.to_string()))?;
-        let status: SessionStatus = serde_json::from_value(serde_json::Value::String(status))?;
-        return Ok(Some((id, status)));
-    }
-    Ok(None)
 }
 
 /// The predecessor's own handoff, bound to its worktree: exactly one
@@ -452,9 +651,13 @@ async fn git_lines(root: &std::path::Path, args: &[&str]) -> Option<Vec<String>>
 #[allow(clippy::expect_used, clippy::significant_drop_tightening)]
 mod tests {
     use super::super::tests::{
-        rotation_manager, rotation_manager_on, terminal_rotation_events, test_session,
+        SeatedParent, persist_live_rotation_parent, reserve_and_bind_live_successor_for_test,
+        rotation_manager, rotation_manager_on, rotation_manager_with_context_rotation,
+        seat_holders, seated_live_parent, terminal_rotation_events, test_session,
     };
-    use super::super::{ROTATION_HANDOFF_PROMPT, install_rotation_child_id_for_test};
+    use super::super::{
+        CompletedSession, ROTATION_HANDOFF_PROMPT, install_rotation_child_id_for_test,
+    };
     use super::*;
     use std::path::Path;
 
@@ -716,6 +919,368 @@ mod tests {
         Ok(())
     }
 
+    /// An idle (`Completed`) seat whose rotation was triggered: the state a
+    /// crash right after the trigger leaves. The intent is the one the
+    /// trigger funnel writes (#1149).
+    async fn triggered_idle_predecessor(
+        manager: &SessionManager,
+        repo: &Path,
+        rotation_id: &str,
+    ) -> anyhow::Result<Session> {
+        let mut predecessor = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        predecessor.working_dir = repo.to_path_buf();
+        predecessor.query = "Objective X".into();
+        let mut store = manager.store.lock().await;
+        store.insert_session(&predecessor)?;
+        store.publish_startup_ordinary(predecessor.id)?;
+        assert!(store.record_completed_trigger_intent(
+            predecessor.id,
+            rotation_id,
+            "manual_triggered"
+        )?);
+        store.insert_rotation_event(
+            predecessor.id,
+            rotation_id,
+            "completed",
+            "manual_triggered",
+            Some(&serde_json::json!({ "manual": true }).to_string()),
+        )?;
+        Ok(predecessor)
+    }
+
+    /// #1149: the daemon died after an idle seat's rotation trigger was
+    /// logged and before any successor was reserved. The trigger left an open
+    /// intent, so restart recovery owns the rotation: exactly one successor,
+    /// published once, resumed from the task, and a second restore is a no-op.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_seat_rotation_crash_after_trigger_before_reservation_is_recovered()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let (repo, _) = predecessor_repo(dir.path());
+        let predecessor = triggered_idle_predecessor(&manager, &repo, "rot-idle").await?;
+
+        let child = Uuid::new_v4();
+        restore_and_settle(&manager, predecessor.id, child).await;
+        manager.restore_sessions().await?;
+
+        let successors = continued_from_rows(&manager, predecessor.id).await;
+        assert_eq!(
+            successors.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![child]
+        );
+        assert!(successors[0].query.starts_with("Objective X"));
+        let store = manager.store.lock().await;
+        let events = terminal_rotation_events(&store, predecessor.id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "completed");
+        assert_eq!(
+            store.find_published_rotation_successor(predecessor.id)?,
+            Some(child)
+        );
+        assert!(store.open_completed_trigger_rotation_sessions()?.is_empty());
+        Ok(())
+    }
+
+    /// #1149: the daemon died after the idle seat's successor was reserved and
+    /// finished its first turn, before publication. Recovery publishes that
+    /// exact successor once and allocates no second row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_seat_rotation_crash_after_reservation_publishes_the_reserved_successor_once()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let (repo, _) = predecessor_repo(dir.path());
+        let predecessor = triggered_idle_predecessor(&manager, &repo, "rot-idle").await?;
+        let mut reserved = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        reserved.working_dir = repo.clone();
+        reserved.continued_from = Some(predecessor.id);
+        reserved.rotation_depth = 1;
+        {
+            let store = manager.store.lock().await;
+            store.insert_session(&reserved)?;
+            store.insert_rotation_event(
+                predecessor.id,
+                "rot-idle",
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({ "successor_id": reserved.id }).to_string()),
+            )?;
+        }
+
+        manager.restore_sessions().await?;
+        manager.restore_sessions().await?;
+
+        let successors = continued_from_rows(&manager, predecessor.id).await;
+        assert_eq!(
+            successors.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![reserved.id]
+        );
+        let store = manager.store.lock().await;
+        let events = terminal_rotation_events(&store, predecessor.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["completed"]
+        );
+        assert_eq!(
+            store.find_published_rotation_successor(predecessor.id)?,
+            Some(reserved.id)
+        );
+        Ok(())
+    }
+
+    /// #1149: the live manual trigger of an idle seat records the intent
+    /// before its decider runs, once, and the rotation still completes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn manual_trigger_of_an_idle_seat_records_its_intent() -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (repo, _) = predecessor_repo(dir.path());
+        let mut predecessor = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        predecessor.working_dir = repo.clone();
+        predecessor.query = "Objective X".into();
+        {
+            let mut store = manager.store.lock().await;
+            store.insert_session(&predecessor)?;
+            store.publish_startup_ordinary(predecessor.id)?;
+        }
+        manager.completed.write().await.insert(
+            predecessor.id,
+            CompletedSession::for_test(predecessor.clone()),
+        );
+        let child = Uuid::new_v4();
+        install_rotation_child_id_for_test(predecessor.id, child);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(child);
+
+        manager.trigger_rotation(predecessor.id).await?;
+        {
+            let store = manager.store.lock().await;
+            let intents: Vec<(String, String)> = store
+                .conn
+                .prepare(
+                    "SELECT phase, json_extract(metadata,'$.trigger') FROM rotation_events
+                     WHERE session_id=?1 AND event_type='entered'",
+                )?
+                .query_map([predecessor.id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            assert_eq!(
+                intents,
+                vec![(
+                    "completed_trigger".to_string(),
+                    "manual_triggered".to_string()
+                )],
+                "the trigger recorded exactly one durable intent"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager.active.read().await.contains_key(&child) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("successor launches");
+        super::super::super::launch::drop_controller_candidate_test_stream(child);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !terminal_rotation_events(&*manager.store.lock().await, predecessor.id)?
+                    .is_empty()
+                {
+                    break anyhow::Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("rotation reaches a terminal decision")?;
+        let store = manager.store.lock().await;
+        assert_eq!(
+            store.find_published_rotation_successor(predecessor.id)?,
+            Some(child)
+        );
+        assert!(store.open_completed_trigger_rotation_sessions()?.is_empty());
+        Ok(())
+    }
+
+    fn custody_owner_and_projection(
+        store: &crate::store::Store,
+        custody_id: Uuid,
+        predecessor: Uuid,
+    ) -> (String, String) {
+        let owner: String = store
+            .conn
+            .query_row(
+                "SELECT owner_session_id FROM sandbox_custody_roots WHERE custody_id=?1",
+                [custody_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("custody owner");
+        let projection: String = store
+            .conn
+            .query_row(
+                "SELECT execution_state FROM session_execution_projections WHERE session_id=?1",
+                [predecessor.to_string()],
+                |row| row.get(0),
+            )
+            .expect("predecessor projection");
+        (owner, projection)
+    }
+
+    fn system_errors(rx: &mut tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>) -> usize {
+        let mut errors = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(&*event, DaemonEvent::SystemMessage { level, .. } if level == "error") {
+                errors += 1;
+            }
+        }
+        errors
+    }
+
+    /// #1156: the daemon died after a sandboxed seat's rotation successor was
+    /// reserved and bound to the seat's transferred sandbox custody, before
+    /// publication. Restart fails the child; custody moves only forward, so
+    /// recovery neither closes the intent (that would strand the seat with the
+    /// sandbox on a dead child) nor moves custody back nor allocates another
+    /// successor: it keeps the intent open and tells the operator once, across
+    /// restarts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_after_custody_bind_keeps_the_intent_open_and_escalates_once()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let fixture = persist_live_rotation_parent(&manager, dir.path(), None).await;
+        let parent = fixture.parent.id;
+        {
+            let store = manager.store.lock().await;
+            assert!(store.record_completed_trigger_intent(
+                parent,
+                "rot-bound",
+                "manual_triggered"
+            )?);
+        }
+        let child =
+            reserve_and_bind_live_successor_for_test(&manager, &fixture, "rot-bound").await?;
+        {
+            let store = manager.store.lock().await;
+            assert_eq!(
+                custody_owner_and_projection(&store, fixture.custody_id, parent),
+                (child.id.to_string(), "historical_transferred".to_string()),
+                "binding moved the sandbox to the successor"
+            );
+        }
+        drop(manager); // the daemon dies
+
+        for boot in 1..=2 {
+            let restarted = rotation_manager_on(dir.path(), true);
+            let mut events = restarted.event_bus.subscribe();
+            restarted.restore_sessions().await?;
+            let store = restarted.store.lock().await;
+            assert_eq!(
+                store.get_session(child.id)?.expect("child").status,
+                SessionStatus::Failed,
+                "boot {boot}: startup fails the child that never started"
+            );
+            assert!(
+                terminal_rotation_events(&store, parent)?.is_empty(),
+                "boot {boot}: the intent is not closed"
+            );
+            assert_eq!(
+                store.open_completed_trigger_rotation_sessions()?,
+                vec![parent]
+            );
+            assert_eq!(
+                custody_owner_and_projection(&store, fixture.custody_id, parent),
+                (child.id.to_string(), "historical_transferred".to_string()),
+                "boot {boot}: custody is not moved back"
+            );
+            let blocked: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM rotation_events WHERE session_id=?1 AND event_type='recovery_blocked'",
+                [parent.to_string()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(blocked, 1, "boot {boot}: blocked is recorded once");
+            let successors: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE continued_from=?1",
+                [parent.to_string()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(successors, 1, "boot {boot}: no second successor");
+            drop(store);
+            assert_eq!(
+                system_errors(&mut events),
+                usize::from(boot == 1),
+                "boot {boot}: the operator is told once, on the first boot"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1153: the open intent reserved A; another rotation of the same
+    /// predecessor reserved a newer, `Completed` B. Recovery acts on A (the
+    /// intent's own reservation) and never publishes or fails B.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_rotation_intent_recovers_its_own_reservation_not_a_newer_foreign_row()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let (repo, _) = predecessor_repo(dir.path());
+        let predecessor =
+            crashed_rotating_predecessor(&manager, &repo, &[("writing_handoff", None)]).await?;
+        let mut reserved = test_session(Uuid::new_v4(), SessionStatus::Running);
+        reserved.working_dir = repo.clone();
+        reserved.continued_from = Some(predecessor.id);
+        reserved.rotation_depth = 1;
+        let mut foreign = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        foreign.working_dir = repo.clone();
+        foreign.continued_from = Some(predecessor.id);
+        foreign.rotation_depth = 1;
+        foreign.created_at = chrono::Utc::now() + chrono::Duration::seconds(30);
+        {
+            let store = manager.store.lock().await;
+            store.insert_session(&reserved)?;
+            store.insert_session(&foreign)?;
+            // The intent's own reservation is its newest event, so it is the
+            // latest rotation the recovery scan considers.
+            for (rotation_id, id) in [("manual-rotation", foreign.id), ("rot-crash", reserved.id)] {
+                store.insert_rotation_event(
+                    predecessor.id,
+                    rotation_id,
+                    "reserved",
+                    "successor_reserved",
+                    Some(&serde_json::json!({ "successor_id": id }).to_string()),
+                )?;
+            }
+        }
+
+        manager.restore_sessions().await?;
+
+        let store = manager.store.lock().await;
+        assert_eq!(
+            terminal_rotation_events(&store, predecessor.id)?
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["refused:successor_not_live"],
+            "the intent is refused on its own reservation"
+        );
+        assert_eq!(
+            store.get_session(foreign.id)?.expect("foreign").status,
+            SessionStatus::Completed,
+            "the other rotation's successor is not failed"
+        );
+        assert_eq!(
+            store.find_published_rotation_successor(predecessor.id)?,
+            None,
+            "nothing was published"
+        );
+        Ok(())
+    }
+
     /// Review round 2 `rotation_recovery_second_crash`: boot 1 reconciles P
     /// `Failed` and claims its open intent, then the daemon dies before the
     /// recovery decider reserves a successor. Boot 2 no longer sees P as
@@ -797,6 +1362,409 @@ mod tests {
                 .unwrap_or(0),
             0,
             "restart retry never relaunched the predecessor"
+        );
+        Ok(())
+    }
+    /// Crash state of a sandboxed coordinator seat: the manually triggered
+    /// rotation `rot-bound` reserved a successor and bound the seat's custody
+    /// to it; the daemon died before publication. `pre_launch` models the
+    /// crash before the provider ever reported a thread. Also reserves a newer
+    /// successor under another rotation, which recovery must not touch.
+    async fn crashed_bound_seat(
+        manager: &SessionManager,
+        root: &Path,
+        pre_launch: bool,
+    ) -> anyhow::Result<(SeatedParent, Session, Session)> {
+        let seat = seated_live_parent(manager, root).await?;
+        let parent = seat.fixture.parent.id;
+        let mut foreign = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        foreign.working_dir = seat.fixture.repo.clone();
+        foreign.continued_from = Some(parent);
+        foreign.rotation_depth = 1;
+        foreign.created_at = chrono::Utc::now() + chrono::Duration::seconds(30);
+        {
+            let store = manager.store.lock().await;
+            store.insert_session(&foreign)?;
+            store.insert_rotation_event(
+                parent,
+                "other-rotation",
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({ "successor_id": foreign.id }).to_string()),
+            )?;
+            store.record_completed_trigger_intent(parent, "rot-bound", "manual_triggered")?;
+        }
+        let failed =
+            reserve_and_bind_live_successor_for_test(manager, &seat.fixture, "rot-bound").await?;
+        if pre_launch {
+            // The reservation never carries a provider thread; it is set by
+            // the first provider event, which this crash precedes.
+            manager.store.lock().await.conn.execute(
+                "UPDATE sessions SET claude_session_id=NULL WHERE id=?1",
+                [failed.id.to_string()],
+            )?;
+        }
+        Ok((seat, failed, foreign))
+    }
+
+    /// #1158: a blocked rotation survives restarts with the seat and its
+    /// grant untouched, names its own reservation (never a newer
+    /// `continued_from` row), and refuses to publish any other row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_rotation_keeps_the_seat_across_restart_and_names_the_exact_reservation()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (seat, failed, foreign) = crashed_bound_seat(&manager, dir.path(), true).await?;
+        let parent = seat.fixture.parent.id;
+        drop(manager); // the daemon dies
+
+        for boot in 1..=2 {
+            let restarted = rotation_manager_on(dir.path(), true);
+            restarted.restore_sessions().await?;
+            let store = restarted.store.lock().await;
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(parent), Some(parent)),
+                "boot {boot}: the Epic lead and the grant stay on the seat"
+            );
+            assert_eq!(
+                custody_owner_and_projection(&store, seat.fixture.custody_id, parent),
+                (failed.id.to_string(), "historical_transferred".to_string()),
+                "boot {boot}: custody is the failed successor's (forward only)"
+            );
+            assert_eq!(
+                store.blocked_rotation_of(parent)?,
+                Some(crate::store::BlockedRotation {
+                    predecessor: parent,
+                    rotation_id: "rot-bound".into(),
+                    successor: failed.id,
+                }),
+                "boot {boot}: the block names the intent's own reservation"
+            );
+            assert_eq!(store.blocked_rotation_of_successor(foreign.id)?, None);
+            drop(store);
+            // A row another rotation reserved is never published under this one.
+            let refused = restarted
+                .publish_continued_blocked_successor(&crate::store::BlockedRotation {
+                    predecessor: parent,
+                    rotation_id: "rot-bound".into(),
+                    successor: foreign.id,
+                })
+                .await;
+            assert!(
+                matches!(refused, Err(DaemonError::PolicyDenied(_))),
+                "boot {boot}: {refused:?}"
+            );
+            let store = restarted.store.lock().await;
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(parent), Some(parent)),
+                "boot {boot}: a refused publication moves nothing"
+            );
+            assert!(terminal_rotation_events(&store, parent)?.is_empty());
+        }
+        Ok(())
+    }
+
+    /// Run the operator Continue of a blocked successor after a restart and
+    /// assert the seat: the successor started (a scripted provider), is
+    /// published in this boot, and the Epic lead pointer and global grant
+    /// moved to it in that one commit, with custody still its own.
+    async fn operator_continue_publishes_the_blocked_successor(
+        pre_launch: bool,
+    ) -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (seat, failed, foreign) = crashed_bound_seat(&manager, dir.path(), pre_launch).await?;
+        let parent = seat.fixture.parent.id;
+        drop(manager); // the daemon dies
+
+        let restarted = rotation_manager_on(dir.path(), true);
+        restarted.restore_sessions().await?;
+        {
+            let store = restarted.store.lock().await;
+            assert_eq!(
+                store
+                    .get_session(failed.id)?
+                    .expect("failed")
+                    .claude_session_id
+                    .is_none(),
+                pre_launch
+            );
+            assert!(store.blocked_rotation_of_successor(failed.id)?.is_some());
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(parent), Some(parent))
+            );
+        }
+
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(failed.id);
+        restarted
+            .continue_session_operator(failed.id, "start the blocked successor".into())
+            .await?;
+        super::super::super::launch::drop_controller_candidate_test_stream(failed.id);
+
+        let store = restarted.store.lock().await;
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(failed.id), Some(failed.id)),
+            "the Epic lead and the grant moved to the exact reserved successor"
+        );
+        let events = terminal_rotation_events(&store, parent)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "completed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(events[0].1.as_deref().unwrap_or("{}"))?["successor_id"],
+            serde_json::json!(failed.id)
+        );
+        assert_eq!(
+            store.find_published_rotation_successor(parent)?,
+            Some(failed.id),
+            "the exact reservation, not the newer continued_from row"
+        );
+        assert_eq!(
+            custody_owner_and_projection(&store, seat.fixture.custody_id, parent),
+            (failed.id.to_string(), "historical_transferred".to_string()),
+            "one writer: the successor owned the sandbox throughout"
+        );
+        assert_eq!(
+            store.get_session(foreign.id)?.expect("foreign").status,
+            SessionStatus::Completed,
+            "the other rotation's successor is untouched"
+        );
+        assert_eq!(store.blocked_rotation_of(parent)?, None);
+        let successors: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE continued_from=?1",
+            [parent.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(successors, 2, "no third successor was allocated");
+        Ok(())
+    }
+
+    /// #1158: the operator's Continue of a successor that failed before it
+    /// ever started (no provider thread, no retry budget) starts it in a new
+    /// thread and publishes it in this boot.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operator_continue_of_a_pre_launch_blocked_successor_starts_and_publishes_in_this_boot()
+    -> anyhow::Result<()> {
+        operator_continue_publishes_the_blocked_successor(true).await
+    }
+
+    /// #1158: a continuation that succeeds publishes the exact reservation in
+    /// the same boot, not at the next restart's recovery scan.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operator_continue_of_a_blocked_successor_with_a_provider_thread_publishes_in_this_boot()
+    -> anyhow::Result<()> {
+        operator_continue_publishes_the_blocked_successor(false).await
+    }
+
+    /// #1180: the operator's Continue published a successor that had never
+    /// started, and the daemon died before the provider reported a thread. The
+    /// restored successor is `Failed` with no thread and its rotation closed;
+    /// the operator's next Continue of that exact successor must still start
+    /// it (custody never moves back), keeping one usable seat: the Epic lead
+    /// and the grant stay on it, with a single completion.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn published_never_started_successor_restarts_after_a_crash_before_its_first_provider_event()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (seat, failed, foreign) = crashed_bound_seat(&manager, dir.path(), true).await?;
+        let parent = seat.fixture.parent.id;
+        // A real rotation successor is a direct child of the Epic it leads
+        // (restore clears a lead pointer to a row that is not); the shared
+        // fixture does not set it.
+        manager.store.lock().await.conn.execute(
+            "UPDATE sessions SET parent_id=?1 WHERE id=?2",
+            [seat.epic.to_string(), failed.id.to_string()],
+        )?;
+        drop(manager); // the daemon dies before publication
+
+        // First repair: the Continue starts the successor and publishes it.
+        let repaired = rotation_manager_on(dir.path(), true);
+        repaired.restore_sessions().await?;
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(failed.id);
+        repaired
+            .continue_session_operator(failed.id, "start the blocked successor".into())
+            .await?;
+        super::super::super::launch::drop_controller_candidate_test_stream(failed.id);
+        {
+            let store = repaired.store.lock().await;
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(failed.id), Some(failed.id))
+            );
+            assert_eq!(store.blocked_rotation_of(parent)?, None);
+        }
+        // The scripted provider never reports a thread. Let the dropped
+        // stream's monitor settle, then leave the row as a daemon that died
+        // while the successor was live leaves it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let status = repaired
+                    .store
+                    .lock()
+                    .await
+                    .get_session(failed.id)?
+                    .expect("successor")
+                    .status;
+                if !matches!(status, SessionStatus::Starting | SessionStatus::Running) {
+                    break anyhow::Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped stream settles")?;
+        repaired.store.lock().await.conn.execute(
+            "UPDATE sessions SET status='Running', claude_session_id=NULL WHERE id=?1",
+            [failed.id.to_string()],
+        )?;
+        drop(repaired); // the daemon dies after publication, before a provider event
+
+        for boot in 1..=2 {
+            let restarted = rotation_manager_on(dir.path(), true);
+            restarted.restore_sessions().await?;
+            let store = restarted.store.lock().await;
+            let row = store.get_session(failed.id)?.expect("successor");
+            assert_eq!(row.status, SessionStatus::Failed, "boot {boot}");
+            assert!(row.claude_session_id.is_none(), "boot {boot}");
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(failed.id), Some(failed.id)),
+                "boot {boot}: the published seat is the successor's"
+            );
+            assert_eq!(
+                terminal_rotation_events(&store, parent)?.len(),
+                1,
+                "boot {boot}: one completion"
+            );
+            assert_eq!(store.blocked_rotation_of_successor(failed.id)?, None);
+            assert_eq!(
+                store.published_blocked_rotation_of_successor(failed.id)?,
+                Some(crate::store::BlockedRotation {
+                    predecessor: parent,
+                    rotation_id: "rot-bound".into(),
+                    successor: failed.id,
+                }),
+                "boot {boot}: the operator's bootstrap path survives publication"
+            );
+            assert_eq!(
+                store.published_blocked_rotation_of_successor(foreign.id)?,
+                None,
+                "boot {boot}: only the exact published successor"
+            );
+            drop(store);
+            if boot == 1 {
+                continue;
+            }
+            let _scripted =
+                super::super::super::launch::install_controller_candidate_test_process(failed.id);
+            restarted
+                .continue_session_operator(failed.id, "start the published successor again".into())
+                .await?;
+            super::super::super::launch::drop_controller_candidate_test_stream(failed.id);
+            let store = restarted.store.lock().await;
+            assert_eq!(
+                seat_holders(&store, seat.epic),
+                (Some(failed.id), Some(failed.id)),
+                "the seat holders are the successor after the second Continue"
+            );
+            assert_eq!(terminal_rotation_events(&store, parent)?.len(), 1);
+            assert_eq!(
+                custody_owner_and_projection(&store, seat.fixture.custody_id, parent),
+                (failed.id.to_string(), "historical_transferred".to_string()),
+                "custody stayed forward-only on the successor"
+            );
+            assert_eq!(
+                store.find_published_rotation_successor(parent)?,
+                Some(failed.id)
+            );
+            let successors: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE continued_from=?1",
+                [parent.to_string()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(successors, 2, "no third successor was allocated");
+        }
+        Ok(())
+    }
+
+    /// #1180: two operator Continues of the same blocked successor capture the
+    /// same blocked reservation before either publishes. The loser finds the
+    /// rotation already completed with its exact successor, which is its own
+    /// outcome (success, one completion); every other settlement still
+    /// refuses.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_continues_of_a_blocked_successor_both_succeed_with_one_completion()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (seat, failed, foreign) = crashed_bound_seat(&manager, dir.path(), true).await?;
+        let parent = seat.fixture.parent.id;
+        drop(manager); // the daemon dies
+
+        let restarted = rotation_manager_on(dir.path(), true);
+        restarted.restore_sessions().await?;
+        let captured = restarted
+            .store
+            .lock()
+            .await
+            .blocked_rotation_of_successor(failed.id)?
+            .expect("both Continues capture the blocked reservation");
+
+        // The first Continue starts the successor and publishes.
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(failed.id);
+        restarted
+            .continue_session_operator(failed.id, "first continue".into())
+            .await?;
+        super::super::super::launch::drop_controller_candidate_test_stream(failed.id);
+
+        // The second Continue's wrapper publishes its stale capture.
+        restarted
+            .publish_continued_blocked_successor(&captured)
+            .await?;
+        restarted
+            .publish_continued_blocked_successor(&captured)
+            .await?;
+
+        // A different successor, or a different rotation, is still refused.
+        for mismatch in [
+            crate::store::BlockedRotation {
+                successor: foreign.id,
+                ..captured.clone()
+            },
+            crate::store::BlockedRotation {
+                rotation_id: "other-rotation".into(),
+                ..captured.clone()
+            },
+        ] {
+            let refused = restarted
+                .publish_continued_blocked_successor(&mismatch)
+                .await;
+            assert!(
+                matches!(refused, Err(DaemonError::PolicyDenied(_))),
+                "{mismatch:?}: {refused:?}"
+            );
+        }
+
+        let store = restarted.store.lock().await;
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(failed.id), Some(failed.id))
+        );
+        let events = terminal_rotation_events(&store, parent)?;
+        assert_eq!(events.len(), 1, "exactly one completion");
+        assert_eq!(events[0].0, "completed");
+        assert_eq!(
+            store.find_published_rotation_successor(parent)?,
+            Some(failed.id)
         );
         Ok(())
     }

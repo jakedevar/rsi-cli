@@ -109,6 +109,7 @@ mod program_runs;
 mod projects;
 mod recursive_control;
 mod recursive_read;
+mod remote;
 mod satellites;
 mod scheduled_jobs;
 mod sessions;
@@ -148,6 +149,10 @@ pub use self::topology::*;
 // confirmed side-effect-free from the calling session's perspective, or is
 // an `Agent*` verb that internally enforces its own self/lead scoping.
 mod failure_signatures; // #1016: AgentQueryFailureSignatures handler
+mod global_manager; // #872 Slice B: global manager v0
+mod manager_issue_worker; // #1100: AgentManagerLaunchIssueWorker handler
+mod operator_restart; // #1122: operator quiet-point restart
+mod scratch_adopt; // #1147: operator adoption of legacy scratch
 mod agent_gate {
     use std::collections::HashSet;
     use std::sync::LazyLock;
@@ -227,6 +232,7 @@ pub struct RpcServer {
     remote_signer: Arc<crate::remote_read::RemoteCursorSigner>,
     satellite_incarnation_id: Uuid,
     satellite_snapshots: crate::satellite::SatelliteSessionSnapshots,
+    remote: Arc<crate::remote_control::RemoteController>,
     codegraph_handle: Option<crate::codegraph::IndexHandle>,
     memory_manager: Option<Arc<crate::memory::manager::MemoryManager>>,
     dreamer_handle: Option<crate::dreamer::scheduler::DreamerHandle>,
@@ -268,6 +274,9 @@ impl RpcServer {
                 Uuid::new_v4()
             },
             satellite_snapshots: crate::satellite::SatelliteSessionSnapshots::default(),
+            remote: Arc::new(crate::remote_control::RemoteController::new(Arc::new(
+                crate::remote_control::HostSystem,
+            ))),
             codegraph_handle: None,
             memory_manager,
             dreamer_handle: None,
@@ -284,6 +293,15 @@ impl RpcServer {
             compile_engine,
             ollama_http,
         }
+    }
+
+    /// Replace the host effects behind the operator RSI Remote controls.
+    #[cfg(test)]
+    pub(crate) fn set_remote_system(
+        &mut self,
+        system: Arc<dyn crate::remote_control::RemoteSystem>,
+    ) {
+        self.remote = Arc::new(crate::remote_control::RemoteController::new(system));
     }
 
     /// Set the dreamer handle for manual dream trigger via RPC.
@@ -559,6 +577,9 @@ impl RpcServer {
                     .await
             }
             "AgentManagerGetAction" => self.handle_agent_manager_get_action(request).await,
+            "AgentManagerLaunchIssueWorker" => {
+                self.handle_agent_manager_launch_issue_worker(request).await
+            }
             "AgentManagerWorkView" => self.handle_agent_manager_work_view(request).await,
             "AgentManagerDelegateNode" => self.handle_agent_manager_delegate_node(request).await,
             "AgentManagerEscalate" => self.handle_agent_manager_escalate(request).await,
@@ -601,21 +622,41 @@ impl RpcServer {
             "AgentSubmitJob" => self.handle_agent_submit_job(request).await,
             "AgentGetJob" => self.handle_agent_get_job(request).await,
             "AgentListJobs" => self.handle_agent_list_jobs(request).await,
+            "AgentCancelJob" => self.handle_agent_cancel_job(request).await,
             "AgentSendSatelliteMessage" => self.handle_agent_send_satellite_message(request).await,
+            "AgentReportToHub" => self.handle_agent_report_to_hub(request).await,
             "AgentGetDaemonInfo" => self.handle_agent_get_daemon_info(request).await,
             "AgentRequestDeploy" => self.handle_agent_request_deploy(request).await,
+            "AgentGlobalOverview" => self.handle_agent_global_overview(request).await,
+            "AgentGlobalSend" => self.handle_agent_global_send(request).await,
+            "AgentGlobalAppointManager" => self.handle_agent_global_appoint_manager(request).await,
+            "AgentReportToGlobal" => self.handle_agent_report_to_global(request).await,
 
             // Appointment and scope replacement remain operator-only: neither
             // method belongs to AGENT_VERBS or READ_VERBS.
             // #1036: operator-only remote-gate spend view. It must stay out of
             // AGENT_VERBS, READ_VERBS, native tools and the agent CLI catalog.
             "GetCloudSpend" => self.handle_get_cloud_spend(request).await,
+            // #872 Slice B: the global manager grant is operator-only.
+            "ConfigureGlobalManager" => self.handle_configure_global_manager(request).await,
+            "GetGlobalManager" => self.handle_get_global_manager(request).await,
+            "RevokeGlobalManager" => self.handle_revoke_global_manager(request).await,
+            // #1122: the operator's quiet-point restart; operator-only.
+            "RequestOperatorRestart" => self.handle_request_operator_restart(request).await,
+            "GetOperatorRestart" => self.handle_get_operator_restart(request).await,
+            "CancelOperatorRestart" => self.handle_cancel_operator_restart(request).await,
+            "ForceOperatorRestart" => self.handle_force_operator_restart(request).await,
+            // #1147: operator-only (not in the verb registry): list and adopt
+            // legacy scratch. Adopting records a directory; it deletes nothing.
+            "ListLegacyScratch" => self.handle_list_legacy_scratch(request).await,
+            "AdoptLegacyScratch" => self.handle_adopt_legacy_scratch(request).await,
             "GetHarnessManager" => self.handle_get_harness_manager(request).await,
             "ListHarnessManagerEpics" => self.handle_list_harness_manager_epics(request).await,
             "ListHarnessManagerScope" => self.handle_list_harness_manager_scope(request).await,
             "ConfigureHarnessManager" => self.handle_configure_harness_manager(request).await,
             "ListManagerNodes" => self.handle_list_manager_nodes(request).await,
             "GetManagerNode" => self.handle_get_manager_node(request).await,
+            "GetManagerTree" => self.handle_get_manager_tree(request).await,
             "ConfigureManagerNode" => self.handle_configure_manager_node(request).await,
             "RevokeManagerNode" => self.handle_revoke_manager_node(request).await,
             "GetHarnessManagerPolicy" => self.handle_get_harness_manager_policy(request).await,
@@ -629,6 +670,10 @@ impl RpcServer {
 
             "GetSession" => self.handle_get_session(request).await,
             "ListSessions" => self.handle_list_sessions(request).await,
+            // #1096 operator-only RSI Remote controls: keep out of AGENT_VERBS,
+            // READ_VERBS, native tools and the agent CLI catalog.
+            "RemoteGetStatus" => self.handle_remote_get_status(request).await,
+            "RemoteSetConfig" => self.handle_remote_set_config(request).await,
             "GetSatelliteIdentity" => self.handle_get_satellite_identity(request).await,
             "ListSatelliteSessions" => self.handle_list_satellite_sessions(request).await,
             // Hub registry controls are operator-only. They must remain out of
@@ -641,6 +686,7 @@ impl RpcServer {
             "GetSatelliteInboundPolicy" => self.handle_get_satellite_inbound_policy(request).await,
             "PutSatelliteInboundPolicy" => self.handle_put_satellite_inbound_policy(request).await,
             "DeliverHubMessage" => self.handle_deliver_hub_message(request).await,
+            "FetchHubReports" => self.handle_fetch_hub_reports(request).await,
             "RequestHubDeploy" => self.handle_request_hub_deploy(request).await,
             "ProbeSatelliteLink" => self.handle_probe_satellite_link(request).await,
             "ListHubSatelliteSessions" => self.handle_list_hub_satellite_sessions(request).await,
@@ -913,7 +959,7 @@ impl RpcServer {
             "TriggerIssueTrackerPoll" => self.handle_trigger_issue_tracker_poll(request).await,
             // Local issue tracker (Track C slice C3): operator-only issue
             // CRUD + dependency-edge + ready-work RPC surface over the V72
-            // `issues`/`issue_deps` store (crates/rsid/src/store/issues.rs).
+            // `issues`/`issue_deps` store (crates/rsid-store/src/store/issues.rs).
             // Deliberately absent from AGENT_VERBS/READ_VERBS above — the
             // default-deny agent gate rejects any token-attributed call to
             // these methods (P-003); agent-attributed issue writes are C5.
@@ -1343,6 +1389,7 @@ pub(crate) fn rpc_production_source() -> String {
         include_str!("rpc/projects.rs"),
         include_str!("rpc/recursive_control.rs"),
         include_str!("rpc/recursive_read.rs"),
+        include_str!("rpc/remote.rs"),
         include_str!("rpc/satellites.rs"),
         include_str!("rpc/scheduled_jobs.rs"),
         include_str!("rpc/sessions.rs"),

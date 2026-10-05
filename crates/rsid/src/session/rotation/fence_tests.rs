@@ -703,12 +703,14 @@ async fn agent_continue_child_during_a_draining_deploy_returns_the_typed_retry_r
     let request = continue_request(&manager, worker, "more work").await?;
     let live = crate::store::agent_deploys::DeployRow {
         id: Uuid::new_v4(),
-        owner_session_id: Uuid::new_v4(),
+        owner_session_id: Some(Uuid::new_v4()),
         sha: "0".repeat(40),
         manifest: Vec::new(),
         state: rsi_common::agent_deploy::DeployState::Staged,
         reason: None,
         deadline_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        operator: false,
+        forced: false,
     };
     manager
         .deploy_drain()

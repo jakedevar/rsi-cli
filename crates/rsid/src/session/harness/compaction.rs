@@ -219,6 +219,7 @@ pub async fn auto_compact(
         tools: Vec::new(),
         stream: false,
         reasoning_effort: None,
+        context_editing: false,
     };
 
     if cancel.is_cancelled() {

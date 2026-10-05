@@ -18,7 +18,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rsi_common::agent_deploy::{
     DEPLOY_BINARIES, DEPLOY_BINARY_MISSING, DEPLOY_DIR_NOT_ALLOWED, DEPLOY_MAX_RESTARTS_PER_HOUR,
     DEPLOY_NEEDS_SUPERVISOR, DEPLOY_RESTART_BUDGET, DEPLOY_SCHEMA_DOWNGRADE, DEPLOY_SHA_MISMATCH,
-    DEPLOY_STAGE_FAILED, DEPLOY_STAGED_CHANGED, DeployBinaryV1, DeployState,
+    DEPLOY_STAGE_FAILED, DEPLOY_STAGED_CHANGED, DEPLOY_TARGET_MISMATCH, DeployBinaryV1,
+    DeployState, ObjectIdentityV1,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,9 @@ type Trigger = Arc<dyn Fn() + Send + Sync>;
 pub struct DeployService {
     plan: StagePlan,
     supervised: Box<dyn Fn() -> bool + Send + Sync>,
+    /// The rsid binary the supervisor relaunches (#1164); `None` skips the
+    /// target check (tests, or a supervisor argv that cannot be read).
+    supervisor_binary: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
     restart: Mutex<Option<Trigger>>,
 }
 
@@ -80,8 +84,44 @@ impl DeployService {
                 probe,
             },
             supervised,
+            supervisor_binary: Box::new(|| None),
             restart: Mutex::new(None),
         }
+    }
+
+    /// Name the rsid binary the supervisor relaunches, so a deploy that would
+    /// install somewhere else is refused up front (#1164).
+    #[must_use]
+    pub fn with_supervisor_binary(
+        mut self,
+        supervisor_binary: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
+    ) -> Self {
+        self.supervisor_binary = supervisor_binary;
+        self
+    }
+
+    /// Refuse a deploy whose `rsid` install path is not the binary the
+    /// supervisor relaunches: the restart would bring the old build back and
+    /// verification would fail after a full drain.
+    ///
+    /// # Errors
+    /// `deploy_target_mismatch`, naming both paths.
+    pub(crate) fn check_target(&self) -> Result<()> {
+        let Some(running) = (self.supervisor_binary)() else {
+            return Ok(());
+        };
+        let installed = self.plan.install_dir.join("rsid");
+        let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let (running_real, installed_real) = (real(&running), real(&installed));
+        if running_real == installed_real {
+            return Ok(());
+        }
+        Err(DaemonError::PolicyDenied(format!(
+            "{DEPLOY_TARGET_MISMATCH}: the supervisor runs {} but a deploy installs {}; \
+             restart the supervisor on the installed path (make release-install NOW=1)",
+            running_real.display(),
+            installed_real.display(),
+        )))
     }
 
     fn production(sandbox_base: PathBuf) -> Self {
@@ -99,6 +139,7 @@ impl DeployService {
             }),
             Arc::new(probe_binary),
         )
+        .with_supervisor_binary(Box::new(crate::daemon_info::supervisor_binary))
     }
 
     /// Initialise the process-wide service with the configured sandbox base.
@@ -174,6 +215,31 @@ impl StagePlan {
         expected_sha: &str,
         live_schema: i64,
     ) -> Result<Vec<DeployBinaryV1>> {
+        self.stage_checked(id, binaries_dir, Some(expected_sha), live_schema)
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// Stage like [`Self::stage_binaries`] for an operator restart (#1122): the
+    /// build sha is whatever the probed `rsid` reports.
+    ///
+    /// # Errors
+    /// A stable `deploy_*` refusal; staged copies are removed on any failure.
+    pub fn stage_binaries_discovering_sha(
+        &self,
+        id: Uuid,
+        binaries_dir: &str,
+        live_schema: i64,
+    ) -> Result<(Vec<DeployBinaryV1>, String)> {
+        self.stage_checked(id, binaries_dir, None, live_schema)
+    }
+
+    fn stage_checked(
+        &self,
+        id: Uuid,
+        binaries_dir: &str,
+        expected_sha: Option<&str>,
+        live_schema: i64,
+    ) -> Result<(Vec<DeployBinaryV1>, String)> {
         let invalid = |code: &str| DaemonError::InvalidParam(code.into());
         let dir =
             std::fs::canonicalize(binaries_dir).map_err(|_| invalid(DEPLOY_DIR_NOT_ALLOWED))?;
@@ -185,11 +251,13 @@ impl StagePlan {
             return Err(invalid(DEPLOY_DIR_NOT_ALLOWED));
         }
         let mut manifest = Vec::new();
-        let outcome = self.stage_all(id, &dir, &mut manifest, expected_sha, live_schema);
-        if outcome.is_err() {
-            remove_staged(&manifest, id);
+        match self.stage_all(id, &dir, &mut manifest, expected_sha, live_schema) {
+            Ok(sha) => Ok((manifest, sha)),
+            Err(error) => {
+                remove_staged(&manifest, id);
+                Err(error)
+            }
         }
-        outcome.map(|()| manifest)
     }
 
     fn stage_all(
@@ -197,9 +265,9 @@ impl StagePlan {
         id: Uuid,
         dir: &Path,
         manifest: &mut Vec<DeployBinaryV1>,
-        expected_sha: &str,
+        expected_sha: Option<&str>,
         live_schema: i64,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let invalid = |code: &str| DaemonError::InvalidParam(code.into());
         for name in DEPLOY_BINARIES {
             let source = dir.join(name);
@@ -217,15 +285,22 @@ impl StagePlan {
             let staged = staged_path(&dest, id);
             let source_hash = binary_sha256(&source).ok_or_else(|| invalid(DEPLOY_STAGE_FAILED))?;
             std::fs::create_dir_all(parent).map_err(|_| invalid(DEPLOY_STAGE_FAILED))?;
+            let prior_present = std::fs::symlink_metadata(&dest).is_ok();
             std::fs::copy(&source, &staged).map_err(|_| invalid(DEPLOY_STAGE_FAILED))?;
             manifest.push(DeployBinaryV1 {
                 name: name.to_string(),
                 dest: dest.to_string_lossy().into_owned(),
                 sha256: source_hash.clone(),
+                prior_present,
+                staged_identity: None,
             });
             set_executable(&staged).map_err(|_| invalid(DEPLOY_STAGE_FAILED))?;
             if binary_sha256(&staged).as_deref() != Some(source_hash.as_str()) {
                 return Err(invalid(DEPLOY_STAGE_FAILED));
+            }
+            let identity = object_identity(&staged).ok_or_else(|| invalid(DEPLOY_STAGE_FAILED))?;
+            if let Some(entry) = manifest.last_mut() {
+                entry.staged_identity = Some(identity);
             }
         }
         let rsid = manifest
@@ -234,13 +309,13 @@ impl StagePlan {
             .ok_or_else(|| invalid(DEPLOY_BINARY_MISSING))?;
         let (sha, schema) = (self.probe)(&staged_path(Path::new(&rsid.dest), id))
             .map_err(|_| invalid(DEPLOY_STAGE_FAILED))?;
-        if sha != expected_sha {
+        if expected_sha.is_some_and(|expected| sha != expected) {
             return Err(invalid(DEPLOY_SHA_MISMATCH));
         }
         if schema < live_schema {
             return Err(invalid(DEPLOY_SCHEMA_DOWNGRADE));
         }
-        Ok(())
+        Ok(sha)
     }
 }
 
@@ -326,16 +401,42 @@ impl std::fmt::Display for SwapError {
     }
 }
 
+/// Identity (device, inode) of the file object at `path`, without following a
+/// symlink; `None` when it is absent or not a regular file.
+fn object_identity(path: &Path) -> Option<ObjectIdentityV1> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.file_type().is_file().then(|| ObjectIdentityV1 {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// Serializes every mutation and removal of an install destination: the swap
+/// and the rollback both hold it (#1127).
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+fn install_lock() -> std::sync::MutexGuard<'static, ()> {
+    INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Rename staged copies over the install paths, keeping `<name>.prev`. Each
-/// staged copy is re-hashed immediately before its rename, so a copy changed
-/// since staging is never installed. Undoes any partial swap on failure.
+/// staged copy is re-hashed immediately before its rename, and must still be
+/// the object recorded at staging, so a copy changed since staging is never
+/// installed. Undoes any partial swap on failure.
 fn swap_in(manifest: &[DeployBinaryV1], id: Uuid) -> std::result::Result<(), SwapError> {
+    let _lock = install_lock();
     let mut done: Vec<&DeployBinaryV1> = Vec::new();
     for entry in manifest {
         let dest = Path::new(&entry.dest);
         let staged = staged_path(dest, id);
-        if binary_sha256(&staged).as_deref() != Some(entry.sha256.as_str()) {
-            rollback(&done);
+        if binary_sha256(&staged).as_deref() != Some(entry.sha256.as_str())
+            || (entry.staged_identity.is_some()
+                && object_identity(&staged) != entry.staged_identity)
+        {
+            rollback_locked(&done);
             return Err(SwapError::StagedChanged);
         }
         let step = (|| {
@@ -348,7 +449,7 @@ fn swap_in(manifest: &[DeployBinaryV1], id: Uuid) -> std::result::Result<(), Swa
             if !dest.exists() && prev_path(dest).exists() {
                 let _ = std::fs::rename(prev_path(dest), dest);
             }
-            rollback(&done);
+            rollback_locked(&done);
             return Err(SwapError::Io(error));
         }
         done.push(entry);
@@ -356,14 +457,72 @@ fn swap_in(manifest: &[DeployBinaryV1], id: Uuid) -> std::result::Result<(), Swa
     Ok(())
 }
 
-/// Restore `<name>.prev` over each install path that has one.
+/// Restore the prior set: `<name>.prev` over each install path that has one,
+/// and removal of a binary this deploy installed that was absent before it
+/// (an optional first-time install). Only the exact file object this deploy
+/// installed is removed; anything else at the path is not ours (#1114, #1127).
 fn rollback(manifest: &[&DeployBinaryV1]) {
+    let _lock = install_lock();
+    rollback_locked(manifest);
+}
+
+/// [`rollback`] with the install lock already held.
+fn rollback_locked(manifest: &[&DeployBinaryV1]) {
     for entry in manifest {
         let dest = Path::new(&entry.dest);
         let prev = prev_path(dest);
         if prev.exists() {
             let _ = std::fs::rename(&prev, dest);
+        } else if !entry.prior_present
+            && let Some(identity) = entry.staged_identity
+        {
+            remove_if_installed(dest, identity);
         }
+    }
+}
+
+/// Remove `dest` only when it is the object `identity`. The path is first moved
+/// aside atomically, so the identity is checked on the very object that is then
+/// unlinked: a replacement installed at any moment either is moved aside and
+/// put back untouched, or lands after the move and is never touched.
+fn remove_if_installed(dest: &Path, identity: ObjectIdentityV1) {
+    let name = dest
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let aside = dest.with_file_name(format!(".{name}.rollback-{}", std::process::id()));
+    if std::fs::rename(dest, &aside).is_err() {
+        return;
+    }
+    #[cfg(test)]
+    after_move_aside_hook();
+    if object_identity(&aside) == Some(identity) {
+        let _ = std::fs::remove_file(&aside);
+        return;
+    }
+    // Not ours: put it back, never over something installed since.
+    let restored = nix::fcntl::renameat2(
+        None,
+        &aside,
+        None,
+        dest,
+        nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+    );
+    if let Err(error) = restored {
+        tracing::warn!(%error, path = %aside.display(), "rollback kept a replaced file aside");
+    }
+}
+
+#[cfg(test)]
+static AFTER_MOVE_ASIDE: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn after_move_aside_hook() {
+    if let Some(hook) = AFTER_MOVE_ASIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        hook();
     }
 }
 
@@ -478,6 +637,7 @@ async fn poll_step(
     let store = store.lock().await;
     let Some(row) = store.live_agent_deploy()? else {
         gate.quiet_polls = 0;
+        drain.set_blockers(&[]);
         drain.sync(None, drain_enabled, now);
         return Ok(PollOutcome::Idle);
     };
@@ -486,16 +646,22 @@ async fn poll_step(
     drain.sync(Some(&row), drain_enabled, now);
     if row.state != DeployState::Staged {
         // `restarting`: the drain is in flight; startup verification settles it.
+        drain.set_blockers(&[]);
         return Ok(PollOutcome::Idle);
     }
-    let blockers = store.deploy_quiet_blockers(row.owner_session_id)?;
+    let blockers = match row.owner_session_id {
+        Some(owner) => store.deploy_quiet_blockers(owner)?,
+        // An operator restart also waits for managers mid-turn (#1122).
+        None => store.operator_quiet_blockers()?.0,
+    };
     gate.last_blockers.clone_from(&blockers);
+    drain.set_blockers(&blockers);
     if blockers.is_empty() {
         gate.quiet_polls += 1;
     } else {
         gate.quiet_polls = 0;
     }
-    if gate.quiet_polls >= QUIET_POLLS_REQUIRED {
+    if row.forced || gate.quiet_polls >= QUIET_POLLS_REQUIRED {
         gate.quiet_polls = 0;
         if !service.is_supervised() {
             return settle(
@@ -751,6 +917,78 @@ mod tests {
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rolling_land_and_remote_deploy_when_present_and_are_named_when_absent() {
+        let f = fixture(true);
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        std::fs::write(f.source.join("rsi-remote"), b"new-remote").unwrap();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        let names: Vec<&str> = manifest.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["rsid", "rsi-rolling-land", "rsi-remote"]);
+        let lander = manifest
+            .iter()
+            .find(|entry| entry.name == "rsi-rolling-land")
+            .unwrap();
+        assert_eq!(
+            lander.sha256,
+            binary_sha256(&f.source.join("rsi-rolling-land")).unwrap()
+        );
+        assert_eq!(
+            rsi_common::agent_deploy::skipped_binaries(&manifest),
+            vec![
+                "rsi",
+                "rsi-rpc",
+                "rsi-agent-mcp",
+                "rsi-build-rustc",
+                "rsi-contract-validate"
+            ]
+        );
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        swap_in(&manifest, id).unwrap();
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-rolling-land")).unwrap(),
+            b"new-lander"
+        );
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-remote")).unwrap(),
+            b"new-remote"
+        );
+        assert_eq!(installed(&f), NEW);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn absent_optional_binaries_are_skipped_and_only_rsid_is_required() {
+        let f = fixture(true);
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        assert_eq!(manifest.len(), 1);
+        let skipped = rsi_common::agent_deploy::skipped_binaries(&manifest);
+        assert!(skipped.contains(&"rsi-rolling-land".to_string()));
+        assert!(skipped.contains(&"rsi-remote".to_string()));
+        assert!(!skipped.contains(&"rsid".to_string()));
+        std::fs::remove_file(f.source.join("rsid")).unwrap();
+        let error = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains(DEPLOY_BINARY_MISSING), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn quiet_point_gate_waits_for_workers_then_swaps_and_restarts() {
         let f = fixture(true);
@@ -858,6 +1096,58 @@ mod tests {
         );
         assert_eq!(f.restarts.load(Ordering::SeqCst), 0);
         assert_eq!(installed(&f), OLD);
+    }
+
+    /// #1177: a deploy waits only for work a restart would break. Off-host jobs
+    /// that survive and reattach (`cloud_sweep`, `cloud_gate`) do not block;
+    /// a local job does, and the blocker list is visible in the drain status.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn off_host_cloud_jobs_do_not_block_a_deploy_but_a_local_job_does_and_the_drain_names_it()
+    {
+        let f = fixture(true);
+        stage(&f, "cloud-jobs", 900).await;
+        let mut gate = GateState::default();
+        let now = Utc::now();
+        let insert = |kind: &str| {
+            let store = f.store.try_lock().unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO agent_jobs(id, owner_session_id, kind, params_json, cwd, \
+                     unit_name, log_path, status_path, state, created_at, row_version) \
+                     VALUES (?1,?2,?3,'{}','/tmp',?1,'/tmp/l','/tmp/s','running',?4,1)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        f.owner.to_string(),
+                        kind,
+                        now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        };
+        insert("cloud_sweep");
+        insert("cloud_gate");
+        assert_eq!(
+            poll_once(&f.store, &f.service, now, &mut gate, &f.drain, true)
+                .await
+                .unwrap(),
+            PollOutcome::Waiting(vec![]),
+            "running cloud jobs are not blockers"
+        );
+        assert!(f.drain.status().blockers.is_empty());
+        assert_eq!(gate.quiet_polls, 1);
+        insert("build");
+        assert_eq!(
+            poll_once(&f.store, &f.service, now, &mut gate, &f.drain, true)
+                .await
+                .unwrap(),
+            PollOutcome::Waiting(vec!["job_running"])
+        );
+        let status = f.drain.status();
+        assert!(status.draining);
+        assert_eq!(status.blockers, vec!["job_running".to_string()]);
+        assert_eq!(gate.quiet_polls, 0);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1106,6 +1396,12 @@ mod tests {
         assert_eq!(wake[0].wake_mode, rsi_common::types::WakeMode::Resume);
         assert!(wake[0].message.contains("succeeded"), "{}", wake[0].message);
         assert!(wake[0].message.contains(SHA), "{}", wake[0].message);
+        assert!(
+            wake[0].message.contains("Skipped (not in binaries_dir)")
+                && wake[0].message.contains("rsi-rolling-land"),
+            "{}",
+            wake[0].message
+        );
         assert_eq!(f.restarts.load(Ordering::SeqCst), 1);
     }
 
@@ -1141,6 +1437,148 @@ mod tests {
             "{}",
             wake[0].message
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn failed_verification_removes_an_optional_binary_that_was_absent_before() {
+        let f = fixture(true);
+        // `rsi-rolling-land` is installed for the first time; `rsi-remote`
+        // already exists and must be restored, not removed.
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        std::fs::write(f.source.join("rsi-remote"), b"new-remote").unwrap();
+        std::fs::write(f.install.join("rsi-remote"), b"old-remote").unwrap();
+        let row = stage(&f, "first-time", 900).await;
+        let presence: Vec<(&str, bool)> = row
+            .manifest
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.prior_present))
+            .collect();
+        assert_eq!(
+            presence,
+            vec![
+                ("rsid", true),
+                ("rsi-rolling-land", false),
+                ("rsi-remote", true)
+            ],
+            "the deploy record carries each destination's prior presence"
+        );
+        let mut gate = GateState::default();
+        let now = Utc::now();
+        for _ in 0..2 {
+            poll_once(&f.store, &f.service, now, &mut gate, &f.drain, true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-rolling-land")).unwrap(),
+            b"new-lander"
+        );
+        let other = "f".repeat(40);
+        let outcome = verify_after_restart(&f.store, &f.service, &other, Some("0"), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Some(PollOutcome::Settled(row.id, DeployState::Failed))
+        );
+        assert_eq!(installed(&f), OLD);
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-remote")).unwrap(),
+            b"old-remote"
+        );
+        assert!(
+            std::fs::symlink_metadata(f.install.join("rsi-rolling-land")).is_err(),
+            "a binary absent before the deploy is absent after the failed deploy"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rollback_leaves_a_file_it_did_not_install_at_an_absent_before_path() {
+        let f = fixture(true);
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        // The deployed copy never landed and something else sits at the path.
+        let lander = f.install.join("rsi-rolling-land");
+        std::fs::write(&lander, b"operator-installed").unwrap();
+        rollback(&manifest.iter().collect::<Vec<_>>());
+        assert_eq!(std::fs::read(&lander).unwrap(), b"operator-installed");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rollback_removes_only_the_object_it_installed_even_when_replaced_mid_removal() {
+        let f = fixture(true);
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        let lander_entry: Vec<&DeployBinaryV1> = manifest
+            .iter()
+            .filter(|entry| entry.name == "rsi-rolling-land")
+            .collect();
+        swap_in(&manifest, id).unwrap();
+        let lander = f.install.join("rsi-rolling-land");
+        assert_eq!(std::fs::read(&lander).unwrap(), b"new-lander");
+
+        // The deploy's own object is removed, and a replacement installed
+        // right after it is moved aside (between the check and the removal) is
+        // preserved untouched.
+        let path = lander.clone();
+        *AFTER_MOVE_ASIDE.lock().unwrap() = Some(Box::new(move || {
+            std::fs::write(&path, b"operator-replacement").unwrap();
+        }));
+        rollback(&lander_entry);
+        *AFTER_MOVE_ASIDE.lock().unwrap() = None;
+        assert_eq!(std::fs::read(&lander).unwrap(), b"operator-replacement");
+        let leftovers: Vec<_> = std::fs::read_dir(&f.install)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".rollback-"))
+            .collect();
+        assert!(leftovers.is_empty(), "our object is gone: {leftovers:?}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn rollback_preserves_a_replacement_installed_before_it_runs() {
+        let f = fixture(true);
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        swap_in(&manifest, id).unwrap();
+        let lander = f.install.join("rsi-rolling-land");
+        // Same bytes, different object: identity, not content, decides. The
+        // deployed object is kept aside so its inode is not reused.
+        std::fs::rename(&lander, f.install.join("kept-aside")).unwrap();
+        std::fs::write(&lander, b"new-lander").unwrap();
+        let entries: Vec<&DeployBinaryV1> = manifest
+            .iter()
+            .filter(|entry| entry.name == "rsi-rolling-land")
+            .collect();
+        rollback(&entries);
+        assert_eq!(std::fs::read(&lander).unwrap(), b"new-lander");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_manifest_recorded_before_prior_presence_existed_reads_as_present() {
+        let old = r#"{"name":"rsid","dest":"/x/rsid","sha256":"ab"}"#;
+        let entry: DeployBinaryV1 = serde_json::from_str(old).unwrap();
+        assert!(entry.prior_present);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1218,6 +1656,8 @@ mod tests {
                     name: "rsid".into(),
                     dest: "/x/rsid".into(),
                     sha256: "0".repeat(64),
+                    prior_present: true,
+                    staged_identity: None,
                 }];
                 store
                     .insert_agent_deploy(
@@ -1256,5 +1696,49 @@ mod tests {
         assert_eq!(schema, i64::from(crate::store::LATEST_SCHEMA_VERSION));
         assert!(parse_build_info("only-one-field").is_none());
         assert!(parse_build_info("a 1 extra").is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_supervisor_on_another_path_refuses_the_deploy_naming_both_paths() {
+        let f = fixture(true);
+        let elsewhere = f._dir.path().join("shared-target/release/rsid");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, OLD).unwrap();
+        let running = elsewhere.clone();
+        let service = f
+            .service
+            .with_supervisor_binary(Box::new(move || Some(running.clone())));
+        let message = service.check_target().unwrap_err().to_string();
+        assert!(message.contains(DEPLOY_TARGET_MISMATCH), "{message}");
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap().display().to_string();
+        assert!(message.contains(&canonical(&elsewhere)), "{message}");
+        assert!(
+            message.contains(&canonical(&f.install.join("rsid"))),
+            "{message}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_supervisor_on_the_installed_path_passes_directly_or_through_a_link() {
+        let f = fixture(true);
+        let installed = f.install.join("rsid");
+        let link_dir = f._dir.path().join("bin");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("rsid");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        for running in [installed.clone(), link] {
+            let service = DeployService::new(
+                f.install.clone(),
+                vec![f._dir.path().to_path_buf()],
+                Box::new(|| true),
+                Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+            )
+            .with_supervisor_binary(Box::new(move || Some(running.clone())));
+            service.check_target().unwrap();
+        }
+        // No readable supervisor argv: nothing to compare, nothing refused.
+        f.service.check_target().unwrap();
     }
 }

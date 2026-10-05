@@ -1,0 +1,27 @@
+#!/bin/sh
+# #1097: run a command and spill large output (builds, tests, logs), or read a
+# spilled output back. Thin shim over `rsi-rpc spill` (one implementation of
+# the deterministic stub extractor, shared with the Claude hook).
+#
+#   rsi-spill -- <cmd> [args...]          run; print output, or a <2 KB stub
+#   rsi-spill --shell '<command line>'    same, through bash -c
+#   rsi-spill show <session/n> [--grep P] [--range a:b]
+#
+# Env: RSI_SPILL_BYTES (default 8192), RSI_SPILL_LINES (200), RSI_SPILL_DIR
+# (~/.rsi/spill), RSI_SPILL_DISABLE=1. The exit code is the command's.
+if [ -n "$RSI_RPC" ]; then
+    exec "$RSI_RPC" spill "$@"
+fi
+if command -v rsi-rpc >/dev/null 2>&1; then
+    exec rsi-rpc spill "$@"
+fi
+# Resolve symlinks: install-release.sh links this script into ~/.local/bin.
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+here=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+for candidate in "$here/../target/debug/rsi-rpc" "$HOME/.cargo/shared-target/debug/rsi-rpc" "$HOME/.local/bin/rsi-rpc"; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" spill "$@"
+    fi
+done
+echo "rsi-spill: rsi-rpc not found (set RSI_RPC)" >&2
+exit 127

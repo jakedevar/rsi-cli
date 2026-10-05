@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""check-touched-shards: verify a candidate once, print one line plus a JSON receipt (#1099).
+
+Replaces the per-file `grep -o 'test-shard-...'` + shard-mode compile ritual and
+the manager's hand verification (merge-base, merge-tree, diff --check, audits).
+
+    scripts/check-touched-shards [--base <rev>] [--head <rev>] [--repo <dir>]
+
+For the diff merge-base(base, head)..head it:
+  * maps changed rsid and rsid-store sources to their test shards and
+    shard-mode-compiles exactly those (`cargo check -p rsid [-p rsid-store]
+    --lib --tests --no-default-features --features test-shard-<shard>`, the
+    `-p` list being the packages that declare the shard, from
+    `check-rsid-test-shards.py --list-shard-packages`; through
+    ~/.rsi/bin/cargo-slot when present); a changed source with no gated test
+    still compiles one fallback shard, and an rsid-store change also compiles
+    one rsid-only shard so a store API break in the daemon is caught;
+  * runs check-rsid-test-shards.py --require-gates, `git diff --check`,
+    tools/check-released-migrations.py and a dynamic-SQL guard (format!-built
+    SQL in added lines; add `sql-dynamic-ok` on the line to accept one);
+  * reports whether head merges cleanly into base and which migrations it adds;
+  * suggests landing filters (rsid=shard:<shard>:test(<module>), rsi-common=,
+    rsi=, plus the cross-cutting pins the worker contract names).
+  * with --run-filters, runs the suggested (and any --filter) rsid shard
+    landing filters under a private tmpfs TMPDIR (/dev/shm, override with
+    CHECK_TOUCHED_SHARDS_TMPDIR), as the merge-queue lander does (#1182).
+
+Output: one summary line, then the JSON receipt (--json: only JSON).
+Exit 0 when every verdict is ok/skipped, 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+RSID_SRC = "crates/rsid/src/"
+RSID_STORE_SRC = "crates/rsid-store/src/"
+# Sharded library sources: rsid and (since the #1021 S4 crate split) rsid-store.
+SHARDED_SRCS = (RSID_SRC, RSID_STORE_SRC)
+# `build.rs` of rsid-store consumes only the first directory; the second is the
+# pre-split layout, still read on an old base and refused for new units.
+MIGRATIONS = RSID_STORE_SRC + "store/migrations/"
+PRE_SPLIT_MIGRATIONS = RSID_SRC + "store/migrations/"
+GATE = re.compile(r"test-shard-([a-z]+-[0-9]+)")
+MIGRATION_FILE = re.compile(r"^" + re.escape(MIGRATIONS) + r"v(\d+)\.rs$")
+PRE_SPLIT_MIGRATION_FILE = re.compile(r"^" + re.escape(PRE_SPLIT_MIGRATIONS) + r"v(\d+)\.rs$")
+SQL_WORDS = re.compile(r"\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(?:TABLE|INDEX)|ALTER\s+TABLE|DROP\s+(?:TABLE|INDEX))\b")
+SQL_OK = "sql-dynamic-ok"
+AGENT_VERB_PINS = ["rsid=shard:other-01:test(rpc::tests)", "rsid=shard:session-05:test(harness::tools)"]
+
+
+def run(args, cwd, check=False, env=None, timeout=None):
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=check, env=env, timeout=timeout)
+
+
+def git(repo, *args):
+    return run(["git", *args], repo)
+
+
+def git_out(repo, *args):
+    result = git(repo, *args)
+    if result.returncode != 0:
+        raise SystemExit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def module_of(path: str) -> str | None:
+    """crates/rsid/src/a/b.rs -> a::b ; a/mod.rs -> a ; lib.rs/main.rs -> None."""
+    for prefix in (*SHARDED_SRCS, "crates/rsi-common/src/", "crates/rsi/src/"):
+        if path.startswith(prefix) and path.endswith(".rs"):
+            parts = path[len(prefix):-3].split("/")
+            if parts[-1] == "mod":
+                parts.pop()
+            if parts and parts != ["lib"] and parts != ["main"]:
+                return "::".join(parts)
+    return None
+
+
+TEST_ATTR = re.compile(r"#\[(?:[a-z_]+::)?test\b")
+TARGET = re.compile(r"^crates/([a-z0-9_-]+)/(?:src/bin/([A-Za-z0-9_-]+)(?:\.rs|/main\.rs)|tests/([A-Za-z0-9_-]+)\.rs)$")
+
+
+def lib_source(path: str) -> bool:
+    """A sharded library source: rsid (not a bin target, not main.rs) or rsid-store."""
+    if path.startswith(RSID_STORE_SRC):
+        return path.endswith(".rs")
+    return path.startswith(RSID_SRC) and path.endswith(".rs") and not path.startswith(RSID_SRC + "bin/") and path != RSID_SRC + "main.rs"
+
+
+def package_of(path: str) -> str:
+    return "rsid-store" if path.startswith(RSID_STORE_SRC) else "rsid"
+
+
+def shard_packages(repo):
+    """{shard: [package, ...]} in shard order, from the checker at `repo`.
+
+    A repo whose checker predates the split has no such mode: every shard is rsid's.
+    """
+    script = repo / "scripts/check-rsid-test-shards.py"
+    listing = run([sys.executable, str(script), "--list-shard-packages"], repo) if script.exists() else None
+    if listing is not None and listing.returncode == 0:
+        mapping = {}
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                mapping[parts[0]] = parts[1:]
+        if mapping:
+            return mapping
+    names = []
+    if script.exists():
+        legacy = run([sys.executable, str(script), "--list-shards"], repo)
+        names = legacy.stdout.split() if legacy.returncode == 0 else []
+    return {name: ["rsid"] for name in (names or ["store-01"])}
+
+
+def child_sources(path, tree_files):
+    stem = path[:-3] if path.endswith(".rs") else path
+    if path.endswith("/mod.rs"):
+        stem = path[: -len("/mod.rs")]
+    return [path] + [f for f in tree_files if f.startswith(stem + "/")]
+
+
+def has_tests(repo, head, path, tree_files):
+    """Static check that the file or its child modules hold at least one test."""
+    for source in child_sources(path, tree_files):
+        shown = git(repo, "show", f"{head}:{source}")
+        if shown.returncode == 0 and TEST_ATTR.search(shown.stdout):
+            return True
+    return False
+
+
+def shards_in(text: str) -> set[str]:
+    return set(GATE.findall(text))
+
+
+def shards_for(repo, head, path, tree_files):
+    """Shards gating tests in the changed file or its child module directory."""
+    found = set()
+    for source in child_sources(path, tree_files):
+        shown = git(repo, "show", f"{head}:{source}")
+        if shown.returncode == 0:
+            found |= shards_in(shown.stdout)
+    return found
+
+
+def added_lines(repo, merge_base, head):
+    """{path: [(lineno, text)]} for .rs files, from a zero-context diff."""
+    diff = git_out(repo, "diff", "-U0", "--no-color", f"{merge_base}..{head}", "--", "*.rs")
+    out: dict[str, list[tuple[int, str]]] = {}
+    path, line = None, 0
+    for raw in diff.splitlines():
+        if raw.startswith("+++ "):
+            path = raw[6:] if raw.startswith("+++ b/") else None
+        elif raw.startswith("@@"):
+            match = re.search(r"\+(\d+)", raw)
+            line = int(match.group(1)) if match else 0
+        elif raw.startswith("+") and path:
+            out.setdefault(path, []).append((line, raw[1:]))
+            line += 1
+    return out
+
+
+def dynamic_sql(added):
+    """format!-built SQL: a `format!(` line with a SQL keyword on it or the next 5 added lines."""
+    findings = []
+    for path, lines in added.items():
+        for index, (number, text) in enumerate(lines):
+            if "format!(" not in text and "format!" not in text:
+                continue
+            window = lines[index : index + 6]
+            joined = " ".join(item[1] for item in window)
+            if SQL_WORDS.search(joined) and not any(SQL_OK in item[1] for item in window):
+                findings.append(f"{path}:{number}")
+    return findings
+
+
+def cargo_prefix():
+    override = os.environ.get("CHECK_TOUCHED_SHARDS_CARGO")
+    if override is not None:
+        return override.split()
+    slot = Path.home() / ".rsi/bin/cargo-slot"
+    prefix = [str(slot)] if slot.exists() else []
+    return prefix + ["env", "-u", "RSI_PROCESS_OWNERSHIP_NAMESPACE", "cargo"]
+
+
+TMPFS_FIXTURE = re.compile(r"\b(?:TempDir::new|tempfile::tempdir|tempdir)\(\)")
+SHARD_FILTER = re.compile(r"^rsid=shard:([a-z]+-\d+):(.+)$")
+
+
+def gate_tmpdir():
+    """A private TMPDIR on tmpfs, the filesystem the merge-queue lander gates on.
+
+    A fixture that allocates a sandbox under `$TMPDIR` passes with a disk-backed
+    TMPDIR and fails the gate (#1182). Override the parent with
+    CHECK_TOUCHED_SHARDS_TMPDIR; without a usable tmpfs the host TMPDIR is used.
+    """
+    parent = os.environ.get("CHECK_TOUCHED_SHARDS_TMPDIR", "/dev/shm")
+    if not os.path.isdir(parent) or not os.access(parent, os.W_OK):
+        sys.stderr.write(f"check-touched-shards: {parent} unusable; filters run with the host TMPDIR\n")
+        parent = None
+    return tempfile.mkdtemp(prefix="check-touched-shards-", dir=parent)
+
+
+def impact_filters(repo, merge_base, head):
+    exe = os.environ.get("RSI_TEST_IMPACT") or shutil.which("rsi-test-impact")
+    if not exe:
+        return None
+    result = run([exe, "--repo", str(repo), "--base", merge_base, "--head", head], repo)
+    if result.returncode != 0:
+        return None
+    filters, in_section = [], False
+    for line in result.stdout.splitlines():
+        if line.startswith("Lander arguments:"):
+            in_section = True
+        elif in_section and line.startswith("  --test-filter"):
+            filters.append(line.strip().split(None, 1)[1])
+        elif in_section and not line.startswith("  "):
+            break
+    return filters
+
+
+def verdict(ok, detail=""):
+    return {"verdict": "ok" if ok else "fail", "detail": detail}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--base", default="origin/rolling", help="revision the candidate lands on (default origin/rolling)")
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--repo", default=".", help="worktree to check (default cwd)")
+    parser.add_argument("--no-compile", action="store_true", help="map shards but skip the cargo compile")
+    parser.add_argument("--run-filters", action="store_true", help="run the suggested rsid shard landing filters (plus any --filter) under a tmpfs TMPDIR, as the merge-queue lander does (#1182)")
+    parser.add_argument("--filter", action="append", default=[], help="extra landing filter rsid=shard:<shard>:<filterset> to run with --run-filters (repeatable)")
+    parser.add_argument("--json", action="store_true", help="print only the JSON receipt")
+    parser.add_argument("--receipt-line", action="store_true", help="print the receipt last as one `RECEIPT_JSON <json>` line (used by candidate-receipt.sh)")
+    parser.add_argument("--receipt", help="also write the JSON receipt to this path")
+    args = parser.parse_args()
+
+    repo = Path(args.repo).resolve()
+    base = git_out(repo, "rev-parse", args.base).strip()
+    head = git_out(repo, "rev-parse", args.head).strip()
+    mb = git(repo, "merge-base", base, head)
+    merge_base = mb.stdout.strip() if mb.returncode == 0 else base
+    changed = [p for p in git_out(repo, "diff", "--name-only", f"{merge_base}..{head}").splitlines() if p]
+    added_files = set(git_out(repo, "diff", "--name-only", "--diff-filter=A", f"{merge_base}..{head}").splitlines())
+
+    # merge-clean vs base
+    tree = git(repo, "merge-tree", "--write-tree", base, head)
+    merge_clean = True if tree.returncode == 0 else (False if tree.returncode == 1 else None)
+
+    # shard mapping
+    tree_files = [f for f in git_out(repo, "ls-tree", "-r", "--name-only", head, "crates").splitlines()]
+    shard_files: dict[str, list[str]] = {}
+    rsid_changed = [p for p in changed if lib_source(p)]
+    packages_of_shard = shard_packages(repo)
+    for path in rsid_changed:
+        for shard in shards_for(repo, head, path, tree_files):
+            shard_files.setdefault(shard, []).append(path)
+    fallback = None
+    if rsid_changed and not shard_files:
+        # A shard declared by a changed package: an rsid-store-only change must
+        # not fall back to a shard that compiles only rsid.
+        changed_packages = {package_of(p) for p in rsid_changed}
+        fallback = next(
+            (name for name, pkgs in packages_of_shard.items() if changed_packages & set(pkgs)),
+            next(iter(packages_of_shard), "store-01"),
+        )
+        shard_files[fallback] = list(rsid_changed)
+    # The daemon depends on the store: compile one rsid-only shard too, so a
+    # store API change that breaks session code cannot hide behind store shards.
+    dependent_shard = None
+    if any(p.startswith(RSID_STORE_SRC) for p in rsid_changed):
+        dependent_shard = next((n for n, pkgs in packages_of_shard.items() if pkgs == ["rsid"]), None)
+        if dependent_shard and dependent_shard not in shard_files:
+            shard_files[dependent_shard] = []
+
+    compiled = {"ok": [], "failed": [], "skipped": args.no_compile}
+    if not args.no_compile:
+        for shard in sorted(shard_files):
+            package_flags = [flag for pkg in packages_of_shard.get(shard, ["rsid"]) for flag in ("-p", pkg)]
+            cmd = cargo_prefix() + ["check", *package_flags, "--lib", "--tests", "--no-default-features", "--features", f"test-shard-{shard}"]
+            result = run(cmd, repo)
+            (compiled["ok"] if result.returncode == 0 else compiled["failed"]).append(shard)
+            if result.returncode != 0:
+                sys.stderr.write(f"shard {shard} compile failed:\n{result.stderr[-2000:]}\n")
+
+    audits = {}
+    filter_runs = {"ok": [], "failed": [], "skipped": not args.run_filters}
+    if (repo / "scripts/check-rsid-test-shards.py").exists():
+        result = run([sys.executable, "scripts/check-rsid-test-shards.py", "--require-gates"], repo)
+        audits["shard_gates"] = verdict(result.returncode == 0, (result.stdout + result.stderr).strip()[-300:])
+    else:
+        audits["shard_gates"] = {"verdict": "skipped", "detail": "script absent"}
+    result = git(repo, "diff", "--check", f"{base}...{head}")
+    audits["diff_check"] = verdict(result.returncode == 0, result.stdout.strip()[-300:])
+    if (repo / "tools/check-released-migrations.py").exists():
+        result = run([sys.executable, "tools/check-released-migrations.py", merge_base, head], repo)
+        audits["released_migrations"] = verdict(result.returncode == 0, (result.stdout + result.stderr).strip()[-300:])
+    else:
+        audits["released_migrations"] = {"verdict": "skipped", "detail": "tool absent"}
+    added = added_lines(repo, merge_base, head)
+    sql = dynamic_sql(added)
+    audits["dynamic_sql"] = {"verdict": "ok" if not sql else "flag", "detail": ", ".join(sql[:10])}
+    # #1182: a fixture on $TMPDIR passes with a disk-backed TMPDIR and fails the
+    # lander's tmpfs gate when it allocates a sandbox. Advisory: read each flag;
+    # add `tmpfs-fixture-ok` on the line when the test never allocates a sandbox.
+    tmpfs_fixtures = [
+        f"{path}:{number}"
+        for path, lines in added.items()
+        if path.startswith("crates/rsid/src/session/")
+        for number, text in lines
+        if TMPFS_FIXTURE.search(text) and "tmpfs-fixture-ok" not in text
+    ]
+    audits["tmpfs_fixture"] = {"verdict": "ok" if not tmpfs_fixtures else "flag", "detail": ", ".join(tmpfs_fixtures[:10])}
+
+    # migrations
+    # The head and the new units follow the layout each revision builds from:
+    # the rsid-store directory when populated, else the pre-split one. A unit
+    # added to the pre-split directory of a split head is never executed.
+    def layout_heads(rev):
+        for pattern, directory in ((MIGRATION_FILE, MIGRATIONS), (PRE_SPLIT_MIGRATION_FILE, PRE_SPLIT_MIGRATIONS)):
+            found = [int(m.group(1)) for p in git_out(repo, "ls-tree", "--name-only", rev, directory).splitlines() if (m := pattern.match(p))]
+            if found:
+                return found, pattern
+        return [], MIGRATION_FILE
+
+    base_heads, _ = layout_heads(base)
+    head_versions, head_pattern = layout_heads(head)
+    split_head = head_pattern is MIGRATION_FILE and bool(head_versions)
+    new_migrations = sorted(int(m.group(1)) for p in added_files if (m := (MIGRATION_FILE.match(p) or PRE_SPLIT_MIGRATION_FILE.match(p))))
+    stray_pre_split = sorted(p for p in added_files if split_head and PRE_SPLIT_MIGRATION_FILE.match(p))
+    base_head = max(base_heads) if base_heads else None
+    migration_conflict = bool(new_migrations and base_head is not None and new_migrations[0] != base_head + 1)
+
+    # suggested filters
+    # Only filters that match at least one test: a static check that the file (or
+    # its child modules) holds a test, never a filter that would match nothing
+    # (a 40-minute landing gate was refused for one, #1129).
+    suggested = []
+    for path in changed:
+        target = TARGET.match(path)
+        if target:
+            package, binary, integration = target.groups()
+            if has_tests(repo, head, path, tree_files):
+                suggested.append(f"{package}=bin:{binary}" if binary else f"{package}=test:{integration}")
+            continue
+        module = module_of(path)
+        if module is None or (path.startswith(SHARDED_SRCS) and not lib_source(path)):
+            continue
+        if path.startswith(SHARDED_SRCS):
+            shards = sorted(s for s, files in shard_files.items() if path in files and s != fallback)
+            suggested += [f"rsid=shard:{s}:test({module})" for s in shards]
+        elif has_tests(repo, head, path, tree_files):
+            package = "rsi-common" if path.startswith("crates/rsi-common/") else "rsi"
+            suggested.append(f"{package}={module}")
+    pins = []
+    added_text = "\n".join(t for lines in added.values() for _, t in lines)
+    if re.search(r"\b(AGENT_VERBS|READ_VERBS)\b", added_text) or any(p.startswith(("crates/rsid/src/rpc/agent", "crates/rsid/src/harness/tools")) for p in changed):
+        pins += AGENT_VERB_PINS
+    manual_docs_changed = "docs/keybindings.md" in changed
+    if any(Path(p).name in ("settings_registry.rs", "key_tables.rs") for p in changed):
+        pins.append("rsi=manual::")
+    suggested = list(dict.fromkeys(suggested + pins))
+    impact = impact_filters(repo, merge_base, head)
+
+    if args.run_filters:
+        tmpdir = gate_tmpdir()
+        try:
+            for flt in dict.fromkeys(suggested + args.filter):
+                match = SHARD_FILTER.match(flt)
+                if not match:
+                    continue
+                shard, expr = match.groups()
+                package_flags = [flag for pkg in packages_of_shard.get(shard, ["rsid"]) for flag in ("-p", pkg)]
+                cmd = cargo_prefix() + ["nextest", "run", *package_flags, "--lib", "--no-default-features", "--features", f"test-shard-{shard}", "-E", expr]
+                env = {**os.environ, "TMPDIR": tmpdir}
+                result = run(cmd, repo, env=env)
+                (filter_runs["ok"] if result.returncode == 0 else filter_runs["failed"]).append(flt)
+                if result.returncode != 0:
+                    sys.stderr.write(f"filter {flt} failed with TMPDIR={tmpdir}:\n{(result.stdout + result.stderr)[-3000:]}\n")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    failed = bool(filter_runs["failed"]) or bool(compiled["failed"]) or any(a["verdict"] == "fail" for a in audits.values()) or merge_clean is False or migration_conflict or bool(stray_pre_split)
+    receipt = {
+        "base": base,
+        "head": head,
+        "merge_base": merge_base,
+        "merge_clean": merge_clean,
+        "changed_files": len(changed),
+        "shards": {"compiled_ok": compiled["ok"], "compiled_failed": compiled["failed"], "compile_skipped": compiled["skipped"], "fallback": fallback, "map": shard_files},
+        "audits": audits,
+        "filter_runs": filter_runs,
+        "migrations": {
+            "new": new_migrations,
+            "base_head": base_head,
+            "numbering_conflict": migration_conflict,
+            "stray_pre_split": stray_pre_split,
+        },
+        "suggested_filters": suggested,
+        "impact_filters": impact,
+        "manual_docs_changed": manual_docs_changed,
+        "ok": not failed,
+    }
+    audit_text = " ".join(f"{k}={v['verdict']}" for k, v in audits.items())
+    summary = (
+        f"check-touched-shards {'OK' if not failed else 'FAIL'} head={head[:9]} base={base[:9]} "
+        f"merge_clean={str(merge_clean).lower()} shards_ok={','.join(compiled['ok']) or '-'} "
+        f"shards_failed={','.join(compiled['failed']) or '-'} {audit_text} "
+        f"filters_failed={','.join(filter_runs['failed']) or '-'} "
+        f"migrations={','.join('V%d' % n for n in new_migrations) or '-'}"
+        f"{' RENUMBER' if migration_conflict else ''}"
+        f"{' STRAY_PRE_SPLIT_MIGRATION' if stray_pre_split else ''} filters={len(suggested)}"
+    )
+    if args.receipt:
+        Path(args.receipt).write_text(json.dumps(receipt, indent=2) + "\n")
+    if not args.json:
+        print(summary)
+    if args.receipt_line:
+        print("RECEIPT_JSON " + json.dumps(receipt, separators=(",", ":")))
+    else:
+        print(json.dumps(receipt, indent=2))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -2232,18 +2232,23 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn legacy_consumers_have_no_provider_specific_mapping_or_stale_numeric_value() {
-        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let stale_spaced = ["372", "_000"].concat();
         let stale_plain = ["372", "000"].concat();
         let mut stale_hits = Vec::new();
-        for entry in walkdir::WalkDir::new(&source_root)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("rs"))
-        {
-            let source = std::fs::read_to_string(entry.path()).unwrap();
-            if source.contains(&stale_spaced) || source.contains(&stale_plain) {
-                stale_hits.push(entry.path().to_path_buf());
+        // Both crates: `rsid-store` holds the store, config and vault sources.
+        for source_root in [manifest.join("src"), manifest.join("../rsid-store/src")] {
+            for entry in walkdir::WalkDir::new(&source_root)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("rs")
+                })
+            {
+                let source = std::fs::read_to_string(entry.path()).unwrap();
+                if source.contains(&stale_spaced) || source.contains(&stale_plain) {
+                    stale_hits.push(entry.path().to_path_buf());
+                }
             }
         }
         assert!(
