@@ -1,5 +1,8 @@
 # rsi
 
+[![CI](https://github.com/jakedevar/rsi-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/jakedevar/rsi-cli/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+
 ![rsi splash screen](Images/rsi_splash.png)
 
 A vim-native terminal UI for running many AI coding agents at once (Claude
@@ -7,6 +10,30 @@ Code, Codex, Antigravity, local models, or a direct API harness) from one
 keyboard-driven screen.
 
 > **Status:** alpha. Expect rough edges and breaking changes.
+
+## Why rsi
+
+Running one coding agent is easy. Running five at once usually means a pile of
+terminal tabs, agents editing the same checkout, and no idea which one is
+waiting on you. rsi gives each agent its own git worktree, keeps every session
+alive in a background daemon, and puts all of them on one screen where you can
+see what each is doing, what it costs, and which ones need an answer. You drive
+it from the keyboard, the way you drive vim.
+
+## Quick start
+
+```bash
+git clone https://github.com/jakedevar/rsi-cli.git && cd rsi-cli
+make release-install        # builds and links rsi, rsid, rsi-rpc, rsi-agent-mcp into ~/.local/bin
+rsi                         # starts the daemon and opens the TUI
+```
+
+You need Rust (rustup) and at least one signed-in agent CLI, such as
+[Claude Code](https://github.com/anthropics/claude-code) or
+[Codex](https://github.com/openai/codex). No subscription? Point the `Local`
+provider at [Ollama](https://ollama.com). Then press `<Space>p` to add a
+project, `<Space>n` to start a session, and `?` for help anywhere. Details are
+under [Install](#install) and [Run](#run).
 
 ## What it does
 
@@ -97,7 +124,12 @@ licenses to permissive ones plus MPL-2.0.
 
 ## Install
 
-From a clone of this repository (or the unpacked archive you were sent):
+Prebuilt binaries for Linux (x86_64, arm64) and macOS (Apple Silicon), when
+available, are attached to
+[GitHub Releases](https://github.com/jakedevar/rsi-cli/releases): unpack the
+archive and put its four binaries on your `PATH`.
+
+To build from a clone of this repository:
 
 ```bash
 make release-install
