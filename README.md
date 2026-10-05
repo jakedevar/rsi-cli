@@ -56,7 +56,8 @@ under [Install](#install) and [Run](#run).
 
 ## Dependencies
 
-rsi runs on Linux and macOS.
+rsi runs on Linux. macOS is a target too, but the daemon does not currently
+build there because it uses Linux-only filesystem calls; that is being fixed.
 
 ### To build
 
@@ -114,6 +115,8 @@ and wakes for long builds and tests; ordinary commands can run in the foreground
 - `cargo-nextest` for `make test-fast`
 - `cargo-deny` for license and advisory checks (`cargo deny check`)
 - `python3` for the landing and helper scripts
+- fontconfig and freetype headers for the TUI end-to-end test harness
+  (`libfontconfig1-dev libfreetype-dev pkg-config` on Debian / Ubuntu)
 
 ### Main Rust libraries
 
@@ -124,8 +127,7 @@ licenses to permissive ones plus MPL-2.0.
 
 ## Install
 
-Prebuilt binaries for Linux (x86_64, arm64) and macOS (Apple Silicon), when
-available, are attached to
+Prebuilt Linux binaries (x86_64, arm64), when available, are attached to
 [GitHub Releases](https://github.com/jakedevar/rsi-cli/releases): unpack the
 archive and put its four binaries on your `PATH`.
 
