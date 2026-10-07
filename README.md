@@ -34,7 +34,9 @@ You need Rust (rustup) and at least one signed-in agent CLI, such as
 provider at [Ollama](https://ollama.com). Then press `<Space>p` to add a
 project, `<Space>N` to start a session, and `?` for help anywhere. Details are
 under [Install](#install) and [Run](#run). To have a manager working in
-minutes, see [Start here](#start-here).
+minutes, see [Start here](#start-here). Before launching, use the new-session
+modal's [settings backside](#new-session-settings-backside) to choose the model,
+effort, sandbox, or manager role.
 
 ## Start here
 
@@ -218,6 +220,30 @@ First steps:
 3. `Enter` opens a session, `F3` shows exactly what it launched with, `x`
    stops it, `<Space>a` archives it, and `<Space>n` (or `:alerts`) opens notifications.
 4. `?` lists the keys available wherever you are.
+
+### New-session settings (backside)
+
+Open the new-session modal with `<Space>N` or `Ctrl-N`. Write your prompt on
+the front, then press `Ctrl+O` in any mode to flip to the settings backside.
+Alternatively, press `Esc` to leave insert mode (dismiss any suggestions first),
+then press `Tab` in normal mode. Flipping preserves your prompt and editing mode.
+
+| Key on the backside | Action |
+|---|---|
+| `j` / `k` or `Down` / `Up` | Select a setting |
+| `h` / `l` or `Left` / `Right` | Cycle values backward / forward |
+| `Space` or `Enter` | Open the model picker, toggle a setting, or cycle forward |
+| `Ctrl+O`, `Tab`, or `Esc` | Return to the prompt |
+| `?` | Show help for the current side |
+| `Ctrl+Enter` | Launch with the current prompt and settings from either side |
+
+Choose **Model** (provider and model), **Effort**, and **Sandbox** (git-worktree
+isolation, when supported). With a project selected, enable **Manager** to
+appoint the new session at launch; **Scope** and **Policy** then appear. Scope
+can cover the project or a live Group or Epic; policy cycles through **Observe**,
+**Execute** (default), and **Full project control**. Appointing replaces the
+project's current manager. Plain `Enter` on the backside changes a setting;
+use `Ctrl+Enter` to launch.
 
 The [operator manual](docs/agent-harness-operator-manual.md) covers daily use,
 and [docs/keybindings.md](docs/keybindings.md) is the full key reference.
